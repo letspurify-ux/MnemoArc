@@ -911,12 +911,24 @@ pub fn execute_cancellable(
             let start = n(&args, "start_line", 1).max(1);
             let lines = n(&args, "max_lines", 120).clamp(1, 2000);
             let offset = n(&args, "offset", 0);
+            let total_lines = contents.lines().count();
+            if start > total_lines {
+                if offset != 0 {
+                    bail!("invalid_offset");
+                }
+                return Ok(
+                    json!({"path":path,"hash":hash(contents.as_bytes()),"total_lines":total_lines,"content":{"text":"","truncated":false,"next_offset":null},"source":null,"eof":true,"next_line":null,"next_offset":0}),
+                );
+            }
             let selected = contents
                 .lines()
                 .skip(start - 1)
                 .take(lines)
                 .collect::<Vec<_>>()
                 .join("\n");
+            if offset > selected.chars().count() {
+                bail!("invalid_offset");
+            }
             let prior = s
                 .history
                 .bundles
@@ -1172,11 +1184,14 @@ pub fn execute_cancellable(
                 let sources = s.source_refs(&list(&args, "source_ids"))?;
                 if sources.is_empty()
                     || sources.iter().any(|source| {
-                        source.origin != "file" || source.path.is_none() || source.hash.is_none()
+                        source.origin != "file"
+                            || source.path.is_none()
+                            || source.hash.is_none()
+                            || source.excerpt.trim().is_empty()
                     })
                 {
                     bail!(
-                        "verification requires observed file sources; pass source_ids returned by file_read/source_search/symbol_search"
+                        "verification requires non-empty observed file sources; pass source_ids returned by file_read/source_search/symbol_search"
                     );
                 }
                 for source in &sources {

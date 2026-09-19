@@ -310,6 +310,54 @@ fn final_check_rejects_invalid_citations_even_after_agent_attestation() {
 }
 
 #[test]
+fn out_of_range_read_is_empty_and_cannot_supply_verification_evidence() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("main.rs"), "\nfn main() {}\n").unwrap();
+    let eof = run(
+        &mut s,
+        "file_read",
+        json!({"path":"main.rs","start_line":99}),
+    );
+    assert_eq!(eof["source"], Value::Null);
+    assert_eq!(eof["eof"], true);
+    assert_eq!(eof["total_lines"], 2);
+    assert!(
+        tools::execute(
+            &mut s,
+            "file_read",
+            json!({"path":"main.rs","start_line":1,"offset":50})
+        )
+        .is_err()
+    );
+    let blank = run(
+        &mut s,
+        "file_read",
+        json!({"path":"main.rs","start_line":1,"max_lines":1}),
+    );
+    let id = blank["source"]["id"].clone();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Entry\nmain.rs:2\n"}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"entry","title":"entry","section":"# Entry","status":"written"}),
+    );
+    assert!(
+        tools::execute(
+            &mut s,
+            "investigation",
+            json!({"action":"verify","id":"entry","source_ids":[id],"verification_note":"blank"})
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("non-empty")
+    );
+}
+
+#[test]
 fn settings_validate_reserves_and_patch_keeps_existing_references() {
     let (dir, mut s) = setup();
     s.config.writing_reserve_ratio = 0.2;
