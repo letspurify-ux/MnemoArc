@@ -7,9 +7,9 @@
 | 도구 | 사용법과 보장 |
 |---|---|
 | `file_read` | 전체 줄 수·파일 해시와 `content.line_start`, `content.line_offsets`를 제공한다. `line_offsets`는 반환 텍스트 내 Unicode 문자 위치이며 각 줄의 시작을 가리킨다. 본문을 잘라도 이어 읽기 위치와 줄 지도를 함께 갱신한다. |
-| `document_inspect` | 인자 없이 출력 파일의 해시·실제 줄 수·목차를 조회한다. `section`에 정확한 제목을 주면 해당 섹션만 읽고 섹션 해시를 반환한다. 목차와 본문 모두 `offset`으로 이어 읽는다. |
+| `document_inspect` | 인자 없이 출력 파일의 해시·실제 줄 수·목차를 조회한다. `section`에 제목을 주면 해당 섹션만 읽고 섹션 해시를 반환한다. `offset`으로 이어 읽을 때는 첫 페이지의 `hash`를 `expected_hash`로 전달해야 하며, 중간에 파일이 바뀌면 거부한다. |
 | `document_edit`의 `section` | `section`, `text`, `expected_hash`, `expected_section_hash`를 받아 해당 제목부터 다음 동급/상위 제목 전까지 교체한다. 원래 제목을 유지해야 한다. 코드 펜스 안의 제목은 무시하며 중복 제목과 외부 편집 충돌을 거부한다. 기존 원자적 파일 교체와 경로 제한을 적용한다. |
-| `document_audit` | `path.ext:10-20` 및 Markdown 링크의 `path.ext#L10-L20` 출처를 검사한다. 파일 존재·허용 경로·줄 범위·연결된 소스 변경·문서 섹션·미검증 조사 항목을 한 번에 점검한다. 오류 목록은 페이지 조회 가능하다. |
+| `document_audit` | `path.ext:10-20` 및 Markdown 링크의 `path.ext#L10-L20` 출처를 검사한다. 코드 펜스 안의 예시는 인용 검사에서 제외한다. 파일 존재·허용 경로·줄 범위·연결된 소스 변경·문서 섹션·미검증 조사 항목을 한 번에 점검한다. 오류 목록은 페이지 조회 가능하다. |
 | `investigation`의 `verify_batch` | `items`에 조사 항목 ID를 키로 하고 `{source_ids: [...], verification_note: "비교 내용"}`을 값으로 전달한다. 최대 20개를 순차 검증하며 항목별 성공/실패를 반환한다. 성공한 항목은 유지하고 실패한 항목은 재시도한다. |
 | `symbol_search` | `query`, 파일 glob `pattern`, `cursor`, `limit`으로 JS/TS·Rust·Python 선언을 검색한다. 이름·위치·선언 줄·프로그램 발급 출처를 반환한다. 파일 변경 시 커서는 만료된다. |
 

@@ -61,16 +61,27 @@ pub(super) fn execute(
                 return Ok(json!({"exists":false,"path":path,"total_lines":0}));
             }
             let doc = read_text(&path)?;
+            if n(args, "offset", 0) > 0 && args["expected_hash"].as_str().is_none() {
+                bail!("expected_hash required for paged document reads");
+            }
+            if let Some(expected) = args["expected_hash"].as_str()
+                && expected != hash(doc.as_bytes())
+            {
+                bail!("document_revision_conflict: output changed during paged read");
+            }
             let mut result = json!({"exists":true,"path":path,"hash":hash(doc.as_bytes()),"total_lines":doc.lines().count(),"bytes":doc.len()});
             if let Some(heading) = args["section"].as_str() {
                 let section = section_text(&doc, heading)?;
-                result["section"] = json!(heading);
+                if n(args, "offset", 0) > section.chars().count() {
+                    bail!("invalid_offset");
+                }
+                result["section"] = json!(heading.trim());
                 result["section_hash"] = json!(hash(section.as_bytes()));
                 result["content"] = bounded_text(s, section, n(args, "offset", 0));
                 result["start_line"] = json!(
                     headings(&doc)
                         .iter()
-                        .find(|h| h.heading == heading)
+                        .find(|h| h.heading == heading.trim())
                         .unwrap()
                         .line
                 );
@@ -150,41 +161,67 @@ pub(super) fn execute(
             let citations = regex::Regex::new(
                 r"([\p{L}\p{N}_./@-]+\.[A-Za-z][A-Za-z0-9]*)(:|#L)([0-9]+)(?:[-–]L?([0-9]+))?",
             )?;
-            for c in citations.captures_iter(&doc) {
+            let mut fence: Option<(char, usize)> = None;
+            for line in doc.split_inclusive('\n') {
                 if cancel.is_cancelled() {
                     bail!("cancelled");
                 }
-                let before = &doc[..c.get(0).unwrap().start()];
-                let token_prefix = before
-                    .rsplit(|ch: char| ch.is_whitespace() || ch == '`' || ch == '(' || ch == '\"')
-                    .next()
-                    .unwrap_or("");
-                if token_prefix.contains("://") {
+                let trimmed = line.trim_start_matches(' ');
+                let marker = trimmed.chars().next().unwrap_or(' ');
+                let width = trimmed.chars().take_while(|c| *c == marker).count();
+                if line.len() - trimmed.len() <= 3 {
+                    if let Some((open, min_width)) = fence {
+                        if marker == open
+                            && width >= min_width
+                            && trimmed[width..].trim().is_empty()
+                        {
+                            fence = None;
+                        }
+                        continue;
+                    }
+                    if (marker == '`' || marker == '~') && width >= 3 {
+                        fence = Some((marker, width));
+                        continue;
+                    }
+                }
+                if fence.is_some() {
                     continue;
                 }
-                checked += 1;
-                let begin = c[3].parse::<usize>().unwrap_or(0);
-                let end = c
-                    .get(4)
-                    .map(|v| v.as_str().parse::<usize>().unwrap_or(0))
-                    .unwrap_or(begin);
-                let citation_path = if &c[2] == "#L" {
-                    path.parent()
-                        .unwrap()
-                        .join(&c[1])
-                        .to_string_lossy()
-                        .to_string()
-                } else {
-                    c[1].to_string()
-                };
-                let check = read_path(&s.project, &citation_path).and_then(|p| read_text(&p));
-                match check {
-                    Ok(contents)
-                        if begin > 0 && end >= begin && end <= contents.lines().count() => {}
-                    Ok(_) => issues.push(json!({"kind":"citation_range","citation":&c[0]})),
-                    Err(e) => issues.push(
-                        json!({"kind":"citation_path","citation":&c[0],"error":e.to_string()}),
-                    ),
+                for c in citations.captures_iter(line) {
+                    let before = &line[..c.get(0).unwrap().start()];
+                    let token_prefix = before
+                        .rsplit(|ch: char| {
+                            ch.is_whitespace() || ch == '`' || ch == '(' || ch == '\"'
+                        })
+                        .next()
+                        .unwrap_or("");
+                    if token_prefix.contains("://") {
+                        continue;
+                    }
+                    checked += 1;
+                    let begin = c[3].parse::<usize>().unwrap_or(0);
+                    let end = c
+                        .get(4)
+                        .map(|v| v.as_str().parse::<usize>().unwrap_or(0))
+                        .unwrap_or(begin);
+                    let citation_path = if &c[2] == "#L" {
+                        path.parent()
+                            .unwrap()
+                            .join(&c[1])
+                            .to_string_lossy()
+                            .to_string()
+                    } else {
+                        c[1].to_string()
+                    };
+                    let check = read_path(&s.project, &citation_path).and_then(|p| read_text(&p));
+                    match check {
+                        Ok(contents)
+                            if begin > 0 && end >= begin && end <= contents.lines().count() => {}
+                        Ok(_) => issues.push(json!({"kind":"citation_range","citation":&c[0]})),
+                        Err(e) => issues.push(
+                            json!({"kind":"citation_path","citation":&c[0],"error":e.to_string()}),
+                        ),
+                    }
                 }
             }
             if checked == 0 {

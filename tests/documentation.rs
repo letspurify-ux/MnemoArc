@@ -201,7 +201,7 @@ fn long_korean_section_survives_result_limiting_and_resumes_exactly() {
         "# 긴 문서\n{}",
         "한글 근거 문장과 코드 foo_bar.\n".repeat(500)
     );
-    run(
+    let created = run(
         &mut s,
         "document_edit",
         json!({"action":"create","text":body}),
@@ -212,7 +212,9 @@ fn long_korean_section_survives_result_limiting_and_resumes_exactly() {
         let call = mnemoarc::llm::ToolCall {
             id: format!("section-{i}"),
             name: "document_inspect".into(),
-            arguments: json!({"section":"# 긴 문서","offset":offset}).to_string(),
+            arguments:
+                json!({"section":"# 긴 문서","offset":offset,"expected_hash":created["hash"]})
+                    .to_string(),
         };
         let result = tools::run_call(&mut s, &call);
         let result = tools::limit_result(&mut s, &call, result, 500);
@@ -227,6 +229,57 @@ fn long_korean_section_survives_result_limiting_and_resumes_exactly() {
         offset = next;
     }
     assert_eq!(reconstructed, body);
+}
+
+#[test]
+fn section_lookup_trims_heading_and_rejects_changes_between_pages() {
+    let (_dir, mut s) = setup();
+    let first = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# 개요\n처음\n"}),
+    );
+    let page = run(
+        &mut s,
+        "document_inspect",
+        json!({"section":"  # 개요  ","expected_hash":first["hash"]}),
+    );
+    assert_eq!(page["content"]["text"], "# 개요\n처음\n");
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","text":"추가\n","expected_hash":first["hash"]}),
+    );
+    assert!(
+        tools::execute(
+            &mut s,
+            "document_inspect",
+            json!({"section":"# 개요","offset":2,"expected_hash":first["hash"]})
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("document_revision_conflict")
+    );
+}
+
+#[test]
+fn audit_ignores_example_citations_inside_fenced_code() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Entry\nmain.rs:1\n```text\nexample.rs:999\n```\n"}),
+    );
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert_eq!(audit["citations_checked"], 1);
+    assert!(
+        !audit["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["kind"] == "citation_path")
+    );
 }
 
 #[test]

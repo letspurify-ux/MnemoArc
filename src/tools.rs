@@ -150,11 +150,11 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_inspect",
-                description: "Read output metadata/hash/line count and paginated Markdown outline without loading full text. Supply section to read one unique heading, offset for continuation.",
+                description: "Read output metadata/hash/line count and paginated Markdown outline without loading full text. Supply section to read one unique heading, offset and expected_hash for safe continuation.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"section":string(),"offset":number(),"limit":number()}),
+                    json!({"section":string(),"offset":number(),"limit":number(),"expected_hash":string()}),
                     &[],
                 ),
             },
@@ -1361,7 +1361,7 @@ pub fn limit_result(
                 } else if pointer == "/data/content/text" && call.name == "document_inspect" {
                     v["data"]["content"]["truncated"] = json!(true);
                     v["data"]["content"]["next_offset"] = json!(offset);
-                    v["next_cursor"] = json!({"tool":"document_inspect","section":args["section"],"offset":offset});
+                    v["next_cursor"] = json!({"tool":"document_inspect","section":args["section"],"offset":offset,"expected_hash":v["data"]["hash"]});
                 } else if pointer == "/data/body/text" && call.name == "memory_read" {
                     v["data"]["body"]["truncated"] = json!(true);
                     v["data"]["body"]["next_offset"] = json!(offset);
