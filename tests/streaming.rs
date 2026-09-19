@@ -137,3 +137,146 @@ async fn retries_transient_http_error_before_accepting_a_complete_stream() {
     );
     server.abort();
 }
+
+async fn sequenced_server(
+    bodies: Vec<String>,
+) -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let bodies = Arc::new(bodies);
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move || {
+            let index = counter.fetch_add(1, Ordering::SeqCst);
+            let body = bodies[index.min(bodies.len() - 1)].clone();
+            async move { ([(header::CONTENT_TYPE, "text/event-stream")], body) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, server, calls)
+}
+
+#[tokio::test]
+async fn retries_provider_finish_error_without_accepting_partial_calls() {
+    use std::sync::atomic::Ordering;
+    let failed = format!(
+        "{}data: [DONE]\n\n",
+        event(
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"discard","function":{"name":"document_edit","arguments":"{\"action\":\"create\"}"}}]},"finish_reason":"error"}]})
+        )
+    );
+    let valid = format!(
+        "{}data: [DONE]\n\n",
+        event(json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}))
+    );
+    let (url, server, calls) = sequenced_server(vec![failed, valid]).await;
+    let c = Config {
+        base_url: url,
+        retries: 1,
+        ..Default::default()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let out = OpenAiClient
+        .complete(json!({"messages":[]}), &c, CancellationToken::new(), tx)
+        .await
+        .unwrap();
+    assert_eq!(out.attempts, 2);
+    assert_eq!(out.text, "OK");
+    assert!(out.calls.is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn retries_malformed_tool_arguments_once_then_returns_only_complete_call() {
+    use std::sync::atomic::Ordering;
+    let malformed = format!(
+        "{}data: [DONE]\n\n",
+        event(
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"broken","function":{"name":"memory_write","arguments":"{\"body\":\"unfinished"}}]},"finish_reason":"tool_calls"}]})
+        )
+    );
+    let valid = format!(
+        "{}data: [DONE]\n\n",
+        event(
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"good","function":{"name":"memory_write","arguments":"{\"body\":\"saved\"}"}}]},"finish_reason":"tool_calls"}]})
+        )
+    );
+    let (url, server, calls) = sequenced_server(vec![malformed, valid]).await;
+    let c = Config {
+        base_url: url,
+        retries: 2,
+        ..Default::default()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let out = OpenAiClient
+        .complete(json!({"messages":[]}), &c, CancellationToken::new(), tx)
+        .await
+        .unwrap();
+    assert_eq!(out.attempts, 2);
+    assert_eq!(out.calls.len(), 1);
+    assert_eq!(out.calls[0].id, "good");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn repeated_provider_finish_error_stops_at_retry_limit() {
+    use std::sync::atomic::Ordering;
+    let failed = format!(
+        "{}data: [DONE]\n\n",
+        event(json!({"choices":[{"delta":{},"finish_reason":"error"}]}))
+    );
+    let (url, server, calls) = sequenced_server(vec![failed]).await;
+    let c = Config {
+        base_url: url,
+        retries: 2,
+        ..Default::default()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let error = OpenAiClient
+        .complete(json!({"messages":[]}), &c, CancellationToken::new(), tx)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "provider_stream_error: finish_reason=error"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    server.abort();
+}
+
+#[tokio::test]
+async fn malformed_sse_event_is_labeled_and_retried_once() {
+    use std::sync::atomic::Ordering;
+    let invalid = "data: {\"choices\":\"unterminated\n\ndata: [DONE]\n\n".to_string();
+    let valid = format!(
+        "{}data: [DONE]\n\n",
+        event(json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}))
+    );
+    let (url, server, calls) = sequenced_server(vec![invalid, valid]).await;
+    let c = Config {
+        base_url: url,
+        retries: 2,
+        ..Default::default()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let out = OpenAiClient
+        .complete(json!({"messages":[]}), &c, CancellationToken::new(), tx)
+        .await
+        .unwrap();
+    assert_eq!(out.attempts, 2);
+    assert_eq!(out.text, "OK");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}

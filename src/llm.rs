@@ -154,7 +154,8 @@ impl OpenAiClient {
                     done = true;
                     continue;
                 }
-                let v: Value = serde_json::from_str(&event)?;
+                let v: Value = serde_json::from_str(&event)
+                    .map_err(|e| anyhow::anyhow!("invalid_stream_event: {e}"))?;
                 if !v["error"].is_null() {
                     bail!("provider_error: {}", v["error"]);
                 }
@@ -175,6 +176,9 @@ impl OpenAiClient {
                 };
                 if let Some(reason) = choice["finish_reason"].as_str() {
                     if !["stop", "tool_calls"].contains(&reason) {
+                        if reason == "error" {
+                            bail!("provider_stream_error: finish_reason=error");
+                        }
                         bail!("incomplete_completion: {reason}");
                     }
                     finish = true;
@@ -223,7 +227,8 @@ impl OpenAiClient {
             if call.id.is_empty() || call.name.is_empty() || !ids.insert(call.id.clone()) {
                 bail!("malformed_tool_call");
             }
-            let _: serde_json::Map<String, Value> = serde_json::from_str(&call.arguments)?;
+            let _: serde_json::Map<String, Value> = serde_json::from_str(&call.arguments)
+                .map_err(|e| anyhow::anyhow!("invalid_tool_arguments: {e}"))?;
         }
         out.calls = calls.into_values().collect();
         Ok(out)
@@ -297,7 +302,10 @@ impl LlmClient for OpenAiClient {
                 }
                 Err(e) => {
                     let text = e.to_string();
-                    let retry = text.starts_with("http_429")
+                    let retry = text.starts_with("provider_stream_error:")
+                        || (attempt == 0 && text.starts_with("invalid_tool_arguments:"))
+                        || (attempt == 0 && text.starts_with("invalid_stream_event:"))
+                        || text.starts_with("http_429")
                         || text.starts_with("http_5")
                         || text.contains("error sending request");
                     if !retry || attempt == c.retries {
