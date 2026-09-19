@@ -1,0 +1,511 @@
+/* Reused from llm_agent/frontend/index.html. MnemoArc layout overrides live in styles.css. */
+
+      :root {
+        --bg: #f5f7fb;
+        --surface: #ffffff;
+        --border: #e4e9f2;
+        --text: #1a2233;
+        --muted: #67728a;
+        --accent: #4f46e5;
+        --accent-2: #7c3aed;
+        --grad: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+        --robot-bg: #071426 radial-gradient(circle at 35% 25%, #173f68, #071426);
+      }
+      * { box-sizing: border-box; }
+      html, body, #root { height: 100%; }
+      /* 뷰포트 자체는 스크롤되지 않지만 스크롤 사슬의 끝은 늘 뷰포트다. 표·대화가 더 못 가는 방향으로
+         트랙패드를 밀면(가로로 스치듯, 또는 맨 위에서 더 위로) 브라우저는 그것을 뒤로 가기·새로고침
+         제스처로 받아 대화를 통째로 잃게 한다 — 여기서 끊는다. Chrome은 예전엔 body, 지금은 html의 값을
+         뷰포트에 옮기므로 둘 다에 둔다. */
+      html, body { overscroll-behavior: none; }
+      body {
+        margin: 0;
+        font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, 'Segoe UI', sans-serif;
+        background: var(--bg); /* 장식 그라데이션은 .chat에 있다 — 그 이유는 .chat 주석 참고 */
+        color: var(--text);
+      }
+
+      .app { display: flex; flex-direction: column; height: 100%; }
+
+      /* ===== 헤더 ===== */
+      .header {
+        display: flex; align-items: center; gap: 12px;
+        padding: 14px 24px;
+        /* 불투명한 단색이다. 반투명(rgba)이었을 때와 보이는 색은 같다 — 뒤에 있는 것이 body의 단색뿐이라
+           섞인 결과가 거의 흰색이다. 불투명해야 하는 이유는 .chat과 같다: 헤더는 스크롤 상자 위에 겹쳐
+           자기 합성 레이어가 되는데, 비치는 레이어의 글자는 Windows에서 서브픽셀 렌더링을 잃어 본문과
+           다르게(회색 계단으로) 보인다.
+           backdrop-filter도 두지 않는다: 헤더 뒤에는 스크롤되는 내용이 없어(대화는 헤더 아래 .chat 안에서
+           스크롤된다) 흐릴 것이 body의 단색뿐인데, 브라우저는 그래도 매 프레임 그 영역을 별도 패스로
+           처리한다 — Windows 내장 GPU에서는 스크롤 프레임마다 내는 순수한 비용이다. */
+        background: var(--surface);
+        border-bottom: 1px solid var(--border);
+        position: sticky; top: 0; z-index: 10;
+      }
+      .brand-home {
+        display: inline-flex; align-items: center; gap: 12px;
+        min-width: 0; padding: 0; border: 0; background: transparent; color: inherit;
+        font: inherit; text-align: left; cursor: pointer;
+      }
+      .brand-home:focus-visible { outline: 3px solid #c7c3ff; outline-offset: 4px; border-radius: 13px; }
+      .logo {
+        width: 40px; height: 40px; border-radius: 12px;
+        background: var(--robot-bg);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 19px; font-weight: 800; color: #fff;
+        box-shadow: 0 2px 10px rgba(30, 64, 105, 0.08), inset 0 0 0 1px #e0eaf5;
+      }
+      .robot-icon { position: relative; display: block; flex-shrink: 0; width: 100%; height: 100%; border-radius: inherit; overflow: hidden; background: var(--robot-bg); }
+      .robot-icon canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; opacity: 0; }
+      .robot-ready canvas { animation: robot-reveal 850ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+      @keyframes robot-reveal { from { opacity: 0; } to { opacity: 1; } }
+      .brand-copy { display: flex; flex-direction: column; min-width: 0; }
+      .brand-title { font-size: 17px; font-weight: 800; letter-spacing: -0.2px; }
+      .brand-title > span { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+      .brand-subtitle { margin-top: 1px; font-size: 12px; color: var(--muted); }
+      /* 대화를 접고 첫 화면(빈 상태)으로 되돌리는 단추. 화면이 하나뿐인 앱이라
+         '홈'은 이동할 다른 주소가 아니라 대화를 비운 그 첫 화면이다. */
+      .home-btn {
+        margin-left: auto; flex-shrink: 0;
+        display: inline-flex; align-items: center; gap: 6px;
+        border: 1px solid var(--border); background: var(--surface); color: var(--muted);
+        padding: 8px 14px; border-radius: 999px;
+        font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+        box-shadow: 0 1px 3px rgba(16, 24, 40, 0.06);
+        transition: all 0.15s ease;
+      }
+      .home-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
+      /* 이미 첫 화면이면 누를 것이 없다 — 눌러도 아무 일도 일어나지 않는 단추로 두지 않는다 */
+      .home-btn:disabled { opacity: 0.4; cursor: default; }
+      /* 좁은 화면에서는 글자를 접고 아이콘만 남긴다 — 헤더의 제목을 밀어내지 않게 한다 */
+      @media (max-width: 480px) {
+        .home-btn { padding: 8px 11px; }
+        .home-btn .home-label { display: none; }
+        .brand-home { gap: 8px; }
+        .brand-home .logo { flex-shrink: 0; width: 34px; height: 34px; }
+        .brand-title { font-size: 15px; }
+        .brand-subtitle { font-size: 11px; }
+      }
+      /* 좁은 화면에서 말풍선의 기본 90% 제한도 낭비다 — 320px 창에서 답변 안의 표는 159px, 열 두 개도 못 담는
+         세로 띠가 된다. 답변은 폭을 다 쓰게 하고(누구의 말인지는 색·모서리·정렬이 이미 말한다),
+         내가 한 말은 오른쪽에 붙은 것이 보이도록 조금 남긴다. 바깥 여백도 함께 줄여 글이 들어갈
+         자리를 실제로 만든다. .bubble 정의보다 아래에 두어야 하므로 규칙은 파일 끝에 있다
+         (여기 480px 블록은 헤더 것이다) — 아래 '좁은 화면' 절 참고. */
+
+      /* ===== 채팅 영역 ===== */
+      /* .chat이 페이지의 스크롤 상자다(문서 자체는 스크롤되지 않는다). 창 너비 전체를 차지해 스크롤바가
+         창 오른쪽 끝에 오고, 1024px 열은 안쪽 .chat-inner가 잡는다. */
+      .chat {
+        flex: 1; overflow-y: auto;
+        display: flex; flex-direction: column;
+        /* 불투명한 배경이 있어야 한다 — 색 이름이 아니라 스크롤 방식이 걸린 문제다.
+           Windows Chrome은 LCD(서브픽셀) 텍스트를 지키려고, 배경이 비치는(투명한) 스크롤 상자는 자기
+           합성 레이어로 떼지 않고 내용을 문서 레이어에 함께 그린다. 그러면 스크롤할 때마다 그 부분을 다시
+           래스터해야 하고, 다시 그려지기 전까지는 이전 픽셀이 그대로 보인다(멈춘 것처럼). 반면 배경이
+           불투명한 안쪽 스크롤 상자(코드 블록·실행 과정 표)는 자기 레이어라 스크롤을 즉시 따라간다 —
+           그래서 창을 줄인 직후(전부 다시 래스터해야 할 때) 스크롤바를 끌면 말풍선은 서 있는데 표·코드만
+           움직이는 현상이 났다. 배경이 불투명하면 Chrome은 이 상자를 합성 스크롤로 만들고 말풍선도 표와
+           같은 레이어에서 함께 움직인다. macOS는 LCD 텍스트가 없어 어느 쪽이든 합성 스크롤이다 — 그래서
+           macOS에서는 재현되지 않았다.
+           그라데이션은 그 배경의 일부로 여기 둔다. attachment가 local인 이유: scroll(기본)이면 배경이
+           스크롤 내용과 함께 움직이지 않는 그림이라 Chrome이 내용 레이어에 넣지 못해 다시 투명 취급이
+           된다. local은 내용에 붙어 함께 스크롤되므로 장식은 대화의 첫머리(빈 화면·첫 질문)에서 보이고
+           길어지면 위로 올라간다. 마지막 단색이 실제로 불투명을 보장하는 층이다. */
+        background:
+          radial-gradient(1200px 500px at 80% -160px, #e4e0ff 0%, transparent 60%),
+          radial-gradient(900px 400px at -10% 120px, #dceafe 0%, transparent 55%),
+          var(--bg);
+        background-attachment: local;
+        /* 스크롤바 자리를 양쪽에 늘 비워 둔다(고전 스크롤바인 Windows에서). 없으면 첫 답변이 와서 스크롤바가
+           생기는 순간 열이 스크롤바 폭의 반만큼 왼쪽으로 밀리고(차트도 다시 그려진다), 그 뒤로는 열이
+           '창 폭 - 스크롤바'의 가운데에 서서 창 폭의 가운데에 있는 입력창과 어긋난다. both-edges로 양쪽을
+           비우면 열은 언제나 창의 가운데다. 겹쳐 그리는(overlay) 스크롤바인 macOS에서는 비울 것이 없다. */
+        scrollbar-gutter: stable both-edges;
+        /* 이 스크롤 상자를 쌓임 맥락(stacking context)으로 만든다. 없으면 안의 position: relative 요소
+           (recharts가 차트 wrapper에 준다)는 페이지 루트의 쌓임 순서로 빠져나가 스크롤 내용과 '겹치는'
+           별도 요소가 되고, Chrome은 그런 것을 차트마다 자기 합성 레이어로 떼어 낸다(compositing reason:
+           Overlap). 떼어진 레이어는 스크롤 내용과 따로 래스터되어 빠르게 스크롤하면 글은 보이는데
+           차트 자리만 비었다가 늦게 나타난다 — Retina에서는 픽셀이 넷이라 더 늦다. isolate는 레이아웃·
+           position: fixed·이벤트에 아무 영향이 없고 z-index의 범위만 이 상자 안으로 가둔다. */
+        isolation: isolate;
+      }
+      .chat-inner {
+        /* 내용이 적어도 스크롤 상자 높이만큼은 차지해 빈 화면(.empty)의 margin: auto가 가운데를 잡는다 */
+        flex: 1 0 auto;
+        width: 100%; max-width: 1024px; margin: 0 auto;
+        padding: 24px 20px 8px;
+        display: flex; flex-direction: column; gap: 16px;
+      }
+
+      .empty { margin: auto; text-align: center; padding: 40px 0; }
+      .empty-icon {
+        width: 96px; height: 96px; flex-shrink: 0; border-radius: 32px; margin: 0 auto 20px;
+        background: var(--robot-bg); display: flex; align-items: center; justify-content: center;
+        font-size: 32px; font-weight: 800; color: #fff;
+        box-shadow: 0 12px 30px -12px rgba(99, 86, 138, 0.22), 0 2px 6px rgba(99, 86, 138, 0.04);
+      }
+      .empty h2 { margin: 0 0 6px; font-size: 22px; font-weight: 800; letter-spacing: -0.3px; }
+      .empty p { margin: 0 0 20px; color: var(--muted); font-size: 14px; }
+      .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+      .chip {
+        border: 1px solid var(--border); background: var(--surface); color: var(--text);
+        padding: 9px 14px; border-radius: 999px; font-size: 13px; cursor: pointer;
+        box-shadow: 0 1px 3px rgba(16, 24, 40, 0.06);
+        transition: all 0.15s ease;
+      }
+      .chip:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
+
+      /* ===== 메시지 ===== */
+      .row { display: flex; }
+      .row.user { justify-content: flex-end; }
+      .bubble {
+        max-width: 90%; padding: 12px 16px; font-size: 14px; line-height: 1.6;
+        /* 말풍선 '상자'는 max-width로 묶이지만 내용은 그렇지 않다 — URL·식별자처럼 공백 없는
+           긴 토큰은 기본값(overflow-wrap: normal)에서 줄바꿈 지점이 없어 상자를 그대로 뚫고 나간다.
+           표준은 anywhere지만 Safari 15.4 미만은 모르므로, 구형에서도 같은 효과를 내는
+           word-break를 앞에 함께 둔다 (지원 범위는 App.jsx의 빌드 타깃 주석 참고). */
+        word-break: break-word;
+        overflow-wrap: anywhere;
+        /* 최후의 그물. 텍스트 줄바꿈과 코드·표·수식의 개별 스크롤이 내용을 표시하고,
+           바깥 말풍선은 예기치 않은 가로 넘침을 가둔다. 넓은 인라인 수식도
+           InlineMath가 끝까지 읽을 수 있는 스크롤 영역으로 만든다. 세로로 뚫는 것(\rule{500em})은 여기서 못 막는다
+           (clip은 가로만 자른다) — 그쪽은 KaTeX의 maxSize가 막는다 (math.js).
+           auto가 아니라 clip인 이유: auto는 세로 overflow까지 visible이 아니게 만들어 인라인
+           수식의 위아래가 잘리고 스크롤바가 생긴다. clip은 가로만 자르고 세로는 건드리지 않는다.
+           Safari 16 미만은 clip을 모르고 무시한다 — 그 경우 이전과 같이 동작할 뿐 나빠지지 않는다. */
+        overflow-x: clip;
+        animation: pop 0.18s ease;
+      }
+      @keyframes pop { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+      .bubble.user {
+        background: var(--grad); color: #fff;
+        border-radius: 18px 18px 4px 18px;
+        box-shadow: 0 4px 14px rgba(79, 70, 229, 0.3);
+        white-space: pre-wrap;
+      }
+      .bubble.assistant {
+        background: #ffffff; border: 1px solid var(--border);
+        border-radius: 18px 18px 18px 4px;
+        box-shadow: 0 2px 10px rgba(16, 24, 40, 0.05);
+      }
+
+      /* assistant 말풍선 안의 markdown */
+      .md p { margin: 0 0 8px; }
+      .md h1, .md h2, .md h3 { margin: 12px 0 6px; font-size: 14px; font-weight: 700; color: var(--accent); }
+      .md ul, .md ol { margin: 4px 0 8px; padding-left: 20px; }
+      .md table { border-collapse: collapse; margin: 8px 0; display: block; overflow-x: auto; }
+      .md th, .md td { border: 1px solid var(--border); padding: 6px 12px; font-size: 13px; text-align: left; white-space: nowrap; }
+      .md th { background: #f1f3fb; font-weight: 600; }
+      .md .rich-cell { white-space: normal; vertical-align: top; }
+      .md .rich-cell > p:last-child { margin-bottom: 0; }
+      .md .rich-cell .chart, .md .rich-cell .mermaid { width: 480px; max-width: min(480px, 72vw); }
+      .md .rich-cell .chart-table { max-width: min(480px, 72vw); }
+      .md tr:nth-child(even) td { background: #fafbfe; }
+      .md code { background: #eef0fa; padding: 1px 6px; border-radius: 5px; font-size: 12.5px; }
+      /* 코드블록(```). 이 규칙이 없으면 <pre> 기본값(white-space: pre)대로 한 줄을 끝까지 늘여
+         말풍선 밖으로 수백 px 삐져나간다 — 위의 줄바꿈 규칙은 pre에 닿지 않으므로
+         (줄바꿈을 막는 것이 pre의 정의다) 대신 가로 스크롤로 가둔다. .trace-grid와 같은 처방이다. */
+      .md pre {
+        margin: 8px 0; padding: 10px 12px; border-radius: 10px;
+        background: #f1f3fb; border: 1px solid var(--border);
+        overflow-x: auto; font-size: 12.5px; line-height: 1.5;
+      }
+      /* 블록 안의 code에는 인라인용 알약 배경·여백을 걷어낸다 — 두 배경이 겹쳐 얼룩덜룩해진다 */
+      .md pre code { background: none; padding: 0; border-radius: 0; font-size: inherit; }
+      /* 지금은 닿지 않는 규칙이다 — 답변의 그림은 App.jsx AltImage가 링크로만 남기고 <img>를 만들지
+         않는다. 그림을 다시 띄우기로 하면 그 한 곳만 되돌리면 되도록 크기 규칙은 남겨 둔다. */
+      .md img { max-width: 100%; }
+
+      /* ===== 차트·흐름도 (App.jsx ChartBlock / MermaidBlock) ===== */
+      /* 그림의 글자 폭은 별도로 측정한다. 표 머리글·바깥 서식의 굵기/기울임이 나중에
+         상속되면 측정값과 실제 라벨 폭이 달라져 글자가 잘린다. 그림 내부의 강조는 유지한다. */
+      .md .chart, .md .mermaid { font-weight: 400; font-style: normal; letter-spacing: normal; }
+      /* 폭을 고정값으로 두는 이유: 말풍선은 내용 폭으로 크기가 정해지는데(shrink-to-fit) 차트는 스스로
+         폭이 없다(ResponsiveContainer는 부모를 채울 뿐이다). 글 한 줄 아래 놓인 차트가 그 한 줄 폭으로
+         쪼그라드는 것을 막는다. max-width: 100%는 실제 배치 때 말풍선 폭(90% 상한)에 맞춰 다시 줄인다. */
+      .md .chart { width: 640px; max-width: 100%; margin: 10px 0 6px; min-width: 0; }
+      .md .chart figcaption { font-size: 13px; font-weight: 600; color: var(--text); margin: 0 0 6px 4px; }
+      .md .chart-note { font-size: 12px; color: var(--muted); margin: 2px 0 0 4px; }
+      /* 좁은 화면의 원그래프 범례 (Chart.jsx PieView). 조각 안에는 비율만 적고 이름은 여기서 말한다 —
+         그래프 상자 밖이라 몇 줄로 감기든 그래프가 설 자리를 뺏지 않는다. */
+      .md .chart-legend { display: flex; flex-wrap: wrap; gap: 3px 12px; margin: 3px 0 0; padding: 0 4px; list-style: none; font-size: 12px; }
+      .md .chart-legend li { display: flex; align-items: center; gap: 5px; min-width: 0; overflow-wrap: anywhere; }
+      /* 색칩은 이름과 그림을 잇는 유일한 끈이다 — 그림 속에는 이름이 없다(원그래프의 조각에는 비율만
+         적히고, 막대·선의 계열도 색으로만 구별된다). 그래서 강제 색상(Windows 고대비)에서도 이 색만은
+         지킨다: 브라우저는 강제 색상에서 HTML의 background-color를 시스템 색으로 갈아 끼우는데 SVG의
+         fill·stroke는 그대로 두므로, 두면 조각·선은 여덟 가지 색인데 색칩만 여덟 개가 모두 바탕과 같은
+         흰색이 되어 사라진다(실측: 강제 색상에서 색칩 8개가 전부 rgb(255,255,255), 말풍선 바탕과 같은
+         색이었다 — 이름 목록만 남아 어느 이름이 어느 조각인지 알 길이 없다). CSS 표준이 이 예외를
+         두고 든 보기가 정확히 차트의 범례다. 글자는 손대지 않는다 — 그쪽은 고대비가 지켜야 한다. */
+      .md .chart-legend i { width: 9px; height: 9px; border-radius: 2px; flex: none; forced-color-adjust: none; }
+      /* 차트 아래 '표로 보기'. 접힌 줄은 눈에 띄지 않게, 펼치면 표는 원래 규칙(.md table)대로 */
+      .md .chart-table { margin: 0 0 8px; font-size: 12.5px; }
+      .md .chart-table summary { cursor: pointer; color: var(--muted); user-select: none; }
+      .md .chart-table[open] summary { margin-bottom: 4px; }
+      /* recharts 툴팁 등은 자기 스타일을 인라인으로 갖는다. 글자 줄바꿈 규칙만 말풍선 것을 되돌린다 —
+         축 눈금은 SVG 글자라 영향이 없지만 범례·툴팁은 HTML이다. */
+      .md .chart .recharts-wrapper { word-break: normal; overflow-wrap: normal; }
+      /* 그 되돌림의 예외 둘. 범례·툴팁에 서는 이름은 조회 결과의 열 이름·셀 값 그대로이고(chart.js가
+         MAX_NAME_LEN 60자까지만 들여보낸다) 띄어쓰기가 없을 수 있다 — 위 규칙 그대로면 60자짜리
+         식별자 하나가 상자를 뚫고 나가고, 나간 글자는 말풍선의 overflow-x: clip에 잘려 읽을 수 없다.
+         이 둘은 아래로 감겨도 그림을 밀어내지 않는 자리이므로 여기서만 다시 켠다. */
+      .md .chart .recharts-tooltip-wrapper, .md .chart .recharts-legend-wrapper { overflow-wrap: anywhere; }
+      /* mermaid는 SVG에 자기 폭(max-width: NNNpx)을 인라인으로 쓴다 — 말풍선보다 넓으면 줄인다 */
+      .md .mermaid { margin: 8px 0; overflow-x: auto; }
+      /* SVG의 인라인 기준선이 목록 기호를 그림 맨 아래로 끌어내리지 않도록 한다. */
+      .md .mermaid svg { display: block; max-width: 100%; height: auto; }
+      /* 그림 뒤에 오류 원문(details)이 있어도 목록 기호의 첫 기준선은 그림 위다.
+         높이 없는 줄은 SVG를 밀지 않고, 아래 summary가 첫 글줄이 되는 것을 막는다. */
+      .md li > .mermaid::before { content: "\200b"; display: block; height: 0; }
+
+      /* ===== 수식 (KaTeX) ===== */
+      /* .bubble의 줄바꿈 규칙(overflow-wrap: anywhere)이 여기까지 상속되면, KaTeX가 span으로
+         조립한 수식을 기호 한가운데서 끊어 분수·근호가 어긋난 채 렌더된다 — 수식 안에서만 되돌린다. */
+      .md .katex { word-break: normal; overflow-wrap: normal; }
+      /* 넘치는 인라인 수식만 InlineMath가 전환한다. 짧은 수식의 기준선과
+         행 높이는 그대로이며, grid의 실제 내용 높이로 큰 분수·근호를 보존한다.
+         아래 여백은 고전 스크롤바가 분모를 가리지 않도록 확보한다. */
+      .md .katex.math-scroll { display: inline-grid; max-width: 100%; overflow-x: auto;
+        overflow-y: hidden; padding: 4px 0 16px; }
+      .md .math-scroll > .katex-html { min-width: max-content; }
+      .md .math-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      /* 별행 수식($$)은 말풍선보다 넓어질 수 있다. 코드블록·표와 같은 처방으로 가로 스크롤에 가둔다.
+         세로 여백은 남긴다 — 적분·행렬처럼 키 큰 수식이 위아래로 잘리는 것을 막는다.
+         아래 여백이 위보다 두꺼운 이유: 가로 스크롤바가 생기면 그 두께(윈도우·리눅스는 겹치지 않는
+         고전 스크롤바라 15px 안팎)를 패딩 상자 안에서 가져간다. overflow-y: hidden이라 상자는
+         늘어날 수 없으므로, 여백이 얇으면 분수의 분모나 ∑의 아래 첨자가 스크롤바에 잘린다
+         — 이 패딩이 막으려던 바로 그 손상이 스크롤바 쪽 문으로 되돌아온다. */
+      .md .katex-display { overflow-x: auto; overflow-y: hidden; padding: 4px 0 16px; margin: 10px 0 0; }
+      /* 수식과 번호의 폭을 모두 확보한다. 좁으면 둘이 겹치는 대신 수식 영역 안에서 스크롤한다. */
+      .md .katex-display > .katex > .katex-html.math-numbered {
+        display: grid; grid-template-columns: minmax(max-content, 1fr) max-content;
+        column-gap: 1em; align-items: baseline; min-width: max-content;
+      }
+      .md .katex-display > .katex > .katex-html.math-numbered > .tag { position: static; }
+      /* 지원하지 않는 수식도 답변을 깨뜨리지 않는다. 오류 원문은 사용자가 펼쳐 확인한다. */
+      .md .math-error { margin: 10px 0; border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; }
+      .md .math-error summary { cursor: pointer; font-size: 13px; }
+      .md .math-error pre { margin-bottom: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+      .md > :first-child { margin-top: 0; }
+      .md > :last-child { margin-bottom: 0; }
+
+      /* ===== 쿼리 trace ===== */
+      .trace { margin-top: 10px; font-size: 12px; }
+      .trace summary {
+        cursor: pointer; color: var(--muted); user-select: none;
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 4px 10px; border-radius: 999px; background: #f1f3fb;
+      }
+      .trace summary:hover { color: var(--accent); }
+      /* 스텝 하나(머리띠 + 표)를 한 상자로 묶어 테두리와 둥근 모서리를 여기서 그리고, 여기서 자른다.
+         둥근 모서리를 표(.trace-grid) 자신에게 주면 안 된다 — 표는 스크롤 상자이고 그 안의 sticky
+         머리글·행번호는 Chrome이 합성 레이어로 떼어 내는데, 아래만 둥근(모서리가 서로 다른) 상자로
+         합성 레이어를 자르려면 Chrome은 레이어마다 상자 크기의 마스크 레이어를 하나씩 더 만든다
+         (1000행 표 다섯이면 25장, Retina에서 각 4MB). 스크롤하는 매 프레임 그것을 다시 합성하느라
+         차트·표가 늦게 그려진다. 네 모서리가 같은 둥근 상자는 마스크 없이 자른다(fast rounded corner).
+         hidden인 이유: 잘라야 할 것이 없어 스크롤 상자가 되어도 실제로 스크롤될 일이 없고(표는 자기
+         높이 안에서 스크롤한다), clip과 달리 모든 브라우저가 안다. */
+      .trace-step {
+        margin-top: 6px;
+        border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+      }
+      /* 쿼리 이름·바인드 한 줄은 코드처럼 어두운 띠로, 그 아래 행은 밝은 표로 — 무엇을 실행했는지와
+         무엇이 나왔는지를 한눈에 가른다. 모서리는 .trace-step이 자른다. */
+      .trace-head {
+        display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px;
+        padding: 7px 10px;
+        background: #0f172a; color: #c7d2fe; font-size: 11.5px; line-height: 1.5;
+      }
+      .trace-head code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+      .trace-head .trace-count { color: #a5b4fc; }
+      /* 이력의 절대 순번 (App.jsx TraceStep 주석) — 답변 본문이 말하는 번호와 같은 값이다 */
+      .trace-head .trace-no { color: #8f99e0; font-variant-numeric: tabular-nums; flex: none; }
+      .trace-head .trace-csv {
+        margin-left: auto; padding: 2px 10px; border-radius: 999px; cursor: pointer;
+        border: 1px solid #3b4a6b; background: transparent; color: #c7d2fe; font-size: 11px;
+      }
+      .trace-head .trace-csv:hover { border-color: #a5b4fc; color: #fff; }
+      /* 조회된 행 전부를 싣는 표. 세로는 이 높이 안에서, 가로는 표 너비만큼 스크롤한다 — 1000행 × 30열이
+         말풍선을 세로로 끝없이 늘이거나(스크롤 따라가기가 그 아래 답변을 놓친다) 가로로 뚫지 않게.
+         머리글은 스크롤해도 붙어 있다(sticky) — 열이 많으면 몇 행만 내려가도 무슨 열인지 잊는다. */
+      .trace-grid {
+        /* 높이는 화면에 비례하되 상한을 둔다 — 큰 모니터에서도 표 하나가 대화를 밀어내지 않게.
+           테두리·둥근 모서리는 없다 — .trace-step이 그린다(그 주석 참고). */
+        max-height: min(55vh, 520px); overflow: auto; background: var(--surface);
+      }
+      /* 스크롤바를 늘 보이게 그린다. macOS의 기본(overlay) 스크롤바는 손대기 전까지 숨어 있어서, 잘린 열·행이
+         '더 있다'는 것을 알 길이 없다 — 세로·가로 둘 다. (표준 scrollbar-width/color를 함께 쓰면 Chrome이
+         이 규칙을 무시하고 overlay로 돌아가므로 여기서는 -webkit- 규칙만 쓴다. Firefox는 시스템 설정을 따른다.) */
+      .trace-grid::-webkit-scrollbar { width: 11px; height: 11px; }
+      .trace-grid::-webkit-scrollbar-track, .trace-grid::-webkit-scrollbar-corner { background: #f1f3fb; }
+      .trace-grid::-webkit-scrollbar-thumb { background: #b9c0ec; border-radius: 999px; border: 2px solid #f1f3fb; }
+      .trace-grid::-webkit-scrollbar-thumb:hover { background: #8f99e0; }
+      /* 표는 내용 폭대로 자란다(max-content). 그냥 두면 표가 상자 폭에 맞춰 열을 줄이는데, .bubble에서
+         물려받은 overflow-wrap: anywhere 때문에 글자 단위로 접혀 텍스트 열 하나가 한 글자 폭의 세로 띠가 된다. */
+      .trace-grid table { width: max-content; border-collapse: separate; border-spacing: 0; font-size: 12px; line-height: 1.45; }
+      .trace-grid th, .trace-grid td {
+        padding: 4px 10px; text-align: left; vertical-align: top; white-space: nowrap;
+        border-bottom: 1px solid var(--border); border-right: 1px solid var(--border);
+      }
+      /* 셀 값은 줄바꿈을 살려 보이되(pre-wrap) 한 셀이 표 전체를 끌고 가지 않게 폭을 묶는다 —
+         200자짜리 텍스트 열 하나가 나머지 열을 화면 밖으로 밀어내지 않도록. 폭 제한이 td가 아니라
+         안쪽 상자에 있는 이유: 자동 표 배치는 셀의 max-width를 지킨다는 보장이 없다.
+         anywhere가 아니라 break-word인 이유는 위와 같다 — break-word는 열의 최소 폭 계산에 끼어들지 않아
+         긴 단어가 있을 때만 그 자리에서 접힌다. */
+      .trace-grid .cell { max-width: 24rem; white-space: pre-wrap; word-break: normal; overflow-wrap: break-word; }
+      .trace-grid th { position: sticky; top: 0; z-index: 1; background: #f1f3fb; font-weight: 600; color: var(--text); }
+      .trace-grid tr > :last-child { border-right: 0; }
+      .trace-grid tbody tr:last-child td { border-bottom: 0; }
+      /* 행 번호 열은 가로로 스크롤해도 붙어 있다 — 열이 많은 표에서 몇 번째 행을 보고 있는지 놓치지 않게. */
+      .trace-grid .idx {
+        position: sticky; left: 0; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums;
+        background: var(--surface);
+      }
+      .trace-grid th.idx { z-index: 2; background: #f1f3fb; }
+      .trace-grid td.num { text-align: right; font-variant-numeric: tabular-nums; }
+      /* 종이에서만 보이는 한 줄 — 인쇄된 표가 잘려 보이는 이유와 전체를 가져가는 길을 알려 준다 */
+      .trace-print-note { display: none; font-size: 11px; color: var(--muted); margin: 4px 0 0; }
+
+      /* ===== 타이핑 인디케이터 ===== */
+      .typing { display: flex; gap: 5px; padding: 6px 2px; }
+      .typing i {
+        width: 7px; height: 7px; border-radius: 50%; background: #a5b4fc;
+        animation: blink 1.2s infinite;
+      }
+      .typing i:nth-child(2) { animation-delay: 0.2s; }
+      .typing i:nth-child(3) { animation-delay: 0.4s; }
+      @keyframes blink { 0%, 70%, 100% { opacity: 0.25; transform: none; } 35% { opacity: 1; transform: translateY(-3px); } }
+
+      /* 답을 기다리는 동안의 진행 줄 (App.jsx ProgressList) — 타이핑 점 아래에 선다.
+         아직 안 끝난 줄은 뒤에 점을 깜빡여 '진행 중'을 말한다(글자로 적으면 끝난 줄과 시작 글자가 같아 구분이 안 된다). */
+      .progress { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+      .progress li { display: flex; gap: 6px; align-items: baseline; overflow-wrap: anywhere; }
+      .progress li.pending .progress-text::after { content: ' …'; animation: blink-fade 1.2s infinite; }
+      /* 검색 항목은 표가 없는 한 줄이다 — 머리띠 아래 경계선을 두지 않는다 */
+      .trace-search .trace-head { border-bottom: 0; }
+      /* 화면에는 없고 보조기술에만 있는 한 줄 (App.jsx의 role="status"). display:none·visibility:hidden은
+         접근성 트리에서도 빠져 아무것도 읽히지 않으므로 쓸 수 없다 — 1px 상자로 접어 두고 잘라낸다.
+         white-space: nowrap이 없으면 1px 폭 안에서 글자마다 줄이 바뀌어 일부 화면낭독기가 세로로 읽는다. */
+      .sr-only {
+        position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+        overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0;
+      }
+
+      /* 답변 미리보기 (App.jsx) — 아직 오는 중인 글자라 조금 흐리게. 답이 오면 정식 말풍선이 그 자리를 대신한다. */
+      .preview { margin-top: 8px; opacity: 0.8; }
+      .preview-raw { margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; opacity: 0.8; }
+      .stopped-note { margin: 10px 0 0; color: var(--muted); font-size: 12px; font-style: italic; }
+
+      /* ===== 입력창 ===== */
+      .composer-wrap { padding: 12px 20px 20px; }
+      .composer {
+        /* 여러 줄로 자란 뒤에도 보내기 단추는 맨 아래 줄에 붙어 있게 한다(center면 가운데로 떠오른다). */
+        display: flex; align-items: flex-end; gap: 8px;
+        width: 100%; max-width: 1024px; margin: 0 auto;
+        background: var(--surface); border: 1px solid var(--border);
+        /* 999px(알약)이 아닌 이유: 여러 줄로 자라면 그 곡률이 상자 높이의 절반까지 커져
+           입력창이 타원처럼 보인다. 한 줄일 때의 모습은 이 값으로도 거의 같다(높이 54px → 곡률 27px). */
+        border-radius: 24px; padding: 6px 6px 6px 20px;
+        box-shadow: 0 8px 30px rgba(16, 24, 40, 0.09);
+        transition: border-color 0.15s ease, box-shadow 0.15s ease;
+      }
+      .composer:focus-within { border-color: var(--accent); box-shadow: 0 8px 30px rgba(79, 70, 229, 0.18); }
+      .composer textarea {
+        flex: 1; border: none; outline: none; background: transparent;
+        font-size: 14.5px; color: var(--text); font-family: inherit;
+        /* 높이는 App.jsx가 내용에 맞춰 직접 준다. 여기서 정하는 것은 한 줄일 때의 크기(padding+line-height로
+           보내기 단추와 같은 42px)와 여기까지만 자란다는 한계뿐이다. 그 뒤로는 안에서 스크롤된다. */
+        /* overflow-y는 App.jsx가 max-height에 걸렸을 때만 auto로 바꾼다 — 여기서는 꺼 둔다. */
+        /* 여러 줄 초안이 창을 잠식하지 못하게 한다. 160px은 큰 창에서의 상한이고, 낮은 창에서는
+           40vh가 먼저 걸린다 — 그러지 않으면 높이 260px 창에서 입력창(206px)과 헤더(69px)가 창보다
+           높아져 대화가 0px으로 눌리고, 220px에서는 전송 단추가 창 밖으로 나가 보낼 수조차 없었다.
+           휴대폰에서는 dvh를 쓴다: vh는 주소창이 보일 때도 '숨겨졌을 때의 높이'라, 실제로 보이는
+           높이보다 크게 잡혀 낮은 화면에서 상한 노릇을 하지 못한다. dvh를 모르는 브라우저는 앞 줄의
+           vh를 그대로 쓴다(뒷 줄을 통째로 버린다). */
+        line-height: 1.5; padding: 10px 0; max-height: min(160px, 40vh); overflow-y: hidden;
+        max-height: min(160px, 40dvh);
+        /* 높이가 자동이므로 사용자가 끄트머리를 끌어 늘리는 손잡이는 거짓말이 된다 — 없앤다. */
+        resize: none;
+      }
+      .composer textarea::placeholder { color: #9aa4bd; }
+      .send {
+        width: 42px; height: 42px; border-radius: 50%; border: none; flex-shrink: 0;
+        background: var(--grad); color: #fff; font-size: 17px; cursor: pointer;
+        display: flex; align-items: center; justify-content: center;
+        box-shadow: 0 4px 12px rgba(79, 70, 229, 0.35);
+        transition: transform 0.12s ease, opacity 0.15s ease;
+      }
+      .send:hover:not(:disabled) { transform: scale(1.06); }
+      .send:disabled { opacity: 0.35; cursor: default; box-shadow: none; }
+      .stop-icon { width: 13px; height: 13px; border-radius: 3px; background: currentColor; }
+
+      /* ===== 동작 줄이기 =====
+         OS에서 '동작 줄이기'를 켠 사람에게 움직임은 취향이 아니라 멀미다(전정 장애). 여기서는 자리를
+         옮기는 것만 걷어낸다 — 새 말풍선이 아래에서 밀려 올라오는 것, 점이 튀는 것, 버튼이 들리는 것.
+         기다리는 중이라는 깜빡임은 투명도만 남겨 둔다: 아예 멈추면 멈춘 화면과 구별되지 않는다.
+         대화를 따라가는 스크롤은 CSS가 아니라 App.jsx의 glide가 같은 질문을 하고 한 번에 놓는다. */
+      @media (prefers-reduced-motion: reduce) {
+        .bubble { animation: none; }
+        .typing i { animation-name: blink-fade; }
+        .home-btn:hover:not(:disabled), .chip:hover { transform: none; }
+        .send:hover:not(:disabled) { transform: none; }
+      }
+      @keyframes blink-fade { 0%, 70%, 100% { opacity: 0.25; } 35% { opacity: 1; } }
+
+      /* ===== 인쇄 =====
+         이 화면은 창 높이에 붙박인 껍데기고 대화는 그 안에서만 스크롤된다 — 그대로 인쇄하면 브라우저는
+         껍데기 한 장, 곧 지금 보이는 한 화면만 찍고 나머지(8,000px짜리 대화가 A4 한 장이 된다) 버린다.
+         인쇄할 때만 껍데기를 풀어 문서가 제 길이를 갖게 한다. 입력창·홈 단추는 종이에서 할 일이 없고,
+         표의 높이 상한(55vh)도 종이에서는 행을 자르는 일만 하므로 푼다. 접어 둔 것은 접힌 채로 둔다 —
+         보이는 대로 찍히는 것이 인쇄다. */
+      @media print {
+        html, body, #root, .app { height: auto; overflow: visible; }
+        .app { display: block; }
+        .chat { overflow: visible; flex: none; isolation: auto; scrollbar-gutter: auto; }
+        .chat-inner { max-width: 100%; padding: 0; }
+        .composer-wrap, .home-btn, .trace-csv { display: none; }
+        .header { position: static; }
+        .bubble { max-width: 100%; box-shadow: none; animation: none; }
+        /* 표만은 상한을 그대로 둔다. 조회 결과는 200행·1000행이 예사라, 상한을 풀면 대화 하나가 수십
+           쪽이 되고 Chrome의 쪽 나누기가 1,000행을 넘기면서 몇 분씩 멎는다(2답=800행 1.3초, 3답=1,200행
+           40초에도 못 끝냄). 그래서 표는 화면에 보이는 만큼만 찍고, 전체는 CSV로 가져가라고 적어 준다
+           (.trace-print-note). overflow만 hidden으로 바꾸는 것은 종이에 스크롤바를 그리지 않기 위함이다. */
+        .trace-grid { overflow: hidden; }
+        .trace-print-note { display: block; }
+        .md .chart { break-inside: avoid; }
+        /* 종이에는 가로 스크롤이 없다 — 코드는 접어서 보여 준다 */
+        .md pre { white-space: pre-wrap; overflow: visible; }
+        .md .katex.math-scroll { max-width: none; overflow: visible; padding: 0;
+          zoom: var(--math-print-scale, 1); }
+        /* 답변 안의 표도 같다. 화면에서는 넓은 표를 가로 스크롤(.md table의 overflow-x)로 가두는데,
+           종이에서 그것은 '오른쪽을 그냥 버린다'가 된다 — 그러고도 아무 표시가 남지 않는다
+           (실측: 열 14개짜리 표의 오른쪽 587px이 인쇄물에서 사라졌다). 조회 결과 표(.trace-grid)는
+           잘린다는 것을 안내로 밝히고 전체를 CSV로 넘기지만, 답변 안의 표에는 그런 출구가 없다 —
+           여기서 잘린 값은 어디에서도 볼 수 없다. 그래서 코드와 같은 처방으로 셀을 접어 폭 안에 들인다
+           (nowrap은 화면에서 열이 한 글자 폭으로 접히지 않게 하려는 것이라 종이에서는 할 일이 없다).
+           .trace-grid의 셀은 .md 밖이라 이 규칙에 닿지 않는다 — 그쪽은 지금처럼 안내로 밝힌다. */
+        .md table { overflow-x: visible; }
+        .md th, .md td { white-space: normal; }
+        /* 흐름도도 마찬가지다. 좁은 창에서는 글자가 읽히도록 SVG에 최소 폭을 인라인으로 걸어 두는데
+           (Mermaid.jsx), 인쇄에는 ResizeObserver가 돌지 않아 그 값이 그대로 남는다 — 종이에서는
+           스크롤로 볼 수 없으니 오른쪽이 그냥 잘린다. 인라인 값을 덮으려면 !important여야 한다. */
+        .md .mermaid { overflow: visible; }
+        .md .mermaid svg { min-width: 0 !important; }
+      }
+
+      /* ===== 좁은 화면 ===== (앞의 .bubble·.chat-inner를 덮으므로 그 뒤에 온다) */
+      @media (max-width: 480px) {
+        .chat-inner { padding: 16px 12px 8px; }
+        .bubble { padding: 12px 13px; }
+        .bubble.assistant { max-width: 100%; }
+        .bubble.user { max-width: 88%; }
+      }
+      /* 이보다 좁아지면 입력창 안내문이 두 줄로 감긴다(실측: 창 344px까지는 한 줄, 340px부터 두 줄).
+         상자 높이는 '들어 있는 글'로 정해지는데 안내문은 글이 아니라서 한 줄 높이에 잘린다 —
+         폭 320px에서 아랫줄 22px이 잘려 '줄바꿈)'만 반쯤 보였다. 빈 상자만 두 줄로 열어 둔다
+         (글을 넣으면 App.jsx의 fitInput이 그때부터 재고, min-height는 그 위에서 바닥만 잡는다). */
+      @media (max-width: 343px) {
+        /* 창이 아주 낮으면 이 바닥이 위의 max-height(40dvh)를 밀어낸다 — min-height가 늘 이긴다.
+           두 줄을 여는 것은 안내문이 감기기 때문이지 자리를 뺏자는 것이 아니므로 상한에 맞춰 접는다. */
+        .composer textarea { min-height: min(64px, 40vh); min-height: min(64px, 40dvh); }
+      }

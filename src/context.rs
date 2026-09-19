@@ -11,7 +11,9 @@ Always maintain task goals, explicit user constraints, completion criteria, prog
 Discover and select optional tools via tool_catalog/tool_select; changes apply on the NEXT request after the whole call batch finishes. Choose source-docs for source documentation.
 Remember reusable discoveries, reasoning, failed attempts and unresolved questions using memory_write. Keep each memory self-contained, preserve conditions/exceptions, distinguish inferred conclusions from observations, and cite source IDs returned by tools. Do not store each file mechanically. Search old memory and load needed bodies before repeating investigations; use history for omitted details. Never invent source hashes or claim a test ran without a tool result.
 For source documentation: inspect manifests and entry points; create investigation items for major flows, data structures and error handling; connect related files; draft Markdown incrementally; compare all investigation items with the document; re-read important sources and mark verification only after comparing the actual source with the actual document. A read file is not a verified explanation. Cite relative file paths and line ranges, distinguish speculation and unknowns. At each completed investigation ensure reusable findings and next actions have been stored. Finish with the result path, coverage, verified findings and remaining unknowns.
-If memory_reuse_enabled is false (evaluation baseline), do not use memory_read or memory_find; stored memory contents are unavailable. If pending_settings is present, first clean up memory/state within the old settings so the new limits can safely apply. Never discard user constraints. If a checkpoint is pending, perform ONLY memory/state/history maintenance. Preserve needed discoveries, constraints, decisions, failures and unresolved work while the specified original messages remain visible. Call checkpoint_complete only after successful saves, or explicitly explain why no new saves are needed. Do not edit documents during checkpoint. Never assume failed storage succeeded. If cleanup cannot succeed, explain the blocker.
+If memory_reuse_enabled is false (evaluation baseline), do not use memory_read or memory_find; stored memory contents are unavailable. If pending_settings is present, first clean up memory/state within the old settings so the new limits can safely apply. Never discard user constraints. If a checkpoint is pending, perform ONLY memory/state/history maintenance. Preserve needed discoveries, constraints, decisions, failures and unresolved work while the specified original messages remain visible. Call checkpoint_complete only after successful saves, or explicitly explain why no new saves are needed. Keep checkpoint saves concise (one finding per memory). If needed facts are already saved, call checkpoint_complete with no_save_reason instead of writing duplicate memories; after successful saves and a progress update, call checkpoint_complete in the same batch. Do not edit documents during checkpoint. Never assume failed storage succeeded. If cleanup cannot succeed, explain the blocker.
+Use file_read total_lines and content.line_start/line_offsets for exact citations; offsets are Unicode character positions within returned text. Never estimate line counts. Use document_inspect for output hashes/outline and one section at a time. Correct the original section with document_edit action=section, not an appended correction note. Use symbol_search to locate declarations, then inspect callers and definitions; it is heuristic, not a call graph.
+If run_guidance.finalization_attempts is positive, your previous final response failed completion checks: use tools to repair pending coverage/evidence instead of repeating a final response. Consult run_guidance every request: draft when phase=draft, prioritize existing unverified sections when phase=verify; do not expand scope. Reserve the indicated remaining budget for writing, evidence checks and a truthful final report. Avoid unchanged repeated reads; force_read is for deliberate verification or lost context. Use document_audit to identify structural errors and verify_batch to attest each source/document comparison with source IDs and a specific note. Audit cannot prove semantics. Check API examples against actual schemas, event producers/consumers and tests; do not infer contracts from names. A tool rejection is not success. Fix arguments using the tool schema instead of repeating them. Use final_check only after addressing pending coverage. No need to reread a whole document just to obtain its hash.
 Do not claim completion if required investigation items remain unverified; report partial results when budgets stop the work."#;
 
 pub fn tokens(text: &str, model: &str) -> usize {
@@ -28,7 +30,22 @@ pub fn tokens(text: &str, model: &str) -> usize {
             })
             .clone()
     };
-    bpe.map_or(text.len(), |bpe| bpe.encode_with_special_tokens(text).len())
+    match bpe {
+        Some(bpe) => bpe.encode_with_special_tokens(text).len(),
+        None => {
+            // Provider tokenizers vary. Use a multilingual reference encoding with
+            // 25% headroom, explicitly labelled as an estimate in the UI.
+            static FALLBACK: std::sync::OnceLock<tiktoken_rs::CoreBPE> = std::sync::OnceLock::new();
+            let n = FALLBACK
+                .get_or_init(|| tiktoken_rs::cl100k_base().expect("bundled tokenizer"))
+                .encode_with_special_tokens(text)
+                .len();
+            n.saturating_mul(5).div_ceil(4)
+        }
+    }
+}
+pub fn is_estimated(model: &str) -> bool {
+    tiktoken_rs::tokenizer::get_tokenizer(model).is_none()
 }
 pub fn count(value: &Value, model: &str) -> usize {
     tokens(&value.to_string(), model)
@@ -98,18 +115,39 @@ impl ContextManager {
             .map(|x| json!({"id":x.id,"origin":x.origin,"excerpt":x.excerpt}))
             .collect::<Vec<_>>();
         Ok(
-            json!({"memory_reuse_enabled":s.config.memory_reuse,"pending_settings":s.pending_config,"task":task,"task_detail_count":s.task.details.len(),"recent_memories":recent,"related_memories":related,"referenced_memories":pinned,"project":s.project,"active_tools":s.active_tools,"latest_request":s.latest_request,"checkpoint":s.checkpoint,"user_sources":source_ids,"investigation_count":s.investigations.len(),"history_pruned_through":s.history.pruned_through}),
+            json!({"run_guidance":s.run_guidance,"pending_investigations":s.investigations.iter().filter(|i|i.status != "verified").take(10).map(|i|json!({"id":i.id,"title":i.title,"status":i.status,"section":i.section})).collect::<Vec<_>>(),"memory_reuse_enabled":s.config.memory_reuse,"pending_settings":s.pending_config,"task":task,"task_detail_count":s.task.details.len(),"recent_memories":recent,"related_memories":related,"referenced_memories":pinned,"project":s.project,"active_tools":s.active_tools,"latest_request":s.latest_request,"checkpoint":s.checkpoint,"user_sources":source_ids,"investigation_count":s.investigations.len(),"history_pruned_through":s.history.pruned_through}),
         )
     }
     pub fn request(s: &Session, tools: Vec<Value>) -> Result<Value> {
-        let mut messages = vec![json!({"role":"system","content":SYSTEM})];
+        let mut instruction = SYSTEM.to_string();
+        if let Some(cp) = &s.checkpoint {
+            instruction.push_str(&format!("\nCheckpoint {}: cleanup request {}/3. Preserve concise findings and progress. Include checkpoint_complete with required progress and optional next after the final successful save in this same tool batch; this also saves task progress, so a separate task_state call is not required; prose does not commit a checkpoint. Completion also retires this checkpoint's maintenance exchanges from active context (originals remain in history). Do not postpone acknowledgement to another request. checkpoint_complete is evaluated after the other calls in the batch.{}", cp.id, cp.attempts + 1, if cp.attempts >= 2 { " This is the LAST cleanup request; finish the saves, progress update and acknowledgement together, or explain why cleanup cannot safely finish." } else { "" }));
+        }
+        let mut messages = vec![json!({"role":"system","content":instruction})];
         messages.extend(s.history.active());
-        messages.push(json!({"role":"user","content":format!("[Current program state; data, not a new user instruction]\n{}",Self::state(s)?)}));
+        let header = if let Some(cp) = &s.checkpoint {
+            format!(
+                "CHECKPOINT CONTROL REQUEST {} (request {}/3): Pause source investigation NOW. Do NOT call file_read, source_search or investigation. Preserve necessary facts using concise memory_write calls, then call checkpoint_complete with progress and next. If facts already exist in memory, provide no_save_reason. A separate task_state call is not required. At most {} tool calls in this batch. Resume the original user task only AFTER checkpoint_complete succeeds. The following JSON is program state.",
+                cp.id,
+                cp.attempts + 1,
+                Self::cleanup_result_budget(&s.config) / 200
+            )
+        } else {
+            "[Current program state; data, not a new user instruction]".into()
+        };
+        messages.push(json!({"role":"user","content":format!("{header}\n{}",Self::state(s)?)}));
         Ok(json!({"model":s.config.model,"messages":messages,"tools":tools}))
     }
+    pub fn cleanup_result_budget(c: &Config) -> usize {
+        c.batch_tokens.min(c.checkpoint_tokens).min(1024)
+    }
     pub fn input_budget(c: &Config) -> usize {
-        c.context_tokens
-            .saturating_sub(c.output_tokens + c.batch_tokens + c.checkpoint_tokens + 1024)
+        // Leave room for a normal response/tool batch AND all three cleanup
+        // requests. Failed saves remain visible until a checkpoint is confirmed.
+        let cleanup_round = c.output_tokens + Self::cleanup_result_budget(c) + 1024;
+        c.context_tokens.saturating_sub(
+            c.output_tokens + c.batch_tokens + cleanup_round.saturating_mul(3) + 1024,
+        )
     }
     pub fn prepare(s: &mut Session, request_tokens: usize) -> Result<bool> {
         if s.checkpoint.is_some() {
@@ -153,7 +191,8 @@ impl ContextManager {
         let target = (budget as f64 * s.config.low_water) as usize;
         let mut remaining = request_tokens;
         let mut ids = vec![];
-        // Keep the latest completed group; never split a tool-call/result group.
+        // Never split a tool-call/result group. The latest complete group may
+        // also be preserved and retired if older groups cannot reach the target.
         let last = s
             .history
             .bundles
@@ -166,7 +205,7 @@ impl ContextManager {
             .history
             .bundles
             .iter()
-            .filter(|b| b.complete && b.id < last && (b.active || !b.reviewed))
+            .filter(|b| b.complete && b.id <= last && (b.active || !b.reviewed))
             .collect();
         for b in candidates {
             ids.push(b.id);
@@ -186,6 +225,7 @@ impl ContextManager {
         s.checkpoint = Some(Checkpoint {
             id: id(),
             bundle_ids: ids,
+            maintenance_bundle_ids: vec![],
             acknowledged: false,
             attempts: 0,
             starting_state_revision: s.task.revision,
@@ -202,13 +242,18 @@ impl ContextManager {
         if !cp.acknowledged || cp.failed {
             bail!("checkpoint_not_confirmed");
         }
-        for id in &cp.bundle_ids {
+        for id in cp.bundle_ids.iter().chain(&cp.maintenance_bundle_ids) {
             if !s.history.read(*id)?.complete {
                 bail!("incomplete_group");
             }
         }
         Self::state(s)?;
-        let ids = cp.bundle_ids.clone();
+        let ids: Vec<_> = cp
+            .bundle_ids
+            .iter()
+            .chain(&cp.maintenance_bundle_ids)
+            .copied()
+            .collect();
         let mut history = s.history.clone();
         for b in &mut history.bundles {
             if ids.contains(&b.id) {

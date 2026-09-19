@@ -173,8 +173,12 @@ impl MemoryStore {
             updated_at: now,
         };
         // Enforce the same per-entry token reservation used by configuration validation.
-        if crate::context::count(&serde_json::to_value(m.meta())?, &config.model) > 160 {
-            bail!("memory_metadata_limit: shorten title/summary/tags (160 counted tokens)");
+        let metadata_tokens =
+            crate::context::count(&serde_json::to_value(m.meta())?, &config.model);
+        if metadata_tokens > 160 {
+            bail!(
+                "memory_metadata_limit: metadata uses {metadata_tokens}/160 estimated tokens including ID/key/JSON; shorten key/title/summary/tags, keep details in body"
+            );
         }
         let next_bytes = self.bytes().saturating_sub(
             old.as_ref()

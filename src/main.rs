@@ -17,8 +17,16 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Open the terminal UI (also the default).
-    Tui,
+    /// Serve the React browser UI and local agent API (also the default).
+    Web {
+        #[arg(long, default_value_t = 3030)]
+        port: u16,
+        #[arg(long, default_value = "frontend/dist")]
+        frontend: PathBuf,
+        /// Shut down cleanly when the launcher closes its stdin pipe.
+        #[arg(long, hide = true)]
+        shutdown_on_stdin: bool,
+    },
     /// Print a full example configuration without credentials.
     Config,
     /// Verify plain response, streaming and tool-call round trip.
@@ -48,8 +56,19 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let config = Config::load(&cli.config, &BTreeMap::new())?;
-    match cli.command.unwrap_or(Command::Tui) {
-        Command::Tui => mnemoarc::ui::run(config, cli.config).await?,
+    match cli.command.unwrap_or(Command::Web {
+        port: 3030,
+        frontend: "frontend/dist".into(),
+        shutdown_on_stdin: false,
+    }) {
+        Command::Web {
+            port,
+            frontend,
+            shutdown_on_stdin,
+        } => {
+            mnemoarc::web::serve_managed(config, cli.config, port, frontend, shutdown_on_stdin)
+                .await?
+        }
         Command::Config => unreachable!(),
         Command::Check => println!("{}", mnemoarc::llm::OpenAiClient.probe(&config).await?),
         Command::Evaluate { suite, output } => {

@@ -5,9 +5,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Clone)]
+pub struct Secret(pub String);
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    #[serde(skip)]
+    pub api_key: Option<Secret>,
     pub base_url: String,
     pub model: String,
     pub api_key_env: String,
@@ -39,6 +48,10 @@ pub struct Config {
     pub run_timeout_secs: u64,
     pub run_tokens: usize,
     pub review_limit: usize,
+    pub writing_reserve_ratio: f64,
+    pub verification_reserve_ratio: f64,
+    pub repeated_read_limit: usize,
+    pub stall_round_limit: usize,
     pub projects: Vec<Project>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,6 +73,7 @@ impl Default for Project {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            api_key: None,
             base_url: "https://api.openai.com/v1".into(),
             model: String::new(),
             api_key_env: "OPENAI_API_KEY".into(),
@@ -90,6 +104,10 @@ impl Default for Config {
             retries: 2,
             run_timeout_secs: 1800,
             run_tokens: 500000,
+            writing_reserve_ratio: 0.5,
+            verification_reserve_ratio: 0.25,
+            repeated_read_limit: 2,
+            stall_round_limit: 8,
             review_limit: 3,
             projects: vec![],
         }
@@ -116,6 +134,15 @@ impl Config {
         {
             bail!("Context must leave space for input, output, tools and checkpoint");
         }
+        if self.checkpoint_tokens == 0 || crate::context::ContextManager::input_budget(self) < 4096
+        {
+            bail!(
+                "Context must reserve 4096 input tokens plus three cleanup rounds; reduce output/batch/checkpoint limits or increase context"
+            );
+        }
+        if self.result_tokens < 200 || self.batch_tokens < 200 || self.checkpoint_tokens < 200 {
+            bail!("Result, batch and checkpoint limits must be at least 200 tokens");
+        }
         if let Some(n) = self.model_context
             && self.context_tokens > n
         {
@@ -141,6 +168,19 @@ impl Config {
             || self.run_timeout_secs == 0
         {
             bail!("Limits must be positive");
+        }
+        if !self.writing_reserve_ratio.is_finite()
+            || !self.verification_reserve_ratio.is_finite()
+            || !(0.0..1.0).contains(&self.verification_reserve_ratio)
+            || self.verification_reserve_ratio == 0.0
+            || !(self.verification_reserve_ratio..1.0).contains(&self.writing_reserve_ratio)
+            || self.writing_reserve_ratio == self.verification_reserve_ratio
+            || self.repeated_read_limit == 0
+            || self.stall_round_limit == 0
+        {
+            bail!(
+                "Require 0 < verification reserve < writing reserve < 1 and positive repetition limits"
+            );
         }
         reqwest::Url::parse(&self.base_url)?;
         Ok(())

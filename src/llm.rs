@@ -85,14 +85,22 @@ impl OpenAiClient {
         }
         Ok(b.build()?)
     }
+    pub fn has_key(c: &Config) -> bool {
+        Self::key(c).is_some()
+    }
     fn key(c: &Config) -> Option<String> {
-        std::env::var(&c.api_key_env).ok().or_else(|| {
-            dotenvy::from_path_iter(".env")
-                .ok()?
-                .filter_map(Result::ok)
-                .find(|(k, _)| k == &c.api_key_env)
-                .map(|(_, v)| v)
-        })
+        c.api_key
+            .as_ref()
+            .map(|s| s.0.clone())
+            .or_else(|| std::env::var(&c.api_key_env).ok())
+            .or_else(|| {
+                dotenvy::from_path_iter(".env")
+                    .ok()?
+                    .filter_map(Result::ok)
+                    .find(|(k, _)| k == &c.api_key_env)
+                    .map(|(_, v)| v)
+            })
+            .filter(|value| !value.trim().is_empty())
     }
     async fn attempt(
         &self,

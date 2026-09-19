@@ -10,12 +10,10 @@ anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-crossterm = { version = "0.29", features = ["event-stream"] }
 dotenvy = "0.15"
 futures-util = "0.3"
 globset = "0.4"
 ignore = "0.4"
-ratatui = "0.30"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -28,5 +26,5 @@ tokio-util = "0.7"
 toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
 
-[dev-dependencies]
 axum = "0.8"
+tower-http = { version = "0.6", features = ["fs"] }

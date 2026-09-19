@@ -170,7 +170,7 @@ fn checkpoint_three_cycles_preserve_memory_and_whole_tool_bundles() {
         tools::execute(
             &mut s,
             "checkpoint_complete",
-            json!({"id":cp,"no_save_reason":"All required facts already stored"}),
+            json!({"id":cp,"progress":"Saved facts and preserved next steps","no_save_reason":"All required facts already stored"}),
         )
         .unwrap();
         ContextManager::commit(&mut s).unwrap();
@@ -208,7 +208,7 @@ fn failed_checkpoint_tool_cannot_acknowledge() {
         tools::execute(
             &mut s,
             "checkpoint_complete",
-            json!({"id":cp,"no_save_reason":"skip"})
+            json!({"id":cp,"progress":"Saved facts and preserved next steps","no_save_reason":"skip"})
         )
         .is_err()
     );
@@ -338,7 +338,7 @@ fn unicode_truncation_is_safe() {
     let s = "한국어🦀".repeat(500);
     let (part, cut) = context::truncate(&s, 100, "unknown-model");
     assert!(cut);
-    assert!(part.len() <= 100);
+    assert!(context::tokens(&part, "unknown-model") <= 100);
     assert!(s.starts_with(&part));
 }
 
@@ -359,6 +359,8 @@ fn history_pruning_and_checkpoint_capacity_failure_are_atomic() {
     s.config.history_bytes = 1;
     ContextManager::prepare(&mut s, 60000).unwrap();
     s.checkpoint.as_mut().unwrap().acknowledged = true;
+    // Work added after preparation has not been approved for removal.
+    s.add_user("Unconfirmed new work".into());
     let before = serde_json::to_value(&s.history.bundles).unwrap();
     assert!(ContextManager::commit(&mut s).is_err());
     assert_eq!(before, serde_json::to_value(&s.history.bundles).unwrap());
@@ -397,4 +399,149 @@ fn history_pressure_selects_enough_groups_even_when_context_is_small() {
     ContextManager::commit(&mut s).unwrap();
     assert!(s.history.bytes() <= s.config.history_bytes);
     assert!(s.history.bundles.back().unwrap().active);
+}
+
+#[test]
+fn unknown_model_can_store_korean_metadata_and_budget_twenty_memories() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.config.model = "z-ai/glm-5.3-flash".into();
+    assert!(context::is_estimated(&s.config.model));
+    for i in 0..20 {
+        let mut item = input(
+            &format!("flow-{i}"),
+            "실패한 접근과 다음 조사 항목을 보존합니다.",
+            None,
+        );
+        item.title = "주요 실행 흐름".into();
+        item.summary = "요청 검증 후 에이전트를 실행하고 오류를 반환한다.".into();
+        s.memory.save(item, vec![], &s.config).unwrap();
+    }
+    let state = ContextManager::state(&s).unwrap();
+    assert_eq!(state["recent_memories"].as_array().unwrap().len(), 20);
+    let sample = "한국어 구조와 오류 처리".repeat(20);
+    let estimate = context::tokens(&sample, &s.config.model);
+    assert!(estimate < sample.len());
+    let baseline = tiktoken_rs::cl100k_base()
+        .unwrap()
+        .encode_with_special_tokens(&sample)
+        .len();
+    assert_eq!(estimate, (baseline * 5).div_ceil(4));
+}
+
+#[test]
+fn bounded_file_results_keep_sources_offsets_and_fit_serialized_message_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = "const value = \"한국어 \\\\ 경로\"; // 근거\n".repeat(120);
+    std::fs::write(dir.path().join("main.js"), &text).unwrap();
+    let mut s = session(dir.path());
+    s.config.model = "z-ai/glm-5.3-flash".into();
+    s.config.result_tokens = 1200;
+    s.active_tools.insert("file_read".into());
+    let call = mnemoarc::llm::ToolCall {
+        id: "file-1".into(),
+        name: "file_read".into(),
+        arguments: json!({"path":"main.js","max_lines":120}).to_string(),
+    };
+    let output = tools::run_call(&mut s, &call);
+    assert_eq!(output["status"], "ok");
+    assert!(tools::result_tokens(&call, &output, &s.config.model) <= 1200);
+    let reduced = tools::limit_result(&mut s, &call, output, 600);
+    assert!(tools::result_tokens(&call, &reduced, &s.config.model) <= 600);
+    assert!(reduced["data"]["preview"].is_null());
+    let archive_count = s.history.bundles.len();
+    let twice = tools::limit_result(&mut s, &call, reduced.clone(), 400);
+    assert!(tools::result_tokens(&call, &twice, &s.config.model) <= 400);
+    assert_eq!(s.history.bundles.len(), archive_count);
+
+    assert!(reduced["data"]["source"]["id"].is_string(), "{reduced}");
+    let shown = reduced["data"]["content"]["text"].as_str().unwrap();
+    assert!(!shown.is_empty());
+    assert!(text.starts_with(shown));
+    assert_eq!(reduced["data"]["next_offset"], shown.chars().count());
+    let next = mnemoarc::llm::ToolCall {
+        id: "file-2".into(),
+        name: "file_read".into(),
+        arguments:
+            json!({"path":"main.js","max_lines":120,"offset":reduced["data"]["next_offset"]})
+                .to_string(),
+    };
+    let continuation = tools::run_call(&mut s, &next);
+    let combined = format!(
+        "{}{}",
+        shown,
+        continuation["data"]["content"]["text"].as_str().unwrap()
+    );
+    assert!(text.starts_with(&combined));
+}
+
+#[test]
+fn history_continuations_do_not_recursively_archive_previews() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.config.model = "unknown-model".into();
+    s.config.result_tokens = 500;
+    let id = s.history.push(
+        vec![json!({"role":"tool_archive","result":{"text":"\\\"한국어\\\"\n".repeat(400)}})],
+        true,
+    );
+    s.history.bundles.back_mut().unwrap().active = false;
+    let original = serde_json::to_string(&s.history.read(id).unwrap().messages).unwrap();
+    let mut joined = String::new();
+    let mut offset = 0;
+    for index in 0..100 {
+        let call = mnemoarc::llm::ToolCall {
+            id: format!("page-{index}"),
+            name: "history".into(),
+            arguments: json!({"action":"read","id":id,"offset":offset}).to_string(),
+        };
+        let output = tools::run_call(&mut s, &call);
+        assert!(tools::result_tokens(&call, &output, &s.config.model) <= 500);
+        let chunk = output["data"]["text"].as_str().unwrap();
+        joined.push_str(chunk);
+        if !output["data"]["truncated"].as_bool().unwrap() {
+            break;
+        }
+        let next = output["data"]["next_offset"].as_u64().unwrap();
+        assert!(next > offset);
+        offset = next;
+    }
+    assert_eq!(joined, original);
+    assert_eq!(s.history.bundles.len(), 1);
+}
+
+#[test]
+fn checkpoint_cannot_execute_hidden_source_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.active_tools.insert("file_read".into());
+    s.add_user("Keep constraints".into());
+    s.add_user("Latest work".into());
+    ContextManager::prepare(&mut s, 60000).unwrap();
+    let error = tools::execute(&mut s, "file_read", json!({"path":"main.rs"})).unwrap_err();
+    assert!(error.to_string().contains("checkpoint_pending"));
+}
+
+#[test]
+fn compatible_tool_integer_strings_are_normalized_without_loose_coercion() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.rs"), "first\nsecond\nthird\n").unwrap();
+    let mut s = session(dir.path());
+    s.active_tools.insert("file_read".into());
+    let value = tools::execute(
+        &mut s,
+        "file_read",
+        json!({"path":"main.rs","start_line":"2","max_lines":"1","offset":"0"}),
+    )
+    .unwrap();
+    assert_eq!(value["content"]["text"], "second");
+    for invalid in ["-1", "2.5", "1e2", " 2", "18446744073709551616", ""] {
+        let err = tools::execute(
+            &mut s,
+            "file_read",
+            json!({"path":"main.rs","start_line":invalid}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid_argument_type"));
+    }
 }

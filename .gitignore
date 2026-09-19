@@ -5,3 +5,9 @@ config.toml
 /eval/fixtures/*/target
 
 .DS_Store
+/node_modules
+/frontend/node_modules
+/frontend/dist
+*.credentials.json
+/frontend/test-artifacts
+/.mnemoarc

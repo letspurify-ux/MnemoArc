@@ -122,6 +122,8 @@ impl SessionHistory {
 pub struct Checkpoint {
     pub id: String,
     pub bundle_ids: Vec<u64>,
+    #[serde(default)]
+    pub maintenance_bundle_ids: Vec<u64>,
     pub acknowledged: bool,
     pub attempts: usize,
     pub starting_state_revision: u64,
@@ -155,6 +157,7 @@ pub struct Session {
     pub history_loads: usize,
     pub document_written: bool,
     pub last_error: Option<String>,
+    pub run_guidance: Value,
 }
 impl Session {
     pub fn new(project: Project, config: Config) -> Self {
@@ -190,6 +193,7 @@ impl Session {
             history_loads: 0,
             document_written: false,
             last_error: None,
+            run_guidance: json!({}),
         }
     }
     pub fn protected(&self) -> BTreeSet<String> {

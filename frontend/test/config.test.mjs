@@ -1,0 +1,45 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { fieldKeys, parseValue, inputValue } from "../src/fields.js";
+import {
+  linkTarget,
+  imageTarget,
+  mdUrlTransform,
+} from "../src/chat/markdown.js";
+import { parseChartBlock, sliceSafe } from "../src/chat/chart.js";
+
+test("every public Rust setting has a UI editor", async () => {
+  const code = await readFile(
+    new URL("../../src/config.rs", import.meta.url),
+    "utf8",
+  );
+  const block = code.split("pub struct Config {")[1].split("\n}")[0];
+  const keys = [...block.matchAll(/pub (\w+):/g)]
+    .map((m) => m[1])
+    .filter((k) => k !== "api_key");
+  assert.deepEqual([...fieldKeys, "projects"].sort(), keys.sort());
+  assert.equal(new Set(fieldKeys).size, fieldKeys.length);
+});
+test("UI units and optional values round trip without silent zeroes", () => {
+  for (const [value, type] of [
+    [16777216, "mib"],
+    [8192, "kib"],
+    [0.8, "percent"],
+    [64000, "number"],
+  ]) {
+    assert.equal(parseValue(inputValue(value, type), type), value);
+  }
+  assert.equal(parseValue("", "optionalNumber"), null);
+  assert.equal(parseValue("", "number"), "");
+  assert.equal(parseValue("", "optional"), null);
+});
+test("reused chat preserves unicode and blocks executable links", () => {
+  assert.equal(sliceSafe("a😀b", 2), "a");
+  assert.equal(
+    linkTarget(mdUrlTransform("javascript:alert(1)", "href")).url,
+    "",
+  );
+  assert.notEqual(imageTarget("https://example.com/image.png").kind, "image");
+  assert.equal(parseChartBlock("not a chart").ok, false);
+});

@@ -1,3 +1,4 @@
+mod documentation;
 use crate::{
     config::Project,
     context::{self},
@@ -62,7 +63,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_write",
-                description: "Save one reusable memory. Same key requires expected_revision. Source IDs must come from program observations. Maximum metadata 160 tokens. kind: fact/decision/failure/question/procedure",
+                description: "Save one reusable memory. Same key requires expected_revision. Source IDs must come from program observations. Keep metadata very short (aim for 80 tokens; hard limit 160 including ID/key/JSON). Put details in body. kind: fact/decision/failure/question/procedure",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -119,10 +120,13 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "checkpoint_complete",
-                description: "Acknowledge pending checkpoint after successful memory/state saves, or with explicit nonempty no_save_reason; must supply exact checkpoint ID",
+                description: "Finish a checkpoint and save progress in ONE call. Required progress is a concise current/next-work summary. Save needed memories first, or explain no new memory is needed with no_save_reason. Evaluated after other calls in this batch.",
                 optional: false,
                 read_only: false,
-                parameters: schema(json!({"id":string(),"no_save_reason":string()}), &["id"]),
+                parameters: schema(
+                    json!({"id":string(),"progress":string(),"next":string(),"no_save_reason":string()}),
+                    &["id", "progress"],
+                ),
             },
             ToolSpec {
                 name: "file_list",
@@ -145,39 +149,82 @@ impl ToolRegistry {
                 ),
             },
             ToolSpec {
-                name: "file_read",
-                description: "Read project/output file by 1-based start_line and max_lines. Long-line continuation uses character offset. Returns source ID, file hash and next location",
+                name: "document_inspect",
+                description: "Read output metadata/hash/line count and paginated Markdown outline without loading full text. Supply section to read one unique heading, offset for continuation.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"path":string(),"start_line":number(),"max_lines":number(),"offset":number()}),
+                    json!({"section":string(),"offset":number(),"limit":number()}),
+                    &[],
+                ),
+            },
+            ToolSpec {
+                name: "symbol_search",
+                description: "Heuristic declaration search for JS/TS, Rust and Python (not LSP or references). Returns source lines and hashes; narrow pattern/query. Cursor expires on source changes.",
+                optional: true,
+                read_only: true,
+                parameters: schema(
+                    json!({"query":string(),"pattern":string(),"cursor":string(),"limit":number()}),
+                    &[],
+                ),
+            },
+            ToolSpec {
+                name: "document_audit",
+                description: "Check output citations path:line[-line], source freshness, section coverage and pending investigations in one call. Structural checks do NOT prove semantic correctness. Paginated issues.",
+                optional: true,
+                read_only: true,
+                parameters: schema(json!({"offset":number(),"limit":number()}), &[]),
+            },
+            ToolSpec {
+                name: "file_read",
+                description: "Read project/output file by 1-based start_line and max_lines. Continuation: copy returned next_line and next_offset together (offset is relative to start_line, NOT the whole file). Returns source ID, hash, total_lines and line_start/line_offsets for exact citations; repeated unchanged active-context reads are suppressed unless force_read=true",
+                optional: true,
+                read_only: true,
+                parameters: schema(
+                    json!({"path":string(),"start_line":number(),"max_lines":number(),"offset":number(),"force_read":{"type":"boolean"}}),
                     &["path"],
                 ),
             },
             ToolSpec {
                 name: "document_edit",
-                description: "Edit ONLY configured Markdown output: create, replace entire file, append, or unique exact text patch. Existing file requires expected_hash. Returns new hash",
+                description: "Edit ONLY configured Markdown output: create, replace entire file, append, or unique exact text patch. Existing file requires expected_hash. section replaces a unique full heading section and also requires expected_section_hash. Returns measured lines and new hash",
                 optional: true,
                 read_only: false,
                 parameters: schema(
-                    json!({"action":action(&["create","write","append","patch"]),"text":string(),"old_text":string(),"expected_hash":string()}),
+                    json!({"action":action(&["create","write","append","patch","section"]),"text":string(),"old_text":string(),"expected_hash":string(),"section":string(),"expected_section_hash":string()}),
                     &["action", "text"],
                 ),
             },
             ToolSpec {
                 name: "investigation",
-                description: "Manage source documentation items. Actions list/upsert/verify/final_check. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. section is a unique Markdown heading",
+                description: "Manage source documentation items. Actions list/upsert/verify/verify_batch/final_check. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified and failures reported. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. section is a unique Markdown heading",
                 optional: true,
                 read_only: false,
                 parameters: schema(
-                    json!({"action":action(&["list","upsert","verify","final_check"]),"id":string(),"title":string(),"status":action(&["uninvestigated","in_progress","written"]),"memory_ids":strings(),"source_ids":strings(),"section":string(),"verification_note":string(),"offset":number(),"limit":number()}),
+                    json!({"action":action(&["list","upsert","verify","verify_batch","final_check"]),"id":string(),"title":string(),"status":action(&["uninvestigated","in_progress","written"]),"memory_ids":strings(),"source_ids":strings(),"section":string(),"verification_note":string(),"items":{"type":"object","minProperties":1,"maxProperties":20,"additionalProperties":{"type":"object","properties":{"source_ids":strings(),"verification_note":string()},"required":["source_ids","verification_note"],"additionalProperties":false}},"offset":number(),"limit":number()}),
                     &["action"],
                 ),
             },
         ]
     }
+    fn checkpoint_allowed(name: &str) -> bool {
+        [
+            "memory_write",
+            "memory_read",
+            "memory_find",
+            "memory_manage",
+            "task_state",
+            "history",
+            "checkpoint_complete",
+        ]
+        .contains(&name)
+    }
     pub fn definitions(s: &Session) -> Vec<Value> {
-        Self::specs().into_iter().filter(|t|!t.optional||s.active_tools.contains(t.name)).map(|t|json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.parameters}})).collect()
+        Self::specs().into_iter()
+            .filter(|t| !t.optional || s.active_tools.contains(t.name))
+            .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
+            .map(|t| json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.parameters}}))
+            .collect()
     }
     pub fn optional_names() -> BTreeSet<String> {
         Self::specs()
@@ -429,6 +476,15 @@ fn observe_hashed(
     end: usize,
     excerpt: &str,
 ) -> Source {
+    if let Some(source) = s.sources.values().find(|source| {
+        source.path.as_deref() == path.to_str()
+            && source.hash.as_deref() == Some(&content_hash)
+            && source.start_line == Some(start)
+            && source.end_line == Some(end)
+            && source.excerpt == excerpt.chars().take(2000).collect::<String>()
+    }) {
+        return source.clone();
+    }
     let source = Source {
         id: crate::memory::id(),
         observed_at: chrono::Utc::now(),
@@ -492,37 +548,26 @@ pub fn revalidate(s: &mut Session) -> Result<()> {
     Ok(())
 }
 fn section_text<'a>(doc: &'a str, heading: &str) -> Result<&'a str> {
-    let mut starts = vec![];
-    let mut offset = 0;
-    for line in doc.split_inclusive('\n') {
-        if line.trim() == heading.trim() {
-            starts.push(offset)
-        }
-        offset += line.len();
-    }
-    if starts.len() != 1 || !heading.starts_with('#') {
+    let headings = documentation::headings(doc);
+    let matching: Vec<_> = headings
+        .iter()
+        .filter(|h| h.heading == heading.trim())
+        .collect();
+    if matching.len() != 1 {
         bail!("section must be a unique Markdown heading");
     }
-    let start = starts[0];
-    let level = heading.chars().take_while(|c| *c == '#').count();
-    let tail = &doc[start..];
-    let mut end = tail.len();
-    let mut off = 0;
-    for (i, line) in tail.split_inclusive('\n').enumerate() {
-        let n = line.chars().take_while(|c| *c == '#').count();
-        if i > 0 && n > 0 && n <= level && line.as_bytes().get(n) == Some(&b' ') {
-            end = off;
-            break;
-        }
-        off += line.len();
-    }
-    Ok(&tail[..end])
+    let h = matching[0];
+    Ok(&doc[h.start..h.end])
 }
 fn bounded_text(s: &Session, content: &str, offset: usize) -> Value {
     let remaining: String = content.chars().skip(offset).collect();
     let (body, truncated) = context::truncate(
         &remaining,
-        s.config.result_tokens.saturating_sub(500),
+        s.config
+            .result_tokens
+            .saturating_sub(500)
+            .max(s.config.result_tokens / 2)
+            .max(1),
         &s.config.model,
     );
     let next = offset + body.chars().count();
@@ -548,17 +593,46 @@ pub fn execute(s: &mut Session, name: &str, args: Value) -> Result<Value> {
 pub fn execute_cancellable(
     s: &mut Session,
     name: &str,
-    args: Value,
+    mut args: Value,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value> {
     if cancel.is_cancelled() {
         bail!("cancelled");
     }
+    // Some compatible tool parsers quote integers. Convert only exact ASCII
+    // unsigned decimals in fields whose schema explicitly requires an integer.
+    if let Some(spec) = ToolRegistry::specs().into_iter().find(|t| t.name == name)
+        && let Some(fields) = args.as_object_mut()
+    {
+        for (key, value) in fields {
+            if spec.parameters["properties"][key]["type"] == "integer"
+                && let Some(raw) = value.as_str()
+                && !raw.is_empty()
+                && raw.bytes().all(|b| b.is_ascii_digit())
+                && let Ok(number) = raw.parse::<u64>()
+            {
+                *value = json!(number);
+            }
+        }
+    }
     ToolRegistry::validate(s, name, &args)?;
-    if s.checkpoint.is_some() && ["document_edit", "investigation", "tool_select"].contains(&name) {
+    if s.checkpoint.is_some() && !ToolRegistry::checkpoint_allowed(name) {
         bail!("checkpoint_pending: only memory/state/history maintenance allowed");
     }
+    if s.run_guidance["phase"] == "verify"
+        && !s.investigations.is_empty()
+        && (name == "file_list"
+            || (name == "symbol_search" && args["query"].as_str().unwrap_or("").is_empty())
+            || (name == "investigation" && args["action"] == "upsert" && args["id"].is_null()))
+    {
+        bail!(
+            "verification_reserve: focus on existing investigation items; broad discovery and new items are paused"
+        );
+    }
     match name {
+        "document_inspect" | "document_audit" | "symbol_search" => {
+            documentation::execute(s, name, &args, cancel)
+        }
         "tool_catalog" => {
             let q = args["query"].as_str().unwrap_or("").to_lowercase();
             Ok(
@@ -720,7 +794,7 @@ pub fn execute_cancellable(
         "checkpoint_complete" => {
             let cp = s
                 .checkpoint
-                .as_mut()
+                .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("no_checkpoint"))?;
             if cp.id != text(&args, "id")? {
                 bail!("checkpoint_id_mismatch");
@@ -731,14 +805,31 @@ pub fn execute_cancellable(
             let no_save = args["no_save_reason"]
                 .as_str()
                 .is_some_and(|x| !x.trim().is_empty());
-            if !no_save
-                && (s.task.revision == cp.starting_state_revision
-                    || s.memory.generation == cp.starting_memory_generation)
-            {
-                bail!("Save memory and progress, or explain why no new saves are needed");
+            if !no_save && s.memory.generation == cp.starting_memory_generation {
+                bail!(
+                    "checkpoint_memory_missing: save needed memories first, or provide no_save_reason when existing memories already preserve the facts"
+                );
             }
-            cp.acknowledged = true;
-            Ok(json!({"acknowledged":true}))
+            let progress = text(&args, "progress")?;
+            if progress.trim().is_empty() {
+                bail!("checkpoint progress must be nonempty");
+            }
+            let mut task = s.task.clone();
+            task.current = progress.to_string();
+            if let Some(next) = args["next"].as_str() {
+                task.next = next.to_string();
+            }
+            task.revision += 1;
+            let mut compact = json!(task);
+            compact.as_object_mut().unwrap().remove("details");
+            if context::count(&compact, &s.config.model) > s.config.state_tokens {
+                bail!(
+                    "task_state_limit: shorten checkpoint progress/next; original progress retained"
+                );
+            }
+            s.task = task;
+            s.checkpoint.as_mut().unwrap().acknowledged = true;
+            Ok(json!({"acknowledged":true,"state_revision":s.task.revision}))
         }
         "file_list" => {
             let files = paths(&s.project, args["pattern"].as_str(), cancel)?;
@@ -754,7 +845,7 @@ pub fn execute_cancellable(
             }
             let end = (offset + n(&args, "limit", 100).clamp(1, 500)).min(names.len());
             Ok(
-                json!({"paths":names[offset..end],"next_cursor":(end<names.len()).then(||format!("{fingerprint}:{end}"))}),
+                json!({"hash":fingerprint,"paths":names[offset..end],"next_cursor":(end<names.len()).then(||format!("{fingerprint}:{end}"))}),
             )
         }
         "source_search" => {
@@ -811,7 +902,7 @@ pub fn execute_cancellable(
                 result.push(json!({"path":path,"line":line,"text":excerpt,"source":source}));
             }
             Ok(
-                json!({"matches":result,"next_cursor":(end<rows.len()).then(||format!("{fingerprint}:{end}"))}),
+                json!({"hash":fingerprint,"matches":result,"next_cursor":(end<rows.len()).then(||format!("{fingerprint}:{end}"))}),
             )
         }
         "file_read" => {
@@ -826,7 +917,34 @@ pub fn execute_cancellable(
                 .take(lines)
                 .collect::<Vec<_>>()
                 .join("\n");
-            let content = bounded_text(s, &selected, offset);
+            let prior = s
+                .history
+                .bundles
+                .iter()
+                .filter(|b| b.active)
+                .flat_map(|b| &b.messages)
+                .filter(|m| {
+                    m["role"] == "tool"
+                        && m["content"]
+                            .as_str()
+                            .and_then(|v| serde_json::from_str::<Value>(v).ok())
+                            .is_some_and(|v| {
+                                v["data"]["path"] == json!(path)
+                                    && v["data"]["source"]["hash"] == hash(contents.as_bytes())
+                                    && v["data"]["read_start"] == start
+                                    && v["data"]["read_offset"] == offset
+                                    && v["data"]["read_max_lines"] == lines
+                            })
+                })
+                .count();
+            if prior >= s.config.repeated_read_limit
+                && !args["force_read"].as_bool().unwrap_or(false)
+            {
+                return Ok(
+                    json!({"path":path,"hash":hash(contents.as_bytes()),"total_lines":contents.lines().count(),"repeated_read":true,"suppressed":true,"guidance":"Unchanged range already present repeatedly in active context. Reuse it, read another range, use document_inspect for output metadata, or force_read=true for deliberate verification."}),
+                );
+            }
+            let mut content = bounded_text(s, &selected, offset);
             let shown = content["text"].as_str().unwrap();
             let observed_start =
                 start + selected.chars().take(offset).filter(|c| *c == '\n').count();
@@ -838,6 +956,17 @@ pub fn execute_cancellable(
                 observed_start + shown.lines().count().saturating_sub(1),
                 shown,
             );
+            let line_offsets = std::iter::once(0)
+                .chain(
+                    shown
+                        .chars()
+                        .enumerate()
+                        .filter(|(_, c)| *c == '\n')
+                        .map(|(i, _)| i + 1),
+                )
+                .collect::<Vec<_>>();
+            content["line_start"] = json!(observed_start);
+            content["line_offsets"] = json!(line_offsets);
             let truncated = content["truncated"].as_bool().unwrap();
             let next_line = if truncated {
                 Some(start)
@@ -845,7 +974,7 @@ pub fn execute_cancellable(
                 (start - 1 + lines < contents.lines().count()).then_some(start + lines)
             };
             Ok(
-                json!({"path":path,"content":content,"source":source,"next_line":next_line,"next_offset":if truncated{content["next_offset"].clone()}else{json!(0)}}),
+                json!({"path":path,"total_lines":contents.lines().count(),"hash":hash(contents.as_bytes()),"read_start":start,"read_offset":offset,"read_max_lines":lines,"content":content,"source":source,"next_line":next_line,"next_offset":if truncated{content["next_offset"].clone()}else{json!(0)}}),
             )
         }
         "document_edit" => {
@@ -870,6 +999,24 @@ pub fn execute_cancellable(
             let result = match action {
                 "create" | "write" => new.to_string(),
                 "append" => format!("{old}{new}"),
+                "section" => {
+                    let heading = text(&args, "section")?;
+                    let target = section_text(&old, heading)?;
+                    if args["expected_section_hash"].as_str()
+                        != Some(hash(target.as_bytes()).as_str())
+                    {
+                        bail!("section_revision_conflict");
+                    }
+                    if new.lines().next() != Some(heading) {
+                        bail!("section replacement must retain its heading");
+                    }
+                    let mut candidate = old.replacen(target, &format!("{}\n", new.trim_end()), 1);
+                    section_text(&candidate, heading)?;
+                    if !old.ends_with('\n') && target == old {
+                        candidate = new.to_string();
+                    }
+                    candidate
+                }
                 "patch" => {
                     let target = text(&args, "old_text")?;
                     if target.is_empty() || old.matches(target).count() != 1 {
@@ -903,7 +1050,9 @@ pub fn execute_cancellable(
             }
             s.document_written = true;
             revalidate(s)?;
-            Ok(json!({"path":path,"hash":hash(result.as_bytes()),"bytes":result.len()}))
+            Ok(
+                json!({"path":path,"hash":hash(result.as_bytes()),"bytes":result.len(),"total_lines":result.lines().count()}),
+            )
         }
         "investigation" => match text(&args, "action")? {
             "list" => {
@@ -919,6 +1068,14 @@ pub fn execute_cancellable(
                     .as_str()
                     .map(str::to_string)
                     .unwrap_or_else(crate::memory::id);
+                let previous = s.investigations.iter().find(|item| item.id == id).cloned();
+                if previous.is_none()
+                    && s.investigations
+                        .iter()
+                        .any(|item| item.title == args["title"].as_str().unwrap_or(""))
+                {
+                    bail!("duplicate_investigation_title: list and update the existing item by ID");
+                }
                 let refs = list(&args, "memory_ids")
                     .into_iter()
                     .map(|id| s.memory.get(&id).map(|m| (m.id.clone(), m.revision)))
@@ -927,10 +1084,46 @@ pub fn execute_cancellable(
                 let item = Investigation {
                     id: id.clone(),
                     title: text(&args, "title")?.into(),
-                    status: args["status"].as_str().unwrap_or("uninvestigated").into(),
-                    memory_refs: refs,
-                    sources,
-                    section: args["section"].as_str().unwrap_or("").into(),
+                    status: args["status"]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            previous
+                                .as_ref()
+                                .map(|i| {
+                                    if i.status == "verified" {
+                                        "written".into()
+                                    } else {
+                                        i.status.clone()
+                                    }
+                                })
+                                .unwrap_or("uninvestigated".into())
+                        }),
+                    memory_refs: if args.get("memory_ids").is_none() {
+                        previous
+                            .as_ref()
+                            .map(|i| i.memory_refs.clone())
+                            .unwrap_or(refs)
+                    } else {
+                        refs
+                    },
+                    sources: if args.get("source_ids").is_none() {
+                        previous
+                            .as_ref()
+                            .map(|i| i.sources.clone())
+                            .unwrap_or(sources)
+                    } else {
+                        sources
+                    },
+                    section: args["section"]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            previous
+                                .as_ref()
+                                .map(|i| i.section.clone())
+                                .unwrap_or_default()
+                        }),
                     document_hash: None,
                     note: String::new(),
                 };
@@ -941,6 +1134,34 @@ pub fn execute_cancellable(
                 }
                 Ok(json!({"id":id}))
             }
+            "verify_batch" => {
+                let items = args["items"].as_object().ok_or_else(|| {
+                    anyhow::anyhow!("items must be an object keyed by investigation ID")
+                })?;
+                if items.is_empty() || items.len() > 20 {
+                    bail!("batch requires 1..20 items");
+                }
+                let mut results = vec![];
+                for (id, entry) in items {
+                    if cancel.is_cancelled() {
+                        bail!("cancelled");
+                    }
+                    let mut params = entry.clone();
+                    if !params.is_object() {
+                        results.push(
+                            json!({"id":id,"status":"error","error":"item must be an object"}),
+                        );
+                        continue;
+                    }
+                    params["action"] = json!("verify");
+                    params["id"] = json!(id);
+                    let result = execute_cancellable(s, "investigation", params, cancel);
+                    results.push(json!({"id":id,"result":envelope(result)}));
+                }
+                Ok(
+                    json!({"results":results,"semantic_verification":"agent attestation; not program proof"}),
+                )
+            }
             "verify" => {
                 revalidate(s)?;
                 let id = text(&args, "id")?;
@@ -949,8 +1170,14 @@ pub fn execute_cancellable(
                     bail!("verification_note required");
                 }
                 let sources = s.source_refs(&list(&args, "source_ids"))?;
-                if sources.is_empty() {
-                    bail!("verification requires freshly read sources");
+                if sources.is_empty()
+                    || sources.iter().any(|source| {
+                        source.origin != "file" || source.path.is_none() || source.hash.is_none()
+                    })
+                {
+                    bail!(
+                        "verification requires observed file sources; pass source_ids returned by file_read/source_search/symbol_search"
+                    );
                 }
                 for source in &sources {
                     if let Some(path) = &source.path {
@@ -966,7 +1193,7 @@ pub fn execute_cancellable(
                     .iter_mut()
                     .find(|i| i.id == id)
                     .ok_or_else(|| anyhow::anyhow!("item_not_found"))?;
-                if item.status != "written" {
+                if item.status != "written" && item.status != "verified" {
                     bail!("item_must_be_written_before_verification");
                 }
                 for (id, revision) in &item.memory_refs {
@@ -985,6 +1212,20 @@ pub fn execute_cancellable(
                 Ok(json!({"verified":id}))
             }
             "final_check" => {
+                revalidate(s)?;
+                if s.investigations.is_empty()
+                    || s.investigations.iter().any(|i| i.status != "verified")
+                {
+                    return Ok(
+                        json!({"complete":false,"incomplete":s.investigations.iter().filter(|i|i.status != "verified").map(|i|json!({"id":i.id,"title":i.title,"status":i.status,"section":i.section})).collect::<Vec<_>>(),"review":s.reviews,"guidance":"Verify pending items first; incomplete preflight does not consume a document review."}),
+                    );
+                }
+                let audit = documentation::execute(s, "document_audit", &json!({}), cancel)?;
+                if audit["structural_ok"] != true {
+                    return Ok(
+                        json!({"complete":false,"audit":audit,"review":s.reviews,"guidance":"Fix structural evidence issues before final review."}),
+                    );
+                }
                 if s.reviews >= s.config.review_limit {
                     bail!("review_budget_exhausted");
                 }
@@ -1006,9 +1247,171 @@ pub fn execute_cancellable(
     }
 }
 
+/// Deterministic output checks; this does not attest semantic accuracy.
+pub fn audit_document(s: &mut Session) -> Result<Value> {
+    documentation::execute(
+        s,
+        "document_audit",
+        &json!({}),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+}
+
 pub fn run_call(s: &mut Session, call: &crate::llm::ToolCall) -> Value {
     run_call_cancellable(s, call, &tokio_util::sync::CancellationToken::new())
 }
+/// Budget the actual chat message, including JSON escaping and call ID.
+pub fn result_tokens(call: &crate::llm::ToolCall, result: &Value, model: &str) -> usize {
+    context::count(
+        &json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}),
+        model,
+    )
+}
+
+/// Keep results structured. Repeated bounding reuses the original archive rather
+/// than serializing a preview of a preview (which expands escapes and hides IDs).
+pub fn limit_result(
+    s: &mut Session,
+    call: &crate::llm::ToolCall,
+    result: Value,
+    limit: usize,
+) -> Value {
+    if result_tokens(call, &result, &s.config.model) <= limit {
+        return result;
+    }
+    let mut output = result.clone();
+    fn strip_duplicate_excerpts(value: &mut Value) {
+        match value {
+            Value::Object(fields) => {
+                if fields.contains_key("observed_at") && fields.contains_key("origin") {
+                    fields.remove("excerpt");
+                }
+                for v in fields.values_mut() {
+                    strip_duplicate_excerpts(v);
+                }
+            }
+            Value::Array(values) => {
+                for v in values {
+                    strip_duplicate_excerpts(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    strip_duplicate_excerpts(&mut output);
+    if result_tokens(call, &output, &s.config.model) <= limit {
+        return output;
+    }
+    let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
+    let old_archive = result["archive_id"]
+        .as_u64()
+        .or_else(|| {
+            (result["next_cursor"]["tool"] == "history")
+                .then(|| result["next_cursor"]["id"].as_u64())
+                .flatten()
+        })
+        .filter(|id| s.history.read(*id).is_ok());
+    let archive = if call.name == "history" && args["action"] == "read" {
+        args["id"].as_u64().unwrap_or_default()
+    } else if let Some(id) = old_archive {
+        id
+    } else {
+        let id = s.history.push(
+            vec![json!({"role":"tool_archive","call_id":call.id,"result":result})],
+            true,
+        );
+        s.history.bundles.back_mut().unwrap().active = false;
+        id
+    };
+    output["truncated"] = json!(true);
+    output["archive_id"] = json!(archive);
+    output["next_cursor"] = json!({"tool":"history","action":"read","id":archive,"offset":0});
+    for pointer in ["/data/content/text", "/data/text", "/data/body/text"] {
+        if let Some(text) = output
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        {
+            let chars: Vec<_> = text.chars().collect();
+            let template = output.clone();
+            let (mut low, mut high) = (0, chars.len());
+            let candidate = |length: usize| {
+                let mut v = template.clone();
+                *v.pointer_mut(pointer).unwrap() =
+                    json!(chars[..length].iter().collect::<String>());
+                let offset = args["offset"].as_u64().unwrap_or(0) + length as u64;
+                if pointer == "/data/content/text" && call.name == "file_read" {
+                    let line = args["start_line"].as_u64().unwrap_or(1).max(1);
+                    v["data"]["content"]["line_offsets"] = json!(
+                        std::iter::once(0)
+                            .chain(
+                                chars[..length]
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, c)| **c == '\n')
+                                    .map(|(i, _)| i + 1)
+                            )
+                            .collect::<Vec<_>>()
+                    );
+                    v["data"]["content"]["truncated"] = json!(true);
+                    v["data"]["content"]["next_offset"] = json!(offset);
+                    v["data"]["next_line"] = json!(line);
+                    v["data"]["next_offset"] = json!(offset);
+                    v["next_cursor"] = json!({"tool":"file_read","path":args["path"],"start_line":line,"max_lines":args["max_lines"].as_u64().unwrap_or(120),"offset":offset});
+                } else if pointer == "/data/content/text" && call.name == "document_inspect" {
+                    v["data"]["content"]["truncated"] = json!(true);
+                    v["data"]["content"]["next_offset"] = json!(offset);
+                    v["next_cursor"] = json!({"tool":"document_inspect","section":args["section"],"offset":offset});
+                } else if pointer == "/data/body/text" && call.name == "memory_read" {
+                    v["data"]["body"]["truncated"] = json!(true);
+                    v["data"]["body"]["next_offset"] = json!(offset);
+                    v["next_cursor"] =
+                        json!({"tool":"memory_read","id":args["id"],"offset":offset});
+                } else if pointer == "/data/text" && call.name == "history" {
+                    v["data"]["truncated"] = json!(true);
+                    v["data"]["next_offset"] = json!(offset);
+                    v["next_cursor"]["offset"] = json!(offset);
+                }
+                v
+            };
+            while low < high {
+                let mid = (low + high).div_ceil(2);
+                if result_tokens(call, &candidate(mid), &s.config.model) <= limit {
+                    low = mid;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            output = candidate(low);
+            if low > 0 && result_tokens(call, &output, &s.config.model) <= limit {
+                return output;
+            }
+        }
+    }
+    // Collections stay structured; the top-level cursor retrieves omitted rows
+    // from the original archive, never from another abbreviated result.
+    for field in ["paths", "matches", "items"] {
+        while output["data"][field]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+        {
+            if result_tokens(call, &output, &s.config.model) <= limit {
+                return output;
+            }
+            output["data"][field].as_array_mut().unwrap().pop();
+            output["data"]["next_cursor"] = Value::Null;
+        }
+    }
+    let mut compact = json!({"status":result["status"],"truncated":true,"data":{"message":"Result retained in history; follow next_cursor."},"next_cursor":{"tool":"history","action":"read","id":archive,"offset":0}});
+    if let Some(id) = result.pointer("/data/source/id") {
+        compact["data"]["source_id"] = id.clone();
+    }
+    if result_tokens(call, &compact, &s.config.model) > limit {
+        compact["data"] = Value::Null;
+    }
+    compact
+}
+
 pub fn run_call_cancellable(
     s: &mut Session,
     call: &crate::llm::ToolCall,
@@ -1031,25 +1434,7 @@ pub fn run_call_cancellable(
         cp.failed = true;
         cp.acknowledged = false;
     }
-    let mut output = envelope(result);
-    if output["status"] == "ok" && context::count(&output, &s.config.model) > s.config.result_tokens
-    {
-        // Cache complete results in the raw bundle below; continuation is available through history.
-        let text = output["data"].to_string();
-        let (preview, _) = context::truncate(
-            &text,
-            s.config.result_tokens.saturating_sub(200),
-            &s.config.model,
-        );
-        let history_id = s.history.push(
-            vec![json!({"role":"tool_archive","call_id":call.id,"result":output})],
-            true,
-        );
-        if let Some(b) = s.history.bundles.back_mut() {
-            b.active = false;
-        }
-        output = json!({"status":"ok","data":{"preview":preview},"truncated":true,"next_cursor":{"tool":"history","action":"read","id":history_id,"offset":0}});
-    }
+    let output = limit_result(s, call, envelope(result), s.config.result_tokens);
     // Failed mutations are not cached, allowing deliberate recovery with corrected arguments.
     if output["status"] == "ok" {
         s.ledger
