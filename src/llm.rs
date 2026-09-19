@@ -1,0 +1,304 @@
+use crate::config::Config;
+use anyhow::{Result, bail};
+use async_trait::async_trait;
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{collections::BTreeMap, time::Duration};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Usage {
+    pub input: usize,
+    pub output: usize,
+    pub cached: Option<usize>,
+}
+#[derive(Clone, Debug, Default)]
+pub struct Completion {
+    pub text: String,
+    pub calls: Vec<ToolCall>,
+    pub usage: Option<Usage>,
+    pub attempts: usize,
+}
+#[async_trait]
+pub trait LlmClient: Send + Sync {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &Config,
+        cancel: CancellationToken,
+        delta: mpsc::Sender<String>,
+    ) -> Result<Completion>;
+}
+#[derive(Default)]
+pub struct OpenAiClient;
+#[derive(Default)]
+pub struct SseDecoder {
+    buffer: Vec<u8>,
+}
+impl SseDecoder {
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>> {
+        self.buffer.extend_from_slice(bytes);
+        if self.buffer.len() > 8 * 1024 * 1024 {
+            bail!("SSE event too large");
+        }
+        let mut result = vec![];
+        loop {
+            let lf = self
+                .buffer
+                .windows(2)
+                .position(|x| x == b"\n\n")
+                .map(|p| (p, 2));
+            let crlf = self
+                .buffer
+                .windows(4)
+                .position(|x| x == b"\r\n\r\n")
+                .map(|p| (p, 4));
+            let Some((pos, size)) = lf.into_iter().chain(crlf).min_by_key(|(p, _)| *p) else {
+                break;
+            };
+            let event = String::from_utf8(self.buffer.drain(..pos + size).collect())?;
+            let data = event
+                .lines()
+                .filter_map(|l| l.strip_prefix("data:").map(str::trim_start))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !data.is_empty() {
+                result.push(data)
+            }
+        }
+        Ok(result)
+    }
+}
+impl OpenAiClient {
+    fn client(c: &Config) -> Result<reqwest::Client> {
+        let mut b = reqwest::Client::builder().connect_timeout(Duration::from_secs(15));
+        if let Some(proxy) = &c.proxy {
+            b = b.proxy(reqwest::Proxy::all(proxy)?)
+        }
+        Ok(b.build()?)
+    }
+    fn key(c: &Config) -> Option<String> {
+        std::env::var(&c.api_key_env).ok().or_else(|| {
+            dotenvy::from_path_iter(".env")
+                .ok()?
+                .filter_map(Result::ok)
+                .find(|(k, _)| k == &c.api_key_env)
+                .map(|(_, v)| v)
+        })
+    }
+    async fn attempt(
+        &self,
+        mut request: Value,
+        c: &Config,
+        cancel: CancellationToken,
+        delta: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        request["stream"] = json!(true);
+        request[if c.legacy_max_tokens {
+            "max_tokens"
+        } else {
+            "max_completion_tokens"
+        }] = json!(c.output_tokens);
+        if c.stream_usage {
+            request["stream_options"] = json!({"include_usage":true});
+        }
+        if let Some(e) = &c.reasoning_effort {
+            request["reasoning_effort"] = json!(e);
+        }
+        let mut req = Self::client(c)?
+            .post(format!(
+                "{}/chat/completions",
+                c.base_url.trim_end_matches('/')
+            ))
+            .json(&request);
+        if let Some(key) = Self::key(c) {
+            req = req.bearer_auth(key)
+        }
+        let response = tokio::select! {_ = cancel.cancelled()=>bail!("cancelled"),r=req.send()=>r?};
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            bail!(
+                "http_{}: {}",
+                status.as_u16(),
+                body.chars().take(1000).collect::<String>()
+            );
+        }
+        let mut stream = response.bytes_stream();
+        let mut parser = SseDecoder::default();
+        let mut out = Completion::default();
+        let mut calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
+        let (mut done, mut finish) = (false, false);
+        loop {
+            let next = tokio::select! {_ = cancel.cancelled()=>bail!("cancelled"),chunk=stream.next()=>chunk};
+            let Some(chunk) = next else { break };
+            let chunk = chunk.map_err(|e| anyhow::anyhow!("stream_interrupted: {e}"))?;
+            for event in parser.feed(&chunk)? {
+                if event == "[DONE]" {
+                    done = true;
+                    continue;
+                }
+                let v: Value = serde_json::from_str(&event)?;
+                if !v["error"].is_null() {
+                    bail!("provider_error: {}", v["error"]);
+                }
+                if let Some(u) = v.get("usage").filter(|u| !u.is_null())
+                    && let (Some(input), Some(output)) =
+                        (u["prompt_tokens"].as_u64(), u["completion_tokens"].as_u64())
+                {
+                    out.usage = Some(Usage {
+                        input: input as usize,
+                        output: output as usize,
+                        cached: u["prompt_tokens_details"]["cached_tokens"]
+                            .as_u64()
+                            .map(|n| n as usize),
+                    });
+                }
+                let Some(choice) = v["choices"].as_array().and_then(|a| a.first()) else {
+                    continue;
+                };
+                if let Some(reason) = choice["finish_reason"].as_str() {
+                    if !["stop", "tool_calls"].contains(&reason) {
+                        bail!("incomplete_completion: {reason}");
+                    }
+                    finish = true;
+                }
+                if let Some(text) = choice["delta"]["content"].as_str() {
+                    out.text.push_str(text);
+                    let _ = delta.send(text.to_string()).await;
+                }
+                if let Some(entries) = choice["delta"]["tool_calls"].as_array() {
+                    for call in entries {
+                        let index = call["index"]
+                            .as_u64()
+                            .ok_or_else(|| anyhow::anyhow!("tool call missing index"))?
+                            as usize;
+                        let target = calls.entry(index).or_insert(ToolCall {
+                            id: String::new(),
+                            name: String::new(),
+                            arguments: String::new(),
+                        });
+                        if let Some(id) = call["id"].as_str() {
+                            target.id = id.into();
+                        }
+                        if let Some(name) = call["function"]["name"].as_str() {
+                            target.name.push_str(name);
+                        }
+                        if let Some(args) = call["function"]["arguments"].as_str() {
+                            target.arguments.push_str(args);
+                        }
+                    }
+                }
+                if out.text.len() + calls.values().map(|c| c.arguments.len()).sum::<usize>()
+                    > 8 * 1024 * 1024
+                {
+                    bail!("response_size_limit");
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        if !done || !finish {
+            bail!("stream_interrupted: missing completion terminator");
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for call in calls.values() {
+            if call.id.is_empty() || call.name.is_empty() || !ids.insert(call.id.clone()) {
+                bail!("malformed_tool_call");
+            }
+            let _: serde_json::Map<String, Value> = serde_json::from_str(&call.arguments)?;
+        }
+        out.calls = calls.into_values().collect();
+        Ok(out)
+    }
+    pub async fn probe(&self, c: &Config) -> Result<String> {
+        c.runnable()?;
+        let mut body = json!({"model":c.model,"messages":[{"role":"user","content":"Reply OK"}],"stream":false});
+        body[if c.legacy_max_tokens {
+            "max_tokens"
+        } else {
+            "max_completion_tokens"
+        }] = json!(c.output_tokens);
+        if let Some(effort) = &c.reasoning_effort {
+            body["reasoning_effort"] = json!(effort);
+        }
+        let mut req = Self::client(c)?
+            .post(format!(
+                "{}/chat/completions",
+                c.base_url.trim_end_matches('/')
+            ))
+            .json(&body);
+        if let Some(k) = Self::key(c) {
+            req = req.bearer_auth(k)
+        }
+        let plain =
+            tokio::time::timeout(Duration::from_secs(c.request_timeout_secs), req.send()).await??;
+        if !plain.status().is_success() {
+            bail!("plain response probe failed: {}", plain.status());
+        }
+        let (tx, mut rx) = mpsc::channel(32);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let tool = json!({"type":"function","function":{"name":"connection_echo","description":"Return the supplied text","parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}});
+        let mut request = json!({"model":c.model,"messages":[{"role":"user","content":"Call connection_echo with text OK"}],"tools":[tool],"tool_choice":{"type":"function","function":{"name":"connection_echo"}}});
+        let completion = self
+            .complete(request.clone(), c, CancellationToken::new(), tx.clone())
+            .await?;
+        if completion.calls.len() != 1 || completion.calls[0].name != "connection_echo" {
+            bail!("tool probe did not return expected call");
+        }
+        request.as_object_mut().unwrap().remove("tool_choice");
+        let call = &completion.calls[0];
+        request["messages"].as_array_mut().unwrap().extend([json!({"role":"assistant","content":null,"tool_calls":[{"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments}}]}),json!({"role":"tool","tool_call_id":call.id,"content":"OK"})]);
+        self.complete(request, c, CancellationToken::new(), tx)
+            .await?;
+        Ok("Plain response, SSE streaming and tool round-trip succeeded".into())
+    }
+}
+#[async_trait]
+impl LlmClient for OpenAiClient {
+    async fn complete(
+        &self,
+        request: Value,
+        c: &Config,
+        cancel: CancellationToken,
+        delta: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        for attempt in 0..=c.retries {
+            let result = tokio::time::timeout(
+                Duration::from_secs(c.request_timeout_secs),
+                self.attempt(request.clone(), c, cancel.clone(), delta.clone()),
+            )
+            .await;
+            let result = match result {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!("request_timeout")),
+            };
+            match result {
+                Ok(mut r) => {
+                    r.attempts = attempt + 1;
+                    return Ok(r);
+                }
+                Err(e) => {
+                    let text = e.to_string();
+                    let retry = text.starts_with("http_429")
+                        || text.starts_with("http_5")
+                        || text.contains("error sending request");
+                    if !retry || attempt == c.retries {
+                        return Err(e);
+                    }
+                    tokio::select! {_=cancel.cancelled()=>bail!("cancelled"),_=tokio::time::sleep(Duration::from_millis(500*(1<<attempt.min(5))))=>{}}
+                }
+            }
+        }
+        unreachable!()
+    }
+}

@@ -1,0 +1,14 @@
+repetitions = 3
+
+[[cases]]
+name = "mini-service"
+root = "fixtures/mini-service"
+prompt = "Create a developer Markdown summary of this Rust project. Cover the entry point, Service::create validation, Store IDs and retention, get error handling, and the main-to-service-to-store flow. Cite source file paths and line ranges. Distinguish UTF-8 bytes from character count. Inspect all three source files, create investigation items, save useful memories and verify each document section against source before finishing. Do not modify source files."
+expected_topics = ["Service", "Store", "200", "UTF-8"]
+
+[[cases]]
+name = "mnemoarc"
+root = ".."
+exclude = ["eval/**", "tests/**", "Cargo.lock"]
+prompt = "Write a Korean developer summary of MnemoArc. Explain session isolation, memory save/search, checkpoint preservation, tool selection boundaries, document verification, streaming argument assembly, cancellation and retries, configuration precedence and UI execution ownership. Trace important flows across modules; record failures/unknowns and useful memories; verify documented claims against source. Cite file paths and line ranges. Do not modify source code."
+expected_topics = ["Session", "Memory", "checkpoint", "tool", "config"]
