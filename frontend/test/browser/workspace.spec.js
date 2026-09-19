@@ -15,7 +15,9 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
     fullPage: true,
   });
   await page.getByRole("button", { name: "모든 설정" }).click();
-  await page.getByLabel("모델 이름", { exact: true }).fill("z-ai/glm-5.3-flash");
+  await page
+    .getByLabel("모델 이름", { exact: true })
+    .fill("z-ai/glm-5.3-flash");
   await page.getByLabel("모델 최대 컨텍스트", { exact: true }).fill("128000");
   await page.getByLabel("API 키", { exact: true }).fill("browser-test-only");
   await page.getByRole("button", { name: "설정 저장", exact: true }).click();
@@ -61,9 +63,13 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
     .getByRole("textbox", { name: "메시지", exact: true })
     .fill("느린 요청 테스트");
   await page.getByRole("button", { name: "메시지 보내기" }).click();
+  await expect(page.locator(".thinking")).toContainText("모델 응답 대기 중");
+  await expect(page.locator(".thinking")).toContainText("1번째 모델 호출");
+  await expect(page.locator(".thinking")).toContainText(/1초/);
   await expect(
     page.getByText("천천히 조사하고 있습니다…", { exact: true }),
   ).toBeVisible();
+  await expect(page.locator(".thinking")).toContainText("답변 생성 중");
   await page.getByRole("button", { name: /프로젝트를 조사해줘/ }).click();
   await expect(
     page.getByRole("button", { name: "● 다른 세션 작업 중" }),
@@ -71,19 +77,32 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
   await page.getByRole("button", { name: "● 다른 세션 작업 중" }).click();
   await page.getByRole("button", { name: "■ 중지" }).click();
   await expect(page.locator(".status-pill")).toHaveText("중지됨");
+  await expect(page.locator(".thinking")).toHaveCount(0);
   await expect(
     page.getByText("느린 요청 테스트", { exact: true }).last(),
   ).toBeVisible();
   await page.getByRole("tab", { name: "기억", exact: true }).click();
   await expect(page.getByText(/컨텍스트 예산은 기준 토크나이저/)).toBeVisible();
   await page.getByRole("tab", { name: "도구", exact: true }).click();
+  await expect(
+    page.getByText(/상대 경로는 프로젝트 루트 기준입니다/),
+  ).toBeVisible();
+  await expect(
+    page.getByText(/경로 입력 없이 설정된 결과 문서를 조회합니다/),
+  ).toBeVisible();
   await page.getByRole("checkbox", { name: "파일 읽기", exact: true }).check();
   await expect(
     page.getByRole("checkbox", { name: "파일 읽기", exact: true }),
   ).toBeChecked();
-  await expect(page.getByRole("checkbox", { name: "문서 구조 조회", exact: true })).toBeVisible();
-  await expect(page.getByRole("checkbox", { name: "문서 근거 점검", exact: true })).toBeVisible();
-  await expect(page.getByRole("checkbox", { name: "심볼 검색", exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("checkbox", { name: "문서 구조 조회", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("checkbox", { name: "문서 근거 점검", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("checkbox", { name: "심볼 검색", exact: true }),
+  ).toBeVisible();
   expect(errors).toEqual([]);
 });
 
@@ -126,4 +145,34 @@ test("project folder picker, settings validation and narrow screen", async ({
     path: "test-artifacts/mobile-settings.png",
     fullPage: true,
   });
+});
+
+test("length-limited Mermaid answer continues as one rendered diagram", async ({
+  page,
+  request,
+}) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  await page
+    .getByRole("textbox", { name: "메시지", exact: true })
+    .fill("길이 이어받기 테스트");
+  await page.getByRole("button", { name: "메시지 보내기" }).click();
+  await expect(page.locator(".mermaid svg")).toHaveCount(1);
+  await expect(page.locator(".thinking")).toHaveCount(0);
+  const state = await (await request.get("/api/state")).json();
+  const session = state.sessions.find(
+    (s) => s.title === "길이 이어받기 테스트",
+  );
+  const detail = await (
+    await request.get(`/api/sessions/${session.id}`)
+  ).json();
+  expect(detail.status).toBe("complete");
+  expect(detail.usage.output).toBe(40);
+  expect(detail.continuation_pending).toBe(false);
+  const replies = detail.bundles
+    .flatMap((b) => b.messages)
+    .filter((m) => m.role === "assistant");
+  expect(replies).toHaveLength(2);
+  expect(replies[0].partial).toBe(true);
+  expect(replies[1].continues_previous).toBe(true);
 });

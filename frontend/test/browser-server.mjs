@@ -45,10 +45,38 @@ const provider = createServer(async (req, res) => {
     res.end("data: [DONE]\n\n");
     return;
   }
+  const continuation = data.messages.some(
+    (m) => m.role === "user" && m.content === "길이 이어받기 테스트",
+  );
+  if (continuation) {
+    const resumed = data.messages.some(
+      (m) =>
+        m.role === "assistant" &&
+        m.content === "```mermaid\nflowchart LR\n A -->",
+    );
+    event({
+      choices: [
+        {
+          delta: {
+            content: resumed ? " B\n```" : "```mermaid\nflowchart LR\n A -->",
+          },
+          finish_reason: resumed ? "stop" : "length",
+        },
+      ],
+    });
+    event({
+      choices: [],
+      usage: { prompt_tokens: 100, completion_tokens: 20 },
+    });
+    res.end("data: [DONE]\n\n");
+    return;
+  }
   const slow = data.messages.some(
     (m) => m.role === "user" && m.content === "느린 요청 테스트",
   );
   if (slow) {
+    await new Promise((resolve) => setTimeout(resolve, 1800));
+    if (res.destroyed) return;
     event({
       choices: [
         {

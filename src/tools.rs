@@ -63,7 +63,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_write",
-                description: "Save one reusable memory. Same key requires expected_revision. Source IDs must come from program observations. Keep metadata very short (aim for 80 tokens; hard limit 160 including ID/key/JSON). Put details in body. kind: fact/decision/failure/question/procedure",
+                description: "Save one reusable memory. Same key requires expected_revision. Copy source_ids exactly from tool results; never omit them to recover from unknown_source. Facts without sources and inferred memories are needs_review. Source IDs must come from program observations. Keep metadata very short (aim for 80 tokens; hard limit 160 including ID/key/JSON). Put details in body. kind: fact/decision/failure/question/procedure",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -100,7 +100,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "task_state",
-                description: "Read/update structured goals and compact progress, or read/write detailed work list. Updates preserve omitted fields. Preserve user constraints unless explicitly changed by user",
+                description: "Read/update structured goals and compact progress, or read/write detailed work list. Updates preserve omitted fields. Set patch.require_investigation=true BEFORE source-documentation work requiring evidence coverage; simple document edits do not need it. Once required, it cannot be disabled during the same request. Preserve user constraints unless explicitly changed by user",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -130,27 +130,27 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "file_list",
-                description: "List project text file paths with glob filter and pagination; respects project boundaries and exclusions",
+                description: "List project text file paths. path_glob is a file glob such as backend/**/*.js (pattern is a legacy alias); pagination; respects project boundaries and exclusions",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"pattern":string(),"cursor":string(),"limit":number()}),
+                    json!({"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number()}),
                     &[],
                 ),
             },
             ToolSpec {
                 name: "source_search",
-                description: "Search source lines by literal or regex and path glob; paginated results include program-issued source IDs and hashes",
+                description: "Search source lines: query is content text or regex (regex=true); path_glob filters file paths, e.g. backend/**/*.js (pattern is a legacy alias); paginated results include program-issued source IDs and hashes",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"query":string(),"regex":{"type":"boolean"},"pattern":string(),"cursor":string(),"limit":number()}),
+                    json!({"query":string(),"regex":{"type":"boolean"},"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number()}),
                     &["query"],
                 ),
             },
             ToolSpec {
                 name: "document_inspect",
-                description: "Read output metadata/hash/line count and paginated Markdown outline without loading full text. Supply section to read one unique heading, offset and expected_hash for safe continuation.",
+                description: "Read the configured project.output directly; no path required, even when output is outside project.root. With no section, return metadata and outline with canonical headings and absolute path. section accepts a full Markdown heading or a unique title without #; duplicate titles require disambiguation. offset and expected_hash support safe continuation.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -160,11 +160,11 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "symbol_search",
-                description: "Heuristic declaration search for JS/TS, Rust and Python (not LSP or references). Returns source lines and hashes; narrow pattern/query. Cursor expires on source changes.",
+                description: "Heuristic declaration search for JS/TS, Rust and Python. query is a symbol-name substring, e.g. handleQuestion; path_glob is a file glob, e.g. backend/src/agent.js (pattern is a legacy alias). For declaration regex use source_search instead. Returns matched_files/scanned_files to distinguish no files from no symbols. Cursor expires on source changes.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"query":string(),"pattern":string(),"cursor":string(),"limit":number()}),
+                    json!({"query":string(),"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number()}),
                     &[],
                 ),
             },
@@ -177,17 +177,17 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "file_read",
-                description: "Read project/output file by 1-based start_line and max_lines. Continuation: copy returned next_line and next_offset together (offset is relative to start_line, NOT the whole file). Returns source ID, hash, total_lines and line_start/line_offsets for exact citations; repeated unchanged active-context reads are suppressed unless force_read=true",
+                description: "Read a new range with path, 1-based start_line and max_lines (line count). limit is accepted as a compatibility alias for max_lines; prefer max_lines. Do not use offset as a line number. Example: {path:\"src/agent.rs\",start_line:160,max_lines:140}. Relative paths resolve against project.root, NEVER the output directory or workspace parent. For project.output outside the project, copy the absolute path returned by document_inspect; do not shorten it to a basename. Example: root=/workspace/app and output=/workspace/app_summary.md requires path=/workspace/app_summary.md, not app_summary.md. Use document_inspect to read the configured output without supplying a path. If truncated, continue ONLY with {cursor: next_cursor.cursor}; never combine cursor with path/start_line/max_lines/offset. A cursor completes the original requested range and expires if the file changes. Once that range is complete, next_line indicates where a NEW range can start. Returned line_start/line_end describe delivered text; boundary flags mark partial lines. Use force_read=true only for deliberate repeat verification.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"path":string(),"start_line":number(),"max_lines":number(),"offset":number(),"force_read":{"type":"boolean"}}),
-                    &["path"],
+                    json!({"path":{"type":"string","description":"File path: relative to project.root, or the absolute configured output path returned by document_inspect. Never infer the output path from its basename."},"cursor":string(),"start_line":number(),"max_lines":number(),"limit":{"type":"integer","minimum":0,"description":"Compatibility alias for max_lines (number of lines). Prefer max_lines; never use a different value alongside max_lines."},"offset":number(),"force_read":{"type":"boolean"}}),
+                    &[],
                 ),
             },
             ToolSpec {
                 name: "document_edit",
-                description: "Edit ONLY configured Markdown output: create, replace entire file, append, or unique exact text patch. Existing file requires expected_hash. section replaces a unique full heading section and also requires expected_section_hash. Returns measured lines and new hash",
+                description: "Edit ONLY configured Markdown output: create, replace entire file, append, or unique exact text patch. Existing file requires expected_hash. section accepts a full heading or a unique title without # and also requires expected_section_hash. Replacement text must retain the original full Markdown heading including #. Simple edits do not require investigation items; source documentation must first set task_state patch.require_investigation=true. Returns measured lines and new hash",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -197,11 +197,11 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "investigation",
-                description: "Manage source documentation items. Actions list/upsert/verify/verify_batch/final_check. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified and failures reported. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. section is a unique Markdown heading",
+                description: "Manage source documentation items. upsert registers ONE item per call: requires top-level title, optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified and failures reported. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. section is a unique Markdown heading",
                 optional: true,
                 read_only: false,
                 parameters: schema(
-                    json!({"action":action(&["list","upsert","verify","verify_batch","final_check"]),"id":string(),"title":string(),"status":action(&["uninvestigated","in_progress","written"]),"memory_ids":strings(),"source_ids":strings(),"section":string(),"verification_note":string(),"items":{"type":"object","minProperties":1,"maxProperties":20,"additionalProperties":{"type":"object","properties":{"source_ids":strings(),"verification_note":string()},"required":["source_ids","verification_note"],"additionalProperties":false}},"offset":number(),"limit":number()}),
+                    json!({"action":action(&["list","upsert","verify","verify_batch","final_check"]),"id":string(),"title":{"type":"string","description":"Required non-empty top-level title for upsert (one item per call)."},"status":action(&["uninvestigated","in_progress","written"]),"memory_ids":strings(),"source_ids":strings(),"section":string(),"verification_note":string(),"items":{"type":"object","description":"ONLY for action=verify_batch. Object keyed by existing investigation IDs; not an array and not used by upsert.","minProperties":1,"maxProperties":20,"additionalProperties":{"type":"object","properties":{"source_ids":strings(),"verification_note":string()},"required":["source_ids","verification_note"],"additionalProperties":false}},"offset":number(),"limit":number()}),
                     &["action"],
                 ),
             },
@@ -223,7 +223,11 @@ impl ToolRegistry {
         Self::specs().into_iter()
             .filter(|t| !t.optional || s.active_tools.contains(t.name))
             .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
-            .map(|t| json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.parameters}}))
+            .map(|mut t| {
+                // Keep offset for old clients, but offer the model only opaque continuation.
+                if t.name == "file_read" { t.parameters["properties"].as_object_mut().unwrap().remove("offset"); }
+                json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.parameters}})
+            })
             .collect()
     }
     pub fn optional_names() -> BTreeSet<String> {
@@ -248,9 +252,15 @@ impl ToolRegistry {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("Arguments must be an object"))?;
         let fields = spec.parameters["properties"].as_object().unwrap();
+        if name == "investigation" {
+            validate_investigation_arguments(args)?;
+        }
         for key in object.keys() {
             if !fields.contains_key(key) {
-                bail!("unknown_argument: {key}");
+                bail!(
+                    "unknown_argument: {key} for {name}; allowed arguments: {}",
+                    fields.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
             }
         }
         for required in spec.parameters["required"].as_array().unwrap() {
@@ -280,6 +290,76 @@ impl ToolRegistry {
         Ok(spec)
     }
 }
+// Keep action-specific contracts explicit without requiring conditional JSON
+// Schema support from OpenAI-compatible providers.
+fn validate_investigation_arguments(args: &Value) -> Result<()> {
+    let action = args["action"].as_str().unwrap_or("");
+    let (allowed, required, example): (&[&str], &[&str], &str) = match action {
+        "upsert" => (
+            &[
+                "action",
+                "id",
+                "title",
+                "status",
+                "memory_ids",
+                "source_ids",
+                "section",
+            ],
+            &["title"],
+            r##"{"action":"upsert","id":"overview","title":"Project overview","section":"# Overview"}"##,
+        ),
+        "verify" => (
+            &["action", "id", "source_ids", "verification_note"],
+            &["id", "source_ids", "verification_note"],
+            r#"{"action":"verify","id":"existing-id","source_ids":["observed-source-id"],"verification_note":"Actual source/document comparison"}"#,
+        ),
+        "verify_batch" => (
+            &["action", "items"],
+            &["items"],
+            r#"{"action":"verify_batch","items":{"existing-id":{"source_ids":["observed-source-id"],"verification_note":"Actual comparison"}}}"#,
+        ),
+        "list" => (
+            &["action", "offset", "limit"],
+            &[],
+            r#"{"action":"list","offset":0,"limit":20}"#,
+        ),
+        "final_check" => (&["action"], &[], r#"{"action":"final_check"}"#),
+        _ => return Ok(()), // Generic validation reports unknown/missing actions.
+    };
+    if action == "upsert" && args.get("items").is_some() {
+        bail!(
+            "invalid_action_arguments: investigation upsert registers ONE item per call and requires top-level title; items is only for verify_batch of existing written items. Issue separate upsert calls. Example: {example}"
+        );
+    }
+    for key in args.as_object().unwrap().keys() {
+        if !allowed.contains(&key.as_str()) {
+            bail!(
+                "invalid_action_arguments: investigation action={action} does not accept {key}; allowed: {}. Example: {example}",
+                allowed.join(", ")
+            );
+        }
+    }
+    for key in required {
+        if args.get(*key).is_none() {
+            bail!("missing_argument: {key} for investigation action={action}. Example: {example}");
+        }
+        if args[*key]
+            .as_str()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!(
+                "invalid_argument_value: {key} must not be empty for investigation action={action}. Example: {example}"
+            );
+        }
+    }
+    if action == "verify_batch" && !args["items"].is_object() {
+        bail!(
+            "invalid_argument_type: items for verify_batch must be an object keyed by existing item IDs, not an array. Example: {example}"
+        );
+    }
+    Ok(())
+}
+
 fn text<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args[key]
         .as_str()
@@ -295,6 +375,25 @@ fn list(args: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+fn path_glob(args: &Value) -> Result<Option<&str>> {
+    if args["path_glob"].is_string()
+        && args["pattern"].is_string()
+        && args["path_glob"] != args["pattern"]
+    {
+        bail!("conflicting_path_filters: use path_glob only; pattern is a legacy alias");
+    }
+    let value = args["path_glob"]
+        .as_str()
+        .or_else(|| args["pattern"].as_str());
+    if value.is_some_and(|v| {
+        v.starts_with('^') || v.ends_with('$') || v.contains("(?") || v.contains("\\s")
+    }) {
+        bail!(
+            "invalid_path_glob: expected a file glob such as backend/**/*.js, not a content regex; use source_search query with regex=true for content"
+        );
+    }
+    Ok(value)
 }
 fn n(args: &Value, key: &str, default: usize) -> usize {
     args[key].as_u64().map_or(default, |n| n as usize)
@@ -397,6 +496,14 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
 }
 fn read_text(path: &Path) -> Result<String> {
     let metadata = path.metadata()?;
+    if metadata.is_dir() {
+        bail!(
+            "path_is_directory: use file_list with path_glob (e.g. backend/**), then file_read with a file path"
+        );
+    }
+    if !metadata.is_file() {
+        bail!("unsupported_file_type: expected a regular text file");
+    }
     if metadata.len() > 16 * 1024 * 1024 {
         bail!("unsupported_large_file: maximum 16MiB");
     }
@@ -486,7 +593,7 @@ fn observe_hashed(
         return source.clone();
     }
     let source = Source {
-        id: crate::memory::id(),
+        id: crate::memory::source_id(),
         observed_at: chrono::Utc::now(),
         origin: "file".into(),
         path: Some(path.display().to_string()),
@@ -548,15 +655,7 @@ pub fn revalidate(s: &mut Session) -> Result<()> {
     Ok(())
 }
 fn section_text<'a>(doc: &'a str, heading: &str) -> Result<&'a str> {
-    let headings = documentation::headings(doc);
-    let matching: Vec<_> = headings
-        .iter()
-        .filter(|h| h.heading == heading.trim())
-        .collect();
-    if matching.len() != 1 {
-        bail!("section must be a unique Markdown heading");
-    }
-    let h = matching[0];
+    let h = documentation::resolve_heading(doc, heading)?;
     Ok(&doc[h.start..h.end])
 }
 fn bounded_text(s: &Session, content: &str, offset: usize) -> Value {
@@ -615,6 +714,25 @@ pub fn execute_cancellable(
             }
         }
     }
+    if name == "file_read"
+        && let Some(fields) = args.as_object_mut()
+        && let Some(limit) = fields.remove("limit")
+    {
+        if fields.get("offset").is_some_and(|v| v != &json!(0)) {
+            bail!(
+                "ambiguous_file_read_range: limit means max_lines, but offset is a character offset within the selected range, NOT a line number. For a new range use path/start_line/max_lines and omit offset. For continuation copy only {{cursor: next_cursor.cursor}}"
+            );
+        }
+        if let Some(max_lines) = fields.get("max_lines") {
+            if max_lines != &limit {
+                bail!(
+                    "conflicting_arguments: file_read limit and max_lines differ; supply only max_lines (number of lines)"
+                );
+            }
+        } else {
+            fields.insert("max_lines".into(), limit);
+        }
+    }
     ToolRegistry::validate(s, name, &args)?;
     if s.checkpoint.is_some() && !ToolRegistry::checkpoint_allowed(name) {
         bail!("checkpoint_pending: only memory/state/history maintenance allowed");
@@ -635,8 +753,12 @@ pub fn execute_cancellable(
         }
         "tool_catalog" => {
             let q = args["query"].as_str().unwrap_or("").to_lowercase();
+            let terms: Vec<_> = q
+                .split(|c: char| c.is_whitespace() || c == '_' || c == '-')
+                .filter(|t| !t.is_empty())
+                .collect();
             Ok(
-                json!({"groups":["source-docs"],"tools":ToolRegistry::specs().into_iter().filter(|t|t.name.contains(&q)||t.description.to_lowercase().contains(&q)).map(|t|json!({"name":t.name,"description":t.description,"basic":!t.optional,"active":!t.optional||s.active_tools.contains(t.name)})).collect::<Vec<_>>()}),
+                json!({"groups":["source-docs"],"tools":ToolRegistry::specs().into_iter().filter(|t|terms.is_empty() || terms.iter().any(|term| t.name.contains(term) || t.description.to_lowercase().contains(term))).map(|t|json!({"name":t.name,"description":t.description,"basic":!t.optional,"active":!t.optional||s.active_tools.contains(t.name)})).collect::<Vec<_>>()}),
             )
         }
         "tool_select" => {
@@ -757,6 +879,15 @@ pub fn execute_cancellable(
                     value[k] = v.clone();
                 }
                 let mut next: TaskState = serde_json::from_value(value)?;
+                if !["", "investigate", "draft", "verify", "answer"].contains(&next.phase.as_str())
+                {
+                    bail!("invalid_task_phase: use investigate, draft, verify or answer");
+                }
+                if s.task.require_investigation && !next.require_investigation {
+                    bail!(
+                        "investigation_requirement_locked: cannot disable required evidence verification during this request"
+                    );
+                }
                 for id in &next.memory_ids {
                     s.memory.get(id)?;
                 }
@@ -832,7 +963,7 @@ pub fn execute_cancellable(
             Ok(json!({"acknowledged":true,"state_revision":s.task.revision}))
         }
         "file_list" => {
-            let files = paths(&s.project, args["pattern"].as_str(), cancel)?;
+            let files = paths(&s.project, path_glob(&args)?, cancel)?;
             let root = s.project.root.canonicalize()?;
             let names = files
                 .iter()
@@ -861,7 +992,8 @@ pub fn execute_cancellable(
             let regex = regex::RegexBuilder::new(&expression)
                 .size_limit(1024 * 1024)
                 .build()?;
-            let files = paths(&s.project, args["pattern"].as_str(), cancel)?;
+            let files = paths(&s.project, path_glob(&args)?, cancel)?;
+            let matched_files = files.len();
             let mut rows = vec![];
             let mut fingerprint = Sha256::new();
             fingerprint.update(expression.as_bytes());
@@ -902,19 +1034,47 @@ pub fn execute_cancellable(
                 result.push(json!({"path":path,"line":line,"text":excerpt,"source":source}));
             }
             Ok(
-                json!({"hash":fingerprint,"matches":result,"next_cursor":(end<rows.len()).then(||format!("{fingerprint}:{end}"))}),
+                json!({"hash":fingerprint,"matches":result,"matched_files":matched_files,"next_cursor":(end<rows.len()).then(||format!("{fingerprint}:{end}"))}),
             )
         }
         "file_read" => {
+            let cursor = if let Some(id) = args["cursor"].as_str() {
+                if ["path", "start_line", "max_lines", "offset"]
+                    .iter()
+                    .any(|key| args.get(key).is_some())
+                {
+                    bail!(
+                        "cursor_arguments_conflict: pass only cursor (and optional force_read); for a new range omit cursor and use path/start_line/max_lines"
+                    );
+                }
+                let cursor = s.file_cursors.get(id).cloned().ok_or_else(|| anyhow::anyhow!("invalid_file_cursor: copy next_cursor.cursor exactly from this session, or start a new read with path/start_line/max_lines"))?;
+                args["path"] = json!(cursor.path);
+                args["start_line"] = json!(cursor.start_line);
+                args["max_lines"] = json!(cursor.max_lines);
+                args["offset"] = json!(cursor.offset);
+                Some(cursor)
+            } else {
+                None
+            };
             let path = read_path(&s.project, text(&args, "path")?)?;
             let contents = read_text(&path)?;
+            if cursor
+                .as_ref()
+                .is_some_and(|c| c.hash != hash(contents.as_bytes()))
+            {
+                bail!(
+                    "file_cursor_expired: file changed; start a new read with path/start_line/max_lines and no cursor"
+                );
+            }
             let start = n(&args, "start_line", 1).max(1);
             let lines = n(&args, "max_lines", 120).clamp(1, 2000);
             let offset = n(&args, "offset", 0);
             let total_lines = contents.lines().count();
             if start > total_lines {
                 if offset != 0 {
-                    bail!("invalid_offset");
+                    bail!(
+                        "invalid_offset: start_line {start} is beyond total_lines {total_lines}; start a new read without offset"
+                    );
                 }
                 return Ok(
                     json!({"path":path,"hash":hash(contents.as_bytes()),"total_lines":total_lines,"content":{"text":"","truncated":false,"next_offset":null},"source":null,"eof":true,"next_line":null,"next_offset":0}),
@@ -927,7 +1087,10 @@ pub fn execute_cancellable(
                 .collect::<Vec<_>>()
                 .join("\n");
             if offset > selected.chars().count() {
-                bail!("invalid_offset");
+                bail!(
+                    "invalid_offset: offset {offset} exceeds {} characters in start_line={start}, max_lines={lines}. Offset is relative to this range, not the file. Copy next_cursor.cursor for continuation, or omit offset for a new range",
+                    selected.chars().count()
+                );
             }
             let prior = s
                 .history
@@ -978,6 +1141,14 @@ pub fn execute_cancellable(
                 )
                 .collect::<Vec<_>>();
             content["line_start"] = json!(observed_start);
+            content["line_end"] = json!(source.end_line);
+            content["first_line_complete"] =
+                json!(offset == 0 || selected.chars().nth(offset - 1) == Some('\n'));
+            let shown_end = offset + content["text"].as_str().unwrap().chars().count();
+            content["last_line_complete"] = json!(
+                content["text"].as_str().unwrap().ends_with('\n')
+                    || selected.chars().nth(shown_end).is_none_or(|c| c == '\n')
+            );
             content["line_offsets"] = json!(line_offsets);
             let truncated = content["truncated"].as_bool().unwrap();
             let next_line = if truncated {
@@ -1019,7 +1190,7 @@ pub fn execute_cancellable(
                     {
                         bail!("section_revision_conflict");
                     }
-                    if new.lines().next() != Some(heading) {
+                    if new.lines().next().map(str::trim) != target.lines().next().map(str::trim) {
                         bail!("section replacement must retain its heading");
                     }
                     let mut candidate = old.replacen(target, &format!("{}\n", new.trim_end()), 1);
@@ -1061,6 +1232,7 @@ pub fn execute_cancellable(
                 temp.persist_noclobber(&path)?;
             }
             s.document_written = true;
+            s.last_document_write = Some((path.clone(), hash(result.as_bytes())));
             revalidate(s)?;
             Ok(
                 json!({"path":path,"hash":hash(result.as_bytes()),"bytes":result.len(),"total_lines":result.lines().count()}),
@@ -1227,6 +1399,7 @@ pub fn execute_cancellable(
                 Ok(json!({"verified":id}))
             }
             "final_check" => {
+                s.task.require_investigation = true;
                 revalidate(s)?;
                 if s.investigations.is_empty()
                     || s.investigations.iter().any(|i| i.status != "verified")
@@ -1283,14 +1456,45 @@ pub fn result_tokens(call: &crate::llm::ToolCall, result: &Value, model: &str) -
     )
 }
 
+fn new_file_cursor_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    format!(
+        "R{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+fn register_file_cursor(s: &mut Session, id: String, result: &Value) {
+    let data = &result["data"];
+    s.file_cursors.insert(
+        id,
+        crate::session::FileCursor {
+            path: data["path"].as_str().unwrap().into(),
+            hash: data["hash"].as_str().unwrap().into(),
+            start_line: data["read_start"].as_u64().unwrap() as usize,
+            max_lines: data["read_max_lines"].as_u64().unwrap() as usize,
+            offset: data["next_offset"].as_u64().unwrap() as usize,
+        },
+    );
+}
+
 /// Keep results structured. Repeated bounding reuses the original archive rather
 /// than serializing a preview of a preview (which expands escapes and hides IDs).
 pub fn limit_result(
     s: &mut Session,
     call: &crate::llm::ToolCall,
-    result: Value,
+    mut result: Value,
     limit: usize,
 ) -> Value {
+    if call.name == "file_read"
+        && result["status"] == "ok"
+        && result["data"]["content"]["truncated"] == true
+        && !result["next_cursor"]["cursor"].is_string()
+    {
+        let id = new_file_cursor_id();
+        register_file_cursor(s, id.clone(), &result);
+        result["truncated"] = json!(true);
+        result["next_cursor"] = json!({"tool":"file_read","cursor":id});
+    }
     if result_tokens(call, &result, &s.config.model) <= limit {
         return result;
     }
@@ -1348,7 +1552,24 @@ pub fn limit_result(
             .map(str::to_owned)
         {
             let chars: Vec<_> = text.chars().collect();
-            let template = output.clone();
+            let mut template = output.clone();
+            // Each shortened view gets its own immutable source observation.
+            // Archives and previously delivered results keep their original IDs.
+            let narrowed_source = if call.name == "file_read" && pointer == "/data/content/text" {
+                template["data"]["source"]["id"]
+                    .as_str()
+                    .and_then(|id| s.sources.get(id))
+                    .cloned()
+                    .map(|mut source| {
+                        source.id = crate::memory::source_id();
+                        template["data"]["source"]["id"] = json!(source.id);
+                        source
+                    })
+            } else {
+                None
+            };
+            let narrowed_cursor = (call.name == "file_read" && pointer == "/data/content/text")
+                .then(new_file_cursor_id);
             let (mut low, mut high) = (0, chars.len());
             let candidate = |length: usize| {
                 let mut v = template.clone();
@@ -1356,7 +1577,21 @@ pub fn limit_result(
                     json!(chars[..length].iter().collect::<String>());
                 let offset = args["offset"].as_u64().unwrap_or(0) + length as u64;
                 if pointer == "/data/content/text" && call.name == "file_read" {
-                    let line = args["start_line"].as_u64().unwrap_or(1).max(1);
+                    let line = template["data"]["read_start"].as_u64().unwrap();
+                    let offset = template["data"]["read_offset"].as_u64().unwrap() + length as u64;
+                    let shown = v["data"]["content"]["text"].as_str().unwrap();
+                    let end = v["data"]["content"]["line_start"].as_u64().unwrap_or(line)
+                        + shown.lines().count().saturating_sub(1) as u64;
+                    let complete = if length < chars.len() {
+                        shown.ends_with('\n') || chars[length] == '\n'
+                    } else {
+                        template["data"]["content"]["last_line_complete"]
+                            .as_bool()
+                            .unwrap_or(false)
+                    };
+                    v["data"]["content"]["line_end"] = json!(end);
+                    v["data"]["content"]["last_line_complete"] = json!(complete);
+                    v["data"]["source"]["end_line"] = json!(end);
                     v["data"]["content"]["line_offsets"] = json!(
                         std::iter::once(0)
                             .chain(
@@ -1372,7 +1607,7 @@ pub fn limit_result(
                     v["data"]["content"]["next_offset"] = json!(offset);
                     v["data"]["next_line"] = json!(line);
                     v["data"]["next_offset"] = json!(offset);
-                    v["next_cursor"] = json!({"tool":"file_read","path":args["path"],"start_line":line,"max_lines":args["max_lines"].as_u64().unwrap_or(120),"offset":offset});
+                    v["next_cursor"] = json!({"tool":"file_read","cursor":narrowed_cursor});
                 } else if pointer == "/data/content/text" && call.name == "document_inspect" {
                     v["data"]["content"]["truncated"] = json!(true);
                     v["data"]["content"]["next_offset"] = json!(offset);
@@ -1399,6 +1634,21 @@ pub fn limit_result(
             }
             output = candidate(low);
             if low > 0 && result_tokens(call, &output, &s.config.model) <= limit {
+                if let Some(id) = narrowed_cursor {
+                    register_file_cursor(s, id, &output);
+                }
+                if let Some(mut source) = narrowed_source {
+                    source.end_line = output["data"]["source"]["end_line"]
+                        .as_u64()
+                        .map(|n| n as usize);
+                    source.excerpt = output["data"]["content"]["text"]
+                        .as_str()
+                        .unwrap()
+                        .chars()
+                        .take(2000)
+                        .collect();
+                    s.sources.insert(source.id.clone(), source);
+                }
                 return output;
             }
         }
@@ -1418,9 +1668,6 @@ pub fn limit_result(
         }
     }
     let mut compact = json!({"status":result["status"],"truncated":true,"data":{"message":"Result retained in history; follow next_cursor."},"next_cursor":{"tool":"history","action":"read","id":archive,"offset":0}});
-    if let Some(id) = result.pointer("/data/source/id") {
-        compact["data"]["source_id"] = id.clone();
-    }
     if result_tokens(call, &compact, &s.config.model) > limit {
         compact["data"] = Value::Null;
     }
@@ -1469,4 +1716,23 @@ pub fn project_fingerprint(project: &Project) -> Result<String> {
         hasher.update([0]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Confirm the last successful edit still exists unchanged. This is a persistence
+/// check, not a semantic or source-evidence attestation.
+pub fn verify_document_write(s: &Session) -> Result<()> {
+    if let Some((path, expected)) = &s.last_document_write {
+        let actual = read_text(path).map_err(|error| {
+            anyhow::anyhow!(
+                "document_write_verification_failed: {}: {error}",
+                path.display()
+            )
+        })?;
+        if hash(actual.as_bytes()) != *expected {
+            bail!(
+                "document_changed_after_write: inspect the saved document and reconcile changes before completing"
+            );
+        }
+    }
+    Ok(())
 }

@@ -43,3 +43,29 @@ test("reused chat preserves unicode and blocks executable links", () => {
   assert.notEqual(imageTarget("https://example.com/image.png").kind, "image");
   assert.equal(parseChartBlock("not a chart").ok, false);
 });
+
+test("length continuation joins Markdown and streaming without losing the prefix", async () => {
+  const { continuationMessages } = await import("../src/chat/continuation.js");
+  const first = {
+    id: 1,
+    messages: [
+      { role: "assistant", content: "```mermaid\nA -->", partial: true },
+    ],
+  };
+  const last = {
+    id: 2,
+    messages: [
+      { role: "assistant", content: " B\n```", continues_previous: true },
+    ],
+  };
+  const complete = continuationMessages([first, last], "", false);
+  assert.equal(complete.messages.length, 1);
+  assert.equal(complete.messages[0].content, "```mermaid\nA --> B\n```");
+  assert.equal(complete.messages[0].partial, false);
+  const live = continuationMessages([first], " B", true);
+  assert.equal(live.messages.length, 0);
+  assert.equal(live.streamText, "```mermaid\nA --> B");
+  assert.equal(first.messages[0].content, "```mermaid\nA -->");
+  const stopped = continuationMessages([first], "", true);
+  assert.equal(stopped.messages[0].content, first.messages[0].content);
+});

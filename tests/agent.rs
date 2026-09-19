@@ -266,7 +266,8 @@ async fn settings_apply_at_next_request_and_generic_tasks_work() {
     drain.await.unwrap();
     assert_eq!(result.config.output_tokens, 4000);
     assert_eq!(result.task.current, "compare documents");
-    assert!(result.active_tools.is_empty());
+    assert!(result.active_tools.contains("file_read"));
+    assert!(!result.active_tools.contains("document_edit"));
     assert_eq!(result.status, "complete");
 }
 
@@ -640,12 +641,25 @@ struct PrematureFinal {
 impl LlmClient for PrematureFinal {
     async fn complete(
         &self,
-        _: Value,
+        request: Value,
         _: &Config,
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        *self.calls.lock().unwrap() += 1;
+        let mut calls = self.calls.lock().unwrap();
+        if *calls > 0 {
+            let state = request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap();
+            let state: Value = serde_json::from_str(state.split_once('\n').unwrap().1).unwrap();
+            assert!(
+                !state["run_guidance"]["completion_error"]
+                    .as_str()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        *calls += 1;
         Ok(Completion {
             text: "Everything is complete".into(),
             ..Default::default()
@@ -657,6 +671,7 @@ async fn premature_final_is_retried_but_never_claimed_complete_without_coverage(
     let dir = tempfile::tempdir().unwrap();
     let mut session = s(dir.path());
     session.document_written = true;
+    session.task.require_investigation = true;
     let client = Arc::new(PrematureFinal {
         calls: Mutex::new(0),
     });
@@ -668,4 +683,558 @@ async fn premature_final_is_retried_but_never_claimed_complete_without_coverage(
     assert_eq!(*client.calls.lock().unwrap(), 3);
     assert_eq!(result.run_guidance["phase"], "verify");
     assert_eq!(result.history.bundles.len(), 3);
+}
+
+struct SummaryReads {
+    step: Mutex<usize>,
+    offsets: Mutex<Vec<usize>>,
+    text: String,
+}
+#[async_trait]
+impl LlmClient for SummaryReads {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let mut step = self.step.lock().unwrap();
+        let mut offsets = self.offsets.lock().unwrap();
+        let mut calls = vec![];
+        if *step == 0 {
+            assert!(
+                request["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["function"]["name"] == "file_read")
+            );
+            for i in 0..4 {
+                calls.push(ToolCall {
+                    id: format!("read-{i}"),
+                    name: "file_read".into(),
+                    arguments: json!({"path":format!("part-{i}.md"),"start_line":1,"max_lines":1})
+                        .to_string(),
+                });
+            }
+        } else {
+            let results: Vec<Value> = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["role"] == "tool")
+                .rev()
+                .take(4)
+                .map(|m| serde_json::from_str(m["content"].as_str().unwrap()).unwrap())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            assert_eq!(results.len(), 4);
+            let mut total = 0;
+            for (i, result) in results.iter().enumerate() {
+                let text = result["data"]["content"]["text"]
+                    .as_str()
+                    .expect("every read must retain actual document text");
+                assert!(text.chars().count() > 500, "later reads must not starve");
+                let expected: String = self
+                    .text
+                    .chars()
+                    .skip(offsets[i])
+                    .take(text.chars().count())
+                    .collect();
+                assert!(
+                    text == expected,
+                    "step={} part={i} expected_offset={} read_offset={} first={:?} expected={:?}",
+                    *step,
+                    offsets[i],
+                    result["data"]["read_offset"],
+                    text.chars().take(30).collect::<String>(),
+                    expected.chars().take(30).collect::<String>()
+                );
+                offsets[i] += text.chars().count();
+                let cursor = &result["next_cursor"];
+                assert_eq!(cursor["tool"], "file_read");
+                assert_eq!(
+                    result["data"]["next_offset"].as_u64().unwrap() as usize,
+                    offsets[i]
+                );
+                assert!(cursor["cursor"].as_str().unwrap().starts_with('R'));
+                assert!(cursor.get("offset").is_none());
+                total += mnemoarc::tools::result_tokens(
+                    &ToolCall {
+                        id: format!("read-{i}"),
+                        name: "file_read".into(),
+                        arguments: "{}".into(),
+                    },
+                    result,
+                    "gpt-4o",
+                );
+                let mut args = cursor.clone();
+                args.as_object_mut().unwrap().remove("tool");
+                calls.push(ToolCall {
+                    id: format!("continue-{i}"),
+                    name: "file_read".into(),
+                    arguments: args.to_string(),
+                });
+            }
+            assert!(total <= 8000);
+        }
+        *step += 1;
+        if *step == 3 {
+            Ok(Completion {
+                text: "```mermaid\nflowchart LR\n A --> B\n```".into(),
+                ..Default::default()
+            })
+        } else {
+            Ok(Completion {
+                calls,
+                ..Default::default()
+            })
+        }
+    }
+}
+#[tokio::test]
+async fn summary_reads_share_budget_and_continue_without_history_or_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = "백엔드 요청 처리와 검색 결과 설명. ".repeat(2000);
+    for i in 0..4 {
+        std::fs::write(dir.path().join(format!("part-{i}.md")), &text).unwrap();
+    }
+    let mut session = s(dir.path());
+    session.config.context_tokens = 128000;
+    session.config.result_tokens = 4000;
+    session.config.batch_tokens = 8000;
+    session.add_user("기존 문서에서 backend 부분만 mermaid로 요약해줘".into());
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(
+        session,
+        Arc::new(SummaryReads {
+            step: Mutex::new(0),
+            offsets: Mutex::new(vec![0; 4]),
+            text: text.clone(),
+        }),
+        CancellationToken::new(),
+        tx,
+    )
+    .await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    for bundle in &result.history.bundles {
+        for message in &bundle.messages {
+            if message["role"] != "tool" {
+                continue;
+            }
+            let output: Value = serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+            if let Some(text) = output["data"]["content"]["text"].as_str() {
+                let start = output["data"]["content"]["line_start"].as_u64().unwrap() as usize;
+                let end = start + text.lines().count() - 1;
+                let id = output["data"]["source"]["id"].as_str().unwrap();
+                assert_eq!(output["data"]["source"]["end_line"], end);
+                assert_eq!(result.sources[id].end_line, Some(end));
+                assert_eq!(
+                    result.sources[id].excerpt,
+                    text.chars().take(2000).collect::<String>()
+                );
+            }
+        }
+    }
+    assert!(result.investigations.is_empty());
+    assert!(result.memory.entries.is_empty());
+    assert!(!dir.path().join("docs/source-summary.md").exists());
+    for i in 0..4 {
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(format!("part-{i}.md"))).unwrap(),
+            text
+        );
+    }
+}
+
+struct ExpectPhase(&'static str);
+#[async_trait]
+impl LlmClient for ExpectPhase {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let content = request["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        let state: Value = serde_json::from_str(content.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(state["run_guidance"]["phase"], self.0);
+        Ok(Completion {
+            text: "Answer from available evidence.".into(),
+            ..Default::default()
+        })
+    }
+}
+#[tokio::test]
+async fn resume_and_large_budgets_do_not_restart_investigation() {
+    for (phase, rounds, expected) in [("draft", 2, "draft"), ("", 6, "answer")] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = s(dir.path());
+        session.config.run_tokens = 5_000_000;
+        session.task.phase = phase.into();
+        session.task_rounds = rounds;
+        session.add_user("계속 진행".into());
+        let (tx, mut rx) = mpsc::channel(128);
+        let drain = tokio::spawn(async move {
+            let mut model = false;
+            while let Some(event) = rx.recv().await {
+                if let mnemoarc::agent::AgentEvent::Snapshot(s) = event {
+                    if s.activity["stage"] == "model" {
+                        model = true;
+                        assert!(s.activity["started_at_ms"].as_i64().unwrap() > 0);
+                    }
+                }
+            }
+            assert!(model);
+        });
+        let result = run_session(
+            session,
+            Arc::new(ExpectPhase(expected)),
+            CancellationToken::new(),
+            tx,
+        )
+        .await;
+        drain.await.unwrap();
+        assert_eq!(result.status, "complete");
+        assert_eq!(result.activity["stage"], "idle");
+    }
+}
+
+struct LengthScript {
+    step: Mutex<usize>,
+    always_empty: bool,
+    tools: bool,
+}
+#[async_trait]
+impl LlmClient for LengthScript {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let mut step = self.step.lock().unwrap();
+        if *step > 0 {
+            assert!(
+                request["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("LENGTH RECOVERY")
+            );
+            assert!(
+                request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|m| m.get("partial").is_none() && m.get("continues_previous").is_none())
+            );
+            if self.tools {
+                assert!(
+                    request["messages"][0]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("NONE of those calls executed")
+                );
+            }
+            if !self.always_empty {
+                assert!(
+                    request["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|m| m["content"] == "```mermaid\nflowchart LR\n A -->")
+                );
+            }
+        }
+        let limited = *step == 0 || self.always_empty;
+        *step += 1;
+        Ok(Completion {
+            text: if self.always_empty {
+                "".into()
+            } else if limited {
+                "```mermaid\nflowchart LR\n A -->".into()
+            } else {
+                " B\n```".into()
+            },
+            length_limited: limited,
+            discarded_tool_calls: limited && self.tools,
+            usage: Some(mnemoarc::llm::Usage {
+                input: 100,
+                output: 10,
+                cached: None,
+            }),
+            ..Default::default()
+        })
+    }
+}
+#[tokio::test]
+async fn length_continues_text_and_bounds_empty_reasoning_loops() {
+    for (empty, tools) in [(false, false), (false, true), (true, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = s(dir.path());
+        session.add_user("Draw a diagram".into());
+        let (tx, mut rx) = mpsc::channel(128);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let result = run_session(
+            session,
+            Arc::new(LengthScript {
+                step: Mutex::new(0),
+                always_empty: empty,
+                tools,
+            }),
+            CancellationToken::new(),
+            tx,
+        )
+        .await;
+        drain.await.unwrap();
+        assert!(!result.document_written);
+        if empty {
+            assert_eq!(result.status, "blocked");
+            assert!(
+                result
+                    .last_error
+                    .unwrap()
+                    .starts_with("length_recovery_limit")
+            );
+            assert_eq!(result.task_rounds, 3);
+            assert!(result.continuation.is_some());
+        } else {
+            assert_eq!(result.status, "complete");
+            assert_eq!((result.input_tokens, result.output_tokens), (200, 20));
+            let messages = result.history.active();
+            assert_eq!(messages[1]["partial"], true);
+            assert_eq!(messages[2]["continues_previous"], true);
+            assert_eq!(
+                format!(
+                    "{}{}",
+                    messages[1]["content"].as_str().unwrap(),
+                    messages[2]["content"].as_str().unwrap()
+                ),
+                "```mermaid\nflowchart LR\n A --> B\n```"
+            );
+            assert!(result.continuation.is_none());
+        }
+    }
+}
+
+struct ExhaustOnLength;
+#[async_trait]
+impl LlmClient for ExhaustOnLength {
+    async fn complete(
+        &self,
+        _: Value,
+        config: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        Ok(Completion {
+            text: "Retained prefix".into(),
+            length_limited: true,
+            usage: Some(mnemoarc::llm::Usage {
+                input: config.run_tokens,
+                output: 1,
+                cached: None,
+            }),
+            ..Default::default()
+        })
+    }
+}
+#[tokio::test]
+async fn length_continuation_obeys_run_budget_and_preserves_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = s(dir.path());
+    session.add_user("Answer".into());
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(
+        session,
+        Arc::new(ExhaustOnLength),
+        CancellationToken::new(),
+        tx,
+    )
+    .await;
+    drain.await.unwrap();
+    assert_eq!(result.task_rounds, 1);
+    assert_eq!(result.status, "blocked");
+    assert!(
+        result
+            .last_error
+            .unwrap()
+            .starts_with("run_budget_exhausted")
+    );
+    assert!(
+        result
+            .history
+            .active()
+            .iter()
+            .any(|m| m["content"] == "Retained prefix" && m["partial"] == true)
+    );
+    assert!(result.continuation.is_some());
+}
+
+#[tokio::test]
+async fn simple_summary_append_completes_without_investigation_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = s(dir.path());
+    session.active_tools.insert("document_edit".into());
+    session.active_tools.insert("investigation".into());
+    session.add_user("결과 파일에 전체 summary도 추가해줘".into());
+    let original = "# Backend\nExisting description.\n";
+    let output = dir.path().join("summary.md");
+    session.project.output = output.clone();
+    std::fs::write(&output, original).unwrap();
+    mnemoarc::tools::execute(
+        &mut session,
+        "document_edit",
+        json!({
+            "action":"append", "text":"\n## Summary\nProject overview.\n",
+            "expected_hash":mnemoarc::tools::hash(original.as_bytes())
+        }),
+    )
+    .unwrap();
+    let client = Arc::new(PrematureFinal {
+        calls: Mutex::new(0),
+    });
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(session, client.clone(), CancellationToken::new(), tx).await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert!(result.last_error.is_none());
+    assert!(result.investigations.is_empty());
+    assert_eq!(*client.calls.lock().unwrap(), 1);
+    assert!(
+        std::fs::read_to_string(output)
+            .unwrap()
+            .contains("## Summary")
+    );
+}
+
+#[tokio::test]
+async fn simple_edit_cannot_complete_if_saved_file_changes_or_disappears() {
+    for remove in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = s(dir.path());
+        session.active_tools.insert("document_edit".into());
+        session.active_tools.insert("investigation".into());
+        session.project.output = dir.path().join("summary.md");
+        mnemoarc::tools::execute(
+            &mut session,
+            "document_edit",
+            json!({
+                "action":"create", "text":"# Summary\nSaved content.\n"
+            }),
+        )
+        .unwrap();
+        if remove {
+            std::fs::remove_file(&session.project.output).unwrap();
+        } else {
+            std::fs::write(&session.project.output, "External changes").unwrap();
+        }
+        let (tx, mut rx) = mpsc::channel(128);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let result = run_session(
+            session,
+            Arc::new(PrematureFinal {
+                calls: Mutex::new(0),
+            }),
+            CancellationToken::new(),
+            tx,
+        )
+        .await;
+        drain.await.unwrap();
+        assert_eq!(result.status, "partial");
+        assert!(result.last_error.unwrap().contains(if remove {
+            "document_write_verification_failed"
+        } else {
+            "document_changed_after_write"
+        }));
+    }
+}
+
+#[test]
+fn evidence_requirement_is_explicit_and_retained_on_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = s(dir.path());
+    session.active_tools.insert("document_edit".into());
+    session.active_tools.insert("investigation".into());
+    mnemoarc::tools::execute(
+        &mut session,
+        "task_state",
+        json!({
+            "action":"update", "patch":{"require_investigation":true}
+        }),
+    )
+    .unwrap();
+    let error = mnemoarc::tools::execute(
+        &mut session,
+        "task_state",
+        json!({
+            "action":"update", "patch":{"require_investigation":false}
+        }),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("investigation_requirement_locked")
+    );
+    session.add_user("계속 진행".into());
+    assert!(session.task.require_investigation);
+    session.add_user("문서 제목만 바꿔줘".into());
+    assert!(!session.task.require_investigation);
+    assert!(!session.document_written);
+    let result = mnemoarc::tools::execute(
+        &mut session,
+        "investigation",
+        json!({"action":"final_check"}),
+    )
+    .unwrap();
+    assert_eq!(result["complete"], false);
+    assert!(session.task.require_investigation);
+}
+
+#[tokio::test]
+async fn existing_unverified_investigation_still_blocks_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = s(dir.path());
+    session.active_tools.insert("document_edit".into());
+    session.active_tools.insert("investigation".into());
+    mnemoarc::tools::execute(
+        &mut session,
+        "investigation",
+        json!({
+            "action":"upsert", "id":"pending", "title":"Source analysis"
+        }),
+    )
+    .unwrap();
+    assert!(!session.task.require_investigation);
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(
+        session,
+        Arc::new(PrematureFinal {
+            calls: Mutex::new(0),
+        }),
+        CancellationToken::new(),
+        tx,
+    )
+    .await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "partial");
+    assert!(
+        result
+            .last_error
+            .unwrap()
+            .contains("Unverified investigation")
+    );
 }

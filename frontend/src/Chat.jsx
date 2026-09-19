@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Message, StreamingMessage } from "./chat/Message.jsx";
+import { continuationMessages } from "./chat/continuation.js";
 import { toolLabels } from "./api.js";
 
 export default function Chat({
@@ -11,6 +12,30 @@ export default function Chat({
   onSettings,
   onOlder,
 }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (session?.status !== "running") return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [session?.id, session?.status]);
+  const elapsed = Math.max(
+    0,
+    Math.floor((now - (session?.activity?.started_at_ms || now)) / 1000),
+  );
+  const stage = session?.activity?.stage;
+  const progress =
+    stage === "tools"
+      ? `${(session.activity.tools || []).map((name) => toolLabels[name] || name).join(" · ")} 실행 중`
+      : session?.stream
+        ? "답변 생성 중"
+        : stage === "model"
+          ? session?.continuation_pending
+            ? "길이 제한으로 이어서 생성 중"
+            : "모델 응답 대기 중"
+          : stage === "continuing"
+            ? "받은 답변을 보존하고 이어서 생성 중"
+            : "요청 준비 중";
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const inputRef = useRef(null),
@@ -58,11 +83,10 @@ export default function Chat({
       setSending(false);
     }
   }
-  const messages = (session?.bundles || []).flatMap((bundle) =>
-    bundle.messages.map((message, index) => ({
-      ...message,
-      key: `${bundle.id}-${index}`,
-    })),
+  const { messages, streamText } = continuationMessages(
+    session?.bundles,
+    session?.stream,
+    session?.continuation_pending,
   );
   const haveText = messages.some(
     (m) => (m.role === "user" || m.role === "assistant") && m.content,
@@ -145,11 +169,14 @@ export default function Chat({
               <Message key={m.key} role={m.role} text={m.content} />
             ) : null,
           )}
-          {session?.stream && <StreamingMessage text={session.stream} />}
-          {session?.status === "running" && !session?.stream && (
+          {streamText && <StreamingMessage text={streamText} />}
+          {session?.status === "running" && (
             <div className="thinking" role="status">
               <span className="pulse" />
-              프로젝트와 기억을 살펴보고 있어요
+              {progress} · {elapsed}초
+              {session?.activity?.round
+                ? ` · ${session.activity.round}번째 모델 호출`
+                : ""}
             </div>
           )}
           {session?.error && (

@@ -387,3 +387,71 @@ fn settings_validate_reserves_and_patch_keeps_existing_references() {
         .is_err()
     );
 }
+
+#[test]
+fn bare_section_title_reads_and_edits_unique_heading_without_renaming_it() {
+    let (_dir, mut s) = setup();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# 문서\n## 1. 시스템 개요\n처음\n```md\n## 1. 시스템 개요\n```\n## 다른 제목\n나머지\n"}),
+    );
+    let page = run(
+        &mut s,
+        "document_inspect",
+        json!({"section":" 1. 시스템 개요 "}),
+    );
+    assert_eq!(page["section"], "## 1. 시스템 개요");
+    assert_eq!(page["start_line"], 2);
+    assert!(
+        page["content"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("## 1. 시스템 개요\n처음")
+    );
+    let modified = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":"1. 시스템 개요","expected_hash":page["hash"],"expected_section_hash":page["section_hash"],"text":"## 1. 시스템 개요\n수정\n"}),
+    );
+    let exact = run(
+        &mut s,
+        "document_inspect",
+        json!({"section":"## 1. 시스템 개요"}),
+    );
+    assert_eq!(exact["hash"], modified["hash"]);
+    assert_eq!(exact["content"]["text"], "## 1. 시스템 개요\n수정\n");
+    assert!(tools::execute(&mut s, "document_edit", json!({"action":"section","section":"1. 시스템 개요","expected_hash":exact["hash"],"expected_section_hash":exact["section_hash"],"text":"1. 시스템 개요\n제목 기호 제거\n"})).unwrap_err().to_string().contains("retain its heading"));
+}
+
+#[test]
+fn bare_section_title_never_guesses_between_duplicate_titles() {
+    let (_dir, mut s) = setup();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# 문서\n## 개요\n상위\n### 개요\n하위\n## 반복\n하나\n## 반복\n둘\n"}),
+    );
+    let ambiguous = tools::execute(&mut s, "document_inspect", json!({"section":"개요"}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        ambiguous.contains("ambiguous_section")
+            && ambiguous.contains("## 개요")
+            && ambiguous.contains("### 개요")
+    );
+    let explicit = run(&mut s, "document_inspect", json!({"section":"### 개요"}));
+    assert_eq!(explicit["start_line"], 4);
+    for section in ["반복", "## 반복"] {
+        assert!(
+            tools::execute(&mut s, "document_inspect", json!({"section":section}))
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous_section")
+        );
+    }
+    let missing = tools::execute(&mut s, "document_inspect", json!({"section":"없는 제목"}))
+        .unwrap_err()
+        .to_string();
+    assert!(missing.contains("section_not_found") && missing.contains("document_inspect"));
+}

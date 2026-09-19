@@ -5,6 +5,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
+// Process-wide allocation also keeps parallel read workers collision-free.
+pub fn source_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    format!(
+        "S{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
 pub fn id() -> String {
     Uuid::new_v4().to_string()
 }
@@ -135,6 +143,15 @@ impl MemoryStore {
         }
         let old = input.key.as_deref().and_then(|k| self.get(k).ok()).cloned();
         if let Some(m) = &old {
+            if input.kind == MemoryKind::Fact
+                && !input.inferred
+                && !m.sources.is_empty()
+                && sources.is_empty()
+            {
+                bail!(
+                    "memory_sources_required: an observed fact cannot discard its existing sources; supply valid source_ids or explicitly mark the new claim inferred for review"
+                );
+            }
             if input.expected_revision != Some(m.revision) {
                 bail!("revision_conflict: expected {}", m.revision);
             }
@@ -142,7 +159,7 @@ impl MemoryStore {
             bail!("revision_conflict: memory does not exist");
         }
         if let Some(m) = self.entries.values().find(|m| {
-            m.status == MemoryStatus::Active
+            m.status != MemoryStatus::Superseded
                 && m.body == input.body
                 && m.sources == sources
                 && m.key == input.key
@@ -155,6 +172,11 @@ impl MemoryStore {
         }) {
             return Ok(m.meta());
         }
+        let status = if input.inferred || (input.kind == MemoryKind::Fact && sources.is_empty()) {
+            MemoryStatus::NeedsReview
+        } else {
+            MemoryStatus::Active
+        };
         let now = Utc::now();
         let m = Memory {
             id: old.as_ref().map(|m| m.id.clone()).unwrap_or_else(id),
@@ -164,7 +186,7 @@ impl MemoryStore {
             body: input.body,
             tags: input.tags,
             kind: input.kind,
-            status: MemoryStatus::Active,
+            status,
             inferred: input.inferred,
             sources,
             metadata: input.metadata,

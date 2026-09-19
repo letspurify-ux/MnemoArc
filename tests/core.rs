@@ -224,6 +224,7 @@ fn file_evidence_document_conflict_and_revalidation() {
     )
     .unwrap();
     let mut s = session(dir.path());
+    s.active_tools.clear();
     assert!(tools::execute(&mut s, "file_read", json!({"path":"main.rs"})).is_err());
     tools::execute(
         &mut s,
@@ -446,6 +447,7 @@ fn bounded_file_results_keep_sources_offsets_and_fit_serialized_message_budget()
     let output = tools::run_call(&mut s, &call);
     assert_eq!(output["status"], "ok");
     assert!(tools::result_tokens(&call, &output, &s.config.model) <= 1200);
+    let original_source = s.sources[output["data"]["source"]["id"].as_str().unwrap()].clone();
     let reduced = tools::limit_result(&mut s, &call, output, 600);
     assert!(tools::result_tokens(&call, &reduced, &s.config.model) <= 600);
     assert!(reduced["data"]["preview"].is_null());
@@ -459,6 +461,37 @@ fn bounded_file_results_keep_sources_offsets_and_fit_serialized_message_budget()
     assert!(!shown.is_empty());
     assert!(text.starts_with(shown));
     assert_eq!(reduced["data"]["next_offset"], shown.chars().count());
+    let start = reduced["data"]["content"]["line_start"].as_u64().unwrap() as usize;
+    let end = start + shown.lines().count() - 1;
+    assert_eq!(
+        reduced["data"]["source"]["end_line"], end,
+        "source range must describe delivered text, not the archived longer read"
+    );
+    let source = s
+        .sources
+        .get(reduced["data"]["source"]["id"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(source.end_line, Some(end));
+    assert_ne!(source.id, original_source.id);
+    assert_eq!(
+        s.sources[&original_source.id].end_line,
+        original_source.end_line
+    );
+    assert_eq!(
+        s.sources[&original_source.id].excerpt,
+        original_source.excerpt
+    );
+    assert_eq!(reduced["data"]["content"]["line_end"], end);
+    assert_eq!(reduced["data"]["content"]["first_line_complete"], true);
+    let boundary_complete =
+        shown.ends_with('\n') || text.chars().nth(shown.chars().count()) == Some('\n');
+    assert_eq!(
+        reduced["data"]["content"]["last_line_complete"],
+        boundary_complete
+    );
+
+    assert_eq!(source.excerpt, shown.chars().take(2000).collect::<String>());
+
     let next = mnemoarc::llm::ToolCall {
         id: "file-2".into(),
         name: "file_read".into(),
@@ -467,6 +500,16 @@ fn bounded_file_results_keep_sources_offsets_and_fit_serialized_message_budget()
                 .to_string(),
     };
     let continuation = tools::run_call(&mut s, &next);
+    let continued_text = continuation["data"]["content"]["text"].as_str().unwrap();
+    let continued_start = continuation["data"]["content"]["line_start"]
+        .as_u64()
+        .unwrap() as usize;
+    let continued_end = continued_start + continued_text.lines().count() - 1;
+    assert_eq!(continuation["data"]["source"]["end_line"], continued_end);
+    assert_eq!(
+        continuation["data"]["content"]["first_line_complete"],
+        shown.ends_with('\n')
+    );
     let combined = format!(
         "{}{}",
         shown,
@@ -544,4 +587,362 @@ fn compatible_tool_integer_strings_are_normalized_without_loose_coercion() {
         .unwrap_err();
         assert!(err.to_string().contains("invalid_argument_type"));
     }
+}
+
+#[test]
+fn catalog_finds_spaced_tool_names_and_new_sessions_can_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    assert!(s.task.deliverables.is_empty());
+    assert!(s.active_tools.contains("file_read"));
+    assert!(s.active_tools.contains("document_inspect"));
+    assert!(!s.active_tools.contains("document_edit"));
+    for (query, expected) in [
+        ("file read", "file_read"),
+        ("document inspect edit", "document_inspect"),
+        ("DOCUMENT_EDIT", "document_edit"),
+    ] {
+        let result = tools::execute(&mut s, "tool_catalog", json!({"query":query})).unwrap();
+        assert!(
+            result["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == expected)
+        );
+    }
+}
+
+#[test]
+fn source_ids_are_short_and_unknown_sources_give_recovery_without_saving() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("sample.rs"), "fn main() {}\n").unwrap();
+    let mut s = session(dir.path());
+    let read = tools::execute(&mut s, "file_read", json!({"path":"sample.rs"})).unwrap();
+    let id = read["source"]["id"].as_str().unwrap();
+    assert!(id.starts_with('S') && id.len() < 16);
+    let err = tools::execute(&mut s, "memory_write", json!({"title":"test","summary":"test","body":"test","kind":"fact","source_ids":["S-invalid"]})).unwrap_err().to_string();
+    assert!(err.contains("unknown_source") && err.contains(id) && err.contains("sample.rs"));
+    assert!(s.memory.entries.is_empty());
+    let unsourced = tools::execute(
+        &mut s,
+        "memory_write",
+        json!({"title":"test","summary":"test","body":"test","kind":"fact"}),
+    )
+    .unwrap();
+    assert_eq!(unsourced["status"], "needs_review");
+    let sourced = tools::execute(&mut s, "memory_write", json!({"key":"fact","title":"test","summary":"test","body":"test","kind":"fact","source_ids":[id]})).unwrap();
+    assert_eq!(sourced["status"], "active");
+    assert!(tools::execute(&mut s, "memory_write", json!({"key":"fact","expected_revision":1,"title":"test","summary":"test","body":"changed","kind":"fact"})).unwrap_err().to_string().contains("memory_sources_required"));
+}
+
+#[test]
+fn directory_read_has_actionable_recovery_and_search_distinguishes_no_files() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.js"),
+        "export function handleQuestion() {}\n",
+    )
+    .unwrap();
+    let mut s = session(dir.path());
+    s.active_tools = tools::ToolRegistry::optional_names();
+    let error = tools::execute(&mut s, "file_read", json!({"path":"."}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("path_is_directory") && error.contains("file_list"));
+    let bad = tools::execute(
+        &mut s,
+        "symbol_search",
+        json!({"pattern":"^export (async )?function","query":"agent.js"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(bad.contains("invalid_path_glob"));
+    let found = tools::execute(
+        &mut s,
+        "symbol_search",
+        json!({"path_glob":"main.js","query":"handle"}),
+    )
+    .unwrap();
+    assert_eq!(found["matched_files"], 1);
+    assert_eq!(found["scanned_files"], 1);
+    assert_eq!(found["symbols"].as_array().unwrap().len(), 1);
+    let no_symbol = tools::execute(
+        &mut s,
+        "symbol_search",
+        json!({"path_glob":"main.js","query":"missing"}),
+    )
+    .unwrap();
+    assert_eq!(no_symbol["matched_files"], 1);
+    assert!(no_symbol["symbols"].as_array().unwrap().is_empty());
+    let no_file =
+        tools::execute(&mut s, "symbol_search", json!({"path_glob":"missing.js"})).unwrap();
+    assert_eq!(no_file["matched_files"], 0);
+    let legacy = tools::execute(
+        &mut s,
+        "symbol_search",
+        json!({"pattern":"main.js","query":"handle"}),
+    )
+    .unwrap();
+    assert_eq!(legacy["symbols"][0]["name"], found["symbols"][0]["name"]);
+}
+
+#[test]
+fn source_id_allocation_is_unique_across_workers() {
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(|| {
+                (0..100)
+                    .map(|_| mnemoarc::memory::source_id())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let ids: BTreeSet<_> = workers
+        .into_iter()
+        .flat_map(|w| w.join().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 800);
+}
+
+#[test]
+fn continuation_preserves_progress_but_new_task_resets_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.task.phase = "draft".into();
+    s.task_rounds = 12;
+    s.add_user("계속 진행".into());
+    assert_eq!(s.task.phase, "draft");
+    assert_eq!(s.task_rounds, 12);
+    s.add_user("다른 문서를 조사해줘".into());
+    assert_eq!(s.task.phase, "");
+    assert_eq!(s.task_rounds, 0);
+}
+
+#[test]
+fn opaque_file_cursor_survives_relimiting_without_skips_or_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    let lines: Vec<_> = (1..=50)
+        .map(|i| format!("{i:03}: {}", "한글😀 exact position ".repeat(6)))
+        .collect();
+    std::fs::write(dir.path().join("pages.md"), lines.join("\n")).unwrap();
+    let expected = lines[6..31].join("\n");
+    let mut s = session(dir.path());
+    s.config.result_tokens = 1400;
+    let mut args = json!({"path":"pages.md","start_line":7,"max_lines":25});
+    let mut joined = String::new();
+    let mut completed = false;
+    for page in 0..100 {
+        let call = mnemoarc::llm::ToolCall {
+            id: format!("opaque-{page}"),
+            name: "file_read".into(),
+            arguments: args.to_string(),
+        };
+        let original = tools::run_call(&mut s, &call);
+        assert_eq!(original["status"], "ok", "{original}");
+        let original_cursor = original["next_cursor"]["cursor"]
+            .as_str()
+            .map(str::to_owned);
+        let original_position = original_cursor.as_ref().map(|id| s.file_cursors[id].offset);
+        let result = tools::limit_result(&mut s, &call, original, 800);
+        assert!(tools::result_tokens(&call, &result, &s.config.model) <= 800);
+        let text = result["data"]["content"]["text"]
+            .as_str()
+            .expect("must retain text");
+        assert!(!text.is_empty());
+        joined.push_str(text);
+        assert!(
+            expected.starts_with(&joined),
+            "a cursor skipped or repeated content on page {page}"
+        );
+        assert_eq!(result["data"]["read_start"], 7);
+        if let Some(id) = original_cursor {
+            assert_eq!(
+                s.file_cursors[&id].offset,
+                original_position.unwrap(),
+                "relimiting must not mutate previously issued cursors"
+            );
+        }
+        if result["next_cursor"].is_null() {
+            completed = true;
+            assert_eq!(result["data"]["next_line"], 32);
+            break;
+        }
+        assert_eq!(result["next_cursor"].as_object().unwrap().len(), 2);
+        args = json!({"cursor":result["next_cursor"]["cursor"]});
+    }
+    assert!(completed);
+    assert_eq!(joined, expected);
+    let definition = tools::ToolRegistry::definitions(&s)
+        .into_iter()
+        .find(|t| t["function"]["name"] == "file_read")
+        .unwrap();
+    assert!(
+        definition["function"]["parameters"]["properties"]
+            .get("offset")
+            .is_none()
+    );
+}
+
+#[test]
+fn file_cursors_reject_mixed_ranges_changed_files_and_other_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pages.md");
+    std::fs::write(&path, "긴 문서와 정확한 위치😀\n".repeat(200)).unwrap();
+    let mut s = session(dir.path());
+    s.config.result_tokens = 1000;
+    let call = mnemoarc::llm::ToolCall {
+        id: "initial".into(),
+        name: "file_read".into(),
+        arguments: json!({"path":"pages.md","max_lines":200}).to_string(),
+    };
+    let result = tools::run_call(&mut s, &call);
+    let cursor = result["next_cursor"]["cursor"].clone();
+    assert!(cursor.is_string());
+    for extra in [
+        json!({"start_line":90}),
+        json!({"offset":0}),
+        json!({"path":"pages.md"}),
+        json!({"max_lines":20}),
+    ] {
+        let mut args = extra;
+        args["cursor"] = cursor.clone();
+        assert!(
+            tools::execute(&mut s, "file_read", args)
+                .unwrap_err()
+                .to_string()
+                .contains("cursor_arguments_conflict")
+        );
+    }
+    let mut other = session(dir.path());
+    assert!(
+        tools::execute(&mut other, "file_read", json!({"cursor":cursor}))
+            .unwrap_err()
+            .to_string()
+            .contains("invalid_file_cursor")
+    );
+    std::fs::write(&path, "changed").unwrap();
+    assert!(
+        tools::execute(&mut s, "file_read", json!({"cursor":cursor}))
+            .unwrap_err()
+            .to_string()
+            .contains("file_cursor_expired")
+    );
+    let err = tools::execute(
+        &mut s,
+        "file_read",
+        json!({"path":"pages.md","start_line":1,"max_lines":10,"offset":8900}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("8900 exceeds 7") && err.contains("omit offset"));
+}
+
+#[test]
+fn file_read_limit_alias_preserves_ranges_and_rejects_ambiguity() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("read.md"), "one\ntwo\nthree\nfour\n").unwrap();
+    let mut s = session(dir.path());
+    for args in [
+        json!({"path":"read.md","start_line":2,"limit":2}),
+        json!({"path":"read.md","start_line":"2","limit":"2","max_lines":2}),
+    ] {
+        let result = tools::execute(&mut s, "file_read", args).unwrap();
+        assert_eq!(result["content"]["text"], "two\nthree");
+        assert_eq!(result["content"]["line_start"], 2);
+        assert_eq!(result["content"]["line_end"], 3);
+    }
+    for (args, error) in [
+        (
+            json!({"path":"read.md","limit":1,"max_lines":2}),
+            "conflicting_arguments",
+        ),
+        (
+            json!({"path":"read.md","start_line":160,"offset":"160","limit":"140"}),
+            "ambiguous_file_read_range",
+        ),
+        (
+            json!({"path":"read.md","limit":"2.5"}),
+            "invalid_argument_type",
+        ),
+        (json!({"cursor":"R0","limit":2}), "cursor"),
+    ] {
+        assert!(
+            tools::execute(&mut s, "file_read", args)
+                .unwrap_err()
+                .to_string()
+                .contains(error)
+        );
+    }
+    let error = tools::execute(
+        &mut s,
+        "file_read",
+        json!({"path":"read.md","line_count":2}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("allowed arguments") && error.contains("max_lines"));
+}
+
+#[test]
+fn investigation_action_contracts_explain_invalid_calls_before_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.active_tools.insert("investigation".into());
+    for (args, expected) in [
+        (json!({"action":"upsert","items":[]}), "ONE item per call"),
+        (
+            json!({"action":"upsert","items":{"overview":{"source_ids":[],"verification_note":"note"}}}),
+            "ONE item per call",
+        ),
+        (
+            json!({"action":"upsert","id":"overview"}),
+            "missing_argument: title",
+        ),
+        (json!({"action":"upsert","title":"  "}), "must not be empty"),
+        (
+            json!({"action":"upsert","title":"Overview","verification_note":"note"}),
+            "does not accept verification_note",
+        ),
+        (
+            json!({"action":"verify","id":"overview"}),
+            "missing_argument: source_ids",
+        ),
+        (
+            json!({"action":"verify_batch","items":[]}),
+            "object keyed by existing item IDs",
+        ),
+        (
+            json!({"action":"list","title":"overview"}),
+            "does not accept title",
+        ),
+        (
+            json!({"action":"final_check","source_ids":[]}),
+            "does not accept source_ids",
+        ),
+    ] {
+        let error = tools::execute(&mut s, "investigation", args)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+        assert!(error.contains("Example:"), "{error}");
+        assert!(s.investigations.is_empty());
+        assert!(!s.task.require_investigation);
+    }
+    tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"overview","title":"Overview"}),
+    )
+    .unwrap();
+    tools::execute(&mut s, "investigation", json!({"action":"upsert","id":"overview","title":"Updated overview","status":"in_progress"})).unwrap();
+    assert_eq!(s.investigations.len(), 1);
+    assert_eq!(s.investigations[0].title, "Updated overview");
+    let list = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"list","limit":"1"}),
+    )
+    .unwrap();
+    assert_eq!(list["items"].as_array().unwrap().len(), 1);
 }

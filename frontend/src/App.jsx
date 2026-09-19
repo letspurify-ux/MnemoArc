@@ -801,6 +801,37 @@ function Inspector({ session, tools, running, onAction }) {
                   <small>
                     {tool.optional ? "선택 도구" : "기본 도구 · 항상 사용"}
                   </small>
+                  {tool.name === "file_read" && (
+                    <small style={{ overflowWrap: "anywhere" }}>
+                      상대 경로는 프로젝트 루트 기준입니다:{" "}
+                      {session.project.root}
+                      <br />
+                      설정된 결과 문서: {session.project.output}
+                      <br />
+                      결과 문서가 프로젝트 밖에 있으면 문서 구조
+                      조회(document_inspect)가 반환한 절대 경로를 그대로
+                      사용하세요. 파일명만 넘기면 프로젝트 안에서 찾습니다.
+                      <br />
+                      시작 줄은 start_line, 읽을 줄 수는 max_lines입니다. limit은
+                      max_lines의 별칭이며 offset은 줄 번호가 아닙니다. 잘린 결과는
+                      반환된 cursor로 이어 읽으세요.
+                    </small>
+                  )}
+                  {tool.name === "investigation" && (
+                    <small>
+                      upsert는 title을 포함해 항목 하나씩 등록합니다. 여러 항목은
+                      각각 호출하세요. verify는 id, source_ids, verification_note가
+                      필요합니다. items는 기존 작성 항목의 일괄 검증인
+                      verify_batch에서만 사용하며, 항목 ID를 키로 갖는 객체입니다.
+                    </small>
+                  )}
+                  {tool.name === "document_inspect" && (
+                    <small>
+                      경로 입력 없이 설정된 결과 문서를 조회합니다. 섹션 제목은
+                      #을 생략해도 유일하면 찾습니다. 중복이면 #을 포함한 실제
+                      제목으로 구분하세요.
+                    </small>
+                  )}
                 </span>
               </label>
             ))}

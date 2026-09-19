@@ -26,6 +26,8 @@ pub struct Completion {
     pub calls: Vec<ToolCall>,
     pub usage: Option<Usage>,
     pub attempts: usize,
+    pub length_limited: bool,
+    pub discarded_tool_calls: bool,
 }
 #[async_trait]
 pub trait LlmClient: Send + Sync {
@@ -175,12 +177,13 @@ impl OpenAiClient {
                     continue;
                 };
                 if let Some(reason) = choice["finish_reason"].as_str() {
-                    if !["stop", "tool_calls"].contains(&reason) {
+                    if !["stop", "tool_calls", "length"].contains(&reason) {
                         if reason == "error" {
                             bail!("provider_stream_error: finish_reason=error");
                         }
                         bail!("incomplete_completion: {reason}");
                     }
+                    out.length_limited = reason == "length";
                     finish = true;
                 }
                 if let Some(text) = choice["delta"]["content"].as_str() {
@@ -221,6 +224,12 @@ impl OpenAiClient {
         }
         if !done || !finish {
             bail!("stream_interrupted: missing completion terminator");
+        }
+        if out.length_limited {
+            // A length-limited batch may contain syntactically valid but unfinished
+            // instructions. Never expose any of its calls for execution.
+            out.discarded_tool_calls = !calls.is_empty();
+            return Ok(out);
         }
         let mut ids = std::collections::BTreeSet::new();
         for call in calls.values() {
@@ -271,8 +280,12 @@ impl OpenAiClient {
         request.as_object_mut().unwrap().remove("tool_choice");
         let call = &completion.calls[0];
         request["messages"].as_array_mut().unwrap().extend([json!({"role":"assistant","content":null,"tool_calls":[{"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments}}]}),json!({"role":"tool","tool_call_id":call.id,"content":"OK"})]);
-        self.complete(request, c, CancellationToken::new(), tx)
+        let final_response = self
+            .complete(request, c, CancellationToken::new(), tx)
             .await?;
+        if final_response.length_limited {
+            bail!("incomplete_completion: length during connection probe");
+        }
         Ok("Plain response, SSE streaming and tool round-trip succeeded".into())
     }
 }

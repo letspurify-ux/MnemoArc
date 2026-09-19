@@ -15,9 +15,11 @@ pub struct TaskState {
     pub deliverables: Vec<String>,
     pub constraints: Vec<String>,
     pub completion: Vec<String>,
+    pub require_investigation: bool,
     pub done: Vec<String>,
     pub findings: Vec<String>,
     pub current: String,
+    pub phase: String,
     pub next: String,
     pub unresolved: Vec<String>,
     pub memory_ids: Vec<String>,
@@ -130,6 +132,14 @@ pub struct Checkpoint {
     pub starting_memory_generation: u64,
     pub failed: bool,
 }
+#[derive(Clone, Debug, Serialize)]
+pub struct FileCursor {
+    pub path: String,
+    pub hash: String,
+    pub start_line: usize,
+    pub max_lines: usize,
+    pub offset: usize,
+}
 #[derive(Clone, Debug)]
 pub struct Session {
     pub id: String,
@@ -140,6 +150,7 @@ pub struct Session {
     pub memory: MemoryStore,
     pub history: SessionHistory,
     pub sources: BTreeMap<String, Source>,
+    pub file_cursors: BTreeMap<String, FileCursor>,
     pub active_tools: BTreeSet<String>,
     pub pending_tools: Option<BTreeSet<String>>,
     pub investigations: Vec<Investigation>,
@@ -156,15 +167,21 @@ pub struct Session {
     pub memory_loads: usize,
     pub history_loads: usize,
     pub document_written: bool,
+    pub last_document_write: Option<(std::path::PathBuf, String)>,
     pub last_error: Option<String>,
     pub run_guidance: Value,
+    pub activity: Value,
+    pub task_rounds: usize,
+    // Some(true): truncated tool batch; Some(false): text continuation.
+    pub continuation: Option<bool>,
 }
 impl Session {
     pub fn new(project: Project, config: Config) -> Self {
         let task = TaskState {
             purpose: project.purpose.clone(),
             scope: project.root.display().to_string(),
-            deliverables: vec![project.output.display().to_string()],
+            // A configured output is a possible destination, not a requested deliverable.
+            deliverables: vec![],
             ..Default::default()
         };
         Self {
@@ -176,7 +193,11 @@ impl Session {
             memory: Default::default(),
             history: Default::default(),
             sources: BTreeMap::new(),
-            active_tools: BTreeSet::new(),
+            file_cursors: BTreeMap::new(),
+            active_tools: ["file_read", "document_inspect", "file_list"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             pending_tools: None,
             investigations: vec![],
             checkpoint: None,
@@ -192,8 +213,12 @@ impl Session {
             memory_loads: 0,
             history_loads: 0,
             document_written: false,
+            last_document_write: None,
             last_error: None,
             run_guidance: json!({}),
+            activity: json!({}),
+            task_rounds: 0,
+            continuation: None,
         }
     }
     pub fn protected(&self) -> BTreeSet<String> {
@@ -222,14 +247,35 @@ impl Session {
                             .find(|s| &s.id == id)
                             .cloned()
                     })
-                    .ok_or_else(|| anyhow::anyhow!("unknown_source: {id}"))
+                    .ok_or_else(|| {
+                        let mut candidates: Vec<_> = self.sources.values().collect();
+                        candidates.sort_by_key(|s| std::cmp::Reverse(s.observed_at));
+                        let choices: Vec<_> = candidates.into_iter().take(8).map(|s| json!({"id":s.id,"path":s.path,"start_line":s.start_line,"end_line":s.end_line})).collect();
+                        anyhow::anyhow!("unknown_source: {id}; copy an exact ID from a matching tool result, or reread the relevant file. Do not remove source_ids to bypass this error. Recent sources (not automatic replacements): {}", json!(choices))
+                    })
             })
             .collect()
     }
     pub fn add_user(&mut self, text: String) {
+        let continuation = matches!(
+            text.trim()
+                .trim_end_matches(['.', '!'])
+                .to_lowercase()
+                .as_str(),
+            "계속 진행" | "계속" | "이어서 진행" | "continue" | "resume"
+        );
+        if !continuation {
+            self.continuation = None;
+            self.task.phase.clear();
+            self.task.require_investigation = false;
+            self.document_written = false;
+            self.last_document_write = None;
+            self.task_rounds = 0;
+            self.run_guidance = json!({});
+        }
         self.latest_request = text.clone();
         let source = Source {
-            id: id(),
+            id: crate::memory::source_id(),
             observed_at: chrono::Utc::now(),
             origin: "user".into(),
             path: None,

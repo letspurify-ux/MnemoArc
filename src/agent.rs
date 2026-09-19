@@ -98,8 +98,9 @@ async fn read_parallel(
         pruned_through: s.history.pruned_through,
     };
     let guidance = s.run_guidance.clone();
+    let file_cursors = s.file_cursors.clone();
     let owned_calls = calls.to_vec();
-    let futures=owned_calls.into_iter().map(|call|{let mut temporary=Session::new(project.clone(),config.clone());temporary.active_tools=active.clone();temporary.history=history.clone();temporary.run_guidance=guidance.clone();let cancel=cancel.clone();let timeout=config.tool_timeout_secs;async move{
+    let futures=owned_calls.into_iter().map(|call|{let mut temporary=Session::new(project.clone(),config.clone());temporary.active_tools=active.clone();temporary.history=history.clone();temporary.run_guidance=guidance.clone();temporary.file_cursors=file_cursors.clone();let cancel=cancel.clone();let timeout=config.tool_timeout_secs;async move{
         let child=cancel.child_token();let tool_cancel=child.clone();let mut job=tokio::task::spawn_blocking(move||{let result=tools::run_call_cancellable(&mut temporary,&call,&tool_cancel);(temporary,result)});
         tokio::select!{_ = cancel.cancelled()=>{child.cancel();Err(anyhow::anyhow!("cancelled"))},result=tokio::time::timeout(Duration::from_secs(timeout),&mut job)=>match result {Ok(Ok(value))=>Ok(value),Ok(Err(e))=>Err(anyhow::anyhow!("tool worker failed: {e}")),Err(_)=>{child.cancel();Err(anyhow::anyhow!("tool_timeout"))}}}
     }});
@@ -108,6 +109,7 @@ async fn read_parallel(
     while let Some(result) = pending.next().await {
         match result {
             Ok((temp, mut result)) => {
+                s.file_cursors.extend(temp.file_cursors);
                 for source in temp.sources.into_values() {
                     if let Some(path) = &source.path {
                         s.memory.stale_path(path, source.hash.as_deref());
@@ -158,6 +160,7 @@ pub async fn run_session_controlled(
     let initial_tokens = s.input_tokens + s.output_tokens;
     let mut failure = None;
     let mut finalization_attempts = 0usize;
+    let mut length_recoveries = 0usize;
     let mut repetitions = std::collections::BTreeMap::<String, usize>::new();
     let mut last_document_hash: Option<String> = None;
     let mut verified_count = s
@@ -212,19 +215,42 @@ pub async fn run_session_controlled(
             .saturating_sub(started.elapsed().as_secs());
         let fraction = (remaining as f64 / s.config.run_tokens as f64)
             .min(seconds_remaining as f64 / s.config.run_timeout_secs as f64);
-        let phase = if finalization_attempts > 0 || fraction <= s.config.verification_reserve_ratio
-        {
-            "verify"
-        } else if fraction <= s.config.writing_reserve_ratio {
-            "draft"
-        } else {
-            "investigate"
+        let budget_phase =
+            if finalization_attempts > 0 || fraction <= s.config.verification_reserve_ratio {
+                "verify"
+            } else if fraction <= s.config.writing_reserve_ratio {
+                "draft"
+            } else {
+                "investigate"
+            };
+        // Progress survives resume and budget increases; only a new task resets it.
+        let rank = |phase: &str| match phase {
+            "answer" => 3,
+            "verify" => 2,
+            "draft" => 1,
+            _ => 0,
         };
-        s.run_guidance = json!({"finalization_attempts":finalization_attempts,"phase":phase,"remaining_tokens":remaining,"remaining_seconds":seconds_remaining,
+        let mut phase = budget_phase.to_string();
+        if rank(&s.task.phase) > rank(&phase) {
+            phase = s.task.phase.clone();
+        }
+        // Chat explanations get a bounded investigation hint, not a forced finish:
+        // missing evidence may still be read, while document workflows retain verification.
+        if s.task_rounds >= 6 && s.investigations.is_empty() && !s.document_written {
+            phase = "answer".into();
+        }
+        if finalization_attempts > 0 {
+            // A rejected document completion always returns to verification,
+            // even if the model previously declared itself ready to answer.
+            phase = "verify".into();
+        }
+        s.task.phase = phase.clone();
+        s.run_guidance = json!({"task_rounds":s.task_rounds,"finalization_attempts":finalization_attempts,"phase":phase,"remaining_tokens":remaining,"remaining_seconds":seconds_remaining,
             "writing_reserve_tokens":(s.config.run_tokens as f64*s.config.writing_reserve_ratio) as usize,
             "verification_reserve_tokens":(s.config.run_tokens as f64*s.config.verification_reserve_ratio) as usize,
             "pending_count":s.investigations.iter().filter(|i|i.status != "verified").count(),
-            "instruction":match phase {"verify"=>"Stop expanding scope. Audit and verify existing sections, fix factual errors, then report remaining unknowns.","draft"=>"Write investigated sections now; use targeted reads only. Preserve verification budget.",_=>"Investigate incrementally and write each completed section."}});
+            "completion_error":if finalization_attempts > 0 { s.last_error.as_deref() } else { None },
+            "instruction":match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, audit and verify existing sections and fix factual errors. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, write investigated sections now and preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>"For source documentation, investigate incrementally and write completed sections. For a question or existing-document summary, read only relevant content and answer directly; no source audit or document write is required."}});
         let definitions = ToolRegistry::definitions(&s);
         let mut request = match ContextManager::request(&s, definitions.clone()) {
             Ok(r) => r,
@@ -275,6 +301,8 @@ pub async fn run_session_controlled(
         if let Some(cp) = &mut s.checkpoint {
             cp.attempts += 1;
         }
+        s.task_rounds += 1;
+        s.activity = json!({"stage":"model","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds});
         snapshot(&s, &events).await;
         let (tx, mut rx) = mpsc::channel(64);
         let event_tx = events.clone();
@@ -313,12 +341,43 @@ pub async fn run_session_controlled(
         } else {
             s.usage_incomplete = true;
             s.input_tokens += request_tokens;
-            s.output_tokens += context::tokens(&completion.text, &s.config.model)
-                + completion
-                    .calls
-                    .iter()
-                    .map(|c| context::tokens(&c.arguments, &s.config.model))
-                    .sum::<usize>();
+            s.output_tokens += if completion.length_limited {
+                // No provider usage: length exhaustion may be invisible reasoning.
+                request_config.output_tokens
+            } else {
+                context::tokens(&completion.text, &s.config.model)
+                    + completion
+                        .calls
+                        .iter()
+                        .map(|c| context::tokens(&c.arguments, &s.config.model))
+                        .sum::<usize>()
+            };
+        }
+        if completion.length_limited {
+            let mut partial = assistant(&completion.text, &[]);
+            partial["partial"] = json!(true);
+            partial["continues_previous"] =
+                json!(s.continuation.is_some() && s.checkpoint.is_none());
+            let id = s.history.push(vec![partial], true);
+            if let Some(cp) = &mut s.checkpoint {
+                cp.maintenance_bundle_ids.push(id);
+            } else {
+                s.continuation = Some(completion.discarded_tool_calls);
+            }
+            length_recoveries += 1;
+            s.activity = json!({"stage":"continuing","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds});
+            snapshot(&s, &events).await;
+            if length_recoveries >= 3 {
+                failure = Some("length_recovery_limit: partial text retained after 3 output-limit responses; shorten the requested answer or adjust output/reasoning settings before resuming".into());
+                break;
+            }
+            // Use the normal next-request path for budget, timeout, cancellation
+            // and checkpoint checks; never execute a length-limited tool batch.
+            continue;
+        }
+        let continuing = s.continuation.is_some() && s.checkpoint.is_none();
+        if s.checkpoint.is_none() {
+            s.continuation = None;
         }
         let batch_limit = if s.checkpoint.is_some() {
             ContextManager::cleanup_result_budget(&s.config)
@@ -333,7 +392,11 @@ pub async fn run_session_controlled(
             break;
         }
         if completion.calls.is_empty() {
-            let id = s.history.push(vec![assistant(&completion.text, &[])], true);
+            let mut message = assistant(&completion.text, &[]);
+            if continuing {
+                message["continues_previous"] = json!(true);
+            }
+            let id = s.history.push(vec![message], true);
             if let Some(cp) = &mut s.checkpoint {
                 cp.maintenance_bundle_ids.push(id);
                 continue;
@@ -343,9 +406,12 @@ pub async fn run_session_controlled(
                     Some("Pending settings still require cleanup; old settings retained".into());
                 break;
             }
-            if s.document_written && s.investigations.is_empty() {
+            if let Err(error) = tools::verify_document_write(&s) {
                 s.status = "partial".into();
-                s.last_error = Some("Document has no verified investigation coverage".into());
+                s.last_error = Some(error.to_string());
+            } else if s.task.require_investigation && s.investigations.is_empty() {
+                s.status = "partial".into();
+                s.last_error = Some("Required source-evidence coverage is missing: create investigation items with investigation action=upsert, then compare sources and document and verify them before finishing".into());
             } else if !s.investigations.is_empty() {
                 let _ = tools::revalidate(&mut s);
                 if s.investigations.iter().any(|i| i.status != "verified") {
@@ -373,6 +439,7 @@ pub async fn run_session_controlled(
                 }
             } else {
                 s.status = "complete".into();
+                s.last_error = None;
             }
             if s.status == "partial" && finalization_attempts < s.config.review_limit.min(2) {
                 finalization_attempts += 1;
@@ -406,6 +473,8 @@ pub async fn run_session_controlled(
                     group += 1
                 }
             }
+            s.activity = json!({"stage":"tools","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds,"tools":execution_calls[i..i+group].iter().map(|c| c.name.clone()).collect::<Vec<_>>()});
+            snapshot(&s, &events).await;
             let results = if parallel {
                 read_parallel(&mut s, &execution_calls[i..i + group], &cancel).await
             } else {
@@ -451,9 +520,12 @@ pub async fn run_session_controlled(
                     cp.failed = true;
                     cp.acknowledged = false;
                 }
+                // Share the remaining budget fairly; early large reads must not
+                // starve later reads into archive-only responses.
                 let slots = execution_calls.len() - messages.len() + 1;
                 let budget = remaining
-                    .saturating_sub(slots.saturating_sub(1) * 200)
+                    .checked_div(slots)
+                    .unwrap_or(0)
                     .min(s.config.result_tokens)
                     .max(200);
                 let result = tools::limit_result(&mut s, call, result, budget);
@@ -513,8 +585,14 @@ pub async fn run_session_controlled(
             break;
         }
         // Bound ancillary session data too; never silently discard observations or receipts.
-        if serde_json::to_vec(&(&s.sources, &s.ledger, &s.investigations, &s.task))
-            .map_or(true, |v| v.len() > s.config.memory_bytes)
+        if serde_json::to_vec(&(
+            &s.sources,
+            &s.ledger,
+            &s.investigations,
+            &s.task,
+            &s.file_cursors,
+        ))
+        .map_or(true, |v| v.len() > s.config.memory_bytes)
         {
             failure = Some(
                 "session_metadata_capacity: start another session or reduce retained details"
@@ -531,6 +609,7 @@ pub async fn run_session_controlled(
         s.status = "blocked".into();
         s.last_error = Some(error);
     }
+    s.activity = json!({"stage":"idle"});
     snapshot(&s, &events).await;
     s
 }

@@ -48,6 +48,47 @@ pub(super) fn headings(doc: &str) -> Vec<Heading> {
     result
 }
 
+/// Full headings match exactly; bare titles are accepted only when unique.
+pub(super) fn resolve_heading(doc: &str, requested: &str) -> Result<Heading> {
+    let requested = requested.trim();
+    let headings = headings(doc);
+    let matches = |h: &&Heading| {
+        if requested.is_empty() {
+            return false;
+        }
+        if requested.starts_with('#') {
+            h.heading == requested
+        } else {
+            h.heading.trim_start_matches('#').trim_start() == requested
+        }
+    };
+    let matching: Vec<_> = headings.iter().filter(matches).collect();
+    if matching.len() != 1 {
+        let candidates: Vec<_> = if matching.is_empty() {
+            headings.iter().take(8).collect()
+        } else {
+            matching.iter().copied().take(8).collect()
+        };
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .map(|h| json!({"heading":h.heading,"start_line":h.line}))
+            .collect();
+        if matching.is_empty() {
+            bail!(
+                "section_not_found: {requested:?}; use document_inspect without section for the outline. Headings: {}",
+                json!(candidates)
+            );
+        }
+        bail!(
+            "ambiguous_section: {requested:?} matches {} headings; supply an exact heading including # when levels differ. If exact headings repeat, use file_read with start_line for reading. Matches: {}",
+            matching.len(),
+            json!(candidates)
+        );
+    }
+    let start = matching[0].start;
+    Ok(headings.into_iter().find(|h| h.start == start).unwrap())
+}
+
 pub(super) fn execute(
     s: &mut Session,
     name: &str,
@@ -71,20 +112,15 @@ pub(super) fn execute(
             }
             let mut result = json!({"exists":true,"path":path,"hash":hash(doc.as_bytes()),"total_lines":doc.lines().count(),"bytes":doc.len()});
             if let Some(heading) = args["section"].as_str() {
-                let section = section_text(&doc, heading)?;
+                let resolved = resolve_heading(&doc, heading)?;
+                let section = &doc[resolved.start..resolved.end];
                 if n(args, "offset", 0) > section.chars().count() {
                     bail!("invalid_offset");
                 }
-                result["section"] = json!(heading.trim());
+                result["section"] = json!(resolved.heading);
                 result["section_hash"] = json!(hash(section.as_bytes()));
                 result["content"] = bounded_text(s, section, n(args, "offset", 0));
-                result["start_line"] = json!(
-                    headings(&doc)
-                        .iter()
-                        .find(|h| h.heading == heading.trim())
-                        .unwrap()
-                        .line
-                );
+                result["start_line"] = json!(resolved.line);
                 result["section_lines"] = json!(section.lines().count());
             } else {
                 let headings = headings(&doc);
@@ -103,7 +139,9 @@ pub(super) fn execute(
                 r"^\s*(?:(?:export|default|pub(?:\([^)]*\))?|async|abstract|declare|static)\s+)*(?:(?:function\*?|class|interface|type|enum|struct|trait|fn|def|const|let|var)\s+([\p{L}_$][\p{L}\p{N}_$]*))",
             )?;
             let query = args["query"].as_str().unwrap_or("").to_lowercase();
-            let files = paths(&s.project, args["pattern"].as_str(), cancel)?;
+            let files = paths(&s.project, path_glob(args)?, cancel)?;
+            let matched_files = files.len();
+            let mut scanned_files = 0usize;
             let mut rows = vec![];
             let mut fingerprint = Sha256::new();
             fingerprint.update(query.as_bytes());
@@ -117,6 +155,7 @@ pub(super) fn execute(
                 ) {
                     continue;
                 }
+                scanned_files += 1;
                 let contents = read_text(&path)?;
                 let digest = hash(contents.as_bytes());
                 fingerprint.update(path.to_string_lossy().as_bytes());
@@ -149,7 +188,7 @@ pub(super) fn execute(
                 json!({"name":name,"path":path,"line":line,"declaration":excerpt,"source":source})
             }).collect::<Vec<_>>();
             Ok(
-                json!({"hash":fingerprint,"symbols":results,"heuristic":true,"limitations":"Declarations only; may include constants/comments and miss multiline or method declarations. Not semantic references.","next_cursor":(end<rows.len()).then(||format!("{fingerprint}:{end}"))}),
+                json!({"hash":fingerprint,"symbols":results,"matched_files":matched_files,"scanned_files":scanned_files,"heuristic":true,"limitations":"Declarations only; may include constants/comments and miss multiline or method declarations. Not semantic references.","next_cursor":(end<rows.len()).then(||format!("{fingerprint}:{end}"))}),
             )
         }
         "document_audit" => {

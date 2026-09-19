@@ -280,3 +280,65 @@ async fn malformed_sse_event_is_labeled_and_retried_once() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     server.abort();
 }
+
+#[tokio::test]
+async fn length_retains_last_delta_and_usage_but_discards_entire_tool_batch() {
+    let body = [
+        event(json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"valid","function":{"name":"document_edit","arguments":"{\"action\":\"create\",\"text\":\"unsafe\"}"}},
+            {"index":1,"id":"partial","function":{"name":"document_edit","arguments":"{\"text\":"}}
+        ]},"finish_reason":null}]})),
+        event(json!({"choices":[{"delta":{"content":"받은 답변"},"finish_reason":"length"}]})),
+        event(json!({"choices":[],"usage":{"prompt_tokens":123,"completion_tokens":16000,"prompt_tokens_details":{"cached_tokens":20}}})),
+        "data: [DONE]\n\n".into(),
+    ].concat();
+    let (url, server) = server(body).await;
+    let config = Config {
+        base_url: url,
+        ..Default::default()
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let result = OpenAiClient
+        .complete(
+            json!({"messages":[]}),
+            &config,
+            CancellationToken::new(),
+            tx,
+        )
+        .await
+        .unwrap();
+    assert!(result.length_limited && result.discarded_tool_calls);
+    assert!(result.calls.is_empty());
+    assert_eq!(result.text, "받은 답변");
+    assert_eq!(rx.recv().await.as_deref(), Some("받은 답변"));
+    let usage = result.usage.unwrap();
+    assert_eq!(
+        (usage.input, usage.output, usage.cached),
+        (123, 16000, Some(20))
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn length_without_done_remains_a_stream_error() {
+    let (url, server) = server(event(
+        json!({"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}]}),
+    ))
+    .await;
+    let config = Config {
+        base_url: url,
+        ..Default::default()
+    };
+    let (tx, _) = tokio::sync::mpsc::channel(8);
+    let error = OpenAiClient
+        .complete(
+            json!({"messages":[]}),
+            &config,
+            CancellationToken::new(),
+            tx,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("stream_interrupted"));
+    server.abort();
+}
