@@ -18,8 +18,24 @@ pub(super) fn execute(
     args: &Value,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value> {
-    let query = text(args, "query")?;
-    if query.is_empty() {
+    if args.get("query").is_some() == args.get("queries").is_some() {
+        bail!(
+            "conflicting_arguments: supply exactly one of query (literal by default) or queries (literal OR)"
+        );
+    }
+    let query = args["query"].as_str().unwrap_or("");
+    let terms = args["queries"].as_array();
+    if let Some(terms) = terms {
+        if terms.is_empty()
+            || terms.len() > 16
+            || terms.iter().any(|t| t.as_str().is_none_or(str::is_empty))
+        {
+            bail!("invalid_argument_value: queries requires 1 to 16 nonempty literal strings");
+        }
+        if args["regex"] == true {
+            bail!("conflicting_arguments: queries is literal OR; use query for regex");
+        }
+    } else if query.is_empty() {
         bail!("query required");
     }
     if args.get("path").is_some()
@@ -42,7 +58,16 @@ pub(super) fn execute(
     if mode != "matches" && (before != 0 || after != 0) {
         bail!("invalid_argument_value: before/after require mode=matches");
     }
-    let mut expression = if args["regex"].as_bool().unwrap_or(false) {
+    let mut expression = if let Some(terms) = terms {
+        format!(
+            "(?:{})",
+            terms
+                .iter()
+                .map(|t| regex::escape(t.as_str().unwrap()))
+                .collect::<Vec<_>>()
+                .join("|")
+        )
+    } else if args["regex"].as_bool().unwrap_or(false) {
         query.to_owned()
     } else {
         regex::escape(query)
@@ -55,7 +80,7 @@ pub(super) fn execute(
     let regex = regex::RegexBuilder::new(&expression)
         .case_insensitive(!case_sensitive)
         .size_limit(1024 * 1024)
-        .build()?;
+        .build().map_err(|e| anyhow::anyhow!("invalid_search_regex: {e}; no search executed. For literal code such as .on(, retry with regex:false; for literal alternatives use queries. Keep the same file scope."))?;
     let mut fingerprint = Sha256::new();
     // Presentation options are part of the cursor identity too: an offset into
     // matching lines cannot be reused as an offset into matching files.
@@ -175,7 +200,7 @@ pub(super) fn execute(
             "Files were searched but the query did not match. Keep the file scope and try a shorter known identifier or route; do not guess call syntax, receiver names or quote style. Use before/after for nearby navigation context, then file_read for evidence."
         }.to_owned();
         if matched_files > 0 && !args["regex"].as_bool().unwrap_or(false) && query.contains('|') {
-            guidance.push_str(" This query was literal: | does not mean OR. If alternatives were intended, explicitly set regex:true; literal matching has not been changed automatically.");
+            guidance.push_str(" This query was literal: | does not mean OR. For literal alternatives put the intended strings in the queries array. Use regex:true only for intentional regex syntax. Literal matching has not been changed automatically.");
         }
         output["guidance"] = json!(guidance);
     }

@@ -27,6 +27,7 @@ fn s(dir: &std::path::Path) -> Session {
             ..Default::default()
         },
         Config {
+            source_answer_review: false,
             model: "gpt-4o".into(),
             model_context: Some(128000),
             ..Default::default()

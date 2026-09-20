@@ -299,3 +299,43 @@ fn exact_path_search_is_literal_scoped_and_cursor_bound() {
         .is_err()
     );
 }
+
+#[test]
+fn literal_alternatives_preserve_punctuation_and_cursor_identity() {
+    let (dir, mut s) = setup();
+    std::fs::write(
+        dir.path().join("a.js"),
+        "res.on('close')\nreq.once('close')\nclose|req.on\nelse\n",
+    )
+    .unwrap();
+    let args = json!({"path":"a.js","queries":["res.on(","req.once("],"limit":1});
+    let first = search(&mut s, args.clone());
+    assert_eq!(first["total_matching_lines"], 2);
+    assert_eq!(first["matches"][0]["line"], 1);
+    let mut next = args;
+    next["cursor"] = first["next_cursor"].clone();
+    assert_eq!(search(&mut s, next.clone())["matches"][0]["line"], 2);
+    next["queries"] = json!(["else"]);
+    assert!(tools::execute(&mut s, "source_search", next).is_err());
+    for invalid in [
+        json!({}),
+        json!({"query":"a","queries":["b"]}),
+        json!({"queries":[]}),
+        json!({"queries":[""]}),
+        json!({"queries":["a"],"regex":true}),
+    ] {
+        assert!(tools::execute(&mut s, "source_search", invalid).is_err());
+    }
+    let error = tools::execute(
+        &mut s,
+        "source_search",
+        json!({"path":"a.js","query":".on(","regex":true}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("invalid_search_regex") && error.contains("regex:false"));
+    assert_eq!(
+        search(&mut s, json!({"path":"a.js","query":".on("}))["total_matching_lines"],
+        1
+    );
+}

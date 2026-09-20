@@ -326,7 +326,7 @@ pub async fn run_session_controlled(
             "verification_reserve_tokens":(s.config.run_tokens as f64*s.config.verification_reserve_ratio) as usize,
             "pending_count":s.investigations.iter().filter(|i|i.status != "verified").count(),
             "completion_error":if finalization_attempts > 0 { s.last_error.as_deref() } else { None },
-            "instruction":match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, audit and verify existing sections and fix factual errors. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, write investigated sections now and preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>"For source documentation, investigate incrementally and write completed sections. For a question or existing-document summary, read only relevant content and answer directly; no source audit or document write is required."}});
+            "instruction":match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, audit and verify existing sections and fix factual errors. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, write investigated sections now and preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>"For source documentation, investigate incrementally and write completed sections. For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. Answer once evidence is sufficient; no source audit or document write is required."}});
         let definitions = ToolRegistry::definitions(&s);
         let mut request = match ContextManager::request(&s, definitions.clone()) {
             Ok(r) => r,
@@ -355,6 +355,18 @@ pub async fn run_session_controlled(
                 }
             };
         }
+        let reviewing_answer = s.answer_draft.is_some() && s.checkpoint.is_none();
+        if reviewing_answer {
+            request = match tools::answer_review::request(&s) {
+                Ok(request) => request,
+                Err(error) => {
+                    failure = Some(error.to_string());
+                    break;
+                }
+            };
+        }
+        let buffer_answer =
+            reviewing_answer || (s.checkpoint.is_none() && tools::answer_review::eligible(&s));
         let request_tokens = context::count(&request, &s.config.model);
         // Reasoning models spend output tokens on reasoning too; retain the
         // configured output allowance and reserve it for every cleanup round.
@@ -384,7 +396,7 @@ pub async fn run_session_controlled(
             cp.attempts += 1;
         }
         s.task_rounds += 1;
-        s.activity = json!({"stage":"model","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds});
+        s.activity = json!({"stage":if reviewing_answer {"answer_review"} else {"model"},"started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds});
         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
         let deadline = run_deadline(started, &s.config);
         if tokio::time::Instant::now() >= deadline {
@@ -406,6 +418,9 @@ pub async fn run_session_controlled(
                     text = rx.recv() => text,
                 };
                 let Some(text) = text else { break };
+                if buffer_answer {
+                    continue;
+                }
                 emit(
                     &event_tx,
                     AgentEvent::Delta {
@@ -419,6 +434,7 @@ pub async fn run_session_controlled(
             }
         });
         let _relay_guard = AbortOnDrop(relay.abort_handle());
+        let usage_before = (s.input_tokens, s.output_tokens);
         let response = tokio::select! {_ = cancel.cancelled()=>Err(anyhow::anyhow!("cancelled")),result=tokio::time::timeout_at(deadline,std::panic::AssertUnwindSafe(client.complete(request,&request_config,cancel.clone(),tx)).catch_unwind())=>match result{Ok(Ok(r))=>r,Ok(Err(_))=>Err(anyhow::anyhow!("model_worker_panic: model request interrupted; session retained")),Err(_)=>Err(anyhow::anyhow!("run_timeout"))}};
         relay_done.cancel();
         let _ = relay.await;
@@ -460,6 +476,24 @@ pub async fn run_session_controlled(
                             .sum::<usize>()
                 });
         }
+        if reviewing_answer {
+            s.answer_review_input_tokens += s.input_tokens.saturating_sub(usage_before.0);
+            s.answer_review_output_tokens += s.output_tokens.saturating_sub(usage_before.1);
+        }
+        if reviewing_answer
+            && (completion.length_limited
+                || !completion.calls.is_empty()
+                || completion.text.trim().is_empty())
+        {
+            failure = Some("answer_review_incomplete: review must return one complete answer without tools; draft retained".into());
+            break;
+        }
+        if completion.length_limited && buffer_answer && !completion.discarded_tool_calls {
+            // A source draft need not be streamed or continued verbatim: the
+            // bounded review can produce a complete answer from its evidence.
+            s.answer_draft = Some(completion.text.clone());
+            continue;
+        }
         if completion.length_limited {
             let mut partial = assistant(&completion.text, &[]);
             partial["partial"] = json!(true);
@@ -499,6 +533,35 @@ pub async fn run_session_controlled(
             break;
         }
         if completion.calls.is_empty() {
+            if !reviewing_answer && s.checkpoint.is_none() && tools::answer_review::eligible(&s) {
+                s.answer_draft = Some(completion.text.clone());
+                s.activity = json!({"stage":"answer_review"});
+                emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"Checking the source answer against delivered evidence (one bounded review).".into() }, &cancel, run_deadline(started, &s.config)).await;
+                snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
+                continue;
+            }
+            let citation_issues = if reviewing_answer {
+                s.answer_reviewed = true;
+                s.answer_review_original = s.answer_draft.take();
+                tools::answer_review::citation_issues(&s, &completion.text)
+            } else if s.answer_reviewed {
+                tools::answer_review::citation_issues(&s, &completion.text)
+            } else {
+                vec![]
+            };
+            s.answer_review_issues = citation_issues.clone();
+            if buffer_answer {
+                emit(
+                    &events,
+                    AgentEvent::Delta {
+                        session: s.id.clone(),
+                        text: completion.text.clone(),
+                    },
+                    &cancel,
+                    run_deadline(started, &s.config),
+                )
+                .await;
+            }
             let mut message = assistant(&completion.text, &[]);
             if continuing {
                 message["continues_previous"] = json!(true);
@@ -511,6 +574,14 @@ pub async fn run_session_controlled(
             if s.pending_config.is_some() {
                 failure =
                     Some("Pending settings still require cleanup; old settings retained".into());
+                break;
+            }
+            if !citation_issues.is_empty() {
+                s.status = "partial".into();
+                s.last_error = Some(format!(
+                    "answer_citation_check: {}; one review completed, further review is not automatic",
+                    citation_issues.join("; ")
+                ));
                 break;
             }
             if let Err(error) = tools::verify_document_write(&s) {
@@ -555,6 +626,18 @@ pub async fn run_session_controlled(
                 continue;
             }
             break;
+        }
+        if buffer_answer && !completion.text.is_empty() {
+            emit(
+                &events,
+                AgentEvent::Delta {
+                    session: s.id.clone(),
+                    text: completion.text.clone(),
+                },
+                &cancel,
+                run_deadline(started, &s.config),
+            )
+            .await;
         }
         let mut messages = vec![assistant(&completion.text, &completion.calls)];
         // A checkpoint acknowledges the whole batch. Evaluate it after writes,

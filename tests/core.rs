@@ -597,6 +597,31 @@ fn catalog_finds_spaced_tool_names_and_new_sessions_can_read() {
     assert!(s.active_tools.contains("file_read"));
     assert!(s.active_tools.contains("document_inspect"));
     assert!(!s.active_tools.contains("document_edit"));
+    std::fs::write(
+        dir.path().join("nav.rs"),
+        "fn target() { println!(\"found\"); }\n",
+    )
+    .unwrap();
+    let search = tools::execute(
+        &mut s,
+        "source_search",
+        json!({"path":"nav.rs","query":"target"}),
+    )
+    .unwrap();
+    assert_eq!(search["total_matching_lines"], 1);
+    let outline = tools::execute(
+        &mut s,
+        "code_outline",
+        json!({"path":"nav.rs","query":"target","match":"exact"}),
+    )
+    .unwrap();
+    let body = tools::execute(
+        &mut s,
+        "symbol_read",
+        json!({"path":"nav.rs","symbol_id":outline["symbols"][0]["symbol_id"],"max_lines":5}),
+    )
+    .unwrap();
+    assert!(body["content"]["text"].as_str().unwrap().contains("found"));
     for (query, expected) in [
         ("file read", "file_read"),
         ("document inspect edit", "document_inspect"),

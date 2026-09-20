@@ -99,7 +99,7 @@ cargo run -- run --project /path/to/project --output docs/source-summary.md \
 
 부분 완료·복구 가능한 중단은 종료 코드 2로 표시합니다. 취소하거나 프로그램을 종료해도 이미 작성한 결과 파일은 남습니다.
 
-기존 문서의 요약·설명·Mermaid 요청은 관련 구간을 읽고 채팅으로 답하도록 안내합니다. 새 세션은 `file_list`, `file_read`, `document_inspect`를 바로 제공하며, 프로젝트의 출력 경로를 자동으로 작성해야 할 산출물로 지정하지 않습니다. 소스 조사·문서 수정·검증은 해당 작업을 요청했을 때 수행하도록 지시합니다. 여러 읽기 결과는 남은 결과 예산을 균등하게 나누고, 잘린 본문은 파일/섹션 커서로 이어 읽습니다.
+기존 문서의 요약·설명·Mermaid 요청은 관련 구간을 읽고 채팅으로 답하도록 안내합니다. 새 세션은 `file_list`, `file_read`, `document_inspect`, `source_search`, `code_outline`, `symbol_read`를 바로 제공하며, 프로젝트의 출력 경로를 자동으로 작성해야 할 산출물로 지정하지 않습니다. 소스 조사·문서 수정·검증은 해당 작업을 요청했을 때 수행하도록 지시합니다. 여러 읽기 결과는 남은 결과 예산을 균등하게 나누고, 잘린 본문은 파일/섹션 커서로 이어 읽습니다.
 
 ## 기억과 컨텍스트
 
@@ -223,11 +223,15 @@ OpenAI 호환 클라이언트를 직접 호출할 때도 설정과 요청 JSON�
 파일명 탐색에는 `file_list mode=paths`를 사용해 본문 읽기를 생략할 수 있습니다. 기존 텍스트 전용 목록은 기본 `mode=text`로 유지됩니다. `source_search`는 대소문자·단어 경계 옵션, 앞뒤 문맥, 일치 파일 목록과 파일별 일치 줄 수를 지원합니다. 내용·심볼 검색의 중복 파일 읽기를 제거하고, 내용 검색은 반환할 페이지의 결과만 보관합니다. 파일 변경 감지를 위해 다음 페이지에서도 내용을 재검사합니다. 사용 예와 출처 범위는 [코드 탐색 옵션](docs/documentation-tools.md#코드-탐색-옵션)을 참고하세요.
 
 
+새 세션의 탐색 도구 기본 제공, 구문 트리 캐시와 호출·입력 토큰 회귀 기준은 [탐색 효율 개선 기록](docs/navigation-efficiency-improvement.md)을 참고하세요. 실제 모델 평가의 남은 실패도 기록했습니다.
+
+소스 채팅 답변은 기본적으로 이미 읽은 근거로 동일 모델이 한 번 검토한 뒤 표시합니다. `source_answer_review` 설정으로 끌 수 있으며 추가 호출 비용이 발생합니다. 명시적 JSON 인용의 읽기 범위·파일 변경 검사와 적용 범위는 [소스 답변 검토 설계](docs/source-answer-review.md)를 참고하세요. 여러 문자열 검색은 `source_search queries:["abort", "signal"]`처럼 정규식 없이 수행할 수 있습니다.
+
 ### Tree-sitter 구조 탐색
 
 `source-docs` 그룹의 `code_outline`, `symbol_read`로 코드 구조와 심볼 본문을 탐색합니다. 구현과 자동 테스트는 Rust로 작성했습니다. Tree-sitter는 네이티브 파서의 Rust 바인딩을 사용하며 Rust, JavaScript/JSX, TypeScript/TSX, Python, Java, C#을 분석합니다.
 
-구조 조회는 별도 서버 설치 없이 사용할 수 있습니다. 사용 예와 검증 범위는 [구조 탐색](docs/documentation-tools.md#구조-탐색)을 참고하세요.
+구조 조회는 별도 서버 설치 없이 사용할 수 있습니다. 같은 내용·언어의 구문 트리는 최대 8개, 원문 크기 합계 4MiB까지 캐시해 반복 파싱을 줄입니다(트리 자체의 메모리 크기 한도를 뜻하지 않습니다). 매 호출에서 파일 권한·현재 내용 해시를 다시 확인하며 출처와 필터 결과는 재사용하지 않습니다. 사용 예와 검증 범위는 [구조 탐색](docs/documentation-tools.md#구조-탐색)을 참고하세요.
 
 LLM은 `code_outline`의 `view=compact`, `max_depth=0`으로 최상위 구조를 확인하고, `query`·`match=exact`·공통 `kind`·정확한 `container`로 범위를 좁힌 뒤 `symbol_read`로 본문을 읽을 수 있습니다. 기본 상세 응답은 유지하며 간결한 목록은 출처 근거로 취급하지 않습니다. 다음 페이지 호출에는 모든 필터가 전달되고 조건 변경 시 커서를 거부합니다.
 

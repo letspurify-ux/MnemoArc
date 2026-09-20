@@ -56,6 +56,12 @@ MNEMOARC_NAV_REPORT=/tmp/mnemoarc-navigation-report.json \
 cargo test --test navigation_eval live_navigation_regressions -- --ignored --nocapture
 ```
 
-`MNEMOARC_LIVE_CONFIG`로 설정 파일을 바꿀 수 있다. `MNEMOARC_NAV_CASES=semantics,recovery,java`에서 원하는 항목을 고를 수 있으며 반복 수는 1~5다. 실제 프로젝트 소스가 바뀌면 기대 사실과 근거 위치를 다시 검토해야 한다. Java fixture는 Rust 테스트 코드에 포함되어 동일하게 재생성된다.
+`MNEMOARC_LIVE_CONFIG`로 설정 파일을 바꿀 수 있다. `MNEMOARC_NAV_CASES=semantics,recovery,java,branches`에서 원하는 항목을 고를 수 있으며 반복 수는 1~5다. 실제 프로젝트 소스가 바뀌면 기대 사실과 근거 위치를 다시 검토해야 한다. Java fixture는 Rust 테스트 코드에 포함되어 동일하게 재생성된다.
 
 최종 일반 테스트 131개, Clippy, 포맷 검사, 릴리스 빌드가 통과했다. 일반 실행에서 제외되는 유료 테스트는 3개이며 위 실제 모델 평가는 별도로 실행했다.
+
+## 후속 효율 개선
+
+새 세션 기본 탐색 도구, 구문 트리 캐시, 호출·토큰 상한 검사와 추가 실측은 [소스 탐색 효율 개선](navigation-efficiency-improvement.md)에 기록했다. 후속 실측에는 의미·인용·비용 기준 실패가 남아 있으므로 위 과거 통과 결과를 현재 실행의 안정성 보장으로 해석하지 않는다.
+
+소스 답변 1회 검토와 문자 OR 검색의 설계·후속 평가 조건은 [소스 답변 검토](source-answer-review.md)를 참고한다. `MNEMOARC_NAV_REVIEW=off`는 검토만 끄는 비교 옵션이다.

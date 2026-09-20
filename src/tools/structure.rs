@@ -1,5 +1,48 @@
 use super::*;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
+
+// Cache only syntax, never sources, permissions, filtered results or evidence.
+// Every call still reads and hashes the current allowed file before lookup.
+// Entry count and aggregate input size bound retention; large files bypass it.
+#[derive(Default)]
+struct SyntaxCache {
+    entries: std::collections::VecDeque<(&'static str, String, usize, Tree)>,
+}
+impl SyntaxCache {
+    const MAX_ENTRIES: usize = 8;
+    const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+
+    fn get(&mut self, language: &str, digest: &str) -> Option<Tree> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(lang, hash, _, _)| *lang == language && hash == digest)?;
+        let entry = self.entries.remove(index)?;
+        let tree = entry.3.clone();
+        self.entries.push_back(entry);
+        Some(tree)
+    }
+
+    fn insert(&mut self, language: &'static str, digest: String, bytes: usize, tree: Tree) {
+        if bytes > Self::MAX_SOURCE_BYTES {
+            return;
+        }
+        self.entries
+            .retain(|(lang, hash, _, _)| *lang != language || *hash != digest);
+        while self.entries.len() >= Self::MAX_ENTRIES
+            || self.entries.iter().map(|entry| entry.2).sum::<usize>() + bytes
+                > Self::MAX_SOURCE_BYTES
+        {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((language, digest, bytes, tree));
+    }
+}
+
+fn syntax_cache() -> &'static std::sync::Mutex<SyntaxCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<SyntaxCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
 
 pub(super) fn language(path: &Path) -> Result<&'static str> {
     match path.extension().and_then(|s| s.to_str()) {
@@ -338,24 +381,43 @@ pub(super) fn execute(
         "csharp" => tree_sitter_c_sharp::LANGUAGE.into(),
         _ => unreachable!(),
     };
-    let mut parser = Parser::new();
-    parser.set_language(&grammar)?;
     let started = std::time::Instant::now();
     let deadline = std::time::Duration::from_secs(s.config.tool_timeout_secs);
-    let mut stop = |_: &tree_sitter::ParseState| {
-        if cancel.is_cancelled() || started.elapsed() >= deadline {
-            std::ops::ControlFlow::Break(())
-        } else {
-            std::ops::ControlFlow::Continue(())
+    if cancel.is_cancelled() {
+        bail!("cancelled");
+    }
+    let cached = syntax_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(language, &digest);
+    let tree = match cached {
+        Some(tree) => tree,
+        None => {
+            let mut parser = Parser::new();
+            parser.set_language(&grammar)?;
+            let mut stop = |_: &tree_sitter::ParseState| {
+                if cancel.is_cancelled() || started.elapsed() >= deadline {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            };
+            let tree = parser
+                .parse_with_options(
+                    &mut |offset, _| &source.as_bytes()[offset..],
+                    None,
+                    Some(tree_sitter::ParseOptions::new().progress_callback(&mut stop)),
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!("cancelled_or_timeout: structure parsing interrupted")
+                })?;
+            syntax_cache()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(language, digest.clone(), source.len(), tree.clone());
+            tree
         }
     };
-    let tree = parser
-        .parse_with_options(
-            &mut |offset, _| &source.as_bytes()[offset..],
-            None,
-            Some(tree_sitter::ParseOptions::new().progress_callback(&mut stop)),
-        )
-        .ok_or_else(|| anyhow::anyhow!("cancelled_or_timeout: structure parsing interrupted"))?;
     let mut stack = vec![(tree.root_node(), String::new(), "", 0u64)];
     let mut symbols = Vec::new();
     let mut containers = std::collections::BTreeSet::new();
@@ -519,4 +581,42 @@ pub(super) fn execute(
         result["container_suggestions_truncated"] = json!(containers.len() > 12);
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn syntax_cache_separates_revisions_languages_and_bounds_retention() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn old() {}", None).unwrap();
+        let mut cache = SyntaxCache::default();
+        cache.insert("rust", "old".into(), 12, tree.clone());
+        assert!(cache.get("rust", "old").is_some());
+        assert!(cache.get("rust", "changed").is_none());
+        assert!(cache.get("javascript", "old").is_none());
+        for i in 0..SyntaxCache::MAX_ENTRIES {
+            cache.insert("rust", i.to_string(), 12, tree.clone());
+        }
+        assert!(cache.get("rust", "old").is_none());
+        cache.insert(
+            "rust",
+            "large".into(),
+            SyntaxCache::MAX_SOURCE_BYTES,
+            tree.clone(),
+        );
+        assert_eq!(cache.entries.len(), 1);
+        cache.insert(
+            "rust",
+            "oversized".into(),
+            SyntaxCache::MAX_SOURCE_BYTES + 1,
+            tree,
+        );
+        assert!(cache.get("rust", "oversized").is_none());
+        assert!(cache.get("rust", "large").is_some());
+    }
 }

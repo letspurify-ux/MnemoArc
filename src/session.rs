@@ -180,6 +180,14 @@ pub struct Session {
     pub run_guidance: Value,
     pub activity: Value,
     pub task_rounds: usize,
+    pub answer_draft: Option<String>,
+    pub answer_reviewed: bool,
+    pub answer_review_original: Option<String>,
+    pub answer_review_issues: Vec<String>,
+    pub answer_review_input_tokens: usize,
+    pub answer_review_output_tokens: usize,
+    pub answer_review_start: u64,
+    pub answer_review_question: String,
     // Some(true): truncated tool batch; Some(false): text continuation.
     pub continuation: Option<bool>,
 }
@@ -203,10 +211,17 @@ impl Session {
             sources: BTreeMap::new(),
             file_cursors: BTreeMap::new(),
             read_coverage: BTreeMap::new(),
-            active_tools: ["file_read", "document_inspect", "file_list"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            active_tools: [
+                "file_read",
+                "document_inspect",
+                "file_list",
+                "source_search",
+                "code_outline",
+                "symbol_read",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
             pending_tools: None,
             investigations: vec![],
             checkpoint: None,
@@ -227,6 +242,14 @@ impl Session {
             run_guidance: json!({}),
             activity: json!({}),
             task_rounds: 0,
+            answer_draft: None,
+            answer_reviewed: false,
+            answer_review_original: None,
+            answer_review_issues: vec![],
+            answer_review_input_tokens: 0,
+            answer_review_output_tokens: 0,
+            answer_review_start: 0,
+            answer_review_question: String::new(),
             continuation: None,
         }
     }
@@ -274,6 +297,14 @@ impl Session {
             "계속 진행" | "계속" | "이어서 진행" | "continue" | "resume"
         );
         if !continuation {
+            self.answer_draft = None;
+            self.answer_reviewed = false;
+            self.answer_review_original = None;
+            self.answer_review_issues.clear();
+            self.answer_review_input_tokens = 0;
+            self.answer_review_output_tokens = 0;
+            self.answer_review_start = self.history.next_id + 1;
+            self.answer_review_question = text.clone();
             self.continuation = None;
             self.task.phase.clear();
             self.task.require_investigation = false;

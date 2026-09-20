@@ -1,3 +1,4 @@
+pub mod answer_review;
 mod coverage;
 mod documentation;
 mod search;
@@ -144,12 +145,12 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "source_search",
-                description: "Search source lines: query is literal text by default. For alternatives use {query:\"agent|run|db\",regex:true}; without regex=true the pipe is searched literally. case_sensitive defaults true; whole_word defaults false (Unicode word boundaries). path selects one exact file (no glob syntax); path_glob filters multiple files (pattern is a legacy alias). Do not combine path with path_glob or pattern. mode=matches (default) returns matching lines and source IDs; files returns matching paths; count returns matching-line counts per file. before/after add up to 20 context lines each in matches mode. Each displayed line is capped at 500 characters with truncation marked. Reuse the same search options with cursor for pagination; limit may change. Hashes detect source changes",
+                description: "Search source lines: query is literal text by default. Prefer queries:[\"agent\",\"run\",\"db\"] for literal OR without regex escaping. Supply exactly one of query or queries. Use regex:true only for intentional regular expressions; punctuation such as .on( is literal unless regex:true. case_sensitive defaults true; whole_word defaults false (Unicode word boundaries). path selects one exact file (no glob syntax); path_glob filters multiple files (pattern is a legacy alias). Do not combine path with path_glob or pattern. mode=matches (default) returns matching lines and source IDs; files returns matching paths; count returns matching-line counts per file. before/after add up to 20 context lines each in matches mode. Each displayed line is capped at 500 characters with truncation marked. Reuse the same search options with cursor for pagination; limit may change. Hashes detect source changes",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"query":string(),"path":string(),"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"whole_word":{"type":"boolean"},"mode":action(&["matches","files","count"]),"before":{"type":"integer","minimum":0,"maximum":20},"after":{"type":"integer","minimum":0,"maximum":20},"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number()}),
-                    &["query"],
+                    json!({"query":string(),"queries":strings(),"path":string(),"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"whole_word":{"type":"boolean"},"mode":action(&["matches","files","count"]),"before":{"type":"integer","minimum":0,"maximum":20},"after":{"type":"integer","minimum":0,"maximum":20},"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number()}),
+                    &[],
                 ),
             },
             ToolSpec {
@@ -201,7 +202,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "file_read",
-                description: "Read a new range with path, 1-based start_line and max_lines (line count). limit is accepted as a compatibility alias for max_lines; prefer max_lines. Do not use offset as a line number. Example: {path:\"src/agent.rs\",start_line:160,max_lines:140}. Relative paths resolve against project.root, NEVER the output directory or workspace parent. For project.output outside the project, copy the absolute path returned by document_inspect; do not shorten it to a basename. Example: root=/workspace/app and output=/workspace/app_summary.md requires path=/workspace/app_summary.md, not app_summary.md. Use document_inspect to read the configured output without supplying a path. If truncated, continue ONLY with {cursor: next_cursor.cursor}; never combine cursor with path/start_line/max_lines/offset. A cursor completes the original requested range and expires if the file changes. Once that range is complete, next_line indicates where a NEW range can start. Returned line_start/line_end describe delivered text; boundary flags mark partial lines. Use force_read=true only for deliberate repeat verification.",
+                description: "Read a new range with path, 1-based start_line and max_lines (line count). For a targeted source question, first locate the identifier/route with source_search or code_outline, then supply an explicit range; do not start with default first-page reads of every file. limit is accepted as a compatibility alias for max_lines; prefer max_lines. Do not use offset as a line number. Example: {path:\"src/agent.rs\",start_line:160,max_lines:140}. Relative paths resolve against project.root, NEVER the output directory or workspace parent. For project.output outside the project, copy the absolute path returned by document_inspect; do not shorten it to a basename. Example: root=/workspace/app and output=/workspace/app_summary.md requires path=/workspace/app_summary.md, not app_summary.md. Use document_inspect to read the configured output without supplying a path. If truncated, continue ONLY with {cursor: next_cursor.cursor}; never combine cursor with path/start_line/max_lines/offset. A cursor completes the original requested range and expires if the file changes. Once that range is complete, next_line indicates where a NEW range can start. Returned line_start/line_end describe delivered text; boundary flags mark partial lines. Use force_read=true only for deliberate repeat verification.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -249,7 +250,19 @@ impl ToolRegistry {
             .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
             .map(|mut t| {
                 // Keep offset for old clients, but offer the model only opaque continuation.
-                if t.name == "file_read" { t.parameters["properties"].as_object_mut().unwrap().remove("offset"); }
+                if t.name == "file_read" {
+                    t.parameters["properties"].as_object_mut().unwrap().remove("offset");
+                    t.parameters["oneOf"] = json!([
+                        {"required":["path"],"not":{"required":["cursor"]}},
+                        {"required":["cursor"],"not":{"anyOf":[{"required":["path"]},{"required":["start_line"]},{"required":["max_lines"]},{"required":["limit"]}]}}
+                    ]);
+                }
+                if t.name == "source_search" {
+                    t.parameters["oneOf"] = json!([
+                        {"required":["query"],"not":{"required":["queries"]}},
+                        {"required":["queries"],"not":{"anyOf":[{"required":["query"]},{"required":["regex"],"properties":{"regex":{"const":true}}}]}}
+                    ]);
+                }
                 json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.parameters}})
             })
             .collect()
