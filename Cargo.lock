@@ -951,6 +951,7 @@ dependencies = [
  "globset",
  "ignore",
  "libc",
+ "mime_guess",
  "regex",
  "reqwest",
  "serde",

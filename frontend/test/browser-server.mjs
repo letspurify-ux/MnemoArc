@@ -104,16 +104,8 @@ await writeFile(
 );
 const child = spawn(
   resolve("../target/debug/mnemoarc"),
-  [
-    "--config",
-    join(dir, "config.toml"),
-    "web",
-    "--port",
-    "3099",
-    "--frontend",
-    resolve("dist"),
-  ],
-  { stdio: "inherit" },
+  ["--config", join(dir, "config.toml"), "web", "--no-open", "--port", "3099"],
+  { stdio: "inherit", cwd: dir },
 );
 let stopping = false;
 async function close() {

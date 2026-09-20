@@ -13,7 +13,9 @@ export default function App() {
     [connected, setConnected] = useState(false),
     [detail, setDetail] = useState(true),
     [mobileNav, setMobileNav] = useState(false),
-    [navigating, setNavigating] = useState(false);
+    [navigating, setNavigating] = useState(false),
+    [stopped, setStopped] = useState(false),
+    [stopping, setStopping] = useState(false);
   const selection = useRef(window.location.hash.slice(1)),
     fetching = useRef(false),
     pending = useRef(false),
@@ -77,6 +79,7 @@ export default function App() {
     }
   }, []);
   useEffect(() => {
+    if (stopped) return;
     alive.current = true;
     void refresh();
     const stream = new EventSource("/api/events");
@@ -99,7 +102,7 @@ export default function App() {
       clearInterval(poll);
       clearTimeout(timer.current);
     };
-  }, [refresh]);
+  }, [refresh, stopped]);
   function choose(id) {
     selection.current = id;
     window.history.replaceState(null, "", `#${id}`);
@@ -132,10 +135,35 @@ export default function App() {
       setNavigating(false);
     }
   }
+  async function shutdown() {
+    if (
+      !window.confirm(
+        "진행 중인 작업을 중지하고 앱을 종료할까요? 저장된 문서는 유지되며 세션과 기억은 사라집니다.",
+      )
+    )
+      return;
+    setStopping(true);
+    try {
+      await send("/shutdown", {});
+      setStopped(true);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setStopping(false);
+    }
+  }
   const current = state?.sessions.find((s) => s.id === selected);
   const canRun = Boolean(
     session?.config.model && session?.config.model_context,
   );
+  if (stopped)
+    return (
+      <main style={{ padding: "3rem", maxWidth: "40rem", margin: "auto" }}>
+        <h1>앱 종료를 요청했습니다</h1>
+        <p>진행 중인 작업을 정리한 뒤 종료합니다. 이 탭을 닫아도 됩니다.</p>
+        <p>다시 사용하려면 MnemoArc 실행 파일을 실행하세요.</p>
+      </main>
+    );
   return (
     <div className="workspace">
       <aside className={`sidebar ${mobileNav ? "mobile-open" : ""}`}>
@@ -232,7 +260,11 @@ export default function App() {
           >
             <span>⚙</span>모든 설정
           </button>
-          <p>설정과 결과 파일만 디스크에 보관합니다.</p>
+          <button aria-label="앱 종료" onClick={shutdown} disabled={stopping}>
+            <span>⏻</span>
+            {stopping ? "종료 요청 중…" : "앱 종료"}
+          </button>
+          <p>탭을 닫아도 작업은 계속됩니다. 종료하려면 앱 종료를 누르세요.</p>
         </div>
       </aside>
       <main className="main-workspace">
@@ -812,17 +844,18 @@ function Inspector({ session, tools, running, onAction }) {
                       조회(document_inspect)가 반환한 절대 경로를 그대로
                       사용하세요. 파일명만 넘기면 프로젝트 안에서 찾습니다.
                       <br />
-                      시작 줄은 start_line, 읽을 줄 수는 max_lines입니다. limit은
-                      max_lines의 별칭이며 offset은 줄 번호가 아닙니다. 잘린 결과는
-                      반환된 cursor로 이어 읽으세요.
+                      시작 줄은 start_line, 읽을 줄 수는 max_lines입니다.
+                      limit은 max_lines의 별칭이며 offset은 줄 번호가 아닙니다.
+                      잘린 결과는 반환된 cursor로 이어 읽으세요.
                     </small>
                   )}
                   {tool.name === "investigation" && (
                     <small>
-                      upsert는 title을 포함해 항목 하나씩 등록합니다. 여러 항목은
-                      각각 호출하세요. verify는 id, source_ids, verification_note가
-                      필요합니다. items는 기존 작성 항목의 일괄 검증인
-                      verify_batch에서만 사용하며, 항목 ID를 키로 갖는 객체입니다.
+                      upsert는 title을 포함해 항목 하나씩 등록합니다. 여러
+                      항목은 각각 호출하세요. verify는 id, source_ids,
+                      verification_note가 필요합니다. items는 기존 작성 항목의
+                      일괄 검증인 verify_batch에서만 사용하며, 항목 ID를 키로
+                      갖는 객체입니다.
                     </small>
                   )}
                   {tool.name === "document_inspect" && (

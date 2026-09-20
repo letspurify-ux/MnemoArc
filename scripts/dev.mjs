@@ -128,7 +128,15 @@ try {
       "debug",
       process.platform === "win32" ? "mnemoarc.exe" : "mnemoarc",
     ),
-    ["web", "--port", String(backendPort), "--shutdown-on-stdin"],
+    [
+      "--config",
+      "config.toml",
+      "web",
+      "--no-open",
+      "--port",
+      String(backendPort),
+      "--shutdown-on-stdin",
+    ],
     { stdio: ["pipe", "inherit", "inherit"] },
   );
   backend.stdin.on("error", () => {});

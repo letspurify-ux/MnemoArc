@@ -10,8 +10,8 @@ use std::{collections::BTreeMap, path::PathBuf};
     about = "Session-local memory agent for evidence-based source documentation"
 )]
 struct Cli {
-    #[arg(long, default_value = "config.toml")]
-    config: PathBuf,
+    #[arg(long)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -19,10 +19,14 @@ struct Cli {
 enum Command {
     /// Serve the React browser UI and local agent API (also the default).
     Web {
-        #[arg(long, default_value_t = 3030)]
-        port: u16,
-        #[arg(long, default_value = "frontend/dist")]
-        frontend: PathBuf,
+        #[arg(long)]
+        port: Option<u16>,
+        /// Override embedded UI files for development.
+        #[arg(long)]
+        frontend: Option<PathBuf>,
+        /// Print the URL without opening a browser.
+        #[arg(long)]
+        no_open: bool,
         /// Shut down cleanly when the launcher closes its stdin pipe.
         #[arg(long, hide = true)]
         shutdown_on_stdin: bool,
@@ -38,7 +42,7 @@ enum Command {
         #[arg(long, default_value = "eval/results")]
         output: PathBuf,
     },
-    /// Run the same agent without the terminal UI.
+    /// Run the same agent without the browser UI.
     Run {
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -55,18 +59,26 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", toml::to_string_pretty(&Config::default())?);
         return Ok(());
     }
-    let config = Config::load(&cli.config, &BTreeMap::new())?;
-    match cli.command.unwrap_or(Command::Web {
-        port: 3030,
-        frontend: "frontend/dist".into(),
+    let command = cli.command.unwrap_or(Command::Web {
+        port: None,
+        frontend: None,
+        no_open: false,
         shutdown_on_stdin: false,
-    }) {
+    });
+    let path = match cli.config {
+        Some(path) => path,
+        None if matches!(command, Command::Web { .. }) => mnemoarc::desktop::config_path()?,
+        None => PathBuf::from("config.toml"),
+    };
+    let config = Config::load(&path, &BTreeMap::new())?;
+    match command {
         Command::Web {
             port,
             frontend,
             shutdown_on_stdin,
+            no_open,
         } => {
-            mnemoarc::web::serve_managed(config, cli.config, port, frontend, shutdown_on_stdin)
+            mnemoarc::web::serve_app(config, path, port, frontend, shutdown_on_stdin, !no_open)
                 .await?
         }
         Command::Config => unreachable!(),

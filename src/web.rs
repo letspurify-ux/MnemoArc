@@ -203,7 +203,12 @@ async fn local_only(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 pub fn router(state: WebState, frontend: PathBuf) -> Router {
-    Router::new()
+    app_router(state, Some(frontend))
+}
+
+pub fn app_router(state: WebState, frontend: Option<PathBuf>) -> Router {
+    let router = Router::new()
+        .route("/api/shutdown", post(shutdown_request))
         .route("/api/state", get(state_get))
         .route("/api/events", get(events))
         .route("/api/settings", put(settings))
@@ -217,12 +222,23 @@ pub fn router(state: WebState, frontend: PathBuf) -> Router {
         .route("/api/sessions/{id}/project", put(session_project))
         .route("/api/sessions/{id}/tools", put(session_tools))
         .route("/api/sessions/{id}/memories/{memory}", get(memory_get))
-        .route("/api/sessions/{id}/output", get(output))
-        .fallback_service(ServeDir::new(frontend).append_index_html_on_directories(true))
+        .route("/api/sessions/{id}/output", get(output));
+    let router = match frontend {
+        Some(path) => {
+            router.fallback_service(ServeDir::new(path).append_index_html_on_directories(true))
+        }
+        None => router.fallback(get(crate::desktop::embedded_ui)),
+    };
+    router
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn(local_only))
         .with_state(state)
 }
+async fn shutdown_request(State(s): State<WebState>) -> Json<Value> {
+    s.stopping.cancel();
+    Json(json!({"stopping": true}))
+}
+
 async fn events(
     State(s): State<WebState>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
@@ -669,14 +685,55 @@ pub async fn serve_managed(
     frontend: PathBuf,
     shutdown_on_stdin: bool,
 ) -> Result<()> {
+    serve_app(
+        config,
+        path,
+        Some(port),
+        Some(frontend),
+        shutdown_on_stdin,
+        false,
+    )
+    .await
+}
+
+pub async fn serve_app(
+    config: Config,
+    path: PathBuf,
+    port: Option<u16>,
+    frontend: Option<PathBuf>,
+    shutdown_on_stdin: bool,
+    open_browser: bool,
+) -> Result<()> {
+    if let Some(frontend) = &frontend {
+        anyhow::ensure!(
+            frontend.join("index.html").is_file(),
+            "UI index.html missing in {}",
+            frontend.display()
+        );
+    }
     let state = WebState::new(config, path, Arc::new(OpenAiClient))?;
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    let listener =
+        match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port.unwrap_or(3030)))
+            .await
+        {
+            Ok(listener) => listener,
+            Err(error) if port.is_none() && error.kind() == std::io::ErrorKind::AddrInUse => {
+                tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?
+            }
+            Err(error) => return Err(error.into()),
+        };
     println!(
         "MnemoArc: http://127.0.0.1:{}",
         listener.local_addr()?.port()
     );
-    if !frontend.join("index.html").exists() {
-        println!("React UI: run npm install && npm run dev, or npm run build first.");
+    let url = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
+    // The listener is bound before launching the browser; failures leave a usable printed URL.
+    if open_browser {
+        std::thread::spawn(move || {
+            if let Err(error) = crate::desktop::open_browser(&url) {
+                eprintln!("브라우저를 열지 못했습니다: {error}. 직접 접속하세요: {url}");
+            }
+        });
     }
     let (stdin_closed, closed) = tokio::sync::oneshot::channel();
     if shutdown_on_stdin {
@@ -688,10 +745,11 @@ pub async fn serve_managed(
         });
     }
     let shutdown = state.clone();
-    axum::serve(listener, router(state, frontend))
+    axum::serve(listener, app_router(state, frontend))
         .with_graceful_shutdown(async move {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {},
+                _ = shutdown.stopping.cancelled() => {},
                 _ = closed, if shutdown_on_stdin => {},
             }
             shutdown.shutdown().await;

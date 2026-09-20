@@ -176,3 +176,23 @@ test("length-limited Mermaid answer continues as one rendered diagram", async ({
   expect(replies[0].partial).toBe(true);
   expect(replies[1].continues_previous).toBe(true);
 });
+
+test("app exit can be cancelled and stops reconnecting after confirmation", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByText("로컬 에이전트 연결됨")).toBeVisible();
+  page.once("dialog", (dialog) => dialog.dismiss());
+  await page.getByRole("button", { name: "앱 종료", exact: true }).click();
+  await expect(page.getByText("로컬 에이전트 연결됨")).toBeVisible();
+  // The Rust launcher integration test covers actual server termination.
+  await page.route("**/api/shutdown", (route) =>
+    route.fulfill({ json: { stopping: true } }),
+  );
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "앱 종료", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "앱 종료를 요청했습니다" }),
+  ).toBeVisible();
+  await expect(page.getByText("연결 복구 중…")).toHaveCount(0);
+});

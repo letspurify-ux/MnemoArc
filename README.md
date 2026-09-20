@@ -1,10 +1,43 @@
 # MnemoArc
 
-세션 안에서 기억을 저장·검색·재사용하며 소스 코드를 조사하고 근거 있는 Markdown 문서를 만드는 에이전트입니다. **Node.js + React 브라우저 UI**와 Rust 실행부로 구성됩니다. 기존 터미널 UI는 브라우저 화면으로 교체했습니다.
+세션 안에서 기억을 저장·검색·재사용하며 소스 코드를 조사하고 근거 있는 Markdown 문서를 만드는 에이전트입니다. **React 브라우저 UI를 내장한 Rust 실행 파일**로 배포합니다. 사용자의 컴퓨터에는 Node.js·npm이나 별도 UI 폴더가 필요하지 않습니다.
 
-## 시작하기
+## 단일 실행 파일로 사용하기
 
-Node.js 22.12 이상과 Rust 2024 edition 도구 체인이 필요합니다. 프로젝트 루트의 시작·종료 스크립트를 사용하세요.
+해당 OS·CPU용 `mnemoarc`(Windows는 `mnemoarc.exe`)를 실행하면 로컬 서버가 시작되고 기본 브라우저가 자동으로 열립니다. 기본 포트는 3030이며, 이미 사용 중이면 빈 포트로 전환합니다. 실제 주소는 콘솔에도 표시합니다. 브라우저 자동 실행이 실패해도 표시된 주소로 직접 접속할 수 있습니다.
+
+```sh
+./mnemoarc
+# 브라우저를 자동으로 열지 않으려면
+./mnemoarc web --no-open
+# 포트를 명시하면 충돌 시 다른 포트로 바꾸지 않고 오류를 표시합니다.
+./mnemoarc web --port 3031
+```
+
+UI의 **앱 종료** 또는 터미널의 Ctrl+C로 진행 중인 작업을 정리하고 서버를 종료합니다. 브라우저 탭만 닫으면 작업과 서버는 계속 실행됩니다. 종료하면 RAM의 세션·기억은 사라지며 이미 저장한 문서는 유지됩니다.
+
+설정은 `--config 경로` → `MNEMOARC_CONFIG_DIR/config.toml` → 현재 폴더의 기존 `config.toml` → 다음 사용자 경로 순으로 선택합니다. 기존 설정은 자동 이동하지 않습니다.
+
+- macOS: `~/Library/Application Support/MnemoArc/config.toml`
+- Windows: `%APPDATA%\MnemoArc\config.toml`
+- Linux: `$XDG_CONFIG_HOME/mnemoarc/config.toml` 또는 `~/.config/mnemoarc/config.toml`
+
+설정을 저장할 때 폴더와 파일을 생성합니다. 저장한 API 키는 설정 파일과 같은 위치의 `config.credentials.json`에 보관합니다. 조사할 프로젝트는 UI에서 선택하며, 결과 문서는 해당 프로젝트의 지정 경로에 저장합니다. `run` 등 headless 명령은 기존처럼 현재 폴더의 `config.toml` 또는 명시한 `--config`를 사용합니다.
+
+### 배포 파일 빌드
+
+빌드하는 컴퓨터에만 Node.js 22.12 이상과 Rust 2024 edition 도구 체인이 필요합니다.
+
+```sh
+npm ci
+npm run build
+```
+
+배포할 파일은 `target/release/mnemoarc` 또는 `target/release/mnemoarc.exe` 하나입니다. React 빌드의 HTML·JS·CSS·폰트·Mermaid 청크를 모두 내장하며 실행 시 디스크에 풀지 않고 제공합니다. UI를 변경하면 `npm run build`를 다시 실행하세요. `frontend/dist/index.html`이 없으면 release 빌드는 실패하여 UI 없는 배포 파일 생성을 방지합니다. OS·CPU별 빌드와 대상 OS의 기본 시스템 라이브러리는 필요합니다.
+
+## 소스에서 개발하기
+
+Node.js와 Rust 도구 체인이 필요합니다. 다음 시작·종료 스크립트는 **개발용** Rust API와 Vite 서버를 실행합니다.
 
 macOS / Linux:
 
@@ -59,7 +92,7 @@ npm run build
 npm start
 ```
 
-이때 주소는 **http://127.0.0.1:3030**입니다. Rust 서버가 React 빌드 파일도 제공합니다. 기본적으로 로컬 컴퓨터에서만 접속할 수 있습니다. 다른 로컬 포트는 `cargo run -- web --port 3031`로 지정합니다. 개발 시에는 `MNEMOARC_PORT=3031 npm run dev`를 사용할 수 있습니다.
+이때 내장 UI를 제공하는 서버를 실행하고 브라우저를 자동으로 엽니다. 로컬 컴퓨터에서만 접속할 수 있습니다. 개발 시 외부 UI 폴더를 제공하려면 `cargo run -- web --frontend frontend/dist --no-open`을 사용합니다. Vite 개발 서버 포트 설정은 `MNEMOARC_PORT=3031 npm run dev`를 사용할 수 있습니다. UI 빌드가 없는 debug 실행은 API를 제공하며 루트 화면에 빌드 안내를 표시합니다.
 
 ## 화면에서 할 수 있는 일
 

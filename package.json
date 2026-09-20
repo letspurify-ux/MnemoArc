@@ -14,7 +14,7 @@
     "start": "cargo run --release -- web",
     "test": "npm run test:scripts && npm test -w frontend && cargo test",
     "test:scripts": "node --test scripts/services.test.mjs",
-    "test:ui": "cargo build && npm run build -w frontend && npm run test:ui -w frontend"
+    "test:ui": "npm run build -w frontend && cargo build && npm run test:ui -w frontend"
   },
   "devDependencies": {
     "prettier": "^3.9.8"
