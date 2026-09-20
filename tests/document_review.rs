@@ -273,7 +273,7 @@ async fn required_document_before_investigations_is_not_forced_to_chat_answer() 
 }
 
 #[test]
-fn explicitly_cited_comments_survive_compaction_and_oversize_review_is_refused() {
+fn explicitly_cited_comments_survive_compaction_and_oversize_line_is_refused() {
     let (dir, mut s) = fixture();
     std::fs::write(
         dir.path().join("main.js"),
@@ -300,6 +300,116 @@ fn explicitly_cited_comments_survive_compaction_and_oversize_review_is_refused()
             .to_string()
             .contains("document_review_budget")
     );
+}
+
+#[test]
+fn oversized_requirements_are_reported_before_document_paging() {
+    let (_dir, mut s) = fixture();
+    s.task.completion = vec!["review every branch and condition ".repeat(10_000)];
+    let error = document_review::request(&mut s).unwrap_err().to_string();
+    assert!(
+        error.contains("requirements and review instructions"),
+        "{error}"
+    );
+}
+
+#[test]
+fn oversized_multiline_document_is_reviewed_in_complete_bounded_ranges() {
+    let (_dir, mut s) = fixture();
+    let doc = (1..=900)
+        .map(|i| {
+            format!(
+                "Line {i}: {} main.js:1-6\n",
+                "The backend must preserve source evidence and compare every branch before approval. ".repeat(3)
+            )
+        })
+        .collect::<String>();
+    assert!(mnemoarc::context::tokens(&doc, &s.config.model) > 24_000);
+    std::fs::write(&s.project.output, &doc).unwrap();
+    s.document_review = Default::default();
+    let mut expected_start = 1;
+    let mut pages = 0;
+    loop {
+        let request = document_review::request(&mut s).unwrap();
+        assert!(mnemoarc::context::count(&request, &s.config.model) <= 24_000);
+        let payload: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        let start = payload["document_line_start"].as_u64().unwrap() as usize;
+        let end = payload["document_line_end"].as_u64().unwrap() as usize;
+        assert_eq!(start, expected_start);
+        assert!(end >= start && end <= 900);
+        assert_eq!(
+            payload["document"].as_str().unwrap().lines().count(),
+            end - start + 1
+        );
+        assert!(!payload["evidence"].as_array().unwrap().is_empty());
+        expected_start = end + 1;
+        pages += 1;
+        document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+        if !s.document_review.pending {
+            break;
+        }
+        assert!(!document_review::approved(&s));
+        assert_eq!(s.document_review.attempts, 0);
+        assert!(pages < 32);
+    }
+    assert_eq!(expected_start, 901);
+    assert!(pages > 1);
+    assert_eq!(s.document_review.attempts, 1);
+    assert!(document_review::approved(&s));
+}
+
+#[test]
+fn editing_document_between_ranges_restarts_review_and_discards_old_findings() {
+    let (_dir, mut s) = fixture();
+    let doc = (1..=220)
+        .map(|i| format!("Line {i}: main.js:1-6\n"))
+        .collect::<String>();
+    std::fs::write(&s.project.output, &doc).unwrap();
+    s.document_review = Default::default();
+    document_review::request(&mut s).unwrap();
+    document_review::finish(&mut s, r#"{"issues":["Old revision issue"]}"#).unwrap();
+    assert!(s.document_review.pending);
+    std::fs::write(&s.project.output, format!("{doc}New line: main.js:1-6\n")).unwrap();
+    let request = document_review::request(&mut s).unwrap();
+    let payload: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["document_line_start"], 1);
+    assert_eq!(payload["evidence_page"], 0);
+    assert_eq!(s.document_review.attempts, 0);
+    while s.document_review.pending {
+        document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+        if s.document_review.pending {
+            document_review::request(&mut s).unwrap();
+        }
+    }
+    assert!(s.document_review.issues.is_empty());
+    assert!(document_review::approved(&s));
+}
+
+#[test]
+fn document_ranges_keep_a_mermaid_section_together_when_it_fits() {
+    let (_dir, mut s) = fixture();
+    let mut doc = String::from("# Intro\n");
+    doc.push_str(&"Intro context. main.js:1-6\n".repeat(59));
+    doc.push_str("## Diagram\n```mermaid\n");
+    doc.push_str(&"A --> B\n".repeat(60));
+    doc.push_str("```\n## End\n");
+    doc.push_str(&"Conclusion. main.js:1-6\n".repeat(100));
+    std::fs::write(&s.project.output, doc).unwrap();
+    s.document_review = Default::default();
+    let first = document_review::request(&mut s).unwrap();
+    let first: Value =
+        serde_json::from_str(first["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(first["document_line_end"], 60);
+    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    let second = document_review::request(&mut s).unwrap();
+    let second: Value =
+        serde_json::from_str(second["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(second["document_line_start"], 61);
+    assert_eq!(second["document_line_end"], 123);
+    assert!(second["document"].as_str().unwrap().contains("```mermaid"));
+    assert!(second["document"].as_str().unwrap().ends_with("```"));
 }
 
 struct StallingRepair;

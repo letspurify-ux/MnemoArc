@@ -4,8 +4,10 @@ import {
   copyFile,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,13 +15,21 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { createServer } from "node:http";
 import test from "node:test";
+import {
+  DailyLogSink,
+  dailyLogPath,
+  pruneLogs,
+  retentionDays,
+} from "./service-log.mjs";
 
 const exec = promisify(execFile);
 const source = new URL("./services.mjs", import.meta.url);
+const logSource = new URL("./service-log.mjs", import.meta.url);
 async function fixture(t, dev) {
   const root = await mkdtemp(join(tmpdir(), "mnemoarc launcher test "));
   await mkdir(join(root, "scripts"));
   await copyFile(source, join(root, "scripts/services.mjs"));
+  await copyFile(logSource, join(root, "scripts/service-log.mjs"));
   await writeFile(join(root, "scripts/dev.mjs"), dev);
   const run = (command, options = {}) =>
     exec(process.execPath, [join(root, "scripts/services.mjs"), command], {
@@ -37,6 +47,7 @@ const fakeDev = `
 import { createServer } from 'node:http';
 import { appendFileSync } from 'node:fs';
 appendFileSync('events', 'start\\n');
+console.log('dev started');
 const server = createServer((req,res) => res.end('ready'));
 server.listen(0, '127.0.0.1', () => process.send({ ready: true, url: 'http://127.0.0.1:' + server.address().port }));
 function stop() { server.close(() => { appendFileSync('events', 'stop\\n'); process.exit(0); }); }
@@ -64,6 +75,50 @@ test("background lifecycle handles spaces, repeat start/stop, and checkout owner
   assert.match((await first.run("stop")).stdout, /not running/);
   assert.match((await first.run("start")).stdout, /is running/);
   await first.run("stop");
+  const daily = dailyLogPath(join(first.root, ".mnemoarc"));
+  assert.match(await readFile(daily, "utf8"), /dev started/);
+});
+
+test("live writes switch daily files and cleanup keeps today plus two days", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "mnemoarc daily log "));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const at = (day) => new Date(2026, 8, day, 12);
+  let now = at(19);
+  const logs = new DailyLogSink(directory, () => now);
+  logs.write("first\n");
+  now = at(20);
+  logs.end("second\n");
+  await new Promise((resolve, reject) => {
+    logs.once("finish", resolve);
+    logs.once("error", reject);
+  });
+  assert.equal(
+    await readFile(dailyLogPath(directory, at(19)), "utf8"),
+    "first\n",
+  );
+  assert.equal(
+    await readFile(dailyLogPath(directory, at(20)), "utf8"),
+    "second\n",
+  );
+  await writeFile(dailyLogPath(directory, at(17)), "expired");
+  await writeFile(dailyLogPath(directory, at(18)), "within window");
+  await writeFile(join(directory, "services.log"), "old format");
+  await utimes(join(directory, "services.log"), at(17), at(17));
+  await writeFile(join(directory, "other.json"), "keep");
+  await pruneLogs(directory, 3, at(20));
+  assert.deepEqual((await readdir(directory)).sort(), [
+    "other.json",
+    "services-2026-09-18.log",
+    "services-2026-09-19.log",
+    "services-2026-09-20.log",
+  ]);
+});
+
+test("retention setting rejects unsafe values", () => {
+  assert.equal(retentionDays(undefined), 3);
+  assert.equal(retentionDays("3"), 3);
+  for (const value of ["0", "-1", "1.5", "abc", "3651"])
+    assert.throws(() => retentionDays(value), /MNEMOARC_LOG_RETENTION_DAYS/);
 });
 
 test("startup errors are reported and release the launcher for a retry", async (t) => {

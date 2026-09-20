@@ -4,7 +4,7 @@ pub(super) struct Heading {
     pub heading: String,
     pub start: usize,
     pub end: usize,
-    line: usize,
+    pub(super) line: usize,
     level: usize,
 }
 
@@ -107,19 +107,28 @@ pub(super) fn execute(
             }
             let doc = read_text(&path)?;
             if n(args, "offset", 0) > 0 && args["expected_hash"].as_str().is_none() {
-                bail!("expected_hash required for paged document reads");
+                bail!(
+                    "document_hash_required: offset > 0 requires expected_hash from the first document_inspect result; copy its hash or the returned next_cursor arguments. If that result is unavailable, call document_inspect with offset 0 first"
+                );
             }
             if let Some(expected) = args["expected_hash"].as_str()
                 && expected != hash(doc.as_bytes())
             {
-                bail!("document_revision_conflict: output changed during paged read");
+                bail!(
+                    "document_revision_conflict: document changed during paged read; restart document_inspect with offset 0 and use its new hash"
+                );
             }
             let mut result = json!({"exists":true,"path":path,"hash":hash(doc.as_bytes()),"total_lines":doc.lines().count(),"bytes":doc.len()});
             if let Some(heading) = args["section"].as_str() {
                 let resolved = resolve_heading(&doc, heading)?;
                 let section = &doc[resolved.start..resolved.end];
-                if n(args, "offset", 0) > section.chars().count() {
-                    bail!("invalid_offset");
+                let offset = n(args, "offset", 0);
+                let section_chars = section.chars().count();
+                if offset > section_chars {
+                    bail!(
+                        "invalid_offset: offset {offset} is beyond {section_chars} characters in section {:?}; use content.next_offset from the prior page or restart at offset 0",
+                        resolved.heading
+                    );
                 }
                 result["section"] = json!(resolved.heading);
                 result["section_hash"] = json!(hash(section.as_bytes()));
@@ -131,7 +140,10 @@ pub(super) fn execute(
                 let headings = headings(&doc);
                 let offset = n(args, "offset", 0);
                 if offset > headings.len() {
-                    bail!("invalid_offset");
+                    bail!(
+                        "invalid_offset: offset {offset} is an outline heading index, but this document has {} headings; it is not a document line number. Use file_read with start_line to read a line range, or copy next_offset from the previous document_inspect outline page",
+                        headings.len()
+                    );
                 }
                 let end = (offset + n(args, "limit", 50).clamp(1, 100)).min(headings.len());
                 let (coverage, read_lines) = super::coverage::report(
@@ -245,7 +257,10 @@ pub(super) fn execute(
             }
             let offset = n(args, "offset", 0);
             if offset > issues.len() {
-                bail!("invalid_offset");
+                bail!(
+                    "invalid_offset: audit issue offset {offset} exceeds {} issues; restart document_audit at offset 0 or copy its prior next_offset",
+                    issues.len()
+                );
             }
             let end = (offset + n(args, "limit", 30).clamp(1, 100)).min(issues.len());
             Ok(
@@ -263,6 +278,7 @@ pub(super) struct Citation {
     pub begin: usize,
     pub end: usize,
     pub relative_link: bool,
+    pub document_line: usize,
 }
 
 pub(super) fn citation_spans(doc: &str) -> Result<Vec<Citation>> {
@@ -272,7 +288,7 @@ pub(super) fn citation_spans(doc: &str) -> Result<Vec<Citation>> {
     let continuation = regex::Regex::new(r"^\s*,\s*([0-9]+)(?:[-–]L?([0-9]+))?")?;
     let mut spans = vec![];
     let mut fence: Option<(char, usize, bool)> = None;
-    for line in doc.lines() {
+    for (document_line, line) in doc.lines().enumerate() {
         let trimmed = line.trim_start_matches(' ');
         let marker = trimmed.chars().next().unwrap_or(' ');
         let width = trimmed.chars().take_while(|c| *c == marker).count();
@@ -314,6 +330,7 @@ pub(super) fn citation_spans(doc: &str) -> Result<Vec<Citation>> {
                 begin,
                 end,
                 relative_link: &c[2] == "#L",
+                document_line,
             });
             // Repeat the path internally for grouped citations such as a.js:3, 8-10.
             let mut tail = &line[c.get(0).unwrap().end()..];
@@ -329,6 +346,7 @@ pub(super) fn citation_spans(doc: &str) -> Result<Vec<Citation>> {
                     begin,
                     end,
                     relative_link: &c[2] == "#L",
+                    document_line,
                 });
                 tail = &tail[extra.get(0).unwrap().end()..];
             }
@@ -347,6 +365,7 @@ fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<
         begin,
         end,
         relative_link,
+        ..
     } in &spans
     {
         let path = if *relative_link {

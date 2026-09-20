@@ -42,6 +42,27 @@ pub fn describe(message: &str) -> Value {
         (Class::Prerequisite, "complete_prerequisite")
     } else if code == "file_not_found" || code == "document_missing" {
         (Class::MissingPath, "resolve_path")
+    } else if code == "file_permission_denied" {
+        (Class::Unavailable, "check_file_permissions")
+    } else if code == "path_is_directory" {
+        (Class::InvalidInput, "select_file_from_directory")
+    } else if matches!(
+        code,
+        "path_outside_project"
+            | "path_excluded"
+            | "output_path_escape"
+            | "output_symlink_escape"
+            | "parent_traversal_not_allowed"
+    ) {
+        (Class::InvalidInput, "choose_allowed_path")
+    } else if code == "document_hash_required" {
+        (Class::InvalidInput, "copy_document_hash")
+    } else if code == "document_revision_conflict" {
+        (Class::StaleState, "restart_document_inspection")
+    } else if code == "ambiguous_section" {
+        (Class::InvalidInput, "choose_exact_section")
+    } else if matches!(code, "section_not_found" | "investigation_section_required") {
+        (Class::InvalidInput, "inspect_document_outline")
     } else if matches!(
         code,
         "cursor_arguments_conflict" | "conflicting_arguments" | "ambiguous_file_read_range"
@@ -49,12 +70,15 @@ pub fn describe(message: &str) -> Value {
         (Class::InvalidInput, "correct_arguments")
     } else if code == "unknown_source" || code == "source_coverage_missing" {
         (Class::MissingEvidence, "lookup_observed_evidence")
+    } else if code == "unknown_symbol" {
+        (Class::InvalidInput, "copy_observed_symbol_id")
     } else if code.contains("conflict")
         || code.contains("changed")
         || code.contains("stale")
+        || code.ends_with("_expired")
         || matches!(
             code,
-            "invalid_cursor" | "cursor_expired" | "unknown_symbol" | "memory_not_found"
+            "invalid_cursor" | "cursor_expired" | "memory_not_found"
         )
     {
         (Class::StaleState, "refresh_matching_state")
@@ -85,6 +109,26 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
     if result["status"] == "ok" {
         return;
     }
+    // Batch items need the same actionable, availability-filtered recovery
+    // contract as standalone calls. Preserve successful siblings unchanged.
+    if result["recovery"]["code"] == "batch_partial_failure" {
+        let mut hints = Vec::<Value>::new();
+        if let Some(items) = result["data"]["results"].as_array_mut() {
+            for item in items {
+                let nested = &mut item["result"];
+                if nested.is_object() && nested["status"] != "ok" {
+                    attach(s, call, nested);
+                    for hint in nested["recovery"]["tools"].as_array().into_iter().flatten() {
+                        if !hints.contains(hint) {
+                            hints.push(hint.clone());
+                        }
+                    }
+                }
+            }
+        }
+        result["recovery"]["tools"] = json!(hints);
+        return;
+    }
     if result["recovery"].is_null() {
         result["recovery"] = describe(result["error"].as_str().unwrap_or("tool_error"));
     }
@@ -92,6 +136,17 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "lookup_observed_evidence" => &["source_lookup", "history", "file_read"],
         "complete_prerequisite" => &["document_inspect", "investigation", "document_edit"],
         "resolve_path" => &["document_inspect", "file_list"],
+        "select_file_from_directory" => &["file_list", "file_read"],
+        "choose_allowed_path" => &["file_list", "document_inspect"],
+        "copy_document_hash" => &["document_inspect"],
+        "restart_document_inspection" | "inspect_document_outline" => &["document_inspect"],
+        "choose_exact_section" => &["document_inspect", "file_read"],
+        "copy_observed_symbol_id" => &["code_outline", "symbol_read"],
+        "correct_arguments" if call.name == "document_inspect" => {
+            &["document_inspect", "file_read"]
+        }
+        "correct_arguments" if call.name == "document_audit" => &["document_audit"],
+        "correct_arguments" if call.name == "file_read" => &["file_read"],
         "refresh_matching_state" if call.name.starts_with("memory_") => {
             &["memory_read", "memory_find"]
         }

@@ -2,11 +2,18 @@
 // Only the supervisor holding this checkout's local socket can stop its children.
 import { fork } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, open, readFile, unlink } from "node:fs/promises";
+import { mkdir, readFile, unlink } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { finished } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
+import {
+  DailyLogSink,
+  dailyLogPath,
+  pruneLogs,
+  retentionDays,
+} from "./service-log.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const id = createHash("sha256")
@@ -18,7 +25,7 @@ const endpoint =
   process.platform === "win32"
     ? `\\\\.\\pipe\\mnemoarc-${id}`
     : join(socketDir, "control.sock");
-const logPath = join(root, ".mnemoarc", "services.log");
+const logDirectory = join(root, ".mnemoarc");
 
 function request(command) {
   return new Promise((resolve, reject) => {
@@ -107,11 +114,40 @@ async function supervise() {
   process.on("message", (message) => {
     if (message === "stop") void stop();
   });
+  const logs = new DailyLogSink(logDirectory);
+  logs.on("error", (error) => {
+    process.send?.({ logError: error.message });
+    void stop();
+  });
+  const days = retentionDays();
+  await pruneLogs(logDirectory, days);
+  // Cleanup still runs when the server stays up through midnight without
+  // producing output. The timer does not keep a stopped supervisor alive.
+  function schedulePrune() {
+    const now = new Date();
+    const midnight = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() + 1,
+    );
+    const timer = setTimeout(
+      () => {
+        void pruneLogs(logDirectory, days)
+          .catch((error) => logs.destroy(error))
+          .finally(schedulePrune);
+      },
+      Math.max(1, midnight.getTime() - now.getTime()),
+    );
+    timer.unref();
+  }
+  schedulePrune();
   child = fork(join(root, "scripts/dev.mjs"), [], {
     cwd: root,
     windowsHide: true,
-    stdio: ["ignore", "inherit", "inherit", "ipc"],
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
+  child.stdout.pipe(logs, { end: false });
+  child.stderr.pipe(logs, { end: false });
   child.on("message", (message) => {
     if (message.ready && !stopping) {
       current = { state: "running", url: message.url };
@@ -119,12 +155,13 @@ async function supervise() {
       process.disconnect?.();
     }
   });
-  child.once("exit", (code) => {
+  child.once("close", async (code) => {
+    logs.end();
+    await finished(logs).catch(() => {});
     server.close(() => process.exit(code ?? 1));
   });
   child.once("error", (error) => {
-    console.error(error.message);
-    server.close(() => process.exit(1));
+    logs.write(`${error.message}\n`);
   });
 }
 
@@ -136,18 +173,19 @@ async function start() {
     );
     return;
   }
-  await mkdir(join(root, ".mnemoarc"), { recursive: true, mode: 0o700 });
-  const log = await open(logPath, "w", 0o600);
+  const days = retentionDays();
+  await mkdir(logDirectory, { recursive: true, mode: 0o700 });
+  await pruneLogs(logDirectory, days);
+  const logPath = dailyLogPath(logDirectory);
   console.log(
-    `Starting MnemoArc (first build may take several minutes).\nStartup log: ${logPath}`,
+    `Starting MnemoArc (first build may take several minutes).\nDaily log: ${logPath} (keep ${days} days)`,
   );
   const child = fork(fileURLToPath(import.meta.url), ["supervise"], {
     cwd: root,
     detached: true,
     windowsHide: true,
-    stdio: ["ignore", log.fd, log.fd, "ipc"],
+    stdio: ["ignore", "ignore", "ignore", "ipc"],
   });
-  await log.close();
   const cancel = () => {
     if (child.connected) child.send("stop");
   };
@@ -159,6 +197,8 @@ async function start() {
       reject(new Error(`Startup failed (exit ${code}).`)),
     );
     child.once("message", (message) => {
+      if (message.logError)
+        return reject(new Error(`Log write failed: ${message.logError}`));
       if (!message.ready) return;
       console.log(
         `MnemoArc is ${message.state}. ${message.url ?? ""}\nUse stop_all.sh or stop_all.bat to stop it.`,
@@ -167,7 +207,9 @@ async function start() {
       resolve();
     });
   }).catch(async (error) => {
-    console.error((await readFile(logPath, "utf8")).slice(-6000));
+    console.error(
+      (await readFile(logPath, "utf8").catch(() => "")).slice(-6000),
+    );
     throw error;
   });
   process.removeListener("SIGINT", cancel);

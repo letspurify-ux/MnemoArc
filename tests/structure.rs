@@ -57,6 +57,40 @@ fn rust_structure_tracks_impl_methods_multiline_signatures_and_exact_body() {
 }
 
 #[test]
+fn unknown_symbol_means_current_hash_but_no_matching_symbol_id() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.rs"), "fn real() {}\n").unwrap();
+    let outline = run(&mut s, "code_outline", json!({"path":"a.rs"}));
+    let observed = outline["symbols"][0]["symbol_id"].as_str().unwrap();
+    let hash = observed.split(':').next().unwrap();
+    let call = mnemoarc::llm::ToolCall {
+        id: "unobserved-symbol".into(),
+        name: "symbol_read".into(),
+        arguments: json!({"path":"a.rs","symbol_id":format!("{hash}:999:1000")}).to_string(),
+    };
+    let result = tools::run_call(&mut s, &call);
+    assert_eq!(result["recovery"]["code"], "unknown_symbol");
+    assert_eq!(result["recovery"]["class"], "invalid_input");
+    assert_eq!(result["recovery"]["action"], "copy_observed_symbol_id");
+    assert_eq!(
+        result["recovery"]["tools"],
+        json!(["code_outline", "symbol_read"])
+    );
+    assert_eq!(result["recovery"]["automatic_retry"], false);
+    let valid = run(
+        &mut s,
+        "symbol_read",
+        json!({"path":"a.rs","symbol_id":observed}),
+    );
+    assert!(
+        valid["content"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("fn real")
+    );
+}
+
+#[test]
 fn all_grammars_find_methods_and_decorated_functions_without_comment_symbols() {
     let (dir, mut s) = setup();
     for (file, source, expected) in [

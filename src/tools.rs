@@ -196,7 +196,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_inspect",
-                description: "Inspect a document using path (relative to project.root); omit path for project.output. Uses file_read path restrictions. Returns session delivery coverage for the current hash, not proof of understanding or current context retention. coverage_offset pages missing line ranges. With no section, return metadata and outline with canonical headings and absolute path. section accepts a full Markdown heading or a unique title without #; duplicate titles require disambiguation. offset and expected_hash support safe continuation.",
+                description: "Inspect a document using path (relative to project.root); omit path for project.output. Uses file_read path restrictions. Returns session delivery coverage for the current hash, not proof of understanding or current context retention. coverage_offset pages missing line ranges. With no section, offset is an OUTLINE HEADING INDEX, not a document line number; copy next_offset from the prior outline page. With section, offset is a CHARACTER INDEX inside that section; copy content.next_offset or the returned next_cursor arguments. For a document line number use file_read with start_line. section accepts a full Markdown heading or a unique title without #; duplicate titles require disambiguation. For any offset > 0, copy expected_hash from the first result's hash; if unavailable, restart at offset 0.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -263,7 +263,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "investigation",
-                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified and failures reported. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. section is an exact unique Markdown heading copied from document_inspect, including numbering",
+                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified and failures reported. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. status=written requires a non-empty section (supplied now or preserved from the existing item). section is an exact unique Markdown heading copied from document_inspect, including numbering",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -621,10 +621,11 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
     }
     Ok(canonical)
 }
-fn regular_metadata(metadata: &std::fs::Metadata) -> Result<()> {
+fn regular_metadata(metadata: &std::fs::Metadata, path: &Path) -> Result<()> {
     if metadata.is_dir() {
         bail!(
-            "path_is_directory: use file_list with path_glob (e.g. backend/**), then file_read with a file path"
+            "path_is_directory: {} is a directory; use file_list with path_glob (e.g. backend/**), then file_read with a file path",
+            path.display()
         );
     }
     if !metadata.is_file() {
@@ -632,18 +633,19 @@ fn regular_metadata(metadata: &std::fs::Metadata) -> Result<()> {
     }
     Ok(())
 }
+fn file_access_error(path: &Path, error: std::io::Error) -> anyhow::Error {
+    let code = match error.kind() {
+        std::io::ErrorKind::NotFound => "file_not_found",
+        std::io::ErrorKind::PermissionDenied => "file_permission_denied",
+        _ => "file_access_error",
+    };
+    anyhow::anyhow!("{code}: {}: {error}", path.display())
+}
 fn open_regular_file(path: &Path) -> Result<std::fs::File> {
-    regular_metadata(&path.metadata().map_err(|e| {
-        anyhow::anyhow!(
-            "{}: {}: {e}",
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "file_not_found"
-            } else {
-                "file_access_error"
-            },
-            path.display()
-        )
-    })?)?;
+    regular_metadata(
+        &path.metadata().map_err(|e| file_access_error(path, e))?,
+        path,
+    )?;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -653,8 +655,11 @@ fn open_regular_file(path: &Path) -> Result<std::fs::File> {
         // never block waiting for a writer. Regular files ignore O_NONBLOCK.
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let file = options.open(path)?;
-    regular_metadata(&file.metadata()?)?;
+    let file = options.open(path).map_err(|e| file_access_error(path, e))?;
+    regular_metadata(
+        &file.metadata().map_err(|e| file_access_error(path, e))?,
+        path,
+    )?;
     Ok(file)
 }
 fn read_text(path: &Path) -> Result<String> {
@@ -1438,6 +1443,11 @@ pub fn execute_cancellable(
                     document_hash: None,
                     note: String::new(),
                 };
+                if item.status == "written" && item.section.trim().is_empty() {
+                    bail!(
+                        "investigation_section_required: status=written requires a non-empty section. Copy an exact heading from document_inspect and upsert this id with section and status=written together; existing item retained"
+                    );
+                }
                 if let Some(existing) = s.investigations.iter_mut().find(|i| i.id == id) {
                     *existing = item
                 } else {
@@ -1509,7 +1519,7 @@ pub fn execute_cancellable(
                     .ok_or_else(|| anyhow::anyhow!("item_not_found"))?;
                 if item.status != "written" && item.status != "verified" {
                     bail!(
-                        "item_must_be_written_before_verification: id={}, status={}, section={:?}. Inspect the document section first; if its content is written, use investigation upsert with this id and status=written, then verify. Otherwise write the section before verifying.",
+                        "item_must_be_written_before_verification: id={}, status={}, section={:?}. Inspect the document section first; if its content is written, use investigation upsert with this id, the exact section heading from document_inspect, and status=written together, then verify. Otherwise write the section before verifying.",
                         item.id,
                         item.status,
                         item.section
@@ -2234,5 +2244,14 @@ mod file_tests {
                 .to_string()
                 .contains("unsupported_large_file")
         );
+    }
+
+    #[test]
+    fn missing_file_after_path_check_keeps_path_and_recovery_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vanished.md");
+        let error = file_access_error(&path, std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(error.to_string().starts_with("file_not_found:"));
+        assert!(error.to_string().contains(&path.display().to_string()));
     }
 }

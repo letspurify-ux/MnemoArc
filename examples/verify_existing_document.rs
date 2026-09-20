@@ -10,13 +10,14 @@ use std::{collections::BTreeMap, path::Path};
 use tokio_util::sync::CancellationToken;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    if std::env::var("MNEMOARC_LIVE_TEST").as_deref() != Ok("1") {
+    let dry_run = std::env::args().any(|arg| arg == "--dry-run");
+    if !dry_run && std::env::var("MNEMOARC_LIVE_TEST").as_deref() != Ok("1") {
         anyhow::bail!("Set MNEMOARC_LIVE_TEST=1 to authorize provider calls");
     }
     dotenvy::dotenv().ok();
     let path = Path::new("config.toml");
     let mut config = Config::load(path, &BTreeMap::new())?;
-    if path.with_extension("credentials.json").exists() {
+    if !dry_run && path.with_extension("credentials.json").exists() {
         let keys: BTreeMap<String, String> =
             serde_json::from_slice(&std::fs::read(path.with_extension("credentials.json"))?)?;
         config.api_key = keys.get(&config.api_key_env).cloned().map(Secret);
@@ -29,6 +30,29 @@ async fn main() -> anyhow::Result<()> {
         .clone();
     let mut s = Session::new(project, config);
     s.answer_review_question="기존 문서에서 MnemoArc backend의 실제 동작 흐름과 Mermaid, 인용 및 수치 한도가 최신 소스와 일치하는지 검토한다. 범위를 늘리거나 구현 세부사항을 모두 추가할 필요는 없다. 최종 결과 보고는 별도로 제공된다.".into();
+    if dry_run {
+        let mut pages = 0;
+        loop {
+            let request = document_review::request(&mut s)?;
+            let payload: serde_json::Value =
+                serde_json::from_str(request["messages"][1]["content"].as_str().unwrap())?;
+            pages += 1;
+            println!(
+                "page {pages}: document lines {}-{}, evidence chunks {}, input tokens {}",
+                payload["document_line_start"],
+                payload["document_line_end"],
+                payload["evidence"].as_array().map_or(0, Vec::len),
+                mnemoarc::context::count(&request, &s.config.model)
+            );
+            // Advance the in-memory pager only. This is not a semantic verdict.
+            document_review::finish(&mut s, r#"{"issues":[]}"#)?;
+            if !s.document_review.pending {
+                break;
+            }
+        }
+        println!("DRY RUN: {pages} bounded pages; no provider review or report written");
+        return Ok(());
+    }
     let mut pages = Vec::new();
     let mut response_failures = 0;
     let mut input = 0usize;

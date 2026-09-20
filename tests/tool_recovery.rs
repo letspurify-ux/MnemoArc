@@ -226,3 +226,248 @@ fn observed_state_and_path_errors_have_actionable_recovery() {
         assert_eq!(r["action"], action);
     }
 }
+
+#[test]
+fn directory_read_identifies_path_and_available_navigation_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let call = ToolCall {
+        id: "directory".into(),
+        name: "file_read".into(),
+        arguments: json!({"path":"."}).to_string(),
+    };
+    let result = tools::run_call(&mut s, &call);
+    assert_eq!(result["status"], "error");
+    assert_eq!(result["recovery"]["code"], "path_is_directory");
+    assert_eq!(result["recovery"]["class"], "invalid_input");
+    assert_eq!(result["recovery"]["action"], "select_file_from_directory");
+    assert_eq!(
+        result["recovery"]["tools"],
+        json!(["file_list", "file_read"])
+    );
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains(&dir.path().canonicalize().unwrap().display().to_string())
+    );
+}
+
+#[test]
+fn paged_document_read_requires_and_accepts_observed_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.project.output = dir.path().join("summary.md");
+    std::fs::write(&s.project.output, "# Summary\nFirst line\nSecond line\n").unwrap();
+    let call = |id: &str, arguments: serde_json::Value| ToolCall {
+        id: id.into(),
+        name: "document_inspect".into(),
+        arguments: arguments.to_string(),
+    };
+    let missing = tools::run_call(
+        &mut s,
+        &call("missing-hash", json!({"section":"# Summary","offset":1})),
+    );
+    assert_eq!(missing["recovery"]["code"], "document_hash_required");
+    assert_eq!(missing["recovery"]["class"], "invalid_input");
+    assert_eq!(missing["recovery"]["action"], "copy_document_hash");
+    assert_eq!(missing["recovery"]["tools"], json!(["document_inspect"]));
+    let first = tools::run_call(&mut s, &call("first-page", json!({"section":"# Summary"})));
+    assert_eq!(first["status"], "ok");
+    let resumed = tools::run_call(
+        &mut s,
+        &call(
+            "resumed",
+            json!({"section":"# Summary","offset":1,"expected_hash":first["data"]["hash"]}),
+        ),
+    );
+    assert_eq!(resumed["status"], "ok");
+    assert_eq!(resumed["data"]["read_offset"], 1);
+
+    std::fs::write(&s.project.output, "# Summary\nChanged\n").unwrap();
+    let changed = tools::run_call(
+        &mut s,
+        &call(
+            "changed",
+            json!({"section":"# Summary","offset":1,"expected_hash":first["data"]["hash"]}),
+        ),
+    );
+    assert_eq!(changed["recovery"]["code"], "document_revision_conflict");
+    assert_eq!(changed["recovery"]["class"], "stale_state");
+    assert_eq!(changed["recovery"]["action"], "restart_document_inspection");
+    assert_eq!(changed["recovery"]["tools"], json!(["document_inspect"]));
+}
+
+#[test]
+fn adjacent_document_navigation_errors_have_specific_recovery() {
+    for (message, class, action) in [
+        (
+            "file_cursor_expired: file changed",
+            "stale_state",
+            "refresh_matching_state",
+        ),
+        (
+            "ambiguous_section: multiple headings",
+            "invalid_input",
+            "choose_exact_section",
+        ),
+        (
+            "section_not_found: missing heading",
+            "invalid_input",
+            "inspect_document_outline",
+        ),
+        (
+            "path_outside_project",
+            "invalid_input",
+            "choose_allowed_path",
+        ),
+        (
+            "file_permission_denied: cannot read",
+            "unavailable",
+            "check_file_permissions",
+        ),
+    ] {
+        let recovery = tools::recovery::describe(message);
+        assert_eq!(recovery["class"], class);
+        assert_eq!(recovery["action"], action);
+    }
+}
+
+#[test]
+fn document_offset_error_explains_heading_index_versus_line_number() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.project.output = dir.path().join("summary.md");
+    std::fs::write(&s.project.output, "# Summary\nFirst line\nSecond line\n").unwrap();
+    let first = tools::run_call(
+        &mut s,
+        &ToolCall {
+            id: "outline".into(),
+            name: "document_inspect".into(),
+            arguments: "{}".into(),
+        },
+    );
+    let inspect = |id: &str, arguments: serde_json::Value| ToolCall {
+        id: id.into(),
+        name: "document_inspect".into(),
+        arguments: arguments.to_string(),
+    };
+    let outline = tools::run_call(
+        &mut s,
+        &inspect(
+            "wrong-line",
+            json!({"offset":244,"expected_hash":first["data"]["hash"]}),
+        ),
+    );
+    assert_eq!(outline["recovery"]["code"], "invalid_offset");
+    assert_eq!(
+        outline["recovery"]["tools"],
+        json!(["document_inspect", "file_read"])
+    );
+    let explanation = outline["error"].as_str().unwrap();
+    assert!(explanation.contains("244") && explanation.contains("1 headings"));
+    assert!(explanation.contains("not a document line number"));
+    let section = tools::run_call(
+        &mut s,
+        &inspect(
+            "wrong-char",
+            json!({"section":"# Summary","offset":244,"expected_hash":first["data"]["hash"]}),
+        ),
+    );
+    assert!(
+        section["error"]
+            .as_str()
+            .unwrap()
+            .contains("characters in section")
+    );
+}
+
+#[test]
+fn written_items_require_a_section_without_mutating_existing_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"draft","title":"Draft","status":"in_progress"}),
+    )
+    .unwrap();
+    let before = serde_json::to_value(&s.investigations).unwrap();
+    for section in [json!(null), json!(""), json!("  ")] {
+        let mut args = json!({"action":"upsert","id":"draft","status":"written"});
+        if !section.is_null() {
+            args["section"] = section;
+        }
+        let result = tools::run_call(
+            &mut s,
+            &ToolCall {
+                id: "invalid-written".into(),
+                name: "investigation".into(),
+                arguments: args.to_string(),
+            },
+        );
+        assert_eq!(result["recovery"]["code"], "investigation_section_required");
+        assert_eq!(result["recovery"]["tools"], json!(["document_inspect"]));
+        assert_eq!(serde_json::to_value(&s.investigations).unwrap(), before);
+    }
+    tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"draft","section":"# Draft","status":"written"}),
+    )
+    .unwrap();
+    tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"draft","title":"Updated"}),
+    )
+    .unwrap();
+    assert_eq!(s.investigations[0].section, "# Draft");
+    assert_eq!(s.investigations[0].status, "written");
+}
+
+#[test]
+fn failed_batch_items_expose_recovery_tools_and_preserve_successful_siblings() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.project.output = dir.path().join("out.md");
+    std::fs::write(&s.project.output, "# Done\na.rs:1\n").unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+    let read = tools::execute(&mut s, "file_read", json!({"path":"a.rs"})).unwrap();
+    tools::execute(&mut s, "investigation", json!({"action":"upsert","id":"ready","title":"Ready","status":"written","section":"# Done"})).unwrap();
+    tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"draft","title":"Draft","status":"in_progress"}),
+    )
+    .unwrap();
+    let entry = json!({"source_ids":[read["source"]["id"]],"verification_note":"Compared source"});
+    let result = tools::run_call(
+        &mut s,
+        &ToolCall {
+            id: "mixed".into(),
+            name: "investigation".into(),
+            arguments: json!({"action":"verify_batch","items":{"draft":entry,"ready":entry}})
+                .to_string(),
+        },
+    );
+    assert_eq!(result["recovery"]["code"], "batch_partial_failure");
+    assert_eq!(
+        result["recovery"]["tools"],
+        json!(["document_inspect", "investigation", "document_edit"])
+    );
+    let items = result["data"]["results"].as_array().unwrap();
+    let failed = &items.iter().find(|i| i["id"] == "draft").unwrap()["result"];
+    assert_eq!(failed["recovery"]["tools"], result["recovery"]["tools"]);
+    let success = &items.iter().find(|i| i["id"] == "ready").unwrap()["result"];
+    assert_eq!(success["status"], "ok");
+    assert!(success["recovery"].is_null());
+    assert_eq!(
+        s.investigations
+            .iter()
+            .find(|i| i.id == "ready")
+            .unwrap()
+            .status,
+        "verified"
+    );
+}
