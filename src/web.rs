@@ -18,6 +18,7 @@ use axum::{
     },
     routing::{get, post, put},
 };
+use futures_util::FutureExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -76,7 +77,7 @@ fn busy() -> ApiError {
     )
 }
 fn changed(s: &WebState, c: &mut Core) {
-    c.revision += 1;
+    c.revision = c.revision.saturating_add(1);
     let _ = s.events.send(c.revision);
 }
 fn credential_path(path: &FsPath) -> PathBuf {
@@ -387,7 +388,12 @@ async fn check(State(s): State<WebState>, Json(input): Json<Settings>) -> Api {
         let c = s.core.lock().await;
         prepare_settings(&input, &c.config, &c.credentials)?
     };
-    Ok(Json(json!({"message":OpenAiClient.probe(&config).await?})))
+    let message = tokio::select! {
+        biased;
+        _ = s.stopping.cancelled() => return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "앱을 종료하고 있습니다.".into())),
+        result = OpenAiClient.probe(&config) => result?,
+    };
+    Ok(Json(json!({"message":message})))
 }
 #[derive(Deserialize)]
 struct NewSession {
@@ -482,8 +488,15 @@ async fn run(
             "앱을 종료하고 있습니다.".into(),
         ));
     }
-    let (mut session, cancel, rx) = {
+    let (session, cancel, rx) = {
         let mut c = s.core.lock().await;
+        // Admission and shutdown must agree under the same lock.
+        if s.stopping.is_cancelled() {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "앱을 종료하고 있습니다.".into(),
+            ));
+        }
         if c.running.is_some() {
             return Err(busy());
         }
@@ -549,7 +562,7 @@ async fn run(
             }
         });
         let job = agent::run_session_controlled(session, state.client.clone(), cancel, tx, rx);
-        session = job.await;
+        let outcome = std::panic::AssertUnwindSafe(job).catch_unwind().await;
         let _ = pump.await;
         let mut c = state.core.lock().await;
         c.streams.remove(&id);
@@ -557,7 +570,18 @@ async fn run(
             c.sessions.remove(&id);
             c.order.retain(|old| old != &id);
         } else {
-            c.sessions.insert(id.clone(), session);
+            match outcome {
+                Ok(session) => {
+                    c.sessions.insert(id.clone(), session);
+                }
+                Err(_) => {
+                    if let Some(session) = c.sessions.get_mut(&id) {
+                        session.status = "blocked".into();
+                        session.activity = json!({"stage":"idle"});
+                        session.last_error = Some("agent_worker_panic: last snapshot retained; write outcomes require review".into());
+                    }
+                }
+            }
         }
         c.running = None;
         changed(&state, &mut c);
@@ -604,13 +628,13 @@ async fn output(State(s): State<WebState>, Path(id): Path<String>) -> Api {
         let c = s.core.lock().await;
         c.sessions.get(&id).ok_or_else(missing)?.project.clone()
     };
-    let result=tokio::task::spawn_blocking(move || -> Result<Value>{
-        let path=tools::output_path(&project)?;
-        use std::io::Read;
-        let mut content=String::new();
-        std::fs::File::open(&path)?.take(2*1024*1024).read_to_string(&mut content)?;
-        Ok(json!({"path":path,"content":content,"truncated":std::fs::metadata(path)?.len()>2*1024*1024}))
-    }).await.map_err(|e|ApiError(StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))??;
+    let result = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let path = tools::output_path(&project)?;
+        let (content, truncated) = tools::read_text_preview(&path, 2 * 1024 * 1024)?;
+        Ok(json!({"path":path,"content":content,"truncated":truncated}))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
     Ok(Json(result))
 }
 #[derive(Deserialize)]

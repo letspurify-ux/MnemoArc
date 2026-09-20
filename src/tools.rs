@@ -1,4 +1,7 @@
+mod coverage;
 mod documentation;
+mod search;
+mod structure;
 use crate::{
     config::Project,
     context::{self},
@@ -6,6 +9,7 @@ use crate::{
     session::{Investigation, Session, TaskState},
 };
 use anyhow::{Result, bail};
+pub use coverage::record_delivered_read;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -130,31 +134,31 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "file_list",
-                description: "List project text file paths. path_glob is a file glob such as backend/**/*.js (pattern is a legacy alias); pagination; respects project boundaries and exclusions",
+                description: "List project files. Default mode=text validates UTF-8 text; mode=paths lists regular file paths without reading contents (may include binary/large files). path_glob is a file glob such as backend/**/*.js (pattern is a legacy alias). Paginated; respects project boundaries and exclusions",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number()}),
+                    json!({"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number(),"mode":action(&["text","paths"])}),
                     &[],
                 ),
             },
             ToolSpec {
                 name: "source_search",
-                description: "Search source lines: query is content text or regex (regex=true); path_glob filters file paths, e.g. backend/**/*.js (pattern is a legacy alias); paginated results include program-issued source IDs and hashes",
+                description: "Search source lines: query is literal text or regex (regex=true). case_sensitive defaults true; whole_word defaults false (Unicode word boundaries). path_glob filters files (pattern is a legacy alias). mode=matches (default) returns matching lines and source IDs; files returns matching paths; count returns matching-line counts per file. before/after add up to 20 context lines each in matches mode. Each displayed line is capped at 500 characters with truncation marked. Reuse the same search options with cursor for pagination; limit may change. Hashes detect source changes",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"query":string(),"regex":{"type":"boolean"},"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number()}),
+                    json!({"query":string(),"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"whole_word":{"type":"boolean"},"mode":action(&["matches","files","count"]),"before":{"type":"integer","minimum":0,"maximum":20},"after":{"type":"integer","minimum":0,"maximum":20},"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number()}),
                     &["query"],
                 ),
             },
             ToolSpec {
                 name: "document_inspect",
-                description: "Read the configured project.output directly; no path required, even when output is outside project.root. With no section, return metadata and outline with canonical headings and absolute path. section accepts a full Markdown heading or a unique title without #; duplicate titles require disambiguation. offset and expected_hash support safe continuation.",
+                description: "Inspect a document using path (relative to project.root); omit path for project.output. Uses file_read path restrictions. Returns session delivery coverage for the current hash, not proof of understanding or current context retention. coverage_offset pages missing line ranges. With no section, return metadata and outline with canonical headings and absolute path. section accepts a full Markdown heading or a unique title without #; duplicate titles require disambiguation. offset and expected_hash support safe continuation.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"section":string(),"offset":number(),"limit":number(),"expected_hash":string()}),
+                    json!({"path":string(),"section":string(),"offset":number(),"limit":number(),"coverage_offset":number(),"expected_hash":string()}),
                     &[],
                 ),
             },
@@ -166,6 +170,26 @@ impl ToolRegistry {
                 parameters: schema(
                     json!({"query":string(),"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number()}),
                     &[],
+                ),
+            },
+            ToolSpec {
+                name: "code_outline",
+                description: "Tree-sitter structure of one Rust, JS/JSX, TS/TSX, Python or Java file. Returns declarations, methods, containers, signatures, exact symbol IDs and line ranges; parse errors are explicit. query filters names; cursor requires same path/query and expires on edits. name_line/name_column are 1-based Unicode character positions. Source IDs cover only the displayed declaration line, not the body.",
+                optional: true,
+                read_only: true,
+                parameters: schema(
+                    json!({"path":string(),"query":string(),"cursor":string(),"limit":number()}),
+                    &["path"],
+                ),
+            },
+            ToolSpec {
+                name: "symbol_read",
+                description: "Read a Tree-sitter symbol's line range using path and exact symbol_id from code_outline. Rejects stale IDs. Returns file_read-compatible body, source and coverage; follow file_read cursor when truncated, or next_line for a new range up to symbol.end_line. A symbol over 2000 lines needs additional file_read calls. Overlapping declarations on the same line include surrounding text on that line.",
+                optional: true,
+                read_only: true,
+                parameters: schema(
+                    json!({"path":string(),"symbol_id":string(),"force_read":{"type":"boolean"}}),
+                    &["path", "symbol_id"],
                 ),
             },
             ToolSpec {
@@ -494,8 +518,7 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
     }
     Ok(canonical)
 }
-fn read_text(path: &Path) -> Result<String> {
-    let metadata = path.metadata()?;
+fn regular_metadata(metadata: &std::fs::Metadata) -> Result<()> {
     if metadata.is_dir() {
         bail!(
             "path_is_directory: use file_list with path_glob (e.g. backend/**), then file_read with a file path"
@@ -504,16 +527,64 @@ fn read_text(path: &Path) -> Result<String> {
     if !metadata.is_file() {
         bail!("unsupported_file_type: expected a regular text file");
     }
-    if metadata.len() > 16 * 1024 * 1024 {
+    Ok(())
+}
+fn open_regular_file(path: &Path) -> Result<std::fs::File> {
+    regular_metadata(&path.metadata()?)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A path can become a FIFO between metadata and open. Opening it must
+        // never block waiting for a writer. Regular files ignore O_NONBLOCK.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    regular_metadata(&file.metadata()?)?;
+    Ok(file)
+}
+fn read_text(path: &Path) -> Result<String> {
+    use std::io::Read;
+    const MAX_BYTES: usize = 16 * 1024 * 1024;
+    let file = open_regular_file(path)?;
+    if file.metadata()?.len() > MAX_BYTES as u64 {
         bail!("unsupported_large_file: maximum 16MiB");
     }
-    let bytes = std::fs::read(path)?;
+    // Bound the actual read too: the file may grow after the metadata check.
+    let mut bytes = Vec::new();
+    file.take((MAX_BYTES + 1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_BYTES {
+        bail!("unsupported_large_file: maximum 16MiB");
+    }
     if bytes.contains(&0) {
         bail!("unsupported_binary_file");
     }
     String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("unsupported_non_utf8_file"))
 }
-fn paths(
+pub(crate) fn read_text_preview(path: &Path, max_bytes: usize) -> Result<(String, bool)> {
+    use std::io::Read;
+    let limit = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("invalid_preview_limit"))?;
+    let mut bytes = Vec::new();
+    open_regular_file(path)?
+        .take(limit as u64)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > max_bytes;
+    bytes.truncate(max_bytes);
+    if let Err(error) = std::str::from_utf8(&bytes) {
+        if truncated && error.error_len().is_none() {
+            // Only an incomplete character at the preview boundary is omitted.
+            bytes.truncate(error.valid_up_to());
+        } else {
+            bail!("unsupported_non_utf8_file");
+        }
+    }
+    Ok((String::from_utf8(bytes)?, truncated))
+}
+
+fn candidate_paths(
     p: &Project,
     pattern: Option<&str>,
     cancel: &tokio_util::sync::CancellationToken,
@@ -556,15 +627,37 @@ fn paths(
         if excluded(p, rel)? || filter.as_ref().is_some_and(|f| !f.is_match(rel)) {
             continue;
         }
-        match read_text(entry.path()) {
-            Ok(_) => entries.push(entry.path().to_path_buf()),
-            Err(e) if e.to_string().starts_with("unsupported_") => {}
-            Err(e) => return Err(e),
-        }
+        entries.push(entry.path().to_path_buf());
     }
     entries.sort();
     Ok(entries)
 }
+// Keep the existing text-only listing contract. Searches use candidates directly
+// so text validation and matching share one read instead of opening every file twice.
+fn paths(
+    p: &Project,
+    pattern: Option<&str>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Vec<PathBuf>> {
+    let mut result = Vec::new();
+    for path in candidate_paths(p, pattern, cancel)? {
+        if cancel.is_cancelled() {
+            bail!("cancelled");
+        }
+        if search_text(&path)?.is_some() {
+            result.push(path);
+        }
+    }
+    Ok(result)
+}
+fn search_text(path: &Path) -> Result<Option<String>> {
+    match read_text(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.to_string().starts_with("unsupported_") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn observe(
     s: &mut Session,
     path: &Path,
@@ -748,6 +841,7 @@ pub fn execute_cancellable(
         );
     }
     match name {
+        "code_outline" | "symbol_read" => structure::execute(s, name, &args, cancel),
         "document_inspect" | "document_audit" | "symbol_search" => {
             documentation::execute(s, name, &args, cancel)
         }
@@ -864,7 +958,7 @@ pub fn execute_cancellable(
                 let offset = n(&args, "offset", 0);
                 let limit = n(&args, "limit", 20).clamp(1, 100);
                 Ok(
-                    json!({"items":s.task.details.iter().skip(offset).take(limit).collect::<Vec<_>>(),"next_offset":(offset+limit<s.task.details.len()).then_some(offset+limit)}),
+                    json!({"items":s.task.details.iter().skip(offset).take(limit).collect::<Vec<_>>(),"next_offset":(offset.saturating_add(limit)<s.task.details.len()).then_some(offset.saturating_add(limit))}),
                 )
             }
             "update" => {
@@ -963,203 +1057,30 @@ pub fn execute_cancellable(
             Ok(json!({"acknowledged":true,"state_revision":s.task.revision}))
         }
         "file_list" => {
-            let files = paths(&s.project, path_glob(&args)?, cancel)?;
+            let mode = args["mode"].as_str().unwrap_or("text");
+            let files = if mode == "paths" {
+                candidate_paths(&s.project, path_glob(&args)?, cancel)?
+            } else {
+                paths(&s.project, path_glob(&args)?, cancel)?
+            };
             let root = s.project.root.canonicalize()?;
             let names = files
                 .iter()
                 .map(|p| p.strip_prefix(&root).unwrap().display().to_string())
                 .collect::<Vec<_>>();
-            let fingerprint = hash(serde_json::to_string(&names)?.as_bytes());
+            let fingerprint =
+                hash(serde_json::to_string(&(mode, path_glob(&args)?, &names))?.as_bytes());
             let offset = page_cursor(&args, &fingerprint)?;
             if offset > names.len() {
                 bail!("invalid_cursor");
             }
             let end = (offset + n(&args, "limit", 100).clamp(1, 500)).min(names.len());
             Ok(
-                json!({"hash":fingerprint,"paths":names[offset..end],"next_cursor":(end<names.len()).then(||format!("{fingerprint}:{end}"))}),
+                json!({"hash":fingerprint,"mode":mode,"total_files":names.len(),"paths":names[offset..end],"next_cursor":(end<names.len()).then(||format!("{fingerprint}:{end}"))}),
             )
         }
-        "source_search" => {
-            let query = text(&args, "query")?;
-            if query.is_empty() {
-                bail!("query required");
-            }
-            let expression = if args["regex"].as_bool().unwrap_or(false) {
-                query.to_string()
-            } else {
-                regex::escape(query)
-            };
-            let regex = regex::RegexBuilder::new(&expression)
-                .size_limit(1024 * 1024)
-                .build()?;
-            let files = paths(&s.project, path_glob(&args)?, cancel)?;
-            let matched_files = files.len();
-            let mut rows = vec![];
-            let mut fingerprint = Sha256::new();
-            fingerprint.update(expression.as_bytes());
-            for path in files {
-                if cancel.is_cancelled() {
-                    bail!("cancelled");
-                }
-                let contents = read_text(&path)?;
-                let content_hash = hash(contents.as_bytes());
-                fingerprint.update(path.to_string_lossy().as_bytes());
-                fingerprint.update(content_hash.as_bytes());
-                for (i, line) in contents.lines().enumerate() {
-                    if i % 256 == 0 && cancel.is_cancelled() {
-                        bail!("cancelled");
-                    }
-                    if regex.is_match(line) {
-                        rows.push((
-                            path.clone(),
-                            content_hash.clone(),
-                            i + 1,
-                            line.chars().take(500).collect::<String>(),
-                        ));
-                        if rows.len() > 100000 {
-                            bail!("search_too_broad: narrow path pattern");
-                        }
-                    }
-                }
-            }
-            let fingerprint = format!("{:x}", fingerprint.finalize());
-            let offset = page_cursor(&args, &fingerprint)?;
-            if offset > rows.len() {
-                bail!("invalid_cursor");
-            }
-            let end = (offset + n(&args, "limit", 20).clamp(1, 100)).min(rows.len());
-            let mut result = vec![];
-            for (path, content_hash, line, excerpt) in &rows[offset..end] {
-                let source = observe_hashed(s, path, content_hash.clone(), *line, *line, excerpt);
-                result.push(json!({"path":path,"line":line,"text":excerpt,"source":source}));
-            }
-            Ok(
-                json!({"hash":fingerprint,"matches":result,"matched_files":matched_files,"next_cursor":(end<rows.len()).then(||format!("{fingerprint}:{end}"))}),
-            )
-        }
-        "file_read" => {
-            let cursor = if let Some(id) = args["cursor"].as_str() {
-                if ["path", "start_line", "max_lines", "offset"]
-                    .iter()
-                    .any(|key| args.get(key).is_some())
-                {
-                    bail!(
-                        "cursor_arguments_conflict: pass only cursor (and optional force_read); for a new range omit cursor and use path/start_line/max_lines"
-                    );
-                }
-                let cursor = s.file_cursors.get(id).cloned().ok_or_else(|| anyhow::anyhow!("invalid_file_cursor: copy next_cursor.cursor exactly from this session, or start a new read with path/start_line/max_lines"))?;
-                args["path"] = json!(cursor.path);
-                args["start_line"] = json!(cursor.start_line);
-                args["max_lines"] = json!(cursor.max_lines);
-                args["offset"] = json!(cursor.offset);
-                Some(cursor)
-            } else {
-                None
-            };
-            let path = read_path(&s.project, text(&args, "path")?)?;
-            let contents = read_text(&path)?;
-            if cursor
-                .as_ref()
-                .is_some_and(|c| c.hash != hash(contents.as_bytes()))
-            {
-                bail!(
-                    "file_cursor_expired: file changed; start a new read with path/start_line/max_lines and no cursor"
-                );
-            }
-            let start = n(&args, "start_line", 1).max(1);
-            let lines = n(&args, "max_lines", 120).clamp(1, 2000);
-            let offset = n(&args, "offset", 0);
-            let total_lines = contents.lines().count();
-            if start > total_lines {
-                if offset != 0 {
-                    bail!(
-                        "invalid_offset: start_line {start} is beyond total_lines {total_lines}; start a new read without offset"
-                    );
-                }
-                return Ok(
-                    json!({"path":path,"hash":hash(contents.as_bytes()),"total_lines":total_lines,"content":{"text":"","truncated":false,"next_offset":null},"source":null,"eof":true,"next_line":null,"next_offset":0}),
-                );
-            }
-            let selected = contents
-                .lines()
-                .skip(start - 1)
-                .take(lines)
-                .collect::<Vec<_>>()
-                .join("\n");
-            if offset > selected.chars().count() {
-                bail!(
-                    "invalid_offset: offset {offset} exceeds {} characters in start_line={start}, max_lines={lines}. Offset is relative to this range, not the file. Copy next_cursor.cursor for continuation, or omit offset for a new range",
-                    selected.chars().count()
-                );
-            }
-            let prior = s
-                .history
-                .bundles
-                .iter()
-                .filter(|b| b.active)
-                .flat_map(|b| &b.messages)
-                .filter(|m| {
-                    m["role"] == "tool"
-                        && m["content"]
-                            .as_str()
-                            .and_then(|v| serde_json::from_str::<Value>(v).ok())
-                            .is_some_and(|v| {
-                                v["data"]["path"] == json!(path)
-                                    && v["data"]["source"]["hash"] == hash(contents.as_bytes())
-                                    && v["data"]["read_start"] == start
-                                    && v["data"]["read_offset"] == offset
-                                    && v["data"]["read_max_lines"] == lines
-                            })
-                })
-                .count();
-            if prior >= s.config.repeated_read_limit
-                && !args["force_read"].as_bool().unwrap_or(false)
-            {
-                return Ok(
-                    json!({"path":path,"hash":hash(contents.as_bytes()),"total_lines":contents.lines().count(),"repeated_read":true,"suppressed":true,"guidance":"Unchanged range already present repeatedly in active context. Reuse it, read another range, use document_inspect for output metadata, or force_read=true for deliberate verification."}),
-                );
-            }
-            let mut content = bounded_text(s, &selected, offset);
-            let shown = content["text"].as_str().unwrap();
-            let observed_start =
-                start + selected.chars().take(offset).filter(|c| *c == '\n').count();
-            let source = observe(
-                s,
-                &path,
-                &contents,
-                observed_start,
-                observed_start + shown.lines().count().saturating_sub(1),
-                shown,
-            );
-            let line_offsets = std::iter::once(0)
-                .chain(
-                    shown
-                        .chars()
-                        .enumerate()
-                        .filter(|(_, c)| *c == '\n')
-                        .map(|(i, _)| i + 1),
-                )
-                .collect::<Vec<_>>();
-            content["line_start"] = json!(observed_start);
-            content["line_end"] = json!(source.end_line);
-            content["first_line_complete"] =
-                json!(offset == 0 || selected.chars().nth(offset - 1) == Some('\n'));
-            let shown_end = offset + content["text"].as_str().unwrap().chars().count();
-            content["last_line_complete"] = json!(
-                content["text"].as_str().unwrap().ends_with('\n')
-                    || selected.chars().nth(shown_end).is_none_or(|c| c == '\n')
-            );
-            content["line_offsets"] = json!(line_offsets);
-            let truncated = content["truncated"].as_bool().unwrap();
-            let next_line = if truncated {
-                Some(start)
-            } else {
-                (start - 1 + lines < contents.lines().count()).then_some(start + lines)
-            };
-            Ok(
-                json!({"path":path,"total_lines":contents.lines().count(),"hash":hash(contents.as_bytes()),"read_start":start,"read_offset":offset,"read_max_lines":lines,"content":content,"source":source,"next_line":next_line,"next_offset":if truncated{content["next_offset"].clone()}else{json!(0)}}),
-            )
-        }
+        "source_search" => search::execute(s, &args, cancel),
+        "file_read" => read_file(s, &mut args, cancel),
         "document_edit" => {
             let path = output_path(&s.project)?;
             let exists = path.exists();
@@ -1244,7 +1165,7 @@ pub fn execute_cancellable(
                 let offset = n(&args, "offset", 0);
                 let limit = n(&args, "limit", 20).clamp(1, 100);
                 Ok(
-                    json!({"items":s.investigations.iter().skip(offset).take(limit).collect::<Vec<_>>(),"next_offset":(offset+limit<s.investigations.len()).then_some(offset+limit)}),
+                    json!({"items":s.investigations.iter().skip(offset).take(limit).collect::<Vec<_>>(),"next_offset":(offset.saturating_add(limit)<s.investigations.len()).then_some(offset.saturating_add(limit))}),
                 )
             }
             "upsert" => {
@@ -1435,7 +1356,132 @@ pub fn execute_cancellable(
     }
 }
 
-/// Deterministic output checks; this does not attest semantic accuracy.
+/// Shared line reader for explicit file reads and Tree-sitter symbol bodies.
+fn read_file(
+    s: &mut Session,
+    args: &mut Value,
+    _cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Value> {
+    let cursor = if let Some(id) = args["cursor"].as_str() {
+        if ["path", "start_line", "max_lines", "offset"]
+            .iter()
+            .any(|key| args.get(key).is_some())
+        {
+            bail!(
+                "cursor_arguments_conflict: pass only cursor (and optional force_read); for a new range omit cursor and use path/start_line/max_lines"
+            );
+        }
+        let cursor = s.file_cursors.get(id).cloned().ok_or_else(|| anyhow::anyhow!("invalid_file_cursor: copy next_cursor.cursor exactly from this session, or start a new read with path/start_line/max_lines"))?;
+        args["path"] = json!(cursor.path);
+        args["start_line"] = json!(cursor.start_line);
+        args["max_lines"] = json!(cursor.max_lines);
+        args["offset"] = json!(cursor.offset);
+        Some(cursor)
+    } else {
+        None
+    };
+    let path = read_path(&s.project, text(args, "path")?)?;
+    let contents = read_text(&path)?;
+    if cursor
+        .as_ref()
+        .is_some_and(|c| c.hash != hash(contents.as_bytes()))
+    {
+        bail!(
+            "file_cursor_expired: file changed; start a new read with path/start_line/max_lines and no cursor"
+        );
+    }
+    let start = n(args, "start_line", 1).max(1);
+    let lines = n(args, "max_lines", 120).clamp(1, 2000);
+    let offset = n(args, "offset", 0);
+    let total_lines = contents.lines().count();
+    if start > total_lines {
+        if offset != 0 {
+            bail!(
+                "invalid_offset: start_line {start} is beyond total_lines {total_lines}; start a new read without offset"
+            );
+        }
+        return Ok(
+            json!({"path":path,"hash":hash(contents.as_bytes()),"total_lines":total_lines,"content":{"text":"","truncated":false,"next_offset":null},"source":null,"eof":true,"next_line":null,"next_offset":0}),
+        );
+    }
+    let selected = contents
+        .lines()
+        .skip(start - 1)
+        .take(lines)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if offset > selected.chars().count() {
+        bail!(
+            "invalid_offset: offset {offset} exceeds {} characters in start_line={start}, max_lines={lines}. Offset is relative to this range, not the file. Copy next_cursor.cursor for continuation, or omit offset for a new range",
+            selected.chars().count()
+        );
+    }
+    let prior = s
+        .history
+        .bundles
+        .iter()
+        .filter(|b| b.active)
+        .flat_map(|b| &b.messages)
+        .filter(|m| {
+            m["role"] == "tool"
+                && m["content"]
+                    .as_str()
+                    .and_then(|v| serde_json::from_str::<Value>(v).ok())
+                    .is_some_and(|v| {
+                        v["data"]["path"] == json!(path)
+                            && v["data"]["source"]["hash"] == hash(contents.as_bytes())
+                            && v["data"]["read_start"] == start
+                            && v["data"]["read_offset"] == offset
+                            && v["data"]["read_max_lines"] == lines
+                    })
+        })
+        .count();
+    if prior >= s.config.repeated_read_limit && !args["force_read"].as_bool().unwrap_or(false) {
+        return Ok(
+            json!({"path":path,"hash":hash(contents.as_bytes()),"total_lines":contents.lines().count(),"repeated_read":true,"suppressed":true,"guidance":"Unchanged range already present repeatedly in active context. Reuse it, read another range, use document_inspect for output metadata, or force_read=true for deliberate verification."}),
+        );
+    }
+    let mut content = bounded_text(s, &selected, offset);
+    let shown = content["text"].as_str().unwrap();
+    let observed_start = start + selected.chars().take(offset).filter(|c| *c == '\n').count();
+    let source = observe(
+        s,
+        &path,
+        &contents,
+        observed_start,
+        observed_start + shown.lines().count().saturating_sub(1),
+        shown,
+    );
+    let line_offsets = std::iter::once(0)
+        .chain(
+            shown
+                .chars()
+                .enumerate()
+                .filter(|(_, c)| *c == '\n')
+                .map(|(i, _)| i + 1),
+        )
+        .collect::<Vec<_>>();
+    content["line_start"] = json!(observed_start);
+    content["line_end"] = json!(source.end_line);
+    content["first_line_complete"] =
+        json!(offset == 0 || selected.chars().nth(offset - 1) == Some('\n'));
+    let shown_end = offset + content["text"].as_str().unwrap().chars().count();
+    content["last_line_complete"] = json!(
+        content["text"].as_str().unwrap().ends_with('\n')
+            || selected.chars().nth(shown_end).is_none_or(|c| c == '\n')
+    );
+    content["line_offsets"] = json!(line_offsets);
+    let truncated = content["truncated"].as_bool().unwrap();
+    let next_line = if truncated {
+        Some(start)
+    } else {
+        (start - 1 + lines < contents.lines().count()).then_some(start + lines)
+    };
+    Ok(
+        json!({"path":path,"total_lines":contents.lines().count(),"hash":hash(contents.as_bytes()),"read_start":start,"read_offset":offset,"read_max_lines":lines,"content":content,"source":source,"next_line":next_line,"next_offset":if truncated{content["next_offset"].clone()}else{json!(0)}}),
+    )
+}
+
 pub fn audit_document(s: &mut Session) -> Result<Value> {
     documentation::execute(
         s,
@@ -1485,7 +1531,7 @@ pub fn limit_result(
     mut result: Value,
     limit: usize,
 ) -> Value {
-    if call.name == "file_read"
+    if matches!(call.name.as_str(), "file_read" | "symbol_read")
         && result["status"] == "ok"
         && result["data"]["content"]["truncated"] == true
         && !result["next_cursor"]["cursor"].is_string()
@@ -1494,6 +1540,11 @@ pub fn limit_result(
         register_file_cursor(s, id.clone(), &result);
         result["truncated"] = json!(true);
         result["next_cursor"] = json!({"tool":"file_read","cursor":id});
+    }
+    if call.name == "document_inspect" && result["data"]["content"]["truncated"] == true {
+        let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
+        result["next_cursor"] = json!({"tool":"document_inspect","path":result["data"]["path"],"section":args["section"],"offset":result["data"]["content"]["next_offset"],"expected_hash":result["data"]["hash"]});
+        result["truncated"] = json!(true);
     }
     if result_tokens(call, &result, &s.config.model) <= limit {
         return result;
@@ -1551,11 +1602,18 @@ pub fn limit_result(
             .and_then(Value::as_str)
             .map(str::to_owned)
         {
+            // Empty/EOF results have no range metadata and cannot yield a
+            // smaller body or a meaningful continuation. Use archive fallback.
+            if text.is_empty() {
+                continue;
+            }
             let chars: Vec<_> = text.chars().collect();
             let mut template = output.clone();
             // Each shortened view gets its own immutable source observation.
             // Archives and previously delivered results keep their original IDs.
-            let narrowed_source = if call.name == "file_read" && pointer == "/data/content/text" {
+            let narrowed_source = if matches!(call.name.as_str(), "file_read" | "symbol_read")
+                && pointer == "/data/content/text"
+            {
                 template["data"]["source"]["id"]
                     .as_str()
                     .and_then(|id| s.sources.get(id))
@@ -1568,7 +1626,8 @@ pub fn limit_result(
             } else {
                 None
             };
-            let narrowed_cursor = (call.name == "file_read" && pointer == "/data/content/text")
+            let narrowed_cursor = (matches!(call.name.as_str(), "file_read" | "symbol_read")
+                && pointer == "/data/content/text")
                 .then(new_file_cursor_id);
             let (mut low, mut high) = (0, chars.len());
             let candidate = |length: usize| {
@@ -1576,7 +1635,9 @@ pub fn limit_result(
                 *v.pointer_mut(pointer).unwrap() =
                     json!(chars[..length].iter().collect::<String>());
                 let offset = args["offset"].as_u64().unwrap_or(0) + length as u64;
-                if pointer == "/data/content/text" && call.name == "file_read" {
+                if pointer == "/data/content/text"
+                    && matches!(call.name.as_str(), "file_read" | "symbol_read")
+                {
                     let line = template["data"]["read_start"].as_u64().unwrap();
                     let offset = template["data"]["read_offset"].as_u64().unwrap() + length as u64;
                     let shown = v["data"]["content"]["text"].as_str().unwrap();
@@ -1609,9 +1670,10 @@ pub fn limit_result(
                     v["data"]["next_offset"] = json!(offset);
                     v["next_cursor"] = json!({"tool":"file_read","cursor":narrowed_cursor});
                 } else if pointer == "/data/content/text" && call.name == "document_inspect" {
+                    let offset = n(&template["data"], "read_offset", 0) + length;
                     v["data"]["content"]["truncated"] = json!(true);
                     v["data"]["content"]["next_offset"] = json!(offset);
-                    v["next_cursor"] = json!({"tool":"document_inspect","section":args["section"],"offset":offset,"expected_hash":v["data"]["hash"]});
+                    v["next_cursor"] = json!({"tool":"document_inspect","path":v["data"]["path"],"section":args["section"],"offset":offset,"expected_hash":v["data"]["hash"]});
                 } else if pointer == "/data/body/text" && call.name == "memory_read" {
                     v["data"]["body"]["truncated"] = json!(true);
                     v["data"]["body"]["next_offset"] = json!(offset);
@@ -1679,6 +1741,30 @@ pub fn run_call_cancellable(
     call: &crate::llm::ToolCall,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Value {
+    guard_tool(s, |s| run_call_inner(s, call, cancel))
+}
+
+fn guard_tool(s: &mut Session, operation: impl FnOnce(&mut Session) -> Value) -> Value {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(s))) {
+        Ok(result) => result,
+        Err(_) => {
+            // Preserve state and completed writes; a panic is not a rollback.
+            if let Some(cp) = &mut s.checkpoint {
+                cp.failed = true;
+                cp.acknowledged = false;
+            }
+            envelope(Err(anyhow::anyhow!(
+                "tool_worker_panic: execution interrupted; retained state and write outcomes require review"
+            )))
+        }
+    }
+}
+
+fn run_call_inner(
+    s: &mut Session,
+    call: &crate::llm::ToolCall,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Value {
     let signature = format!("{}:{}", call.name, call.arguments);
     if let Some((stored, result)) = s.ledger.get(&call.id) {
         return if stored == &signature {
@@ -1735,4 +1821,97 @@ pub fn verify_document_write(s: &Session) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod panic_tests {
+    use super::*;
+
+    #[test]
+    fn worker_panic_preserves_completed_write_and_invalidates_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                ..Default::default()
+            },
+            Default::default(),
+        );
+        s.checkpoint = Some(crate::session::Checkpoint {
+            id: "checkpoint".into(),
+            bundle_ids: vec![],
+            maintenance_bundle_ids: vec![],
+            acknowledged: true,
+            attempts: 1,
+            starting_state_revision: 0,
+            starting_memory_generation: 0,
+            failed: false,
+        });
+        let path = dir.path().join("saved.md");
+        let result = guard_tool(&mut s, |s| {
+            std::fs::write(&path, "saved before panic").unwrap();
+            s.last_document_write = Some((path.clone(), hash(b"saved before panic")));
+            panic!("injected failure after write");
+        });
+        assert_eq!(result["status"], "error");
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("tool_worker_panic")
+        );
+        assert!(s.checkpoint.as_ref().unwrap().failed);
+        assert!(!s.checkpoint.as_ref().unwrap().acknowledged);
+        assert!(verify_document_write(&s).is_ok());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "saved before panic");
+    }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+
+    #[test]
+    fn preview_preserves_valid_text_and_rejects_invalid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("text.md");
+        for text in ["", "hello", "한글🙂", "one\r\ntwo\n"] {
+            std::fs::write(&path, text).unwrap();
+            for limit in 0..=text.len() + 1 {
+                let (preview, truncated) = read_text_preview(&path, limit).unwrap();
+                assert!(text.starts_with(&preview));
+                assert!(preview.len() <= limit);
+                assert_eq!(truncated, text.len() > limit);
+                if !truncated {
+                    assert_eq!(preview, text);
+                }
+            }
+        }
+        for bytes in [vec![0xff], vec![0xe3, 0x81]] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(read_text_preview(&path, 100).is_err());
+        }
+    }
+
+    #[test]
+    fn text_reader_rejects_directories_and_oversized_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            read_text(dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("path_is_directory")
+        );
+        let path = dir.path().join("large.md");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(16 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(
+            read_text(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported_large_file")
+        );
+    }
 }

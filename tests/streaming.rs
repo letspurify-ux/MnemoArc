@@ -342,3 +342,80 @@ async fn length_without_done_remains_a_stream_error() {
     assert!(error.to_string().contains("stream_interrupted"));
     server.abort();
 }
+
+#[tokio::test]
+async fn malformed_request_and_extreme_timeout_return_errors_without_panicking() {
+    use futures_util::FutureExt;
+    for request in [json!(true), json!([]), json!("invalid")] {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let result = std::panic::AssertUnwindSafe(OpenAiClient.complete(
+            request,
+            &Config::default(),
+            CancellationToken::new(),
+            tx,
+        ))
+        .catch_unwind()
+        .await;
+        assert!(result.is_ok(), "request shape caused a panic");
+        assert!(result.unwrap().is_err());
+    }
+    let c = Config {
+        request_timeout_secs: u64::MAX,
+        ..Default::default()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let result = std::panic::AssertUnwindSafe(OpenAiClient.complete(
+        json!({"messages":[]}),
+        &c,
+        CancellationToken::new(),
+        tx,
+    ))
+    .catch_unwind()
+    .await;
+    assert!(result.is_ok(), "timeout creation caused a panic");
+    assert!(result.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn cancelling_openai_client_unblocks_a_full_delta_channel() {
+    use std::time::Duration;
+    let body = format!(
+        "{}{}data: [DONE]\n\n",
+        event(json!({"choices":[{"delta":{"content":"first"}}]})),
+        event(json!({"choices":[{"delta":{"content":"second"},"finish_reason":"stop"}]}))
+    );
+    let (url, server) = server(body).await;
+    let c = Config {
+        base_url: url,
+        request_timeout_secs: 60,
+        ..Default::default()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let observer = tx.clone();
+    let cancel = CancellationToken::new();
+    let token = cancel.clone();
+    let mut job = tokio::spawn(async move {
+        OpenAiClient
+            .complete(json!({"messages":[]}), &c, token, tx)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while observer.capacity() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(1), &mut job).await;
+    job.abort();
+    server.abort();
+    assert!(
+        result
+            .expect("cancel waited for request timeout instead of interrupting send")
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled")
+    );
+}

@@ -455,3 +455,295 @@ fn bare_section_title_never_guesses_between_duplicate_titles() {
         .to_string();
     assert!(missing.contains("section_not_found") && missing.contains("document_inspect"));
 }
+
+fn deliver(s: &mut Session, name: &str, args: Value, budget: usize) -> Value {
+    let call = mnemoarc::llm::ToolCall {
+        id: mnemoarc::memory::id(),
+        name: name.into(),
+        arguments: args.to_string(),
+    };
+    let result = tools::run_call(s, &call);
+    let result = tools::limit_result(s, &call, result, budget);
+    tools::record_delivered_read(s, &call, &result);
+    result
+}
+
+#[test]
+fn input_document_path_and_coverage_respect_actual_delivery_and_revision() {
+    let (dir, mut s) = setup();
+    let path = dir.path().join("input.md");
+    std::fs::write(&path, "# 제목\n소개\n## 내용\n본문\n").unwrap();
+    let outline = deliver(&mut s, "document_inspect", json!({"path":"input.md"}), 4000);
+    assert_eq!(outline["data"]["outline"].as_array().unwrap().len(), 2);
+    assert!(s.read_coverage.is_empty());
+    // Execution alone is not delivery; it can still be truncated by the batch.
+    run(&mut s, "file_read", json!({"path":"input.md"}));
+    assert!(s.read_coverage.is_empty());
+    deliver(
+        &mut s,
+        "file_read",
+        json!({"path":"input.md","max_lines":2}),
+        4000,
+    );
+    let coverage = run(&mut s, "document_inspect", json!({"path":"input.md"}))["coverage"].clone();
+    assert_eq!(coverage["fully_read_lines"], 2);
+    assert_eq!(
+        coverage["missing_ranges"],
+        json!([{"start_line":3,"end_line":4}])
+    );
+    deliver(
+        &mut s,
+        "document_inspect",
+        json!({"path":"input.md","section":"내용"}),
+        4000,
+    );
+    assert_eq!(
+        run(&mut s, "document_inspect", json!({"path":path}))["coverage"]["complete"],
+        true
+    );
+    std::fs::write(&path, "# 변경\n새 내용\n").unwrap();
+    let changed = run(&mut s, "document_inspect", json!({"path":"input.md"}));
+    assert_eq!(changed["coverage"]["fully_read_lines"], 0);
+    assert_eq!(changed["coverage"]["previous_revision_ignored"], true);
+    deliver(&mut s, "file_read", json!({"path":"input.md"}), 4000);
+    assert_eq!(
+        run(&mut s, "document_inspect", json!({"path":"input.md"}))["coverage"]["complete"],
+        true
+    );
+}
+
+#[test]
+fn input_inspection_enforces_file_read_path_rules() {
+    let (dir, mut s) = setup();
+    let outside = tempfile::tempdir().unwrap();
+    let external = outside.path().join("external.md");
+    std::fs::write(&external, "# 외부\n").unwrap();
+    assert!(tools::execute(&mut s, "document_inspect", json!({"path":external})).is_err());
+    std::fs::write(dir.path().join("private.md"), "# 비공개\n").unwrap();
+    s.project.exclude = vec!["private.md".into()];
+    assert!(tools::execute(&mut s, "document_inspect", json!({"path":"private.md"})).is_err());
+    assert!(tools::execute(&mut s, "document_inspect", json!({"path":"."})).is_err());
+    s.project.output = external.clone();
+    assert_eq!(
+        run(&mut s, "document_inspect", json!({}))["path"],
+        json!(external)
+    );
+    assert_eq!(
+        run(&mut s, "document_inspect", json!({"path":external}))["total_lines"],
+        1
+    );
+    #[cfg(unix)]
+    {
+        let other = outside.path().join("other.md");
+        std::fs::write(&other, "# outside\n").unwrap();
+        std::os::unix::fs::symlink(&other, dir.path().join("escape.md")).unwrap();
+        assert!(tools::execute(&mut s, "document_inspect", json!({"path":"escape.md"})).is_err());
+    }
+}
+
+#[test]
+fn final_budget_partial_lines_and_archive_only_do_not_overstate_coverage() {
+    let (dir, mut s) = setup();
+    let body = format!("# 긴 문서\n{}\n끝\n", "아주 긴 한글 문장 ".repeat(800));
+    std::fs::write(dir.path().join("input.md"), &body).unwrap();
+    deliver(&mut s, "file_read", json!({"path":"input.md"}), 100);
+    assert!(s.read_coverage.is_empty());
+    let mut page = deliver(&mut s, "file_read", json!({"path":"input.md"}), 700);
+    assert_eq!(page["data"]["content"]["last_line_complete"], false);
+    assert_eq!(
+        run(&mut s, "document_inspect", json!({"path":"input.md"}))["coverage"]["fully_read_lines"],
+        1
+    );
+    for _ in 0..200 {
+        if page["data"]["content"]["truncated"] != true {
+            break;
+        }
+        page = deliver(
+            &mut s,
+            "file_read",
+            json!({"cursor":page["next_cursor"]["cursor"]}),
+            700,
+        );
+    }
+    assert_eq!(
+        run(&mut s, "document_inspect", json!({"path":"input.md"}))["coverage"]["complete"],
+        true
+    );
+}
+
+#[test]
+fn section_cursor_keeps_input_path_and_coverage_merges_crlf_pages() {
+    let (dir, mut s) = setup();
+    let body = format!("# 문서\r\n{}", "한글🙂\r\n\r\n".repeat(50));
+    std::fs::write(dir.path().join("input.md"), &body).unwrap();
+    let mut args = json!({"path":"input.md","section":"문서"});
+    let mut reconstructed = String::new();
+    for _ in 0..200 {
+        let page = deliver(&mut s, "document_inspect", args, 500);
+        reconstructed.push_str(page["data"]["content"]["text"].as_str().unwrap());
+        if page["data"]["content"]["truncated"] != true {
+            break;
+        }
+        args = page["next_cursor"].clone();
+        assert_eq!(
+            args["path"],
+            json!(dir.path().join("input.md").canonicalize().unwrap())
+        );
+        args.as_object_mut().unwrap().remove("tool");
+    }
+    assert_eq!(reconstructed, body);
+    assert_eq!(
+        run(&mut s, "document_inspect", json!({"path":"input.md"}))["coverage"]["complete"],
+        true
+    );
+}
+
+#[test]
+fn coverage_missing_ranges_page_and_empty_lines_are_counted() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("input.md"), "a\n\nb\nc\nd\n").unwrap();
+    for line in [2, 4] {
+        deliver(
+            &mut s,
+            "file_read",
+            json!({"path":"input.md","start_line":line,"max_lines":1}),
+            4000,
+        );
+    }
+    let first = run(
+        &mut s,
+        "document_inspect",
+        json!({"path":"input.md","limit":1}),
+    );
+    assert_eq!(first["coverage"]["fully_read_lines"], 2);
+    assert_eq!(first["coverage"]["missing_range_count"], 3);
+    assert_eq!(first["coverage"]["next_offset"], 1);
+    let second = run(
+        &mut s,
+        "document_inspect",
+        json!({"path":"input.md","limit":1,"coverage_offset":1}),
+    );
+    assert_eq!(
+        second["coverage"]["missing_ranges"],
+        json!([{"start_line":3,"end_line":3}])
+    );
+}
+
+#[test]
+fn crlf_split_before_lf_cannot_count_the_next_line_body() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("input.md"), "# H\r\nX\r\n").unwrap();
+    let call = mnemoarc::llm::ToolCall {
+        id: "split".into(),
+        name: "document_inspect".into(),
+        arguments: json!({"path":"input.md","section":"H"}).to_string(),
+    };
+    let mut result = tools::run_call(&mut s, &call);
+    result["data"]["content"]["text"] = json!("# H\r");
+    tools::record_delivered_read(&mut s, &call, &result);
+    let call = mnemoarc::llm::ToolCall { id: "split-next".into(), arguments:json!({"path":"input.md","section":"H","offset":4,"expected_hash":result["data"]["hash"]}).to_string(), ..call };
+    let mut next = tools::run_call(&mut s, &call);
+    next["data"]["content"]["text"] = json!("\n");
+    tools::record_delivered_read(&mut s, &call, &next);
+    let outline = run(&mut s, "document_inspect", json!({"path":"input.md"}));
+    assert_eq!(outline["coverage"]["fully_read_lines"], 1);
+    assert_eq!(outline["outline"][0]["fully_read"], false);
+    tools::record_delivered_read(
+        &mut s,
+        &call,
+        &tools::envelope(Ok(
+            json!({"path":dir.path().join("input.md"),"hash":result["data"]["hash"],"section":"# H","read_offset":4,"content":{"text":"\nX\r\n"}}),
+        )),
+    );
+    assert_eq!(
+        run(&mut s, "document_inspect", json!({"path":"input.md"}))["outline"][0]["fully_read"],
+        true
+    );
+}
+
+#[test]
+fn quoted_section_offsets_survive_relimiting_and_record_the_right_range() {
+    let (dir, mut s) = setup();
+    let body = format!("# H\n{}\n", "긴 본문 ".repeat(600));
+    std::fs::write(dir.path().join("input.md"), &body).unwrap();
+    let digest = tools::hash(body.as_bytes());
+    let start = 50usize;
+    let page = deliver(
+        &mut s,
+        "document_inspect",
+        json!({"path":"input.md","section":"H","offset":start.to_string(),"expected_hash":digest}),
+        500,
+    );
+    let shown = page["data"]["content"]["text"].as_str().unwrap();
+    assert_eq!(page["next_cursor"]["offset"], start + shown.chars().count());
+    assert_eq!(s.read_coverage.values().next().unwrap().ranges[0].0, start);
+}
+
+#[test]
+fn truncated_read_at_newline_does_not_mark_the_following_blank_line_read() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("input.md"), "a\n\nb\n").unwrap();
+    let call = mnemoarc::llm::ToolCall {
+        id: "newline-cut".into(),
+        name: "file_read".into(),
+        arguments: json!({"path":"input.md"}).to_string(),
+    };
+    let mut result = tools::run_call(&mut s, &call);
+    result["data"]["content"]["text"] = json!("a\n");
+    result["data"]["content"]["truncated"] = json!(true);
+    tools::record_delivered_read(&mut s, &call, &result);
+    let coverage = run(&mut s, "document_inspect", json!({"path":"input.md"}));
+    assert_eq!(coverage["coverage"]["fully_read_lines"], 1);
+}
+
+#[test]
+fn eof_read_with_small_result_budget_does_not_panic() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("input.md"), "a\n").unwrap();
+    let page = deliver(
+        &mut s,
+        "file_read",
+        json!({"path":"input.md","start_line":100}),
+        100,
+    );
+    assert_eq!(page["status"], "ok");
+    assert!(s.read_coverage.is_empty());
+}
+
+#[test]
+fn complete_range_including_a_blank_last_line_still_counts_it() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("input.md"), "a\n\nb\n").unwrap();
+    deliver(
+        &mut s,
+        "file_read",
+        json!({"path":"input.md","max_lines":2}),
+        4000,
+    );
+    let result = run(&mut s, "document_inspect", json!({"path":"input.md"}));
+    assert_eq!(result["coverage"]["fully_read_lines"], 2);
+    assert_eq!(
+        result["coverage"]["missing_ranges"],
+        json!([{"start_line":3,"end_line":3}])
+    );
+}
+
+#[test]
+fn changed_file_between_execution_and_delivery_does_not_gain_coverage() {
+    let (dir, mut s) = setup();
+    let path = dir.path().join("input.md");
+    std::fs::write(&path, "# H\nold\n").unwrap();
+    let call = mnemoarc::llm::ToolCall {
+        id: "changed-before-delivery".into(),
+        name: "document_inspect".into(),
+        arguments: json!({"path":"input.md","section":"H"}).to_string(),
+    };
+    let result = tools::run_call(&mut s, &call);
+    std::fs::write(&path, "# H\nnew\n").unwrap();
+    tools::record_delivered_read(&mut s, &call, &result);
+    assert!(s.read_coverage.is_empty());
+    assert_eq!(
+        run(&mut s, "document_inspect", json!({"path":"input.md"}))["coverage"]["complete"],
+        false
+    );
+}

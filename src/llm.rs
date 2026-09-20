@@ -298,12 +298,22 @@ impl LlmClient for OpenAiClient {
         cancel: CancellationToken,
         delta: mpsc::Sender<String>,
     ) -> Result<Completion> {
+        // The client is also called directly (outside the agent's guards).
+        c.validate()?;
+        if !request.is_object() {
+            bail!("invalid_request: completion request must be a JSON object");
+        }
         for attempt in 0..=c.retries {
-            let result = tokio::time::timeout(
-                Duration::from_secs(c.request_timeout_secs),
-                self.attempt(request.clone(), c, cancel.clone(), delta.clone()),
-            )
-            .await;
+            // Cancellation must cover every await inside an attempt, including
+            // response-body reads and backpressure on the delta channel.
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("cancelled"),
+                result = tokio::time::timeout(
+                    Duration::from_secs(c.request_timeout_secs),
+                    self.attempt(request.clone(), c, cancel.clone(), delta.clone()),
+                ) => result,
+            };
             let result = match result {
                 Ok(r) => r,
                 Err(_) => Err(anyhow::anyhow!("request_timeout")),

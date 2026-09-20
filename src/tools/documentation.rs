@@ -97,7 +97,11 @@ pub(super) fn execute(
 ) -> Result<Value> {
     match name {
         "document_inspect" => {
-            let path = output_path(&s.project)?;
+            let path = if let Some(path) = args["path"].as_str() {
+                read_path(&s.project, path)?
+            } else {
+                output_path(&s.project)?
+            };
             if !path.exists() {
                 return Ok(json!({"exists":false,"path":path,"total_lines":0}));
             }
@@ -119,6 +123,7 @@ pub(super) fn execute(
                 }
                 result["section"] = json!(resolved.heading);
                 result["section_hash"] = json!(hash(section.as_bytes()));
+                result["read_offset"] = json!(n(args, "offset", 0));
                 result["content"] = bounded_text(s, section, n(args, "offset", 0));
                 result["start_line"] = json!(resolved.line);
                 result["section_lines"] = json!(section.lines().count());
@@ -129,7 +134,18 @@ pub(super) fn execute(
                     bail!("invalid_offset");
                 }
                 let end = (offset + n(args, "limit", 50).clamp(1, 100)).min(headings.len());
-                result["outline"] = json!(headings[offset..end].iter().map(|h|json!({"heading":h.heading,"start_line":h.line,"lines":doc[h.start..h.end].lines().count(),"hash":hash(&doc.as_bytes()[h.start..h.end])})).collect::<Vec<_>>());
+                let (coverage, read_lines) = super::coverage::report(
+                    s,
+                    &path,
+                    &doc,
+                    n(args, "coverage_offset", 0),
+                    n(args, "limit", 50),
+                );
+                result["coverage"] = coverage;
+                result["outline"] = json!(headings[offset..end].iter().map(|h| {
+                    let lines = doc[h.start..h.end].lines().count();
+                    json!({"heading":h.heading,"start_line":h.line,"lines":lines,"hash":hash(&doc.as_bytes()[h.start..h.end]),"fully_read":read_lines[h.line-1..h.line-1+lines].iter().all(|&v|v)})
+                }).collect::<Vec<_>>());
                 result["next_offset"] = json!((end < headings.len()).then_some(end));
             }
             Ok(result)
@@ -139,8 +155,8 @@ pub(super) fn execute(
                 r"^\s*(?:(?:export|default|pub(?:\([^)]*\))?|async|abstract|declare|static)\s+)*(?:(?:function\*?|class|interface|type|enum|struct|trait|fn|def|const|let|var)\s+([\p{L}_$][\p{L}\p{N}_$]*))",
             )?;
             let query = args["query"].as_str().unwrap_or("").to_lowercase();
-            let files = paths(&s.project, path_glob(args)?, cancel)?;
-            let matched_files = files.len();
+            let files = candidate_paths(&s.project, path_glob(args)?, cancel)?;
+            let mut matched_files = 0;
             let mut scanned_files = 0usize;
             let mut rows = vec![];
             let mut fingerprint = Sha256::new();
@@ -149,6 +165,10 @@ pub(super) fn execute(
                 if cancel.is_cancelled() {
                     bail!("cancelled");
                 }
+                let Some(contents) = search_text(&path)? else {
+                    continue;
+                };
+                matched_files += 1;
                 if !matches!(
                     path.extension().and_then(|x| x.to_str()),
                     Some("rs" | "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "py")
@@ -156,11 +176,13 @@ pub(super) fn execute(
                     continue;
                 }
                 scanned_files += 1;
-                let contents = read_text(&path)?;
                 let digest = hash(contents.as_bytes());
                 fingerprint.update(path.to_string_lossy().as_bytes());
                 fingerprint.update(digest.as_bytes());
                 for (i, line) in contents.lines().enumerate() {
+                    if i % 256 == 0 && cancel.is_cancelled() {
+                        bail!("cancelled");
+                    }
                     if let Some(c) = declaration.captures(line)
                         && c[1].to_lowercase().contains(&query)
                     {

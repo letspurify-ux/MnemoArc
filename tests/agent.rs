@@ -841,6 +841,13 @@ async fn summary_reads_share_budget_and_continue_without_history_or_writes() {
             }
         }
     }
+    // Parallel worker results are recorded only after final batch truncation.
+    assert_eq!(result.read_coverage.len(), 4);
+    for coverage in result.read_coverage.values() {
+        assert_eq!(coverage.ranges.len(), 1);
+        assert_eq!(coverage.ranges[0].0, 0);
+        assert!(coverage.ranges[0].1 > 0 && coverage.ranges[0].1 < text.chars().count());
+    }
     assert!(result.investigations.is_empty());
     assert!(result.memory.entries.is_empty());
     assert!(!dir.path().join("docs/source-summary.md").exists());
@@ -886,11 +893,11 @@ async fn resume_and_large_budgets_do_not_restart_investigation() {
         let drain = tokio::spawn(async move {
             let mut model = false;
             while let Some(event) = rx.recv().await {
-                if let mnemoarc::agent::AgentEvent::Snapshot(s) = event {
-                    if s.activity["stage"] == "model" {
-                        model = true;
-                        assert!(s.activity["started_at_ms"].as_i64().unwrap() > 0);
-                    }
+                if let mnemoarc::agent::AgentEvent::Snapshot(s) = event
+                    && s.activity["stage"] == "model"
+                {
+                    model = true;
+                    assert!(s.activity["started_at_ms"].as_i64().unwrap() > 0);
                 }
             }
             assert!(model);

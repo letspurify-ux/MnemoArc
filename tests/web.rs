@@ -271,3 +271,125 @@ async fn shutdown_closes_event_streams_without_waiting_for_browser_disconnect() 
     assert!(body.contains("event: changed"));
     server.abort();
 }
+
+#[tokio::test]
+async fn shutdown_interrupts_a_pending_connection_probe() {
+    use axum::{Router, routing::post};
+    use std::time::Duration;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let signal = entered.clone();
+    let mock = Router::new().route(
+        "/chat/completions",
+        post(move || {
+            let signal = signal.clone();
+            async move {
+                signal.notify_one();
+                std::future::pending::<String>().await
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_server = tokio::spawn(async move {
+        axum::serve(listener, mock).await.unwrap();
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (url, state, server) = launch(dir.path()).await;
+    let client = reqwest::Client::new();
+    let mut config = get(&client, &url, "/api/state").await["config"].clone();
+    config["base_url"] = json!(upstream);
+    config["request_timeout_secs"] = json!(60);
+    let mut pending = tokio::spawn(async move {
+        client
+            .post(format!("{url}/api/check"))
+            .header("x-mnemoarc-client", "web")
+            .json(&json!({"config":config}))
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    state.shutdown().await;
+    let result = tokio::time::timeout(Duration::from_secs(1), &mut pending).await;
+    pending.abort();
+    server.abort();
+    mock_server.abort();
+    assert_eq!(
+        result
+            .expect("shutdown left connection probe active")
+            .unwrap()
+            .status(),
+        503
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn output_rejects_fifo_without_waiting_for_a_writer() {
+    use std::{os::unix::fs::OpenOptionsExt, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("docs/source-summary.md");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (url, state, server) = launch(dir.path()).await;
+    let client = reqwest::Client::new();
+    let initial = get(&client, &url, "/api/state").await;
+    let id = initial["sessions"][0]["id"].as_str().unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        client.get(format!("{url}/api/sessions/{id}/output")).send(),
+    )
+    .await;
+    if result.is_err() {
+        // Release the old implementation's blocked reader before failing the
+        // regression test; never leave a blocking worker stuck at test exit.
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        drop(writer);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    state.shutdown().await;
+    server.abort();
+    assert_eq!(
+        result
+            .expect("output API waited for a FIFO writer")
+            .unwrap()
+            .status(),
+        400
+    );
+}
+
+#[tokio::test]
+async fn output_preview_truncates_at_utf8_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("docs/source-summary.md");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let prefix = "a".repeat(2 * 1024 * 1024 - 1);
+    std::fs::write(&path, format!("{prefix}한글")).unwrap();
+    let (url, state, server) = launch(dir.path()).await;
+    let client = reqwest::Client::new();
+    let initial = get(&client, &url, "/api/state").await;
+    let id = initial["sessions"][0]["id"].as_str().unwrap();
+    let response = client
+        .get(format!("{url}/api/sessions/{id}/output"))
+        .send()
+        .await
+        .unwrap();
+    state.shutdown().await;
+    server.abort();
+    assert!(response.status().is_success());
+    let data: Value = response.json().await.unwrap();
+    assert_eq!(data["truncated"], true);
+    assert_eq!(data["content"], prefix);
+}

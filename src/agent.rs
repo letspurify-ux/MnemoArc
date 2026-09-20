@@ -6,6 +6,7 @@ use crate::{
     tools::{self, ToolRegistry},
 };
 use anyhow::{Result, bail};
+use futures_util::FutureExt;
 use serde_json::{Value, json};
 use std::{
     sync::Arc,
@@ -37,8 +38,44 @@ pub enum AgentEvent {
         text: String,
     },
 }
-async fn snapshot(s: &Session, tx: &mpsc::Sender<AgentEvent>) {
-    let _ = tx.send(AgentEvent::Snapshot(Box::new(s.clone()))).await;
+// A detached relay can retain the web event sender and prevent shutdown.
+struct AbortOnDrop(tokio::task::AbortHandle);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+fn run_deadline(started: Instant, config: &Config) -> tokio::time::Instant {
+    tokio::time::Instant::from_std(started)
+        .checked_add(Duration::from_secs(config.run_timeout_secs))
+        .unwrap_or_else(tokio::time::Instant::now)
+}
+async fn emit(
+    tx: &mpsc::Sender<AgentEvent>,
+    event: AgentEvent,
+    cancel: &CancellationToken,
+    deadline: tokio::time::Instant,
+) {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => { let _ = tx.try_send(event); }
+        _ = tokio::time::sleep_until(deadline) => { let _ = tx.try_send(event); }
+        permit = tx.reserve() => { if let Ok(permit) = permit { permit.send(event); } }
+    }
+}
+async fn snapshot(
+    s: &Session,
+    tx: &mpsc::Sender<AgentEvent>,
+    cancel: &CancellationToken,
+    deadline: tokio::time::Instant,
+) {
+    emit(
+        tx,
+        AgentEvent::Snapshot(Box::new(s.clone())),
+        cancel,
+        deadline,
+    )
+    .await;
 }
 fn assistant(text: &str, calls: &[ToolCall]) -> Value {
     let mut v = json!({"role":"assistant","content":text});
@@ -56,6 +93,7 @@ async fn execute_one(
         return (s, tools::envelope(Err(anyhow::anyhow!("cancelled"))));
     }
     let timeout = s.config.tool_timeout_secs;
+    let backup = s.clone();
     let child = cancel.child_token();
     let tool_cancel = child.clone();
     let mut job = tokio::task::spawn_blocking(move || {
@@ -65,10 +103,25 @@ async fn execute_one(
     // Joining a mutating operation is mandatory: cancellation must not hide a completed write.
     match tokio::time::timeout(Duration::from_secs(timeout), &mut job).await {
         Ok(Ok(result)) => result,
-        Ok(Err(e)) => panic!("tool worker panicked: {e}"),
+        Ok(Err(_)) => (
+            backup,
+            tools::envelope(Err(anyhow::anyhow!(
+                "tool_worker_panic: worker lost; last snapshot retained, write outcomes require review"
+            ))),
+        ),
         Err(_) => {
             child.cancel();
-            let (mut s, result) = job.await.expect("tool worker panicked");
+            let (mut s, result) = match job.await {
+                Ok(result) => result,
+                Err(_) => {
+                    return (
+                        backup,
+                        tools::envelope(Err(anyhow::anyhow!(
+                            "tool_worker_panic: worker lost after deadline; write outcomes require review"
+                        ))),
+                    );
+                }
+            };
             s.last_error = Some(
                 "Tool exceeded deadline; waited for its final outcome to avoid an untracked write"
                     .into(),
@@ -157,7 +210,7 @@ pub async fn run_session_controlled(
     s.status = "running".into();
     s.last_error = None;
     let started = Instant::now();
-    let initial_tokens = s.input_tokens + s.output_tokens;
+    let initial_tokens = s.input_tokens.saturating_add(s.output_tokens);
     let mut failure = None;
     let mut finalization_attempts = 0usize;
     let mut length_recoveries = 0usize;
@@ -171,7 +224,16 @@ pub async fn run_session_controlled(
     if let Err(e) = s.config.runnable() {
         failure = Some(e.to_string());
     }
-    snapshot(&s, &events).await;
+    if s.input_tokens
+        .checked_add(s.output_tokens)
+        .is_none_or(|total| total == usize::MAX)
+    {
+        failure = Some(
+            "token_counter_exhausted: reported usage exceeds supported range; start a new session"
+                .into(),
+        );
+    }
+    snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
     while failure.is_none() && !cancel.is_cancelled() {
         while let Ok(command) = commands.try_recv() {
             match command {
@@ -184,30 +246,44 @@ pub async fn run_session_controlled(
             match apply_config(&mut s, config) {
                 Ok(()) => {
                     s.pending_config = None;
-                    let _ = events
-                        .send(AgentEvent::Notice {
+                    emit(
+                        &events,
+                        AgentEvent::Notice {
                             session: s.id.clone(),
                             text: "Settings applied at request boundary".into(),
-                        })
-                        .await;
+                        },
+                        &cancel,
+                        run_deadline(started, &s.config),
+                    )
+                    .await;
                 }
                 Err(error) => {
-                    let _ = events
-                        .send(AgentEvent::Notice {
+                    emit(
+                        &events,
+                        AgentEvent::Notice {
                             session: s.id.clone(),
                             text: format!("Settings pending cleanup: {error}"),
-                        })
-                        .await;
+                        },
+                        &cancel,
+                        run_deadline(started, &s.config),
+                    )
+                    .await;
                 }
             }
         }
         if started.elapsed().as_secs() >= s.config.run_timeout_secs
-            || s.input_tokens + s.output_tokens - initial_tokens >= s.config.run_tokens
+            || s.input_tokens
+                .saturating_add(s.output_tokens)
+                .saturating_sub(initial_tokens)
+                >= s.config.run_tokens
         {
             failure = Some("run_budget_exhausted: partial results and memory retained".into());
             break;
         }
-        let spent = (s.input_tokens + s.output_tokens).saturating_sub(initial_tokens);
+        let spent = s
+            .input_tokens
+            .saturating_add(s.output_tokens)
+            .saturating_sub(initial_tokens);
         let remaining = s.config.run_tokens.saturating_sub(spent);
         let seconds_remaining = s
             .config
@@ -283,16 +359,22 @@ pub async fn run_session_controlled(
         // Reasoning models spend output tokens on reasoning too; retain the
         // configured output allowance and reserve it for every cleanup round.
         let request_config = s.config.clone();
-        if request_tokens + request_config.output_tokens + 512 > s.config.context_tokens {
+        if request_tokens
+            .saturating_add(request_config.output_tokens)
+            .saturating_add(512)
+            > s.config.context_tokens
+        {
             failure = Some(format!(
                 "context_limit: input estimate {request_tokens} + output {} + margin 512 exceeds {}; original context retained",
                 request_config.output_tokens, s.config.context_tokens
             ));
             break;
         }
-        if s.input_tokens + s.output_tokens - initial_tokens
-            + request_tokens
-            + request_config.output_tokens
+        if s.input_tokens
+            .saturating_add(s.output_tokens)
+            .saturating_sub(initial_tokens)
+            .saturating_add(request_tokens)
+            .saturating_add(request_config.output_tokens)
             > s.config.run_tokens
         {
             failure = Some("run_budget_exhausted: insufficient budget for next request".into());
@@ -303,55 +385,80 @@ pub async fn run_session_controlled(
         }
         s.task_rounds += 1;
         s.activity = json!({"stage":"model","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds});
-        snapshot(&s, &events).await;
+        snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
+        let deadline = run_deadline(started, &s.config);
+        if tokio::time::Instant::now() >= deadline {
+            failure = Some("run_timeout: event delivery exhausted execution deadline".into());
+            break;
+        }
         let (tx, mut rx) = mpsc::channel(64);
         let event_tx = events.clone();
         let sid = s.id.clone();
+        let relay_done = CancellationToken::new();
+        let done = relay_done.clone();
+        let relay_cancel = cancel.clone();
         let relay = tokio::spawn(async move {
-            while let Some(text) = rx.recv().await {
-                let _ = event_tx
-                    .send(AgentEvent::Delta {
+            loop {
+                let text = tokio::select! {
+                    biased;
+                    _ = relay_cancel.cancelled() => break,
+                    _ = done.cancelled(), if !rx.is_closed() => { rx.close(); continue; },
+                    text = rx.recv() => text,
+                };
+                let Some(text) = text else { break };
+                emit(
+                    &event_tx,
+                    AgentEvent::Delta {
                         session: sid.clone(),
                         text,
-                    })
-                    .await;
+                    },
+                    &relay_cancel,
+                    deadline,
+                )
+                .await;
             }
         });
-        let response = tokio::select! {_ = cancel.cancelled()=>Err(anyhow::anyhow!("cancelled")),result=tokio::time::timeout(Duration::from_secs(s.config.run_timeout_secs.saturating_sub(started.elapsed().as_secs()).max(1)),client.complete(request,&request_config,cancel.clone(),tx))=>match result{Ok(r)=>r,Err(_)=>Err(anyhow::anyhow!("run_timeout"))}};
+        let _relay_guard = AbortOnDrop(relay.abort_handle());
+        let response = tokio::select! {_ = cancel.cancelled()=>Err(anyhow::anyhow!("cancelled")),result=tokio::time::timeout_at(deadline,std::panic::AssertUnwindSafe(client.complete(request,&request_config,cancel.clone(),tx)).catch_unwind())=>match result{Ok(Ok(r))=>r,Ok(Err(_))=>Err(anyhow::anyhow!("model_worker_panic: model request interrupted; session retained")),Err(_)=>Err(anyhow::anyhow!("run_timeout"))}};
+        relay_done.cancel();
         let _ = relay.await;
         let completion = match response {
             Ok(r) => r,
             Err(e) => {
                 s.usage_incomplete = true;
-                s.input_tokens += request_tokens;
+                s.input_tokens = s.input_tokens.saturating_add(request_tokens);
                 failure = Some(e.to_string());
                 break;
             }
         };
         if completion.attempts > 1 {
             s.usage_incomplete = true;
-            s.input_tokens += request_tokens * (completion.attempts - 1);
+            s.input_tokens = s
+                .input_tokens
+                .saturating_add(request_tokens.saturating_mul(completion.attempts - 1));
         }
         if let Some(u) = completion.usage {
-            s.input_tokens += u.input;
-            s.output_tokens += u.output;
+            s.input_tokens = s.input_tokens.saturating_add(u.input);
+            s.output_tokens = s.output_tokens.saturating_add(u.output);
             if let Some(c) = u.cached {
-                s.cached_tokens = Some(s.cached_tokens.unwrap_or(0) + c);
+                s.cached_tokens = Some(s.cached_tokens.unwrap_or(0).saturating_add(c));
             }
         } else {
             s.usage_incomplete = true;
-            s.input_tokens += request_tokens;
-            s.output_tokens += if completion.length_limited {
-                // No provider usage: length exhaustion may be invisible reasoning.
-                request_config.output_tokens
-            } else {
-                context::tokens(&completion.text, &s.config.model)
-                    + completion
-                        .calls
-                        .iter()
-                        .map(|c| context::tokens(&c.arguments, &s.config.model))
-                        .sum::<usize>()
-            };
+            s.input_tokens = s.input_tokens.saturating_add(request_tokens);
+            s.output_tokens = s
+                .output_tokens
+                .saturating_add(if completion.length_limited {
+                    // No provider usage: length exhaustion may be invisible reasoning.
+                    request_config.output_tokens
+                } else {
+                    context::tokens(&completion.text, &s.config.model)
+                        + completion
+                            .calls
+                            .iter()
+                            .map(|c| context::tokens(&c.arguments, &s.config.model))
+                            .sum::<usize>()
+                });
         }
         if completion.length_limited {
             let mut partial = assistant(&completion.text, &[]);
@@ -366,7 +473,7 @@ pub async fn run_session_controlled(
             }
             length_recoveries += 1;
             s.activity = json!({"stage":"continuing","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds});
-            snapshot(&s, &events).await;
+            snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
             if length_recoveries >= 3 {
                 failure = Some("length_recovery_limit: partial text retained after 3 output-limit responses; shorten the requested answer or adjust output/reasoning settings before resuming".into());
                 break;
@@ -444,7 +551,7 @@ pub async fn run_session_controlled(
             if s.status == "partial" && finalization_attempts < s.config.review_limit.min(2) {
                 finalization_attempts += 1;
                 s.status = "running".into();
-                let _ = events.send(AgentEvent::Notice { session:s.id.clone(), text:"Completion checks failed; returning to pending evidence verification within the remaining budget".into() }).await;
+                emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"Completion checks failed; returning to pending evidence verification within the remaining budget".into() }, &cancel, run_deadline(started, &s.config)).await;
                 continue;
             }
             break;
@@ -474,8 +581,32 @@ pub async fn run_session_controlled(
                 }
             }
             s.activity = json!({"stage":"tools","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds,"tools":execution_calls[i..i+group].iter().map(|c| c.name.clone()).collect::<Vec<_>>()});
-            snapshot(&s, &events).await;
-            let results = if parallel {
+            snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
+            let results = if failure
+                .as_deref()
+                .is_some_and(|e| e.starts_with("tool_worker_panic"))
+            {
+                (0..group)
+                    .map(|_| {
+                        tools::envelope(Err(anyhow::anyhow!(
+                            "tool_batch_aborted: earlier worker panic"
+                        )))
+                    })
+                    .collect()
+            } else if cancel.is_cancelled()
+                || tokio::time::Instant::now() >= run_deadline(started, &s.config)
+            {
+                let reason = if cancel.is_cancelled() {
+                    "cancelled: tool not started"
+                } else {
+                    let reason = "run_timeout: tool not started after execution deadline";
+                    failure = Some(reason.into());
+                    reason
+                };
+                (0..group)
+                    .map(|_| tools::envelope(Err(anyhow::anyhow!(reason))))
+                    .collect()
+            } else if parallel {
                 read_parallel(&mut s, &execution_calls[i..i + group], &cancel).await
             } else {
                 let (next, result) = execute_one(s, call.clone(), &cancel).await;
@@ -483,6 +614,12 @@ pub async fn run_session_controlled(
                 vec![result]
             };
             for (call, result) in execution_calls[i..i + group].iter().zip(results) {
+                if result["error"]
+                    .as_str()
+                    .is_some_and(|e| e.starts_with("tool_worker_panic"))
+                {
+                    failure = result["error"].as_str().map(str::to_owned);
+                }
                 if call.name == "document_edit"
                     && result["status"] == "ok"
                     && let Some(digest) = result["data"]["hash"].as_str()
@@ -529,15 +666,20 @@ pub async fn run_session_controlled(
                     .min(s.config.result_tokens)
                     .max(200);
                 let result = tools::limit_result(&mut s, call, result, budget);
+                tools::record_delivered_read(&mut s, call, &result);
                 remaining =
                     remaining.saturating_sub(tools::result_tokens(call, &result, &s.config.model));
-                let _ = events
-                    .send(AgentEvent::Tool {
+                emit(
+                    &events,
+                    AgentEvent::Tool {
                         session: s.id.clone(),
                         name: call.name.clone(),
                         status: result["status"].as_str().unwrap_or("error").into(),
-                    })
-                    .await;
+                    },
+                    &cancel,
+                    run_deadline(started, &s.config),
+                )
+                .await;
                 messages.push(
                     json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}),
                 );
@@ -580,7 +722,7 @@ pub async fn run_session_controlled(
             failure = Some(e.to_string());
             break;
         }
-        if s.history.bytes() > s.config.history_bytes * 2 {
+        if s.history.bytes() > s.config.history_bytes.saturating_mul(2) {
             failure = Some("history_hard_limit: cleanup required".into());
             break;
         }
@@ -591,6 +733,7 @@ pub async fn run_session_controlled(
             &s.investigations,
             &s.task,
             &s.file_cursors,
+            &s.read_coverage,
         ))
         .map_or(true, |v| v.len() > s.config.memory_bytes)
         {
@@ -600,7 +743,7 @@ pub async fn run_session_controlled(
             );
             break;
         }
-        snapshot(&s, &events).await;
+        snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
     }
     if cancel.is_cancelled() {
         s.status = "cancelled".into();
@@ -610,7 +753,7 @@ pub async fn run_session_controlled(
         s.last_error = Some(error);
     }
     s.activity = json!({"stage":"idle"});
-    snapshot(&s, &events).await;
+    snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
     s
 }
 
@@ -655,7 +798,7 @@ pub fn apply_config(s: &mut Session, config: Config) -> Result<()> {
     copy.config = config;
     ContextManager::state(&copy)?;
     let request = ContextManager::request(&copy, ToolRegistry::definitions(&copy))?;
-    if context::count(&request, &copy.config.model) + copy.config.output_tokens
+    if context::count(&request, &copy.config.model).saturating_add(copy.config.output_tokens)
         > copy.config.context_tokens
     {
         bail!("New context budget requires checkpoint first; current settings retained");

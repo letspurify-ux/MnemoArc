@@ -182,6 +182,18 @@ impl Config {
                 "Require 0 < verification reserve < writing reserve < 1 and positive repetition limits"
             );
         }
+        for seconds in [
+            self.request_timeout_secs,
+            self.tool_timeout_secs,
+            self.run_timeout_secs,
+        ] {
+            if std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(seconds))
+                .is_none()
+            {
+                bail!("Timeout exceeds supported clock range");
+            }
+        }
         reqwest::Url::parse(&self.base_url)?;
         Ok(())
     }

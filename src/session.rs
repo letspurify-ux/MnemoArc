@@ -140,6 +140,13 @@ pub struct FileCursor {
     pub max_lines: usize,
     pub offset: usize,
 }
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ReadCoverage {
+    pub hash: String,
+    /// Half-open Unicode character ranges in LF-normalized text.
+    pub ranges: Vec<(usize, usize)>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Session {
     pub id: String,
@@ -151,6 +158,7 @@ pub struct Session {
     pub history: SessionHistory,
     pub sources: BTreeMap<String, Source>,
     pub file_cursors: BTreeMap<String, FileCursor>,
+    pub read_coverage: BTreeMap<String, ReadCoverage>,
     pub active_tools: BTreeSet<String>,
     pub pending_tools: Option<BTreeSet<String>>,
     pub investigations: Vec<Investigation>,
@@ -194,6 +202,7 @@ impl Session {
             history: Default::default(),
             sources: BTreeMap::new(),
             file_cursors: BTreeMap::new(),
+            read_coverage: BTreeMap::new(),
             active_tools: ["file_read", "document_inspect", "file_list"]
                 .into_iter()
                 .map(str::to_owned)

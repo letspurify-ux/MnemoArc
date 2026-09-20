@@ -299,10 +299,10 @@ impl MemoryStore {
             0
         };
         let rows = self.search(query, tags);
-        let end = (offset + limit.clamp(1, 100)).min(rows.len());
         if offset > rows.len() {
             bail!("invalid_cursor");
         }
+        let end = offset.saturating_add(limit.clamp(1, 100)).min(rows.len());
         Ok(
             serde_json::json!({"items":rows[offset..end],"next_cursor":(end<rows.len()).then(||format!("{}:{}",self.generation,end))}),
         )
