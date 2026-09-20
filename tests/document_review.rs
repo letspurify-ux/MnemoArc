@@ -360,6 +360,91 @@ fn oversized_multiline_document_is_reviewed_in_complete_bounded_ranges() {
 }
 
 #[test]
+fn review_keeps_the_last_line_citation_on_its_document_page() {
+    let (dir, mut s) = fixture();
+    let source = (1..=200)
+        .map(|i| format!("const LINE_{i} = {i};\n"))
+        .collect::<String>();
+    std::fs::write(dir.path().join("main.js"), source).unwrap();
+    let mut doc = String::from("# Intro\n");
+    for i in 2..=59 {
+        doc.push_str(&format!(
+            "Uncited context {i}: this is reviewed before the cited boundary.\n"
+        ));
+    }
+    doc.push_str("Claim at the page boundary: main.js:100\n");
+    doc.push_str("## Later\nClaim after the boundary: main.js:200\n");
+    doc.push_str(&"Later context without another boundary.\n".repeat(200));
+    std::fs::write(&s.project.output, doc).unwrap();
+    let request = document_review::request(&mut s).unwrap();
+    let payload: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    let end = payload["document_line_end"].as_u64().unwrap() as usize;
+    let evidence = payload["evidence"].to_string();
+    assert_eq!(end, 60);
+    assert!(
+        evidence.contains("100|const LINE_100"),
+        "last document line {end} was not included in evidence"
+    );
+}
+
+#[test]
+fn review_keeps_citations_on_the_first_line_of_each_document_page() {
+    let (dir, mut s) = fixture();
+    let source = (1..=200)
+        .map(|i| format!("const LINE_{i} = {i};\n"))
+        .collect::<String>();
+    std::fs::write(dir.path().join("main.js"), source).unwrap();
+    let mut doc = String::from("First page context. main.js:1\n");
+    doc.push_str(&"Uncited context that fills the first review page.\n".repeat(120));
+    doc.push_str("Second page boundary claim: main.js:200\n");
+    std::fs::write(&s.project.output, doc).unwrap();
+
+    let first = document_review::request(&mut s).unwrap();
+    let first_payload: Value =
+        serde_json::from_str(first["messages"][1]["content"].as_str().unwrap()).unwrap();
+    let first_end = first_payload["document_line_end"].as_u64().unwrap() as usize;
+    assert!(
+        first_payload["evidence"]
+            .to_string()
+            .contains("1|const LINE_1")
+    );
+    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+
+    let second = document_review::request(&mut s).unwrap();
+    let second_payload: Value =
+        serde_json::from_str(second["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(second_payload["document_line_start"], first_end + 1);
+    assert!(
+        second_payload["evidence"]
+            .to_string()
+            .contains("200|const LINE_200"),
+        "citation at the next page start was omitted"
+    );
+}
+
+#[test]
+fn review_allows_an_uncited_page_before_later_citations() {
+    let (dir, mut s) = fixture();
+    std::fs::write(dir.path().join("main.js"), "const VALUE = 1;\n").unwrap();
+    let mut doc = String::new();
+    for i in 1..=500 {
+        doc.push_str(&format!(
+            "Uncited context {i}: {}\n",
+            "This page has no source citation but must still be reviewed. ".repeat(8)
+        ));
+    }
+    doc.push_str("\nCited conclusion: main.js:1\n");
+    std::fs::write(&s.project.output, doc).unwrap();
+    let request = document_review::request(&mut s).unwrap();
+    let payload: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert!(payload["document_line_end"].as_u64().unwrap() < 500);
+    assert!(payload["evidence"].as_array().unwrap().is_empty());
+    assert_eq!(payload["more_document_pages"], true);
+}
+
+#[test]
 fn editing_document_between_ranges_restarts_review_and_discards_old_findings() {
     let (_dir, mut s) = fixture();
     let doc = (1..=220)
@@ -695,7 +780,12 @@ fn repair_limit_defaults_and_validates() {
     assert!(config.validate().is_err());
     config.document_repair_limit = 16;
     let encoded = toml::to_string(&config).unwrap();
-    assert_eq!(toml::from_str::<Config>(&encoded).unwrap().document_repair_limit, 16);
+    assert_eq!(
+        toml::from_str::<Config>(&encoded)
+            .unwrap()
+            .document_repair_limit,
+        16
+    );
 }
 
 async fn run_repair_test(s: Session, client: Arc<dyn LlmClient>) -> Session {
@@ -729,7 +819,14 @@ async fn increasing_repair_limit_resumes_without_resetting_progress() {
     assert!(s.last_error.as_ref().unwrap().contains("4/4"));
     assert_eq!(s.run_guidance["document_repair_requests_remaining"], 0);
     // Even at the cap, final verification/review is allowed without another edit.
-    let s = run_repair_test(s, Arc::new(Reviewer { issues: false, phase: None })).await;
+    let s = run_repair_test(
+        s,
+        Arc::new(Reviewer {
+            issues: false,
+            phase: None,
+        }),
+    )
+    .await;
     assert_eq!(s.status, "complete");
     assert!(document_review::approved(&s));
 }
@@ -739,21 +836,43 @@ async fn reads_and_verification_can_finish_even_at_the_edit_limit() {
     struct ReadAndVerify(std::sync::atomic::AtomicUsize);
     #[async_trait]
     impl LlmClient for ReadAndVerify {
-        async fn complete(&self, request: Value, config: &Config, cancel: CancellationToken, tx: mpsc::Sender<String>) -> Result<Completion> {
+        async fn complete(
+            &self,
+            request: Value,
+            config: &Config,
+            cancel: CancellationToken,
+            tx: mpsc::Sender<String>,
+        ) -> Result<Completion> {
             let round = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if round < 9 {
-                let content = request["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap();
+                let content = request["messages"].as_array().unwrap().last().unwrap()["content"]
+                    .as_str()
+                    .unwrap();
                 let state: Value = serde_json::from_str(content.split_once('\n').unwrap().1)?;
                 assert_eq!(state["document_review"]["repair_requests"], 2);
                 let name = ["file_read", "document_inspect", "investigation"][round % 3];
                 let args = match name {
                     "file_read" => json!({"path":"main.js","force_read":true}),
                     "document_inspect" => json!({}),
-                    _ => json!({"action":"verify_batch","items":{"flow":{"source_ids":[],"verification_note":"Reuse unchanged attestation"}}}),
+                    _ => {
+                        json!({"action":"verify_batch","items":{"flow":{"source_ids":[],"verification_note":"Reuse unchanged attestation"}}})
+                    }
                 };
-                return Ok(Completion { calls: vec![mnemoarc::llm::ToolCall { id: format!("read-{round}"), name:name.into(), arguments:args.to_string() }], ..Default::default() });
+                return Ok(Completion {
+                    calls: vec![mnemoarc::llm::ToolCall {
+                        id: format!("read-{round}"),
+                        name: name.into(),
+                        arguments: args.to_string(),
+                    }],
+                    ..Default::default()
+                });
             }
-            Reviewer { issues:false, phase:None }.complete(request, config, cancel, tx).await
+            Reviewer {
+                issues: false,
+                phase: None,
+            }
+            .complete(request, config, cancel, tx)
+            .await
         }
     }
     let (_dir, mut s) = fixture();
@@ -761,7 +880,11 @@ async fn reads_and_verification_can_finish_even_at_the_edit_limit() {
     document_review::finish(&mut s, r#"{"issues":["Check the existing section"]}"#).unwrap();
     s.config.document_repair_limit = 2;
     s.document_review.repair_requests = 2;
-    let result = run_repair_test(s, Arc::new(ReadAndVerify(std::sync::atomic::AtomicUsize::new(0)))).await;
+    let result = run_repair_test(
+        s,
+        Arc::new(ReadAndVerify(std::sync::atomic::AtomicUsize::new(0))),
+    )
+    .await;
     assert_eq!(result.status, "complete");
     assert!(document_review::approved(&result));
     assert!(result.task_rounds >= 11); // nine non-edit requests + final + paged review

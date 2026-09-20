@@ -135,6 +135,8 @@ pub fn request(s: &mut Session) -> Result<Value> {
     payload["document_line_end"] = json!(next_document_offset);
     payload["more_document_pages"] = json!(next_document_offset < doc_lines.len());
     request["messages"][1]["content"] = json!(payload.to_string());
+    let citations = documentation::citation_spans(&doc)?;
+    let citation_count = citations.len();
     let mut files = BTreeMap::<String, EvidenceFile>::new();
     for documentation::Citation {
         path,
@@ -143,7 +145,7 @@ pub fn request(s: &mut Session) -> Result<Value> {
         relative_link,
         document_line,
         ..
-    } in documentation::citation_spans(&doc)?
+    } in citations
     {
         let path = if relative_link {
             output
@@ -168,7 +170,9 @@ pub fn request(s: &mut Session) -> Result<Value> {
             );
         }
         let file = files.get_mut(&key).unwrap();
-        if (start_line..next_document_offset).contains(&document_line) {
+        // `start_line`/`next_document_offset` are zero-based slice bounds;
+        // citation document lines are one-based and the end bound is included.
+        if (start_line + 1..=next_document_offset).contains(&document_line) {
             // Include branch/loop declarations immediately before a cited body.
             let start = begin.saturating_sub(8).max(1);
             let stop = end.saturating_add(8).min(file.text.lines().count());
@@ -179,7 +183,9 @@ pub fn request(s: &mut Session) -> Result<Value> {
             }
         }
     }
-    if files.is_empty() {
+    // A page without citations is valid when later document pages contain
+    // citations. Reject only a document with no citations anywhere.
+    if files.is_empty() && citation_count == 0 {
         bail!("document_review_evidence: no source citations");
     }
     let mut evidence = Vec::new();

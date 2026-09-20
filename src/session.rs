@@ -304,6 +304,10 @@ impl Session {
             "계속 진행" | "계속" | "이어서 진행" | "continue" | "resume"
         );
         if !continuation {
+            // Tool-call IDs are scoped to one model request sequence. Retaining
+            // successful results across a new user task can replay a stale read
+            // or suppress a new mutation if a provider reuses an ID.
+            self.ledger.clear();
             self.answer_draft = None;
             self.answer_reviewed = false;
             self.answer_review_original = None;

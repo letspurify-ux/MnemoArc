@@ -422,7 +422,7 @@ pub(super) fn citation_spans(doc: &str) -> Result<Vec<Citation>> {
                 begin,
                 end,
                 relative_link: &c[2] == "#L",
-                document_line,
+                document_line: document_line + 1,
             });
             // Repeat the path internally for grouped citations such as a.js:3, 8-10.
             let mut tail = &line[c.get(0).unwrap().end()..];
@@ -438,7 +438,7 @@ pub(super) fn citation_spans(doc: &str) -> Result<Vec<Citation>> {
                     begin,
                     end,
                     relative_link: &c[2] == "#L",
-                    document_line,
+                    document_line: document_line + 1,
                 });
                 tail = &tail[extra.get(0).unwrap().end()..];
             }

@@ -99,7 +99,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_write",
-                description: "Save one reusable memory. Same key requires expected_revision. Updates replace evidence: resupply valid source_ids for observed facts; existing sources are not inherited. Copy source_ids exactly from tool results; never omit them to recover from unknown_source. Facts without sources and inferred memories are needs_review. Source IDs must come from program observations. Keep metadata very short (aim for 80 tokens; hard limit 160 including ID/key/JSON). Put details in body. kind: fact/decision/failure/question/procedure",
+                description: "Save one reusable memory. Same key requires expected_revision. Updates replace evidence: resupply valid source_ids for observed facts; existing sources are not inherited. Copy source_ids exactly from tool results; never omit them to recover from unknown_source. Facts without sources, inferred memories and memories whose file evidence changed are needs_review. Source IDs must come from program observations. Keep metadata very short (aim for 80 tokens; hard limit 160 including ID/key/JSON). Put details in body. kind: fact/decision/failure/question/procedure",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -116,7 +116,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_find",
-                description: "Search metadata by key/tag/keywords, or list all with empty query; use next cursor until exhausted",
+                description: "Search metadata by key/tag/keywords, or list all with empty query; use next cursor until exhausted. A cursor is bound to the memory generation and the exact query/tag filters and expires if either changes",
                 optional: false,
                 read_only: true,
                 parameters: schema(
@@ -1039,7 +1039,12 @@ pub fn execute_cancellable(
             let input: MemoryInput = serde_json::from_value(args)?;
             let sources = s.source_refs(&input.source_ids)?;
             let result = s.memory.save(input, sources, &s.config)?;
-            Ok(json!(result))
+            // A source can change between its original observation and this
+            // write. Revalidate the newly stored entry too, so stale evidence
+            // cannot be reported as an active fact until it is reread.
+            let id = result.id.clone();
+            revalidate(s)?;
+            Ok(json!(s.memory.get(&id)?.meta()))
         }
         "memory_read" => {
             if !s.config.memory_reuse {
@@ -1082,7 +1087,10 @@ pub fn execute_cancellable(
                         .collect::<Result<Vec<_>>>()?;
                     let input: MemoryInput = serde_json::from_value(args["replacement"].clone())?;
                     let sources = s.source_refs(&input.source_ids)?;
-                    let m = s.memory.replace(&actual, input, sources, &s.config)?;
+                    let replacement = s.memory.replace(&actual, input, sources, &s.config)?;
+                    let replacement_id = replacement.id.clone();
+                    revalidate(s)?;
+                    let m = s.memory.get(&replacement_id)?.meta();
                     for id in &mut s.task.memory_ids {
                         if actual.contains(id) {
                             *id = m.id.clone();
@@ -1531,15 +1539,25 @@ pub fn execute_cancellable(
                         results.push(json!({"id":id,"result":envelope(Err(anyhow::anyhow!("invalid_action_arguments: verify_batch item does not accept {key}; allowed: source_ids, verification_note; ID belongs in the items key")))}));
                         continue;
                     }
+                    // Batch entries are not passed through the outer tool
+                    // schema, so validate required fields and their types
+                    // before either reusing or executing an item.
+                    params["action"] = json!("verify");
+                    params["id"] = json!(id);
+                    if let Err(error) = ToolRegistry::validate(s, "investigation", &params) {
+                        results.push(json!({"id":id,"result":envelope(Err(error))}));
+                        continue;
+                    }
                     // Reuse only after checking section, source and memory freshness.
                     // A redundant batch must not replace valid evidence with an incomplete list.
-                    if s.investigations.iter().any(|i| i.id == *id && i.status == "verified") {
+                    if s.investigations
+                        .iter()
+                        .any(|i| i.id == *id && i.status == "verified")
+                    {
                         reused_ids.push(id.clone());
                         results.push(json!({"id":id,"result":envelope(Ok(json!({"verified":id,"reused":true})))}));
                         continue;
                     }
-                    params["action"] = json!("verify");
-                    params["id"] = json!(id);
                     let result = execute_cancellable(s, "investigation", params, cancel);
                     results.push(json!({"id":id,"result":envelope(result)}));
                 }
@@ -2081,18 +2099,74 @@ pub fn limit_result(
             }
         }
     }
-    // Collections stay structured; the top-level cursor retrieves omitted rows
-    // from the original archive, never from another abbreviated result.
+    fn adjust_collection_continuation(
+        output: &mut Value,
+        call: &crate::llm::ToolCall,
+        args: &Value,
+        field: &str,
+        original_len: usize,
+        retained_len: usize,
+        archive: u64,
+    ) {
+        if retained_len >= original_len {
+            return;
+        }
+        output["truncated"] = json!(true);
+        let data = &mut output["data"];
+        let start = args["cursor"]
+            .as_str()
+            .and_then(|cursor| cursor.rsplit_once(':'))
+            .and_then(|(_, offset)| offset.parse::<usize>().ok())
+            .or_else(|| args["offset"].as_u64().map(|offset| offset as usize))
+            .unwrap_or(0);
+        if let Some(cursor) = data["next_cursor"].as_str()
+            && let Some((prefix, _)) = cursor.rsplit_once(':')
+        {
+            data["next_cursor"] = json!(format!("{prefix}:{}", start + retained_len));
+            return;
+        }
+        if call.name == "history"
+            && args["action"] == "search"
+            && let Some(id) = data[field]
+                .as_array()
+                .and_then(|items| items.last())
+                .and_then(|item| item["id"].as_u64())
+        {
+            data["next_cursor"] = json!(id);
+            return;
+        }
+        if data["next_offset"].is_u64() {
+            data["next_offset"] = json!(start + retained_len);
+            return;
+        }
+        // There is no native continuation for this shortened page. Expose the
+        // immutable archive instead of silently dropping the removed items.
+        output["archive_id"] = json!(archive);
+        output["next_cursor"] = json!({"tool":"history","action":"read","id":archive,"offset":0});
+    }
+
+    // Collections stay structured; a shortened native page resumes at the
+    // first omitted item, while non-paginated collections use the archive.
     for field in ["paths", "matches", "items"] {
+        let original_len = output["data"][field].as_array().map_or(0, Vec::len);
         while output["data"][field]
             .as_array()
             .is_some_and(|a| !a.is_empty())
         {
             if result_tokens(call, &output, &s.config.model) <= limit {
+                let retained_len = output["data"][field].as_array().unwrap().len();
+                adjust_collection_continuation(
+                    &mut output,
+                    call,
+                    &args,
+                    field,
+                    original_len,
+                    retained_len,
+                    archive,
+                );
                 return output;
             }
             output["data"][field].as_array_mut().unwrap().pop();
-            output["data"]["next_cursor"] = Value::Null;
         }
     }
     let mut compact = json!({"status":result["status"],"truncated":true,"data":{"message":"Result retained in history; follow next_cursor."},"next_cursor":{"tool":"history","action":"read","id":archive,"offset":0}});

@@ -2,6 +2,7 @@ use crate::config::Config;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
@@ -107,6 +108,12 @@ pub struct MemoryStore {
     pub generation: u64,
 }
 impl MemoryStore {
+    fn page_fingerprint(&self, query: &str, tags: &[String]) -> String {
+        let input = serde_json::to_vec(&(self.generation, query, tags))
+            .expect("memory page cursor input is always serializable");
+        format!("{:x}", Sha256::digest(input))
+    }
+
     pub fn bytes(&self) -> usize {
         self.entries
             .values()
@@ -287,11 +294,12 @@ impl MemoryStore {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<serde_json::Value> {
+        let fingerprint = self.page_fingerprint(query, tags);
         let offset = if let Some(c) = cursor {
-            let (generation, offset) = c
+            let (stored, offset) = c
                 .split_once(':')
                 .ok_or_else(|| anyhow::anyhow!("invalid_cursor"))?;
-            if generation.parse::<u64>()? != self.generation {
+            if stored != fingerprint {
                 bail!("cursor_expired");
             }
             offset.parse::<usize>()?
@@ -303,9 +311,10 @@ impl MemoryStore {
             bail!("invalid_cursor");
         }
         let end = offset.saturating_add(limit.clamp(1, 100)).min(rows.len());
-        Ok(
-            serde_json::json!({"items":rows[offset..end],"next_cursor":(end<rows.len()).then(||format!("{}:{}",self.generation,end))}),
-        )
+        Ok(serde_json::json!({
+            "items": rows[offset..end],
+            "next_cursor": (end < rows.len()).then(|| format!("{fingerprint}:{end}"))
+        }))
     }
     pub fn stale_path(&mut self, path: &str, hash: Option<&str>) {
         let mut changed = false;

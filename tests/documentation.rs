@@ -975,32 +975,88 @@ fn batch_item_contract_rejects_extra_fields_without_losing_siblings() {
 }
 
 #[test]
+fn batch_reuse_still_requires_the_declared_item_fields() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.rs"), "// source\n").unwrap();
+    std::fs::write(&s.project.output, "# A\na.rs:1\n").unwrap();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"ready","title":"Ready","section":"A","status":"written"}),
+    );
+    let source = run(&mut s, "file_read", json!({"path":"a.rs"}))["source"]["id"].clone();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"ready","source_ids":[source],"verification_note":"Compared source"}),
+    );
+    let result = run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify_batch","items":{"ready":{}}}),
+    );
+    assert_eq!(result["reused_ids"], json!([]));
+    assert_eq!(result["retry_ids"], json!(["ready"]));
+    assert_eq!(
+        result["results"][0]["result"]["recovery"]["code"],
+        "missing_argument"
+    );
+}
+
+#[test]
 fn local_edit_preserves_unrelated_verification_and_batch_reuses_it() {
     let (dir, mut s) = setup();
     std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
     let source = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
-    let doc = run(&mut s, "document_edit", json!({"action":"create","text":"# Entry\nEntry main.rs:1\n# Other\nOther main.rs:1\n"}));
+    let doc = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Entry\nEntry main.rs:1\n# Other\nOther main.rs:1\n"}),
+    );
     for (id, section) in [("entry", "# Entry"), ("other", "# Other")] {
-        run(&mut s, "investigation", json!({"action":"upsert","id":id,"title":id,"status":"written","section":section}));
-        run(&mut s, "investigation", json!({"action":"verify","id":id,"source_ids":[source],"verification_note":"Compared source and section"}));
+        run(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":id,"title":id,"status":"written","section":section}),
+        );
+        run(
+            &mut s,
+            "investigation",
+            json!({"action":"verify","id":id,"source_ids":[source],"verification_note":"Compared source and section"}),
+        );
     }
     let original = serde_json::to_value(&s.investigations[0]).unwrap();
-    let edit = run(&mut s, "document_edit", json!({"action":"patch","expected_hash":doc["hash"],"old_text":"Other main.rs:1","text":"Updated other main.rs:1"}));
+    let edit = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"patch","expected_hash":doc["hash"],"old_text":"Other main.rs:1","text":"Updated other main.rs:1"}),
+    );
     assert_eq!(edit["verification_required_ids"], json!(["other"]));
     assert_eq!(edit["preserved_verified_ids"], json!(["entry"]));
     // A redundant request with missing evidence cannot destroy an unchanged attestation.
-    let result = run(&mut s, "investigation", json!({"action":"verify_batch","items":{
-        "entry":{"source_ids":["unknown"],"verification_note":"Redundant"},
-        "other":{"source_ids":[],"verification_note":"Missing evidence"}
-    }}));
+    let result = run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify_batch","items":{
+            "entry":{"source_ids":["unknown"],"verification_note":"Redundant"},
+            "other":{"source_ids":[],"verification_note":"Missing evidence"}
+        }}),
+    );
     assert_eq!(result["reused_ids"], json!(["entry"]));
     assert_eq!(result["retry_ids"], json!(["other"]));
-    assert_eq!(serde_json::to_value(&s.investigations[0]).unwrap(), original);
+    assert_eq!(
+        serde_json::to_value(&s.investigations[0]).unwrap(),
+        original
+    );
     // A changed source must invalidate the cache and require real verification.
     std::fs::write(dir.path().join("main.rs"), "fn changed() {}\n").unwrap();
-    let result = run(&mut s, "investigation", json!({"action":"verify_batch","items":{
-        "entry":{"source_ids":[source],"verification_note":"Stale source"}
-    }}));
+    let result = run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify_batch","items":{
+            "entry":{"source_ids":[source],"verification_note":"Stale source"}
+        }}),
+    );
     assert_eq!(result["reused_ids"], json!([]));
     assert_eq!(result["retry_ids"], json!(["entry"]));
     assert_eq!(s.investigations[0].status, "written");
