@@ -480,7 +480,14 @@ async fn early_ack_cannot_hide_failed_saves_in_the_same_batch() {
     );
     assert_eq!(result.checkpoints_completed, 0);
     assert!(result.history.bundles.iter().all(|b| b.active));
-    assert_eq!(result.checkpoint.unwrap().attempts, 3);
+    let cp = result.checkpoint.unwrap();
+    assert_eq!(cp.attempts, 3);
+    assert_eq!(cp.failed_attempts, 3);
+    assert!(
+        !cp.last_failure
+            .unwrap()
+            .contains("checkpoint_has_failed_operations")
+    );
 }
 
 struct NeverCalled;
@@ -1259,4 +1266,257 @@ async fn existing_unverified_investigation_still_blocks_completion() {
             .unwrap()
             .contains("Unverified investigation")
     );
+}
+
+struct RecoverUnknownSource {
+    observed: String,
+}
+#[async_trait]
+impl LlmClient for RecoverUnknownSource {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let state: Value = serde_json::from_str(
+            request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )?;
+        let cp = &state["checkpoint"];
+        if cp.is_null() {
+            return Ok(Completion {
+                text: "Recovered".into(),
+                ..Default::default()
+            });
+        }
+        let round = cp["attempts"].as_u64().unwrap();
+        if round == 3 {
+            assert_eq!(cp["failed_attempts"], 1);
+            assert!(
+                cp["last_failure"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unknown_source: S93-missing")
+            );
+            return Ok(call(
+                "lookup",
+                "source_lookup",
+                json!({"path":"evidence.rs"}),
+            ));
+        }
+        let source = if round == 2 {
+            "S93-missing"
+        } else {
+            &self.observed
+        };
+        let mut response = call(
+            &format!("save-{round}"),
+            "memory_write",
+            json!({
+                "title":format!("Finding {round}"),"summary":"Observed fact","kind":"fact",
+                "body":"Entry returns successfully.","source_ids":[source]
+            }),
+        );
+        if round == 4 {
+            let messages = request["messages"].as_array().unwrap();
+            assert!(messages.iter().any(|m| {
+                m["role"] == "tool"
+                    && m["content"]
+                        .as_str()
+                        .is_some_and(|c| c.contains(&self.observed) && c.contains("items"))
+            }));
+            response.calls.push(ToolCall {
+                id: "ack".into(), name: "checkpoint_complete".into(),
+                arguments: json!({"id":cp["id"],"progress":"Saved verified findings", "next":"Resume investigation"}).to_string(),
+            });
+        }
+        assert!(round <= 4);
+        Ok(response)
+    }
+}
+#[tokio::test]
+async fn successful_saves_then_unknown_source_can_lookup_repair_and_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("evidence.rs"), "fn entry() {}\n").unwrap();
+    let mut session = s(dir.path());
+    let evidence = mnemoarc::tools::execute(
+        &mut session,
+        "file_read",
+        json!({"path":"evidence.rs","start_line":1,"max_lines":1}),
+    )
+    .unwrap();
+    let observed = evidence["source"]["id"].as_str().unwrap().to_string();
+    session.add_user("Preserve original evidence".into());
+    mnemoarc::context::ContextManager::prepare(&mut session, 60000).unwrap();
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(
+        session,
+        Arc::new(RecoverUnknownSource { observed }),
+        CancellationToken::new(),
+        tx,
+    )
+    .await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert_eq!(result.checkpoints_completed, 1);
+    assert_eq!(result.memory.entries.len(), 3);
+    assert!(result.checkpoint.is_none());
+    assert!(result.history.bundles.iter().any(|b| {
+        !b.active
+            && b.messages
+                .iter()
+                .any(|m| m["content"] == "Preserve original evidence")
+    }));
+}
+
+struct NeverAcknowledges;
+#[async_trait]
+impl LlmClient for NeverAcknowledges {
+    async fn complete(
+        &self,
+        _: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        Ok(call(
+            "lookup",
+            "source_lookup",
+            json!({"path":"unobserved.rs"}),
+        ))
+    }
+}
+#[tokio::test]
+async fn successful_maintenance_without_ack_is_still_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = s(dir.path());
+    session.add_user("Keep original".into());
+    mnemoarc::context::ContextManager::prepare(&mut session, 60000).unwrap();
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(
+        session,
+        Arc::new(NeverAcknowledges),
+        CancellationToken::new(),
+        tx,
+    )
+    .await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "blocked");
+    let cp = result.checkpoint.unwrap();
+    assert_eq!(cp.attempts, 6);
+    assert_eq!(cp.failed_attempts, 0);
+    assert!(
+        result
+            .last_error
+            .unwrap()
+            .contains("checkpoint_complete was not called")
+    );
+    assert!(result.history.bundles.iter().all(|b| b.active));
+}
+
+struct SeparateLengthRecoveries(Mutex<usize>);
+#[async_trait]
+impl LlmClient for SeparateLengthRecoveries {
+    async fn complete(
+        &self,
+        _: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let mut round = self.0.lock().unwrap();
+        *round += 1;
+        if *round <= 6 && *round % 2 == 1 {
+            return Ok(Completion {
+                length_limited: true,
+                discarded_tool_calls: true,
+                ..Default::default()
+            });
+        }
+        if *round <= 6 {
+            return Ok(call(
+                &format!("read-{round}"),
+                "task_state",
+                json!({"action":"read"}),
+            ));
+        }
+        Ok(Completion {
+            text: "Done".into(),
+            ..Default::default()
+        })
+    }
+}
+#[tokio::test]
+async fn independent_output_truncations_do_not_exhaust_each_others_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = s(dir.path());
+    session.add_user("Work in stages".into());
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(
+        session,
+        Arc::new(SeparateLengthRecoveries(Mutex::new(0))),
+        CancellationToken::new(),
+        tx,
+    )
+    .await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert_eq!(result.task_rounds, 7);
+}
+
+struct ChangingBadSources(Mutex<usize>);
+#[async_trait]
+impl LlmClient for ChangingBadSources {
+    async fn complete(
+        &self,
+        _: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let mut round = self.0.lock().unwrap();
+        *round += 1;
+        let mut response = call(
+            &format!("bad-{round}"),
+            "memory_write",
+            json!({"title":"Invalid finding", "summary":"Invalid", "body":"Unsupported claim", "kind":"fact", "source_ids":[format!("invented-{round}")]}),
+        );
+        response.calls.push(ToolCall {
+            id: format!("progress-{round}"),
+            name: "task_state".into(),
+            arguments: json!({"action":"update","patch":{"current":format!("round {round}")}})
+                .to_string(),
+        });
+        Ok(response)
+    }
+}
+#[tokio::test]
+async fn changing_bad_arguments_and_unrelated_writes_cannot_evade_recovery_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = s(dir.path());
+    session.config.stall_round_limit = 3;
+    session.add_user("Investigate safely".into());
+    let model = Arc::new(ChangingBadSources(Mutex::new(0)));
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(session, model.clone(), CancellationToken::new(), tx).await;
+    drain.await.unwrap();
+    assert_eq!(*model.0.lock().unwrap(), 3);
+    assert!(
+        result
+            .last_error
+            .unwrap()
+            .contains("tool_recovery_limit: memory_write")
+    );
+    assert_eq!(result.memory.entries.len(), 0);
+    assert_eq!(result.task.current, "round 2"); // No later writes after terminal failure.
 }

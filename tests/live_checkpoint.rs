@@ -163,6 +163,8 @@ async fn configured_model_resumes_readonly_investigation() {
     session.checkpoint = serde_json::from_value(snapshot["checkpoint"].clone()).unwrap();
     if let Some(cp) = &mut session.checkpoint {
         cp.attempts = 0;
+        cp.failed_attempts = 0;
+        cp.last_failure = None;
         cp.failed = false;
         cp.acknowledged = false;
     }

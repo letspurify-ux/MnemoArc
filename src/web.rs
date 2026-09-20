@@ -526,6 +526,9 @@ async fn run(
         }
         if let Some(cp) = &mut session.checkpoint {
             cp.attempts = 0;
+            cp.acknowledged = false;
+            cp.failed_attempts = 0;
+            cp.last_failure = None;
             cp.failed = false;
         }
         session.status = "running".into();

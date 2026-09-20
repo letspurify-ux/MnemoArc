@@ -129,6 +129,10 @@ pub struct Checkpoint {
     pub maintenance_bundle_ids: Vec<u64>,
     pub acknowledged: bool,
     pub attempts: usize,
+    #[serde(default)]
+    pub failed_attempts: usize,
+    #[serde(default)]
+    pub last_failure: Option<String>,
     pub starting_state_revision: u64,
     pub starting_memory_generation: u64,
     pub failed: bool,
@@ -286,7 +290,7 @@ impl Session {
                         let mut candidates: Vec<_> = self.sources.values().collect();
                         candidates.sort_by_key(|s| std::cmp::Reverse(s.observed_at));
                         let choices: Vec<_> = candidates.into_iter().take(8).map(|s| json!({"id":s.id,"path":s.path,"start_line":s.start_line,"end_line":s.end_line})).collect();
-                        anyhow::anyhow!("unknown_source: {id}; copy an exact ID from a matching tool result, or reread the relevant file. Do not remove source_ids to bypass this error. Recent sources (not automatic replacements): {}", json!(choices))
+                        anyhow::anyhow!("unknown_source: {id}; Use source_lookup with the matching path to recover an observed ID, or history to inspect the original result. A compact code_outline is navigation only and supplies no evidence ID. If no matching evidence exists, record missing evidence in checkpoint_complete.next and read the source after checkpoint completion; do not save an unsupported fact. Do not substitute unrelated IDs or remove source_ids to bypass this error. Recent sources (not automatic replacements): {}", json!(choices))
                     })
             })
             .collect()

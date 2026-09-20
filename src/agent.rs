@@ -214,6 +214,8 @@ pub async fn run_session_controlled(
     let mut failure = None;
     let mut finalization_attempts = 0usize;
     let mut length_recoveries = 0usize;
+    let mut review_response_failures = 0usize;
+    let mut tool_failures = tools::recovery::FailureTracker::default();
     let mut repetitions = std::collections::BTreeMap::<String, usize>::new();
     let mut last_document_hash: Option<String> = None;
     let mut verified_count = s
@@ -287,9 +289,7 @@ pub async fn run_session_controlled(
         }
         if s.config.source_document_review
             && !s.document_review.pending
-            && s.document_review
-                .repair_started_round
-                .is_some_and(|round| s.task_rounds.saturating_sub(round) >= 8)
+            && s.document_review.repair_requests >= 8
         {
             s.status = "partial".into();
             s.last_error = Some("document_repair_limit: eight repair requests used; partial document and review findings retained".into());
@@ -369,8 +369,17 @@ pub async fn run_session_controlled(
             break;
         }
         if let Some(cp) = &mut s.checkpoint {
-            if cp.attempts >= 3 {
-                failure = Some("checkpoint_retry_limit: original context retained".into());
+            if cp.attempts >= context::CHECKPOINT_MAX_REQUESTS
+                || cp.failed_attempts >= context::CHECKPOINT_MAX_FAILURES
+            {
+                failure = Some(format!(
+                    "checkpoint_retry_limit: {} requests, {} failed requests; last cause: {}; original context retained",
+                    cp.attempts,
+                    cp.failed_attempts,
+                    cp.last_failure
+                        .as_deref()
+                        .unwrap_or("checkpoint_complete was not called successfully")
+                ));
                 break;
             }
             cp.failed = false;
@@ -434,9 +443,6 @@ pub async fn run_session_controlled(
             failure = Some("run_budget_exhausted: insufficient budget for next request".into());
             break;
         }
-        if let Some(cp) = &mut s.checkpoint {
-            cp.attempts += 1;
-        }
         s.task_rounds += 1;
         s.activity = json!({"stage":if reviewing_document {"document_review"} else if reviewing_answer {"answer_review"} else {"model"},"started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds});
         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
@@ -444,6 +450,11 @@ pub async fn run_session_controlled(
         if tokio::time::Instant::now() >= deadline {
             failure = Some("run_timeout: event delivery exhausted execution deadline".into());
             break;
+        }
+        if let Some(cp) = &mut s.checkpoint {
+            cp.attempts += 1;
+        } else if s.document_review.repair_started_round.is_some() && !reviewing_document {
+            s.document_review.repair_requests += 1;
         }
         let document_workflow =
             s.task.require_investigation || s.task.workflow == "source_document";
@@ -523,26 +534,37 @@ pub async fn run_session_controlled(
         if reviewing_document {
             s.document_review.input_tokens += s.input_tokens.saturating_sub(usage_before.0);
             s.document_review.output_tokens += s.output_tokens.saturating_sub(usage_before.1);
-            if completion.length_limited
+            let review_result = if completion.length_limited
                 || !completion.calls.is_empty()
                 || completion.text.trim().is_empty()
             {
-                failure = Some(
+                Err(anyhow::anyhow!(
                     "document_review_incomplete: review must return complete JSON without tools"
-                        .into(),
-                );
+                ))
+            } else {
+                tools::document_review::finish(&mut s, &completion.text)
+            };
+            if let Err(error) = review_result {
+                let reason = error.to_string();
+                review_response_failures += 1;
+                s.last_error = Some(reason.clone());
+                if review_response_failures < 3
+                    && (reason.starts_with("document_review_invalid:")
+                        || reason.starts_with("document_review_incomplete:"))
+                {
+                    snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
+                    continue;
+                }
+                failure = Some(reason);
                 break;
             }
-            if let Err(error) = tools::document_review::finish(&mut s, &completion.text) {
-                failure = Some(error.to_string());
-                break;
-            }
-            if !s.document_review.issues.is_empty() {
+            review_response_failures = 0;
+            if !s.document_review.pending && !s.document_review.issues.is_empty() {
                 s.last_error = Some(format!(
                     "document_review: {}",
                     s.document_review.issues.join("; ")
                 ));
-                if s.document_review.attempts >= 2 {
+                if s.document_review.attempts >= s.config.review_limit {
                     s.status = "partial".into();
                     break;
                 }
@@ -559,9 +581,20 @@ pub async fn run_session_controlled(
                 || !completion.calls.is_empty()
                 || completion.text.trim().is_empty())
         {
-            failure = Some("answer_review_incomplete: review must return one complete answer without tools; draft retained".into());
+            let reason = "answer_review_incomplete: review must return one complete answer without tools; draft retained";
+            review_response_failures += 1;
+            s.last_error = Some(reason.into());
+            if review_response_failures < 3 {
+                snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
+                continue;
+            }
+            failure = Some(reason.into());
             break;
         }
+        if reviewing_answer {
+            review_response_failures = 0;
+        }
+
         if completion.length_limited && buffer_answer && !completion.discarded_tool_calls {
             // A source draft need not be streamed or continued verbatim: the
             // bounded review can produce a complete answer from its evidence.
@@ -590,6 +623,8 @@ pub async fn run_session_controlled(
             // and checkpoint checks; never execute a length-limited tool batch.
             continue;
         }
+        // Independent later truncations get their own bounded recovery window.
+        length_recoveries = 0;
         let continuing = s.continuation.is_some() && s.checkpoint.is_none();
         if s.checkpoint.is_none() {
             s.continuation = None;
@@ -683,7 +718,7 @@ pub async fn run_session_controlled(
                                 && s.config.source_document_review
                                 && !tools::document_review::approved(&s)
                             {
-                                if s.document_review.attempts >= 2 {
+                                if s.document_review.attempts >= s.config.review_limit {
                                     s.status = "partial".into();
                                     s.last_error = Some("document_review_limit: current document has no successful bounded review".into());
                                     break;
@@ -752,6 +787,7 @@ pub async fn run_session_controlled(
         let mut execution_calls = completion.calls.clone();
         execution_calls.sort_by_key(|call| call.name == "checkpoint_complete");
         let mut i = 0;
+        let mut checkpoint_failure_recorded = false;
         let mut remaining = batch_limit;
         while i < execution_calls.len() {
             let call = &execution_calls[i];
@@ -772,14 +808,11 @@ pub async fn run_session_controlled(
             }
             s.activity = json!({"stage":"tools","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds,"tools":execution_calls[i..i+group].iter().map(|c| c.name.clone()).collect::<Vec<_>>()});
             snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
-            let results = if failure
-                .as_deref()
-                .is_some_and(|e| e.starts_with("tool_worker_panic"))
-            {
+            let results = if failure.is_some() {
                 (0..group)
                     .map(|_| {
                         tools::envelope(Err(anyhow::anyhow!(
-                            "tool_batch_aborted: earlier worker panic"
+                            "tool_batch_aborted: earlier terminal failure; call not executed"
                         )))
                     })
                     .collect()
@@ -803,7 +836,14 @@ pub async fn run_session_controlled(
                 s = next;
                 vec![result]
             };
-            for (call, result) in execution_calls[i..i + group].iter().zip(results) {
+            for (call, mut result) in execution_calls[i..i + group].iter().zip(results) {
+                tools::recovery::attach(&s, call, &mut result);
+                if let Some(reason) =
+                    tool_failures.observe(&call.name, &result, s.config.stall_round_limit)
+                    && failure.is_none()
+                {
+                    failure = Some(reason);
+                }
                 if result["error"]
                     .as_str()
                     .is_some_and(|e| e.starts_with("tool_worker_panic"))
@@ -826,7 +866,7 @@ pub async fn run_session_controlled(
                     "document_inspect",
                 ]
                 .contains(&call.name.as_str())
-                    || result["status"] != "ok"
+                    && result["status"] == "ok"
                 {
                     let args =
                         serde_json::from_str::<Value>(&call.arguments).unwrap_or(Value::Null);
@@ -844,6 +884,18 @@ pub async fn run_session_controlled(
                 if result["status"] != "ok"
                     && let Some(cp) = &mut s.checkpoint
                 {
+                    // Count a failed batch once, preserving its first cause rather
+                    // than replacing it with a secondary acknowledgement failure.
+                    if !checkpoint_failure_recorded {
+                        checkpoint_failure_recorded = true;
+                        cp.failed_attempts += 1;
+                        cp.last_failure = Some(
+                            result["error"]
+                                .as_str()
+                                .unwrap_or("tool operation failed")
+                                .to_string(),
+                        );
+                    }
                     cp.failed = true;
                     cp.acknowledged = false;
                 }

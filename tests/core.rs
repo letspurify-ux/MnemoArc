@@ -971,3 +971,65 @@ fn investigation_action_contracts_explain_invalid_calls_before_mutation() {
     .unwrap();
     assert_eq!(list["items"].as_array().unwrap().len(), 1);
 }
+
+#[test]
+fn checkpoint_source_lookup_returns_only_existing_matching_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn entry() {}\n").unwrap();
+    let mut s = session(dir.path());
+    let read = tools::execute(
+        &mut s,
+        "file_read",
+        json!({"path":"a.rs","start_line":1,"max_lines":1}),
+    )
+    .unwrap();
+    let id = read["source"]["id"].as_str().unwrap();
+    tools::execute(&mut s, "memory_write", json!({"title":"Entry", "summary":"Observed", "kind":"fact", "body":"An entry exists", "source_ids":[id]})).unwrap();
+    s.sources.clear(); // Evidence stored in memory must remain discoverable.
+    s.add_user("Preserve findings".into());
+    ContextManager::prepare(&mut s, 60000).unwrap();
+    let found = tools::execute(&mut s, "source_lookup", json!({"path":"a.rs","limit":1})).unwrap();
+    assert_eq!(found["items"][0]["id"], id);
+    assert_eq!(found["items"][0]["start_line"], 1);
+    assert_eq!(found["total"], 1);
+    let missing = tools::execute(&mut s, "source_lookup", json!({"path":"unseen.rs"})).unwrap();
+    assert_eq!(missing["total"], 0);
+    assert!(tools::execute(&mut s, "file_read", json!({"path":"a.rs"})).is_err());
+    assert!(
+        s.source_refs(&["S93-missing".into()])
+            .unwrap_err()
+            .to_string()
+            .contains("source_lookup")
+    );
+    let mut old = serde_json::to_value(s.checkpoint.as_ref().unwrap()).unwrap();
+    old.as_object_mut().unwrap().remove("failed_attempts");
+    old.as_object_mut().unwrap().remove("last_failure");
+    let restored: mnemoarc::session::Checkpoint = serde_json::from_value(old).unwrap();
+    assert_eq!(restored.failed_attempts, 0);
+    assert!(restored.last_failure.is_none());
+}
+
+#[test]
+fn oversized_tool_error_keeps_cause_and_archive_for_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let call = mnemoarc::llm::ToolCall {
+        id: "error".into(),
+        name: "memory_write".into(),
+        arguments: "{}".into(),
+    };
+    let error = format!(
+        "unknown_source: S93-missing; {}",
+        "long recovery details ".repeat(500)
+    );
+    let limited = tools::limit_result(&mut s, &call, json!({"status":"error","error":error}), 200);
+    assert_eq!(limited["status"], "error");
+    assert!(
+        limited["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("unknown_source: S93-missing")
+    );
+    assert_eq!(limited["next_cursor"]["tool"], "history");
+    assert!(tools::result_tokens(&call, &limited, &s.config.model) <= 200);
+}

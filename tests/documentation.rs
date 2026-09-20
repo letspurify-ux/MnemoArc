@@ -157,9 +157,9 @@ fn batch_verification_reports_each_failure_and_source_changes_invalidate_success
     run(
         &mut s,
         "document_edit",
-        json!({"action":"create","text":"# Entry\nmain.rs:1\n## Errors\nmain.rs:999\n"}),
+        json!({"action":"create","text":"# Entry\nmain.rs:1\n# Errors\nmain.rs:999\n"}),
     );
-    for (id, section) in [("entry", "# Entry"), ("errors", "## Errors")] {
+    for (id, section) in [("entry", "# Entry"), ("errors", "# Errors")] {
         run(
             &mut s,
             "investigation",
@@ -341,11 +341,15 @@ fn final_check_rejects_invalid_citations_even_after_agent_attestation() {
         "investigation",
         json!({"action":"upsert","id":"entry","title":"entry","status":"written","section":"# Entry","source_ids":[id]}),
     );
-    run(
+    let error = tools::execute(
         &mut s,
         "investigation",
         json!({"action":"verify","id":"entry","source_ids":[id],"verification_note":"Agent claims comparison."}),
-    );
+    ).unwrap_err();
+    assert!(error.to_string().starts_with("source_coverage_missing:"));
+    // Even an injected legacy attestation cannot bypass final structural audit.
+    s.investigations[0].status = "verified".into();
+    s.investigations[0].document_hash = Some(tools::hash(b"# Entry\nmain.rs:99\n"));
     assert_eq!(
         run(&mut s, "investigation", json!({"action":"final_check"}))["complete"],
         false
@@ -790,4 +794,35 @@ fn changed_file_between_execution_and_delivery_does_not_gain_coverage() {
         run(&mut s, "document_inspect", json!({"path":"input.md"}))["coverage"]["complete"],
         false
     );
+}
+
+#[test]
+fn persisted_sections_become_written_but_unrelated_evidence_cannot_verify_them() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(dir.path().join("other.rs"), "fn other() {}\n").unwrap();
+    for (id, section) in [("entry", "# Entry"), ("missing", "# Missing")] {
+        run(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":id,"title":id,"section":section}),
+        );
+    }
+    let write = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Entry\nmain.rs:1\n"}),
+    );
+    assert_eq!(write["written_items"], json!(["entry"]));
+    assert_eq!(s.investigations[0].status, "written");
+    assert_eq!(s.investigations[1].status, "uninvestigated");
+    let wrong = run(&mut s, "file_read", json!({"path":"other.rs"}))["source"]["id"].clone();
+    assert!(tools::execute(&mut s,"investigation",json!({"action":"verify","id":"entry","source_ids":[wrong],"verification_note":"Claims a match"})).unwrap_err().to_string().starts_with("source_coverage_missing:"));
+    let right = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"entry","source_ids":[right],"verification_note":"Compared the entry"}),
+    );
+    assert_eq!(s.investigations[0].status, "verified");
 }

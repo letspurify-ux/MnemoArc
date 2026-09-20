@@ -45,6 +45,7 @@ pub fn request(s: &Session) -> Result<Value> {
     ]});
     let mut payload = json!({"source_answer_review":true,"request":s.answer_review_question,
         "constraints":s.task.constraints,"draft":s.answer_draft,"evidence":[],"evidence_omitted":false,
+        "previous_response_error":s.last_error.as_deref().filter(|e| e.starts_with("answer_review_incomplete:")),
         "citation_issues":citation_issues(s, s.answer_draft.as_deref().unwrap_or(""))});
     request["messages"][1]["content"] = json!(payload.to_string());
     let ceiling = 8000.min(context::ContextManager::input_budget(&s.config));

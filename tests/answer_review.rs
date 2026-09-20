@@ -255,3 +255,45 @@ fn complete_search_lines_are_evidence_but_truncated_hits_are_not() {
     );
     assert!(!tools::answer_review::citation_issues(&s, answer).is_empty());
 }
+
+struct EmptyThenValidReview(Mutex<usize>);
+#[async_trait]
+impl LlmClient for EmptyThenValidReview {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let mut calls = self.0.lock().unwrap();
+        *calls += 1;
+        if *calls == 1 {
+            return Ok(Completion::default());
+        }
+        assert!(
+            request["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("answer_review_incomplete")
+        );
+        Ok(Completion {
+            text: "The false branch returns false (a.rs:1-4).".into(),
+            ..Default::default()
+        })
+    }
+}
+#[tokio::test]
+async fn incomplete_answer_review_can_recover_without_losing_draft() {
+    let (_dir, mut s) = setup();
+    delivered(&mut s);
+    s.answer_draft = Some("The false branch returns false (a.rs:1-4).".into());
+    let model = Arc::new(EmptyThenValidReview(Mutex::new(0)));
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = agent::run_session(s, model.clone(), CancellationToken::new(), tx).await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert_eq!(*model.0.lock().unwrap(), 2);
+    assert!(result.answer_reviewed);
+}
