@@ -734,9 +734,12 @@ impl LlmClient for SummaryReads {
             assert_eq!(results.len(), 4);
             let mut total = 0;
             for (i, result) in results.iter().enumerate() {
-                let text = result["data"]["content"]["text"]
+                let numbered = result["data"]["content"]["numbered_text"]
                     .as_str()
                     .expect("every read must retain actual document text");
+                // This fixture is one long line; labels never participate in
+                // source cursor offsets or the stored coverage.
+                let text = numbered.strip_prefix("1|").unwrap();
                 assert!(text.chars().count() > 500, "later reads must not starve");
                 let expected: String = self
                     .text

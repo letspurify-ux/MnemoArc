@@ -144,11 +144,11 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "source_search",
-                description: "Search source lines: query is literal text by default. For alternatives use {query:\"agent|run|db\",regex:true}; without regex=true the pipe is searched literally. case_sensitive defaults true; whole_word defaults false (Unicode word boundaries). path_glob filters files (pattern is a legacy alias). mode=matches (default) returns matching lines and source IDs; files returns matching paths; count returns matching-line counts per file. before/after add up to 20 context lines each in matches mode. Each displayed line is capped at 500 characters with truncation marked. Reuse the same search options with cursor for pagination; limit may change. Hashes detect source changes",
+                description: "Search source lines: query is literal text by default. For alternatives use {query:\"agent|run|db\",regex:true}; without regex=true the pipe is searched literally. case_sensitive defaults true; whole_word defaults false (Unicode word boundaries). path selects one exact file (no glob syntax); path_glob filters multiple files (pattern is a legacy alias). Do not combine path with path_glob or pattern. mode=matches (default) returns matching lines and source IDs; files returns matching paths; count returns matching-line counts per file. before/after add up to 20 context lines each in matches mode. Each displayed line is capped at 500 characters with truncation marked. Reuse the same search options with cursor for pagination; limit may change. Hashes detect source changes",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"query":string(),"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"whole_word":{"type":"boolean"},"mode":action(&["matches","files","count"]),"before":{"type":"integer","minimum":0,"maximum":20},"after":{"type":"integer","minimum":0,"maximum":20},"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number()}),
+                    json!({"query":string(),"path":string(),"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"whole_word":{"type":"boolean"},"mode":action(&["matches","files","count"]),"before":{"type":"integer","minimum":0,"maximum":20},"after":{"type":"integer","minimum":0,"maximum":20},"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number()}),
                     &["query"],
                 ),
             },
@@ -174,21 +174,21 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "code_outline",
-                description: "Explore one Rust, JS/JSX, TS/TSX, Python or Java file. Start with {path,view:\"compact\",max_depth:0} for top-level structure. Find a name with {path,query:\"handleQuestion\",match:\"exact\",kind:\"function\"}. query defaults to case-insensitive substring matching. kind filters normalized symbol_kind; container is an exact enclosing path copied from a result, e.g. Store or Outer::Inner. max_depth uses symbol nesting (0=top level, 1=direct members), not AST depth. Defaults: all kinds/depths, view=detailed. Compact returns names, kinds, containers, positions and symbol IDs, without source evidence. Detailed adds native kind, signature and declaration-line sources. Copy symbol_id into symbol_read for the body. Follow next_cursor preserving ALL filters and view; limit may change. Edits expire cursors/IDs. Positions are 1-based Unicode. Syntax structure does not resolve semantic references.",
+                description: "Explore one Rust, JS/JSX, TS/TSX, Python, Java or C# file. For a function list use {path,view:\"compact\",max_depth:0,kind:\"function\"}; use kind:\"method\" with container and without max_depth:0 for class methods. Omit kind only for a mixed overview. Find a name with {path,query:\"handleQuestion\",match:\"exact\",kind:\"function\"}. query defaults to case-insensitive substring matching. kind filters normalized symbol_kind; container is an exact enclosing path: copy the parent class qualified_name, e.g. Store or Outer::Inner, never convert :: to Java or C# member dots. qualified_name is navigation, not a unique ID for overloaded methods. max_depth uses symbol nesting (0=top level, 1=direct members), not AST depth. Defaults: all kinds/depths, view=detailed. Compact returns names, kinds, containers, positions, a ready-to-copy location and symbol IDs, without source evidence. For parameters, defaults and declared return types use view=detailed with query and match=exact; an untruncated signature often answers without a body read. Detailed includes signature_source and signature_truncated; if truncated, read only the missing signature lines. A signature does not establish runtime behavior. Copy symbol_id into symbol_read for the body. Follow next_cursor preserving ALL filters and view; limit may change. Edits expire cursors/IDs. Positions are 1-based Unicode. Syntax structure does not resolve semantic references.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"path":string(),"query":string(),"match":action(&["contains","exact"]),"case_sensitive":{"type":"boolean"},"kind":action(&["function","method","constructor","class","struct","interface","trait","impl","enum","enum_member","record","annotation","field","variable","constant","type","module","macro"]),"container":{"type":"string","description":"Exact enclosing symbol path, case-sensitive. Empty string selects top-level symbols."},"max_depth":{"type":"integer","minimum":0,"description":"Maximum symbol nesting depth; 0 selects top-level declarations."},"view":action(&["compact","detailed"]),"cursor":string(),"limit":number()}),
+                    json!({"path":string(),"query":string(),"match":action(&["contains","exact"]),"case_sensitive":{"type":"boolean"},"kind":action(&["function","method","constructor","class","struct","interface","trait","impl","enum","enum_member","record","annotation","field","variable","constant","type","module","macro","property","accessor","event","delegate","operator","destructor"]),"container":{"type":"string","description":"Exact enclosing symbol path, case-sensitive. Empty string selects top-level symbols."},"max_depth":{"type":"integer","minimum":0,"description":"Maximum symbol nesting depth; 0 selects top-level declarations."},"view":action(&["compact","detailed"]),"cursor":string(),"limit":number()}),
                     &["path"],
                 ),
             },
             ToolSpec {
                 name: "symbol_read",
-                description: "Read a Tree-sitter symbol's line range using path and exact symbol_id from code_outline. Rejects stale IDs. Returns file_read-compatible body, source and coverage; follow file_read cursor when truncated, or next_line for a new range up to symbol.end_line. A symbol over 2000 lines needs additional file_read calls. Overlapping declarations on the same line include surrounding text on that line.",
+                description: "Read implementation only when the requested fact is missing from code_outline's detailed signature. Use {path,symbol_id,max_lines:30} for the start of a function; do not read a whole long function just to list arguments. start_line is an optional ABSOLUTE file line within the symbol (default symbol.start_line), max_lines is a count from 1 to 2000, capped at the symbol end. Omit both to read the whole symbol subject to file_read limits. Copy exact symbol_id from code_outline; stale IDs are rejected. If text is truncated, finish that requested range with file_read cursor before starting another range at next_line, at most symbol.end_line. Sources and coverage attest only delivered text. Shared declaration lines can include neighboring declarations.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"path":string(),"symbol_id":string(),"force_read":{"type":"boolean"}}),
+                    json!({"path":string(),"symbol_id":string(),"start_line":{"type":"integer","minimum":1,"description":"Absolute file line inside the symbol, NOT a relative offset. Omit to start at the symbol's first line."},"max_lines":{"type":"integer","minimum":1,"maximum":2000,"description":"Requested line count; prefer a small range such as 30 for a function prologue."},"force_read":{"type":"boolean"}}),
                     &["path", "symbol_id"],
                 ),
             },
@@ -1512,10 +1512,46 @@ pub fn run_call(s: &mut Session, call: &crate::llm::ToolCall) -> Value {
 }
 /// Budget the actual chat message, including JSON escaping and call ID.
 pub fn result_tokens(call: &crate::llm::ToolCall, result: &Value, model: &str) -> usize {
-    context::count(
+    let raw = context::count(
         &json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}),
         model,
-    )
+    );
+    let rendered = model_result(result);
+    if rendered == *result {
+        return raw;
+    }
+    let shown = context::count(
+        &json!({"role":"tool","tool_call_id":call.id,"content":rendered.to_string()}),
+        model,
+    );
+    raw.max(shown)
+}
+
+/// Present absolute line labels to the model without changing source text,
+/// Unicode cursor offsets, archives or delivery coverage in the session.
+pub fn model_result(result: &Value) -> Value {
+    let mut shown = result.clone();
+    if result["status"] != "ok" || !result["data"]["read_start"].is_u64() {
+        return shown;
+    }
+    let content = &mut shown["data"]["content"];
+    let (Some(text), Some(start)) = (content["text"].as_str(), content["line_start"].as_u64())
+    else {
+        return shown;
+    };
+    if text.is_empty() {
+        return shown;
+    }
+    let numbered = text
+        .split_inclusive('\n')
+        .enumerate()
+        .map(|(index, line)| format!("{}|{}", start + index as u64, line))
+        .collect::<String>();
+    let fields = content.as_object_mut().unwrap();
+    fields.remove("text");
+    fields.remove("line_offsets");
+    fields.insert("numbered_text".into(), json!(numbered));
+    shown
 }
 
 fn new_file_cursor_id() -> String {

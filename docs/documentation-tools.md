@@ -87,6 +87,8 @@
 
 | 옵션 | 동작 |
 |---|---|
+| `path` | 단일 파일의 정확한 경로. glob 문자를 해석하지 않으며 `path_glob`·`pattern`과 함께 사용할 수 없다. 프로젝트 경계와 제외 규칙을 유지한다. |
+| `path_glob` | 여러 파일을 좁히는 glob. `pattern`은 기존 별칭이다. |
 | `case_sensitive` | 기본 `true`. `false`이면 대소문자를 구분하지 않는다. |
 | `whole_word` | 기본 `false`. `true`이면 정규식의 Unicode 단어 경계로 감싼다. 밑줄은 단어 문자이므로 `load`는 `load_all`에 일치하지 않는다. 구두점으로 시작하거나 끝나는 검색에는 적합하지 않을 수 있다. |
 | `mode=matches` | 기본값. 일치한 줄과 출처 ID를 반환한다. |
@@ -102,6 +104,8 @@
 ```
 
 `regex`를 생략하면 `|`, `.*` 같은 기호도 문자 그대로 검색한다. 여러 단어 중 하나를 찾으려면 위 예시처럼 `regex=true`를 명시한다.
+
+결과가 없으면 `empty_reason`과 재탐색 안내 `guidance`를 반환한다. `no_searchable_files`는 경로 조건에 맞는 검색 가능한 텍스트 파일이 없는 경우이며, 제외·바이너리·크기 제한도 원인일 수 있다. `no_matching_lines`는 파일을 검색했지만 검색어가 일치하지 않은 경우다. 파일명만 알면 `file_list`의 `mode=paths`, `path_glob=**/파일명`으로 찾고, 검색어는 알려진 식별자나 경로부터 사용한다. 호출 객체·따옴표 형태를 추측한 검색이 비었으면 파일 범위를 유지하면서 검색어를 줄인다.
 
 모든 검색 모드에서 `matched_files`는 검색한 텍스트 파일 수, `matching_files`는 실제 일치가 있는 파일 수, `total_matching_lines`는 일치한 전체 줄 수다. `limit`은 `matches`에서 줄 수, `files`와 `count`에서 파일 수이며 최대 100이다. 다음 페이지는 기존 검색 인자에 `cursor`를 추가한다. `limit`은 바꿀 수 있지만 검색·문맥·모드·경로 필터가 바뀌면 커서가 만료된다.
 
@@ -119,7 +123,7 @@
 | 도구 | 인자와 결과 |
 |---|---|
 | `code_outline` | `path` 필수. 선택 `query`, `match`, `case_sensitive`, `kind`, `container`, `max_depth`, `view`, `cursor`, `limit`(기본 50, 최대 100). 선언의 종류·소속·위치·`symbol_id`를 반환한다. |
-| `symbol_read` | `path`, `symbol_id` 필수. 선택 `force_read`. 해당 심볼이 차지하는 줄 범위를 읽어 본문과 출처를 반환한다. |
+| `symbol_read` | `path`, `symbol_id` 필수. 선택 `start_line`(파일의 절대 줄 번호), `max_lines`(1~2,000), `force_read`. 심볼 범위 안에서 본문과 출처를 반환한다. 범위를 생략하면 기존처럼 전체 심볼 읽기를 요청한다. |
 
 ```json
 {"path":"backend/src/agent.js","view":"compact","max_depth":0}
@@ -129,22 +133,32 @@
 
 위 인자를 `code_outline`에 전달한 후, 반환된 `symbol_id`를 그대로 `symbol_read`에 전달한다. `name_line`, `name_column`은 이름의 위치이며 줄·열 모두 1부터 시작하고 열은 Unicode 문자 수다.
 
-처음에는 `view=compact`, `max_depth=0`으로 파일의 최상위 구조를 확인한다. 필요한 이름이나 컨테이너를 찾으면 필터를 좁히거나 `symbol_read`로 본문을 읽는다.
+처음에는 `view=compact`, `max_depth=0`으로 파일의 최상위 구조를 확인한다. 함수 목록에는 `kind=function`, 클래스 메서드 목록에는 `kind=method`를 추가한다. 인자·기본값·선언된 반환 타입은 정확한 이름으로 상세 조회한 시그니처부터 확인한다. 잘리지 않은 시그니처로 답할 수 있으면 본문을 읽을 필요가 없다. 실행 동작을 확인할 때는 `symbol_read`에 `max_lines=30`처럼 필요한 양을 지정하고, 필요하면 심볼 안의 절대 `start_line`으로 이동한다.
 
 - `query`: 이름 검색. 기본 `match=contains`는 부분 일치, `match=exact`는 전체 이름 일치다. `case_sensitive` 기본값은 false다.
-- `kind`: 언어 간 공통 분류인 `symbol_kind`로 필터링한다. `function`, `method`, `constructor`, `class`, `struct`, `interface`, `trait`, `impl`, `enum`, `enum_member`, `record`, `annotation`, `field`, `variable`, `constant`, `type`, `module`, `macro`를 지원한다. 기본값은 모든 종류다.
+- `kind`: 언어 간 공통 분류인 `symbol_kind`로 필터링한다. `function`, `method`, `constructor`, `class`, `struct`, `interface`, `trait`, `impl`, `enum`, `enum_member`, `record`, `annotation`, `field`, `variable`, `constant`, `type`, `module`, `macro`, `property`, `accessor`, `event`, `delegate`, `operator`, `destructor`를 지원한다. 기본값은 모든 종류다.
 - `container`: 출력에서 복사한 정확한 소속 경로로 필터링한다. `Store`, `Outer::Inner`처럼 쓰며 대소문자를 구분한다. 빈 문자열은 최상위만 선택한다.
 - `max_depth`: 심볼 중첩 깊이의 상한이다. 최상위는 0, 클래스의 직접 멤버는 1이다. AST 노드 깊이가 아니며 기본값은 제한 없음이다. 필터에서 부모가 제외돼도 자식의 소속·깊이는 유지된다.
 - `view=compact`: 이름·공통 종류·소속·깊이·위치·심볼 ID만 반환한다. 선언 발췌와 출처 ID를 발급하지 않으므로 본문 근거가 필요하면 `symbol_read`를 사용한다.
 - 기본 `view=detailed`: 기존 상세 필드를 유지하며 `symbol_kind`, `depth`를 추가한다. `kind`는 기존 Tree-sitter 노드 이름이고, 필터 인자 `kind`는 공통 분류를 사용한다.
 
+각 심볼의 `location`은 `프로젝트상대경로:시작줄-끝줄` 형식이다. 위치 목록에서는 이 값을 그대로 사용하며, 다른 심볼의 끝 줄과 섞어 범위를 만들지 않는다. 메서드는 클래스 내부에 있으므로 `kind=method`, 정확한 `container`를 사용하고 `max_depth=0`은 지정하지 않는다.
+
+자식 멤버 조회에는 부모의 `qualified_name`을 `container`에 그대로 복사한다. Java 중첩 클래스도 `Service::Inner` 형식을 사용하며 `Service.Inner`로 바꾸지 않는다. 오버로드는 같은 `qualified_name`을 가질 수 있으므로 본문 읽기에는 각각의 `symbol_id`를 사용한다. 빈 구조 조회에는 `empty_reason`, 필터 수정 안내, 최대 12개의 `available_containers`를 반환하며 후보가 더 있으면 `container_suggestions_truncated=true`로 알린다.
+
 JS/TS의 변수에 직접 할당한 화살표 함수·함수 표현식은 `function`으로 분류한다. Java 필드 시그니처에는 타입과 접근 제한자를 포함한다. 여러 변수가 같은 선언문에 있으면 심볼 ID는 각각 구분되지만 시그니처와 본문 읽기에는 공유 선언문이 포함될 수 있다. 분류는 구문 기반이며 모든 언어의 모든 선언 형식을 인식하는 것은 아니다.
 
 ### 구조 탐색 범위
 
-Rust(`rs`), JavaScript(`js`, `jsx`, `mjs`, `cjs`), TypeScript(`ts`, `tsx`, `mts`, `cts`), Python(`py`, `pyi`), Java(`java`)를 지원한다. 함수·클래스·메서드·인터페이스·Rust impl/trait·Java 생성자/record/enum/annotation 등의 이름 있는 선언을 탐색한다. 모든 언어의 모든 구문이나 타입 관계를 모델링하는 기능은 아니다. `container`는 구문상 소속이며 실제 호출 관계가 아니다. 지원하지 않는 확장자는 `source_search`와 `file_read`로 안내한다.
+Rust(`rs`), JavaScript(`js`, `jsx`, `mjs`, `cjs`), TypeScript(`ts`, `tsx`, `mts`, `cts`), Python(`py`, `pyi`), Java(`java`), C#(`cs`)을 지원한다. 함수·클래스·메서드·인터페이스·Rust impl/trait·Java 생성자/record/enum/annotation 등의 이름 있는 선언을 탐색한다. 모든 언어의 모든 구문이나 타입 관계를 모델링하는 기능은 아니다. `container`는 구문상 소속이며 실제 호출 관계가 아니다. 지원하지 않는 확장자는 `source_search`와 `file_read`로 안내한다.
 
-구문 오류가 있으면 `has_parse_errors=true`로 표시하며 부분 구조를 반환할 수 있다. 조회 결과의 출처는 표시된 이름 선언 줄만 가리킨다. 본문은 `symbol_read`로 확인한다. 한 줄에 여러 선언이 있으면 본문 읽기에 같은 줄의 주변 코드도 포함된다. 시그니처와 선언 발췌는 최대 500문자이며 전체 원문을 대신하지 않는다.
+C#은 블록·파일 범위 namespace(`module`), class/struct/interface/record/enum, 생성자·메서드·지역 함수, 필드·상수, 프로퍼티·인덱서(`property`), get/set/init/add/remove(`accessor`), 이벤트·delegate·연산자·소멸자를 탐색한다. namespace도 심볼 깊이에 포함된다. `namespace Demo.Core;` 아래 `Store` 클래스의 멤버 조회에는 `container:"Demo.Core::Store"`를 사용하며, 반환된 `qualified_name`을 그대로 복사한다. 파일 범위 namespace 심볼 자체의 읽기는 namespace 선언만 포함한다. partial 타입 병합, record의 컴파일러 생성 멤버, 활성 전처리 분기 선택, 의미 기반 참조 해석은 하지 않는다. `.csproj`, `.razor`, `.cshtml`은 구조 탐색 대상이 아니다.
+
+구문 오류가 있으면 `has_parse_errors=true`로 표시하며 부분 구조를 반환할 수 있다. 상세 조회의 `source`는 이름 선언 줄을, `signature_source`는 표시된 시그니처의 줄 범위를 가리킨다. 시그니처와 선언 발췌는 최대 500문자다. `signature_truncated=true`이면 시그니처가 불완전하므로 필요한 원문을 읽는다. 시그니처는 실행 동작의 근거를 대신하지 않는다. 본문은 `symbol_read`로 확인하며, 한 줄에 여러 선언이 있으면 같은 줄의 주변 코드도 포함된다.
+
+`symbol_read`의 시작 줄은 심볼 범위 밖이면 거부하고, 요청한 줄 수는 심볼 끝에서 제한한다. 일부 줄만 읽은 결과를 전체 구현을 확인한 것으로 취급하지 않는다. 출력 예산 때문에 잘린 경우 먼저 `file_read` 커서로 요청 범위를 마저 읽는다.
+
+LLM 요청에서는 `file_read`·`symbol_read`의 본문을 `content.numbered_text`의 `절대줄번호|원문`으로 전달한다. 원문을 중복 전송하지 않으며 `line_offsets`는 모델용 표현에서 제외한다. 원시 도구 결과·저장 이력·출처·읽기 기록은 기존 `content.text`와 Unicode 오프셋을 유지한다. 토큰 예산은 원시 표현과 모델용 표현 중 큰 값을 기준으로 제한한다. 줄 중간부터 이어 읽은 경우에도 같은 절대 줄 번호와 `first_line_complete`·`last_line_complete`를 유지하며, 번호 접두사는 원문이나 커서 오프셋에 포함되지 않는다. 빈 본문에는 가상의 줄을 추가하지 않는다.
 
 심볼 ID는 파일 해시와 구문 범위에 연결된다. 파일이 변경되면 `symbol_read`와 목차 커서는 만료된다. 본문 읽기는 기존 파일 읽기의 결과 예산·최종 전달 범위 기록을 사용하며, 잘린 결과는 반환된 **file_read 커서**로 이어 읽는다. 2,000줄을 넘는 심볼은 `next_line`에서 새 읽기를 시작하되 `symbol.end_line`까지만 읽는다. 구조 목록이 출력 예산을 넘으면 온전한 심볼 단위로 페이지를 줄이고 `code_outline`의 `next_cursor`로 이어 조회한다. 도구 응답의 `next_cursor`에는 경로와 필터를 포함한 후속 호출 인자를 제공한다. 모든 필터와 `view`를 유지해야 하며 `limit`만 변경할 수 있다. 변경된 조건이나 소스로 커서를 재사용하면 거부한다. 예산이 심볼 하나도 담을 수 없을 만큼 작은 경우에만 원문 보관소로 이어 조회한다.
 

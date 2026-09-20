@@ -9,8 +9,9 @@ pub(super) fn language(path: &Path) -> Result<&'static str> {
         Some("tsx") => Ok("typescriptreact"),
         Some("py" | "pyi") => Ok("python"),
         Some("java") => Ok("java"),
+        Some("cs") => Ok("csharp"),
         _ => bail!(
-            "unsupported_language: supported extensions are rs, js/jsx/mjs/cjs, ts/tsx/mts/cts, py/pyi, java; use source_search/file_read otherwise"
+            "unsupported_language: supported extensions are rs, js/jsx/mjs/cjs, ts/tsx/mts/cts, py/pyi, java, cs; use source_search/file_read otherwise"
         ),
     }
 }
@@ -44,6 +45,16 @@ fn symbol_name<'a>(node: Node<'a>) -> Option<Node<'a>> {
         | "constructor_declaration"
         | "compact_constructor_declaration"
         | "record_declaration"
+        | "struct_declaration"
+        | "namespace_declaration"
+        | "file_scoped_namespace_declaration"
+        | "property_declaration"
+        | "accessor_declaration"
+        | "event_declaration"
+        | "delegate_declaration"
+        | "destructor_declaration"
+        | "enum_member_declaration"
+        | "local_function_statement"
         | "annotation_type_declaration"
         | "annotation_type_element_declaration"
         | "enum_constant"
@@ -53,16 +64,18 @@ fn symbol_name<'a>(node: Node<'a>) -> Option<Node<'a>> {
         | "function_definition"
         | "class_definition" => node.child_by_field_name("name"),
         "impl_item" => node.child_by_field_name("type"),
+        "operator_declaration" => node.child_by_field_name("operator"),
+        "conversion_operator_declaration" => node.child_by_field_name("type"),
+        "indexer_declaration" => {
+            let mut cursor = node.walk();
+            node.children(&mut cursor).find(|n| n.kind() == "this")
+        }
         "field_definition" => node.child_by_field_name("property"),
         "variable_declarator" => node
             .child_by_field_name("name")
             .filter(|n| n.kind() == "identifier"),
         _ => None,
     }
-}
-
-fn value(node: Node<'_>, source: &str) -> String {
-    source[node.byte_range()].chars().take(500).collect()
 }
 
 fn options(args: &Value) -> Value {
@@ -173,12 +186,12 @@ fn category(node: Node<'_>, parent_kind: &str, source: &str) -> &'static str {
         "class_declaration" | "class" | "abstract_class_declaration" | "class_definition" => {
             "class"
         }
-        "struct_item" => "struct",
+        "struct_item" | "struct_declaration" => "struct",
         "interface_declaration" => "interface",
         "trait_item" => "trait",
         "impl_item" => "impl",
         "enum_item" | "enum_declaration" => "enum",
-        "enum_variant" | "enum_constant" => "enum_member",
+        "enum_variant" | "enum_constant" | "enum_member_declaration" => "enum_member",
         "record_declaration" => "record",
         "annotation_type_declaration" => "annotation",
         "annotation_type_element_declaration" => "method",
@@ -187,7 +200,18 @@ fn category(node: Node<'_>, parent_kind: &str, source: &str) -> &'static str {
         | "public_field_definition"
         | "property_signature" => "field",
         "variable_declarator" if function_value(node).is_some() => "function",
-        "variable_declarator" => match node.parent().map(|p| p.kind()) {
+        "variable_declarator" => match declaration_owner(node).map(|p| p.kind()) {
+            Some("event_field_declaration") => "event",
+            Some("field_declaration")
+                if declaration_owner(node).is_some_and(|owner| {
+                    let mut cursor = owner.walk();
+                    owner
+                        .named_children(&mut cursor)
+                        .any(|n| n.kind() == "modifier" && &source[n.byte_range()] == "const")
+                }) =>
+            {
+                "constant"
+            }
             Some("field_declaration") => "field",
             Some("constant_declaration") => "constant",
             _ => "variable",
@@ -195,8 +219,50 @@ fn category(node: Node<'_>, parent_kind: &str, source: &str) -> &'static str {
         "const_item" | "static_item" => "constant",
         "type_item" | "type_alias_declaration" => "type",
         "mod_item" => "module",
+        "namespace_declaration" | "file_scoped_namespace_declaration" => "module",
+        "property_declaration" | "indexer_declaration" => "property",
+        "accessor_declaration" => "accessor",
+        "event_declaration" => "event",
+        "delegate_declaration" => "delegate",
+        "destructor_declaration" => "destructor",
+        "operator_declaration" | "conversion_operator_declaration" => "operator",
+        "local_function_statement" => "function",
         "macro_definition" => "macro",
         _ => "variable",
+    }
+}
+
+// C# wraps field/event declarators in a variable_declaration; Java and JS
+// attach declarators directly to their declaration owner.
+fn declaration_owner(node: Node<'_>) -> Option<Node<'_>> {
+    let parent = node.parent()?;
+    if parent.kind() == "variable_declaration"
+        && let Some(owner) = parent
+            .parent()
+            .filter(|n| matches!(n.kind(), "field_declaration" | "event_field_declaration"))
+    {
+        return Some(owner);
+    }
+    Some(parent)
+}
+
+fn symbol_label(node: Node<'_>, name: Node<'_>, source: &str) -> String {
+    let name = &source[name.byte_range()];
+    match node.kind() {
+        "destructor_declaration" => format!("~{name}"),
+        "operator_declaration" => format!("operator {name}"),
+        "conversion_operator_declaration" => {
+            let mut cursor = node.walk();
+            let keyword = node
+                .children(&mut cursor)
+                .find(|n| matches!(n.kind(), "implicit" | "explicit"));
+            format!(
+                "{} operator {}",
+                keyword.map_or("conversion", |n| &source[n.byte_range()]),
+                name
+            )
+        }
+        _ => name.to_owned(),
     }
 }
 
@@ -206,10 +272,11 @@ fn describe(node: Node<'_>, name: Node<'_>, container: &str, source: &str, diges
         .filter(|p| matches!(p.kind(), "decorated_definition" | "export_statement"))
         .unwrap_or(node);
     if node.kind() == "variable_declarator" {
-        if let Some(parent) = node.parent().filter(|p| {
+        if let Some(parent) = declaration_owner(node).filter(|p| {
             matches!(
                 p.kind(),
                 "field_declaration"
+                    | "event_field_declaration"
                     | "constant_declaration"
                     | "lexical_declaration"
                     | "variable_declaration"
@@ -226,26 +293,28 @@ fn describe(node: Node<'_>, name: Node<'_>, container: &str, source: &str, diges
     let signature_end = function_value(node)
         .unwrap_or(node)
         .child_by_field_name("body")
+        .or_else(|| node.child_by_field_name("accessors"))
+        .or_else(|| {
+            node.child_by_field_name("value")
+                .filter(|v| v.kind() == "arrow_expression_clause")
+        })
         .map(|n| n.start_byte())
-        .unwrap_or_else(|| {
-            source[outer.byte_range()]
-                .find('\n')
-                .map_or(outer.end_byte(), |n| outer.start_byte() + n)
-        });
-    let signature: String = source[outer.start_byte()..signature_end]
-        .trim()
-        .chars()
-        .take(500)
-        .collect();
+        .unwrap_or(outer.end_byte());
+    let full_signature = source[outer.start_byte()..signature_end].trim();
+    let signature: String = full_signature.chars().take(500).collect();
+    let signature_start_line = outer.start_position().row + 1;
+    let signature_end_line = signature_start_line + signature.lines().count().saturating_sub(1);
     let name_pos = name.start_position();
     let line_start = name.start_byte() - name_pos.column;
     let name_column = source[line_start..name.start_byte()].chars().count() + 1;
     json!({
         "symbol_id":format!("{digest}:{}:{}", node.start_byte(), node.end_byte()),
-        "name":value(name,source),"kind":node.kind(),"container":container,
+        "name":symbol_label(node,name,source).chars().take(500).collect::<String>(),"kind":node.kind(),"container":container,
         "start_line":outer.start_position().row+1,"end_line":end_line,
         "name_line":name_pos.row+1,"name_column":name_column,
-        "signature":signature,"has_parse_errors":node.has_error()
+        "signature":signature,"signature_truncated":full_signature.chars().count()>500,
+        "signature_start_line":signature_start_line,"signature_end_line":signature_end_line,
+        "has_parse_errors":node.has_error()
     })
 }
 
@@ -266,6 +335,7 @@ pub(super) fn execute(
         "typescriptreact" => tree_sitter_typescript::LANGUAGE_TSX.into(),
         "python" => tree_sitter_python::LANGUAGE.into(),
         "java" => tree_sitter_java::LANGUAGE.into(),
+        "csharp" => tree_sitter_c_sharp::LANGUAGE.into(),
         _ => unreachable!(),
     };
     let mut parser = Parser::new();
@@ -288,6 +358,7 @@ pub(super) fn execute(
         .ok_or_else(|| anyhow::anyhow!("cancelled_or_timeout: structure parsing interrupted"))?;
     let mut stack = vec![(tree.root_node(), String::new(), "", 0u64)];
     let mut symbols = Vec::new();
+    let mut containers = std::collections::BTreeSet::new();
     let filters = options(args);
     while let Some((node, mut container, mut parent_kind, mut depth)) = stack.pop() {
         if cancel.is_cancelled() || started.elapsed() >= deadline {
@@ -298,12 +369,16 @@ pub(super) fn execute(
             let kind = category(node, parent_kind, &source);
             symbol["symbol_kind"] = json!(kind);
             symbol["depth"] = json!(depth);
-            let name = &source[name.byte_range()];
+            let name = symbol_label(node, name, &source);
             let next_container = if container.is_empty() {
                 name.to_string()
             } else {
                 format!("{container}::{name}")
             };
+            symbol["qualified_name"] = json!(next_container);
+            if containers.len() < 20_000 {
+                containers.insert(container.clone());
+            }
             let comparable = if filters["case_sensitive"] == true {
                 name.to_owned()
             } else {
@@ -334,9 +409,26 @@ pub(super) fn execute(
         }
         let mut cursor = node.walk();
         let children: Vec<_> = node.named_children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            stack.push((child, container.clone(), parent_kind, depth));
+        let mut scheduled = Vec::with_capacity(children.len());
+        for child in children {
+            scheduled.push((child, container.clone(), parent_kind, depth));
+            // A file-scoped C# namespace owns following siblings, not AST
+            // children. Carry its scope into subsequent declarations.
+            if language == "csharp"
+                && child.kind() == "file_scoped_namespace_declaration"
+                && let Some(name) = child.child_by_field_name("name")
+            {
+                let name = symbol_label(child, name, &source);
+                container = if container.is_empty() {
+                    name
+                } else {
+                    format!("{container}::{name}")
+                };
+                parent_kind = "module";
+                depth += 1;
+            }
         }
+        stack.extend(scheduled.into_iter().rev());
     }
     if tool == "symbol_read" {
         let id = text(args, "symbol_id")?;
@@ -349,7 +441,20 @@ pub(super) fn execute(
             .ok_or_else(|| anyhow::anyhow!("unknown_symbol: copy symbol_id from code_outline"))?;
         let start = symbol["start_line"].as_u64().unwrap();
         let end = symbol["end_line"].as_u64().unwrap();
-        let mut read_args = json!({"path":path,"start_line":start,"max_lines":end-start+1,"force_read":args["force_read"].as_bool().unwrap_or(false)});
+        let start = args["start_line"].as_u64().unwrap_or(start);
+        if start < symbol["start_line"].as_u64().unwrap() || start > end {
+            bail!(
+                "invalid_symbol_range: start_line must be an absolute line within symbol.start_line..symbol.end_line"
+            );
+        }
+        let lines = match args["max_lines"].as_u64() {
+            Some(lines) if !(1..=2000).contains(&lines) => {
+                bail!("invalid_symbol_range: max_lines must be between 1 and 2000")
+            }
+            Some(lines) => lines.min(end - start + 1),
+            None => end - start + 1,
+        };
+        let mut read_args = json!({"path":path,"start_line":start,"max_lines":lines,"force_read":args["force_read"].as_bool().unwrap_or(false)});
         let mut result = read_file(s, &mut read_args, cancel)?;
         if result["hash"] != digest {
             bail!("symbol_revision_conflict: source changed during read; call code_outline again");
@@ -368,12 +473,18 @@ pub(super) fn execute(
         .min(symbols.len());
     let lines: Vec<_> = source.lines().collect();
     let mut page = symbols[offset..end].to_vec();
+    let root = s.project.root.canonicalize()?;
     for symbol in &mut page {
+        let relative = path.strip_prefix(&root).unwrap_or(&path).display();
+        symbol["location"] = json!(format!(
+            "{}:{}-{}",
+            relative, symbol["start_line"], symbol["end_line"]
+        ));
         if filters["view"] == "compact" {
             symbol
                 .as_object_mut()
                 .unwrap()
-                .retain(|key, _| !matches!(key.as_str(), "signature" | "kind"));
+                .retain(|key, _| key != "kind" && !key.starts_with("signature"));
             continue;
         }
         let line = symbol["name_line"].as_u64().unwrap() as usize;
@@ -387,10 +498,25 @@ pub(super) fn execute(
             line,
             &excerpt
         ));
+        symbol["signature_source"] = json!(observe_hashed(
+            s,
+            &path,
+            digest.clone(),
+            symbol["signature_start_line"].as_u64().unwrap() as usize,
+            symbol["signature_end_line"].as_u64().unwrap() as usize,
+            symbol["signature"].as_str().unwrap(),
+        ));
     }
-    Ok(
-        json!({"path":path,"hash":digest,"engine":"tree-sitter","language":language,"view":filters["view"],
+    let mut result = json!({"path":path,"hash":digest,"engine":"tree-sitter","language":language,"view":filters["view"],
         "has_parse_errors":tree.root_node().has_error(),"total_symbols":symbols.len(),"symbols":page,
-        "next_cursor":(end<symbols.len()).then(||format!("{fingerprint}:{end}"))}),
-    )
+        "next_cursor":(end<symbols.len()).then(||format!("{fingerprint}:{end}"))});
+    if symbols.is_empty() {
+        result["empty_reason"] = json!("no_matching_symbols");
+        result["guidance"] = json!(
+            "No declarations matched these filters. Copy the parent's qualified_name into container (nested names use ::, not Java dots). max_depth=0 excludes class members. Relax a filter before repeating; a parse error may also hide declarations."
+        );
+        result["available_containers"] = json!(containers.iter().take(12).collect::<Vec<_>>());
+        result["container_suggestions_truncated"] = json!(containers.len() > 12);
+    }
+    Ok(result)
 }

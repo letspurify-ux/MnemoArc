@@ -213,3 +213,89 @@ fn broad_search_retains_only_the_requested_page() {
     assert_eq!(next["matches"][0]["line"], 2);
     assert_eq!(next["matches"][0]["context"][0]["line"], 1);
 }
+
+#[test]
+fn empty_search_distinguishes_missing_scope_from_literal_miss() {
+    let (dir, mut s) = setup();
+    std::fs::write(
+        dir.path().join("server.js"),
+        "res.once('close', onClose);\n",
+    )
+    .unwrap();
+    for mode in ["matches", "files", "count"] {
+        let missing = search(
+            &mut s,
+            json!({"query":"close","path_glob":"missing.js","mode":mode}),
+        );
+        assert_eq!(missing["empty_reason"], "no_searchable_files");
+        assert_eq!(missing["matched_files"], 0);
+        assert!(missing["guidance"].as_str().unwrap().contains("file_list"));
+        let miss = search(
+            &mut s,
+            json!({"query":"req.on(\"close\"","path_glob":"server.js","mode":mode}),
+        );
+        assert_eq!(miss["empty_reason"], "no_matching_lines");
+        assert_eq!(miss["matched_files"], 1);
+        assert_eq!(miss["total_matching_lines"], 0);
+        assert!(miss["next_cursor"].is_null());
+        assert!(s.sources.is_empty());
+    }
+    let found = search(&mut s, json!({"query":"close","path_glob":"server.js"}));
+    assert_eq!(found["matches"][0]["line"], 1);
+    assert!(found.get("empty_reason").is_none());
+    let alternatives = search(
+        &mut s,
+        json!({"query":"close|abort","path_glob":"server.js"}),
+    );
+    assert_eq!(alternatives["total_matching_lines"], 0);
+    assert!(
+        alternatives["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("regex:true")
+    );
+    let explicit_regex = search(
+        &mut s,
+        json!({"query":"close|abort","path_glob":"server.js","regex":true}),
+    );
+    assert_eq!(explicit_regex["total_matching_lines"], 1);
+}
+
+#[test]
+fn exact_path_search_is_literal_scoped_and_cursor_bound() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a[1].rs"), "hit\nhit\n").unwrap();
+    std::fs::write(dir.path().join("a1.rs"), "hit\n").unwrap();
+    let first = search(&mut s, json!({"path":"a[1].rs","query":"hit","limit":1}));
+    assert_eq!(first["matched_files"], 1);
+    assert_eq!(first["total_matching_lines"], 2);
+    assert!(
+        first["matches"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("a[1].rs")
+    );
+    let next = search(
+        &mut s,
+        json!({"path":"a[1].rs","query":"hit","limit":1,"cursor":first["next_cursor"]}),
+    );
+    assert_eq!(next["matches"][0]["line"], 2);
+    for args in [
+        json!({"path":"a1.rs","query":"hit","cursor":first["next_cursor"]}),
+        json!({"path":"a[1].rs","path_glob":"*.rs","query":"hit"}),
+        json!({"path":"a[1].rs","pattern":"*.rs","query":"hit"}),
+        json!({"path":"../outside.rs","query":"hit"}),
+    ] {
+        assert!(tools::execute(&mut s, "source_search", args).is_err());
+    }
+    // Existing project exclusions remain enforced on an exact file read.
+    s.project.exclude.push("a*".into());
+    assert!(
+        tools::execute(
+            &mut s,
+            "source_search",
+            json!({"path":"a[1].rs","query":"hit"})
+        )
+        .is_err()
+    );
+}

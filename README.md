@@ -225,8 +225,12 @@ OpenAI 호환 클라이언트를 직접 호출할 때도 설정과 요청 JSON�
 
 ### Tree-sitter 구조 탐색
 
-`source-docs` 그룹의 `code_outline`, `symbol_read`로 코드 구조와 심볼 본문을 탐색합니다. 구현과 자동 테스트는 Rust로 작성했습니다. Tree-sitter는 네이티브 파서의 Rust 바인딩을 사용하며 Rust, JavaScript/JSX, TypeScript/TSX, Python, Java를 분석합니다.
+`source-docs` 그룹의 `code_outline`, `symbol_read`로 코드 구조와 심볼 본문을 탐색합니다. 구현과 자동 테스트는 Rust로 작성했습니다. Tree-sitter는 네이티브 파서의 Rust 바인딩을 사용하며 Rust, JavaScript/JSX, TypeScript/TSX, Python, Java, C#을 분석합니다.
 
 구조 조회는 별도 서버 설치 없이 사용할 수 있습니다. 사용 예와 검증 범위는 [구조 탐색](docs/documentation-tools.md#구조-탐색)을 참고하세요.
 
 LLM은 `code_outline`의 `view=compact`, `max_depth=0`으로 최상위 구조를 확인하고, `query`·`match=exact`·공통 `kind`·정확한 `container`로 범위를 좁힌 뒤 `symbol_read`로 본문을 읽을 수 있습니다. 기본 상세 응답은 유지하며 간결한 목록은 출처 근거로 취급하지 않습니다. 다음 페이지 호출에는 모든 필터가 전달되고 조건 변경 시 커서를 거부합니다.
+
+함수 목록에는 `kind=function`을 사용하고, 인자·기본값·선언된 반환 타입은 상세 시그니처와 `signature_source`로 먼저 확인합니다. `signature_truncated`가 잘림 여부를 알립니다. 본문이 필요하면 `symbol_read`의 `max_lines`와 파일 절대 줄 번호인 `start_line`으로 심볼 안의 필요한 부분만 읽을 수 있습니다.
+
+LLM에는 읽은 본문을 절대 줄 번호와 함께 전달하고, 구조 목록에는 복사 가능한 `location`을 제공합니다. 원문과 커서 오프셋은 유지하며 모델용 줄 번호도 응답 토큰 예산에 반영합니다.

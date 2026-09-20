@@ -22,6 +22,17 @@ pub(super) fn execute(
     if query.is_empty() {
         bail!("query required");
     }
+    if args.get("path").is_some()
+        && (args.get("path_glob").is_some() || args.get("pattern").is_some())
+    {
+        bail!(
+            "conflicting_arguments: use path for one exact file OR path_glob/pattern for a file glob"
+        );
+    }
+    let exact_path = args["path"]
+        .as_str()
+        .map(|p| read_path(&s.project, p))
+        .transpose()?;
     let mode = args["mode"].as_str().unwrap_or("matches");
     let before = n(args, "before", 0);
     let after = n(args, "after", 0);
@@ -50,7 +61,7 @@ pub(super) fn execute(
     // matching lines cannot be reused as an offset into matching files.
     fingerprint.update(serde_json::to_vec(&json!({
         "expression":expression,"case_sensitive":case_sensitive,
-        "mode":mode,"before":before,"after":after,"path_glob":path_glob(args)?
+        "mode":mode,"before":before,"after":after,"path_glob":path_glob(args)?,"path":exact_path
     }))?);
     let requested_offset = if let Some(cursor) = args["cursor"].as_str() {
         cursor
@@ -67,7 +78,11 @@ pub(super) fn execute(
     let mut matched_files = 0;
     let mut matching_file_count = 0;
     let mut total_matching_lines = 0usize;
-    for path in candidate_paths(&s.project, path_glob(args)?, cancel)? {
+    let candidates = match exact_path {
+        Some(path) => vec![path],
+        None => candidate_paths(&s.project, path_glob(args)?, cancel)?,
+    };
+    for path in candidates {
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
@@ -148,6 +163,22 @@ pub(super) fn execute(
         "matching_files":matching_file_count,"total_matching_lines":total_matching_lines,
         "next_cursor":(end<total).then(||format!("{fingerprint}:{end}"))
     });
+    if total == 0 {
+        output["empty_reason"] = json!(if matched_files == 0 {
+            "no_searchable_files"
+        } else {
+            "no_matching_lines"
+        });
+        let mut guidance = if matched_files == 0 {
+            "No searchable text files matched the scope. Check path_glob with file_list mode=paths; a known basename can use **/filename. Excluded, binary and oversized files are not searched."
+        } else {
+            "Files were searched but the query did not match. Keep the file scope and try a shorter known identifier or route; do not guess call syntax, receiver names or quote style. Use before/after for nearby navigation context, then file_read for evidence."
+        }.to_owned();
+        if matched_files > 0 && !args["regex"].as_bool().unwrap_or(false) && query.contains('|') {
+            guidance.push_str(" This query was literal: | does not mean OR. If alternatives were intended, explicitly set regex:true; literal matching has not been changed automatically.");
+        }
+        output["guidance"] = json!(guidance);
+    }
     if mode == "matches" {
         output["matches"] = json!(rows.iter().map(|row| {
             // Context is navigation help. The source observation attests only

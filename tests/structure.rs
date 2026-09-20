@@ -139,6 +139,26 @@ fn java_structure_tracks_nested_types_overloads_and_annotated_method_body() {
     let methods: Vec<_> = symbols.iter().filter(|v| v["name"] == "읽기").collect();
     assert_eq!(methods.len(), 2);
     assert_ne!(methods[0]["symbol_id"], methods[1]["symbol_id"]);
+    assert_eq!(methods[0]["qualified_name"], "Store::읽기");
+    let missing = run(
+        &mut s,
+        "code_outline",
+        json!({"path":"Store.java","kind":"method","container":"Store.Loader","view":"compact"}),
+    );
+    assert_eq!(missing["empty_reason"], "no_matching_symbols");
+    assert!(
+        missing["available_containers"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("Store::Loader"))
+    );
+    assert_eq!(missing["total_symbols"], 0);
+    let inner = run(
+        &mut s,
+        "code_outline",
+        json!({"path":"Store.java","kind":"interface","query":"Loader","view":"compact"}),
+    );
+    assert_eq!(inner["symbols"][0]["qualified_name"], "Store::Loader");
     let method = methods[0];
     assert_eq!(method["start_line"], 5);
     assert_eq!(method["end_line"], 10);
@@ -632,5 +652,483 @@ fn budgeted_cursors_preserve_all_filters_and_reject_changed_options() {
             tools::execute(&mut s, "code_outline", changed).is_err(),
             "changed {key}"
         );
+    }
+}
+
+#[test]
+fn multiline_signatures_have_their_own_evidence_and_mark_truncation() {
+    let (dir, mut s) = setup();
+    let source =
+        "interface Store {\n    int load(\n        int value,\n        String name\n    );\n}\n";
+    std::fs::write(dir.path().join("Store.java"), source).unwrap();
+    let outline = run(
+        &mut s,
+        "code_outline",
+        json!({"path":"Store.java","query":"load","match":"exact"}),
+    );
+    let method = &outline["symbols"][0];
+    assert!(
+        method["signature"]
+            .as_str()
+            .unwrap()
+            .contains("String name")
+    );
+    assert_eq!(method["signature_truncated"], false);
+    assert_eq!(method["signature_source"]["start_line"], 2);
+    assert_eq!(method["signature_source"]["end_line"], 5);
+    assert_eq!(method["source"]["end_line"], 2);
+    let source_id = method["signature_source"]["id"].as_str().unwrap();
+    assert!(s.sources[source_id].excerpt.contains("String name"));
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "fn load(\n    value: i32,\n) -> i32 {\n    value + 1\n}\n",
+    )
+    .unwrap();
+    let outline = run(&mut s, "code_outline", json!({"path":"a.rs"}));
+    let function = &outline["symbols"][0];
+    assert_eq!(function["signature_end_line"], 3);
+    assert!(
+        !function["signature_source"]["excerpt"]
+            .as_str()
+            .unwrap()
+            .contains("value + 1")
+    );
+    std::fs::write(
+        dir.path().join("a.rs"),
+        format!("fn load({}: i32) {{}}", "long_parameter_".repeat(60)),
+    )
+    .unwrap();
+    let outline = run(&mut s, "code_outline", json!({"path":"a.rs"}));
+    assert_eq!(outline["symbols"][0]["signature_truncated"], true);
+    assert_eq!(
+        outline["symbols"][0]["signature"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count(),
+        500
+    );
+}
+
+#[test]
+fn symbol_read_slices_use_absolute_lines_and_cannot_escape_symbol() {
+    let (dir, mut s) = setup();
+    let source = "// header\n\nfn target() {\n    let first = 1;\n    let second = 2;\n    let third = 3;\n}\nfn next() {}\n";
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, source).unwrap();
+    let outline = run(
+        &mut s,
+        "code_outline",
+        json!({"path":"a.rs","query":"target","match":"exact"}),
+    );
+    let id = &outline["symbols"][0]["symbol_id"];
+    let first = run(
+        &mut s,
+        "symbol_read",
+        json!({"path":"a.rs","symbol_id":id,"max_lines":2}),
+    );
+    assert_eq!(first["content"]["line_start"], 3);
+    assert_eq!(first["content"]["line_end"], 4);
+    assert_eq!(first["next_line"], 5);
+    let middle = run(
+        &mut s,
+        "symbol_read",
+        json!({"path":"a.rs","symbol_id":id,"start_line":5,"max_lines":1}),
+    );
+    assert_eq!(middle["content"]["text"], "    let second = 2;");
+    assert_eq!(middle["source"]["start_line"], 5);
+    assert_eq!(middle["source"]["end_line"], 5);
+    let tail = run(
+        &mut s,
+        "symbol_read",
+        json!({"path":"a.rs","symbol_id":id,"start_line":6,"max_lines":2000}),
+    );
+    assert_eq!(tail["content"]["line_end"], 7);
+    assert!(!tail["content"]["text"].as_str().unwrap().contains("next"));
+    let before = s.sources.len();
+    for extra in [
+        json!({"start_line":0}),
+        json!({"start_line":2}),
+        json!({"start_line":8}),
+        json!({"start_line":u64::MAX}),
+        json!({"max_lines":0}),
+        json!({"max_lines":2001}),
+        json!({"max_lines":u64::MAX}),
+    ] {
+        let mut args = json!({"path":"a.rs","symbol_id":id});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        assert!(
+            tools::execute(&mut s, "symbol_read", args)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid_symbol_range")
+        );
+        assert_eq!(s.sources.len(), before);
+    }
+    std::fs::write(&path, format!("{source}\n")).unwrap();
+    assert!(
+        tools::execute(
+            &mut s,
+            "symbol_read",
+            json!({"path":"a.rs","symbol_id":id,"max_lines":1})
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("revision_conflict")
+    );
+}
+
+#[test]
+fn budgeted_symbol_slice_cursors_complete_only_the_requested_range() {
+    let (dir, mut s) = setup();
+    let source = format!(
+        "fn target() {{\n{}\n}}\nfn next() {{}}",
+        format!("    // {}\n", "한글 설명 ".repeat(120)).repeat(10)
+    );
+    std::fs::write(dir.path().join("a.rs"), &source).unwrap();
+    let outline = run(
+        &mut s,
+        "code_outline",
+        json!({"path":"a.rs","query":"target"}),
+    );
+    let expected = source
+        .lines()
+        .skip(1)
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut call = mnemoarc::llm::ToolCall {
+        id:"slice".into(), name:"symbol_read".into(),
+        arguments:json!({"path":"a.rs","symbol_id":outline["symbols"][0]["symbol_id"],"start_line":2,"max_lines":3}).to_string(),
+    };
+    let mut combined = String::new();
+    for i in 0..40 {
+        let raw = tools::run_call(&mut s, &call);
+        let page = tools::limit_result(&mut s, &call, raw, 1200);
+        assert_eq!(page["status"], "ok", "{page}");
+        let shown = page["data"]["content"]["text"].as_str().unwrap();
+        if let Some(excerpt) = page["data"]["source"]["excerpt"].as_str() {
+            assert_eq!(excerpt, shown.chars().take(2000).collect::<String>());
+        }
+        let source_id = page["data"]["source"]["id"].as_str().unwrap();
+        assert_eq!(
+            s.sources[source_id].excerpt,
+            shown.chars().take(2000).collect::<String>()
+        );
+        let model = tools::model_result(&page);
+        assert!(model["data"]["content"].get("text").is_none());
+        assert_eq!(model["next_cursor"], page["next_cursor"]);
+        let numbered = model["data"]["content"]["numbered_text"].as_str().unwrap();
+        let start = page["data"]["content"]["line_start"].as_u64().unwrap();
+        let restored = numbered
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(index, line)| {
+                let (label, text) = line.split_once('|').unwrap();
+                assert_eq!(label.parse::<u64>().unwrap(), start + index as u64);
+                text
+            })
+            .collect::<String>();
+        assert_eq!(restored, shown);
+        assert!(tools::result_tokens(&call, &page, &s.config.model) <= 1200);
+        assert_eq!(page["data"]["read_start"], 2);
+        assert_eq!(page["data"]["read_max_lines"], 3);
+        assert!(page["data"]["source"]["end_line"].as_u64().unwrap() <= 4);
+        tools::record_delivered_read(&mut s, &call, &page);
+        combined.push_str(page["data"]["content"]["text"].as_str().unwrap());
+        if page["next_cursor"]["tool"] != "file_read" {
+            break;
+        }
+        call = mnemoarc::llm::ToolCall {
+            id: format!("slice-{i}"),
+            name: "file_read".into(),
+            arguments: json!({"cursor":page["next_cursor"]["cursor"]}).to_string(),
+        };
+    }
+    assert_eq!(combined, expected);
+    let coverage = s.read_coverage.values().next().unwrap();
+    assert_eq!(
+        coverage.ranges,
+        vec![(
+            source.lines().next().unwrap().len() + 1,
+            source.lines().next().unwrap().len() + 1 + expected.chars().count() + 1
+        )]
+    );
+}
+
+#[test]
+fn model_line_labels_preserve_blank_lines_pipes_and_partial_boundaries() {
+    let raw = json!({"status":"ok","data":{"read_start":10,"read_offset":3,
+        "content":{"text":"한글|x\n\n끝\n","line_start":12,"line_end":14,
+        "line_offsets":[0,5,6,8],"first_line_complete":false,"last_line_complete":true}},
+        "next_cursor":{"tool":"file_read","cursor":"R7"}});
+    let shown = tools::model_result(&raw);
+    assert_eq!(
+        shown["data"]["content"]["numbered_text"],
+        "12|한글|x\n13|\n14|끝\n"
+    );
+    assert!(shown["data"]["content"].get("line_offsets").is_none());
+    assert_eq!(shown["data"]["content"]["first_line_complete"], false);
+    assert_eq!(shown["next_cursor"], raw["next_cursor"]);
+    assert_eq!(shown["data"]["read_offset"], 3);
+    assert_eq!(raw["data"]["content"]["text"], "한글|x\n\n끝\n");
+    assert_eq!(tools::model_result(&shown), shown);
+    for raw in [
+        json!({"status":"ok","data":{"read_start":1,"content":{"text":"","line_start":1}}}),
+        json!({"status":"ok","data":{"content":{"text":"a\nb","line_start":1}}}),
+        json!({"status":"error","data":{"read_start":1,"content":{"text":"a","line_start":1}}}),
+    ] {
+        assert_eq!(tools::model_result(&raw), raw);
+    }
+}
+
+#[test]
+fn java_overloads_and_nested_methods_have_unambiguous_locations() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("Store.java"),
+        "class Store {\n int load() { return 1; }\n int load(int value) { return value; }\n class Inner {\n  int load() { return 2; }\n }\n}\n").unwrap();
+    let outline = run(
+        &mut s,
+        "code_outline",
+        json!({"path":"Store.java","view":"compact","kind":"method","container":"Store","query":"load","match":"exact"}),
+    );
+    let methods = outline["symbols"].as_array().unwrap();
+    assert_eq!(methods.len(), 2);
+    assert_eq!(methods[0]["location"], "Store.java:2-2");
+    assert_eq!(methods[1]["location"], "Store.java:3-3");
+    assert_ne!(methods[0]["symbol_id"], methods[1]["symbol_id"]);
+    assert!(
+        s.sources.is_empty(),
+        "compact locations are navigation, not body evidence"
+    );
+    let nested = run(
+        &mut s,
+        "code_outline",
+        json!({"path":"Store.java","kind":"method","container":"Store::Inner"}),
+    );
+    assert_eq!(nested["symbols"][0]["location"], "Store.java:5-5");
+    let body = run(
+        &mut s,
+        "symbol_read",
+        json!({"path":"Store.java","symbol_id":methods[1]["symbol_id"],"max_lines":1}),
+    );
+    assert_eq!(body["source"]["start_line"], 3);
+    assert!(
+        body["content"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("return value")
+    );
+}
+
+#[test]
+fn csharp_file_namespace_members_signatures_and_partial_reads() {
+    let (dir, mut s) = setup();
+    let source = r#"using System;
+namespace Demo.Core;
+public interface IStore { string Load(int id); }
+public partial class Store : IStore {
+ public const int Limit = 10;
+ private int count, limit;
+ public Store(int count = 0) { this.count = count; }
+ public string Name { get; private set; } = "";
+ public int Value { get => count; init { count = value; } }
+ public string this[int index] => index.ToString();
+ public event Action Changed;
+ public event Action Updated { add { } remove { } }
+ [Obsolete]
+ public string Load(
+     int id = 0
+ ) => id.ToString();
+ public string Load(string text) {
+     return text;
+ }
+ public class Inner { public int Read() => 1; }
+ public int Run() { int Local(int n) => n + 1; return Local(count); }
+ ~Store() { }
+ public static Store operator +(Store a, Store b) => a;
+ public static implicit operator int(Store value) => value.count;
+}
+public record Item(int Id);
+public readonly record struct Point(int X, int Y);
+public struct Counter { public int Value; }
+public enum Mode { Fast, Slow }
+public delegate void Handler(string value);
+"#;
+    std::fs::write(dir.path().join("Store.cs"), source).unwrap();
+    let outline = run(&mut s, "code_outline", json!({"path":"Store.cs"}));
+    assert_eq!(outline["language"], "csharp");
+    assert_eq!(outline["has_parse_errors"], false, "{outline}");
+    let symbols = outline["symbols"].as_array().unwrap();
+    for (name, kind, container) in [
+        ("Demo.Core", "module", ""),
+        ("IStore", "interface", "Demo.Core"),
+        ("Store", "class", "Demo.Core"),
+        ("Store", "constructor", "Demo.Core::Store"),
+        ("Limit", "constant", "Demo.Core::Store"),
+        ("count", "field", "Demo.Core::Store"),
+        ("limit", "field", "Demo.Core::Store"),
+        ("Name", "property", "Demo.Core::Store"),
+        ("get", "accessor", "Demo.Core::Store::Name"),
+        ("set", "accessor", "Demo.Core::Store::Name"),
+        ("init", "accessor", "Demo.Core::Store::Value"),
+        ("this", "property", "Demo.Core::Store"),
+        ("Changed", "event", "Demo.Core::Store"),
+        ("Updated", "event", "Demo.Core::Store"),
+        ("add", "accessor", "Demo.Core::Store::Updated"),
+        ("remove", "accessor", "Demo.Core::Store::Updated"),
+        ("Read", "method", "Demo.Core::Store::Inner"),
+        ("Local", "function", "Demo.Core::Store::Run"),
+        ("~Store", "destructor", "Demo.Core::Store"),
+        ("operator +", "operator", "Demo.Core::Store"),
+        ("implicit operator int", "operator", "Demo.Core::Store"),
+        ("Item", "record", "Demo.Core"),
+        ("Point", "record", "Demo.Core"),
+        ("Counter", "struct", "Demo.Core"),
+        ("Fast", "enum_member", "Demo.Core::Mode"),
+        ("Handler", "delegate", "Demo.Core"),
+    ] {
+        assert!(
+            symbols.iter().any(|v| v["name"] == name
+                && v["symbol_kind"] == kind
+                && v["container"] == container),
+            "missing {container}::{name} ({kind}): {outline}"
+        );
+    }
+    let field = symbols.iter().find(|v| v["name"] == "count").unwrap();
+    assert_eq!(field["signature"], "private int count, limit;");
+    let changed = symbols.iter().find(|v| v["name"] == "Changed").unwrap();
+    assert_eq!(changed["signature"], "public event Action Changed;");
+    let value = symbols
+        .iter()
+        .find(|v| v["name"] == "Value" && v["symbol_kind"] == "property")
+        .unwrap();
+    assert_eq!(value["signature"], "public int Value");
+    let first = run(
+        &mut s,
+        "code_outline",
+        json!({"path":"Store.cs","kind":"method","container":"Demo.Core::Store","query":"Load","match":"exact","limit":1}),
+    );
+    assert_eq!(first["total_symbols"], 2);
+    let method = &first["symbols"][0];
+    assert_eq!(method["depth"], 2);
+    assert_eq!(
+        method["signature"],
+        "[Obsolete]\n public string Load(\n     int id = 0\n )"
+    );
+    assert_eq!(method["signature_source"]["start_line"], 13);
+    assert_eq!(method["signature_source"]["end_line"], 16);
+    let next = run(
+        &mut s,
+        "code_outline",
+        json!({"path":"Store.cs","kind":"method","container":"Demo.Core::Store","query":"Load","match":"exact","limit":1,"cursor":first["next_cursor"]}),
+    );
+    assert_ne!(method["symbol_id"], next["symbols"][0]["symbol_id"]);
+    let body = run(
+        &mut s,
+        "symbol_read",
+        json!({"path":"Store.cs","symbol_id":next["symbols"][0]["symbol_id"],"start_line":18,"max_lines":1}),
+    );
+    assert_eq!(body["content"]["text"], "     return text;");
+    assert_eq!(body["source"]["start_line"], 18);
+    let read = run(
+        &mut s,
+        "code_outline",
+        json!({"path":"Store.cs","kind":"accessor","container":"Demo.Core::Store::Value","query":"get","match":"exact"}),
+    );
+    let getter = run(
+        &mut s,
+        "symbol_read",
+        json!({"path":"Store.cs","symbol_id":read["symbols"][0]["symbol_id"]}),
+    );
+    assert!(
+        getter["content"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("get => count")
+    );
+    std::fs::write(dir.path().join("Store.cs"), format!("{source}\n")).unwrap();
+    assert!(
+        tools::execute(
+            &mut s,
+            "symbol_read",
+            json!({"path":"Store.cs","symbol_id":method["symbol_id"]})
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("revision_conflict")
+    );
+}
+
+#[test]
+fn csharp_block_namespaces_and_conditional_declarations_keep_scope() {
+    let (dir, mut s) = setup();
+    let source = "namespace Outer {\n namespace Inner { public class Store { public int Read() => 1; } }\n}\npublic class Outside {}\n#if DEBUG\nclass DebugType {}\n#else\nclass ReleaseType {}\n#endif\n";
+    std::fs::write(dir.path().join("Scopes.cs"), source).unwrap();
+    let outline = run(
+        &mut s,
+        "code_outline",
+        json!({"path":"Scopes.cs","view":"compact"}),
+    );
+    assert_eq!(outline["has_parse_errors"], false);
+    let symbols = outline["symbols"].as_array().unwrap();
+    for (name, container) in [
+        ("Inner", "Outer"),
+        ("Store", "Outer::Inner"),
+        ("Read", "Outer::Inner::Store"),
+        ("Outside", ""),
+        ("DebugType", ""),
+        ("ReleaseType", ""),
+    ] {
+        assert!(
+            symbols
+                .iter()
+                .any(|v| v["name"] == name && v["container"] == container),
+            "{outline}"
+        );
+    }
+    assert!(s.sources.is_empty());
+    std::fs::write(
+        dir.path().join("Scopes.cs"),
+        "namespace Broken { class Store { void Load( { }",
+    )
+    .unwrap();
+    let broken = run(&mut s, "code_outline", json!({"path":"Scopes.cs"}));
+    assert_eq!(broken["has_parse_errors"], true);
+}
+
+#[test]
+fn long_symbol_names_preserve_exact_matching_and_container_paths() {
+    let (dir, mut s) = setup();
+    let name = "N".repeat(510);
+    for (path, source, container) in [
+        (
+            "Long.cs",
+            format!("namespace {name}; class Store {{ public void Read() {{}} }}"),
+            format!("{name}::Store"),
+        ),
+        (
+            "long.rs",
+            format!("mod {name} {{ fn read() {{}} }}"),
+            name.clone(),
+        ),
+    ] {
+        std::fs::write(dir.path().join(path), source).unwrap();
+        let outline = run(
+            &mut s,
+            "code_outline",
+            json!({"path":path,"query":name,"match":"exact"}),
+        );
+        assert_eq!(outline["symbols"].as_array().unwrap().len(), 1, "{outline}");
+        assert_eq!(outline["symbols"][0]["qualified_name"], name);
+        let members = run(
+            &mut s,
+            "code_outline",
+            json!({"path":path,"container":container}),
+        );
+        assert_eq!(members["symbols"].as_array().unwrap().len(), 1, "{members}");
+        assert_eq!(members["symbols"][0]["container"], container);
     }
 }
