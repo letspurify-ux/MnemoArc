@@ -13,7 +13,7 @@
 | `investigation`의 `verify_batch` | `items`에 조사 항목 ID를 키로 하고 `{source_ids: [...], verification_note: "비교 내용"}`을 값으로 전달한다. 최대 20개를 순차 검증하며 항목별 성공/실패를 반환한다. 성공한 항목은 유지하고 실패한 항목은 재시도한다. |
 | `symbol_search` | `query`, 파일 glob `pattern`, `cursor`, `limit`으로 JS/TS·Rust·Python 선언을 검색한다. 이름·위치·선언 줄·프로그램 발급 출처를 반환한다. 파일 변경 시 커서는 만료된다. |
 
-일괄 검증은 관련 원문과 실제 문서를 비교한 뒤 호출해야 한다. 단순히 읽은 항목을 자동으로 검증 처리하지 않는다. `upsert`에서 생략한 출처·기억 참조·섹션은 기존 값을 유지하며 같은 제목의 중복 항목 생성을 거부한다.
+일괄 검증은 관련 원문과 실제 문서를 비교한 뒤 호출해야 한다. 단순히 읽은 항목을 자동으로 검증 처리하지 않는다. 기존 ID를 지정한 `upsert`에서 생략한 제목·출처·기억 참조·섹션은 기존 값을 유지하며 같은 제목의 중복 항목 생성을 거부한다. 신규 항목은 제목이 필수이며, 존재하지 않는 ID에 제목 없이 수정 요청하면 오류를 반환한다. 기존 항목을 수정하면 이전 검증 상태는 무효화된다.
 
 ## 실행 제어와 UI 설정
 
@@ -98,7 +98,10 @@
 {"query":"handle_request","mode":"files","path_glob":"src/**"}
 {"query":"session","case_sensitive":false,"whole_word":true,"before":2,"after":2}
 {"query":"TODO|FIXME","regex":true,"mode":"count"}
+{"query":"agent|run|db","regex":true,"mode":"files","path_glob":"backend/**/*.js"}
 ```
+
+`regex`를 생략하면 `|`, `.*` 같은 기호도 문자 그대로 검색한다. 여러 단어 중 하나를 찾으려면 위 예시처럼 `regex=true`를 명시한다.
 
 모든 검색 모드에서 `matched_files`는 검색한 텍스트 파일 수, `matching_files`는 실제 일치가 있는 파일 수, `total_matching_lines`는 일치한 전체 줄 수다. `limit`은 `matches`에서 줄 수, `files`와 `count`에서 파일 수이며 최대 100이다. 다음 페이지는 기존 검색 인자에 `cursor`를 추가한다. `limit`은 바꿀 수 있지만 검색·문맥·모드·경로 필터가 바뀌면 커서가 만료된다.
 
@@ -115,14 +118,27 @@
 
 | 도구 | 인자와 결과 |
 |---|---|
-| `code_outline` | `path` 필수. 선택 `query`, `cursor`, `limit`(기본 50, 최대 100). 선언·메서드·컨테이너·시그니처·시작/끝 줄·`symbol_id`를 반환한다. 이름 검색은 부분 문자열이며 대소문자를 구분하지 않는다. |
+| `code_outline` | `path` 필수. 선택 `query`, `match`, `case_sensitive`, `kind`, `container`, `max_depth`, `view`, `cursor`, `limit`(기본 50, 최대 100). 선언의 종류·소속·위치·`symbol_id`를 반환한다. |
 | `symbol_read` | `path`, `symbol_id` 필수. 선택 `force_read`. 해당 심볼이 차지하는 줄 범위를 읽어 본문과 출처를 반환한다. |
 
 ```json
-{"path":"src/agent.rs","query":"run_session"}
+{"path":"backend/src/agent.js","view":"compact","max_depth":0}
+{"path":"backend/src/agent.js","query":"handleQuestion","match":"exact","kind":"function"}
+{"path":"Store.java","container":"Store","kind":"method","max_depth":1,"view":"compact"}
 ```
 
 위 인자를 `code_outline`에 전달한 후, 반환된 `symbol_id`를 그대로 `symbol_read`에 전달한다. `name_line`, `name_column`은 이름의 위치이며 줄·열 모두 1부터 시작하고 열은 Unicode 문자 수다.
+
+처음에는 `view=compact`, `max_depth=0`으로 파일의 최상위 구조를 확인한다. 필요한 이름이나 컨테이너를 찾으면 필터를 좁히거나 `symbol_read`로 본문을 읽는다.
+
+- `query`: 이름 검색. 기본 `match=contains`는 부분 일치, `match=exact`는 전체 이름 일치다. `case_sensitive` 기본값은 false다.
+- `kind`: 언어 간 공통 분류인 `symbol_kind`로 필터링한다. `function`, `method`, `constructor`, `class`, `struct`, `interface`, `trait`, `impl`, `enum`, `enum_member`, `record`, `annotation`, `field`, `variable`, `constant`, `type`, `module`, `macro`를 지원한다. 기본값은 모든 종류다.
+- `container`: 출력에서 복사한 정확한 소속 경로로 필터링한다. `Store`, `Outer::Inner`처럼 쓰며 대소문자를 구분한다. 빈 문자열은 최상위만 선택한다.
+- `max_depth`: 심볼 중첩 깊이의 상한이다. 최상위는 0, 클래스의 직접 멤버는 1이다. AST 노드 깊이가 아니며 기본값은 제한 없음이다. 필터에서 부모가 제외돼도 자식의 소속·깊이는 유지된다.
+- `view=compact`: 이름·공통 종류·소속·깊이·위치·심볼 ID만 반환한다. 선언 발췌와 출처 ID를 발급하지 않으므로 본문 근거가 필요하면 `symbol_read`를 사용한다.
+- 기본 `view=detailed`: 기존 상세 필드를 유지하며 `symbol_kind`, `depth`를 추가한다. `kind`는 기존 Tree-sitter 노드 이름이고, 필터 인자 `kind`는 공통 분류를 사용한다.
+
+JS/TS의 변수에 직접 할당한 화살표 함수·함수 표현식은 `function`으로 분류한다. Java 필드 시그니처에는 타입과 접근 제한자를 포함한다. 여러 변수가 같은 선언문에 있으면 심볼 ID는 각각 구분되지만 시그니처와 본문 읽기에는 공유 선언문이 포함될 수 있다. 분류는 구문 기반이며 모든 언어의 모든 선언 형식을 인식하는 것은 아니다.
 
 ### 구조 탐색 범위
 
@@ -130,8 +146,8 @@ Rust(`rs`), JavaScript(`js`, `jsx`, `mjs`, `cjs`), TypeScript(`ts`, `tsx`, `mts`
 
 구문 오류가 있으면 `has_parse_errors=true`로 표시하며 부분 구조를 반환할 수 있다. 조회 결과의 출처는 표시된 이름 선언 줄만 가리킨다. 본문은 `symbol_read`로 확인한다. 한 줄에 여러 선언이 있으면 본문 읽기에 같은 줄의 주변 코드도 포함된다. 시그니처와 선언 발췌는 최대 500문자이며 전체 원문을 대신하지 않는다.
 
-심볼 ID는 파일 해시와 구문 범위에 연결된다. 파일이 변경되면 `symbol_read`와 목차 커서는 만료된다. 본문 읽기는 기존 파일 읽기의 결과 예산·최종 전달 범위 기록을 사용하며, 잘린 결과는 반환된 **file_read 커서**로 이어 읽는다. 2,000줄을 넘는 심볼은 `next_line`에서 새 읽기를 시작하되 `symbol.end_line`까지만 읽는다. 출력 예산에 맞지 않는 목차·위치 목록은 기존 도구 결과 보관소로 이어 조회할 수 있다.
+심볼 ID는 파일 해시와 구문 범위에 연결된다. 파일이 변경되면 `symbol_read`와 목차 커서는 만료된다. 본문 읽기는 기존 파일 읽기의 결과 예산·최종 전달 범위 기록을 사용하며, 잘린 결과는 반환된 **file_read 커서**로 이어 읽는다. 2,000줄을 넘는 심볼은 `next_line`에서 새 읽기를 시작하되 `symbol.end_line`까지만 읽는다. 구조 목록이 출력 예산을 넘으면 온전한 심볼 단위로 페이지를 줄이고 `code_outline`의 `next_cursor`로 이어 조회한다. 도구 응답의 `next_cursor`에는 경로와 필터를 포함한 후속 호출 인자를 제공한다. 모든 필터와 `view`를 유지해야 하며 `limit`만 변경할 수 있다. 변경된 조건이나 소스로 커서를 재사용하면 거부한다. 예산이 심볼 하나도 담을 수 없을 만큼 작은 경우에만 원문 보관소로 이어 조회한다.
 
 ### 테스트
 
-`cargo test`는 지원 문법의 구조 추출, 오래된 심볼·커서 거부, 본문 결과 예산·이어 읽기를 검증한다. 구조 탐색 테스트만 실행하려면 `cargo test --test structure`를 사용한다.
+`cargo test`는 지원 문법의 구조 추출, 오래된 심볼·커서 거부, 본문 결과 예산·이어 읽기를 검증한다. 구조 목록을 반복 축소하거나 여러 페이지로 읽어도 심볼이 누락·중복되지 않는지, 심볼 하나도 담지 못하는 예산에서는 원문을 보존하는지도 검사한다. 구조 탐색 테스트만 실행하려면 `cargo test --test structure`를 사용한다.

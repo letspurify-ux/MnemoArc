@@ -195,7 +195,7 @@ OpenCode 비교는 동일 소스 지문, 같은 모델·요청, 비슷한 시간
 
 파일 읽기의 상대 경로는 프로젝트 루트 기준입니다. 프로젝트 밖 결과 파일을 읽을 때에는 `document_inspect`가 반환한 절대 경로를 그대로 사용합니다. 이 규칙과 예시는 모델 도구 설명·path 인자 설명에 포함되며, 도구 설정 화면에도 현재 프로젝트 루트와 결과 경로를 표시합니다.
 
-도구 인자 오류를 줄이기 위해 `file_read`는 `limit`을 `max_lines`의 별칭으로 허용합니다. 서로 다른 두 값이나 `limit`과 0이 아닌 `offset`의 혼용은 거부하고 새 범위·커서 사용법을 안내합니다. `investigation`은 action별 인자를 검사합니다. `upsert`는 최상위 `title`을 포함한 개별 등록이고, `items`는 기존 항목의 `verify_batch` 전용입니다. 잘못된 조합은 상태 변경 전에 해당 action의 호출 예시와 함께 거부합니다.
+도구 인자 오류를 줄이기 위해 `file_read`는 `limit`을 `max_lines`의 별칭으로 허용합니다. 서로 다른 두 값이나 `limit`과 0이 아닌 `offset`의 혼용은 거부하고 새 범위·커서 사용법을 안내합니다. `investigation`은 action별 인자를 검사합니다. `upsert`는 신규 등록 시 최상위 `title`이 필수이며 기존 ID 수정 시 생략한 제목을 유지하고, `items`는 기존 항목의 `verify_batch` 전용입니다. 잘못된 조합은 상태 변경 전에 해당 action의 호출 예시와 함께 거부합니다.
 
 ### 입력 문서와 읽기 범위 확인
 
@@ -228,3 +228,5 @@ OpenAI 호환 클라이언트를 직접 호출할 때도 설정과 요청 JSON�
 `source-docs` 그룹의 `code_outline`, `symbol_read`로 코드 구조와 심볼 본문을 탐색합니다. 구현과 자동 테스트는 Rust로 작성했습니다. Tree-sitter는 네이티브 파서의 Rust 바인딩을 사용하며 Rust, JavaScript/JSX, TypeScript/TSX, Python, Java를 분석합니다.
 
 구조 조회는 별도 서버 설치 없이 사용할 수 있습니다. 사용 예와 검증 범위는 [구조 탐색](docs/documentation-tools.md#구조-탐색)을 참고하세요.
+
+LLM은 `code_outline`의 `view=compact`, `max_depth=0`으로 최상위 구조를 확인하고, `query`·`match=exact`·공통 `kind`·정확한 `container`로 범위를 좁힌 뒤 `symbol_read`로 본문을 읽을 수 있습니다. 기본 상세 응답은 유지하며 간결한 목록은 출처 근거로 취급하지 않습니다. 다음 페이지 호출에는 모든 필터가 전달되고 조건 변경 시 커서를 거부합니다.

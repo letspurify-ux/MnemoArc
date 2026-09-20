@@ -144,7 +144,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "source_search",
-                description: "Search source lines: query is literal text or regex (regex=true). case_sensitive defaults true; whole_word defaults false (Unicode word boundaries). path_glob filters files (pattern is a legacy alias). mode=matches (default) returns matching lines and source IDs; files returns matching paths; count returns matching-line counts per file. before/after add up to 20 context lines each in matches mode. Each displayed line is capped at 500 characters with truncation marked. Reuse the same search options with cursor for pagination; limit may change. Hashes detect source changes",
+                description: "Search source lines: query is literal text by default. For alternatives use {query:\"agent|run|db\",regex:true}; without regex=true the pipe is searched literally. case_sensitive defaults true; whole_word defaults false (Unicode word boundaries). path_glob filters files (pattern is a legacy alias). mode=matches (default) returns matching lines and source IDs; files returns matching paths; count returns matching-line counts per file. before/after add up to 20 context lines each in matches mode. Each displayed line is capped at 500 characters with truncation marked. Reuse the same search options with cursor for pagination; limit may change. Hashes detect source changes",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -174,11 +174,11 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "code_outline",
-                description: "Tree-sitter structure of one Rust, JS/JSX, TS/TSX, Python or Java file. Returns declarations, methods, containers, signatures, exact symbol IDs and line ranges; parse errors are explicit. query filters names; cursor requires same path/query and expires on edits. name_line/name_column are 1-based Unicode character positions. Source IDs cover only the displayed declaration line, not the body.",
+                description: "Explore one Rust, JS/JSX, TS/TSX, Python or Java file. Start with {path,view:\"compact\",max_depth:0} for top-level structure. Find a name with {path,query:\"handleQuestion\",match:\"exact\",kind:\"function\"}. query defaults to case-insensitive substring matching. kind filters normalized symbol_kind; container is an exact enclosing path copied from a result, e.g. Store or Outer::Inner. max_depth uses symbol nesting (0=top level, 1=direct members), not AST depth. Defaults: all kinds/depths, view=detailed. Compact returns names, kinds, containers, positions and symbol IDs, without source evidence. Detailed adds native kind, signature and declaration-line sources. Copy symbol_id into symbol_read for the body. Follow next_cursor preserving ALL filters and view; limit may change. Edits expire cursors/IDs. Positions are 1-based Unicode. Syntax structure does not resolve semantic references.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"path":string(),"query":string(),"cursor":string(),"limit":number()}),
+                    json!({"path":string(),"query":string(),"match":action(&["contains","exact"]),"case_sensitive":{"type":"boolean"},"kind":action(&["function","method","constructor","class","struct","interface","trait","impl","enum","enum_member","record","annotation","field","variable","constant","type","module","macro"]),"container":{"type":"string","description":"Exact enclosing symbol path, case-sensitive. Empty string selects top-level symbols."},"max_depth":{"type":"integer","minimum":0,"description":"Maximum symbol nesting depth; 0 selects top-level declarations."},"view":action(&["compact","detailed"]),"cursor":string(),"limit":number()}),
                     &["path"],
                 ),
             },
@@ -221,11 +221,11 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "investigation",
-                description: "Manage source documentation items. upsert registers ONE item per call: requires top-level title, optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified and failures reported. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. section is a unique Markdown heading",
+                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified and failures reported. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. section is an exact unique Markdown heading copied from document_inspect, including numbering",
                 optional: true,
                 read_only: false,
                 parameters: schema(
-                    json!({"action":action(&["list","upsert","verify","verify_batch","final_check"]),"id":string(),"title":{"type":"string","description":"Required non-empty top-level title for upsert (one item per call)."},"status":action(&["uninvestigated","in_progress","written"]),"memory_ids":strings(),"source_ids":strings(),"section":string(),"verification_note":string(),"items":{"type":"object","description":"ONLY for action=verify_batch. Object keyed by existing investigation IDs; not an array and not used by upsert.","minProperties":1,"maxProperties":20,"additionalProperties":{"type":"object","properties":{"source_ids":strings(),"verification_note":string()},"required":["source_ids","verification_note"],"additionalProperties":false}},"offset":number(),"limit":number()}),
+                    json!({"action":action(&["list","upsert","verify","verify_batch","final_check"]),"id":string(),"title":{"type":"string","description":"Non-empty title required for a NEW item. Omit when updating an existing id to preserve its title."},"status":action(&["uninvestigated","in_progress","written"]),"memory_ids":strings(),"source_ids":strings(),"section":string(),"verification_note":string(),"items":{"type":"object","description":"ONLY for action=verify_batch. Object keyed by existing investigation IDs; not an array and not used by upsert.","minProperties":1,"maxProperties":20,"additionalProperties":{"type":"object","properties":{"source_ids":strings(),"verification_note":string()},"required":["source_ids","verification_note"],"additionalProperties":false}},"offset":number(),"limit":number()}),
                     &["action"],
                 ),
             },
@@ -277,7 +277,7 @@ impl ToolRegistry {
             .ok_or_else(|| anyhow::anyhow!("Arguments must be an object"))?;
         let fields = spec.parameters["properties"].as_object().unwrap();
         if name == "investigation" {
-            validate_investigation_arguments(args)?;
+            validate_investigation_arguments(s, args)?;
         }
         for key in object.keys() {
             if !fields.contains_key(key) {
@@ -316,8 +316,11 @@ impl ToolRegistry {
 }
 // Keep action-specific contracts explicit without requiring conditional JSON
 // Schema support from OpenAI-compatible providers.
-fn validate_investigation_arguments(args: &Value) -> Result<()> {
+fn validate_investigation_arguments(s: &Session, args: &Value) -> Result<()> {
     let action = args["action"].as_str().unwrap_or("");
+    let updating = args["id"]
+        .as_str()
+        .is_some_and(|id| s.investigations.iter().any(|item| item.id == id));
     let (allowed, required, example): (&[&str], &[&str], &str) = match action {
         "upsert" => (
             &[
@@ -329,7 +332,7 @@ fn validate_investigation_arguments(args: &Value) -> Result<()> {
                 "source_ids",
                 "section",
             ],
-            &["title"],
+            if updating { &[] } else { &["title"] },
             r##"{"action":"upsert","id":"overview","title":"Project overview","section":"# Overview"}"##,
         ),
         "verify" => (
@@ -352,7 +355,7 @@ fn validate_investigation_arguments(args: &Value) -> Result<()> {
     };
     if action == "upsert" && args.get("items").is_some() {
         bail!(
-            "invalid_action_arguments: investigation upsert registers ONE item per call and requires top-level title; items is only for verify_batch of existing written items. Issue separate upsert calls. Example: {example}"
+            "invalid_action_arguments: investigation upsert handles ONE item per call; new items require top-level title. items is only for verify_batch of existing written items. Issue separate upsert calls. Example: {example}"
         );
     }
     for key in args.as_object().unwrap().keys() {
@@ -380,6 +383,13 @@ fn validate_investigation_arguments(args: &Value) -> Result<()> {
         bail!(
             "invalid_argument_type: items for verify_batch must be an object keyed by existing item IDs, not an array. Example: {example}"
         );
+    }
+    if action == "upsert"
+        && args["title"]
+            .as_str()
+            .is_some_and(|title| title.trim().is_empty())
+    {
+        bail!("invalid_argument_value: title must not be empty for investigation action=upsert");
     }
     Ok(())
 }
@@ -1188,7 +1198,13 @@ pub fn execute_cancellable(
                 let sources = s.source_refs(&list(&args, "source_ids"))?;
                 let item = Investigation {
                     id: id.clone(),
-                    title: text(&args, "title")?.into(),
+                    title: args["title"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| previous.as_ref().map(|item| item.title.clone()))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("missing_argument: title for new investigation")
+                        })?,
                     status: args["status"]
                         .as_str()
                         .map(str::to_string)
@@ -1531,6 +1547,16 @@ pub fn limit_result(
     mut result: Value,
     limit: usize,
 ) -> Value {
+    if call.name == "code_outline"
+        && result["status"] == "ok"
+        && let (Some(path), Some(cursor)) = (
+            result["data"]["path"].as_str(),
+            result["data"]["next_cursor"].as_str(),
+        )
+        && let Ok(args) = serde_json::from_str::<Value>(&call.arguments)
+    {
+        result["next_cursor"] = structure::continuation(&args, path, cursor);
+    }
     if matches!(call.name.as_str(), "file_read" | "symbol_read")
         && result["status"] == "ok"
         && result["data"]["content"]["truncated"] == true
@@ -1571,6 +1597,11 @@ pub fn limit_result(
     strip_duplicate_excerpts(&mut output);
     if result_tokens(call, &output, &s.config.model) <= limit {
         return output;
+    }
+    if call.name == "code_outline"
+        && let Some(page) = structure::limit_outline(call, &output, limit, &s.config.model)
+    {
+        return page;
     }
     let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
     let old_archive = result["archive_id"]

@@ -24,6 +24,50 @@ fn setup() -> (tempfile::TempDir, Session) {
 fn run(s: &mut Session, name: &str, args: Value) -> Value {
     tools::execute(s, name, args).unwrap()
 }
+
+#[test]
+fn investigation_updates_preserve_title_but_new_items_still_require_it() {
+    let (_dir, mut s) = setup();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"entry","title":"Entry point","section":"# Entry"}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"entry","status":"written","section":"# Updated entry"}),
+    );
+    assert_eq!(s.investigations.len(), 1);
+    assert_eq!(s.investigations[0].title, "Entry point");
+    assert_eq!(s.investigations[0].status, "written");
+    assert_eq!(s.investigations[0].section, "# Updated entry");
+    let before = serde_json::to_value(&s.investigations).unwrap();
+    for args in [
+        json!({"action":"upsert","id":"unknown","status":"written"}),
+        json!({"action":"upsert","status":"written"}),
+        json!({"action":"upsert","id":"entry","title":"  "}),
+        json!({"action":"upsert","id":"entry","title":null}),
+    ] {
+        assert!(tools::execute(&mut s, "investigation", args).is_err());
+        assert_eq!(serde_json::to_value(&s.investigations).unwrap(), before);
+    }
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"entry","title":"Renamed"}),
+    );
+    assert_eq!(s.investigations[0].title, "Renamed");
+    // Editing a verified item must still invalidate its prior verification.
+    s.investigations[0].status = "verified".into();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"entry","section":"# New section"}),
+    );
+    assert_eq!(s.investigations[0].status, "written");
+    assert!(s.investigations[0].document_hash.is_none());
+}
 #[test]
 fn outline_ignores_code_fences_and_section_edits_are_conflict_checked() {
     let (_dir, mut s) = setup();
