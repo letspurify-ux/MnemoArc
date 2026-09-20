@@ -38,6 +38,10 @@ pub fn describe(message: &str) -> Value {
         (Class::OutcomeUnknown, "inspect_outcome_before_retry")
     } else if code == "batch_partial_failure" {
         (Class::PartialFailure, "repair_failed_items_only")
+    } else if code == "checkpoint_has_failed_operations" {
+        (Class::Prerequisite, "repair_checkpoint_on_next_request")
+    } else if code == "memory_sources_required" {
+        (Class::MissingEvidence, "restore_memory_evidence")
     } else if code == "item_must_be_written_before_verification" {
         (Class::Prerequisite, "complete_prerequisite")
     } else if code == "file_not_found" || code == "document_missing" {
@@ -133,6 +137,8 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         result["recovery"] = describe(result["error"].as_str().unwrap_or("tool_error"));
     }
     let candidates: &[&str] = match result["recovery"]["action"].as_str().unwrap_or("") {
+        "restore_memory_evidence" => &["memory_read", "source_lookup", "history"],
+        "repair_checkpoint_on_next_request" => &["history", "checkpoint_complete"],
         "lookup_observed_evidence" => &["source_lookup", "history", "file_read"],
         "complete_prerequisite" => &["document_inspect", "investigation", "document_edit"],
         "resolve_path" => &["document_inspect", "file_list"],

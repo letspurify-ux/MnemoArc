@@ -281,6 +281,98 @@ pub(super) struct Citation {
     pub document_line: usize,
 }
 
+#[derive(Debug)]
+pub(super) struct CoverageMissing {
+    pub item_id: String,
+    pub missing_ranges: Vec<Value>,
+}
+impl std::fmt::Display for CoverageMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "source_coverage_missing: item {} has {} missing ranges; use source_lookup for matching evidence or file_read for these ranges, then supply all relevant source_ids: {}",
+            self.item_id,
+            self.missing_ranges.len(),
+            json!(self.missing_ranges)
+        )
+    }
+}
+impl std::error::Error for CoverageMissing {}
+
+/// Subtract the union of supplied evidence from every cited interval. Merge
+/// overlapping citations so the recovery plan never asks to read a gap twice.
+pub(super) fn missing_citation_ranges(
+    s: &Session,
+    section: &str,
+    sources: &[Source],
+) -> Result<Vec<Value>> {
+    let mut missing = std::collections::BTreeMap::<PathBuf, Vec<(usize, usize)>>::new();
+    for citation in citation_spans(section)? {
+        let path = if citation.relative_link {
+            output_path(&s.project)?
+                .parent()
+                .unwrap()
+                .join(&citation.path)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            citation.path
+        };
+        let cited = read_path(&s.project, &path)?;
+        let mut ranges: Vec<_> = sources
+            .iter()
+            .filter(|source| {
+                source
+                    .path
+                    .as_deref()
+                    .is_some_and(|p| Path::new(p) == cited)
+            })
+            .filter_map(|source| Some((source.start_line?, source.end_line?)))
+            .collect();
+        ranges.sort_unstable();
+        let mut next = citation.begin;
+        let gaps = missing.entry(cited).or_default();
+        for (start, end) in ranges {
+            if end < next {
+                continue;
+            }
+            if start > citation.end {
+                break;
+            }
+            if start > next {
+                gaps.push((next, start - 1));
+            }
+            next = next.max(end.saturating_add(1));
+            if next > citation.end {
+                break;
+            }
+        }
+        if next <= citation.end {
+            gaps.push((next, citation.end));
+        }
+    }
+    let mut result = vec![];
+    for (path, mut gaps) in missing {
+        gaps.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = vec![];
+        for (start, end) in gaps {
+            if let Some(last) = merged.last_mut()
+                && start <= last.1.saturating_add(1)
+            {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        let root = s.project.root.canonicalize()?;
+        let path = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
+        for (start, end) in merged {
+            result.push(json!({"path":path,"start_line":start,"end_line":end}));
+        }
+    }
+    Ok(result)
+}
+
 pub(super) fn citation_spans(doc: &str) -> Result<Vec<Citation>> {
     let pattern = regex::Regex::new(
         r"([\p{L}\p{N}_./@-]+\.[A-Za-z][A-Za-z0-9]*)(:|#L)([0-9]+)(?:[-–]L?([0-9]+))?",

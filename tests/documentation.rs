@@ -28,6 +28,11 @@ fn run(s: &mut Session, name: &str, args: Value) -> Value {
 #[test]
 fn investigation_updates_preserve_title_but_new_items_still_require_it() {
     let (_dir, mut s) = setup();
+    std::fs::write(
+        &s.project.output,
+        "# Updated entry\nbody\n# New section\nbody\n",
+    )
+    .unwrap();
     run(
         &mut s,
         "investigation",
@@ -408,6 +413,7 @@ fn out_of_range_read_is_empty_and_cannot_supply_verification_evidence() {
 #[test]
 fn settings_validate_reserves_and_patch_keeps_existing_references() {
     let (dir, mut s) = setup();
+    std::fs::write(&s.project.output, "# Entry\nbody\n").unwrap();
     s.config.writing_reserve_ratio = 0.2;
     assert!(s.config.validate().is_err());
     s.config.writing_reserve_ratio = 0.5;
@@ -823,6 +829,147 @@ fn persisted_sections_become_written_but_unrelated_evidence_cannot_verify_them()
         &mut s,
         "investigation",
         json!({"action":"verify","id":"entry","source_ids":[right],"verification_note":"Compared the entry"}),
+    );
+    assert_eq!(s.investigations[0].status, "verified");
+}
+
+#[test]
+fn verification_reports_all_gaps_and_one_repair_completes_verification() {
+    let (dir, mut s) = setup();
+    std::fs::write(
+        dir.path().join("a.rs"),
+        (1..=12)
+            .map(|n| format!("// line {n}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("b.rs"), "// one\n// two\n// three\n").unwrap();
+    // Repeated overlapping citations must not duplicate missing reads.
+    std::fs::write(&s.project.output, "# Gaps\na.rs:1-12 a.rs:3-9 b.rs:1-3\n").unwrap();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"gaps","title":"Gaps","status":"written","section":"Gaps"}),
+    );
+    let mut sources = vec![];
+    for (start, count) in [(2, 2), (6, 2), (10, 1)] {
+        sources.push(
+            run(
+                &mut s,
+                "file_read",
+                json!({"path":"a.rs","start_line":start,"max_lines":count}),
+            )["source"]["id"]
+                .clone(),
+        );
+    }
+    let result = tools::envelope(tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"gaps","source_ids":sources,"verification_note":"Compare both files"}),
+    ));
+    let expected = json!([
+        {"path":"a.rs","start_line":1,"end_line":1},
+        {"path":"a.rs","start_line":4,"end_line":5},
+        {"path":"a.rs","start_line":8,"end_line":9},
+        {"path":"a.rs","start_line":11,"end_line":12},
+        {"path":"b.rs","start_line":1,"end_line":3}
+    ]);
+    assert_eq!(result["data"]["missing_ranges"], expected);
+    assert_eq!(result["data"]["missing_range_count"], 5);
+    assert_eq!(s.investigations[0].status, "written");
+    for gap in expected.as_array().unwrap() {
+        sources.push(run(&mut s, "file_read", json!({"path":gap["path"],"start_line":gap["start_line"],"max_lines":gap["end_line"].as_u64().unwrap()-gap["start_line"].as_u64().unwrap()+1}))["source"]["id"].clone());
+    }
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"gaps","source_ids":sources,"verification_note":"Compared all cited ranges"}),
+    );
+    assert_eq!(s.investigations[0].status, "verified");
+}
+
+#[test]
+fn written_registration_resolves_headings_and_rejects_bad_updates_atomically() {
+    let (_dir, mut s) = setup();
+    // Planning a future section does not require a document.
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"chat","title":"Chat","status":"in_progress","section":"4. 채팅 흐름 (Chat.jsx)"}),
+    );
+    std::fs::write(
+        &s.project.output,
+        "## 4. 채팅 흐름 (Chat.jsx)\nbody\n# Duplicate\none\n## Duplicate\ntwo\n",
+    )
+    .unwrap();
+    let registered = run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"chat","status":"written"}),
+    );
+    assert_eq!(registered["section"], "## 4. 채팅 흐름 (Chat.jsx)");
+    let before = serde_json::to_value(&s.investigations).unwrap();
+    for (heading, code) in [
+        ("Missing", "section_not_found"),
+        ("Duplicate", "ambiguous_section"),
+    ] {
+        let err = tools::execute(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":"chat","section":heading}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().starts_with(code));
+        assert_eq!(serde_json::to_value(&s.investigations).unwrap(), before);
+    }
+}
+
+#[test]
+fn verification_checks_written_prerequisite_before_sources_or_document() {
+    let (_dir, mut s) = setup();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"draft","title":"Draft"}),
+    );
+    for sources in [json!([]), json!(["unknown-source"])] {
+        let err = tools::execute(&mut s, "investigation", json!({"action":"verify","id":"draft","source_ids":sources,"verification_note":"Compare"})).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("item_must_be_written_before_verification:")
+        );
+    }
+}
+
+#[test]
+fn batch_item_contract_rejects_extra_fields_without_losing_siblings() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.rs"), "// source\n").unwrap();
+    std::fs::write(&s.project.output, "# A\na.rs:1\n").unwrap();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"ready","title":"Ready","section":"A","status":"written"}),
+    );
+    let source = run(&mut s, "file_read", json!({"path":"a.rs"}))["source"]["id"].clone();
+    let result = run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify_batch","items":{
+            "extra":{"id":"ready","source_ids":[source],"verification_note":"Compare"},
+            "malformed":false,
+            "ready":{"source_ids":[source],"verification_note":"Compared source"}
+        }}),
+    );
+    assert_eq!(result["retry_ids"], json!(["extra", "malformed"]));
+    assert_eq!(result["succeeded_ids"], json!(["ready"]));
+    assert_eq!(result["summary"]["failed"], 2);
+    assert_eq!(
+        result["summary"]["failures_by_code"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
     );
     assert_eq!(s.investigations[0].status, "verified");
 }

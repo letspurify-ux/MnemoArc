@@ -79,7 +79,7 @@ fn task_patch_schema() -> Value {
 
 impl ToolRegistry {
     pub fn specs() -> Vec<ToolSpec> {
-        vec![
+        let mut specs = vec![
             ToolSpec {
                 name: "tool_catalog",
                 description: "List/search available tools and source-docs group; shows short descriptions and active status",
@@ -99,7 +99,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_write",
-                description: "Save one reusable memory. Same key requires expected_revision. Copy source_ids exactly from tool results; never omit them to recover from unknown_source. Facts without sources and inferred memories are needs_review. Source IDs must come from program observations. Keep metadata very short (aim for 80 tokens; hard limit 160 including ID/key/JSON). Put details in body. kind: fact/decision/failure/question/procedure",
+                description: "Save one reusable memory. Same key requires expected_revision. Updates replace evidence: resupply valid source_ids for observed facts; existing sources are not inherited. Copy source_ids exactly from tool results; never omit them to recover from unknown_source. Facts without sources and inferred memories are needs_review. Source IDs must come from program observations. Keep metadata very short (aim for 80 tokens; hard limit 160 including ID/key/JSON). Put details in body. kind: fact/decision/failure/question/procedure",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -136,7 +136,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "task_state",
-                description: "Read/update structured goals and compact progress, or read/write detailed work list. For source documentation START with patch.workflow=source_document; this locks evidence requirements and activates investigation/document_edit/document_audit immediately. Use investigation upsert for investigation items, NOT task_state. Do not send empty patches. Updates preserve omitted fields. Set patch.require_investigation=true BEFORE source-documentation work requiring evidence coverage; simple document edits do not need it. Once required, it cannot be disabled during the same request. Preserve user constraints unless explicitly changed by user",
+                description: "Read/update structured goals and compact progress, or read/write detailed work list. State fields belong inside patch, e.g. {action:update,patch:{phase:verify}}; phase is not a top-level argument. For source documentation START with patch.workflow=source_document; this locks evidence requirements and activates investigation/document_edit/document_audit immediately. Use investigation upsert for investigation items, NOT task_state. Do not send empty patches. Updates preserve omitted fields. Set patch.require_investigation=true BEFORE source-documentation work requiring evidence coverage; simple document edits do not need it. Once required, it cannot be disabled during the same request. Preserve user constraints unless explicitly changed by user",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -263,7 +263,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "investigation",
-                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified and failures reported. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. status=written requires a non-empty section (supplied now or preserved from the existing item). section is an exact unique Markdown heading copied from document_inspect, including numbering",
+                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. Both verify and verify_batch require existing written items. If not written, write the section and upsert with status=written and section first; source IDs alone do not mark an item written. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified; summary groups failures by code and retry_ids identifies only failed items. Successful items remain verified unless their document or evidence changes. Coverage failures return all missing_ranges together. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. status=written requires a non-empty section (supplied now or preserved from the existing item). For written items, upsert checks the current document and normalizes section to its full heading; a unique title without # is accepted, including numbering. Planned sections may be registered before writing with status=in_progress",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -271,7 +271,27 @@ impl ToolRegistry {
                     &["action"],
                 ),
             },
-        ]
+        ];
+        let spec = specs
+            .iter_mut()
+            .find(|spec| spec.name == "investigation")
+            .unwrap();
+        let fields = spec.parameters["properties"].as_object().unwrap();
+        let branches: Vec<Value> = ["list", "upsert", "verify", "verify_batch", "final_check"]
+            .into_iter()
+            .map(|name| {
+                let (allowed, required, _) = investigation_contract(name, true).unwrap();
+                let mut properties = serde_json::Map::new();
+                for key in allowed {
+                    properties.insert((*key).into(), fields[*key].clone());
+                }
+                properties.insert("action".into(), json!({"const":name}));
+                let mut required = required.to_vec();
+                required.push("action");
+                json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
+            }).collect();
+        spec.parameters["oneOf"] = json!(branches);
+        specs
     }
     fn checkpoint_allowed(name: &str) -> bool {
         [
@@ -345,6 +365,11 @@ impl ToolRegistry {
         }
         for key in object.keys() {
             if !fields.contains_key(key) {
+                if name == "task_state" && task_patch_schema()["properties"].get(key).is_some() {
+                    bail!(
+                        "unknown_argument: {key} belongs inside task_state patch; use {{\"action\":\"update\",\"patch\":{{\"{key}\":...}}}}; state unchanged"
+                    );
+                }
                 bail!(
                     "unknown_argument: {key} for {name}; allowed arguments: {}",
                     fields.keys().cloned().collect::<Vec<_>>().join(", ")
@@ -378,14 +403,13 @@ impl ToolRegistry {
         Ok(spec)
     }
 }
-// Keep action-specific contracts explicit without requiring conditional JSON
-// Schema support from OpenAI-compatible providers.
-fn validate_investigation_arguments(s: &Session, args: &Value) -> Result<()> {
-    let action = args["action"].as_str().unwrap_or("");
-    let updating = args["id"]
-        .as_str()
-        .is_some_and(|id| s.investigations.iter().any(|item| item.id == id));
-    let (allowed, required, example): (&[&str], &[&str], &str) = match action {
+type InvestigationContract = (
+    &'static [&'static str],
+    &'static [&'static str],
+    &'static str,
+);
+fn investigation_contract(action: &str, updating: bool) -> Option<InvestigationContract> {
+    Some(match action {
         "upsert" => (
             &[
                 "action",
@@ -415,7 +439,19 @@ fn validate_investigation_arguments(s: &Session, args: &Value) -> Result<()> {
             r#"{"action":"list","offset":0,"limit":20}"#,
         ),
         "final_check" => (&["action"], &[], r#"{"action":"final_check"}"#),
-        _ => return Ok(()), // Generic validation reports unknown/missing actions.
+        _ => return None,
+    })
+}
+
+// Enforce the advertised action contract even when providers do not validate
+// conditional JSON Schema. New-item title checks additionally require state.
+fn validate_investigation_arguments(s: &Session, args: &Value) -> Result<()> {
+    let action = args["action"].as_str().unwrap_or("");
+    let updating = args["id"]
+        .as_str()
+        .is_some_and(|id| s.investigations.iter().any(|item| item.id == id));
+    let Some((allowed, required, example)) = investigation_contract(action, updating) else {
+        return Ok(());
     };
     if action == "upsert" && args.get("items").is_some() {
         bail!(
@@ -530,7 +566,11 @@ pub fn envelope(result: Result<Value>) -> Value {
             } else {
                 "error"
             };
-            json!({"status":status,"error":message,"recovery":recovery::describe(&message),"truncated":false,"next_cursor":null})
+            let mut result = json!({"status":status,"error":message,"recovery":recovery::describe(&message),"truncated":false,"next_cursor":null});
+            if let Some(coverage) = error.downcast_ref::<documentation::CoverageMissing>() {
+                result["data"] = json!({"item_id":coverage.item_id,"missing_ranges":coverage.missing_ranges,"missing_range_count":coverage.missing_ranges.len()});
+            }
+            result
         }
     }
 }
@@ -1216,7 +1256,9 @@ pub fn execute_cancellable(
                 bail!("checkpoint_id_mismatch");
             }
             if cp.failed {
-                bail!("checkpoint_has_failed_operations: retry on next request");
+                bail!(
+                    "checkpoint_has_failed_operations: an earlier operation in this batch failed; inspect its error and repair it on the next model request before checkpoint_complete. Successful writes are retained; do not repeat them. Completion cannot succeed in this failed batch"
+                );
             }
             let no_save = args["no_save_reason"]
                 .as_str()
@@ -1391,7 +1433,7 @@ pub fn execute_cancellable(
                     .map(|id| s.memory.get(&id).map(|m| (m.id.clone(), m.revision)))
                     .collect::<Result<_>>()?;
                 let sources = s.source_refs(&list(&args, "source_ids"))?;
-                let item = Investigation {
+                let mut item = Investigation {
                     id: id.clone(),
                     title: args["title"]
                         .as_str()
@@ -1448,12 +1490,17 @@ pub fn execute_cancellable(
                         "investigation_section_required: status=written requires a non-empty section. Copy an exact heading from document_inspect and upsert this id with section and status=written together; existing item retained"
                     );
                 }
+                if item.status == "written" {
+                    let doc = read_text(&output_path(&s.project)?)?;
+                    item.section = documentation::resolve_heading(&doc, &item.section)?.heading;
+                }
+                let registered = json!({"id":id,"status":item.status,"section":item.section});
                 if let Some(existing) = s.investigations.iter_mut().find(|i| i.id == id) {
                     *existing = item
                 } else {
                     s.investigations.push(item);
                 }
-                Ok(json!({"id":id}))
+                Ok(registered)
             }
             "verify_batch" => {
                 let items = args["items"].as_object().ok_or_else(|| {
@@ -1470,8 +1517,16 @@ pub fn execute_cancellable(
                     let mut params = entry.clone();
                     if !params.is_object() {
                         results.push(
-                            json!({"id":id,"status":"error","error":"item must be an object"}),
+                            json!({"id":id,"result":envelope(Err(anyhow::anyhow!("invalid_argument_type: batch item must be an object with source_ids and verification_note")))}),
                         );
+                        continue;
+                    }
+                    if let Some(key) =
+                        params.as_object().unwrap().keys().find(|key| {
+                            !["source_ids", "verification_note"].contains(&key.as_str())
+                        })
+                    {
+                        results.push(json!({"id":id,"result":envelope(Err(anyhow::anyhow!("invalid_action_arguments: verify_batch item does not accept {key}; allowed: source_ids, verification_note; ID belongs in the items key")))}));
                         continue;
                     }
                     params["action"] = json!("verify");
@@ -1479,13 +1534,47 @@ pub fn execute_cancellable(
                     let result = execute_cancellable(s, "investigation", params, cancel);
                     results.push(json!({"id":id,"result":envelope(result)}));
                 }
+                let mut succeeded_ids = vec![];
+                let mut retry_ids = vec![];
+                let mut failures = std::collections::BTreeMap::<String, Vec<Value>>::new();
+                for entry in &results {
+                    if entry["result"]["status"] == "ok" {
+                        succeeded_ids.push(entry["id"].clone());
+                    } else {
+                        retry_ids.push(entry["id"].clone());
+                        let code = entry["result"]["recovery"]["code"]
+                            .as_str()
+                            .unwrap_or("tool_error");
+                        failures
+                            .entry(code.into())
+                            .or_default()
+                            .push(entry["id"].clone());
+                    }
+                }
+                let reasons: Vec<_> = failures
+                    .into_iter()
+                    .map(|(code, ids)| json!({"code":code,"count":ids.len(),"ids":ids}))
+                    .collect();
                 Ok(
-                    json!({"results":results,"semantic_verification":"agent attestation; not program proof"}),
+                    json!({"summary":{"total":results.len(),"succeeded":succeeded_ids.len(),"failed":retry_ids.len(),"failures_by_code":reasons},"succeeded_ids":succeeded_ids,"retry_ids":retry_ids,"guidance":"Successful verification updates are retained; failed items are not marked verified. Correct and retry only retry_ids. Do not reverify successful items unless their section, sources or memory references change.","results":results,"semantic_verification":"agent attestation; not program proof"}),
                 )
             }
             "verify" => {
                 revalidate(s)?;
                 let id = text(&args, "id")?;
+                let item = s
+                    .investigations
+                    .iter()
+                    .find(|i| i.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("item_not_found"))?;
+                if item.status != "written" && item.status != "verified" {
+                    bail!(
+                        "item_must_be_written_before_verification: id={}, status={}, section={:?}. Inspect the document section first; if its content is written, use investigation upsert with this id, the exact section heading from document_inspect, and status=written together, then verify. Otherwise write the section before verifying.",
+                        item.id,
+                        item.status,
+                        item.section
+                    );
+                }
                 let note = text(&args, "verification_note")?;
                 if note.trim().is_empty() {
                     bail!("verification_note required");
@@ -1512,19 +1601,6 @@ pub fn execute_cancellable(
                     }
                 }
                 let doc = read_text(&output_path(&s.project)?)?;
-                let item = s
-                    .investigations
-                    .iter()
-                    .find(|i| i.id == id)
-                    .ok_or_else(|| anyhow::anyhow!("item_not_found"))?;
-                if item.status != "written" && item.status != "verified" {
-                    bail!(
-                        "item_must_be_written_before_verification: id={}, status={}, section={:?}. Inspect the document section first; if its content is written, use investigation upsert with this id, the exact section heading from document_inspect, and status=written together, then verify. Otherwise write the section before verifying.",
-                        item.id,
-                        item.status,
-                        item.section
-                    );
-                }
                 for (id, revision) in &item.memory_refs {
                     let memory = s.memory.get(id)?;
                     if memory.revision != *revision
@@ -1534,43 +1610,13 @@ pub fn execute_cancellable(
                     }
                 }
                 let section = section_text(&doc, &item.section)?;
-                for citation in documentation::citation_spans(section)? {
-                    let cited_path = if citation.relative_link {
-                        output_path(&s.project)?
-                            .parent()
-                            .unwrap()
-                            .join(&citation.path)
-                            .to_string_lossy()
-                            .into_owned()
-                    } else {
-                        citation.path.clone()
-                    };
-                    let cited = read_path(&s.project, &cited_path)?;
-                    let mut ranges: Vec<_> = sources
-                        .iter()
-                        .filter(|source| {
-                            source
-                                .path
-                                .as_deref()
-                                .is_some_and(|p| Path::new(p) == cited)
-                        })
-                        .filter_map(|source| Some((source.start_line?, source.end_line?)))
-                        .collect();
-                    ranges.sort_unstable();
-                    let mut next = citation.begin;
-                    for (start, end) in ranges {
-                        if start <= next && end >= next {
-                            next = end.saturating_add(1);
-                        }
+                let missing = documentation::missing_citation_ranges(s, section, &sources)?;
+                if !missing.is_empty() {
+                    return Err(documentation::CoverageMissing {
+                        item_id: id.into(),
+                        missing_ranges: missing,
                     }
-                    if next <= citation.end {
-                        bail!(
-                            "source_coverage_missing: item {id}, {}:{}-{} is not covered by supplied source_ids; use source_lookup for matching evidence or read the missing range before verification",
-                            citation.path,
-                            next,
-                            citation.end
-                        );
-                    }
+                    .into());
                 }
                 let item = s.investigations.iter_mut().find(|i| i.id == id).unwrap();
                 item.document_hash = Some(hash(section.as_bytes()));

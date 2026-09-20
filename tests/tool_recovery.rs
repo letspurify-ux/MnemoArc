@@ -386,6 +386,8 @@ fn document_offset_error_explains_heading_index_versus_line_number() {
 fn written_items_require_a_section_without_mutating_existing_state() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
+    s.project.output = dir.path().join("out.md");
+    std::fs::write(&s.project.output, "# Draft\nbody\n").unwrap();
     tools::execute(
         &mut s,
         "investigation",
@@ -456,6 +458,14 @@ fn failed_batch_items_expose_recovery_tools_and_preserve_successful_siblings() {
         result["recovery"]["tools"],
         json!(["document_inspect", "investigation", "document_edit"])
     );
+    assert_eq!(result["data"]["summary"]["succeeded"], 1);
+    assert_eq!(result["data"]["summary"]["failed"], 1);
+    assert_eq!(result["data"]["retry_ids"], json!(["draft"]));
+    assert_eq!(result["data"]["succeeded_ids"], json!(["ready"]));
+    assert_eq!(
+        result["data"]["summary"]["failures_by_code"],
+        json!([{"code":"item_must_be_written_before_verification","count":1,"ids":["draft"]}])
+    );
     let items = result["data"]["results"].as_array().unwrap();
     let failed = &items.iter().find(|i| i["id"] == "draft").unwrap()["result"];
     assert_eq!(failed["recovery"]["tools"], result["recovery"]["tools"]);
@@ -470,4 +480,56 @@ fn failed_batch_items_expose_recovery_tools_and_preserve_successful_siblings() {
             .status,
         "verified"
     );
+}
+
+#[test]
+fn tool_contract_exposes_action_fields_and_points_state_fields_to_patch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let definition = ToolRegistry::definitions(&s)
+        .into_iter()
+        .find(|d| d["function"]["name"] == "investigation")
+        .unwrap();
+    let branches = definition["function"]["parameters"]["oneOf"]
+        .as_array()
+        .unwrap();
+    let single = branches
+        .iter()
+        .find(|b| b["properties"]["action"]["const"] == "verify")
+        .unwrap();
+    let batch = branches
+        .iter()
+        .find(|b| b["properties"]["action"]["const"] == "verify_batch")
+        .unwrap();
+    assert!(single["properties"].get("items").is_none());
+    assert!(batch["properties"].get("source_ids").is_none());
+    assert_eq!(batch["required"], json!(["items", "action"]));
+    let before = s.task.phase.clone();
+    let err = tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","phase":"verify"}),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("belongs inside task_state patch"));
+    assert_eq!(s.task.phase, before);
+    tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"phase":"verify"}}),
+    )
+    .unwrap();
+    assert_eq!(s.task.phase, "verify");
+    for (code, action) in [
+        ("memory_sources_required", "restore_memory_evidence"),
+        (
+            "checkpoint_has_failed_operations",
+            "repair_checkpoint_on_next_request",
+        ),
+    ] {
+        let recovery = tools::recovery::describe(&format!("{code}: test"));
+        assert_ne!(recovery["class"], "unclassified");
+        assert_eq!(recovery["action"], action);
+        assert_eq!(recovery["automatic_retry"], false);
+    }
 }
