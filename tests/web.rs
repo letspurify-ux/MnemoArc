@@ -235,6 +235,7 @@ async fn local_api_rejects_cross_origin_mutation_and_invalid_project() {
     let id = initial["sessions"][0]["id"].as_str().unwrap();
     let mut config = initial["config"].clone();
     config["run_tokens"] = json!(100000);
+    config["document_repair_limit"] = json!(16);
     assert_eq!(
         c.put(format!("{url}/api/sessions/{id}/settings"))
             .header("x-mnemoarc-client", "web")
@@ -253,6 +254,8 @@ async fn local_api_rejects_cross_origin_mutation_and_invalid_project() {
         get(&c, &url, "/api/state").await["config"]["run_tokens"],
         500000
     );
+    assert_eq!(get(&c, &url, &format!("/api/sessions/{id}")).await["config"]["document_repair_limit"], 16);
+    assert_eq!(get(&c, &url, "/api/state").await["config"]["document_repair_limit"], 8);
     assert!(!dir.path().join("config.toml").exists());
     state.shutdown().await;
     server.abort();

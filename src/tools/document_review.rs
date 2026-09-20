@@ -21,6 +21,8 @@ pub struct ReviewState {
     document_total: usize,
     page_issues: Vec<String>,
     pub repair_started_round: Option<usize>,
+    /// Model requests containing document_edit since the last failed review.
+    /// Counts attempted edit batches once; reads and verification are excluded.
     pub repair_requests: usize,
     target_hash: Option<String>,
     source_hashes: BTreeMap<String, String>,

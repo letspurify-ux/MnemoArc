@@ -263,7 +263,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "investigation",
-                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. Both verify and verify_batch require existing written items. If not written, write the section and upsert with status=written and section first; source IDs alone do not mark an item written. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified; summary groups failures by code and retry_ids identifies only failed items. Successful items remain verified unless their document or evidence changes. Coverage failures return all missing_ranges together. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. status=written requires a non-empty section (supplied now or preserved from the existing item). For written items, upsert checks the current document and normalizes section to its full heading; a unique title without # is accepted, including numbering. Planned sections may be registered before writing with status=in_progress",
+                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. Both verify and verify_batch require existing written items. If not written, write the section and upsert with status=written and section first; source IDs alone do not mark an item written. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified; summary groups failures by code and retry_ids identifies only failed items. Already verified items in verify_batch reuse their existing evidence after section/source/memory freshness checks; new supplied evidence is ignored for those items. Use single verify to explicitly replace evidence. After edits, verify only verification_required_ids returned by document_edit. Coverage failures return all missing_ranges together. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. status=written requires a non-empty section (supplied now or preserved from the existing item). For written items, upsert checks the current document and normalizes section to its full heading; a unique title without # is accepted, including numbering. Planned sections may be registered before writing with status=in_progress",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -892,7 +892,7 @@ pub fn revalidate(s: &mut Session) -> Result<()> {
         }) || item
             .memory_refs
             .iter()
-            .any(|(id, rev)| s.memory.get(id).map_or(true, |m| m.revision != *rev));
+            .any(|(id, rev)| s.memory.get(id).map_or(true, |m| m.revision != *rev || m.status != crate::memory::MemoryStatus::Active));
         let doc_changed = doc
             .as_ref()
             .and_then(|d| section_text(d, &item.section).ok())
@@ -1403,7 +1403,7 @@ pub fn execute_cancellable(
                 }
             }
             Ok(
-                json!({"written_items":written_items,"path":path,"hash":hash(result.as_bytes()),"bytes":result.len(),"total_lines":result.lines().count(),"citation_check":documentation::citation_check(s, &path, &result)?}),
+                json!({"written_items":written_items,"verification_required_ids":s.investigations.iter().filter(|i| i.status != "verified").map(|i| &i.id).collect::<Vec<_>>(),"preserved_verified_ids":s.investigations.iter().filter(|i| i.status == "verified").map(|i| &i.id).collect::<Vec<_>>(),"verification_guidance":"Verify only verification_required_ids. Unchanged sections retain verification; do not resubmit all items after a local edit. If none remain, proceed to final completion and document review.","path":path,"hash":hash(result.as_bytes()),"bytes":result.len(),"total_lines":result.lines().count(),"citation_check":documentation::citation_check(s, &path, &result)?}),
             )
         }
         "investigation" => match text(&args, "action")? {
@@ -1509,6 +1509,8 @@ pub fn execute_cancellable(
                 if items.is_empty() || items.len() > 20 {
                     bail!("batch requires 1..20 items");
                 }
+                revalidate(s)?;
+                let mut reused_ids = vec![];
                 let mut results = vec![];
                 for (id, entry) in items {
                     if cancel.is_cancelled() {
@@ -1527,6 +1529,13 @@ pub fn execute_cancellable(
                         })
                     {
                         results.push(json!({"id":id,"result":envelope(Err(anyhow::anyhow!("invalid_action_arguments: verify_batch item does not accept {key}; allowed: source_ids, verification_note; ID belongs in the items key")))}));
+                        continue;
+                    }
+                    // Reuse only after checking section, source and memory freshness.
+                    // A redundant batch must not replace valid evidence with an incomplete list.
+                    if s.investigations.iter().any(|i| i.id == *id && i.status == "verified") {
+                        reused_ids.push(id.clone());
+                        results.push(json!({"id":id,"result":envelope(Ok(json!({"verified":id,"reused":true})))}));
                         continue;
                     }
                     params["action"] = json!("verify");
@@ -1556,7 +1565,7 @@ pub fn execute_cancellable(
                     .map(|(code, ids)| json!({"code":code,"count":ids.len(),"ids":ids}))
                     .collect();
                 Ok(
-                    json!({"summary":{"total":results.len(),"succeeded":succeeded_ids.len(),"failed":retry_ids.len(),"failures_by_code":reasons},"succeeded_ids":succeeded_ids,"retry_ids":retry_ids,"guidance":"Successful verification updates are retained; failed items are not marked verified. Correct and retry only retry_ids. Do not reverify successful items unless their section, sources or memory references change.","results":results,"semantic_verification":"agent attestation; not program proof"}),
+                    json!({"summary":{"total":results.len(),"succeeded":succeeded_ids.len(),"failed":retry_ids.len(),"failures_by_code":reasons},"succeeded_ids":succeeded_ids,"reused_ids":reused_ids,"retry_ids":retry_ids,"guidance":"Successful verification updates are retained; failed items are not marked verified. Correct and retry only retry_ids. Do not reverify successful items unless their section, sources or memory references change.","results":results,"semantic_verification":"agent attestation; not program proof"}),
                 )
             }
             "verify" => {

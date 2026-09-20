@@ -431,8 +431,8 @@ impl LlmClient for StallingRepair {
                 return Ok(Completion {
                     calls: vec![mnemoarc::llm::ToolCall {
                         id: format!("stall-{}", state["run_guidance"]["task_rounds"]),
-                        name: "task_state".into(),
-                        arguments: json!({"action":"read"}).to_string(),
+                        name: "document_edit".into(),
+                        arguments: json!({"action":"patch","expected_hash":state["document_review"]["target_hash"],"old_text":"A while loop","text":"A while loop"}).to_string(),
                     }],
                     ..Default::default()
                 });
@@ -457,7 +457,7 @@ async fn failed_review_cannot_open_an_unbounded_repair_loop() {
     assert_eq!(result.status, "partial");
     assert_eq!(result.document_review.attempts, 1);
     assert!(result.last_error.unwrap().contains("document_repair_limit"));
-    assert_eq!(result.task_rounds, 10); // initial final + review + eight repair requests
+    assert_eq!(result.task_rounds, 11); // initial final + review + eight edits + rejected edit
 }
 
 #[test]
@@ -526,7 +526,7 @@ async fn checkpoint_maintenance_does_not_consume_document_repair_requests() {
     let result = run_session(s, Arc::new(Cleanup), CancellationToken::new(), tx).await;
     drain.await.unwrap();
     assert_eq!(result.checkpoints_completed, 1);
-    assert_eq!(result.document_review.repair_requests, 1);
+    assert_eq!(result.document_review.repair_requests, 0);
     assert_eq!(result.last_error.as_deref(), Some("stop_after_cleanup"));
 }
 
@@ -685,4 +685,84 @@ fn changing_evidence_between_pages_restarts_review_without_old_findings() {
     assert_eq!(payload["evidence_page"], 0);
     assert!(!document_review::approved(&s));
     assert_eq!(s.document_review.attempts, 0);
+}
+
+#[test]
+fn repair_limit_defaults_and_validates() {
+    let mut config: Config = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(config.document_repair_limit, 8);
+    config.document_repair_limit = 0;
+    assert!(config.validate().is_err());
+    config.document_repair_limit = 16;
+    let encoded = toml::to_string(&config).unwrap();
+    assert_eq!(toml::from_str::<Config>(&encoded).unwrap().document_repair_limit, 16);
+}
+
+async fn run_repair_test(s: Session, client: Arc<dyn LlmClient>) -> Session {
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(s, client, CancellationToken::new(), tx).await;
+    drain.await.unwrap();
+    result
+}
+
+#[tokio::test]
+async fn increasing_repair_limit_resumes_without_resetting_progress() {
+    let (_dir, mut s) = fixture();
+    s.config.document_repair_limit = 2;
+    let mut s = run_repair_test(s, Arc::new(StallingRepair)).await;
+    assert_eq!(s.document_review.repair_requests, 2);
+    assert_eq!(s.task_rounds, 5);
+    let issues = s.document_review.issues.clone();
+    let document = std::fs::read(&s.project.output).unwrap();
+    s.add_user("계속".into());
+    let mut s = run_repair_test(s, Arc::new(StallingRepair)).await;
+    assert_eq!(s.task_rounds, 6); // unchanged limit rejects the next editing request
+    let mut config = s.config.clone();
+    config.document_repair_limit = 4;
+    mnemoarc::agent::apply_config(&mut s, config).unwrap();
+    let s = run_repair_test(s, Arc::new(StallingRepair)).await;
+    assert_eq!(s.document_review.repair_requests, 4);
+    assert_eq!(s.task_rounds, 9); // two additional edits, then a rejected edit
+    assert_eq!(s.document_review.issues, issues);
+    assert_eq!(std::fs::read(&s.project.output).unwrap(), document);
+    assert!(s.last_error.as_ref().unwrap().contains("4/4"));
+    assert_eq!(s.run_guidance["document_repair_requests_remaining"], 0);
+    // Even at the cap, final verification/review is allowed without another edit.
+    let s = run_repair_test(s, Arc::new(Reviewer { issues: false, phase: None })).await;
+    assert_eq!(s.status, "complete");
+    assert!(document_review::approved(&s));
+}
+
+#[tokio::test]
+async fn reads_and_verification_can_finish_even_at_the_edit_limit() {
+    struct ReadAndVerify(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl LlmClient for ReadAndVerify {
+        async fn complete(&self, request: Value, config: &Config, cancel: CancellationToken, tx: mpsc::Sender<String>) -> Result<Completion> {
+            let round = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if round < 9 {
+                let content = request["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap();
+                let state: Value = serde_json::from_str(content.split_once('\n').unwrap().1)?;
+                assert_eq!(state["document_review"]["repair_requests"], 2);
+                let name = ["file_read", "document_inspect", "investigation"][round % 3];
+                let args = match name {
+                    "file_read" => json!({"path":"main.js","force_read":true}),
+                    "document_inspect" => json!({}),
+                    _ => json!({"action":"verify_batch","items":{"flow":{"source_ids":[],"verification_note":"Reuse unchanged attestation"}}}),
+                };
+                return Ok(Completion { calls: vec![mnemoarc::llm::ToolCall { id: format!("read-{round}"), name:name.into(), arguments:args.to_string() }], ..Default::default() });
+            }
+            Reviewer { issues:false, phase:None }.complete(request, config, cancel, tx).await
+        }
+    }
+    let (_dir, mut s) = fixture();
+    document_review::request(&mut s).unwrap();
+    document_review::finish(&mut s, r#"{"issues":["Check the existing section"]}"#).unwrap();
+    s.config.document_repair_limit = 2;
+    s.document_review.repair_requests = 2;
+    let result = run_repair_test(s, Arc::new(ReadAndVerify(std::sync::atomic::AtomicUsize::new(0)))).await;
+    assert_eq!(result.status, "complete");
+    assert!(document_review::approved(&result));
+    assert!(result.task_rounds >= 11); // nine non-edit requests + final + paged review
 }

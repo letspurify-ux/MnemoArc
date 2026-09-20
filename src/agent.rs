@@ -282,18 +282,8 @@ pub async fn run_session_controlled(
             failure = Some("run_budget_exhausted: partial results and memory retained".into());
             break;
         }
-        // A review must not open an unbounded new authoring run. Preserve the
-        // partial document when eight repair requests cannot finish verification.
         if !s.config.source_document_review {
             s.document_review.pending = false;
-        }
-        if s.config.source_document_review
-            && !s.document_review.pending
-            && s.document_review.repair_requests >= 8
-        {
-            s.status = "partial".into();
-            s.last_error = Some("document_repair_limit: eight repair requests used; partial document and review findings retained".into());
-            break;
         }
         let spent = s
             .input_tokens
@@ -352,9 +342,12 @@ pub async fn run_session_controlled(
         s.run_guidance = json!({"task_rounds":s.task_rounds,"finalization_attempts":finalization_attempts,"phase":phase,"remaining_tokens":remaining,"remaining_seconds":seconds_remaining,
             "writing_reserve_tokens":(s.config.run_tokens as f64*s.config.writing_reserve_ratio) as usize,
             "verification_reserve_tokens":(s.config.run_tokens as f64*s.config.verification_reserve_ratio) as usize,
+            "document_repair_limit":s.config.document_repair_limit,
+            "document_repair_requests_used":s.document_review.repair_requests,
+            "document_repair_requests_remaining":s.config.document_repair_limit.saturating_sub(s.document_review.repair_requests),
             "pending_count":s.investigations.iter().filter(|i|i.status != "verified").count(),
             "completion_error":if finalization_attempts > 0 { s.last_error.as_deref() } else { None },
-            "instruction":match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, batch targeted reads for missing evidence, then repair all known issues in one cohesive write/patch when safe. Run verify_batch once after all edits, not after every small correction. At most eight requests are available after a document review failure; audit existing sections and fix factual errors. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, write investigated sections now and preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>"For source documentation, investigate incrementally and write completed sections. For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. Answer once evidence is sufficient; no source audit or document write is required."}});
+            "instruction":match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, batch targeted reads for missing evidence, then repair all known issues in one cohesive write/patch when safe. Run verify_batch once after all edits, not after every small correction. Only requests containing document_edit consume the repair budget (one per request, including failed edits); reads and verification do not. At zero remaining, finish verification and review without another edit. The remaining edit request budget is in document_repair_requests_remaining; audit existing sections and fix factual errors within that budget. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, write investigated sections now and preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>"For source documentation, investigate incrementally and write completed sections. For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. Answer once evidence is sufficient; no source audit or document write is required."}});
         let definitions = ToolRegistry::definitions(&s);
         let mut request = match ContextManager::request(&s, definitions.clone()) {
             Ok(r) => r,
@@ -453,8 +446,6 @@ pub async fn run_session_controlled(
         }
         if let Some(cp) = &mut s.checkpoint {
             cp.attempts += 1;
-        } else if s.document_review.repair_started_round.is_some() && !reviewing_document {
-            s.document_review.repair_requests += 1;
         }
         let document_workflow =
             s.task.require_investigation || s.task.workflow == "source_document";
@@ -768,6 +759,23 @@ pub async fn run_session_controlled(
                 .await;
             }
             break;
+        }
+        // Count editing requests, not reads, verification, final answers or maintenance.
+        // At the cap, allow verification/review to finish; stop before another edit batch.
+        if s.config.source_document_review
+            && s.checkpoint.is_none()
+            && s.document_review.repair_started_round.is_some()
+            && completion.calls.iter().any(|call| call.name == "document_edit")
+        {
+            if s.document_review.repair_requests >= s.config.document_repair_limit {
+                s.status = "partial".into();
+                s.last_error = Some(format!(
+                    "document_repair_limit: {}/{} document edit requests used; increase document_repair_limit in session settings and resume; partial document and review findings retained",
+                    s.document_review.repair_requests, s.config.document_repair_limit
+                ));
+                break;
+            }
+            s.document_review.repair_requests += 1;
         }
         if (buffer_answer || document_workflow) && !completion.text.is_empty() {
             emit(
