@@ -82,7 +82,9 @@ impl SseDecoder {
 impl OpenAiClient {
     fn client(c: &Config) -> Result<reqwest::Client> {
         let mut b = reqwest::Client::builder().connect_timeout(Duration::from_secs(15));
-        if let Some(proxy) = &c.proxy {
+        if c.disable_proxy {
+            b = b.no_proxy();
+        } else if let Some(proxy) = &c.proxy {
             b = b.proxy(reqwest::Proxy::all(proxy)?)
         }
         Ok(b.build()?)

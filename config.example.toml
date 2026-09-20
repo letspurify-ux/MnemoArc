@@ -3,6 +3,8 @@ base_url = "https://api.openai.com/v1"
 model = ""
 # model_context = 128000
 # proxy = "http://localhost:8080"
+# Takes precedence over proxy and disables environment/system proxy detection.
+disable_proxy = false
 # reasoning_effort = "medium"
 api_key_env = "OPENAI_API_KEY"
 context_tokens = 64000
