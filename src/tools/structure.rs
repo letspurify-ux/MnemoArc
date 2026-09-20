@@ -160,7 +160,8 @@ pub(super) fn limit_outline(
     if result["status"] != "ok" {
         return None;
     }
-    let args: Value = serde_json::from_str(&call.arguments).ok()?;
+    let mut args: Value = serde_json::from_str(&call.arguments).ok()?;
+    super::normalize_integer_arguments(call.name.as_str(), &mut args);
     let data = &result["data"];
     let symbols = data["symbols"].as_array()?;
     let path = data["path"].as_str()?;

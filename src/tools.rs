@@ -532,6 +532,27 @@ fn path_glob(args: &Value) -> Result<Option<&str>> {
 fn n(args: &Value, key: &str, default: usize) -> usize {
     args[key].as_u64().map_or(default, |n| n as usize)
 }
+
+// Some compatible tool parsers quote unsigned integer arguments. Normalize
+// them once at the execution boundary and again anywhere a raw call is used to
+// rebuild a continuation, so both paths use the same typed arguments.
+fn normalize_integer_arguments(name: &str, args: &mut Value) {
+    if let Some(spec) = ToolRegistry::specs().into_iter().find(|t| t.name == name)
+        && let Some(fields) = args.as_object_mut()
+    {
+        for (key, value) in fields {
+            if spec.parameters["properties"][key]["type"] == "integer"
+                && let Some(raw) = value.as_str()
+                && !raw.is_empty()
+                && raw.bytes().all(|b| b.is_ascii_digit())
+                && let Ok(number) = raw.parse::<u64>()
+            {
+                *value = json!(number);
+            }
+        }
+    }
+}
+
 pub fn envelope(result: Result<Value>) -> Value {
     match result {
         Ok(data) => {
@@ -702,19 +723,32 @@ fn open_regular_file(path: &Path) -> Result<std::fs::File> {
     )?;
     Ok(file)
 }
-fn read_text(path: &Path) -> Result<String> {
+
+const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
+
+fn read_bytes_bounded(path: &Path) -> Result<Vec<u8>> {
     use std::io::Read;
-    const MAX_BYTES: usize = 16 * 1024 * 1024;
+
     let file = open_regular_file(path)?;
-    if file.metadata()?.len() > MAX_BYTES as u64 {
+    if file.metadata()?.len() > MAX_FILE_BYTES as u64 {
         bail!("unsupported_large_file: maximum 16MiB");
     }
     // Bound the actual read too: the file may grow after the metadata check.
     let mut bytes = Vec::new();
-    file.take((MAX_BYTES + 1) as u64).read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_BYTES {
+    file.take((MAX_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_FILE_BYTES {
         bail!("unsupported_large_file: maximum 16MiB");
     }
+    Ok(bytes)
+}
+
+fn hash_file(path: &Path) -> Result<String> {
+    Ok(hash(&read_bytes_bounded(path)?))
+}
+
+fn read_text(path: &Path) -> Result<String> {
+    let bytes = read_bytes_bounded(path)?;
     if bytes.contains(&0) {
         bail!("unsupported_binary_file");
     }
@@ -859,25 +893,21 @@ fn observe_hashed(
     source
 }
 pub fn revalidate(s: &mut Session) -> Result<()> {
-    let mut sources: Vec<_> = s
+    let paths: BTreeSet<String> = s
         .memory
         .entries
         .values()
         .flat_map(|m| m.sources.clone())
         .chain(s.investigations.iter().flat_map(|i| i.sources.clone()))
+        .filter_map(|source| source.path)
         .collect();
-    sources.sort_by(|a, b| a.path.cmp(&b.path));
-    sources.dedup_by(|a, b| a.path == b.path);
     let mut hashes = std::collections::BTreeMap::new();
-    for source in sources {
-        if let Some(path) = source.path {
-            let current = read_path(&s.project, &path)
-                .and_then(|p| std::fs::read(p).map_err(Into::into))
-                .ok()
-                .map(|b| hash(&b));
-            s.memory.stale_path(&path, current.as_deref());
-            hashes.insert(path, current);
-        }
+    for path in paths {
+        let current = read_path(&s.project, &path)
+            .and_then(|p| hash_file(&p))
+            .ok();
+        s.memory.stale_path(&path, current.as_deref());
+        hashes.insert(path, current);
     }
     let doc = output_path(&s.project)
         .ok()
@@ -889,10 +919,11 @@ pub fn revalidate(s: &mut Session) -> Result<()> {
                     .get(p)
                     .is_none_or(|h| h.as_deref() != r.hash.as_deref())
             })
-        }) || item
-            .memory_refs
-            .iter()
-            .any(|(id, rev)| s.memory.get(id).map_or(true, |m| m.revision != *rev || m.status != crate::memory::MemoryStatus::Active));
+        }) || item.memory_refs.iter().any(|(id, rev)| {
+            s.memory.get(id).map_or(true, |m| {
+                m.revision != *rev || m.status != crate::memory::MemoryStatus::Active
+            })
+        });
         let doc_changed = doc
             .as_ref()
             .and_then(|d| section_text(d, &item.section).ok())
@@ -949,22 +980,7 @@ pub fn execute_cancellable(
     if cancel.is_cancelled() {
         bail!("cancelled");
     }
-    // Some compatible tool parsers quote integers. Convert only exact ASCII
-    // unsigned decimals in fields whose schema explicitly requires an integer.
-    if let Some(spec) = ToolRegistry::specs().into_iter().find(|t| t.name == name)
-        && let Some(fields) = args.as_object_mut()
-    {
-        for (key, value) in fields {
-            if spec.parameters["properties"][key]["type"] == "integer"
-                && let Some(raw) = value.as_str()
-                && !raw.is_empty()
-                && raw.bytes().all(|b| b.is_ascii_digit())
-                && let Ok(number) = raw.parse::<u64>()
-            {
-                *value = json!(number);
-            }
-        }
-    }
+    normalize_integer_arguments(name, &mut args);
     if name == "file_read"
         && let Some(fields) = args.as_object_mut()
         && let Some(limit) = fields.remove("limit")
@@ -1057,12 +1073,15 @@ pub fn execute_cancellable(
                 json!({"metadata":m.meta(),"body":bounded_text(s,&m.body,n(&args,"offset",0)),"sources":m.sources,"inferred":m.inferred,"kind":m.kind}),
             )
         }
-        "memory_find" => s.memory.page(
-            args["query"].as_str().unwrap_or(""),
-            &list(&args, "tags"),
-            args["cursor"].as_str(),
-            n(&args, "limit", 20),
-        ),
+        "memory_find" => {
+            revalidate(s)?;
+            s.memory.page(
+                args["query"].as_str().unwrap_or(""),
+                &list(&args, "tags"),
+                args["cursor"].as_str(),
+                n(&args, "limit", 20),
+            )
+        }
         "memory_manage" => {
             let ids = list(&args, "ids");
             match text(&args, "action")? {
@@ -1622,7 +1641,7 @@ pub fn execute_cancellable(
                 for source in &sources {
                     if let Some(path) = &source.path {
                         let path = read_path(&s.project, path)?;
-                        if Some(hash(&std::fs::read(path)?)) != source.hash {
+                        if Some(hash_file(&path)?) != source.hash {
                             bail!("source_changed: read again");
                         }
                     }
@@ -1906,8 +1925,9 @@ pub fn limit_result(
             result["data"]["path"].as_str(),
             result["data"]["next_cursor"].as_str(),
         )
-        && let Ok(args) = serde_json::from_str::<Value>(&call.arguments)
+        && let Ok(mut args) = serde_json::from_str::<Value>(&call.arguments)
     {
+        normalize_integer_arguments(call.name.as_str(), &mut args);
         result["next_cursor"] = structure::continuation(&args, path, cursor);
     }
     if matches!(call.name.as_str(), "file_read" | "symbol_read")
@@ -1921,7 +1941,8 @@ pub fn limit_result(
         result["next_cursor"] = json!({"tool":"file_read","cursor":id});
     }
     if call.name == "document_inspect" && result["data"]["content"]["truncated"] == true {
-        let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
+        let mut args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
+        normalize_integer_arguments(call.name.as_str(), &mut args);
         result["next_cursor"] = json!({"tool":"document_inspect","path":result["data"]["path"],"section":args["section"],"offset":result["data"]["content"]["next_offset"],"expected_hash":result["data"]["hash"]});
         result["truncated"] = json!(true);
     }
@@ -1956,7 +1977,8 @@ pub fn limit_result(
     {
         return page;
     }
-    let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
+    let mut args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
+    normalize_integer_arguments(call.name.as_str(), &mut args);
     let old_archive = result["archive_id"]
         .as_u64()
         .or_else(|| {
@@ -2256,7 +2278,7 @@ pub fn project_fingerprint(project: &Project) -> Result<String> {
     for path in paths(project, None, &tokio_util::sync::CancellationToken::new())? {
         hasher.update(path.strip_prefix(&root)?.to_string_lossy().as_bytes());
         hasher.update([0]);
-        hasher.update(std::fs::read(path)?);
+        hasher.update(read_bytes_bounded(&path)?);
         hasher.update([0]);
     }
     Ok(format!("{:x}", hasher.finalize()))
