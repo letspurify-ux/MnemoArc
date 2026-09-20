@@ -16,6 +16,7 @@ pub struct TaskState {
     pub constraints: Vec<String>,
     pub completion: Vec<String>,
     pub require_investigation: bool,
+    pub workflow: String,
     pub done: Vec<String>,
     pub findings: Vec<String>,
     pub current: String,
@@ -180,6 +181,7 @@ pub struct Session {
     pub run_guidance: Value,
     pub activity: Value,
     pub task_rounds: usize,
+    pub document_review: crate::tools::document_review::ReviewState,
     pub answer_draft: Option<String>,
     pub answer_reviewed: bool,
     pub answer_review_original: Option<String>,
@@ -242,6 +244,7 @@ impl Session {
             run_guidance: json!({}),
             activity: json!({}),
             task_rounds: 0,
+            document_review: Default::default(),
             answer_draft: None,
             answer_reviewed: false,
             answer_review_original: None,
@@ -308,6 +311,8 @@ impl Session {
             self.continuation = None;
             self.task.phase.clear();
             self.task.require_investigation = false;
+            self.task.workflow.clear();
+            self.document_review = Default::default();
             self.document_written = false;
             self.last_document_write = None;
             self.task_rounds = 0;

@@ -50,6 +50,7 @@ export const groups = [
         "max_completion_tokens 대신 max_tokens 사용",
       ],
       ["source_answer_review", "소스 답변 검토", "boolean", "읽은 소스 근거로 답변을 한 번 검토합니다. 추가 모델 호출 비용이 발생합니다."],
+      ["source_document_review", "소스 문서 검토", "boolean", "생성 문서를 소스·요구사항과 별도로 대조합니다. 작업당 최대 두 번의 모델 호출 비용이 발생합니다."],
       [
         "stream_usage",
         "스트리밍 사용량 요청",

@@ -280,6 +280,21 @@ pub async fn run_session_controlled(
             failure = Some("run_budget_exhausted: partial results and memory retained".into());
             break;
         }
+        // A review must not open an unbounded new authoring run. Preserve the
+        // partial document when eight repair requests cannot finish verification.
+        if !s.config.source_document_review {
+            s.document_review.pending = false;
+        }
+        if s.config.source_document_review
+            && !s.document_review.pending
+            && s.document_review
+                .repair_started_round
+                .is_some_and(|round| s.task_rounds.saturating_sub(round) >= 8)
+        {
+            s.status = "partial".into();
+            s.last_error = Some("document_repair_limit: eight repair requests used; partial document and review findings retained".into());
+            break;
+        }
         let spent = s
             .input_tokens
             .saturating_add(s.output_tokens)
@@ -312,10 +327,23 @@ pub async fn run_session_controlled(
         }
         // Chat explanations get a bounded investigation hint, not a forced finish:
         // missing evidence may still be read, while document workflows retain verification.
-        if s.task_rounds >= 6 && s.investigations.is_empty() && !s.document_written {
+        if s.task_rounds >= 6
+            && !s.task.require_investigation
+            && s.task.workflow != "source_document"
+            && s.task.deliverables.is_empty()
+            && s.investigations.is_empty()
+            && !s.document_written
+        {
             phase = "answer".into();
         }
-        if finalization_attempts > 0 {
+        if s.task.require_investigation
+            && !s.document_written
+            && s.task_rounds >= 6
+            && phase != "verify"
+        {
+            phase = "draft".into();
+        }
+        if finalization_attempts > 0 || !s.document_review.issues.is_empty() {
             // A rejected document completion always returns to verification,
             // even if the model previously declared itself ready to answer.
             phase = "verify".into();
@@ -326,7 +354,7 @@ pub async fn run_session_controlled(
             "verification_reserve_tokens":(s.config.run_tokens as f64*s.config.verification_reserve_ratio) as usize,
             "pending_count":s.investigations.iter().filter(|i|i.status != "verified").count(),
             "completion_error":if finalization_attempts > 0 { s.last_error.as_deref() } else { None },
-            "instruction":match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, audit and verify existing sections and fix factual errors. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, write investigated sections now and preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>"For source documentation, investigate incrementally and write completed sections. For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. Answer once evidence is sufficient; no source audit or document write is required."}});
+            "instruction":match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, batch targeted reads for missing evidence, then repair all known issues in one cohesive write/patch when safe. Run verify_batch once after all edits, not after every small correction. At most eight requests are available after a document review failure; audit existing sections and fix factual errors. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, write investigated sections now and preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>"For source documentation, investigate incrementally and write completed sections. For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. Answer once evidence is sufficient; no source audit or document write is required."}});
         let definitions = ToolRegistry::definitions(&s);
         let mut request = match ContextManager::request(&s, definitions.clone()) {
             Ok(r) => r,
@@ -355,7 +383,17 @@ pub async fn run_session_controlled(
                 }
             };
         }
+        let reviewing_document = s.document_review.pending && s.checkpoint.is_none();
         let reviewing_answer = s.answer_draft.is_some() && s.checkpoint.is_none();
+        if reviewing_document {
+            request = match tools::document_review::request(&mut s) {
+                Ok(request) => request,
+                Err(error) => {
+                    failure = Some(error.to_string());
+                    break;
+                }
+            };
+        }
         if reviewing_answer {
             request = match tools::answer_review::request(&s) {
                 Ok(request) => request,
@@ -365,12 +403,16 @@ pub async fn run_session_controlled(
                 }
             };
         }
-        let buffer_answer =
-            reviewing_answer || (s.checkpoint.is_none() && tools::answer_review::eligible(&s));
+        let buffer_answer = reviewing_document
+            || reviewing_answer
+            || (s.checkpoint.is_none() && tools::answer_review::eligible(&s));
         let request_tokens = context::count(&request, &s.config.model);
         // Reasoning models spend output tokens on reasoning too; retain the
         // configured output allowance and reserve it for every cleanup round.
-        let request_config = s.config.clone();
+        let mut request_config = s.config.clone();
+        if reviewing_document {
+            request_config.output_tokens = request_config.output_tokens.min(4096);
+        }
         if request_tokens
             .saturating_add(request_config.output_tokens)
             .saturating_add(512)
@@ -396,13 +438,15 @@ pub async fn run_session_controlled(
             cp.attempts += 1;
         }
         s.task_rounds += 1;
-        s.activity = json!({"stage":if reviewing_answer {"answer_review"} else {"model"},"started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds});
+        s.activity = json!({"stage":if reviewing_document {"document_review"} else if reviewing_answer {"answer_review"} else {"model"},"started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds});
         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
         let deadline = run_deadline(started, &s.config);
         if tokio::time::Instant::now() >= deadline {
             failure = Some("run_timeout: event delivery exhausted execution deadline".into());
             break;
         }
+        let document_workflow =
+            s.task.require_investigation || s.task.workflow == "source_document";
         let (tx, mut rx) = mpsc::channel(64);
         let event_tx = events.clone();
         let sid = s.id.clone();
@@ -418,7 +462,7 @@ pub async fn run_session_controlled(
                     text = rx.recv() => text,
                 };
                 let Some(text) = text else { break };
-                if buffer_answer {
+                if buffer_answer || document_workflow {
                     continue;
                 }
                 emit(
@@ -475,6 +519,36 @@ pub async fn run_session_controlled(
                             .map(|c| context::tokens(&c.arguments, &s.config.model))
                             .sum::<usize>()
                 });
+        }
+        if reviewing_document {
+            s.document_review.input_tokens += s.input_tokens.saturating_sub(usage_before.0);
+            s.document_review.output_tokens += s.output_tokens.saturating_sub(usage_before.1);
+            if completion.length_limited
+                || !completion.calls.is_empty()
+                || completion.text.trim().is_empty()
+            {
+                failure = Some(
+                    "document_review_incomplete: review must return complete JSON without tools"
+                        .into(),
+                );
+                break;
+            }
+            if let Err(error) = tools::document_review::finish(&mut s, &completion.text) {
+                failure = Some(error.to_string());
+                break;
+            }
+            if !s.document_review.issues.is_empty() {
+                s.last_error = Some(format!(
+                    "document_review: {}",
+                    s.document_review.issues.join("; ")
+                ));
+                if s.document_review.attempts >= 2 {
+                    s.status = "partial".into();
+                    break;
+                }
+            }
+            snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
+            continue;
         }
         if reviewing_answer {
             s.answer_review_input_tokens += s.input_tokens.saturating_sub(usage_before.0);
@@ -566,7 +640,13 @@ pub async fn run_session_controlled(
             if continuing {
                 message["continues_previous"] = json!(true);
             }
-            let id = s.history.push(vec![message], true);
+            // Do not expose an unverified "done" claim through history snapshots.
+            let hold_document_final = document_workflow && s.checkpoint.is_none();
+            let id = if hold_document_final {
+                0
+            } else {
+                s.history.push(vec![message.clone()], true)
+            };
             if let Some(cp) = &mut s.checkpoint {
                 cp.maintenance_bundle_ids.push(id);
                 continue;
@@ -599,6 +679,20 @@ pub async fn run_session_controlled(
                 } else {
                     match tools::audit_document(&mut s) {
                         Ok(audit) if audit["structural_ok"] == true => {
+                            if s.document_written
+                                && s.config.source_document_review
+                                && !tools::document_review::approved(&s)
+                            {
+                                if s.document_review.attempts >= 2 {
+                                    s.status = "partial".into();
+                                    s.last_error = Some("document_review_limit: current document has no successful bounded review".into());
+                                    break;
+                                }
+                                s.document_review.pending = true;
+                                s.status = "running".into();
+                                emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"Reviewing the document against source evidence and requested coverage (bounded same-model review).".into() }, &cancel, run_deadline(started, &s.config)).await;
+                                continue;
+                            }
                             s.status = "complete".into();
                             s.last_error = None;
                         }
@@ -625,9 +719,22 @@ pub async fn run_session_controlled(
                 emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"Completion checks failed; returning to pending evidence verification within the remaining budget".into() }, &cancel, run_deadline(started, &s.config)).await;
                 continue;
             }
+            if hold_document_final && s.status == "complete" {
+                s.history.push(vec![message], true);
+                emit(
+                    &events,
+                    AgentEvent::Delta {
+                        session: s.id.clone(),
+                        text: completion.text.clone(),
+                    },
+                    &cancel,
+                    run_deadline(started, &s.config),
+                )
+                .await;
+            }
             break;
         }
-        if buffer_answer && !completion.text.is_empty() {
+        if (buffer_answer || document_workflow) && !completion.text.is_empty() {
             emit(
                 &events,
                 AgentEvent::Delta {

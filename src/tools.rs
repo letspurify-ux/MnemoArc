@@ -1,5 +1,6 @@
 pub mod answer_review;
 mod coverage;
+pub mod document_review;
 mod documentation;
 mod search;
 mod structure;
@@ -46,6 +47,35 @@ fn action(values: &[&str]) -> Value {
     json!({"type":"string","enum":values})
 }
 pub struct ToolRegistry;
+fn task_patch_schema() -> Value {
+    let mut properties = serde_json::Map::new();
+    for field in ["purpose", "scope", "current", "next"] {
+        properties.insert(field.into(), string());
+    }
+    for field in [
+        "deliverables",
+        "constraints",
+        "completion",
+        "done",
+        "findings",
+        "unresolved",
+        "memory_ids",
+    ] {
+        properties.insert(field.into(), strings());
+    }
+    properties.insert("details".into(), json!({"type":"array","items":{}}));
+    properties.insert("require_investigation".into(), json!({"type":"boolean"}));
+    properties.insert(
+        "workflow".into(),
+        action(&["answer", "source_document", "document_edit"]),
+    );
+    properties.insert(
+        "phase".into(),
+        action(&["investigate", "draft", "verify", "answer"]),
+    );
+    json!({"type":"object","properties":properties,"additionalProperties":false})
+}
+
 impl ToolRegistry {
     pub fn specs() -> Vec<ToolSpec> {
         vec![
@@ -105,11 +135,11 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "task_state",
-                description: "Read/update structured goals and compact progress, or read/write detailed work list. Updates preserve omitted fields. Set patch.require_investigation=true BEFORE source-documentation work requiring evidence coverage; simple document edits do not need it. Once required, it cannot be disabled during the same request. Preserve user constraints unless explicitly changed by user",
+                description: "Read/update structured goals and compact progress, or read/write detailed work list. For source documentation START with patch.workflow=source_document; this locks evidence requirements and activates investigation/document_edit/document_audit immediately. Use investigation upsert for investigation items, NOT task_state. Do not send empty patches. Updates preserve omitted fields. Set patch.require_investigation=true BEFORE source-documentation work requiring evidence coverage; simple document edits do not need it. Once required, it cannot be disabled during the same request. Preserve user constraints unless explicitly changed by user",
                 optional: false,
                 read_only: false,
                 parameters: schema(
-                    json!({"action":action(&["read","update","details"]),"patch":{"type":"object"},"offset":number(),"limit":number()}),
+                    json!({"action":action(&["read","update","details"]),"patch":task_patch_schema(),"offset":number(),"limit":number()}),
                     &["action"],
                 ),
             },
@@ -255,6 +285,14 @@ impl ToolRegistry {
                     t.parameters["oneOf"] = json!([
                         {"required":["path"],"not":{"required":["cursor"]}},
                         {"required":["cursor"],"not":{"anyOf":[{"required":["path"]},{"required":["start_line"]},{"required":["max_lines"]},{"required":["limit"]}]}}
+                    ]);
+                }
+                if t.name == "document_edit" {
+                    t.parameters["oneOf"] = json!([
+                        {"properties":{"action":{"enum":["create","write"]}}},
+                        {"properties":{"action":{"const":"append"}},"required":["expected_hash"]},
+                        {"properties":{"action":{"const":"patch"}},"required":["expected_hash","old_text"]},
+                        {"properties":{"action":{"const":"section"}},"required":["expected_hash","section","expected_section_hash"]}
                     ]);
                 }
                 if t.name == "source_search" {
@@ -988,6 +1026,11 @@ pub fn execute_cancellable(
                 let patch = args["patch"]
                     .as_object()
                     .ok_or_else(|| anyhow::anyhow!("patch required"))?;
+                if patch.is_empty() {
+                    return Ok(
+                        json!({"unchanged":true,"guidance":"Use read to inspect state; update only changed fields."}),
+                    );
+                }
                 let mut value = json!(s.task);
                 for (k, v) in patch {
                     if k == "revision" {
@@ -996,6 +1039,19 @@ pub fn execute_cancellable(
                     value[k] = v.clone();
                 }
                 let mut next: TaskState = serde_json::from_value(value)?;
+                if !["", "answer", "source_document", "document_edit"]
+                    .contains(&next.workflow.as_str())
+                {
+                    bail!("invalid_workflow: use answer, source_document or document_edit");
+                }
+                if next.workflow == "source_document" {
+                    next.require_investigation = true;
+                }
+                if s.task.workflow == "source_document" && next.workflow != "source_document" {
+                    bail!(
+                        "workflow_locked: source-document evidence requirements cannot be disabled during this request"
+                    );
+                }
                 if !["", "investigate", "draft", "verify", "answer"].contains(&next.phase.as_str())
                 {
                     bail!("invalid_task_phase: use investigate, draft, verify or answer");
@@ -1018,6 +1074,14 @@ pub fn execute_cancellable(
                     bail!("task_detail_limit");
                 }
                 s.task = next;
+                if s.task.require_investigation || s.task.workflow == "document_edit" {
+                    for name in ["investigation", "document_edit", "document_audit"] {
+                        s.active_tools.insert(name.into());
+                        if let Some(pending) = &mut s.pending_tools {
+                            pending.insert(name.into());
+                        }
+                    }
+                }
                 Ok(json!({"revision":s.task.revision}))
             }
             _ => unreachable!(),
@@ -1176,10 +1240,11 @@ pub fn execute_cancellable(
                 temp.persist_noclobber(&path)?;
             }
             s.document_written = true;
+            s.document_review.approved_hash = None;
             s.last_document_write = Some((path.clone(), hash(result.as_bytes())));
             revalidate(s)?;
             Ok(
-                json!({"path":path,"hash":hash(result.as_bytes()),"bytes":result.len(),"total_lines":result.lines().count()}),
+                json!({"path":path,"hash":hash(result.as_bytes()),"bytes":result.len(),"total_lines":result.lines().count(),"citation_check":documentation::citation_check(s, &path, &result)?}),
             )
         }
         "investigation" => match text(&args, "action")? {
@@ -1376,7 +1441,7 @@ pub fn execute_cancellable(
                     .map(|i| json!({"id":i.id,"title":i.title,"status":i.status}))
                     .collect();
                 Ok(
-                    json!({"complete":!s.investigations.is_empty()&&incomplete.is_empty(),"incomplete":incomplete,"review":s.reviews,"output":s.project.output}),
+                    json!({"complete":!s.investigations.is_empty()&&incomplete.is_empty(),"semantic_verified":false,"completion_scope":"structural preflight; enabled source-document model review runs before task completion","incomplete":incomplete,"review":s.reviews,"output":s.project.output}),
                 )
             }
             _ => unreachable!(),

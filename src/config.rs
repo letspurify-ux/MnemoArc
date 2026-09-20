@@ -49,6 +49,7 @@ pub struct Config {
     pub run_tokens: usize,
     pub review_limit: usize,
     pub source_answer_review: bool,
+    pub source_document_review: bool,
     pub writing_reserve_ratio: f64,
     pub verification_reserve_ratio: f64,
     pub repeated_read_limit: usize,
@@ -111,6 +112,7 @@ impl Default for Config {
             stall_round_limit: 8,
             review_limit: 3,
             source_answer_review: true,
+            source_document_review: true,
             projects: vec![],
         }
     }

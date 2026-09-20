@@ -217,74 +217,7 @@ pub(super) fn execute(
             revalidate(s)?;
             let path = output_path(&s.project)?;
             let doc = read_text(&path)?;
-            let mut issues = vec![];
-            let mut checked = 0;
-            let citations = regex::Regex::new(
-                r"([\p{L}\p{N}_./@-]+\.[A-Za-z][A-Za-z0-9]*)(:|#L)([0-9]+)(?:[-–]L?([0-9]+))?",
-            )?;
-            let mut fence: Option<(char, usize)> = None;
-            for line in doc.split_inclusive('\n') {
-                if cancel.is_cancelled() {
-                    bail!("cancelled");
-                }
-                let trimmed = line.trim_start_matches(' ');
-                let marker = trimmed.chars().next().unwrap_or(' ');
-                let width = trimmed.chars().take_while(|c| *c == marker).count();
-                if line.len() - trimmed.len() <= 3 {
-                    if let Some((open, min_width)) = fence {
-                        if marker == open
-                            && width >= min_width
-                            && trimmed[width..].trim().is_empty()
-                        {
-                            fence = None;
-                        }
-                        continue;
-                    }
-                    if (marker == '`' || marker == '~') && width >= 3 {
-                        fence = Some((marker, width));
-                        continue;
-                    }
-                }
-                if fence.is_some() {
-                    continue;
-                }
-                for c in citations.captures_iter(line) {
-                    let before = &line[..c.get(0).unwrap().start()];
-                    let token_prefix = before
-                        .rsplit(|ch: char| {
-                            ch.is_whitespace() || ch == '`' || ch == '(' || ch == '\"'
-                        })
-                        .next()
-                        .unwrap_or("");
-                    if token_prefix.contains("://") {
-                        continue;
-                    }
-                    checked += 1;
-                    let begin = c[3].parse::<usize>().unwrap_or(0);
-                    let end = c
-                        .get(4)
-                        .map(|v| v.as_str().parse::<usize>().unwrap_or(0))
-                        .unwrap_or(begin);
-                    let citation_path = if &c[2] == "#L" {
-                        path.parent()
-                            .unwrap()
-                            .join(&c[1])
-                            .to_string_lossy()
-                            .to_string()
-                    } else {
-                        c[1].to_string()
-                    };
-                    let check = read_path(&s.project, &citation_path).and_then(|p| read_text(&p));
-                    match check {
-                        Ok(contents)
-                            if begin > 0 && end >= begin && end <= contents.lines().count() => {}
-                        Ok(_) => issues.push(json!({"kind":"citation_range","citation":&c[0]})),
-                        Err(e) => issues.push(
-                            json!({"kind":"citation_path","citation":&c[0],"error":e.to_string()}),
-                        ),
-                    }
-                }
-            }
+            let (checked, mut issues) = citation_issues(s, &path, &doc)?;
             if checked == 0 {
                 issues.push(json!({"kind":"no_machine_readable_citations","guidance":"Use relative/path.ext:start-end. Other citation formats require manual review."}));
             }
@@ -321,4 +254,129 @@ pub(super) fn execute(
         }
         _ => bail!("unsupported_tool"),
     }
+}
+
+/// Citations in prose and Mermaid are references; other fenced code is an example.
+pub(super) struct Citation {
+    pub raw: String,
+    pub path: String,
+    pub begin: usize,
+    pub end: usize,
+    pub relative_link: bool,
+}
+
+pub(super) fn citation_spans(doc: &str) -> Result<Vec<Citation>> {
+    let pattern = regex::Regex::new(
+        r"([\p{L}\p{N}_./@-]+\.[A-Za-z][A-Za-z0-9]*)(:|#L)([0-9]+)(?:[-–]L?([0-9]+))?",
+    )?;
+    let continuation = regex::Regex::new(r"^\s*,\s*([0-9]+)(?:[-–]L?([0-9]+))?")?;
+    let mut spans = vec![];
+    let mut fence: Option<(char, usize, bool)> = None;
+    for line in doc.lines() {
+        let trimmed = line.trim_start_matches(' ');
+        let marker = trimmed.chars().next().unwrap_or(' ');
+        let width = trimmed.chars().take_while(|c| *c == marker).count();
+        if line.len() - trimmed.len() <= 3 {
+            if let Some((open, size, _)) = fence {
+                if marker == open && width >= size && trimmed[width..].trim().is_empty() {
+                    fence = None;
+                    continue;
+                }
+            } else if (marker == '`' || marker == '~') && width >= 3 {
+                fence = Some((
+                    marker,
+                    width,
+                    trimmed[width..].trim().eq_ignore_ascii_case("mermaid"),
+                ));
+                continue;
+            }
+        }
+        if fence.is_some_and(|(_, _, mermaid)| !mermaid) {
+            continue;
+        }
+        for c in pattern.captures_iter(line) {
+            let before = &line[..c.get(0).unwrap().start()];
+            let prefix = before
+                .rsplit(|ch: char| ch.is_whitespace() || ['`', '(', '"'].contains(&ch))
+                .next()
+                .unwrap_or("");
+            if prefix.contains("://") {
+                continue;
+            }
+            let begin = c[3].parse().unwrap_or(0);
+            let end = c
+                .get(4)
+                .map(|v| v.as_str().parse().unwrap_or(0))
+                .unwrap_or(begin);
+            spans.push(Citation {
+                raw: c[0].into(),
+                path: c[1].into(),
+                begin,
+                end,
+                relative_link: &c[2] == "#L",
+            });
+            // Repeat the path internally for grouped citations such as a.js:3, 8-10.
+            let mut tail = &line[c.get(0).unwrap().end()..];
+            while let Some(extra) = continuation.captures(tail) {
+                let begin = extra[1].parse().unwrap_or(0);
+                let end = extra
+                    .get(2)
+                    .map(|m| m.as_str().parse().unwrap_or(0))
+                    .unwrap_or(begin);
+                spans.push(Citation {
+                    raw: format!("{}{}{}-{}", &c[1], &c[2], begin, end),
+                    path: c[1].into(),
+                    begin,
+                    end,
+                    relative_link: &c[2] == "#L",
+                });
+                tail = &tail[extra.get(0).unwrap().end()..];
+            }
+        }
+    }
+    Ok(spans)
+}
+
+fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<Value>)> {
+    let spans = citation_spans(doc)?;
+    let mut issues = vec![];
+    let mut versions = std::collections::BTreeMap::new();
+    for Citation {
+        raw,
+        path,
+        begin,
+        end,
+        relative_link,
+    } in &spans
+    {
+        let path = if *relative_link {
+            output
+                .parent()
+                .unwrap()
+                .join(path)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            path.clone()
+        };
+        let check = versions.entry(path.clone()).or_insert_with(|| {
+            read_path(&s.project, &path)
+                .and_then(|p| read_text(&p))
+                .map(|t| t.lines().count())
+                .map_err(|e| e.to_string())
+        });
+        match check {
+            Ok(lines) if *begin > 0 && end >= begin && end <= lines => {}
+            Ok(_) => issues.push(json!({"kind":"citation_range","citation":raw})),
+            Err(error) => issues.push(json!({"kind":"citation_path","citation":raw,"error":error})),
+        }
+    }
+    Ok((spans.len(), issues))
+}
+
+pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Value> {
+    let (checked, issues) = citation_issues(s, output, doc)?;
+    Ok(
+        json!({"citations_checked":checked,"issue_count":issues.len(),"issues":issues.iter().take(8).collect::<Vec<_>>(),"semantic_verified":false,"guidance":"Fix citation issues in the next section edit. Partial drafts may still lack investigation coverage."}),
+    )
 }

@@ -32,4 +32,6 @@ run_tokens = 500000
 review_limit = 3
 # One bounded same-model revision for source answers; incurs an extra request.
 source_answer_review = true
+# Source-document review: read-only same-model pass, up to two attempts per task.
+source_document_review = true
 projects = []

@@ -238,3 +238,5 @@ LLM은 `code_outline`의 `view=compact`, `max_depth=0`으로 최상위 구조를
 함수 목록에는 `kind=function`을 사용하고, 인자·기본값·선언된 반환 타입은 상세 시그니처와 `signature_source`로 먼저 확인합니다. `signature_truncated`가 잘림 여부를 알립니다. 본문이 필요하면 `symbol_read`의 `max_lines`와 파일 절대 줄 번호인 `start_line`으로 심볼 안의 필요한 부분만 읽을 수 있습니다.
 
 LLM에는 읽은 본문을 절대 줄 번호와 함께 전달하고, 구조 목록에는 복사 가능한 `location`을 제공합니다. 원문과 커서 오프셋은 유지하며 모델용 줄 번호도 응답 토큰 예산에 반영합니다.
+
+소스 문서는 `task_state.patch.workflow="source_document"`로 시작해 조사·작성 도구를 즉시 활성화합니다. `source_document_review`는 생성 문서와 실제 소스·요구사항을 제한된 별도 요청으로 대조하며 기본값은 `true`입니다. 비용 상한과 재현 방법은 [소스 문서 작업·검토 설계](docs/source-document-review.md)를 참고하세요.

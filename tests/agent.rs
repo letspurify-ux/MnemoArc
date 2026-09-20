@@ -46,6 +46,16 @@ impl LlmClient for Script {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
+        if request["messages"][1]["content"]
+            .as_str()
+            .is_some_and(|t| t.contains("\"source_document_review\":true"))
+        {
+            assert!(request.get("tools").is_none());
+            return Ok(Completion {
+                text: r#"{"issues":[]}"#.into(),
+                ..Default::default()
+            });
+        }
         let mut step = self.step.lock().unwrap();
         let result = match *step {
             0 => call(
@@ -683,7 +693,8 @@ async fn premature_final_is_retried_but_never_claimed_complete_without_coverage(
     assert_eq!(result.status, "partial");
     assert_eq!(*client.calls.lock().unwrap(), 3);
     assert_eq!(result.run_guidance["phase"], "verify");
-    assert_eq!(result.history.bundles.len(), 3);
+    // Rejected completion claims must not appear as final answers in UI history.
+    assert!(result.history.bundles.is_empty());
 }
 
 struct SummaryReads {
