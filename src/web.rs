@@ -379,6 +379,9 @@ fn prepare_settings(
     for p in &mut config.projects {
         *p = normalize_project(p.clone())?;
     }
+    if config.projects.is_empty() {
+        bail!("At least one project is required");
+    }
     config.api_key = if config.api_key_env == old.api_key_env {
         old.api_key.clone()
     } else {
@@ -613,7 +616,7 @@ async fn run(
         match input.action.as_str() {
             "chat" => { if input.text.trim().is_empty(){return Err(ApiError(StatusCode::BAD_REQUEST,"메시지를 입력하세요.".into()));} session.add_user(input.text); },
             "resume" => {},
-            "cleanup" => session.add_user("Clean up memory and progress to fit the pending settings. Preserve important evidence and user constraints. Do not modify project files.".into()),
+            "cleanup" => session.add_maintenance("Clean up memory and progress to fit the pending settings. Preserve important evidence and user constraints. Do not modify project files.".into()),
             _ => return Err(ApiError(StatusCode::BAD_REQUEST,"지원하지 않는 실행 방식입니다.".into())),
         }
         if let Some(cp) = &mut session.checkpoint {

@@ -353,6 +353,15 @@ impl Session {
         self.history
             .push(vec![json!({"role":"user","content":text})], true);
     }
+    /// Add a maintenance request without starting a new user task. Cleanup
+    /// must keep the current workflow, evidence requirements and review state
+    /// so a pending settings change cannot silently weaken completion checks.
+    pub fn add_maintenance(&mut self, text: String) {
+        self.ledger.clear();
+        self.latest_request = text.clone();
+        self.history
+            .push(vec![json!({"role":"user","content":text})], true);
+    }
     pub fn check_limits(&self, c: &Config) -> Result<()> {
         c.validate()?;
         if self.memory.entries.len() > c.memory_count

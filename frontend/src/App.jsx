@@ -408,11 +408,19 @@ export default function App() {
                     `/sessions/${selected}?before=${session.previous}`,
                   );
                   if (selection.current === older.id)
-                    setSession((old) => ({
-                      ...old,
-                      bundles: [...older.bundles, ...old.bundles],
-                      previous: older.previous,
-                    }));
+                    setSession((old) => {
+                      if (!old || old.id !== older.id) return old;
+                      const byId = new Map();
+                      for (const bundle of older.bundles) byId.set(bundle.id, bundle);
+                      // Prefer the live response for overlapping IDs because it
+                      // carries the newest active/reviewed flags.
+                      for (const bundle of old.bundles) byId.set(bundle.id, bundle);
+                      return {
+                        ...old,
+                        bundles: [...byId.values()].sort((a, b) => a.id - b.id),
+                        previous: older.previous,
+                      };
+                    });
                 })}
               />
             </div>
@@ -540,10 +548,12 @@ function Projects({ config, onSaved, onCreate }) {
                 <button
                   className="danger-text"
                   onClick={() => {
+                    if (list.length <= 1) return;
                     setList(list.filter((_, i) => i !== index));
                     setIndex(0);
                     setDirty(true);
                   }}
+                  disabled={list.length <= 1}
                 >
                   목록에서 삭제
                 </button>
