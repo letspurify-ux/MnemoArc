@@ -49,6 +49,7 @@ pub trait LlmClient: Send + Sync {
 #[derive(Default)]
 pub struct OpenAiClient;
 pub(crate) const STREAM_DELTAS_MARKER: &str = "__mnemoarc_stream_deltas";
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 #[derive(Default)]
 pub struct SseDecoder {
     buffer: Vec<u8>,
@@ -147,7 +148,23 @@ impl OpenAiClient {
         let response = tokio::select! {_ = cancel.cancelled()=>bail!("cancelled"),r=req.send()=>r?};
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            // Error responses can have a slow or unbounded body too. Keep
+            // cancellation responsive while collecting a bounded diagnostic.
+            let mut stream = response.bytes_stream();
+            let mut bytes = Vec::new();
+            while bytes.len() < MAX_ERROR_BODY_BYTES {
+                let next = tokio::select! {
+                    _ = cancel.cancelled() => bail!("cancelled"),
+                    chunk = stream.next() => chunk,
+                };
+                let Some(chunk) = next else {
+                    break;
+                };
+                let Ok(chunk) = chunk else { break };
+                let remaining = MAX_ERROR_BODY_BYTES - bytes.len();
+                bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
+            let body = String::from_utf8_lossy(&bytes).into_owned();
             bail!(
                 "http_{}: {}",
                 status.as_u16(),

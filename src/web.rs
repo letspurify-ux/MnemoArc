@@ -123,7 +123,12 @@ impl WebState {
         } else {
             BTreeMap::new()
         };
-        config.api_key = credentials.get(&config.api_key_env).cloned();
+        // A caller may provide a session-only key directly (for example, a
+        // headless embedding). A credentials file overrides it when present,
+        // but its absence must not erase the supplied in-memory key.
+        if let Some(saved) = credentials.get(&config.api_key_env).cloned() {
+            config.api_key = Some(saved);
+        }
         if config.projects.is_empty() {
             config.projects.push(Project {
                 name: "MnemoArc".into(),
@@ -279,7 +284,27 @@ async fn session_get(
     Path(id): Path<String>,
     Query(page): Query<Page>,
 ) -> Api {
-    let c = s.core.lock().await;
+    let mut c = s.core.lock().await;
+    let state_changed = {
+        let session = c.sessions.get_mut(&id).ok_or_else(missing)?;
+        let generation = session.memory.generation;
+        let investigations: Vec<_> = session
+            .investigations
+            .iter()
+            .map(|item| (item.id.clone(), item.status.clone(), item.note.clone()))
+            .collect();
+        tools::revalidate(session)?;
+        generation != session.memory.generation
+            || investigations
+                != session
+                    .investigations
+                    .iter()
+                    .map(|item| (item.id.clone(), item.status.clone(), item.note.clone()))
+                    .collect::<Vec<_>>()
+    };
+    if state_changed {
+        changed(&s, &mut c);
+    }
     let session = c.sessions.get(&id).ok_or_else(missing)?;
     let mut bundles = session
         .history

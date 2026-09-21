@@ -310,7 +310,14 @@ fn symbol_label(node: Node<'_>, name: Node<'_>, source: &str) -> String {
     }
 }
 
-fn describe(node: Node<'_>, name: Node<'_>, container: &str, source: &str, digest: &str) -> Value {
+fn describe(
+    node: Node<'_>,
+    name: Node<'_>,
+    container: &str,
+    source: &str,
+    digest: &str,
+    path_identity: &str,
+) -> Value {
     let mut outer = node
         .parent()
         .filter(|p| matches!(p.kind(), "decorated_definition" | "export_statement"))
@@ -352,7 +359,10 @@ fn describe(node: Node<'_>, name: Node<'_>, container: &str, source: &str, diges
     let line_start = name.start_byte() - name_pos.column;
     let name_column = source[line_start..name.start_byte()].chars().count() + 1;
     json!({
-        "symbol_id":format!("{digest}:{}:{}", node.start_byte(), node.end_byte()),
+        // The content digest alone is insufficient: two files can contain
+        // identical source and byte ranges. Bind IDs to the canonical path so
+        // a copied ID cannot silently read a symbol from the wrong file.
+        "symbol_id":format!("{digest}:{path_identity}:{}:{}", node.start_byte(), node.end_byte()),
         "name":symbol_label(node,name,source).chars().take(500).collect::<String>(),"kind":node.kind(),"container":container,
         "start_line":outer.start_position().row+1,"end_line":end_line,
         "name_line":name_pos.row+1,"name_column":name_column,
@@ -371,6 +381,7 @@ pub(super) fn execute(
     let path = read_path(&s.project, text(args, "path")?)?;
     let source = read_text(&path)?;
     let digest = hash(source.as_bytes());
+    let path_identity = hash(path.to_string_lossy().as_bytes());
     let language = language(&path)?;
     let grammar = match language {
         "rust" => tree_sitter_rust::LANGUAGE.into(),
@@ -428,7 +439,7 @@ pub(super) fn execute(
             bail!("cancelled_or_timeout: structure traversal interrupted");
         }
         if let Some(name) = symbol_name(node) {
-            let mut symbol = describe(node, name, &container, &source, &digest);
+            let mut symbol = describe(node, name, &container, &source, &digest, &path_identity);
             let kind = category(node, parent_kind, &source);
             symbol["symbol_kind"] = json!(kind);
             symbol["depth"] = json!(depth);
