@@ -99,7 +99,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_write",
-                description: "Save one reusable memory. Same key requires expected_revision. Updates replace evidence: resupply valid source_ids for observed facts; existing sources are not inherited. Copy source_ids exactly from tool results; never omit them to recover from unknown_source. Facts without sources, inferred memories and memories whose file evidence changed are needs_review. Source IDs must come from program observations. Keep metadata very short (aim for 80 tokens; hard limit 160 including ID/key/JSON). Put details in body. kind: fact/decision/failure/question/procedure",
+                description: "Save one reusable memory. Same key requires expected_revision. Updates replace evidence: resupply valid source_ids for observed facts; existing sources are not inherited. Copy source_ids exactly from tool results; never omit them to recover from unknown_source. Facts without sources, inferred memories and memories whose file evidence changed are needs_review. Source IDs must come from program observations. Metadata has no per-entry token rejection; keep it concise because recent memory lists still consume index_tokens. Put details in body. kind: fact/decision/failure/question/procedure",
                 optional: false,
                 read_only: false,
                 parameters: schema(

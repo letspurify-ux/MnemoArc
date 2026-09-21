@@ -284,6 +284,7 @@ async fn settings_apply_at_next_request_and_generic_tasks_work() {
 
 struct RetryCleanup {
     step: Mutex<usize>,
+    key: String,
 }
 #[async_trait]
 impl LlmClient for RetryCleanup {
@@ -318,17 +319,16 @@ impl LlmClient for RetryCleanup {
                         .all(|t| t["function"]["name"] != "document_edit")
                 );
                 call(
-                    "failed-memory",
+                    &format!("memory-{}", self.key),
                     "memory_write",
-                    json!({"key":"failed","title":"너무 긴 제목".repeat(150),"summary":"과도한 메타데이터","body":"보존할 근거와 실패 기록".repeat(150),"kind":"fact"}),
+                    json!({"key":self.key,"title":"너무 긴 제목".repeat(150),"summary":"과도한 메타데이터","body":"보존할 근거와 실패 기록".repeat(150),"kind":"fact"}),
                 )
             }
             1 => {
-                assert!(request.to_string().contains("memory_metadata_limit"));
+                assert!(!request.to_string().contains("memory_metadata_limit"));
                 Completion {
                     calls: vec![
                         ToolCall{id:format!("ack-{}",state["checkpoint"]["id"]),name:"checkpoint_complete".into(),arguments:json!({"id":state["checkpoint"]["id"],"progress":"필요한 기억을 보존했고 원본 수정 금지를 유지한다. 다음은 문서 작성이다."}).to_string()},
-                        ToolCall{id:format!("memory-{}",state["checkpoint"]["id"]),name:"memory_write".into(),arguments:json!({"key":format!("finding-{}",state["recent_memories"].as_array().unwrap().len()),"title":"주요 발견","summary":"실패 원인과 다음 조사","body":"실패한 접근을 반복하지 않고 기존 제약을 지킨다.","kind":"failure"}).to_string()},
                         ToolCall{id:format!("progress-{}",state["checkpoint"]["id"]),name:"task_state".into(),arguments:json!({"action":"update","patch":{"current":"실패 근거와 다음 작업 저장 완료"}}).to_string()},
                     ], ..Default::default()
                 }
@@ -352,10 +352,11 @@ impl LlmClient for RetryCleanup {
 }
 
 #[tokio::test]
-async fn unknown_model_recovers_failed_saves_over_three_checkpoints() {
+async fn unknown_model_accepts_large_memory_metadata_over_three_checkpoints() {
     let dir = tempfile::tempdir().unwrap();
     let mut session = s(dir.path());
     session.config.model = "z-ai/glm-5.3-flash".into();
+    session.config.index_tokens = 20_000;
     session
         .task
         .constraints
@@ -370,6 +371,7 @@ async fn unknown_model_recovers_failed_saves_over_three_checkpoints() {
         mnemoarc::context::ContextManager::prepare(&mut session, 60000).unwrap();
         let client = Arc::new(RetryCleanup {
             step: Mutex::new(0),
+            key: format!("large-{cycle}"),
         });
         let (tx, mut rx) = mpsc::channel(128);
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -386,8 +388,6 @@ async fn unknown_model_recovers_failed_saves_over_three_checkpoints() {
             let result: Value = serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
             if id.starts_with("ack-") {
                 assert_eq!(result["data"]["acknowledged"], true);
-            } else if id.starts_with("memory-") {
-                assert!(result["data"]["acknowledged"].is_null());
             }
         }
         assert!(
@@ -397,13 +397,6 @@ async fn unknown_model_recovers_failed_saves_over_three_checkpoints() {
                 .iter()
                 .all(|m| m["tool_calls"].is_null()),
             "maintenance exchanges must not trigger another cleanup"
-        );
-        assert!(
-            !session.history.search("memory_metadata_limit", 0, 50)["items"]
-                .as_array()
-                .unwrap()
-                .is_empty(),
-            "failed saves remain retrievable"
         );
         assert!(
             session

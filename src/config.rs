@@ -130,7 +130,7 @@ impl Config {
             || self.recent_count.saturating_mul(160).saturating_add(128) > self.index_tokens
         {
             bail!(
-                "recent_count does not fit memory_count/index_tokens (160 tokens per entry + 128 overhead)"
+                "recent_count does not fit memory_count/index_tokens (baseline 160 tokens per entry + 128 overhead; larger entries consume more)"
             );
         }
         if self
