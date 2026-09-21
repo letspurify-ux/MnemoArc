@@ -210,11 +210,11 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_inspect",
-                description: "Inspect a document using path (relative to project.root); omit path for project.output. Uses file_read path restrictions. Returns session delivery coverage for the current hash, not proof of understanding or current context retention. coverage_offset pages missing line ranges. With no section, offset is an OUTLINE HEADING INDEX, not a document line number; copy next_offset from the prior outline page. With section, offset is a CHARACTER INDEX inside that section; copy content.next_offset or the returned next_cursor arguments. For a document line number use file_read with start_line. section accepts a full Markdown heading or a unique title without #; duplicate titles require disambiguation. For any offset or coverage_offset > 0, copy expected_hash from the first result's hash; if unavailable, restart at offset 0 with coverage_offset 0.",
+                description: "Inspect a document using path (relative to project.root); omit path for project.output. Uses file_read path restrictions. Returns session delivery coverage for the current hash, not proof of understanding or current context retention. coverage_offset pages missing line ranges; copy coverage.revision as expected_coverage_revision on continuation to detect intervening reads. With no section, offset is an OUTLINE HEADING INDEX, not a document line number; copy next_offset from the prior outline page. With section, offset is a CHARACTER INDEX inside that section; copy content.next_offset or the returned next_cursor arguments. For a document line number use file_read with start_line. section accepts a full Markdown heading or a unique title without #; duplicate titles require disambiguation. For any offset or coverage_offset > 0, copy expected_hash from the first result's hash; if unavailable, restart at offset 0 with coverage_offset 0.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"path":string(),"section":string(),"offset":number(),"limit":number(),"coverage_offset":number(),"expected_hash":string()}),
+                    json!({"path":string(),"section":string(),"offset":number(),"limit":number(),"coverage_offset":number(),"expected_hash":string(),"expected_coverage_revision":string()}),
                     &[],
                 ),
             },
@@ -2246,7 +2246,11 @@ pub fn limit_result(
     if call.name == "document_inspect" && result["data"]["content"]["truncated"] == true {
         let mut args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
         normalize_integer_arguments(call.name.as_str(), &mut args);
-        result["next_cursor"] = json!({"tool":"document_inspect","path":result["data"]["path"],"section":args["section"],"offset":result["data"]["content"]["next_offset"],"expected_hash":result["data"]["hash"]});
+        let mut next = json!({"tool":"document_inspect","path":result["data"]["path"],"section":args["section"],"offset":result["data"]["content"]["next_offset"],"expected_hash":result["data"]["hash"]});
+        if result["data"]["coverage"]["revision"].is_string() {
+            next["expected_coverage_revision"] = result["data"]["coverage"]["revision"].clone();
+        }
+        result["next_cursor"] = next;
         result["truncated"] = json!(true);
     }
     if result_tokens(call, &result, &s.config.model) <= limit {

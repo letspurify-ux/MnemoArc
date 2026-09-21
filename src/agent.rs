@@ -1189,6 +1189,7 @@ pub async fn run_session_controlled(
             &s.task,
             &s.file_cursors,
             &s.read_coverage,
+            &s.coverage_cursors,
         ))
         .map_or(true, |v| v.len() > s.config.memory_bytes)
         {

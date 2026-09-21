@@ -164,6 +164,9 @@ pub struct Session {
     pub sources: BTreeMap<String, Source>,
     pub file_cursors: BTreeMap<String, FileCursor>,
     pub read_coverage: BTreeMap<String, ReadCoverage>,
+    /// Coverage page revisions let legacy offset callers detect intervening
+    /// reads even when they do not echo expected_coverage_revision.
+    pub coverage_cursors: BTreeMap<String, String>,
     pub active_tools: BTreeSet<String>,
     pub pending_tools: Option<BTreeSet<String>>,
     pub investigations: Vec<Investigation>,
@@ -217,6 +220,7 @@ impl Session {
             sources: BTreeMap::new(),
             file_cursors: BTreeMap::new(),
             read_coverage: BTreeMap::new(),
+            coverage_cursors: BTreeMap::new(),
             active_tools: [
                 "file_read",
                 "document_inspect",

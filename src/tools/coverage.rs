@@ -149,7 +149,7 @@ pub(super) fn report(
         &[]
     };
     (
-        json!({"scope":"session_delivered_text","hash":digest,"previous_revision_ignored":prior.is_some_and(|r| r.hash != digest),"total_lines":covered.len(),"fully_read_lines":covered.iter().filter(|&&v|v).count(),"complete":covered.iter().all(|&v|v),"missing_ranges":page,"missing_range_count":missing.len(),"next_offset":(end < missing.len()).then_some(end)}),
+        json!({"scope":"session_delivered_text","hash":digest,"revision":hash(&serde_json::to_vec(&(digest.as_str(), ranges)).expect("coverage revision input is serializable")),"previous_revision_ignored":prior.is_some_and(|r| r.hash != digest),"total_lines":covered.len(),"fully_read_lines":covered.iter().filter(|&&v|v).count(),"complete":covered.iter().all(|&v|v),"missing_ranges":page,"missing_range_count":missing.len(),"next_offset":(end < missing.len()).then_some(end)}),
         covered,
     )
 }

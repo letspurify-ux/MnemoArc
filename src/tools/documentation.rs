@@ -106,6 +106,7 @@ pub(super) fn execute(
                 return Ok(json!({"exists":false,"path":path,"total_lines":0}));
             }
             let doc = read_text(&path)?;
+            let digest = hash(doc.as_bytes());
             let document_offset = n(args, "offset", 0);
             let coverage_offset = n(args, "coverage_offset", 0);
             if (document_offset > 0 || coverage_offset > 0)
@@ -116,13 +117,13 @@ pub(super) fn execute(
                 );
             }
             if let Some(expected) = args["expected_hash"].as_str()
-                && expected != hash(doc.as_bytes())
+                && expected != digest
             {
                 bail!(
                     "document_revision_conflict: document changed during paged read; restart document_inspect with offset 0 and use its new hash"
                 );
             }
-            let mut result = json!({"exists":true,"path":path,"hash":hash(doc.as_bytes()),"total_lines":doc.lines().count(),"bytes":doc.len()});
+            let mut result = json!({"exists":true,"path":path,"hash":digest,"total_lines":doc.lines().count(),"bytes":doc.len()});
             if let Some(heading) = args["section"].as_str() {
                 let resolved = resolve_heading(&doc, heading)?;
                 let section = &doc[resolved.start..resolved.end];
@@ -157,6 +158,36 @@ pub(super) fn execute(
                     n(args, "coverage_offset", 0),
                     n(args, "limit", 50),
                 );
+                let missing_count = coverage["missing_range_count"].as_u64().unwrap_or(0);
+                if coverage_offset as u64 > missing_count {
+                    bail!(
+                        "invalid_offset: coverage_offset {coverage_offset} exceeds {missing_count} missing ranges; restart at coverage_offset 0 or copy coverage.next_offset"
+                    );
+                }
+                let coverage_key = |page: usize| format!("{}:{}:{page}", path.display(), digest);
+                if coverage_offset > 0
+                    && let Some(expected) =
+                        args["expected_coverage_revision"].as_str().or_else(|| {
+                            s.coverage_cursors
+                                .get(&coverage_key(coverage_offset))
+                                .map(String::as_str)
+                        })
+                    && coverage["revision"].as_str() != Some(expected)
+                {
+                    bail!(
+                        "document_coverage_revision_conflict: delivered coverage changed during pagination; restart document_inspect with coverage_offset 0"
+                    );
+                }
+                if coverage_offset > 0 {
+                    s.coverage_cursors.remove(&coverage_key(coverage_offset));
+                }
+                if let (Some(next), Some(revision)) = (
+                    coverage["next_offset"].as_u64(),
+                    coverage["revision"].as_str(),
+                ) {
+                    s.coverage_cursors
+                        .insert(coverage_key(next as usize), revision.into());
+                }
                 result["coverage"] = coverage;
                 result["outline"] = json!(headings[offset..end].iter().map(|h| {
                     let lines = doc[h.start..h.end].lines().count();
