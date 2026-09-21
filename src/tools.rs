@@ -126,7 +126,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_manage",
-                description: "List cleanup candidates, delete unreferenced memories, or atomically replace IDs and redirect references. delete and replace require ids; duplicate IDs are ignored. replacement uses memory_write fields; when it reuses a replaced key, expected_revision and observed-source rules are checked before removal",
+                description: "List cleanup candidates, delete unreferenced memories, or atomically replace IDs and redirect references. delete requires ids; replace requires ids and replacement; duplicate IDs are ignored. replacement uses memory_write fields; when it reuses a replaced key, expected_revision and observed-source rules are checked before removal",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -146,7 +146,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "history",
-                description: "Search retained raw conversation/tool bundles or read one by ID and character offset; unavailable/pruned ranges are explicit",
+                description: "Search retained raw conversation/tool bundles, or read one by ID and character offset (read requires id); unavailable/pruned ranges are explicit",
                 optional: false,
                 read_only: true,
                 parameters: schema(
@@ -337,6 +337,26 @@ impl ToolRegistry {
                         {"required":["queries"],"not":{"anyOf":[{"required":["query"]},{"required":["regex"],"properties":{"regex":{"const":true}}}]}}
                     ]);
                 }
+                if t.name == "task_state" {
+                    t.parameters["oneOf"] = json!([
+                        {"properties":{"action":{"const":"read"}},"required":["action"]},
+                        {"properties":{"action":{"const":"details"}},"required":["action"]},
+                        {"properties":{"action":{"const":"update"}},"required":["action","patch"]}
+                    ]);
+                }
+                if t.name == "memory_manage" {
+                    t.parameters["oneOf"] = json!([
+                        {"properties":{"action":{"const":"candidates"}},"required":["action"]},
+                        {"properties":{"action":{"const":"delete"}},"required":["action","ids"]},
+                        {"properties":{"action":{"const":"replace"}},"required":["action","ids","replacement"]}
+                    ]);
+                }
+                if t.name == "history" {
+                    t.parameters["oneOf"] = json!([
+                        {"properties":{"action":{"const":"search"}},"required":["action"]},
+                        {"properties":{"action":{"const":"read"}},"required":["action","id"]}
+                    ]);
+                }
                 json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.parameters}})
             })
             .collect()
@@ -403,8 +423,115 @@ impl ToolRegistry {
                 bail!("invalid_argument_value: {k}");
             }
         }
+        if name == "task_state" {
+            validate_task_state_arguments(args)?;
+        } else if name == "document_edit" {
+            validate_document_edit_arguments(args)?;
+        } else if name == "memory_manage" {
+            validate_memory_manage_arguments(args)?;
+        } else if name == "history" {
+            validate_history_arguments(args)?;
+        }
         Ok(spec)
     }
+}
+
+fn validate_task_state_arguments(args: &Value) -> Result<()> {
+    let action = args["action"].as_str().unwrap_or("");
+    if action != "update" {
+        return Ok(());
+    }
+    let Some(patch) = args.get("patch") else {
+        bail!("missing_argument: patch for task_state action=update");
+    };
+    let object = patch.as_object().ok_or_else(|| {
+        anyhow::anyhow!("invalid_argument_type: patch for task_state must be an object")
+    })?;
+    let schema = task_patch_schema();
+    let properties = schema["properties"]
+        .as_object()
+        .expect("task patch schema properties are an object");
+    for (key, value) in object {
+        let Some(field) = properties.get(key) else {
+            if key == "revision" {
+                bail!("invalid_argument_value: revision is program-owned");
+            }
+            bail!(
+                "unknown_argument: {key} belongs inside task_state patch schema; state unchanged"
+            );
+        };
+        let valid = match field["type"].as_str() {
+            Some("string") => value.is_string(),
+            Some("boolean") => value.is_boolean(),
+            Some("array") => value.as_array().is_some_and(|items| {
+                field["items"]["type"] != "string" || items.iter().all(Value::is_string)
+            }),
+            Some("object") => value.is_object(),
+            _ => true,
+        };
+        if !valid {
+            bail!("invalid_argument_type: patch.{key}");
+        }
+        if let Some(values) = field["enum"].as_array()
+            && !values.contains(value)
+        {
+            bail!("invalid_argument_value: patch.{key}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_document_edit_arguments(args: &Value) -> Result<()> {
+    let action = args["action"].as_str().unwrap_or("");
+    let require = |key: &str| {
+        if args.get(key).is_none() {
+            return Err(anyhow::anyhow!(
+                "missing_argument: {key} for document_edit action={action}"
+            ));
+        }
+        if args[key]
+            .as_str()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(anyhow::anyhow!(
+                "invalid_argument_value: {key} must not be empty for document_edit action={action}"
+            ));
+        }
+        Ok(())
+    };
+    match action {
+        "append" => require("expected_hash")?,
+        "patch" => {
+            require("expected_hash")?;
+            require("old_text")?;
+        }
+        "section" => {
+            require("expected_hash")?;
+            require("section")?;
+            require("expected_section_hash")?;
+        }
+        "create" | "write" => {}
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_memory_manage_arguments(args: &Value) -> Result<()> {
+    let action = args["action"].as_str().unwrap_or("");
+    if matches!(action, "delete" | "replace") && args["ids"].as_array().is_none_or(Vec::is_empty) {
+        bail!("missing_argument: ids for memory_manage action={action}");
+    }
+    if action == "replace" && args.get("replacement").is_none() {
+        bail!("missing_argument: replacement for memory_manage action=replace");
+    }
+    Ok(())
+}
+
+fn validate_history_arguments(args: &Value) -> Result<()> {
+    if args["action"] == "read" && args.get("id").is_none() {
+        bail!("missing_argument: id for history action=read");
+    }
+    Ok(())
 }
 type InvestigationContract = (
     &'static [&'static str],
@@ -1062,7 +1189,9 @@ pub fn execute_cancellable(
             Ok(json!({"pending":pending,"applies":"next_request"}))
         }
         "memory_write" => {
-            let input: MemoryInput = serde_json::from_value(args)?;
+            let input: MemoryInput = serde_json::from_value(args).map_err(|error| {
+                anyhow::anyhow!("invalid_argument_value: memory_write fields: {error}")
+            })?;
             let sources = s.source_refs(&input.source_ids)?;
             let result = s.memory.save(input, sources, &s.config)?;
             // A source can change between its original observation and this
@@ -1119,7 +1248,7 @@ pub fn execute_cancellable(
                 }
                 "replace" => {
                     if ids.is_empty() {
-                        bail!("replace requires ids");
+                        bail!("missing_argument: ids for memory_manage action=replace");
                     }
                     let mut seen = BTreeSet::new();
                     let actual = ids
@@ -1148,7 +1277,12 @@ pub fn execute_cancellable(
                                 .collect::<BTreeMap<_, _>>()
                         })
                         .collect::<Vec<_>>();
-                    let input: MemoryInput = serde_json::from_value(args["replacement"].clone())?;
+                    let input: MemoryInput = serde_json::from_value(args["replacement"].clone())
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "invalid_argument_value: memory_manage replacement fields: {error}"
+                            )
+                        })?;
                     let sources = s.source_refs(&input.source_ids)?;
                     let replacement = s.memory.replace(&actual, input, sources, &s.config)?;
                     let replacement_id = replacement.id.clone();
@@ -1194,9 +1328,9 @@ pub fn execute_cancellable(
                 )
             }
             "update" => {
-                let patch = args["patch"]
-                    .as_object()
-                    .ok_or_else(|| anyhow::anyhow!("patch required"))?;
+                let patch = args["patch"].as_object().ok_or_else(|| {
+                    anyhow::anyhow!("missing_argument: patch for task_state action=update")
+                })?;
                 if patch.is_empty() {
                     return Ok(
                         json!({"unchanged":true,"guidance":"Use read to inspect state; update only changed fields."}),
@@ -1205,11 +1339,13 @@ pub fn execute_cancellable(
                 let mut value = json!(s.task);
                 for (k, v) in patch {
                     if k == "revision" {
-                        bail!("revision is program-owned");
+                        bail!("invalid_argument_value: revision is program-owned");
                     }
                     value[k] = v.clone();
                 }
-                let mut next: TaskState = serde_json::from_value(value)?;
+                let mut next: TaskState = serde_json::from_value(value).map_err(|error| {
+                    anyhow::anyhow!("invalid_argument_value: task_state patch: {error}")
+                })?;
                 if !["", "answer", "source_document", "document_edit"]
                     .contains(&next.workflow.as_str())
                 {
@@ -1353,7 +1489,7 @@ pub fn execute_cancellable(
             }
             let progress = text(&args, "progress")?;
             if progress.trim().is_empty() {
-                bail!("checkpoint progress must be nonempty");
+                bail!("invalid_argument_value: checkpoint progress must be nonempty");
             }
             let mut task = s.task.clone();
             task.current = progress.to_string();
@@ -1428,7 +1564,9 @@ pub fn execute_cancellable(
                         bail!("section_revision_conflict");
                     }
                     if new.lines().next().map(str::trim) != target.lines().next().map(str::trim) {
-                        bail!("section replacement must retain its heading");
+                        bail!(
+                            "invalid_argument_value: section replacement must retain its heading"
+                        );
                     }
                     let mut candidate = old.replacen(target, &format!("{}\n", new.trim_end()), 1);
                     section_text(&candidate, heading)?;
@@ -1592,10 +1730,12 @@ pub fn execute_cancellable(
             }
             "verify_batch" => {
                 let items = args["items"].as_object().ok_or_else(|| {
-                    anyhow::anyhow!("items must be an object keyed by investigation ID")
+                    anyhow::anyhow!(
+                        "invalid_argument_type: items must be an object keyed by investigation ID"
+                    )
                 })?;
                 if items.is_empty() || items.len() > 20 {
-                    bail!("batch requires 1..20 items");
+                    bail!("invalid_argument_value: items requires 1..20 entries");
                 }
                 revalidate(s)?;
                 let mut reused_ids = vec![];
@@ -1684,7 +1824,7 @@ pub fn execute_cancellable(
                 }
                 let note = text(&args, "verification_note")?;
                 if note.trim().is_empty() {
-                    bail!("verification_note required");
+                    bail!("missing_argument: verification_note must be non-empty");
                 }
                 let sources = s.source_refs(&list(&args, "source_ids"))?;
                 if sources.is_empty()
@@ -1696,7 +1836,7 @@ pub fn execute_cancellable(
                     })
                 {
                     bail!(
-                        "verification requires non-empty observed file sources; pass source_ids returned by file_read/source_search/symbol_search"
+                        "verification_sources_required: pass non-empty observed file source_ids returned by file_read/source_search/symbol_search"
                     );
                 }
                 for source in &sources {

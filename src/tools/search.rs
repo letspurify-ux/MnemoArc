@@ -36,7 +36,7 @@ pub(super) fn execute(
             bail!("conflicting_arguments: queries is literal OR; use query for regex");
         }
     } else if query.is_empty() {
-        bail!("query required");
+        bail!("missing_argument: query or queries");
     }
     if args.get("path").is_some()
         && (args.get("path_glob").is_some() || args.get("pattern").is_some())

@@ -140,13 +140,13 @@ impl MemoryStore {
             || input.summary.trim().is_empty()
             || input.body.trim().is_empty()
         {
-            bail!("Memory title, summary and body are required");
+            bail!("invalid_argument_value: title, summary and body must be non-empty");
         }
         if input.body.len() > config.memory_body_bytes {
             bail!("memory_body_limit");
         }
         if input.key.as_ref().is_some_and(|k| k.trim().is_empty()) {
-            bail!("Empty memory key");
+            bail!("invalid_argument_value: key must not be empty");
         }
         let old = input.key.as_deref().and_then(|k| self.get(k).ok()).cloned();
         if let Some(m) = &old {
