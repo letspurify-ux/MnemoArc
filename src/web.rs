@@ -584,10 +584,24 @@ async fn run(
                 let mut c = owner.core.lock().await;
                 match event {
                     AgentEvent::Delta { session, text } => {
-                        c.streams.entry(session).or_default().push_str(&text)
+                        let closing = c
+                            .running
+                            .as_ref()
+                            .is_some_and(|running| running.id == session && running.closing);
+                        if !closing {
+                            c.streams.entry(session).or_default().push_str(&text);
+                        }
                     }
                     AgentEvent::Snapshot(snapshot) => {
                         let mut snapshot = *snapshot;
+                        let closing = c
+                            .running
+                            .as_ref()
+                            .is_some_and(|running| running.id == snapshot.id && running.closing);
+                        if closing {
+                            c.streams.remove(&snapshot.id);
+                            continue;
+                        }
                         // A source can change while the agent is running. The
                         // snapshot was produced from the agent's private copy,
                         // so revalidate it before publishing it or it could
@@ -606,7 +620,13 @@ async fn run(
                         c.streams.remove(&session);
                     }
                     AgentEvent::Notice { session, text } => {
-                        if let Some(v) = c.sessions.get_mut(&session) {
+                        let closing = c
+                            .running
+                            .as_ref()
+                            .is_some_and(|running| running.id == session && running.closing);
+                        if !closing
+                            && let Some(v) = c.sessions.get_mut(&session)
+                        {
                             v.last_error = Some(text);
                         }
                     }
@@ -665,6 +685,7 @@ async fn close_session(State(s): State<WebState>, Path(id): Path<String>) -> Api
     {
         r.closing = true;
         r.cancel.cancel();
+        c.streams.remove(&id);
     } else {
         c.sessions.remove(&id);
         c.streams.remove(&id);
