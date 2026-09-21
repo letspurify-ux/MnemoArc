@@ -628,6 +628,13 @@ fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
                 if old_text.is_empty() {
                     bail!("invalid_argument_value: edits[{index}].old_text must not be empty");
                 }
+                for key in ["section", "expected_section_hash"] {
+                    if object.contains_key(key) {
+                        bail!(
+                            "unknown_argument: edits[{index}].{key} is not valid for action=patch"
+                        );
+                    }
+                }
             }
             "section" => {
                 let section = object
@@ -646,6 +653,11 @@ fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
                 if section_hash.trim().is_empty() {
                     bail!(
                         "invalid_argument_value: edits[{index}].expected_section_hash must not be empty"
+                    );
+                }
+                if object.contains_key("old_text") {
+                    bail!(
+                        "unknown_argument: edits[{index}].old_text is not valid for action=section"
                     );
                 }
             }
@@ -2696,6 +2708,15 @@ pub fn limit_result(
         }
     }
     let mut compact = json!({"status":result["status"],"truncated":true,"data":{"message":"Result retained in history; follow next_cursor."},"next_cursor":{"tool":"history","action":"read","id":archive,"offset":0}});
+    // Mutating tools must keep the resulting document hash visible even when
+    // their detailed payload is archived. The agent uses it to chain edits in
+    // the same response, and callers need it to retry safely.
+    if result["status"] == "ok"
+        && matches!(call.name.as_str(), "document_edit" | "document_edit_batch")
+        && result["data"]["hash"].is_string()
+    {
+        compact["data"] = json!({"hash":result["data"]["hash"]});
+    }
     if let Some(recovery) = result.get("recovery") {
         compact["recovery"] = recovery.clone();
         // Detailed recovery tools remain in the archive if the tiny result

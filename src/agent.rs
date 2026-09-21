@@ -177,7 +177,16 @@ fn rebase_document_call(call: &ToolCall, hash: Option<&str>) -> (ToolCall, bool)
     let Ok(mut args) = serde_json::from_str::<Value>(&call.arguments) else {
         return (call.clone(), false);
     };
-    if args["expected_hash"].as_str() == Some(hash) || args["expected_hash"].is_null() {
+    let action = args["action"].as_str().unwrap_or("");
+    // A create call intentionally has no revision precondition: rebasing it
+    // would turn its useful document_exists error into a less meaningful
+    // stale-hash error. A first write on a missing file, however, may be
+    // followed by another write in the same response, so fill its now
+    // required precondition just like append/patch/section calls.
+    if action == "create"
+        || args["expected_hash"].as_str() == Some(hash)
+        || (args["expected_hash"].is_null() && action != "write")
+    {
         return (call.clone(), false);
     }
     args["expected_hash"] = json!(hash);
@@ -1060,6 +1069,17 @@ pub async fn run_session_controlled(
             } else {
                 let (next, result) = execute_one(s, effective_call, &cancel).await;
                 s = next;
+                // The tool ran with a rebased execution argument, but the
+                // provider's call ID identifies the original assistant call.
+                // Keep that original signature in the idempotency ledger so a
+                // replay of the same response is served from the cache rather
+                // than reported as a call-id collision.
+                if rebased_document_call && result["status"] == "ok" {
+                    s.ledger.insert(
+                        call.id.clone(),
+                        (format!("{}:{}", call.name, call.arguments), result.clone()),
+                    );
+                }
                 vec![result]
             };
             for (call, mut result) in execution_calls[i..i + group].iter().zip(results) {
