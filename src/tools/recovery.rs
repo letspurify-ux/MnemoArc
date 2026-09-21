@@ -76,6 +76,8 @@ pub fn describe(message: &str) -> Value {
         (Class::StaleState, "restart_document_inspection")
     } else if code == "ambiguous_section" {
         (Class::InvalidInput, "choose_exact_section")
+    } else if code == "invalid_citation_range" {
+        (Class::InvalidInput, "repair_document_citation")
     } else if matches!(
         code,
         "section_not_found" | "investigation_section_required" | "document_exists"
@@ -214,6 +216,7 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "copy_document_hash" => &["document_inspect"],
         "restart_document_inspection" | "inspect_document_outline" => &["document_inspect"],
         "choose_exact_section" => &["document_inspect", "file_read"],
+        "repair_document_citation" => &["document_inspect", "document_edit"],
         "copy_observed_symbol_id" => &["code_outline", "symbol_read"],
         "check_file_permissions" => &["file_list", "file_read", "document_inspect"],
         "inspect_outcome_before_retry" => &["history", "document_inspect", "file_read"],

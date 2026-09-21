@@ -380,6 +380,18 @@ pub(super) fn missing_citation_ranges(
             citation.path
         };
         let cited = read_path(&s.project, &path)?;
+        // `citation_spans` deliberately accepts the same compact syntax used
+        // by the structural audit, but verification must not treat a reversed
+        // range such as `file.rs:10-5` as an empty interval. Without this
+        // guard the coverage walk starts at 10, sees that it is already past
+        // the end 5, and reports no missing lines, allowing an invalid
+        // citation to be marked verified.
+        if citation.begin == 0 || citation.end < citation.begin {
+            bail!(
+                "invalid_citation_range: {} must use a 1-based range with start <= end",
+                citation.raw
+            );
+        }
         let mut ranges: Vec<_> = sources
             .iter()
             .filter(|source| {
