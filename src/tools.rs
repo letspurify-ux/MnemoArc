@@ -356,6 +356,17 @@ impl ToolRegistry {
                         {"type":"object","properties":{"action":{"const":"section"},"text":fields["text"],"expected_hash":fields["expected_hash"],"section":fields["section"],"expected_section_hash":fields["expected_section_hash"]},"required":["expected_hash","section","expected_section_hash"],"additionalProperties":false}
                     ]);
                 }
+                if t.name == "document_edit_batch" {
+                    let item_fields = t.parameters["properties"]["edits"]["items"]["properties"].clone();
+                    t.parameters["properties"]["edits"]["items"] = json!({
+                        "oneOf":[
+                            {"type":"object","properties":{"action":{"const":"write"},"text":item_fields["text"]},"required":["action","text"],"additionalProperties":false},
+                            {"type":"object","properties":{"action":{"const":"append"},"text":item_fields["text"]},"required":["action","text"],"additionalProperties":false},
+                            {"type":"object","properties":{"action":{"const":"patch"},"text":item_fields["text"],"old_text":item_fields["old_text"]},"required":["action","text","old_text"],"additionalProperties":false},
+                            {"type":"object","properties":{"action":{"const":"section"},"text":item_fields["text"],"section":item_fields["section"],"expected_section_hash":item_fields["expected_section_hash"]},"required":["action","text","section","expected_section_hash"],"additionalProperties":false}
+                        ]
+                    });
+                }
                 if t.name == "source_search" {
                     t.parameters["oneOf"] = json!([
                         {"required":["query"],"not":{"required":["queries"]}},
