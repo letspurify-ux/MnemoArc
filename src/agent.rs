@@ -964,6 +964,7 @@ pub async fn run_session_controlled(
         let mut seen_call_ids = std::collections::BTreeSet::new();
         while i < execution_calls.len() {
             let call = &execution_calls[i];
+            let malformed_call = call.id.trim().is_empty() || call.name.trim().is_empty();
             let duplicate_call_id = seen_call_ids.contains(&call.id);
             let parallel = ["file_list", "file_read", "source_search"]
                 .contains(&call.name.as_str())
@@ -975,6 +976,7 @@ pub async fn run_session_controlled(
                 // its cached result (or call-id collision) is honored instead
                 // of silently running the same call again.
                 && !s.ledger.contains_key(&call.id)
+                && !malformed_call
                 && !seen_call_ids.contains(&call.id);
             let mut group = 1;
             if parallel {
@@ -985,6 +987,8 @@ pub async fn run_session_controlled(
                         .contains(&execution_calls[i + group].name.as_str())
                     && s.active_tools.contains(&execution_calls[i + group].name)
                     && !s.ledger.contains_key(&execution_calls[i + group].id)
+                    && !execution_calls[i + group].id.trim().is_empty()
+                    && !execution_calls[i + group].name.trim().is_empty()
                     && !seen_call_ids.contains(&execution_calls[i + group].id)
                     && !group_call_ids.contains(&execution_calls[i + group].id)
                 {
@@ -994,7 +998,11 @@ pub async fn run_session_controlled(
             }
             s.activity = json!({"stage":"tools","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds,"tools":execution_calls[i..i+group].iter().map(|c| c.name.clone()).collect::<Vec<_>>()});
             snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
-            let results = if duplicate_call_id {
+            let results = if malformed_call {
+                vec![tools::envelope(Err(anyhow::anyhow!(
+                    "malformed_tool_call: tool call id and name must be non-empty"
+                )))]
+            } else if duplicate_call_id {
                 vec![tools::envelope(Err(anyhow::anyhow!(
                     "call_id_collision: duplicate tool call id in one response; call IDs must be unique"
                 )))]

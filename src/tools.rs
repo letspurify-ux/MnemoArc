@@ -2554,6 +2554,15 @@ fn run_call_inner(
     call: &crate::llm::ToolCall,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Value {
+    // OpenAI's stream parser rejects missing IDs and names, but alternate
+    // LlmClient implementations can construct ToolCall values directly. Do
+    // not let an invalid ID enter the ledger or execute a mutation: an empty
+    // key would make unrelated calls share one idempotency slot.
+    if call.id.trim().is_empty() || call.name.trim().is_empty() {
+        return envelope(Err(anyhow::anyhow!(
+            "malformed_tool_call: tool call id and name must be non-empty"
+        )));
+    }
     let signature = format!("{}:{}", call.name, call.arguments);
     if let Some((stored, result)) = s.ledger.get(&call.id) {
         return if stored == &signature {

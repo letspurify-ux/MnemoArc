@@ -109,6 +109,7 @@ pub fn describe(message: &str) -> Value {
         code,
         "conflicting_path_filters"
             | "call_id_collision"
+            | "malformed_tool_call"
             | "workflow_locked"
             | "investigation_requirement_locked"
     ) {
