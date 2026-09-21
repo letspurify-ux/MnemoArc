@@ -306,10 +306,18 @@ pub async fn run_session_controlled(
             }
         }
         if let Some(config) = s.pending_config.clone() {
-            let _ = s.history.prune(config.history_bytes);
-            match apply_config(&mut s, config) {
+            // Try history cleanup and the new limits on a private candidate.
+            // A rejected setting must not leave an irreversible history prune
+            // behind while the old configuration remains active.
+            let mut candidate = s.clone();
+            let result = candidate
+                .history
+                .prune(config.history_bytes)
+                .and_then(|_| apply_config(&mut candidate, config));
+            match result {
                 Ok(()) => {
-                    s.pending_config = None;
+                    candidate.pending_config = None;
+                    s = candidate;
                     emit(
                         &events,
                         AgentEvent::Notice {

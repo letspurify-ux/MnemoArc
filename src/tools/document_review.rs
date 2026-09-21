@@ -83,6 +83,16 @@ pub fn request(s: &mut Session) -> Result<Value> {
     {
         reset_pages(&mut s.document_review);
     }
+    let continuing_page =
+        s.document_review.evidence_offset > 0 || s.document_review.document_offset > 0;
+    if continuing_page && (s.document_review.target_hash.as_deref() != Some(&digest) || !fresh(s)) {
+        // A later page can cite different files, so checking only the current
+        // page's hashes would miss edits to evidence already reviewed. Restart
+        // the bounded review before accepting another verdict instead of
+        // repeatedly returning document_review_stale.
+        reset_stale_review(&mut s.document_review);
+        return self::request(s);
+    }
     let ceiling = 24_000.min(context::ContextManager::input_budget(&s.config));
     let doc_lines: Vec<_> = doc.lines().collect();
     let start_line = s.document_review.document_offset.min(doc_lines.len());
@@ -233,7 +243,6 @@ pub fn request(s: &mut Session) -> Result<Value> {
         }
     }
     let state = &mut s.document_review;
-    let continuing_page = state.evidence_offset > 0 || state.document_offset > 0;
     if state
         .target_hash
         .as_deref()
