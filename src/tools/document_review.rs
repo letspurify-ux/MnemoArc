@@ -67,6 +67,13 @@ fn reset_pages(state: &mut ReviewState) {
     state.page_issues.clear();
 }
 
+fn reset_stale_review(state: &mut ReviewState) {
+    reset_pages(state);
+    state.approved_hash = None;
+    state.target_hash = None;
+    state.source_hashes.clear();
+}
+
 pub fn request(s: &mut Session) -> Result<Value> {
     let output = output_path(&s.project)?;
     let doc = read_text(&output)?;
@@ -226,13 +233,34 @@ pub fn request(s: &mut Session) -> Result<Value> {
         }
     }
     let state = &mut s.document_review;
-    if (state.evidence_offset > 0 || state.document_offset > 0)
-        && (state.target_hash.as_deref() != Some(&digest) || state.source_hashes != hashes)
+    let continuing_page = state.evidence_offset > 0 || state.document_offset > 0;
+    if state
+        .target_hash
+        .as_deref()
+        .is_some_and(|target| target != digest)
     {
-        // Discard verdicts from another revision; never combine stale pages.
-        reset_pages(state);
+        // Discard verdicts from another document revision; never combine
+        // stale pages with a new document.
+        reset_stale_review(state);
         return self::request(s);
     }
+    if continuing_page
+        && state
+            .source_hashes
+            .iter()
+            .any(|(path, previous)| hashes.get(path).is_some_and(|current| current != previous))
+    {
+        // A later document page may cite a different set of files. Restart
+        // only when a file already reviewed on an earlier page changed.
+        reset_stale_review(state);
+        return self::request(s);
+    }
+    let mut all_hashes = if continuing_page {
+        state.source_hashes.clone()
+    } else {
+        BTreeMap::new()
+    };
+    all_hashes.extend(hashes);
     if state.evidence_page >= 32 {
         bail!("document_review_budget: more than 32 review pages required; split the document");
     }
@@ -282,7 +310,7 @@ pub fn request(s: &mut Session) -> Result<Value> {
     request["messages"][1]["content"] = json!(payload.to_string());
     state.approved_hash = None;
     state.target_hash = Some(digest);
-    state.source_hashes = hashes;
+    state.source_hashes = all_hashes;
     state.evidence_omitted = next < ordered.len() || next_document_offset < doc_lines.len();
     state.next_evidence_offset = next;
     state.evidence_total = ordered.len();

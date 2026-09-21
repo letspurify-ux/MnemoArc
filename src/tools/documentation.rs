@@ -255,7 +255,28 @@ pub(super) fn execute(
                     }
                 }
             }
+            // The issue list includes source and investigation state as well
+            // as document citations. Bind every continuation page to the
+            // exact list that produced the first page.
+            let document_hash = hash(doc.as_bytes());
+            let revision = hash(&serde_json::to_vec(&(
+                document_hash.as_str(),
+                checked,
+                &issues,
+            ))?);
             let offset = n(args, "offset", 0);
+            if offset > 0 {
+                let expected = args["expected_revision"].as_str().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "document_audit_revision_required: offset > 0 requires expected_revision from the first result; copy its revision or restart at offset 0"
+                    )
+                })?;
+                if expected != revision {
+                    bail!(
+                        "document_audit_revision_conflict: audit inputs changed during pagination; restart document_audit at offset 0"
+                    );
+                }
+            }
             if offset > issues.len() {
                 bail!(
                     "invalid_offset: audit issue offset {offset} exceeds {} issues; restart document_audit at offset 0 or copy its prior next_offset",
@@ -264,7 +285,7 @@ pub(super) fn execute(
             }
             let end = (offset + n(args, "limit", 30).clamp(1, 100)).min(issues.len());
             Ok(
-                json!({"hash":hash(doc.as_bytes()),"total_lines":doc.lines().count(),"citations_checked":checked,"structural_ok":issues.is_empty(),"semantic_verified":false,"issue_count":issues.len(),"issues":issues[offset..end],"next_offset":(end<issues.len()).then_some(end)}),
+                json!({"hash":document_hash,"revision":revision,"total_lines":doc.lines().count(),"citations_checked":checked,"structural_ok":issues.is_empty(),"semantic_verified":false,"issue_count":issues.len(),"issues":issues[offset..end],"next_offset":(end<issues.len()).then_some(end)}),
             )
         }
         _ => bail!("unsupported_tool"),

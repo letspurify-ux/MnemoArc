@@ -461,10 +461,13 @@ async fn session_project(
         return Err(busy());
     }
     let session = c.sessions.get_mut(&id).ok_or_else(missing)?;
-    if project.root != session.project.root && !session.history.bundles.is_empty() {
+    let output_changed = tools::output_path(&project)? != tools::output_path(&session.project)?;
+    if (project.root != session.project.root || output_changed)
+        && !session.history.bundles.is_empty()
+    {
         return Err(ApiError(
             StatusCode::CONFLICT,
-            "소스 폴더를 변경하려면 새 세션을 만드세요.".into(),
+            "기록이 있는 세션의 소스 폴더나 결과 문서 경로는 변경할 수 없습니다. 새 세션을 만드세요.".into(),
         ));
     }
     session.project = project;
@@ -584,6 +587,12 @@ async fn run(
                         c.streams.entry(session).or_default().push_str(&text)
                     }
                     AgentEvent::Snapshot(snapshot) => {
+                        let mut snapshot = *snapshot;
+                        // A source can change while the agent is running. The
+                        // snapshot was produced from the agent's private copy,
+                        // so revalidate it before publishing it or it could
+                        // overwrite a fresher session_get result.
+                        let _ = tools::revalidate(&mut snapshot);
                         let advanced = c
                             .sessions
                             .get(&snapshot.id)
@@ -591,7 +600,7 @@ async fn run(
                         if advanced {
                             c.streams.remove(&snapshot.id);
                         }
-                        c.sessions.insert(snapshot.id.clone(), *snapshot);
+                        c.sessions.insert(snapshot.id.clone(), snapshot);
                     }
                     AgentEvent::Tool { session, .. } => {
                         c.streams.remove(&session);
@@ -616,6 +625,8 @@ async fn run(
         } else {
             match outcome {
                 Ok(session) => {
+                    let mut session = session;
+                    let _ = tools::revalidate(&mut session);
                     c.sessions.insert(id.clone(), session);
                 }
                 Err(_) => {

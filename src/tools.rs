@@ -16,7 +16,7 @@ pub use coverage::record_delivered_read;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::Write,
     path::{Path, PathBuf},
 };
@@ -236,10 +236,13 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_audit",
-                description: "Check output citations path:line[-line], source freshness, section coverage and pending investigations in one call. Structural checks do NOT prove semantic correctness. Paginated issues.",
+                description: "Check output citations path:line[-line], source freshness, section coverage and pending investigations in one call. Structural checks do NOT prove semantic correctness. Paginated issues; the first result returns revision, and offset > 0 requires expected_revision copied from that result. Restart from offset 0 when the revision changes.",
                 optional: true,
                 read_only: true,
-                parameters: schema(json!({"offset":number(),"limit":number()}), &[]),
+                parameters: schema(
+                    json!({"offset":number(),"limit":number(),"expected_revision":string()}),
+                    &[],
+                ),
             },
             ToolSpec {
                 name: "file_read",
@@ -267,7 +270,7 @@ impl ToolRegistry {
                 optional: true,
                 read_only: false,
                 parameters: schema(
-                    json!({"action":action(&["list","upsert","verify","verify_batch","final_check"]),"id":string(),"title":{"type":"string","description":"Non-empty title required for a NEW item. Omit when updating an existing id to preserve its title."},"status":action(&["uninvestigated","in_progress","written"]),"memory_ids":strings(),"source_ids":strings(),"section":string(),"verification_note":string(),"items":{"type":"object","description":"ONLY for action=verify_batch. Object keyed by existing investigation IDs; not an array and not used by upsert.","minProperties":1,"maxProperties":20,"additionalProperties":{"type":"object","properties":{"source_ids":strings(),"verification_note":string()},"required":["source_ids","verification_note"],"additionalProperties":false}},"offset":number(),"limit":number()}),
+                    json!({"action":action(&["list","upsert","verify","verify_batch","final_check"]),"id":{"type":"string","minLength":1},"title":{"type":"string","description":"Non-empty title required for a NEW item. Omit when updating an existing id to preserve its title."},"status":action(&["uninvestigated","in_progress","written"]),"memory_ids":strings(),"source_ids":strings(),"section":string(),"verification_note":string(),"items":{"type":"object","description":"ONLY for action=verify_batch. Object keyed by existing investigation IDs; not an array and not used by upsert.","minProperties":1,"maxProperties":20,"additionalProperties":{"type":"object","properties":{"source_ids":strings(),"verification_note":string()},"required":["source_ids","verification_note"],"additionalProperties":false}},"offset":number(),"limit":number()}),
                     &["action"],
                 ),
             },
@@ -1104,21 +1107,43 @@ pub fn execute_cancellable(
                         .iter()
                         .map(|id| s.memory.get(id).map(|m| m.id.clone()))
                         .collect::<Result<Vec<_>>>()?;
+                    let task_memory_ids = s
+                        .task
+                        .memory_ids
+                        .iter()
+                        .map(|ident| s.canonical_memory_id(ident))
+                        .collect::<Vec<_>>();
+                    // Older investigation records may also contain a memory
+                    // key instead of the canonical ID. Normalize those
+                    // references before the replacement removes old entries.
+                    let investigation_memory_refs = s
+                        .investigations
+                        .iter()
+                        .map(|item| {
+                            item.memory_refs
+                                .iter()
+                                .map(|(ident, revision)| (s.canonical_memory_id(ident), *revision))
+                                .collect::<BTreeMap<_, _>>()
+                        })
+                        .collect::<Vec<_>>();
                     let input: MemoryInput = serde_json::from_value(args["replacement"].clone())?;
                     let sources = s.source_refs(&input.source_ids)?;
                     let replacement = s.memory.replace(&actual, input, sources, &s.config)?;
                     let replacement_id = replacement.id.clone();
                     revalidate(s)?;
                     let m = s.memory.get(&replacement_id)?.meta();
-                    for id in &mut s.task.memory_ids {
-                        if actual.contains(id) {
-                            *id = m.id.clone();
-                        }
+                    for (id, canonical) in s.task.memory_ids.iter_mut().zip(task_memory_ids) {
+                        *id = if actual.contains(&canonical) {
+                            m.id.clone()
+                        } else {
+                            canonical
+                        };
                     }
                     s.task.memory_ids.sort();
                     s.task.memory_ids.dedup();
                     s.task.revision += 1;
-                    for item in &mut s.investigations {
+                    for (item, refs) in s.investigations.iter_mut().zip(investigation_memory_refs) {
+                        item.memory_refs = refs;
                         let mut replaced = false;
                         for id in &actual {
                             replaced |= item.memory_refs.remove(id).is_some();
@@ -1188,6 +1213,15 @@ pub fn execute_cancellable(
                 for id in &next.memory_ids {
                     s.memory.get(id)?;
                 }
+                // Store canonical IDs so protection and replacement remain
+                // correct even when the caller supplied a human-readable key.
+                next.memory_ids = next
+                    .memory_ids
+                    .iter()
+                    .map(|ident| s.memory.get(ident).map(|memory| memory.id.clone()))
+                    .collect::<Result<Vec<_>>>()?;
+                next.memory_ids.sort();
+                next.memory_ids.dedup();
                 next.revision = s.task.revision + 1;
                 let mut compact = json!(next);
                 compact.as_object_mut().unwrap().remove("details");
@@ -1443,6 +1477,11 @@ pub fn execute_cancellable(
                 )
             }
             "upsert" => {
+                if args["id"].as_str().is_some_and(|id| id.trim().is_empty()) {
+                    bail!(
+                        "invalid_argument_value: id must not be empty for investigation action=upsert"
+                    );
+                }
                 let id = args["id"]
                     .as_str()
                     .map(str::to_string)

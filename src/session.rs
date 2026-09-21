@@ -264,13 +264,25 @@ impl Session {
         self.task
             .memory_ids
             .iter()
-            .cloned()
+            // Task state historically accepted either a memory ID or key.
+            // Resolve aliases here as well as at write time so older sessions
+            // cannot delete a memory that is still pinned by its key.
+            .map(|ident| self.canonical_memory_id(ident))
             .chain(
                 self.investigations
                     .iter()
-                    .flat_map(|i| i.memory_refs.keys().cloned()),
+                    .flat_map(|i| i.memory_refs.keys())
+                    .map(|ident| self.canonical_memory_id(ident)),
             )
             .collect()
+    }
+    /// Resolve both current IDs and legacy human-readable memory keys.
+    /// Unknown references are retained so protection remains conservative.
+    pub fn canonical_memory_id(&self, ident: &str) -> String {
+        self.memory
+            .get(ident)
+            .map(|memory| memory.id.clone())
+            .unwrap_or_else(|_| ident.to_string())
     }
     pub fn source_refs(&self, ids: &[String]) -> Result<Vec<Source>> {
         ids.iter()
