@@ -1652,7 +1652,8 @@ pub fn execute_cancellable(
                 "append" => format!("{old}{new}"),
                 "section" => {
                     let heading = text(&args, "section")?;
-                    let target = section_text(&old, heading)?;
+                    let resolved = documentation::resolve_heading(&old, heading)?;
+                    let target = &old[resolved.start..resolved.end];
                     if args["expected_section_hash"].as_str()
                         != Some(hash(target.as_bytes()).as_str())
                     {
@@ -1663,9 +1664,15 @@ pub fn execute_cancellable(
                             "invalid_argument_value: section replacement must retain its heading"
                         );
                     }
-                    let mut candidate = old.replacen(target, &format!("{}\n", new.trim_end()), 1);
+                    let replacement = format!("{}\n", new.trim_end());
+                    let mut candidate = format!(
+                        "{}{}{}",
+                        &old[..resolved.start],
+                        replacement,
+                        &old[resolved.end..]
+                    );
                     section_text(&candidate, heading)?;
-                    if !old.ends_with('\n') && target == old {
+                    if !old.ends_with('\n') && resolved.start == 0 && resolved.end == old.len() {
                         candidate = new.to_string();
                     }
                     candidate
