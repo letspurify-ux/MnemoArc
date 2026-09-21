@@ -224,7 +224,16 @@ async fn read_parallel(
                         .or_else(|| result["next_cursor"]["id"].as_u64())
                     && let Ok(bundle) = temp.history.read(id)
                 {
-                    let id = s.history.push(bundle.messages.clone(), true);
+                    // The archive was created in a temporary read session.
+                    // Its result can contain source objects whose IDs were
+                    // allocated there, so remap the archived messages too;
+                    // otherwise a later history continuation exposes IDs that
+                    // the owning session cannot resolve.
+                    let mut messages = bundle.messages.clone();
+                    for message in &mut messages {
+                        remap_source_ids(message, &source_ids);
+                    }
+                    let id = s.history.push(messages, true);
                     s.history.bundles.back_mut().unwrap().active = false;
                     result["archive_id"] = json!(id);
                     if result["next_cursor"]["tool"] == "history" {
@@ -288,7 +297,12 @@ pub async fn run_session_controlled(
         while let Ok(command) = commands.try_recv() {
             match command {
                 RunCommand::Configure(config) => s.pending_config = Some(*config),
-                RunCommand::Tools(names) => s.active_tools = names,
+                RunCommand::Tools(names) => {
+                    s.active_tools = names;
+                    // An explicit web selection supersedes a model's older
+                    // tool_select request that was waiting for the next batch.
+                    s.pending_tools = None;
+                }
             }
         }
         if let Some(config) = s.pending_config.clone() {

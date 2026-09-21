@@ -80,6 +80,17 @@ fn changed(s: &WebState, c: &mut Core) {
     c.revision = c.revision.saturating_add(1);
     let _ = s.events.send(c.revision);
 }
+fn same_config(a: &Config, b: &Config) -> bool {
+    // Config serialization intentionally omits the secret, so compare it
+    // separately when deciding whether an in-flight setting command applied.
+    let (Ok(serialized_a), Ok(serialized_b)) =
+        (serde_json::to_value(a), serde_json::to_value(b))
+    else {
+        return false;
+    };
+    a.api_key.as_ref().map(|key| &key.0) == b.api_key.as_ref().map(|key| &key.0)
+        && serialized_a == serialized_b
+}
 fn credential_path(path: &FsPath) -> PathBuf {
     path.with_extension("credentials.json")
 }
@@ -507,10 +518,18 @@ async fn session_tools(
         && r.id == id
     {
         r.commands
-            .try_send(RunCommand::Tools(input.names))
+            .try_send(RunCommand::Tools(input.names.clone()))
             .map_err(|_| busy())?;
+        // Keep the latest request in the owner session as well. The agent
+        // owns a private clone while running, so cancellation can otherwise
+        // let its older active_tools overwrite a queued selection.
+        c.sessions.get_mut(&id).unwrap().pending_tools = Some(input.names);
     } else {
-        c.sessions.get_mut(&id).unwrap().active_tools = input.names;
+        let session = c.sessions.get_mut(&id).unwrap();
+        session.active_tools = input.names;
+        // An explicit user selection supersedes any older model tool_select
+        // that was waiting for a request boundary.
+        session.pending_tools = None;
     }
     changed(&s, &mut c);
     Ok(Json(json!({"saved":true})))
@@ -618,6 +637,27 @@ async fn run(
                         if advanced {
                             c.streams.remove(&snapshot.id);
                         }
+                        // The owner may have accepted a setting/tool change
+                        // after this private snapshot was cloned. Preserve
+                        // that queued request until the agent consumes it;
+                        // otherwise the next snapshot would erase it.
+                        if let Some(owner) = c.sessions.get(&snapshot.id) {
+                            if let Some(pending) = owner.pending_config.clone() {
+                                if same_config(&snapshot.config, &pending) {
+                                    snapshot.pending_config = None;
+                                } else {
+                                    snapshot.pending_config = Some(pending);
+                                }
+                            }
+                            if let Some(pending) = owner.pending_tools.clone() {
+                                if snapshot.active_tools == pending {
+                                    snapshot.pending_tools = None;
+                                } else {
+                                    snapshot.active_tools = pending.clone();
+                                    snapshot.pending_tools = Some(pending);
+                                }
+                            }
+                        }
                         c.sessions.insert(snapshot.id.clone(), snapshot);
                     }
                     AgentEvent::Tool { session, .. } => {
@@ -650,6 +690,45 @@ async fn run(
             match outcome {
                 Ok(session) => {
                     let mut session = session;
+                    // The web owner records a pending setting before sending
+                    // the command to the agent. If cancellation wins before
+                    // that command is consumed, the private agent copy still
+                    // has the old config and would otherwise erase the owner's
+                    // pending change when its final snapshot is stored.
+                    if let Some(pending) = c
+                        .sessions
+                        .get(&id)
+                        .and_then(|owner| owner.pending_config.clone())
+                    {
+                        if same_config(&session.config, &pending) {
+                            // The command was applied even if its clearing
+                            // snapshot was not delivered before cancellation.
+                            session.pending_config = None;
+                        } else {
+                            // Preserve the newest requested config for the
+                            // next run; an older private pending value must not
+                            // hide it.
+                            session.pending_config = Some(pending);
+                        }
+                    }
+                    if let Some(pending) = c
+                        .sessions
+                        .get(&id)
+                        .and_then(|owner| owner.pending_tools.clone())
+                    {
+                        if session.active_tools == pending {
+                            // The command was consumed by the agent. A model
+                            // tool_select queued on the private copy must not
+                            // override the user's explicit selection.
+                            session.pending_tools = None;
+                        } else {
+                            // The command was still queued when the run
+                            // ended; make the user's latest selection active
+                            // for the next run and discard stale private work.
+                            session.active_tools = pending;
+                            session.pending_tools = None;
+                        }
+                    }
                     let _ = tools::revalidate(&mut session);
                     c.sessions.insert(id.clone(), session);
                 }
