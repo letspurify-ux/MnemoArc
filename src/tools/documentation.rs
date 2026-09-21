@@ -239,6 +239,7 @@ pub(super) fn execute(
                             i + 1,
                             c[1].to_string(),
                             line.chars().take(500).collect::<String>(),
+                            line.chars().count() > 500,
                         ));
                         if rows.len() > 100000 {
                             bail!("search_too_broad: narrow pattern/query");
@@ -252,8 +253,12 @@ pub(super) fn execute(
                 bail!("invalid_cursor");
             }
             let end = (offset + n(args, "limit", 20).clamp(1, 100)).min(rows.len());
-            let results=rows[offset..end].iter().map(|(path,digest,line,name,excerpt)| {
-                let source=observe_hashed(s,path,digest.clone(),*line,*line,excerpt);
+            let results=rows[offset..end].iter().map(|(path,digest,line,name,excerpt,truncated)| {
+                let source=super::observe_hashed_quality(s,path,digest.clone(),*line,*line,excerpt,super::EvidenceQuality {
+                    line_start_complete: true,
+                    line_end_complete: true,
+                    evidence_truncated: *truncated,
+                });
                 json!({"name":name,"path":path,"line":line,"declaration":excerpt,"source":source})
             }).collect::<Vec<_>>();
             Ok(
@@ -383,7 +388,24 @@ pub(super) fn missing_citation_ranges(
                     .as_deref()
                     .is_some_and(|p| Path::new(p) == cited)
             })
-            .filter_map(|source| Some((source.start_line?, source.end_line?)))
+            .filter_map(|source| {
+                // A cursor may begin or end in the middle of a line, and
+                // search/outline results may contain only a capped excerpt.
+                // Such observations identify navigation context but cannot
+                // attest the entire cited line range.
+                if source.evidence_truncated {
+                    return None;
+                }
+                let mut start = source.start_line?;
+                let mut end = source.end_line?;
+                if !source.line_start_complete {
+                    start = start.saturating_add(1);
+                }
+                if !source.line_end_complete {
+                    end = end.saturating_sub(1);
+                }
+                (start <= end).then_some((start, end))
+            })
             .collect();
         ranges.sort_unstable();
         let mut next = citation.begin;

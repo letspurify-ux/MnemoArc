@@ -350,6 +350,9 @@ impl Session {
             path: None,
             start_line: None,
             end_line: None,
+            line_start_complete: true,
+            line_end_complete: true,
+            evidence_truncated: false,
             hash: None,
             excerpt: text.chars().take(2000).collect(),
         };

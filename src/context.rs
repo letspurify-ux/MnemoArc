@@ -345,6 +345,14 @@ impl ContextManager {
             }
         }
         if ids.is_empty() {
+            // A previous cleanup may already have retired every complete
+            // group. Crossing the high-water mark alone is not a capacity
+            // failure when the current request still fits and retained
+            // history is below its hard target; there is nothing left to
+            // evict, so continue with the existing context.
+            if request_tokens <= budget && retained_bytes <= history_target {
+                return Ok(false);
+            }
             bail!(
                 "context_capacity: no complete old group can be evicted; reduce tool/state size or increase budget"
             );

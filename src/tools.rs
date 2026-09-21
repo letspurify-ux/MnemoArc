@@ -200,7 +200,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "source_search",
-                description: "Search source lines: query is literal text by default. Prefer queries:[\"agent\",\"run\",\"db\"] for literal OR without regex escaping. Supply exactly one of query or queries. Use regex:true only for intentional regular expressions; punctuation such as .on( is literal unless regex:true. case_sensitive defaults true; whole_word defaults false (Unicode word boundaries). path selects one exact file (no glob syntax); path_glob filters multiple files (pattern is a legacy alias). Do not combine path with path_glob or pattern. mode=matches (default) returns matching lines and source IDs; files returns matching paths; count returns matching-line counts per file. before/after add up to 20 context lines each in matches mode. Each displayed line is capped at 500 characters with truncation marked. Reuse the same search options with cursor for pagination; limit may change. Hashes detect source changes",
+                description: "Search source lines: query is literal text by default. Prefer queries:[\"agent\",\"run\",\"db\"] for literal OR without regex escaping. Supply exactly one of query or queries. Use regex:true only for intentional regular expressions; punctuation such as .on( is literal unless regex:true. case_sensitive defaults true; whole_word defaults false (Unicode word boundaries). path selects one exact file (no glob syntax); path_glob filters multiple files (pattern is a legacy alias). Do not combine path with path_glob or pattern. mode=matches (default) returns matching lines and source IDs; files returns matching paths; count returns matching-line counts per file. before/after add up to 20 context lines each in matches mode. Each displayed line is capped at 500 characters with truncation marked; truncated matches are navigation only and do not satisfy citation coverage, so read the full line with file_read. Reuse the same search options with cursor for pagination; limit may change. Hashes detect source changes",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -260,7 +260,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "file_read",
-                description: "Read a new range with path, 1-based start_line and max_lines (line count). For a targeted source question, first locate the identifier/route with source_search or code_outline, then supply an explicit range; do not start with default first-page reads of every file. limit is accepted as a compatibility alias for max_lines; prefer max_lines. Do not use offset as a line number. Example: {path:\"src/agent.rs\",start_line:160,max_lines:140}. Relative paths resolve against project.root, NEVER the output directory or workspace parent. For project.output outside the project, copy the absolute path returned by document_inspect; do not shorten it to a basename. Example: root=/workspace/app and output=/workspace/app_summary.md requires path=/workspace/app_summary.md, not app_summary.md. Use document_inspect to read the configured output without supplying a path. If truncated, continue ONLY with {cursor: next_cursor.cursor}; never combine cursor with path/start_line/max_lines/offset. A cursor completes the original requested range and expires if the file changes. Once that range is complete, next_line indicates where a NEW range can start. Returned line_start/line_end describe delivered text; boundary flags mark partial lines. Use force_read=true only for deliberate repeat verification.",
+                description: "Read a new range with path, 1-based start_line and max_lines (line count). For a targeted source question, first locate the identifier/route with source_search or code_outline, then supply an explicit range; do not start with default first-page reads of every file. limit is accepted as a compatibility alias for max_lines; prefer max_lines. Do not use offset as a line number. Example: {path:\"src/agent.rs\",start_line:160,max_lines:140}. Relative paths resolve against project.root, NEVER the output directory or workspace parent. For project.output outside the project, copy the absolute path returned by document_inspect; do not shorten it to a basename. Example: root=/workspace/app and output=/workspace/app_summary.md requires path=/workspace/app_summary.md, not app_summary.md. Use document_inspect to read the configured output without supplying a path. If truncated, continue ONLY with {cursor: next_cursor.cursor}; never combine cursor with path/start_line/max_lines/offset. A cursor completes the original requested range and expires if the file changes. Once that range is complete, next_line indicates where a NEW range can start. Returned line_start/line_end describe delivered text; boundary flags mark partial lines, and partial boundary lines do not satisfy citation coverage. Use force_read=true only for deliberate repeat verification.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -280,7 +280,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "investigation",
-                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. Both verify and verify_batch require existing written items. If not written, write the section and upsert with status=written and section first; source IDs alone do not mark an item written. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified; summary groups failures by code and retry_ids identifies only failed items. Already verified items in verify_batch reuse their existing evidence after section/source/memory freshness checks; new supplied evidence is ignored for those items. Use single verify to explicitly replace evidence. After edits, verify only verification_required_ids returned by document_edit. Coverage failures return all missing_ranges together. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. status=written requires a non-empty section (supplied now or preserved from the existing item). For written items, upsert checks the current document and normalizes section to its full heading; a unique title without # is accepted, including numbering. Planned sections may be registered before writing with status=in_progress",
+                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. Both verify and verify_batch require existing written items. If not written, write the section and upsert with status=written and section first; source IDs alone do not mark an item written. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified; summary groups failures by code and retry_ids identifies only failed items. Already verified items in verify_batch reuse their existing evidence after section/source/memory freshness checks; new supplied evidence is ignored for those items. Use single verify to explicitly replace evidence. After edits, verify only verification_required_ids returned by document_edit. Coverage failures return all missing_ranges together. Verification coverage counts only complete file lines; partial file_read boundaries, truncated search lines and code outlines are navigation context and require a full file_read. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. status=written requires a non-empty section (supplied now or preserved from the existing item). For written items, upsert checks the current document and normalizes section to its full heading; a unique title without # is accepted, including numbering. Planned sections may be registered before writing with status=in_progress",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -1076,29 +1076,29 @@ fn search_text(path: &Path) -> Result<Option<String>> {
     }
 }
 
-fn observe(
-    s: &mut Session,
-    path: &Path,
-    contents: &str,
-    start: usize,
-    end: usize,
-    excerpt: &str,
-) -> Source {
-    observe_hashed(s, path, hash(contents.as_bytes()), start, end, excerpt)
+#[derive(Clone, Copy)]
+struct EvidenceQuality {
+    line_start_complete: bool,
+    line_end_complete: bool,
+    evidence_truncated: bool,
 }
-fn observe_hashed(
+fn observe_hashed_quality(
     s: &mut Session,
     path: &Path,
     content_hash: String,
     start: usize,
     end: usize,
     excerpt: &str,
+    quality: EvidenceQuality,
 ) -> Source {
     if let Some(source) = s.sources.values().find(|source| {
         source.path.as_deref() == path.to_str()
             && source.hash.as_deref() == Some(&content_hash)
             && source.start_line == Some(start)
             && source.end_line == Some(end)
+            && source.line_start_complete == quality.line_start_complete
+            && source.line_end_complete == quality.line_end_complete
+            && source.evidence_truncated == quality.evidence_truncated
             && source.excerpt == excerpt.chars().take(2000).collect::<String>()
     }) {
         return source.clone();
@@ -1110,6 +1110,9 @@ fn observe_hashed(
         path: Some(path.display().to_string()),
         start_line: Some(start),
         end_line: Some(end),
+        line_start_complete: quality.line_start_complete,
+        line_end_complete: quality.line_end_complete,
+        evidence_truncated: quality.evidence_truncated,
         hash: Some(content_hash),
         excerpt: excerpt.chars().take(2000).collect(),
     };
@@ -1550,7 +1553,11 @@ pub fn execute_cancellable(
                 .map(|source| {
                     json!({
                         "id":source.id, "path":source.path, "start_line":source.start_line,
-                        "end_line":source.end_line, "hash":source.hash,
+                        "end_line":source.end_line,
+                        "line_start_complete":source.line_start_complete,
+                        "line_end_complete":source.line_end_complete,
+                        "evidence_truncated":source.evidence_truncated,
+                        "hash":source.hash,
                         "excerpt":source.excerpt.chars().take(600).collect::<String>(),
                         "excerpt_truncated":source.excerpt.chars().count() > 600
                     })
@@ -2099,13 +2106,22 @@ fn read_file(
     let mut content = bounded_text(s, &selected, offset);
     let shown = content["text"].as_str().unwrap();
     let observed_start = start + selected.chars().take(offset).filter(|c| *c == '\n').count();
-    let source = observe(
+    let first_line_complete = offset == 0 || selected.chars().nth(offset - 1) == Some('\n');
+    let shown_end = offset + shown.chars().count();
+    let last_line_complete =
+        shown.ends_with('\n') || selected.chars().nth(shown_end).is_none_or(|c| c == '\n');
+    let source = observe_hashed_quality(
         s,
         &path,
-        &contents,
+        hash(contents.as_bytes()),
         observed_start,
         observed_start + shown.lines().count().saturating_sub(1),
         shown,
+        EvidenceQuality {
+            line_start_complete: first_line_complete,
+            line_end_complete: last_line_complete,
+            evidence_truncated: false,
+        },
     );
     let line_offsets = std::iter::once(0)
         .chain(
@@ -2118,13 +2134,8 @@ fn read_file(
         .collect::<Vec<_>>();
     content["line_start"] = json!(observed_start);
     content["line_end"] = json!(source.end_line);
-    content["first_line_complete"] =
-        json!(offset == 0 || selected.chars().nth(offset - 1) == Some('\n'));
-    let shown_end = offset + content["text"].as_str().unwrap().chars().count();
-    content["last_line_complete"] = json!(
-        content["text"].as_str().unwrap().ends_with('\n')
-            || selected.chars().nth(shown_end).is_none_or(|c| c == '\n')
-    );
+    content["first_line_complete"] = json!(first_line_complete);
+    content["last_line_complete"] = json!(last_line_complete);
     content["line_offsets"] = json!(line_offsets);
     let truncated = content["truncated"].as_bool().unwrap();
     let next_line = if truncated {
@@ -2366,6 +2377,8 @@ pub fn limit_result(
                     v["data"]["content"]["line_end"] = json!(end);
                     v["data"]["content"]["last_line_complete"] = json!(complete);
                     v["data"]["source"]["end_line"] = json!(end);
+                    v["data"]["source"]["line_end_complete"] = json!(complete);
+                    v["data"]["source"]["evidence_truncated"] = json!(false);
                     v["data"]["content"]["line_offsets"] = json!(
                         std::iter::once(0)
                             .chain(
@@ -2422,6 +2435,10 @@ pub fn limit_result(
                         .chars()
                         .take(2000)
                         .collect();
+                    source.line_end_complete = output["data"]["content"]["last_line_complete"]
+                        .as_bool()
+                        .unwrap_or(false);
+                    source.evidence_truncated = false;
                     s.sources.insert(source.id.clone(), source);
                 }
                 return output;

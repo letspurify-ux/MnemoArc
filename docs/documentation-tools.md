@@ -6,7 +6,7 @@
 
 | 도구 | 사용법과 보장 |
 |---|---|
-| `file_read` | 전체 줄 수·파일 해시와 `content.line_start`, `content.line_offsets`를 제공한다. `line_offsets`는 반환 텍스트 내 Unicode 문자 위치이며 각 줄의 시작을 가리킨다. 본문을 잘라도 이어 읽기 위치와 줄 지도를 함께 갱신한다. 파일 끝을 지난 읽기는 근거 ID 없이 빈 결과를 반환하고, 빈 근거는 검증에 사용할 수 없다. |
+| `file_read` | 전체 줄 수·파일 해시와 `content.line_start`, `content.line_offsets`를 제공한다. `line_offsets`는 반환 텍스트 내 Unicode 문자 위치이며 각 줄의 시작을 가리킨다. 본문을 잘라도 이어 읽기 위치와 줄 지도를 함께 갱신한다. `first_line_complete`·`last_line_complete`가 거짓인 경계 줄은 인용 검증 범위에 포함되지 않으므로 커서로 범위를 끝까지 읽어야 한다. 파일 끝을 지난 읽기는 근거 ID 없이 빈 결과를 반환하고, 빈 근거는 검증에 사용할 수 없다. |
 | `document_inspect` | 인자 없이 출력 파일의 해시·실제 줄 수·목차를 조회한다. `section`에 제목을 주면 해당 섹션만 읽고 섹션 해시를 반환한다. `offset` 또는 `coverage_offset`으로 이어 읽을 때는 첫 페이지의 `hash`를 `expected_hash`로 전달해야 하며, 중간에 파일이 바뀌면 거부한다. |
 | `document_edit`의 `section` | `section`, `text`, `expected_hash`, `expected_section_hash`를 받아 해당 제목부터 다음 동급/상위 제목 전까지 교체한다. 원래 제목을 유지해야 한다. 코드 펜스 안의 제목은 무시하며 중복 제목과 외부 편집 충돌을 거부한다. 기존 원자적 파일 교체와 경로 제한을 적용한다. |
 | `document_audit` | `path.ext:10-20` 및 Markdown 링크의 `path.ext#L10-L20` 출처를 검사한다. 일반 코드 펜스 안의 예시는 인용 검사에서 제외하되 Mermaid의 소스 인용은 검사한다. 파일 존재·허용 경로·줄 범위·연결된 소스 변경·문서 섹션·미검증 조사 항목을 한 번에 점검한다. 오류 목록은 페이지 조회 가능하다. |
@@ -109,7 +109,7 @@
 
 모든 검색 모드에서 `matched_files`는 검색한 텍스트 파일 수, `matching_files`는 실제 일치가 있는 파일 수, `total_matching_lines`는 일치한 전체 줄 수다. `limit`은 `matches`에서 줄 수, `files`와 `count`에서 파일 수이며 최대 100이다. 다음 페이지는 기존 검색 인자에 `cursor`를 추가한다. `limit`은 바꿀 수 있지만 검색·문맥·모드·경로 필터가 바뀌면 커서가 만료된다.
 
-일치 줄과 문맥 줄은 각각 최대 500 Unicode 문자로 표시하고 생략이 있으면 `truncated=true`를 붙인다. `context`에는 일치 줄을 제외한 앞뒤 줄과 줄 번호가 들어간다. 출처 ID는 일치 줄만 가리킨다. 문맥을 검증 근거로 사용할 때에는 `file_read`로 해당 범위를 읽는다.
+일치 줄과 문맥 줄은 각각 최대 500 Unicode 문자로 표시하고 생략이 있으면 `truncated=true`를 붙인다. 잘린 일치 줄의 출처 ID는 탐색용이며 인용 검증을 충족하지 않으므로 `file_read`로 전체 줄을 읽어야 한다. `context`에는 일치 줄을 제외한 앞뒤 줄과 줄 번호가 들어간다. 출처 ID는 일치 줄만 가리킨다. 문맥을 검증 근거로 사용할 때에도 `file_read`로 해당 범위를 읽는다.
 
 내용 검색과 심볼 검색은 파일 후보 목록을 만든 뒤 각 파일을 한 번 읽어 텍스트 검사와 탐색을 수행한다. 내용 검색은 반환할 페이지의 결과만 보관하므로 100,000줄이 넘는 일치도 전체 결과를 메모리에 쌓지 않고 페이지 조회할 수 있다. 파일 내용과 검색 조건의 해시를 재검사하므로 다음 페이지에서도 전체 대상 파일을 다시 읽는다. 지속 캐시나 의미 기반 심볼 인덱스는 사용하지 않는다.
 
@@ -154,7 +154,7 @@ Rust(`rs`), JavaScript(`js`, `jsx`, `mjs`, `cjs`), TypeScript(`ts`, `tsx`, `mts`
 
 C#은 블록·파일 범위 namespace(`module`), class/struct/interface/record/enum, 생성자·메서드·지역 함수, 필드·상수, 프로퍼티·인덱서(`property`), get/set/init/add/remove(`accessor`), 이벤트·delegate·연산자·소멸자를 탐색한다. namespace도 심볼 깊이에 포함된다. `namespace Demo.Core;` 아래 `Store` 클래스의 멤버 조회에는 `container:"Demo.Core::Store"`를 사용하며, 반환된 `qualified_name`을 그대로 복사한다. 파일 범위 namespace 심볼 자체의 읽기는 namespace 선언만 포함한다. partial 타입 병합, record의 컴파일러 생성 멤버, 활성 전처리 분기 선택, 의미 기반 참조 해석은 하지 않는다. `.csproj`, `.razor`, `.cshtml`은 구조 탐색 대상이 아니다.
 
-구문 오류가 있으면 `has_parse_errors=true`로 표시하며 부분 구조를 반환할 수 있다. 상세 조회의 `source`는 이름 선언 줄을, `signature_source`는 표시된 시그니처의 줄 범위를 가리킨다. 시그니처와 선언 발췌는 최대 500문자다. `signature_truncated=true`이면 시그니처가 불완전하므로 필요한 원문을 읽는다. 시그니처는 실행 동작의 근거를 대신하지 않는다. 본문은 `symbol_read`로 확인하며, 한 줄에 여러 선언이 있으면 같은 줄의 주변 코드도 포함된다.
+구문 오류가 있으면 `has_parse_errors=true`로 표시하며 부분 구조를 반환할 수 있다. 상세 조회의 `source`는 이름 선언 줄을, `signature_source`는 표시된 시그니처의 줄 범위를 가리킨다. 구조 목록과 시그니처 발췌는 탐색용 출처이므로 인용 검증에는 사용할 수 없다. 시그니처와 선언 발췌는 최대 500문자다. `signature_truncated=true`이면 시그니처가 불완전하므로 필요한 원문을 읽는다. 시그니처는 실행 동작의 근거를 대신하지 않는다. 본문은 `symbol_read`로 확인하며, 한 줄에 여러 선언이 있으면 같은 줄의 주변 코드도 포함된다.
 
 `symbol_read`의 시작 줄은 심볼 범위 밖이면 거부하고, 요청한 줄 수는 심볼 끝에서 제한한다. 일부 줄만 읽은 결과를 전체 구현을 확인한 것으로 취급하지 않는다. 출력 예산 때문에 잘린 경우 먼저 `file_read` 커서로 요청 범위를 마저 읽는다.
 

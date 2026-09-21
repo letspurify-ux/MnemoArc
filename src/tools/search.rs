@@ -212,7 +212,19 @@ pub(super) fn execute(
         output["matches"] = json!(rows.iter().map(|row| {
             // Context is navigation help. The source observation attests only
             // the matching line, preserving the existing evidence contract.
-            let source = observe_hashed(s, &row.path, row.hash.clone(), row.line, row.line, &row.text);
+            let source = super::observe_hashed_quality(
+                s,
+                &row.path,
+                row.hash.clone(),
+                row.line,
+                row.line,
+                &row.text,
+                super::EvidenceQuality {
+                    line_start_complete: true,
+                    line_end_complete: true,
+                    evidence_truncated: row.truncated,
+                },
+            );
             let mut result = json!({"path":row.path,"line":row.line,"text":row.text,"truncated":row.truncated,"source":source});
             if before > 0 || after > 0 {
                 result["context"] = json!(row.context);

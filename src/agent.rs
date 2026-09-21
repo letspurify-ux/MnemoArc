@@ -56,6 +56,9 @@ fn same_source(a: &crate::memory::Source, b: &crate::memory::Source) -> bool {
         && a.path == b.path
         && a.start_line == b.start_line
         && a.end_line == b.end_line
+        && a.line_start_complete == b.line_start_complete
+        && a.line_end_complete == b.line_end_complete
+        && a.evidence_truncated == b.evidence_truncated
         && a.hash == b.hash
         && a.excerpt == b.excerpt
 }

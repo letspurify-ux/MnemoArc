@@ -6,6 +6,18 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 // Process-wide allocation also keeps parallel read workers collision-free.
 pub fn source_id() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -41,6 +53,17 @@ pub struct Source {
     pub path: Option<String>,
     pub start_line: Option<usize>,
     pub end_line: Option<usize>,
+    /// Whether the first/last reported lines are complete in the delivered
+    /// excerpt. Older persisted sources predate these fields and are treated
+    /// as complete for backward compatibility.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub line_start_complete: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub line_end_complete: bool,
+    /// Search and outline tools may cap an excerpt before the source line or
+    /// signature ends. Such evidence must not satisfy a full citation range.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub evidence_truncated: bool,
     pub hash: Option<String>,
     pub excerpt: String,
 }

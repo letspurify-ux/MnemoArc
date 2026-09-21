@@ -260,24 +260,34 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
     result["recovery"]["tools"] = json!(available);
 }
 
-/// Failures cannot evade the bound by changing an ID or argument every round.
-/// A success resets only that tool's failures; unrelated writes cannot hide it.
+/// Failures cannot evade the bound by changing an ID, argument or recovery
+/// code every round. A success resets only that tool's failures; unrelated
+/// writes cannot hide it.
 #[derive(Default)]
-pub struct FailureTracker(BTreeMap<(String, String), usize>);
+pub struct FailureTracker {
+    by_tool_and_code: BTreeMap<(String, String), usize>,
+    by_tool: BTreeMap<String, usize>,
+}
 impl FailureTracker {
     pub fn observe(&mut self, tool: &str, result: &Value, limit: usize) -> Option<String> {
         if result["status"] == "ok" {
-            self.0.retain(|(name, _), _| name != tool);
+            self.by_tool_and_code.retain(|(name, _), _| name != tool);
+            self.by_tool.remove(tool);
             return None;
         }
         if result["status"] == "cancelled" {
             return None;
         }
         let code = result["recovery"]["code"].as_str().unwrap_or("tool_error");
-        let count = self.0.entry((tool.into(), code.into())).or_default();
-        *count += 1;
-        (*count >= limit).then(|| format!(
-            "tool_recovery_limit: {tool} failed {count} times with {code}; last cause: {}; state and completed writes retained",
+        let code_count = self
+            .by_tool_and_code
+            .entry((tool.into(), code.into()))
+            .or_default();
+        *code_count += 1;
+        let total_count = self.by_tool.entry(tool.into()).or_default();
+        *total_count += 1;
+        (*total_count >= limit).then(|| format!(
+            "tool_recovery_limit: {tool} failed {total_count} times (latest code {code}, code count {code_count}); last cause: {}; state and completed writes retained",
             result["error"].as_str().unwrap_or("unknown failure")
         ))
     }

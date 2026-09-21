@@ -583,21 +583,31 @@ pub(super) fn execute(
         let line = symbol["name_line"].as_u64().unwrap() as usize;
         let excerpt: String = lines[line - 1].chars().take(500).collect();
         symbol["declaration"] = json!(excerpt);
-        symbol["source"] = json!(observe_hashed(
+        symbol["source"] = json!(super::observe_hashed_quality(
             s,
             &path,
             digest.clone(),
             line,
             line,
-            &excerpt
+            &excerpt,
+            super::EvidenceQuality {
+                line_start_complete: true,
+                line_end_complete: true,
+                evidence_truncated: true,
+            },
         ));
-        symbol["signature_source"] = json!(observe_hashed(
+        symbol["signature_source"] = json!(super::observe_hashed_quality(
             s,
             &path,
             digest.clone(),
             symbol["signature_start_line"].as_u64().unwrap() as usize,
             symbol["signature_end_line"].as_u64().unwrap() as usize,
             symbol["signature"].as_str().unwrap(),
+            super::EvidenceQuality {
+                line_start_complete: true,
+                line_end_complete: true,
+                evidence_truncated: true,
+            },
         ));
     }
     let mut result = json!({"path":path,"hash":digest,"engine":"tree-sitter","language":language,"view":filters["view"],
