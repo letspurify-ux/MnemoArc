@@ -123,7 +123,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_read",
-                description: "Load memory by ID/key; offset is character offset for bounded continuation. Revalidates file sources",
+                description: "Load memory by ID/key; offset is character offset for bounded continuation. Returns compact metadata plus custom_metadata exactly as written. Revalidates file sources",
                 optional: false,
                 read_only: true,
                 parameters: schema(json!({"id":string(),"offset":number()}), &["id"]),
@@ -1304,7 +1304,7 @@ pub fn execute_cancellable(
             revalidate(s)?;
             let m = s.memory.get(text(&args, "id")?)?;
             Ok(
-                json!({"metadata":m.meta(),"body":bounded_text(s,&m.body,n(&args,"offset",0)),"sources":m.sources,"inferred":m.inferred,"kind":m.kind}),
+                json!({"metadata":m.meta(),"custom_metadata":m.metadata,"body":bounded_text(s,&m.body,n(&args,"offset",0)),"sources":m.sources,"inferred":m.inferred,"kind":m.kind}),
             )
         }
         "memory_find" => {
