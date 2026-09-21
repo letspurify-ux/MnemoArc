@@ -166,6 +166,28 @@ async fn execute_one(
         }
     }
 }
+
+fn rebase_document_call(call: &ToolCall, hash: Option<&str>) -> (ToolCall, bool) {
+    let Some(hash) = hash else {
+        return (call.clone(), false);
+    };
+    if !matches!(call.name.as_str(), "document_edit" | "document_edit_batch") {
+        return (call.clone(), false);
+    }
+    let Ok(mut args) = serde_json::from_str::<Value>(&call.arguments) else {
+        return (call.clone(), false);
+    };
+    if args["expected_hash"].as_str() == Some(hash) || args["expected_hash"].is_null() {
+        return (call.clone(), false);
+    }
+    args["expected_hash"] = json!(hash);
+    let Ok(arguments) = serde_json::to_string(&args) else {
+        return (call.clone(), false);
+    };
+    let mut rebased = call.clone();
+    rebased.arguments = arguments;
+    (rebased, true)
+}
 async fn read_parallel(
     s: &mut Session,
     calls: &[ToolCall],
@@ -456,7 +478,7 @@ pub async fn run_session_controlled(
             "document_repair_requests_remaining":s.config.document_repair_limit.saturating_sub(s.document_review.repair_requests),
             "pending_count":s.investigations.iter().filter(|i|i.status != "verified").count(),
             "completion_error":if finalization_attempts > 0 { s.last_error.as_deref() } else { None },
-            "instruction":match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, batch targeted reads for missing evidence, then repair all known issues in one cohesive write/patch when safe. Run verify_batch once after all edits, not after every small correction. Only requests containing document_edit consume the repair budget (one per request, including failed edits); reads and verification do not. At zero remaining, finish verification and review without another edit. The remaining edit request budget is in document_repair_requests_remaining; audit existing sections and fix factual errors within that budget. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, write investigated sections now and preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>"For source documentation, investigate incrementally and write completed sections. For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. Answer once evidence is sufficient; no source audit or document write is required."}});
+            "instruction":match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, batch targeted reads for missing evidence, then repair all known issues in one cohesive write/patch when safe. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Run verify_batch once after all edits, not after every small correction. Only requests containing document_edit or document_edit_batch consume the repair budget (one per request, including failed edits); reads and verification do not. At zero remaining, finish verification and review without another edit. The remaining edit request budget is in document_repair_requests_remaining; audit existing sections and fix factual errors within that budget. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, write investigated sections now and preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>"For source documentation, investigate incrementally and write completed sections. For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. Answer once evidence is sufficient; no source audit or document write is required."}});
         let definitions = ToolRegistry::definitions(&s);
         let mut request = match ContextManager::request(&s, definitions.clone()) {
             Ok(r) => r,
@@ -932,7 +954,7 @@ pub async fn run_session_controlled(
             && completion
                 .calls
                 .iter()
-                .any(|call| call.name == "document_edit")
+                .any(|call| matches!(call.name.as_str(), "document_edit" | "document_edit_batch"))
         {
             if s.document_review.repair_requests >= s.config.document_repair_limit {
                 s.status = "partial".into();
@@ -965,8 +987,11 @@ pub async fn run_session_controlled(
         let mut checkpoint_failure_recorded = false;
         let mut remaining = batch_limit;
         let mut seen_call_ids = std::collections::BTreeSet::new();
+        let mut batch_document_hash: Option<String> = None;
         while i < execution_calls.len() {
             let call = &execution_calls[i];
+            let (effective_call, rebased_document_call) =
+                rebase_document_call(call, batch_document_hash.as_deref());
             let malformed_call = call.id.trim().is_empty() || call.name.trim().is_empty();
             let duplicate_call_id = seen_call_ids.contains(&call.id);
             let parallel = ["file_list", "file_read", "source_search"]
@@ -1033,7 +1058,7 @@ pub async fn run_session_controlled(
             } else if parallel {
                 read_parallel(&mut s, &execution_calls[i..i + group], &cancel).await
             } else {
-                let (next, result) = execute_one(s, call.clone(), &cancel).await;
+                let (next, result) = execute_one(s, effective_call, &cancel).await;
                 s = next;
                 vec![result]
             };
@@ -1052,13 +1077,18 @@ pub async fn run_session_controlled(
                 {
                     failure = result["error"].as_str().map(str::to_owned);
                 }
-                if call.name == "document_edit"
+                if rebased_document_call && result["status"] == "ok" {
+                    result["data"]["batch_rebased"] = json!(true);
+                }
+                if matches!(call.name.as_str(), "document_edit" | "document_edit_batch")
                     && result["status"] == "ok"
                     && let Some(digest) = result["data"]["hash"].as_str()
-                    && last_document_hash.as_deref() != Some(digest)
                 {
-                    repetitions.clear();
-                    last_document_hash = Some(digest.into());
+                    batch_document_hash = Some(digest.into());
+                    if last_document_hash.as_deref() != Some(digest) {
+                        repetitions.clear();
+                        last_document_hash = Some(digest.into());
+                    }
                 }
                 if [
                     "file_read",

@@ -74,6 +74,8 @@ pub fn describe(message: &str) -> Value {
         (Class::InvalidInput, "copy_document_hash")
     } else if code == "document_revision_conflict" {
         (Class::StaleState, "restart_document_inspection")
+    } else if code == "document_batch_operation_failed" {
+        (Class::InvalidInput, "correct_arguments")
     } else if code == "ambiguous_section" {
         (Class::InvalidInput, "choose_exact_section")
     } else if code == "invalid_citation_range" {
@@ -216,7 +218,7 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "copy_document_hash" => &["document_inspect"],
         "restart_document_inspection" | "inspect_document_outline" => &["document_inspect"],
         "choose_exact_section" => &["document_inspect", "file_read"],
-        "repair_document_citation" => &["document_inspect", "document_edit"],
+        "repair_document_citation" => &["document_inspect", "document_edit", "document_edit_batch"],
         "copy_observed_symbol_id" => &["code_outline", "symbol_read"],
         "check_file_permissions" => &["file_list", "file_read", "document_inspect"],
         "inspect_outcome_before_retry" => &["history", "document_inspect", "file_read"],
@@ -224,11 +226,18 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             &["document_inspect", "file_read"]
         }
         "correct_arguments" if call.name == "document_audit" => &["document_audit"],
+        "correct_arguments" if call.name == "document_edit_batch" => {
+            &["document_inspect", "document_edit_batch"]
+        }
         "correct_arguments" if call.name == "file_read" => &["file_read"],
         "refresh_matching_state" if call.name.starts_with("memory_") => {
             &["memory_read", "memory_find"]
         }
-        "refresh_matching_state" if call.name == "document_edit" => &["document_inspect"],
+        "refresh_matching_state"
+            if matches!(call.name.as_str(), "document_edit" | "document_edit_batch") =>
+        {
+            &["document_inspect", "document_edit", "document_edit_batch"]
+        }
         "refresh_matching_state" => &["code_outline", "file_read", "source_lookup", "history"],
         "reduce_request_or_cleanup" if call.name == "source_search" => &["source_search"],
         "reduce_request_or_cleanup" if call.name == "code_outline" => &["code_outline"],

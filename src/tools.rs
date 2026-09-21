@@ -150,7 +150,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "task_state",
-                description: "Read/update structured goals and compact progress, or read/write detailed work list. State fields belong inside patch, e.g. {action:update,patch:{phase:verify}}; phase is not a top-level argument. For source documentation START with patch.workflow=source_document; this locks evidence requirements and activates investigation/document_edit/document_audit immediately. Use investigation upsert for investigation items, NOT task_state. Do not send empty patches. Updates preserve omitted fields. Set patch.require_investigation=true BEFORE source-documentation work requiring evidence coverage; simple document edits do not need it. Once required, it cannot be disabled during the same request. Preserve user constraints unless explicitly changed by user",
+                description: "Read/update structured goals and compact progress, or read/write detailed work list. State fields belong inside patch, e.g. {action:update,patch:{phase:verify}}; phase is not a top-level argument. For source documentation START with patch.workflow=source_document; this locks evidence requirements and activates investigation/document_edit/document_edit_batch/document_audit immediately. Use investigation upsert for investigation items, NOT task_state. Do not send empty patches. Updates preserve omitted fields. Set patch.require_investigation=true BEFORE source-documentation work requiring evidence coverage; simple document edits do not need it. Once required, it cannot be disabled during the same request. Preserve user constraints unless explicitly changed by user",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -270,12 +270,22 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit",
-                description: "Edit ONLY configured Markdown output: create, replace entire file, append, or unique exact text patch. Existing file requires expected_hash. section accepts a full heading or a unique title without # and also requires expected_section_hash. Replacement text must retain the original full Markdown heading including #. Simple edits do not require investigation items; source documentation must first set task_state patch.require_investigation=true. Returns measured lines and new hash",
+                description: "Edit ONLY configured Markdown output: create, replace entire file, append, or unique exact text patch. Existing file requires expected_hash. Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section accepts a full heading or a unique title without # and also requires expected_section_hash. Replacement text must retain the original full Markdown heading including #. Simple edits do not require investigation items; source documentation must first set task_state patch.require_investigation=true. Returns measured lines and new hash",
                 optional: true,
                 read_only: false,
                 parameters: schema(
                     json!({"action":action(&["create","write","append","patch","section"]),"text":string(),"old_text":string(),"expected_hash":string(),"section":string(),"expected_section_hash":string()}),
                     &["action", "text"],
+                ),
+            },
+            ToolSpec {
+                name: "document_edit_batch",
+                description: "Apply 1..32 related edits to the existing configured Markdown output in order using one base expected_hash. Each edit is write, append, patch or section and observes the document produced by prior edits. All edits are prepared in memory and persisted only if every operation succeeds; a failed operation leaves the file unchanged. Use this for multiple edits from one document snapshot and retry only after inspecting the reported operation index. section operations require their own expected_section_hash.",
+                optional: true,
+                read_only: false,
+                parameters: schema(
+                    json!({"expected_hash":string(),"edits":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"action":action(&["write","append","patch","section"]),"text":string(),"old_text":string(),"section":string(),"expected_section_hash":string()},"required":["action","text"],"additionalProperties":false}}}),
+                    &["expected_hash", "edits"],
                 ),
             },
             ToolSpec {
@@ -425,7 +435,10 @@ impl ToolRegistry {
                 Some("string") => v.is_string(),
                 Some("integer") => v.as_u64().is_some(),
                 Some("boolean") => v.is_boolean(),
-                Some("array") => v.as_array().is_some_and(|a| a.iter().all(Value::is_string)),
+                Some("array") => {
+                    (name == "document_edit_batch" && k == "edits")
+                        || v.as_array().is_some_and(|a| a.iter().all(Value::is_string))
+                }
                 Some("object") => v.is_object(),
                 _ => true,
             };
@@ -442,6 +455,8 @@ impl ToolRegistry {
             validate_task_state_arguments(args)?;
         } else if name == "document_edit" {
             validate_document_edit_arguments(args)?;
+        } else if name == "document_edit_batch" {
+            validate_document_edit_batch_arguments(args)?;
         } else if name == "memory_manage" {
             validate_memory_manage_arguments(args)?;
         } else if name == "history" {
@@ -555,6 +570,202 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
+    let expected_hash = args
+        .get("expected_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("missing_argument: expected_hash"))?;
+    if expected_hash.trim().is_empty() {
+        bail!("invalid_argument_value: expected_hash must not be empty");
+    }
+    let edits = args
+        .get("edits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("invalid_argument_type: edits must be an array"))?;
+    if edits.is_empty() || edits.len() > 32 {
+        bail!("invalid_argument_value: edits requires 1..32 entries");
+    }
+    for (index, edit) in edits.iter().enumerate() {
+        let object = edit.as_object().ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid_argument_type: edits[{index}] must be an object with action and text"
+            )
+        })?;
+        for key in object.keys() {
+            if ![
+                "action",
+                "text",
+                "old_text",
+                "section",
+                "expected_section_hash",
+            ]
+            .contains(&key.as_str())
+            {
+                bail!("unknown_argument: edits[{index}].{key}");
+            }
+        }
+        let action = object
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("missing_argument: edits[{index}].action"))?;
+        if !["write", "append", "patch", "section"].contains(&action) {
+            bail!(
+                "invalid_argument_value: edits[{index}].action must be write, append, patch or section"
+            );
+        }
+        object
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("missing_argument: edits[{index}].text"))?;
+        match action {
+            "patch" => {
+                let old_text = object
+                    .get("old_text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing_argument: edits[{index}].old_text"))?;
+                if old_text.is_empty() {
+                    bail!("invalid_argument_value: edits[{index}].old_text must not be empty");
+                }
+            }
+            "section" => {
+                let section = object
+                    .get("section")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing_argument: edits[{index}].section"))?;
+                if section.trim().is_empty() {
+                    bail!("invalid_argument_value: edits[{index}].section must not be empty");
+                }
+                let section_hash = object
+                    .get("expected_section_hash")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("missing_argument: edits[{index}].expected_section_hash")
+                    })?;
+                if section_hash.trim().is_empty() {
+                    bail!(
+                        "invalid_argument_value: edits[{index}].expected_section_hash must not be empty"
+                    );
+                }
+            }
+            "write" | "append" => {
+                for key in ["old_text", "section", "expected_section_hash"] {
+                    if object.contains_key(key) {
+                        bail!(
+                            "unknown_argument: edits[{index}].{key} is not valid for action={action}"
+                        );
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
+fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
+    let action = text(args, "action")?;
+    let new = text(args, "text")?;
+    match action {
+        "create" | "write" => Ok(new.to_string()),
+        "append" => Ok(format!("{old}{new}")),
+        "section" => {
+            let heading = text(args, "section")?;
+            let resolved = documentation::resolve_heading(old, heading)?;
+            let target = &old[resolved.start..resolved.end];
+            if args["expected_section_hash"].as_str() != Some(hash(target.as_bytes()).as_str()) {
+                bail!("section_revision_conflict");
+            }
+            if new.lines().next().map(str::trim) != target.lines().next().map(str::trim) {
+                bail!("invalid_argument_value: section replacement must retain its heading");
+            }
+            let replacement = format!("{}\n", new.trim_end());
+            let mut candidate = format!(
+                "{}{}{}",
+                &old[..resolved.start],
+                replacement,
+                &old[resolved.end..]
+            );
+            section_text(&candidate, heading)?;
+            if !old.ends_with('\n') && resolved.start == 0 && resolved.end == old.len() {
+                candidate = new.to_string();
+            }
+            Ok(candidate)
+        }
+        "patch" => {
+            let target = text(args, "old_text")?;
+            if target.is_empty() || old.matches(target).count() != 1 {
+                bail!("patch_target_must_match_once");
+            }
+            Ok(old.replacen(target, new, 1))
+        }
+        _ => bail!("invalid_argument_value: unsupported document edit action"),
+    }
+}
+
+fn persist_document_edit(
+    s: &mut Session,
+    path: &Path,
+    old: &str,
+    exists: bool,
+    result: String,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Value> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid_output_parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let checked = output_path(&s.project)?;
+    if checked != path {
+        bail!("output_changed");
+    }
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(result.as_bytes())?;
+    temp.as_file().sync_all()?;
+    if cancel.is_cancelled() {
+        bail!("cancelled");
+    }
+    if path.exists() != exists
+        || (exists && hash(read_text(path)?.as_bytes()) != hash(old.as_bytes()))
+    {
+        bail!("document_revision_conflict: changed during write");
+    }
+    if exists {
+        temp.persist(path)?;
+    } else {
+        temp.persist_noclobber(path)?;
+    }
+    s.document_written = true;
+    s.document_review.approved_hash = None;
+    s.last_document_write = Some((path.to_path_buf(), hash(result.as_bytes())));
+    revalidate(s)?;
+    let mut written_items = Vec::new();
+    for item in &mut s.investigations {
+        if item.status != "verified"
+            && !item.section.trim().is_empty()
+            && section_text(&result, &item.section)
+                .is_ok_and(|text| text.lines().skip(1).any(|line| !line.trim().is_empty()))
+        {
+            item.status = "written".into();
+            written_items.push(item.id.clone());
+        }
+    }
+    let hash = hash(result.as_bytes());
+    let bytes = result.len();
+    let total_lines = result.lines().count();
+    let citation_check = documentation::citation_check(s, path, &result)?;
+    Ok(json!({
+        "written_items":written_items,
+        "verification_required_ids":s.investigations.iter().filter(|i| i.status != "verified").map(|i| &i.id).collect::<Vec<_>>(),
+        "preserved_verified_ids":s.investigations.iter().filter(|i| i.status == "verified").map(|i| &i.id).collect::<Vec<_>>(),
+        "verification_guidance":"Verify only verification_required_ids. Unchanged sections retain verification; do not resubmit all items after a local edit. If none remain, proceed to final completion and document review.",
+        "path":path,
+        "hash":hash,
+        "bytes":bytes,
+        "total_lines":total_lines,
+        "citation_check":citation_check
+    }))
 }
 
 fn validate_memory_manage_arguments(args: &Value) -> Result<()> {
@@ -1489,7 +1700,12 @@ pub fn execute_cancellable(
                 }
                 s.task = next;
                 if s.task.require_investigation || s.task.workflow == "document_edit" {
-                    for name in ["investigation", "document_edit", "document_audit"] {
+                    for name in [
+                        "investigation",
+                        "document_edit",
+                        "document_edit_batch",
+                        "document_audit",
+                    ] {
                         s.active_tools.insert(name.into());
                         if let Some(pending) = &mut s.pending_tools {
                             pending.insert(name.into());
@@ -1644,9 +1860,11 @@ pub fn execute_cancellable(
                 String::new()
             };
             let action = text(&args, "action")?;
-            let new = text(&args, "text")?;
             if action == "create" && exists {
                 bail!("document_exists");
+            }
+            if exists && action != "create" && args["expected_hash"].as_str().is_none() {
+                bail!("document_hash_required: existing document edits require expected_hash");
             }
             if exists && args["expected_hash"].as_str() != Some(hash(old.as_bytes()).as_str()) {
                 bail!("document_revision_conflict: read output and retry");
@@ -1654,87 +1872,49 @@ pub fn execute_cancellable(
             if !exists && action != "create" && action != "write" {
                 bail!("document_missing");
             }
-            let result = match action {
-                "create" | "write" => new.to_string(),
-                "append" => format!("{old}{new}"),
-                "section" => {
-                    let heading = text(&args, "section")?;
-                    let resolved = documentation::resolve_heading(&old, heading)?;
-                    let target = &old[resolved.start..resolved.end];
-                    if args["expected_section_hash"].as_str()
-                        != Some(hash(target.as_bytes()).as_str())
-                    {
-                        bail!("section_revision_conflict");
-                    }
-                    if new.lines().next().map(str::trim) != target.lines().next().map(str::trim) {
-                        bail!(
-                            "invalid_argument_value: section replacement must retain its heading"
-                        );
-                    }
-                    let replacement = format!("{}\n", new.trim_end());
-                    let mut candidate = format!(
-                        "{}{}{}",
-                        &old[..resolved.start],
-                        replacement,
-                        &old[resolved.end..]
-                    );
-                    section_text(&candidate, heading)?;
-                    if !old.ends_with('\n') && resolved.start == 0 && resolved.end == old.len() {
-                        candidate = new.to_string();
-                    }
-                    candidate
+            let result = apply_document_edit_operation(&old, &args)?;
+            persist_document_edit(s, &path, &old, exists, result, cancel)
+        }
+        "document_edit_batch" => {
+            let path = output_path(&s.project)?;
+            let exists = path.exists();
+            if !exists {
+                bail!("document_missing");
+            }
+            let old = read_text(&path)?;
+            if args["expected_hash"].as_str() != Some(hash(old.as_bytes()).as_str()) {
+                bail!("document_revision_conflict: read output and retry");
+            }
+            let edits = args["edits"].as_array().expect("validated edits array");
+            let mut current = old.clone();
+            let mut operations = Vec::with_capacity(edits.len());
+            for (index, edit) in edits.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    bail!("cancelled");
                 }
-                "patch" => {
-                    let target = text(&args, "old_text")?;
-                    if target.is_empty() || old.matches(target).count() != 1 {
-                        bail!("patch_target_must_match_once");
-                    }
-                    old.replacen(target, new, 1)
-                }
-                _ => unreachable!(),
-            };
-            let parent = path.parent().unwrap();
-            std::fs::create_dir_all(parent)?;
-            let checked = output_path(&s.project)?;
-            if checked != path {
-                bail!("output_changed");
+                let action = edit["action"].as_str().unwrap_or("unknown");
+                let before_hash = hash(current.as_bytes());
+                let next = apply_document_edit_operation(&current, edit).map_err(|error| {
+                    anyhow::anyhow!(
+                        "document_batch_operation_failed: index={index}; action={action}; cause={error}; no changes persisted"
+                    )
+                })?;
+                current = next;
+                operations.push(json!({
+                    "index":index,
+                    "action":action,
+                    "changed":before_hash != hash(current.as_bytes()),
+                    "hash":hash(current.as_bytes())
+                }));
             }
-            let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-            temp.write_all(result.as_bytes())?;
-            temp.as_file().sync_all()?;
-            if cancel.is_cancelled() {
-                bail!("cancelled");
-            }
-            if path.exists() != exists
-                || (exists && hash(read_text(&path)?.as_bytes()) != hash(old.as_bytes()))
-            {
-                bail!("document_revision_conflict: changed during write");
-            }
-            if exists {
-                temp.persist(&path)?;
-            } else {
-                temp.persist_noclobber(&path)?;
-            }
-            s.document_written = true;
-            s.document_review.approved_hash = None;
-            s.last_document_write = Some((path.clone(), hash(result.as_bytes())));
-            revalidate(s)?;
-            // A successful persisted section establishes written state, never
-            // verification. Match the registered heading exactly/unambiguously.
-            let mut written_items = Vec::new();
-            for item in &mut s.investigations {
-                if item.status != "verified"
-                    && !item.section.trim().is_empty()
-                    && section_text(&result, &item.section)
-                        .is_ok_and(|text| text.lines().skip(1).any(|line| !line.trim().is_empty()))
-                {
-                    item.status = "written".into();
-                    written_items.push(item.id.clone());
-                }
-            }
-            Ok(
-                json!({"written_items":written_items,"verification_required_ids":s.investigations.iter().filter(|i| i.status != "verified").map(|i| &i.id).collect::<Vec<_>>(),"preserved_verified_ids":s.investigations.iter().filter(|i| i.status == "verified").map(|i| &i.id).collect::<Vec<_>>(),"verification_guidance":"Verify only verification_required_ids. Unchanged sections retain verification; do not resubmit all items after a local edit. If none remain, proceed to final completion and document review.","path":path,"hash":hash(result.as_bytes()),"bytes":result.len(),"total_lines":result.lines().count(),"citation_check":documentation::citation_check(s, &path, &result)?}),
-            )
+            let result = persist_document_edit(s, &path, &old, exists, current, cancel)?;
+            let final_hash = result["hash"].clone();
+            let mut result = result;
+            result["operations"] = json!(operations);
+            result["operation_count"] = json!(edits.len());
+            result["batch"] =
+                json!({"base_hash":args["expected_hash"],"final_hash":final_hash,"atomic":true});
+            Ok(result)
         }
         "investigation" => match text(&args, "action")? {
             "list" => {
