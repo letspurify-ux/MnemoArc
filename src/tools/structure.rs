@@ -434,9 +434,21 @@ pub(super) fn execute(
     let mut symbols = Vec::new();
     let mut containers = std::collections::BTreeSet::new();
     let filters = options(args);
+    let requested_symbol_id = (tool == "symbol_read").then(|| args["symbol_id"].as_str().unwrap());
+    let requested_span = requested_symbol_id.and_then(|id| {
+        let mut parts = id.rsplitn(3, ':');
+        let end = parts.next()?.parse::<usize>().ok()?;
+        let start = parts.next()?.parse::<usize>().ok()?;
+        Some((start, end))
+    });
     while let Some((node, mut container, mut parent_kind, mut depth)) = stack.pop() {
         if cancel.is_cancelled() || started.elapsed() >= deadline {
             bail!("cancelled_or_timeout: structure traversal interrupted");
+        }
+        if let Some((start, end)) = requested_span
+            && (node.end_byte() <= start || node.start_byte() >= end)
+        {
+            continue;
         }
         if let Some(name) = symbol_name(node) {
             let mut symbol = describe(node, name, &container, &source, &digest, &path_identity);
@@ -464,15 +476,22 @@ pub(super) fn execute(
             } else {
                 comparable.contains(query)
             };
-            if tool == "symbol_read"
-                || (matches_name
+            let selected = requested_symbol_id.is_some_and(|id| symbol["symbol_id"] == id)
+                || (requested_symbol_id.is_none()
+                    && matches_name
                     && filters["kind"].as_str().is_none_or(|wanted| wanted == kind)
                     && filters["container"]
                         .as_str()
                         .is_none_or(|wanted| wanted == container)
-                    && filters["max_depth"].as_u64().is_none_or(|max| depth <= max))
-            {
+                    && filters["max_depth"].as_u64().is_none_or(|max| depth <= max));
+            if selected {
                 symbols.push(symbol);
+                if requested_symbol_id.is_some() {
+                    // symbol_read has an exact ID and needs only that symbol.
+                    // Stop traversal immediately so a valid ID in a very large
+                    // file is not rejected as an overly broad outline.
+                    break;
+                }
                 if symbols.len() > 20_000 {
                     bail!("outline_too_broad: narrow query or use a smaller file");
                 }

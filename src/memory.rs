@@ -231,10 +231,43 @@ impl MemoryStore {
     pub fn replace(
         &mut self,
         ids: &[String],
-        input: MemoryInput,
+        mut input: MemoryInput,
         sources: Vec<Source>,
         config: &Config,
     ) -> Result<MemoryMeta> {
+        // A replacement may intentionally reuse the key of one of the
+        // entries it removes. Validate the write contract against that
+        // entry before removal; otherwise save() would report that the
+        // expected memory does not exist and an observed fact could silently
+        // lose its existing evidence.
+        let target_ids: BTreeSet<String> = ids
+            .iter()
+            .filter_map(|ident| self.get(ident).ok().map(|memory| memory.id.clone()))
+            .collect();
+        if let Some(old) = input
+            .key
+            .as_deref()
+            .and_then(|key| self.get(key).ok())
+            .filter(|memory| target_ids.contains(&memory.id))
+            .cloned()
+        {
+            if input.kind == MemoryKind::Fact
+                && !input.inferred
+                && !old.sources.is_empty()
+                && sources.is_empty()
+            {
+                bail!(
+                    "memory_sources_required: an observed fact cannot discard its existing sources; supply valid source_ids or explicitly mark the new claim inferred for review"
+                );
+            }
+            if input.expected_revision != Some(old.revision) {
+                bail!("revision_conflict: expected {}", old.revision);
+            }
+            // The old keyed entry is deliberately removed as part of this
+            // operation, so save() must create the replacement instead of
+            // trying to apply the same optimistic-lock check a second time.
+            input.expected_revision = None;
+        }
         let mut candidate = self.clone();
         for id in ids {
             let key = candidate.get(id)?.id.clone();

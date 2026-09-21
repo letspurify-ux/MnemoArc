@@ -126,7 +126,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_manage",
-                description: "List cleanup candidates, delete unreferenced memories, or atomically replace IDs and redirect references. delete and replace require ids; duplicate IDs are ignored. replacement uses memory_write fields",
+                description: "List cleanup candidates, delete unreferenced memories, or atomically replace IDs and redirect references. delete and replace require ids; duplicate IDs are ignored. replacement uses memory_write fields; when it reuses a replaced key, expected_revision and observed-source rules are checked before removal",
                 optional: false,
                 read_only: false,
                 parameters: schema(
