@@ -315,20 +315,21 @@ impl ToolRegistry {
             .filter(|t| s.config.memory_reuse || !["memory_read", "memory_find"].contains(&t.name))
             .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
             .map(|mut t| {
+                let fields = t.parameters["properties"].clone();
                 // Keep offset for old clients, but offer the model only opaque continuation.
                 if t.name == "file_read" {
                     t.parameters["properties"].as_object_mut().unwrap().remove("offset");
                     t.parameters["oneOf"] = json!([
                         {"required":["path"],"not":{"required":["cursor"]}},
-                        {"required":["cursor"],"not":{"anyOf":[{"required":["path"]},{"required":["start_line"]},{"required":["max_lines"]},{"required":["limit"]}]}}
+                        {"required":["cursor"],"not":{"anyOf":[{"required":["path"]},{"required":["start_line"]},{"required":["max_lines"]},{"required":["limit"]},{"required":["offset"]}]}}
                     ]);
                 }
                 if t.name == "document_edit" {
                     t.parameters["oneOf"] = json!([
-                        {"properties":{"action":{"enum":["create","write"]}}},
-                        {"properties":{"action":{"const":"append"}},"required":["expected_hash"]},
-                        {"properties":{"action":{"const":"patch"}},"required":["expected_hash","old_text"]},
-                        {"properties":{"action":{"const":"section"}},"required":["expected_hash","section","expected_section_hash"]}
+                        {"type":"object","properties":{"action":{"enum":["create","write"]},"text":fields["text"],"expected_hash":fields["expected_hash"]},"additionalProperties":false},
+                        {"type":"object","properties":{"action":{"const":"append"},"text":fields["text"],"expected_hash":fields["expected_hash"]},"required":["expected_hash"],"additionalProperties":false},
+                        {"type":"object","properties":{"action":{"const":"patch"},"text":fields["text"],"expected_hash":fields["expected_hash"],"old_text":fields["old_text"]},"required":["expected_hash","old_text"],"additionalProperties":false},
+                        {"type":"object","properties":{"action":{"const":"section"},"text":fields["text"],"expected_hash":fields["expected_hash"],"section":fields["section"],"expected_section_hash":fields["expected_section_hash"]},"required":["expected_hash","section","expected_section_hash"],"additionalProperties":false}
                     ]);
                 }
                 if t.name == "source_search" {
@@ -339,22 +340,22 @@ impl ToolRegistry {
                 }
                 if t.name == "task_state" {
                     t.parameters["oneOf"] = json!([
-                        {"properties":{"action":{"const":"read"}},"required":["action"]},
-                        {"properties":{"action":{"const":"details"}},"required":["action"]},
-                        {"properties":{"action":{"const":"update"}},"required":["action","patch"]}
+                        {"properties":{"action":{"const":"read"}},"required":["action"],"not":{"anyOf":[{"required":["patch"]},{"required":["offset"]},{"required":["limit"]}]}},
+                        {"properties":{"action":{"const":"details"}},"required":["action"],"not":{"required":["patch"]}},
+                        {"properties":{"action":{"const":"update"}},"required":["action","patch"],"not":{"anyOf":[{"required":["offset"]},{"required":["limit"]}]}}
                     ]);
                 }
                 if t.name == "memory_manage" {
                     t.parameters["oneOf"] = json!([
-                        {"properties":{"action":{"const":"candidates"}},"required":["action"]},
-                        {"properties":{"action":{"const":"delete"}},"required":["action","ids"]},
+                        {"properties":{"action":{"const":"candidates"}},"required":["action"],"not":{"anyOf":[{"required":["ids"]},{"required":["replacement"]}]}},
+                        {"properties":{"action":{"const":"delete"}},"required":["action","ids"],"not":{"required":["replacement"]}},
                         {"properties":{"action":{"const":"replace"}},"required":["action","ids","replacement"]}
                     ]);
                 }
                 if t.name == "history" {
                     t.parameters["oneOf"] = json!([
-                        {"properties":{"action":{"const":"search"}},"required":["action"]},
-                        {"properties":{"action":{"const":"read"}},"required":["action","id"]}
+                        {"properties":{"action":{"const":"search"}},"required":["action"],"not":{"anyOf":[{"required":["id"]},{"required":["offset"]}]}},
+                        {"properties":{"action":{"const":"read"}},"required":["action","id"],"not":{"anyOf":[{"required":["query"]},{"required":["after"]},{"required":["limit"]}]}}
                     ]);
                 }
                 json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.parameters}})
@@ -438,6 +439,16 @@ impl ToolRegistry {
 
 fn validate_task_state_arguments(args: &Value) -> Result<()> {
     let action = args["action"].as_str().unwrap_or("");
+    validate_action_fields(
+        "task_state",
+        args,
+        match action {
+            "read" => &["action"][..],
+            "details" => &["action", "offset", "limit"][..],
+            "update" => &["action", "patch"][..],
+            _ => &["action"][..],
+        },
+    )?;
     if action != "update" {
         return Ok(());
     }
@@ -483,6 +494,22 @@ fn validate_task_state_arguments(args: &Value) -> Result<()> {
 
 fn validate_document_edit_arguments(args: &Value) -> Result<()> {
     let action = args["action"].as_str().unwrap_or("");
+    validate_action_fields(
+        "document_edit",
+        args,
+        match action {
+            "create" | "write" | "append" => &["action", "text", "expected_hash"][..],
+            "patch" => &["action", "text", "expected_hash", "old_text"][..],
+            "section" => &[
+                "action",
+                "text",
+                "expected_hash",
+                "section",
+                "expected_section_hash",
+            ][..],
+            _ => &["action", "text"][..],
+        },
+    )?;
     let require = |key: &str| {
         if args.get(key).is_none() {
             return Err(anyhow::anyhow!(
@@ -518,6 +545,16 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
 
 fn validate_memory_manage_arguments(args: &Value) -> Result<()> {
     let action = args["action"].as_str().unwrap_or("");
+    validate_action_fields(
+        "memory_manage",
+        args,
+        match action {
+            "candidates" => &["action"][..],
+            "delete" => &["action", "ids"][..],
+            "replace" => &["action", "ids", "replacement"][..],
+            _ => &["action"][..],
+        },
+    )?;
     if matches!(action, "delete" | "replace") && args["ids"].as_array().is_none_or(Vec::is_empty) {
         bail!("missing_argument: ids for memory_manage action={action}");
     }
@@ -528,8 +565,32 @@ fn validate_memory_manage_arguments(args: &Value) -> Result<()> {
 }
 
 fn validate_history_arguments(args: &Value) -> Result<()> {
+    let action = args["action"].as_str().unwrap_or("");
+    validate_action_fields(
+        "history",
+        args,
+        match action {
+            "search" => &["action", "query", "after", "limit"][..],
+            "read" => &["action", "id", "offset"][..],
+            _ => &["action"][..],
+        },
+    )?;
     if args["action"] == "read" && args.get("id").is_none() {
         bail!("missing_argument: id for history action=read");
+    }
+    Ok(())
+}
+
+fn validate_action_fields(name: &str, args: &Value, allowed: &[&str]) -> Result<()> {
+    let object = args
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("invalid_tool_arguments: arguments must be an object"))?;
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        let action = args["action"].as_str().unwrap_or("");
+        bail!(
+            "invalid_action_arguments: {name} action={action} does not accept {key}; allowed: {}",
+            allowed.join(", ")
+        );
     }
     Ok(())
 }
@@ -670,7 +731,7 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
     if let Some(spec) = ToolRegistry::specs().into_iter().find(|t| t.name == name)
         && let Some(fields) = args.as_object_mut()
     {
-        for (key, value) in fields {
+        for (key, value) in &mut *fields {
             if spec.parameters["properties"][key]["type"] == "integer"
                 && let Some(raw) = value.as_str()
                 && !raw.is_empty()
@@ -679,6 +740,21 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
             {
                 *value = json!(number);
             }
+        }
+        // memory_manage carries the memory_write payload under replacement.
+        // Keep its optimistic-lock field compatible with providers that quote
+        // unsigned integers, just like the top-level memory_write argument.
+        if name == "memory_manage"
+            && let Some(value) = fields
+                .get_mut("replacement")
+                .and_then(Value::as_object_mut)
+                .and_then(|replacement| replacement.get_mut("expected_revision"))
+            && let Some(raw) = value.as_str()
+            && !raw.is_empty()
+            && raw.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(number) = raw.parse::<u64>()
+        {
+            *value = json!(number);
         }
     }
 }

@@ -648,7 +648,8 @@ pub async fn run_session_controlled(
             // or report finish_reason=length even when the JSON object is
             // complete. The review request has no executable tools, so a
             // complete, hash-checked verdict is safe to accept in that case.
-            let review_result = if completion.text.trim().is_empty() {
+            let review_result = if !completion.calls.is_empty() || completion.text.trim().is_empty()
+            {
                 Err(anyhow::anyhow!(
                     "document_review_incomplete: review must return complete JSON without tools"
                 ))
