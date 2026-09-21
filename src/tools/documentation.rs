@@ -106,9 +106,13 @@ pub(super) fn execute(
                 return Ok(json!({"exists":false,"path":path,"total_lines":0}));
             }
             let doc = read_text(&path)?;
-            if n(args, "offset", 0) > 0 && args["expected_hash"].as_str().is_none() {
+            let document_offset = n(args, "offset", 0);
+            let coverage_offset = n(args, "coverage_offset", 0);
+            if (document_offset > 0 || coverage_offset > 0)
+                && args["expected_hash"].as_str().is_none()
+            {
                 bail!(
-                    "document_hash_required: offset > 0 requires expected_hash from the first document_inspect result; copy its hash or the returned next_cursor arguments. If that result is unavailable, call document_inspect with offset 0 first"
+                    "document_hash_required: offset or coverage_offset > 0 requires expected_hash from the first document_inspect result; copy its hash or the returned next_cursor arguments. If that result is unavailable, call document_inspect with offset 0 and coverage_offset 0 first"
                 );
             }
             if let Some(expected) = args["expected_hash"].as_str()
@@ -122,7 +126,7 @@ pub(super) fn execute(
             if let Some(heading) = args["section"].as_str() {
                 let resolved = resolve_heading(&doc, heading)?;
                 let section = &doc[resolved.start..resolved.end];
-                let offset = n(args, "offset", 0);
+                let offset = document_offset;
                 let section_chars = section.chars().count();
                 if offset > section_chars {
                     bail!(

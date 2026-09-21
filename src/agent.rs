@@ -926,6 +926,7 @@ pub async fn run_session_controlled(
                 vec![result]
             };
             for (call, mut result) in execution_calls[i..i + group].iter().zip(results) {
+                let cache_parallel_result = parallel && result["status"] == "ok";
                 tools::recovery::attach(&s, call, &mut result);
                 if let Some(reason) =
                     tool_failures.observe(&call.name, &result, s.config.stall_round_limit)
@@ -998,6 +999,17 @@ pub async fn run_session_controlled(
                     .max(200);
                 let result = tools::limit_result(&mut s, call, result, budget);
                 tools::record_delivered_read(&mut s, call, &result);
+                if cache_parallel_result {
+                    // Parallel reads run in temporary sessions, so their
+                    // run_call ledger entries cannot be merged safely until
+                    // source IDs and archive/cursor IDs have been remapped.
+                    // Cache the final owner-session representation so a
+                    // provider replaying the same call ID remains idempotent.
+                    s.ledger.insert(
+                        call.id.clone(),
+                        (format!("{}:{}", call.name, call.arguments), result.clone()),
+                    );
+                }
                 remaining =
                     remaining.saturating_sub(tools::result_tokens(call, &result, &s.config.model));
                 emit(

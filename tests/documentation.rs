@@ -675,7 +675,7 @@ fn coverage_missing_ranges_page_and_empty_lines_are_counted() {
     let second = run(
         &mut s,
         "document_inspect",
-        json!({"path":"input.md","limit":1,"coverage_offset":1}),
+        json!({"path":"input.md","limit":1,"coverage_offset":1,"expected_hash":first["hash"]}),
     );
     assert_eq!(
         second["coverage"]["missing_ranges"],
