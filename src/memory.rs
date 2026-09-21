@@ -165,8 +165,17 @@ impl MemoryStore {
         } else if input.expected_revision.is_some() {
             bail!("revision_conflict: memory does not exist");
         }
+        let status = if input.inferred || (input.kind == MemoryKind::Fact && sources.is_empty()) {
+            MemoryStatus::NeedsReview
+        } else {
+            MemoryStatus::Active
+        };
+        // A stale entry can be written again with the same content after its
+        // evidence is reread. Treat the status transition as progress instead
+        // of returning the old needs_review metadata unchanged.
         if let Some(m) = self.entries.values().find(|m| {
             m.status != MemoryStatus::Superseded
+                && m.status == status
                 && m.body == input.body
                 && m.sources == sources
                 && m.key == input.key
@@ -179,11 +188,6 @@ impl MemoryStore {
         }) {
             return Ok(m.meta());
         }
-        let status = if input.inferred || (input.kind == MemoryKind::Fact && sources.is_empty()) {
-            MemoryStatus::NeedsReview
-        } else {
-            MemoryStatus::Active
-        };
         let now = Utc::now();
         let m = Memory {
             id: old.as_ref().map(|m| m.id.clone()).unwrap_or_else(id),

@@ -1014,7 +1014,11 @@ pub fn execute_cancellable(
         && !s.investigations.is_empty()
         && (name == "file_list"
             || (name == "symbol_search" && args["query"].as_str().unwrap_or("").is_empty())
-            || (name == "investigation" && args["action"] == "upsert" && args["id"].is_null()))
+            || (name == "investigation"
+                && args["action"] == "upsert"
+                && args["id"]
+                    .as_str()
+                    .is_none_or(|id| !s.investigations.iter().any(|item| item.id == id))))
     {
         bail!(
             "verification_reserve: focus on existing investigation items; broad discovery and new items are paused"
