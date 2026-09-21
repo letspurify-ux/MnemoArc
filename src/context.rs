@@ -1,10 +1,11 @@
 use crate::{
     config::Config,
-    memory::id,
+    memory::{MemoryMeta, id},
     session::{Checkpoint, Session},
 };
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 
 pub const SYSTEM: &str = r#"You are MnemoArc, a single agent with session-local memory. Complete the user's task with evidence.
 For source-document creation, FIRST call task_state with patch.workflow="source_document", deliverables and completion criteria matching the user request. This immediately activates investigation, document_edit and document_audit; do not discover these through tool_catalog. Create one investigation per requested section with its exact heading. Read the minimum relevant evidence, then write that section before expanding to others. Use create/append/section instead of accumulating all evidence before a full-file write. For simple document edits choose workflow="document_edit"; for chat answers no workflow call is needed.
@@ -93,6 +94,30 @@ fn model_message(mut message: Value) -> Value {
     message
 }
 
+fn fit_memory_index(
+    candidates: Vec<MemoryMeta>,
+    budget: usize,
+    model: &str,
+) -> (Vec<MemoryMeta>, Vec<MemoryMeta>) {
+    let mut included = Vec::new();
+    let mut omitted = Vec::new();
+    let mut used_tokens = count(&json!(included), model);
+    for memory in candidates {
+        if used_tokens >= budget {
+            omitted.push(memory);
+            continue;
+        }
+        included.push(memory);
+        let total = count(&json!(included), model);
+        if total > budget {
+            omitted.push(included.pop().unwrap());
+        } else {
+            used_tokens = total;
+        }
+    }
+    (included, omitted)
+}
+
 impl ContextManager {
     pub fn state(s: &Session) -> Result<Value> {
         let mut task = serde_json::to_value(&s.task)?;
@@ -100,34 +125,47 @@ impl ContextManager {
         if count(&task, &s.config.model) > s.config.state_tokens {
             bail!("task_state_limit: shorten progress; move details to task details/memory");
         }
-        let recent = if s.config.memory_reuse {
+        let recent_candidates = if s.config.memory_reuse {
             s.memory.recent(s.config.recent_count)
         } else {
             vec![]
         };
-        if count(&json!(recent), &s.config.model) > s.config.index_tokens {
-            bail!("memory_index_limit: shorten memory metadata or increase index budget");
-        }
-        let related = s
+        // A single oversized memory must not make the whole session
+        // unrecoverable: state() is needed before the model can call
+        // memory_manage to remove or replace it. Keep the newest entries that
+        // fit and expose the omission so the model can use memory_find/read.
+        let recent_candidate_ids: BTreeSet<_> = recent_candidates
+            .iter()
+            .map(|memory| memory.id.clone())
+            .collect();
+        let (recent, mut omitted) =
+            fit_memory_index(recent_candidates, s.config.index_tokens, &s.config.model);
+        let related_candidates = s
             .memory
             .search(&format!("{} {}", s.latest_request, s.task.current), &[])
             .into_iter()
-            .filter(|m| !recent.iter().any(|r| r.id == m.id))
+            .filter(|memory| !recent_candidate_ids.contains(&memory.id))
             .take(if s.config.memory_reuse {
                 s.config.related_count
             } else {
                 0
             })
             .collect::<Vec<_>>();
-        let mut pinned = s
+        let (related, related_omitted) =
+            fit_memory_index(related_candidates, s.config.index_tokens, &s.config.model);
+        omitted.extend(related_omitted);
+        let pinned_candidates = s
             .task
             .memory_ids
             .iter()
             .map(|id| s.memory.get(id).map(|m| m.meta()))
             .collect::<Result<Vec<_>>>()?;
-        if !s.config.memory_reuse {
-            pinned.clear();
-        }
+        let (pinned, pinned_omitted) = if s.config.memory_reuse {
+            fit_memory_index(pinned_candidates, s.config.index_tokens, &s.config.model)
+        } else {
+            (vec![], vec![])
+        };
+        omitted.extend(pinned_omitted);
         let mut user_sources = s
             .sources
             .values()
@@ -139,9 +177,22 @@ impl ContextManager {
             .take(5)
             .map(|x| json!({"id":x.id,"origin":x.origin,"excerpt":x.excerpt}))
             .collect::<Vec<_>>();
-        Ok(
-            json!({"document_review":s.document_review,"answer_review":{"completed":s.answer_reviewed,"citation_issues":s.answer_review_issues},"run_guidance":s.run_guidance,"pending_investigations":s.investigations.iter().filter(|i|i.status != "verified").take(10).map(|i|json!({"id":i.id,"title":i.title,"status":i.status,"section":i.section})).collect::<Vec<_>>(),"memory_reuse_enabled":s.config.memory_reuse,"pending_settings":s.pending_config,"task":task,"task_detail_count":s.task.details.len(),"recent_memories":recent,"related_memories":related,"referenced_memories":pinned,"project":s.project,"active_tools":s.active_tools,"latest_request":s.latest_request,"checkpoint":s.checkpoint,"user_sources":source_ids,"investigation_count":s.investigations.len(),"history_pruned_through":s.history.pruned_through}),
-        )
+        let mut state = json!({"document_review":s.document_review,"answer_review":{"completed":s.answer_reviewed,"citation_issues":s.answer_review_issues},"run_guidance":s.run_guidance,"pending_investigations":s.investigations.iter().filter(|i|i.status != "verified").take(10).map(|i|json!({"id":i.id,"title":i.title,"status":i.status,"section":i.section})).collect::<Vec<_>>(),"memory_reuse_enabled":s.config.memory_reuse,"pending_settings":s.pending_config,"task":task,"task_detail_count":s.task.details.len(),"recent_memories":recent,"related_memories":related,"referenced_memories":pinned,"project":s.project,"active_tools":s.active_tools,"latest_request":s.latest_request,"checkpoint":s.checkpoint,"user_sources":source_ids,"investigation_count":s.investigations.len(),"history_pruned_through":s.history.pruned_through});
+        let omitted_id_set: BTreeSet<_> = omitted
+            .into_iter()
+            .map(|memory| memory.id)
+            .collect::<BTreeSet<_>>();
+        let omitted_ids: Vec<_> = omitted_id_set.iter().take(50).cloned().collect();
+        if !omitted_id_set.is_empty() {
+            state["memory_index_notice"] = json!({
+                "omitted": omitted_id_set.len(),
+                "omitted_ids": omitted_ids,
+                "omitted_ids_truncated": omitted_id_set.len() > 50,
+                "budget_tokens": s.config.index_tokens,
+                "guidance": "Some memory metadata was omitted from this state because it exceeds index_tokens; use memory_read with an omitted ID, memory_find, or memory_manage if needed"
+            });
+        }
+        Ok(state)
     }
     pub fn request(s: &Session, tools: Vec<Value>) -> Result<Value> {
         let mut instruction = SYSTEM.to_string();

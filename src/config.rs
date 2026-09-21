@@ -127,10 +127,11 @@ impl Config {
             bail!("Require 0 < low_water < high_water < 1");
         }
         if self.recent_count > self.memory_count
-            || self.recent_count.saturating_mul(160).saturating_add(128) > self.index_tokens
+            || (self.memory_reuse
+                && self.recent_count.saturating_mul(160).saturating_add(128) > self.index_tokens)
         {
             bail!(
-                "recent_count does not fit memory_count/index_tokens (baseline 160 tokens per entry + 128 overhead; larger entries consume more)"
+                "recent_count does not fit memory_count/index_tokens (baseline 160 tokens per entry + 128 overhead; oversized entries are omitted from state)"
             );
         }
         if self
