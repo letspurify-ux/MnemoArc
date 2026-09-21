@@ -244,6 +244,13 @@ impl MemoryStore {
             .iter()
             .filter_map(|ident| self.get(ident).ok().map(|memory| memory.id.clone()))
             .collect();
+        if let Some(existing) = input.key.as_deref().and_then(|key| self.get(key).ok())
+            && !target_ids.contains(&existing.id)
+        {
+            bail!(
+                "memory_key_conflict: replacement key belongs to a memory outside the replacement IDs"
+            );
+        }
         if let Some(old) = input
             .key
             .as_deref()
@@ -331,7 +338,9 @@ impl MemoryStore {
             if stored != fingerprint {
                 bail!("cursor_expired");
             }
-            offset.parse::<usize>()?
+            offset
+                .parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("invalid_cursor"))?
         } else {
             0
         };

@@ -44,6 +44,23 @@ fn number() -> Value {
 fn strings() -> Value {
     json!({"type":"array","items":{"type":"string"}})
 }
+fn memory_input_schema() -> Value {
+    schema(
+        json!({
+            "key":string(),
+            "title":string(),
+            "summary":string(),
+            "body":string(),
+            "tags":strings(),
+            "kind":action(&["fact","decision","failure","question","procedure"]),
+            "inferred":{"type":"boolean"},
+            "source_ids":strings(),
+            "metadata":{"type":"object"},
+            "expected_revision":number()
+        }),
+        &["title", "summary", "body", "kind"],
+    )
+}
 fn action(values: &[&str]) -> Value {
     json!({"type":"string","enum":values})
 }
@@ -102,10 +119,7 @@ impl ToolRegistry {
                 description: "Save one reusable memory. Same key requires expected_revision. Updates replace evidence: resupply valid source_ids for observed facts; existing sources are not inherited. Copy source_ids exactly from tool results; never omit them to recover from unknown_source. Facts without sources, inferred memories and memories whose file evidence changed are needs_review. Source IDs must come from program observations. Metadata has no per-entry token rejection; keep it concise because memory index context still consumes index_tokens. Oversized entries may be omitted from state and remain available through memory_find/memory_read. Put details in body. kind: fact/decision/failure/question/procedure",
                 optional: false,
                 read_only: false,
-                parameters: schema(
-                    json!({"key":string(),"title":string(),"summary":string(),"body":string(),"tags":strings(),"kind":action(&["fact","decision","failure","question","procedure"]),"inferred":{"type":"boolean"},"source_ids":strings(),"metadata":{"type":"object"},"expected_revision":number()}),
-                    &["title", "summary", "body", "kind"],
-                ),
+                parameters: memory_input_schema(),
             },
             ToolSpec {
                 name: "memory_read",
@@ -126,11 +140,11 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_manage",
-                description: "List cleanup candidates, delete unreferenced memories, or atomically replace IDs and redirect references. delete requires ids; replace requires ids and replacement; duplicate IDs are ignored. replacement uses memory_write fields; when it reuses a replaced key, expected_revision and observed-source rules are checked before removal",
+                description: "List cleanup candidates, delete unreferenced memories, or atomically replace IDs and redirect references. delete requires ids; replace requires ids and replacement; duplicate IDs are ignored. replacement uses memory_write fields and must use a new key or a key among the replaced IDs; when it reuses a replaced key, expected_revision and observed-source rules are checked before removal",
                 optional: false,
                 read_only: false,
                 parameters: schema(
-                    json!({"action":action(&["candidates","delete","replace"]),"ids":strings(),"replacement":{"type":"object"}}),
+                    json!({"action":action(&["candidates","delete","replace"]),"ids":strings(),"replacement":memory_input_schema()}),
                     &["action"],
                 ),
             },
@@ -718,6 +732,9 @@ fn path_glob(args: &Value) -> Result<Option<&str>> {
             "invalid_path_glob: expected a file glob such as backend/**/*.js, not a content regex; use source_search query with regex=true for content"
         );
     }
+    if let Some(value) = value {
+        globset::Glob::new(value).map_err(|error| anyhow::anyhow!("invalid_path_glob: {error}"))?;
+    }
     Ok(value)
 }
 fn n(args: &Value, key: &str, default: usize) -> usize {
@@ -1171,7 +1188,9 @@ fn page_cursor(args: &Value, fingerprint: &str) -> Result<usize> {
         if h != fingerprint {
             bail!("cursor_expired: source listing changed");
         }
-        Ok(index.parse()?)
+        index
+            .parse::<usize>()
+            .map_err(|_| anyhow::anyhow!("invalid_cursor"))
     } else {
         Ok(0)
     }

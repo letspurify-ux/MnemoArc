@@ -93,7 +93,8 @@ pub(super) fn execute(
             .split_once(':')
             .ok_or_else(|| anyhow::anyhow!("invalid_cursor"))?
             .1
-            .parse::<usize>()?
+            .parse::<usize>()
+            .map_err(|_| anyhow::anyhow!("invalid_cursor"))?
     } else {
         0
     };
