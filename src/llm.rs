@@ -359,6 +359,12 @@ impl LlmClient for OpenAiClient {
         }
         let emitted_text = Arc::new(AtomicBool::new(false));
         let mut attempt = 0usize;
+        // The optional response-format fallback is a compatibility attempt,
+        // not one of the configured transient retries. Keep its attempt in
+        // the usage accounting, but track retry budget separately so a
+        // fallback cannot either consume all retries or make retries=0 loop
+        // forever after a subsequent 429/5xx response.
+        let mut transient_retries = 0usize;
         let mut response_format_fallback = false;
         loop {
             // Cancellation must cover every await inside an attempt, including
@@ -412,10 +418,11 @@ impl LlmClient for OpenAiClient {
                             || text.starts_with("http_429")
                             || text.starts_with("http_5")
                             || text.contains("error sending request"));
-                    if !retry || attempt == c.retries {
+                    if !retry || transient_retries >= c.retries {
                         return Err(e);
                     }
-                    attempt += 1;
+                    transient_retries += 1;
+                    attempt = attempt.saturating_add(1);
                     tokio::select! {_=cancel.cancelled()=>bail!("cancelled"),_=tokio::time::sleep(Duration::from_millis(500*(1<<attempt.min(5))))=>{}}
                 }
             }

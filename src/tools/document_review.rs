@@ -74,7 +74,21 @@ fn reset_stale_review(state: &mut ReviewState) {
     state.source_hashes.clear();
 }
 
+const MAX_REVIEW_RESTARTS: usize = 4;
+
 pub fn request(s: &mut Session) -> Result<Value> {
+    request_with_restarts(s, 0)
+}
+
+fn request_with_restarts(s: &mut Session, restarts: usize) -> Result<Value> {
+    // A review page is rebuilt when the document or any previously reviewed
+    // evidence changes. Under a continuously written file, unbounded
+    // self-recursion could overflow the worker stack and take down the run.
+    if restarts >= MAX_REVIEW_RESTARTS {
+        bail!(
+            "document_review_stale: document or evidence changed repeatedly; restart review after changes settle"
+        );
+    }
     let output = output_path(&s.project)?;
     let doc = read_text(&output)?;
     let digest = hash(doc.as_bytes());
@@ -91,7 +105,7 @@ pub fn request(s: &mut Session) -> Result<Value> {
         // the bounded review before accepting another verdict instead of
         // repeatedly returning document_review_stale.
         reset_stale_review(&mut s.document_review);
-        return self::request(s);
+        return request_with_restarts(s, restarts + 1);
     }
     let ceiling = 24_000.min(context::ContextManager::input_budget(&s.config));
     let doc_lines: Vec<_> = doc.lines().collect();
@@ -251,7 +265,7 @@ pub fn request(s: &mut Session) -> Result<Value> {
         // Discard verdicts from another document revision; never combine
         // stale pages with a new document.
         reset_stale_review(state);
-        return self::request(s);
+        return request_with_restarts(s, restarts + 1);
     }
     if continuing_page
         && state
@@ -262,7 +276,7 @@ pub fn request(s: &mut Session) -> Result<Value> {
         // A later document page may cite a different set of files. Restart
         // only when a file already reviewed on an earlier page changed.
         reset_stale_review(state);
-        return self::request(s);
+        return request_with_restarts(s, restarts + 1);
     }
     let mut all_hashes = if continuing_page {
         state.source_hashes.clone()
