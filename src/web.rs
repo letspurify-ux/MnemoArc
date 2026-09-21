@@ -83,8 +83,7 @@ fn changed(s: &WebState, c: &mut Core) {
 fn same_config(a: &Config, b: &Config) -> bool {
     // Config serialization intentionally omits the secret, so compare it
     // separately when deciding whether an in-flight setting command applied.
-    let (Ok(serialized_a), Ok(serialized_b)) =
-        (serde_json::to_value(a), serde_json::to_value(b))
+    let (Ok(serialized_a), Ok(serialized_b)) = (serde_json::to_value(a), serde_json::to_value(b))
     else {
         return false;
     };
@@ -112,6 +111,27 @@ fn write_credentials(path: &FsPath, keys: &BTreeMap<String, Secret>) -> Result<(
     file.write_all(serde_json::to_string(&values)?.as_bytes())?;
     file.as_file().sync_all()?;
     file.persist(path)?;
+    Ok(())
+}
+fn restore_file(path: &FsPath, original: Option<&[u8]>) -> Result<()> {
+    match original {
+        Some(bytes) => {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(FsPath::new("."));
+            let mut file = tempfile::NamedTempFile::new_in(parent)?;
+            use std::io::Write;
+            file.write_all(bytes)?;
+            file.as_file().sync_all()?;
+            file.persist(path)?;
+        }
+        None => match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(anyhow::Error::from(error)),
+        },
+    }
     Ok(())
 }
 fn normalize_project(mut project: Project) -> Result<Project> {
@@ -385,17 +405,38 @@ async fn settings(State(s): State<WebState>, Json(input): Json<Settings>) -> Api
     let mut c = s.core.lock().await;
     let config = prepare_settings(&input, &c.config, &c.credentials)?;
     let mut credentials = c.credentials.clone();
+    let updates_credentials = matches!(input.credential_mode.as_str(), "save" | "clear");
     if input.credential_mode == "save" {
         credentials.insert(config.api_key_env.clone(), config.api_key.clone().unwrap());
     }
     if input.credential_mode == "clear" {
         credentials.remove(&config.api_key_env);
     }
-    // Validate everything before writing. Keys are stored separately and never included in API responses.
-    if input.credential_mode == "save" || input.credential_mode == "clear" {
-        write_credentials(&credential_path(&c.path), &credentials)?;
-    }
+    // Stage the old config before changing either file. Keys are stored
+    // separately and never included in API responses. If credential
+    // persistence fails after the config write, restore the exact previous
+    // config so a failed request cannot leave only half of the settings live.
+    let previous_config = if updates_credentials {
+        match std::fs::read(&c.path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(anyhow::Error::from(error).into()),
+        }
+    } else {
+        None
+    };
     config.save(&c.path)?;
+    if updates_credentials
+        && let Err(error) = write_credentials(&credential_path(&c.path), &credentials)
+    {
+        if let Err(rollback) = restore_file(&c.path, previous_config.as_deref()) {
+            return Err(anyhow::anyhow!(
+                "credential save failed: {error}; config rollback failed: {rollback}"
+            )
+            .into());
+        }
+        return Err(error.into());
+    }
     c.config = config;
     c.credentials = credentials;
     changed(&s, &mut c);
@@ -668,9 +709,7 @@ async fn run(
                             .running
                             .as_ref()
                             .is_some_and(|running| running.id == session && running.closing);
-                        if !closing
-                            && let Some(v) = c.sessions.get_mut(&session)
-                        {
+                        if !closing && let Some(v) = c.sessions.get_mut(&session) {
                             v.last_error = Some(text);
                         }
                     }
