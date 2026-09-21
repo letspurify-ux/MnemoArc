@@ -182,11 +182,16 @@ impl ContextManager {
         } else {
             vec![]
         };
-        let candidates = recent_candidates
+        // Explicit task pins are the strongest context contract. Allocate the
+        // shared index budget to them first; otherwise a full recent bucket can
+        // silently hide a memory the task explicitly referenced. Duplicates
+        // that also appear in recent/related are still counted only once and
+        // remain visible under `referenced_memories`.
+        let candidates = pinned_candidates
             .into_iter()
-            .map(|memory| (0, memory))
+            .map(|memory| (2, memory))
+            .chain(recent_candidates.into_iter().map(|memory| (0, memory)))
             .chain(related_candidates.into_iter().map(|memory| (1, memory)))
-            .chain(pinned_candidates.into_iter().map(|memory| (2, memory)))
             .collect();
         let (recent, related, pinned, omitted) =
             fit_memory_index(candidates, s.config.index_tokens, &s.config.model);

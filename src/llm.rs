@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
+    error::Error as StdError,
+    fmt::{Display, Formatter},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -35,6 +37,34 @@ pub struct Completion {
     pub attempts: usize,
     pub length_limited: bool,
     pub discarded_tool_calls: bool,
+}
+
+/// The provider may retry a request several times before returning an error.
+/// Keep that count attached to the error so the agent can account for every
+/// attempted request in its run budget instead of charging only the final one.
+#[derive(Debug)]
+pub(crate) struct CompletionError {
+    source: anyhow::Error,
+    attempts: usize,
+}
+impl CompletionError {
+    fn new(source: anyhow::Error, attempts: usize) -> Self {
+        Self { source, attempts }
+    }
+
+    pub(crate) fn attempts(&self) -> usize {
+        self.attempts.max(1)
+    }
+}
+impl Display for CompletionError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+impl StdError for CompletionError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(self.source.as_ref())
+    }
 }
 #[async_trait]
 pub trait LlmClient: Send + Sync {
@@ -390,7 +420,7 @@ impl LlmClient for OpenAiClient {
             };
             match result {
                 Ok(mut r) => {
-                    r.attempts = attempt + 1;
+                    r.attempts = attempt.saturating_add(1);
                     return Ok(r);
                 }
                 Err(e) => {
@@ -419,9 +449,9 @@ impl LlmClient for OpenAiClient {
                             || text.starts_with("http_5")
                             || text.contains("error sending request"));
                     if !retry || transient_retries >= c.retries {
-                        return Err(e);
+                        return Err(CompletionError::new(e, attempt.saturating_add(1)).into());
                     }
-                    transient_retries += 1;
+                    transient_retries = transient_retries.saturating_add(1);
                     attempt = attempt.saturating_add(1);
                     tokio::select! {_=cancel.cancelled()=>bail!("cancelled"),_=tokio::time::sleep(Duration::from_millis(500*(1<<attempt.min(5))))=>{}}
                 }

@@ -565,7 +565,12 @@ pub async fn run_session_controlled(
             Ok(r) => r,
             Err(e) => {
                 s.usage_incomplete = true;
-                s.input_tokens = s.input_tokens.saturating_add(request_tokens);
+                let attempts = e
+                    .downcast_ref::<crate::llm::CompletionError>()
+                    .map_or(1, crate::llm::CompletionError::attempts);
+                s.input_tokens = s
+                    .input_tokens
+                    .saturating_add(request_tokens.saturating_mul(attempts));
                 failure = Some(e.to_string());
                 break;
             }
@@ -687,6 +692,20 @@ pub async fn run_session_controlled(
         }
         if reviewing_answer {
             review_response_failures = 0;
+        }
+
+        if !completion.length_limited
+            && completion.calls.is_empty()
+            && completion.text.trim().is_empty()
+        {
+            // A provider may legally return stop with an empty content field.
+            // Treating that as a successful final answer would mark the task
+            // complete while persisting an empty assistant message.
+            failure = Some(
+                "empty_completion: model returned neither text nor tool calls; resume to retry"
+                    .into(),
+            );
+            break;
         }
 
         if completion.length_limited && buffer_answer && !completion.discarded_tool_calls {
@@ -868,7 +887,10 @@ pub async fn run_session_controlled(
         if s.config.source_document_review
             && s.checkpoint.is_none()
             && s.document_review.repair_started_round.is_some()
-            && completion.calls.iter().any(|call| call.name == "document_edit")
+            && completion
+                .calls
+                .iter()
+                .any(|call| call.name == "document_edit")
         {
             if s.document_review.repair_requests >= s.config.document_repair_limit {
                 s.status = "partial".into();
