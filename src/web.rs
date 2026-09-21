@@ -638,9 +638,15 @@ async fn close_session(State(s): State<WebState>, Path(id): Path<String>) -> Api
     Ok(Json(json!({"closed":true})))
 }
 async fn memory_get(State(s): State<WebState>, Path((id, memory)): Path<(String, String)>) -> Api {
-    let c = s.core.lock().await;
-    let session = c.sessions.get(&id).ok_or_else(missing)?;
-    Ok(Json(json!(session.memory.get(&memory)?)))
+    let mut c = s.core.lock().await;
+    let session = c.sessions.get_mut(&id).ok_or_else(missing)?;
+    let generation = session.memory.generation;
+    tools::revalidate(session)?;
+    let value = session.memory.get(&memory).cloned();
+    if session.memory.generation != generation {
+        changed(&s, &mut c);
+    }
+    Ok(Json(json!(value?)))
 }
 async fn output(State(s): State<WebState>, Path(id): Path<String>) -> Api {
     let project = {

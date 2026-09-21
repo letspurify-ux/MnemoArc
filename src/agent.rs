@@ -449,6 +449,7 @@ pub async fn run_session_controlled(
         }
         let document_workflow =
             s.task.require_investigation || s.task.workflow == "source_document";
+        request[crate::llm::STREAM_DELTAS_MARKER] = json!(!(buffer_answer || document_workflow));
         let (tx, mut rx) = mpsc::channel(64);
         let event_tx = events.clone();
         let sid = s.id.clone();

@@ -4,7 +4,14 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -41,6 +48,7 @@ pub trait LlmClient: Send + Sync {
 }
 #[derive(Default)]
 pub struct OpenAiClient;
+pub(crate) const STREAM_DELTAS_MARKER: &str = "__mnemoarc_stream_deltas";
 #[derive(Default)]
 pub struct SseDecoder {
     buffer: Vec<u8>,
@@ -112,6 +120,8 @@ impl OpenAiClient {
         c: &Config,
         cancel: CancellationToken,
         delta: mpsc::Sender<String>,
+        emitted_text: Arc<AtomicBool>,
+        stream_deltas: bool,
     ) -> Result<Completion> {
         request["stream"] = json!(true);
         request[if c.legacy_max_tokens {
@@ -190,7 +200,12 @@ impl OpenAiClient {
                 }
                 if let Some(text) = choice["delta"]["content"].as_str() {
                     out.text.push_str(text);
-                    let _ = delta.send(text.to_string()).await;
+                    if stream_deltas
+                        && delta.send(text.to_string()).await.is_ok()
+                        && !text.is_empty()
+                    {
+                        emitted_text.store(true, Ordering::Relaxed);
+                    }
                 }
                 if let Some(entries) = choice["delta"]["tool_calls"].as_array() {
                     for call in entries {
@@ -295,7 +310,7 @@ impl OpenAiClient {
 impl LlmClient for OpenAiClient {
     async fn complete(
         &self,
-        request: Value,
+        mut request: Value,
         c: &Config,
         cancel: CancellationToken,
         delta: mpsc::Sender<String>,
@@ -305,16 +320,31 @@ impl LlmClient for OpenAiClient {
         if !request.is_object() {
             bail!("invalid_request: completion request must be a JSON object");
         }
+        let stream_deltas = request
+            .get(STREAM_DELTAS_MARKER)
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if let Some(fields) = request.as_object_mut() {
+            fields.remove(STREAM_DELTAS_MARKER);
+        }
+        let emitted_text = Arc::new(AtomicBool::new(false));
         for attempt in 0..=c.retries {
             // Cancellation must cover every await inside an attempt, including
             // response-body reads and backpressure on the delta channel.
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => bail!("cancelled"),
-                result = tokio::time::timeout(
-                    Duration::from_secs(c.request_timeout_secs),
-                    self.attempt(request.clone(), c, cancel.clone(), delta.clone()),
-                ) => result,
+                    result = tokio::time::timeout(
+                        Duration::from_secs(c.request_timeout_secs),
+                        self.attempt(
+                            request.clone(),
+                            c,
+                            cancel.clone(),
+                            delta.clone(),
+                            emitted_text.clone(),
+                            stream_deltas,
+                        ),
+                    ) => result,
             };
             let result = match result {
                 Ok(r) => r,
@@ -327,12 +357,13 @@ impl LlmClient for OpenAiClient {
                 }
                 Err(e) => {
                     let text = e.to_string();
-                    let retry = text.starts_with("provider_stream_error:")
-                        || (attempt == 0 && text.starts_with("invalid_tool_arguments:"))
-                        || (attempt == 0 && text.starts_with("invalid_stream_event:"))
-                        || text.starts_with("http_429")
-                        || text.starts_with("http_5")
-                        || text.contains("error sending request");
+                    let retry = !emitted_text.load(Ordering::Relaxed)
+                        && (text.starts_with("provider_stream_error:")
+                            || (attempt == 0 && text.starts_with("invalid_tool_arguments:"))
+                            || (attempt == 0 && text.starts_with("invalid_stream_event:"))
+                            || text.starts_with("http_429")
+                            || text.starts_with("http_5")
+                            || text.contains("error sending request"));
                     if !retry || attempt == c.retries {
                         return Err(e);
                     }
