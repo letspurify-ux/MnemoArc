@@ -964,6 +964,7 @@ pub async fn run_session_controlled(
         let mut seen_call_ids = std::collections::BTreeSet::new();
         while i < execution_calls.len() {
             let call = &execution_calls[i];
+            let duplicate_call_id = seen_call_ids.contains(&call.id);
             let parallel = ["file_list", "file_read", "source_search"]
                 .contains(&call.name.as_str())
                 && s.active_tools.contains(&call.name)
@@ -993,7 +994,11 @@ pub async fn run_session_controlled(
             }
             s.activity = json!({"stage":"tools","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds,"tools":execution_calls[i..i+group].iter().map(|c| c.name.clone()).collect::<Vec<_>>()});
             snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
-            let results = if failure.is_some() {
+            let results = if duplicate_call_id {
+                vec![tools::envelope(Err(anyhow::anyhow!(
+                    "call_id_collision: duplicate tool call id in one response; call IDs must be unique"
+                )))]
+            } else if failure.is_some() {
                 (0..group)
                     .map(|_| {
                         tools::envelope(Err(anyhow::anyhow!(
