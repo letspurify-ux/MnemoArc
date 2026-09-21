@@ -182,11 +182,17 @@ fn rebase_document_call(call: &ToolCall, hash: Option<&str>) -> (ToolCall, bool)
         // never index them mutably while attempting hash recovery.
         return (call.clone(), false);
     };
-    let action = object
-        .get("action")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let expected_hash = object.get("expected_hash").and_then(Value::as_str);
+    let action = object.get("action").and_then(Value::as_str).unwrap_or("");
+    // A missing precondition can be recovered after an earlier successful
+    // edit in this response, but an explicitly supplied non-string value is
+    // malformed input and must still reach normal schema validation. Treating
+    // null/numbers as omitted would silently turn a bad call into a write.
+    let expected_hash = match object.get("expected_hash") {
+        None => None,
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.as_str()),
+        Some(Value::String(_)) => return (call.clone(), false),
+        Some(_) => return (call.clone(), false),
+    };
     // A create call intentionally has no revision precondition: rebasing it
     // would turn its useful document_exists error into a less meaningful
     // stale-hash error. A first write on a missing file, however, may be

@@ -617,25 +617,31 @@ fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
                 bail!("unknown_argument: edits[{index}].{key}");
             }
         }
-        let action = object
+        let action_value = object
             .get("action")
-            .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("missing_argument: edits[{index}].action"))?;
+        let action = action_value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid_argument_type: edits[{index}].action"))?;
         if !["write", "append", "patch", "section"].contains(&action) {
             bail!(
                 "invalid_argument_value: edits[{index}].action must be write, append, patch or section"
             );
         }
-        object
+        let text_value = object
             .get("text")
-            .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("missing_argument: edits[{index}].text"))?;
+        text_value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid_argument_type: edits[{index}].text"))?;
         match action {
             "patch" => {
-                let old_text = object
+                let old_text_value = object
                     .get("old_text")
-                    .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("missing_argument: edits[{index}].old_text"))?;
+                let old_text = old_text_value.as_str().ok_or_else(|| {
+                    anyhow::anyhow!("invalid_argument_type: edits[{index}].old_text")
+                })?;
                 if old_text.is_empty() {
                     bail!("invalid_argument_value: edits[{index}].old_text must not be empty");
                 }
@@ -648,19 +654,21 @@ fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
                 }
             }
             "section" => {
-                let section = object
+                let section_value = object
                     .get("section")
-                    .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("missing_argument: edits[{index}].section"))?;
+                let section = section_value.as_str().ok_or_else(|| {
+                    anyhow::anyhow!("invalid_argument_type: edits[{index}].section")
+                })?;
                 if section.trim().is_empty() {
                     bail!("invalid_argument_value: edits[{index}].section must not be empty");
                 }
-                let section_hash = object
-                    .get("expected_section_hash")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("missing_argument: edits[{index}].expected_section_hash")
-                    })?;
+                let section_hash_value = object.get("expected_section_hash").ok_or_else(|| {
+                    anyhow::anyhow!("missing_argument: edits[{index}].expected_section_hash")
+                })?;
+                let section_hash = section_hash_value.as_str().ok_or_else(|| {
+                    anyhow::anyhow!("invalid_argument_type: edits[{index}].expected_section_hash")
+                })?;
                 if section_hash.trim().is_empty() {
                     bail!(
                         "invalid_argument_value: edits[{index}].expected_section_hash must not be empty"
