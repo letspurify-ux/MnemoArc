@@ -126,7 +126,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_manage",
-                description: "List cleanup candidates, delete unreferenced memories, or atomically replace IDs and redirect references. replacement uses memory_write fields",
+                description: "List cleanup candidates, delete unreferenced memories, or atomically replace IDs and redirect references. delete and replace require ids; duplicate IDs are ignored. replacement uses memory_write fields",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -1099,8 +1099,19 @@ pub fn execute_cancellable(
                     json!({"bytes":s.memory.bytes(),"candidates":s.memory.candidates(&s.protected())}),
                 ),
                 "delete" => {
+                    if ids.is_empty() {
+                        bail!("missing_argument: ids for memory_manage action=delete");
+                    }
                     let mut copy = s.memory.clone();
-                    for id in ids {
+                    let mut seen = BTreeSet::new();
+                    let actual = ids
+                        .iter()
+                        .map(|id| s.memory.get(id).map(|memory| memory.id.clone()))
+                        .collect::<Result<Vec<_>>>()?
+                        .into_iter()
+                        .filter(|id| seen.insert(id.clone()))
+                        .collect::<Vec<_>>();
+                    for id in actual {
                         copy.delete(&id, &s.protected())?;
                     }
                     s.memory = copy;
@@ -1110,10 +1121,14 @@ pub fn execute_cancellable(
                     if ids.is_empty() {
                         bail!("replace requires ids");
                     }
+                    let mut seen = BTreeSet::new();
                     let actual = ids
                         .iter()
                         .map(|id| s.memory.get(id).map(|m| m.id.clone()))
-                        .collect::<Result<Vec<_>>>()?;
+                        .collect::<Result<Vec<_>>>()?
+                        .into_iter()
+                        .filter(|id| seen.insert(id.clone()))
+                        .collect::<Vec<_>>();
                     let task_memory_ids = s
                         .task
                         .memory_ids
