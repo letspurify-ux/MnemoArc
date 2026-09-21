@@ -154,13 +154,13 @@ impl ContextManager {
         let (related, related_omitted) =
             fit_memory_index(related_candidates, s.config.index_tokens, &s.config.model);
         omitted.extend(related_omitted);
-        let pinned_candidates = s
-            .task
-            .memory_ids
-            .iter()
-            .map(|id| s.memory.get(id).map(|m| m.meta()))
-            .collect::<Result<Vec<_>>>()?;
         let (pinned, pinned_omitted) = if s.config.memory_reuse {
+            let pinned_candidates = s
+                .task
+                .memory_ids
+                .iter()
+                .map(|id| s.memory.get(id).map(|m| m.meta()))
+                .collect::<Result<Vec<_>>>()?;
             fit_memory_index(pinned_candidates, s.config.index_tokens, &s.config.model)
         } else {
             (vec![], vec![])
