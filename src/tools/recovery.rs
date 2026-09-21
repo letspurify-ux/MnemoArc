@@ -93,7 +93,10 @@ pub fn describe(message: &str) -> Value {
         (Class::InvalidInput, "choose_allowed_path")
     } else if matches!(
         code,
-        "cursor_arguments_conflict" | "conflicting_arguments" | "ambiguous_file_read_range"
+        "memory_key_conflict"
+            | "cursor_arguments_conflict"
+            | "conflicting_arguments"
+            | "ambiguous_file_read_range"
     ) {
         (Class::InvalidInput, "correct_arguments")
     } else if code == "unknown_source" || code == "source_coverage_missing" {
