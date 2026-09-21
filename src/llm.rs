@@ -50,6 +50,15 @@ pub trait LlmClient: Send + Sync {
 pub struct OpenAiClient;
 pub(crate) const STREAM_DELTAS_MARKER: &str = "__mnemoarc_stream_deltas";
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+fn response_format_rejected(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.starts_with("http_400:")
+        && (error.contains("response_format")
+            || error.contains("json_object")
+            || error.contains("unsupported parameter"))
+}
+
 #[derive(Default)]
 pub struct SseDecoder {
     buffer: Vec<u8>,
@@ -345,7 +354,9 @@ impl LlmClient for OpenAiClient {
             fields.remove(STREAM_DELTAS_MARKER);
         }
         let emitted_text = Arc::new(AtomicBool::new(false));
-        for attempt in 0..=c.retries {
+        let mut attempt = 0usize;
+        let mut response_format_fallback = false;
+        loop {
             // Cancellation must cover every await inside an attempt, including
             // response-body reads and backpressure on the delta channel.
             let result = tokio::select! {
@@ -374,6 +385,22 @@ impl LlmClient for OpenAiClient {
                 }
                 Err(e) => {
                     let text = e.to_string();
+                    // OpenAI-compatible local servers are not uniform about
+                    // JSON mode. Retry once without the optional structured
+                    // output hint when the server explicitly rejects it;
+                    // finish() still validates the returned object.
+                    if !response_format_fallback
+                        && request.get("response_format").is_some()
+                        && response_format_rejected(&text)
+                    {
+                        request
+                            .as_object_mut()
+                            .expect("request was validated as an object")
+                            .remove("response_format");
+                        response_format_fallback = true;
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
                     let retry = !emitted_text.load(Ordering::Relaxed)
                         && (text.starts_with("provider_stream_error:")
                             || (attempt == 0 && text.starts_with("invalid_tool_arguments:"))
@@ -384,10 +411,10 @@ impl LlmClient for OpenAiClient {
                     if !retry || attempt == c.retries {
                         return Err(e);
                     }
+                    attempt += 1;
                     tokio::select! {_=cancel.cancelled()=>bail!("cancelled"),_=tokio::time::sleep(Duration::from_millis(500*(1<<attempt.min(5))))=>{}}
                 }
             }
         }
-        unreachable!()
     }
 }

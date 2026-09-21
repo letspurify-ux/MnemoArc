@@ -461,7 +461,13 @@ pub async fn run_session_controlled(
         // configured output allowance and reserve it for every cleanup round.
         let mut request_config = s.config.clone();
         if reviewing_document {
-            request_config.output_tokens = request_config.output_tokens.min(4096);
+            // A short first response keeps ordinary review calls bounded. If
+            // the provider exhausts that allowance before emitting JSON, give
+            // the bounded recovery request the configured output allowance so
+            // reasoning tokens cannot starve the verdict itself.
+            if review_response_failures == 0 {
+                request_config.output_tokens = request_config.output_tokens.min(4096);
+            }
         }
         if request_tokens
             .saturating_add(request_config.output_tokens)
@@ -574,15 +580,28 @@ pub async fn run_session_controlled(
         if reviewing_document {
             s.document_review.input_tokens += s.input_tokens.saturating_sub(usage_before.0);
             s.document_review.output_tokens += s.output_tokens.saturating_sub(usage_before.1);
-            let review_result = if completion.length_limited
-                || !completion.calls.is_empty()
-                || completion.text.trim().is_empty()
-            {
+            // Validate the visible response before looking at provider
+            // metadata. Some compatible providers attach a spurious tool call
+            // or report finish_reason=length even when the JSON object is
+            // complete. The review request has no executable tools, so a
+            // complete, hash-checked verdict is safe to accept in that case.
+            let review_result = if completion.text.trim().is_empty() {
                 Err(anyhow::anyhow!(
                     "document_review_incomplete: review must return complete JSON without tools"
                 ))
             } else {
-                tools::document_review::finish(&mut s, &completion.text)
+                match tools::document_review::finish(&mut s, &completion.text) {
+                    Ok(()) => Ok(()),
+                    Err(error)
+                        if (completion.length_limited || !completion.calls.is_empty())
+                            && error.to_string().starts_with("document_review_invalid:") =>
+                    {
+                        Err(anyhow::anyhow!(
+                            "document_review_incomplete: review must return complete JSON without tools"
+                        ))
+                    }
+                    Err(error) => Err(error),
+                }
             };
             if let Err(error) = review_result {
                 let reason = error.to_string();
@@ -590,12 +609,25 @@ pub async fn run_session_controlled(
                 s.last_error = Some(reason.clone());
                 if review_response_failures < 3
                     && (reason.starts_with("document_review_invalid:")
-                        || reason.starts_with("document_review_incomplete:"))
+                        || reason.starts_with("document_review_incomplete:")
+                        || reason.starts_with("document_review_stale:"))
                 {
                     snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
                     continue;
                 }
-                failure = Some(reason);
+                // A malformed provider response must not discard the written
+                // document or turn a resumable review into a hard worker
+                // failure. Keep the review pending and expose a resumable
+                // partial result after the bounded retries.
+                if reason.starts_with("document_review_invalid:")
+                    || reason.starts_with("document_review_incomplete:")
+                    || reason.starts_with("document_review_stale:")
+                {
+                    s.status = "partial".into();
+                    s.document_review.pending = true;
+                } else {
+                    failure = Some(reason);
+                }
                 break;
             }
             review_response_failures = 0;

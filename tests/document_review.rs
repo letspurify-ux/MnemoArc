@@ -664,7 +664,7 @@ async fn malformed_review_has_bounded_recovery_without_consuming_valid_review_bu
         drain.await.unwrap();
         assert_eq!(*model.calls.lock().unwrap(), if always_bad { 3 } else { 2 });
         if always_bad {
-            assert_eq!(result.status, "blocked");
+            assert_eq!(result.status, "partial");
             assert!(
                 result
                     .last_error
