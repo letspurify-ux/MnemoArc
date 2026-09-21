@@ -186,10 +186,46 @@ async fn read_parallel(
     let guidance = s.run_guidance.clone();
     let file_cursors = s.file_cursors.clone();
     let owned_calls = calls.to_vec();
-    let futures=owned_calls.into_iter().map(|call|{let mut temporary=Session::new(project.clone(),config.clone());temporary.active_tools=active.clone();temporary.history=history.clone();temporary.run_guidance=guidance.clone();temporary.file_cursors=file_cursors.clone();let cancel=cancel.clone();let timeout=config.tool_timeout_secs;async move{
-        let child=cancel.child_token();let tool_cancel=child.clone();let mut job=tokio::task::spawn_blocking(move||{let result=tools::run_call_cancellable(&mut temporary,&call,&tool_cancel);(temporary,result)});
-        tokio::select!{_ = cancel.cancelled()=>{child.cancel();Err(anyhow::anyhow!("cancelled"))},result=tokio::time::timeout(Duration::from_secs(timeout),&mut job)=>match result {Ok(Ok(value))=>Ok(value),Ok(Err(e))=>Err(anyhow::anyhow!("tool worker failed: {e}")),Err(_)=>{child.cancel();Err(anyhow::anyhow!("tool_timeout"))}}}
-    }});
+    let futures = owned_calls.into_iter().map(|call| {
+        let mut temporary = Session::new(project.clone(), config.clone());
+        temporary.active_tools = active.clone();
+        temporary.history = history.clone();
+        temporary.run_guidance = guidance.clone();
+        temporary.file_cursors = file_cursors.clone();
+        let cancel = cancel.clone();
+        let timeout = config.tool_timeout_secs;
+        async move {
+            let child = cancel.child_token();
+            let tool_cancel = child.clone();
+            let mut job = tokio::task::spawn_blocking(move || {
+                let result = tools::run_call_cancellable(&mut temporary, &call, &tool_cancel);
+                (temporary, result)
+            });
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    child.cancel();
+                    // Do not detach a blocking worker on cancellation. It only
+                    // owns a temporary session, but the worker still consumes a
+                    // thread and can outlive the run indefinitely otherwise.
+                    let _ = job.await;
+                    Err(anyhow::anyhow!("cancelled"))
+                }
+                result = tokio::time::timeout(Duration::from_secs(timeout), &mut job) => {
+                    match result {
+                        Ok(Ok(value)) => Ok(value),
+                        Ok(Err(error)) => Err(anyhow::anyhow!("tool_worker_panic: tool worker failed: {error}")),
+                        Err(_) => {
+                            child.cancel();
+                            // Reads have no owner-session writes, so the final
+                            // outcome can be discarded after the worker joins.
+                            let _ = job.await;
+                            Err(anyhow::anyhow!("tool_timeout"))
+                        }
+                    }
+                }
+            }
+        }
+    });
     let mut results = vec![];
     let mut pending = stream::iter(futures).buffered(config.read_parallelism);
     while let Some(result) = pending.next().await {
@@ -922,20 +958,33 @@ pub async fn run_session_controlled(
         let mut i = 0;
         let mut checkpoint_failure_recorded = false;
         let mut remaining = batch_limit;
+        let mut seen_call_ids = std::collections::BTreeSet::new();
         while i < execution_calls.len() {
             let call = &execution_calls[i];
             let parallel = ["file_list", "file_read", "source_search"]
                 .contains(&call.name.as_str())
                 && s.active_tools.contains(&call.name)
                 && s.checkpoint.is_none()
-                && s.run_guidance["phase"] != "verify";
+                && s.run_guidance["phase"] != "verify"
+                // Parallel workers use isolated temporary sessions. A call
+                // already in the owner ledger must go through execute_one so
+                // its cached result (or call-id collision) is honored instead
+                // of silently running the same call again.
+                && !s.ledger.contains_key(&call.id)
+                && !seen_call_ids.contains(&call.id);
             let mut group = 1;
             if parallel {
+                let mut group_call_ids = std::collections::BTreeSet::new();
+                group_call_ids.insert(call.id.clone());
                 while i + group < execution_calls.len()
                     && ["file_list", "file_read", "source_search"]
                         .contains(&execution_calls[i + group].name.as_str())
                     && s.active_tools.contains(&execution_calls[i + group].name)
+                    && !s.ledger.contains_key(&execution_calls[i + group].id)
+                    && !seen_call_ids.contains(&execution_calls[i + group].id)
+                    && !group_call_ids.contains(&execution_calls[i + group].id)
                 {
+                    group_call_ids.insert(execution_calls[i + group].id.clone());
                     group += 1
                 }
             }
@@ -1070,6 +1119,9 @@ pub async fn run_session_controlled(
                 messages.push(
                     json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}),
                 );
+            }
+            for call in &execution_calls[i..i + group] {
+                seen_call_ids.insert(call.id.clone());
             }
             i += group;
         }
