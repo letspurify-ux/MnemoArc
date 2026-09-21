@@ -53,10 +53,14 @@ const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 fn response_format_rejected(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
+    // OpenAI-compatible servers do not agree on the error body: some name
+    // response_format, while others return only a generic parameter 400/422.
     error.starts_with("http_400:")
-        && (error.contains("response_format")
-            || error.contains("json_object")
-            || error.contains("unsupported parameter"))
+        || error.starts_with("http_422:")
+        || (error.starts_with("http_4")
+            && (error.contains("response_format")
+                || error.contains("json_object")
+                || error.contains("unsupported parameter")))
 }
 
 #[derive(Default)]
