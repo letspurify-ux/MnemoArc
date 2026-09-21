@@ -50,6 +50,39 @@ fn run_deadline(started: Instant, config: &Config) -> tokio::time::Instant {
         .checked_add(Duration::from_secs(config.run_timeout_secs))
         .unwrap_or_else(tokio::time::Instant::now)
 }
+
+fn same_source(a: &crate::memory::Source, b: &crate::memory::Source) -> bool {
+    a.origin == b.origin
+        && a.path == b.path
+        && a.start_line == b.start_line
+        && a.end_line == b.end_line
+        && a.hash == b.hash
+        && a.excerpt == b.excerpt
+}
+
+fn remap_source_ids(value: &mut Value, ids: &std::collections::BTreeMap<String, String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                remap_source_ids(value, ids);
+            }
+        }
+        Value::Object(object) => {
+            for (key, value) in object.iter_mut() {
+                if matches!(key.as_str(), "source" | "signature_source")
+                    && let Some(source) = value.as_object_mut()
+                    && let Some(id) = source.get("id").and_then(Value::as_str).map(str::to_owned)
+                    && let Some(canonical) = ids.get(&id)
+                {
+                    source.insert("id".into(), json!(canonical));
+                }
+                remap_source_ids(value, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn emit(
     tx: &mpsc::Sender<AgentEvent>,
     event: AgentEvent,
@@ -163,12 +196,27 @@ async fn read_parallel(
         match result {
             Ok((temp, mut result)) => {
                 s.file_cursors.extend(temp.file_cursors);
+                let mut source_ids = std::collections::BTreeMap::new();
                 for source in temp.sources.into_values() {
-                    if let Some(path) = &source.path {
-                        s.memory.stale_path(path, source.hash.as_deref());
-                    }
-                    s.sources.insert(source.id.clone(), source);
+                    let source_id = source.id.clone();
+                    let canonical = s
+                        .sources
+                        .values()
+                        .find(|existing| same_source(existing, &source))
+                        .map(|existing| existing.id.clone());
+                    let id = if let Some(id) = canonical {
+                        id
+                    } else {
+                        if let Some(path) = &source.path {
+                            s.memory.stale_path(path, source.hash.as_deref());
+                        }
+                        let id = source_id.clone();
+                        s.sources.insert(id.clone(), source);
+                        id
+                    };
+                    source_ids.insert(source_id, id);
                 }
+                remap_source_ids(&mut result, &source_ids);
                 // Temporary history IDs cannot escape into the owning session.
                 if result["truncated"] == true
                     && let Some(id) = result["archive_id"]

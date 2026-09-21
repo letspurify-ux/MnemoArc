@@ -129,7 +129,10 @@ pub(super) fn execute(
             if i % 256 == 0 && cancel.is_cancelled() {
                 bail!("cancelled");
             }
-            if !regex.is_match(line) {
+            // A blank or whitespace-only line cannot provide the non-empty
+            // excerpt required for source evidence, so do not expose it as a
+            // searchable match even when a regex can match an empty string.
+            if line.trim().is_empty() || !regex.is_match(line) {
                 continue;
             }
             matching_lines += 1;

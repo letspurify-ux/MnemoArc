@@ -121,6 +121,7 @@ async function supervise() {
   });
   const days = retentionDays();
   await pruneLogs(logDirectory, days);
+  if (stopping) return;
   // Cleanup still runs when the server stays up through midnight without
   // producing output. The timer does not keep a stopped supervisor alive.
   function schedulePrune() {

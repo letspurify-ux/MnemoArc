@@ -656,6 +656,9 @@ pub fn output_path(p: &Project) -> Result<PathBuf> {
     {
         bail!("parent_traversal_not_allowed");
     }
+    if path.exists() && std::fs::metadata(&path)?.is_dir() {
+        bail!("output_path_is_directory: configured output must be a file");
+    }
     Ok(path)
 }
 pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {

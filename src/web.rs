@@ -104,6 +104,12 @@ fn write_credentials(path: &FsPath, keys: &BTreeMap<String, Secret>) -> Result<(
     Ok(())
 }
 fn normalize_project(mut project: Project) -> Result<Project> {
+    if project.root.as_os_str().is_empty() {
+        bail!("프로젝트 소스 폴더가 필요합니다.");
+    }
+    if project.output.as_os_str().is_empty() {
+        bail!("프로젝트 결과 문서 경로가 필요합니다.");
+    }
     project.root = project.root.canonicalize()?;
     if !project.root.is_dir() || project.name.trim().is_empty() {
         bail!("프로젝트 이름과 실제 폴더가 필요합니다.");
@@ -137,9 +143,7 @@ impl WebState {
             });
         }
         for project in &mut config.projects {
-            if let Ok(root) = project.root.canonicalize() {
-                project.root = root;
-            }
+            *project = normalize_project(project.clone())?;
         }
         let session = Session::new(config.projects[0].clone(), config.clone());
         let id = session.id.clone();
