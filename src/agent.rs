@@ -177,19 +177,29 @@ fn rebase_document_call(call: &ToolCall, hash: Option<&str>) -> (ToolCall, bool)
     let Ok(mut args) = serde_json::from_str::<Value>(&call.arguments) else {
         return (call.clone(), false);
     };
-    let action = args["action"].as_str().unwrap_or("");
+    let Some(object) = args.as_object_mut() else {
+        // Malformed non-object arguments must reach normal tool validation;
+        // never index them mutably while attempting hash recovery.
+        return (call.clone(), false);
+    };
+    let action = object
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let expected_hash = object.get("expected_hash").and_then(Value::as_str);
     // A create call intentionally has no revision precondition: rebasing it
     // would turn its useful document_exists error into a less meaningful
     // stale-hash error. A first write on a missing file, however, may be
     // followed by another write in the same response, so fill its now
     // required precondition just like append/patch/section calls.
-    if action == "create"
-        || args["expected_hash"].as_str() == Some(hash)
-        || (args["expected_hash"].is_null() && action != "write")
-    {
+    if action == "create" || expected_hash == Some(hash) {
         return (call.clone(), false);
     }
-    args["expected_hash"] = json!(hash);
+    // Every other edit targets the current document. If the model omitted
+    // the precondition after an earlier successful edit in this response,
+    // supply the chained hash for both the single-call and batch contracts.
+    // Invalid/unknown actions still go through normal validation below.
+    object.insert("expected_hash".into(), json!(hash));
     let Ok(arguments) = serde_json::to_string(&args) else {
         return (call.clone(), false);
     };

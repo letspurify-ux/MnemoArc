@@ -212,6 +212,9 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "inspect_checkpoint_state" => &["history", "task_state"],
         "lookup_observed_evidence" => &["source_lookup", "history", "file_read"],
         "complete_prerequisite" => &["document_inspect", "investigation", "document_edit"],
+        "resolve_path" if matches!(call.name.as_str(), "document_edit" | "document_edit_batch") => {
+            &["document_inspect", "document_edit", "document_edit_batch"]
+        }
         "resolve_path" => &["document_inspect", "file_list"],
         "select_file_from_directory" => &["file_list", "file_read"],
         "choose_allowed_path" => &["file_list", "document_inspect"],
