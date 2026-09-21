@@ -94,28 +94,53 @@ fn model_message(mut message: Value) -> Value {
     message
 }
 
+/// Fit all memory-index buckets against one shared budget. Applying the limit
+/// independently to recent, related and referenced memories can still make the
+/// serialized state exceed `index_tokens` by several times.
 fn fit_memory_index(
-    candidates: Vec<MemoryMeta>,
+    candidates: Vec<(u8, MemoryMeta)>,
     budget: usize,
     model: &str,
-) -> (Vec<MemoryMeta>, Vec<MemoryMeta>) {
+) -> (
+    Vec<MemoryMeta>,
+    Vec<MemoryMeta>,
+    Vec<MemoryMeta>,
+    Vec<MemoryMeta>,
+) {
     let mut included = Vec::new();
     let mut omitted = Vec::new();
-    let mut used_tokens = count(&json!(included), model);
-    for memory in candidates {
-        if used_tokens >= budget {
-            omitted.push(memory);
+    let mut accepted_buckets = std::collections::BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    for (bucket, memory) in candidates {
+        // A pinned memory is often also recent. Count it once against the
+        // shared index budget, but keep it in the explicit referenced bucket
+        // so task pins remain visible to the model.
+        if !seen.insert(memory.id.clone()) {
+            if bucket == 2 {
+                accepted_buckets.insert(memory.id.clone(), bucket);
+            }
             continue;
         }
-        included.push(memory);
-        let total = count(&json!(included), model);
-        if total > budget {
-            omitted.push(included.pop().unwrap());
+        included.push(memory.clone());
+        if count(&json!(included), model) > budget {
+            included.pop();
+            omitted.push(memory);
         } else {
-            used_tokens = total;
+            accepted_buckets.insert(memory.id.clone(), bucket);
         }
     }
-    (included, omitted)
+    let mut recent = Vec::new();
+    let mut related = Vec::new();
+    let mut pinned = Vec::new();
+    for memory in included {
+        match accepted_buckets.get(&memory.id).copied() {
+            Some(0) => recent.push(memory),
+            Some(1) => related.push(memory),
+            Some(2) => pinned.push(memory),
+            _ => {}
+        }
+    }
+    (recent, related, pinned, omitted)
 }
 
 impl ContextManager {
@@ -138,34 +163,33 @@ impl ContextManager {
             .iter()
             .map(|memory| memory.id.clone())
             .collect();
-        let (recent, mut omitted) =
-            fit_memory_index(recent_candidates, s.config.index_tokens, &s.config.model);
-        let related_candidates = s
-            .memory
-            .search(&format!("{} {}", s.latest_request, s.task.current), &[])
-            .into_iter()
-            .filter(|memory| !recent_candidate_ids.contains(&memory.id))
-            .take(if s.config.memory_reuse {
-                s.config.related_count
-            } else {
-                0
-            })
-            .collect::<Vec<_>>();
-        let (related, related_omitted) =
-            fit_memory_index(related_candidates, s.config.index_tokens, &s.config.model);
-        omitted.extend(related_omitted);
-        let (pinned, pinned_omitted) = if s.config.memory_reuse {
-            let pinned_candidates = s
-                .task
+        let related_candidates = if s.config.memory_reuse {
+            s.memory
+                .search(&format!("{} {}", s.latest_request, s.task.current), &[])
+                .into_iter()
+                .filter(|memory| !recent_candidate_ids.contains(&memory.id))
+                .take(s.config.related_count)
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+        let pinned_candidates = if s.config.memory_reuse {
+            s.task
                 .memory_ids
                 .iter()
                 .map(|id| s.memory.get(id).map(|m| m.meta()))
-                .collect::<Result<Vec<_>>>()?;
-            fit_memory_index(pinned_candidates, s.config.index_tokens, &s.config.model)
+                .collect::<Result<Vec<_>>>()?
         } else {
-            (vec![], vec![])
+            vec![]
         };
-        omitted.extend(pinned_omitted);
+        let candidates = recent_candidates
+            .into_iter()
+            .map(|memory| (0, memory))
+            .chain(related_candidates.into_iter().map(|memory| (1, memory)))
+            .chain(pinned_candidates.into_iter().map(|memory| (2, memory)))
+            .collect();
+        let (recent, related, pinned, omitted) =
+            fit_memory_index(candidates, s.config.index_tokens, &s.config.model);
         let mut user_sources = s
             .sources
             .values()
