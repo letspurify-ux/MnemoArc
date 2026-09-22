@@ -906,6 +906,17 @@ fn unique_document_text_span(old: &str, target: &str) -> Result<(usize, usize)> 
     Ok((first, first + target.len()))
 }
 
+fn line_delimiter_at(text: &str, position: usize) -> &str {
+    let newline = text[..position]
+        .rfind('\n')
+        .or_else(|| text[position..].find('\n').map(|next| position + next));
+    if newline.is_some_and(|index| index > 0 && text.as_bytes()[index - 1] == b'\r') {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
 fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
     let action = text(args, "action")?;
     let new = if action == "delete_text" {
@@ -950,7 +961,7 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                     .map_or(anchor.end, |heading| heading.start),
                 _ => anchor.end,
             };
-            let delimiter = if old.contains("\r\n") { "\r\n" } else { "\n" };
+            let delimiter = line_delimiter_at(old, position);
             let mut prefix = old[..position].to_string();
             if !prefix.is_empty() && !prefix.ends_with('\n') {
                 prefix.push_str(delimiter);
@@ -974,6 +985,15 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             }
             if new.lines().next().map(str::trim) != target.lines().next().map(str::trim) {
                 bail!("invalid_argument_value: section replacement must retain its heading");
+            }
+            if documentation::headings(new)
+                .iter()
+                .skip(1)
+                .any(|heading| heading.level <= resolved.level)
+            {
+                bail!(
+                    "invalid_argument_value: section replacement cannot add a sibling or ancestor heading"
+                );
             }
             let mut replacement = new.to_string();
             if resolved.end < old.len() && !replacement.ends_with('\n') {

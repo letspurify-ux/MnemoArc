@@ -83,6 +83,32 @@ fn inserting_after_last_child_stays_inside_its_parent() {
 }
 
 #[test]
+fn section_insertion_uses_the_local_line_ending_in_mixed_documents() {
+    let original = "# Doc\r\n## CRLF\r\nA\r\n## LF\nB\n## Tail\nC\n";
+    let expected = "# Doc\r\n## CRLF\r\nA\r\n## LF\nB\n## New\nN\n## Tail\nC\n";
+    for batch in [false, true] {
+        let (_dir, mut s) = setup();
+        std::fs::write(&s.project.output, original).unwrap();
+        let edit = json!({"action":"insert_after","section":"## LF","text":"## New\nN"});
+        if batch {
+            run(
+                &mut s,
+                "document_edit_batch",
+                json!({"expected_hash":tools::hash(original.as_bytes()),"edits":[edit]}),
+            );
+        } else {
+            let mut edit = edit;
+            edit["expected_hash"] = json!(tools::hash(original.as_bytes()));
+            run(&mut s, "document_edit", edit);
+        }
+        assert_eq!(
+            std::fs::read_to_string(&s.project.output).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn nested_outline_paths_select_repeated_titles_and_scope_text_edits() {
     let (_dir, mut s) = setup();
     let created = run(
@@ -752,6 +778,62 @@ fn bare_section_title_reads_and_edits_unique_heading_without_renaming_it() {
     assert_eq!(exact["hash"], modified["hash"]);
     assert_eq!(exact["content"]["text"], "## 1. 시스템 개요\n수정\n");
     assert!(tools::execute(&mut s, "document_edit", json!({"action":"section","section":"1. 시스템 개요","expected_hash":exact["hash"],"expected_section_hash":exact["section_hash"],"text":"1. 시스템 개요\n제목 기호 제거\n"})).unwrap_err().to_string().contains("retain its heading"));
+}
+
+#[test]
+fn tab_separated_markdown_headings_can_be_inspected_and_edited() {
+    let (_dir, mut s) = setup();
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n##\tPart ###\nBody.\n## Next\nLater.\n"}),
+    );
+    let inspected = run(&mut s, "document_inspect", json!({"section":"Part"}));
+    assert_eq!(inspected["section"], "##\tPart ###");
+    let edited = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_last_child","section":"Part","expected_hash":created["hash"],"text":"### Child\nDetail."}),
+    );
+    let expected = "# Guide\n##\tPart ###\nBody.\n### Child\nDetail.\n## Next\nLater.\n";
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        expected
+    );
+    assert_eq!(edited["hash"], tools::hash(expected.as_bytes()));
+}
+
+#[test]
+fn section_replacement_cannot_insert_peer_or_ancestor_headings() {
+    for batch in [false, true] {
+        let (_dir, mut s) = setup();
+        let original = "# Guide\n## Part\nOriginal.\n## Next\nLater.\n";
+        let created = run(
+            &mut s,
+            "document_edit",
+            json!({"action":"create","text":original}),
+        );
+        let inspected = run(&mut s, "document_inspect", json!({"section":"## Part"}));
+        for heading in ["## Sibling", "# Ancestor"] {
+            let edit = json!({"action":"section","section":"## Part","expected_section_hash":inspected["section_hash"],"text":format!("## Part\nUpdated.\n{heading}\nUnexpected.\n")});
+            let (name, args) = if batch {
+                (
+                    "document_edit_batch",
+                    json!({"expected_hash":created["hash"],"edits":[edit]}),
+                )
+            } else {
+                let mut edit = edit;
+                edit["expected_hash"] = created["hash"].clone();
+                ("document_edit", edit)
+            };
+            let error = tools::execute(&mut s, name, args).unwrap_err().to_string();
+            assert!(error.contains("sibling or ancestor heading"), "{error}");
+            assert_eq!(
+                std::fs::read_to_string(&s.project.output).unwrap(),
+                original
+            );
+        }
+    }
 }
 
 #[test]

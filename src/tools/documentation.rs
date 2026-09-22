@@ -27,7 +27,10 @@ pub(super) fn headings(doc: &str) -> Vec<Heading> {
                 fence = Some((first, run));
             } else if first == '#'
                 && (1..=6).contains(&run)
-                && trimmed.as_bytes().get(run) == Some(&b' ')
+                && trimmed
+                    .as_bytes()
+                    .get(run)
+                    .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
             {
                 for prior in result.iter_mut().rev() {
                     if prior.end == doc.len() && prior.level >= run {
@@ -79,6 +82,21 @@ pub(super) fn heading_path(doc: &str, start: usize) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("section_not_found: heading position changed"))
 }
 
+fn bare_heading_title(heading: &str) -> &str {
+    let content = heading.trim_start_matches('#').trim_start();
+    let without_closing = content.trim_end_matches('#');
+    if without_closing.len() < content.len()
+        && without_closing
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace)
+    {
+        without_closing.trim_end()
+    } else {
+        content
+    }
+}
+
 /// Full headings, unique bare titles, or newline-separated ancestor paths.
 pub(super) fn resolve_heading(doc: &str, requested: &str) -> Result<Heading> {
     let requested = requested.trim();
@@ -100,7 +118,7 @@ pub(super) fn resolve_heading(doc: &str, requested: &str) -> Result<Heading> {
         } else if requested.starts_with('#') {
             h.heading == requested
         } else {
-            h.heading.trim_start_matches('#').trim_start() == requested
+            bare_heading_title(&h.heading) == requested
         }
     };
     let matching: Vec<_> = headings.iter().enumerate().filter(matches).collect();
