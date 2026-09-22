@@ -333,9 +333,20 @@ impl Session {
             self.answer_review_start = self.history.next_id + 1;
             self.answer_review_question = text.clone();
             self.continuation = None;
-            self.task.phase.clear();
-            self.task.require_investigation = false;
-            self.task.workflow.clear();
+            // A non-continuation message starts a new task. Keep explicit
+            // user constraints as session safety rules, but discard the
+            // previous task's plan, progress, pins and unresolved work so
+            // the model cannot apply an old deliverable to an unrelated
+            // request. The revision remains monotonic for stale snapshots.
+            let revision = self.task.revision.saturating_add(1);
+            let constraints = std::mem::take(&mut self.task.constraints);
+            self.task = TaskState {
+                purpose: self.project.purpose.clone(),
+                scope: self.project.root.display().to_string(),
+                constraints,
+                revision,
+                ..Default::default()
+            };
             // Investigation items and review attempts belong to the previous
             // task. Keeping them makes finalization audit an old document (or
             // consume the old review budget) when a new, unrelated request is
