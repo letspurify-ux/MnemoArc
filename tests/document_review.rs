@@ -882,6 +882,8 @@ async fn reads_and_verification_can_finish_even_at_the_edit_limit() {
     let (_dir, mut s) = fixture();
     document_review::request(&mut s).unwrap();
     document_review::finish(&mut s, r#"{"issues":["Check the existing section"]}"#).unwrap();
+    // This test exercises the edit cap across many reads, not checkpoint cleanup.
+    s.config.context_tokens = 128_000;
     s.config.document_repair_limit = 2;
     s.document_review.repair_requests = 2;
     let result = run_repair_test(
@@ -889,7 +891,7 @@ async fn reads_and_verification_can_finish_even_at_the_edit_limit() {
         Arc::new(ReadAndVerify(std::sync::atomic::AtomicUsize::new(0))),
     )
     .await;
-    assert_eq!(result.status, "complete");
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
     assert!(document_review::approved(&result));
     assert!(result.task_rounds >= 11); // nine non-edit requests + final + paged review
 }

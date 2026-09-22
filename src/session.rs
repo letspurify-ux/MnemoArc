@@ -201,6 +201,20 @@ pub struct Session {
     pub continuation: Option<bool>,
 }
 impl Session {
+    fn initial_completion(&self, request: &str) -> Vec<String> {
+        let request = request.trim();
+        let max_chars = (self.config.state_tokens / 6).clamp(24, 320);
+        let excerpt: String = request.chars().take(max_chars).collect();
+        let suffix = if request.chars().count() > max_chars {
+            "… (전체 요청은 latest_request 참고)"
+        } else {
+            ""
+        };
+        vec![format!(
+            "사용자 요청의 명시 요구를 충족한다: {excerpt}{suffix}"
+        )]
+    }
+
     pub fn new(project: Project, config: Config) -> Self {
         let task = TaskState {
             purpose: project.purpose.clone(),
@@ -312,6 +326,7 @@ impl Session {
             .collect()
     }
     pub fn add_user(&mut self, text: String) {
+        let first_request = self.latest_request.is_empty() && self.history.bundles.is_empty();
         let continuation = matches!(
             text.trim()
                 .trim_end_matches(['.', '!'])
@@ -333,31 +348,33 @@ impl Session {
             self.answer_review_start = self.history.next_id + 1;
             self.answer_review_question = text.clone();
             self.continuation = None;
-            // A non-continuation message starts a new task. Keep explicit
-            // user constraints as session safety rules, but discard the
-            // previous task's plan, progress, pins and unresolved work so
-            // the model cannot apply an old deliverable to an unrelated
-            // request. The revision remains monotonic for stale snapshots.
-            let revision = self.task.revision.saturating_add(1);
-            let constraints = std::mem::take(&mut self.task.constraints);
-            self.task = TaskState {
-                purpose: self.project.purpose.clone(),
-                scope: self.project.root.display().to_string(),
-                constraints,
-                revision,
-                ..Default::default()
-            };
-            // Investigation items and review attempts belong to the previous
-            // task. Keeping them makes finalization audit an old document (or
-            // consume the old review budget) when a new, unrelated request is
-            // answered in the same session.
-            self.investigations.clear();
-            self.reviews = 0;
-            self.document_review = Default::default();
-            self.document_written = false;
-            self.last_document_write = None;
-            self.task_rounds = 0;
-            self.run_guidance = json!({});
+            // The first prompt may follow a caller's task_state setup. Keep
+            // that plan; later non-continuation messages start a new task.
+            if first_request {
+                self.task.revision = self.task.revision.saturating_add(1);
+            } else {
+                // Keep explicit user constraints as session safety rules,
+                // but discard the previous task's plan and review state.
+                let revision = self.task.revision.saturating_add(1);
+                let constraints = std::mem::take(&mut self.task.constraints);
+                self.task = TaskState {
+                    purpose: self.project.purpose.clone(),
+                    scope: self.project.root.display().to_string(),
+                    constraints,
+                    revision,
+                    ..Default::default()
+                };
+                self.investigations.clear();
+                self.reviews = 0;
+                self.document_review = Default::default();
+                self.document_written = false;
+                self.last_document_write = None;
+                self.task_rounds = 0;
+                self.run_guidance = json!({});
+            }
+            if self.task.completion.is_empty() {
+                self.task.completion = self.initial_completion(&text);
+            }
         }
         self.latest_request = text.clone();
         let source = Source {

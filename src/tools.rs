@@ -150,7 +150,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "task_state",
-                description: "Read/update structured goals and compact progress, or read/write detailed work list. State fields belong inside patch, e.g. {action:update,patch:{phase:verify}}; phase is not a top-level argument. For source documentation START with patch.workflow=source_document; this locks evidence requirements and activates investigation/document_edit/document_edit_batch/document_audit immediately. Use investigation upsert for investigation items, NOT task_state. Do not send empty patches. Updates preserve omitted fields. Set patch.require_investigation=true BEFORE source-documentation work requiring evidence coverage; simple document edits do not need it. Once required, it cannot be disabled during the same request. Preserve user constraints unless explicitly changed by user",
+                description: "Read/update structured goals and compact progress, or read/write detailed work list. State fields belong inside patch, e.g. {action:update,patch:{phase:verify}}; phase is not a top-level argument. A new user task starts with a request-based completion condition; refine it into concrete checks before substantial work. For source documentation START with patch.workflow=source_document and completion criteria matching the user request; this locks evidence requirements and activates investigation/document_edit/document_edit_batch/document_audit immediately. Use investigation upsert for investigation items, NOT task_state. Do not send empty patches or completion:[]. Updates preserve omitted fields. Set patch.require_investigation=true BEFORE source-documentation work requiring evidence coverage; simple document edits do not need it. Once required, it cannot be disabled during the same request. Preserve user constraints unless explicitly changed by user",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -1930,12 +1930,33 @@ pub fn execute_cancellable(
                 let mut next: TaskState = serde_json::from_value(value).map_err(|error| {
                     anyhow::anyhow!("invalid_argument_value: task_state patch: {error}")
                 })?;
+                if patch.contains_key("completion")
+                    && (next.completion.is_empty()
+                        || next
+                            .completion
+                            .iter()
+                            .any(|criterion| criterion.trim().is_empty()))
+                {
+                    bail!(
+                        "completion_required: provide non-empty completion criteria, or omit completion to preserve the current criteria"
+                    );
+                }
                 if !["", "answer", "source_document", "document_edit"]
                     .contains(&next.workflow.as_str())
                 {
                     bail!("invalid_workflow: use answer, source_document or document_edit");
                 }
                 if next.workflow == "source_document" {
+                    if next.completion.is_empty()
+                        || next
+                            .completion
+                            .iter()
+                            .any(|criterion| criterion.trim().is_empty())
+                    {
+                        bail!(
+                            "completion_required: source_document needs non-empty completion criteria before work begins"
+                        );
+                    }
                     next.require_investigation = true;
                 }
                 if s.task.workflow == "source_document" && next.workflow != "source_document" {

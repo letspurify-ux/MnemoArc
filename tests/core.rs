@@ -745,6 +745,88 @@ fn continuation_preserves_progress_but_new_task_resets_it() {
 }
 
 #[test]
+fn first_prompt_preserves_prepared_completion_and_new_tasks_start_with_criteria() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"workflow":"source_document","completion":["Check every requested flow"],"deliverables":["Report"]}}),
+    )
+    .unwrap();
+    let prepared_revision = s.task.revision;
+    s.add_user("Document the routes".into());
+    assert_eq!(s.task.completion, ["Check every requested flow"]);
+    assert_eq!(s.task.deliverables, ["Report"]);
+    assert_eq!(s.task.workflow, "source_document");
+    assert!(s.task.revision > prepared_revision);
+    s.add_user("계속 진행".into());
+    assert_eq!(s.task.completion, ["Check every requested flow"]);
+    s.add_user("Explain a different module".into());
+    assert_eq!(s.task.completion.len(), 1);
+    assert!(s.task.completion[0].contains("Explain a different module"));
+    assert!(s.task.deliverables.is_empty());
+    assert_eq!(s.task.workflow, "");
+}
+
+#[test]
+fn completion_cannot_be_emptied_by_task_state_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.add_user("Document the routes".into());
+    let original = s.task.completion.clone();
+    let revision = s.task.revision;
+    let error = tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"completion":[]}}),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("completion_required"));
+    assert_eq!(s.task.completion, original);
+    assert_eq!(s.task.revision, revision);
+    tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"current":"Reading route code"}}),
+    )
+    .unwrap();
+    assert_eq!(s.task.completion, original);
+}
+
+#[test]
+fn source_document_workflow_requires_completion_before_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let error = tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"workflow":"source_document"}}),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("completion_required"));
+    assert_eq!(s.task.workflow, "");
+    tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"workflow":"source_document","completion":["Every requested flow is documented and verified"]}}),
+    )
+    .unwrap();
+    assert_eq!(s.task.workflow, "source_document");
+}
+
+#[test]
+fn long_user_request_keeps_a_bounded_completion_and_full_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let request = "사용자 요구 조건과 예외 처리 확인. ".repeat(2000);
+    s.add_user(request.clone());
+    assert_eq!(s.latest_request, request);
+    assert!(s.task.completion[0].contains("latest_request"));
+    assert!(ContextManager::state(&s).is_ok());
+}
+
+#[test]
 fn opaque_file_cursor_survives_relimiting_without_skips_or_overlap() {
     let dir = tempfile::tempdir().unwrap();
     let lines: Vec<_> = (1..=50)
