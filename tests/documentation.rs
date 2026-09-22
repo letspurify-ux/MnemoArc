@@ -1266,3 +1266,214 @@ fn file_read_split_crlf_does_not_claim_the_next_line() {
         true
     );
 }
+
+#[test]
+fn section_edit_preserves_replacement_whitespace_and_line_endings() {
+    for batch in [false, true] {
+        for (original, replacement, expected) in [
+            (
+                "# Doc\r\n## Target\r\nOld\r\n\r\n## Next\r\nRest\r\n",
+                "## Target\r\nNew  \r\n\r\n",
+                "# Doc\r\n## Target\r\nNew  \r\n\r\n## Next\r\nRest\r\n",
+            ),
+            (
+                "# Doc\n## Target\nOld\n## Next\nRest\n",
+                "## Target\nNew\n\n",
+                "# Doc\n## Target\nNew\n\n## Next\nRest\n",
+            ),
+            (
+                "# Doc\n## Target\nOld",
+                "## Target\nNew  ",
+                "# Doc\n## Target\nNew  ",
+            ),
+            (
+                "# Doc\r\n## Target\r\nOld\r\n## Next\r\nRest\r\n",
+                "## Target\r\nNew",
+                "# Doc\r\n## Target\r\nNew\r\n## Next\r\nRest\r\n",
+            ),
+        ] {
+            let (_dir, mut s) = setup();
+            std::fs::write(&s.project.output, original).unwrap();
+            let target = run(&mut s, "document_inspect", json!({"section":"## Target"}));
+            let edit = json!({"action":"section","section":"## Target","expected_section_hash":target["section_hash"],"text":replacement});
+            let result = if batch {
+                run(
+                    &mut s,
+                    "document_edit_batch",
+                    json!({"expected_hash":target["hash"],"edits":[edit]}),
+                )
+            } else {
+                let mut edit = edit;
+                edit["expected_hash"] = target["hash"].clone();
+                run(&mut s, "document_edit", edit)
+            };
+            assert_eq!(
+                std::fs::read_to_string(&s.project.output).unwrap(),
+                expected
+            );
+            assert_eq!(result["hash"], tools::hash(expected.as_bytes()));
+        }
+    }
+}
+
+#[test]
+fn batch_failure_after_successful_edit_leaves_file_unchanged() {
+    let (_dir, mut s) = setup();
+    let original = "# Doc\n## Target\nold\n## Next\nrest\n";
+    std::fs::write(&s.project.output, original).unwrap();
+    let inspected = run(&mut s, "document_inspect", json!({"section":"## Target"}));
+    let error = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":inspected["hash"],"edits":[
+            {"action":"patch","old_text":"old","text":"changed"},
+            {"action":"section","section":"## Target","expected_section_hash":inspected["section_hash"],"text":"## Target\nfinal\n"}
+        ]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("index=1") && error.contains("section_revision_conflict"));
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        original
+    );
+    assert!(!s.document_written);
+}
+
+#[test]
+fn patch_rejects_overlapping_matches_and_handles_large_unique_text() {
+    for (body, target) in [("aaa", "aa"), ("ééé", "éé"), ("ababa", "aba")] {
+        for batch in [false, true] {
+            let (_dir, mut s) = setup();
+            std::fs::write(&s.project.output, body).unwrap();
+            let edit = json!({"action":"patch","old_text":target,"text":"x"});
+            let error = if batch {
+                tools::execute(
+                    &mut s,
+                    "document_edit_batch",
+                    json!({"expected_hash":tools::hash(body.as_bytes()),"edits":[edit]}),
+                )
+            } else {
+                let mut edit = edit;
+                edit["expected_hash"] = json!(tools::hash(body.as_bytes()));
+                tools::execute(&mut s, "document_edit", edit)
+            }
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("patch_target_must_match_once"));
+            assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), body);
+        }
+    }
+
+    let (_dir, mut s) = setup();
+    let target = format!("{}b", "a".repeat(256 * 1024));
+    let body = format!("# Doc\n{target}\n");
+    std::fs::write(&s.project.output, &body).unwrap();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"patch","expected_hash":tools::hash(body.as_bytes()),"old_text":target,"text":"updated"}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Doc\nupdated\n"
+    );
+}
+
+#[test]
+fn document_edits_reject_outputs_that_cannot_be_read_back() {
+    const LIMIT: usize = 16 * 1024 * 1024;
+    let original = format!("# H\n{}", "x".repeat(LIMIT - 5));
+    assert_eq!(original.len(), LIMIT - 1);
+    let (_dir, mut s) = setup();
+    std::fs::write(&s.project.output, &original).unwrap();
+    let original_hash = tools::hash(original.as_bytes());
+
+    for (name, args) in [
+        (
+            "document_edit",
+            json!({"action":"append","expected_hash":original_hash,"text":"ab"}),
+        ),
+        (
+            "document_edit_batch",
+            json!({"expected_hash":original_hash,"edits":[
+                {"action":"append","text":"a"},
+                {"action":"append","text":"b"}
+            ]}),
+        ),
+    ] {
+        let error = tools::execute(&mut s, name, args).unwrap_err().to_string();
+        assert!(error.contains("unsupported_large_file"), "{name}: {error}");
+        assert_eq!(
+            std::fs::metadata(&s.project.output).unwrap().len(),
+            (LIMIT - 1) as u64
+        );
+        assert_eq!(
+            tools::hash(&std::fs::read(&s.project.output).unwrap()),
+            original_hash
+        );
+        assert!(!s.document_written);
+    }
+
+    let at_limit = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":original_hash,"text":"a"}),
+    );
+    assert_eq!(at_limit["bytes"], LIMIT);
+    assert_eq!(
+        run(&mut s, "document_inspect", json!({}))["hash"],
+        at_limit["hash"]
+    );
+
+    let (_dir, mut s) = setup();
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"x".repeat(LIMIT + 1)}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("unsupported_large_file"));
+    assert!(!s.project.output.exists());
+}
+
+#[test]
+fn document_edits_reject_embedded_nul_bytes() {
+    let (_dir, mut s) = setup();
+    let original = "# Doc\nbody\n";
+    std::fs::write(&s.project.output, original).unwrap();
+    let original_hash = tools::hash(original.as_bytes());
+    for (name, args) in [
+        (
+            "document_edit",
+            json!({"action":"append","expected_hash":original_hash,"text":"bad\u{0}text"}),
+        ),
+        (
+            "document_edit_batch",
+            json!({"expected_hash":original_hash,"edits":[
+                {"action":"append","text":"ok"},
+                {"action":"append","text":"bad\u{0}text"}
+            ]}),
+        ),
+    ] {
+        let error = tools::execute(&mut s, name, args).unwrap_err().to_string();
+        assert!(error.contains("unsupported_binary_file"), "{name}: {error}");
+        assert_eq!(
+            std::fs::read_to_string(&s.project.output).unwrap(),
+            original
+        );
+        assert!(!s.document_written);
+    }
+
+    let (_dir, mut s) = setup();
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Doc\nbad\u{0}text"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("unsupported_binary_file"));
+    assert!(!s.project.output.exists());
+}

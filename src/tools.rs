@@ -771,36 +771,48 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             if new.lines().next().map(str::trim) != target.lines().next().map(str::trim) {
                 bail!("invalid_argument_value: section replacement must retain its heading");
             }
-            let replacement = format!("{}\n", new.trim_end());
-            let mut candidate = format!(
+            let mut replacement = new.to_string();
+            if resolved.end < old.len() && !replacement.ends_with('\n') {
+                // A following heading must remain on its own line. Use the
+                // original section's delimiter only when the replacement
+                // has not supplied one; otherwise preserve text verbatim.
+                if replacement.ends_with('\r') {
+                    replacement.push('\n');
+                } else if target.ends_with("\r\n") {
+                    replacement.push_str("\r\n");
+                } else {
+                    replacement.push('\n');
+                }
+            }
+            let candidate = format!(
                 "{}{}{}",
                 &old[..resolved.start],
                 replacement,
                 &old[resolved.end..]
             );
             section_text(&candidate, heading)?;
-            if !old.ends_with('\n') && resolved.start == 0 && resolved.end == old.len() {
-                candidate = new.to_string();
-            }
             Ok(candidate)
         }
         "patch" => {
             let target = text(args, "old_text")?;
-            // `str::matches` counts only non-overlapping occurrences. A target
-            // such as `aa` in `aaa` occurs at two valid starting positions, so
-            // treating it as unique would make a patch choose an arbitrary
-            // location and silently modify the wrong text.
-            let occurrences = if target.is_empty() {
-                0
-            } else {
-                old.char_indices()
-                    .filter(|(start, _)| old[*start..].starts_with(target))
-                    .count()
-            };
-            if occurrences != 1 {
+            if target.is_empty() {
                 bail!("patch_target_must_match_once");
             }
-            Ok(old.replacen(target, new, 1))
+            let Some(first) = old.find(target) else {
+                bail!("patch_target_must_match_once");
+            };
+            // Start one Unicode character after the first match, not after
+            // the entire target: matches such as `aa` in `aaa` overlap.
+            let next_start = first + old[first..].chars().next().unwrap().len_utf8();
+            if old[next_start..].contains(target) {
+                bail!("patch_target_must_match_once");
+            }
+            Ok(format!(
+                "{}{}{}",
+                &old[..first],
+                new,
+                &old[first + target.len()..]
+            ))
         }
         _ => bail!("invalid_argument_value: unsupported document edit action"),
     }
@@ -814,6 +826,14 @@ fn persist_document_edit(
     result: String,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value> {
+    // Every persisted document must remain readable by document_inspect and
+    // subsequent edits, which both use read_text's size and text checks.
+    if result.len() > MAX_FILE_BYTES {
+        bail!("unsupported_large_file: maximum 16MiB");
+    }
+    if result.as_bytes().contains(&0) {
+        bail!("unsupported_binary_file");
+    }
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid_output_parent"))?;
