@@ -1,6 +1,12 @@
 // Every serialized Config field is represented here; projects have a dedicated editor.
 export const groups = [
   {
+    id: "database",
+    label: "데이터베이스",
+    description: "Oracle 연결 한 곳과 LLM이 조회할 저장 쿼리를 관리합니다. 활성화는 사용자 설정에서만 가능합니다.",
+    fields: [],
+  },
+  {
     id: "connection",
     label: "모델 연결",
     description: "응답을 생성할 서버와 모델을 연결합니다.",
@@ -192,7 +198,7 @@ export const groups = [
     ],
   },
 ];
-export const fieldKeys = groups.flatMap((g) => g.fields.map((f) => f[0]));
+export const fieldKeys = ["database", ...groups.flatMap((g) => g.fields.map((f) => f[0]))];
 export const unitScale = (type) =>
   type === "kib"
     ? 1024

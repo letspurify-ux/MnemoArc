@@ -41,3 +41,21 @@ source_answer_review = true
 # Source-document review: read-only same-model pass, up to two attempts per task.
 source_document_review = true
 projects = []
+
+# DB access remains off until you explicitly enable both switches.
+# Put the password in the named environment variable or .env, not here.
+[database]
+enabled = false
+host = "localhost"
+port = 1521
+service = "FREEPDB1"
+username = "READ_ONLY_USER"
+password_env = "MNEMOARC_DB_PASSWORD"
+max_rows = 100
+
+[[database.queries]]
+id = "employee_by_department"
+description = "Find employee IDs and names in a department"
+sql = "SELECT employee_id, first_name FROM employees WHERE department_id = :dept_id"
+enabled = false
+params = [{ name = "dept_id", description = "Department ID to look up" }]

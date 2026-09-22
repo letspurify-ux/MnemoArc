@@ -154,6 +154,40 @@ export function cleanProject(project) {
     exclude: project.exclude.filter((s) => s.trim()),
   };
 }
+function DatabaseEditor({ database, onChange }) {
+  const set = (key, value) => onChange({ ...database, [key]: value });
+  const updateQuery = (index, patch) => set("queries", database.queries.map((q, i) => i === index ? { ...q, ...patch } : q));
+  const updateParam = (queryIndex, paramIndex, patch) => {
+    const q = database.queries[queryIndex];
+    updateQuery(queryIndex, { params: q.params.map((p, i) => i === paramIndex ? { ...p, ...patch } : p) });
+  };
+  return <div className="project-fields">
+    <label className="check-label"><input type="checkbox" checked={database.enabled} onChange={e => set("enabled", e.target.checked)} />DB 조회 전체 활성화</label>
+    <small>기본값은 꺼짐입니다. 모델은 이 설정이나 개별 쿼리 스위치를 변경할 수 없습니다. 전체와 쿼리가 모두 켜져야 도구가 노출됩니다.</small>
+    <div className="field-grid">
+      {[["host", "호스트", "localhost"], ["port", "포트", "1521"], ["service", "서비스 이름", "FREEPDB1"], ["username", "사용자", "READ_ONLY_USER"], ["password_env", "암호 환경변수 이름", "MNEMOARC_DB_PASSWORD"], ["max_rows", "최대 결과 행", "100"]].map(([key, label, placeholder]) =>
+        <label className="setting-field" key={key}><span>{label}</span><input aria-label={label} type={["port", "max_rows"].includes(key) ? "number" : "text"} value={database[key]} placeholder={placeholder} onChange={e => set(key, ["port", "max_rows"].includes(key) ? Number(e.target.value) : e.target.value)} /></label>
+      )}
+    </div>
+    <small>암호 값은 이 화면이나 설정 파일에 저장하지 않습니다. 앱 실행 환경변수 또는 실행 폴더의 .env에 지정하세요. DB 사용자는 조회 권한만 부여하는 것이 좋습니다.</small>
+    <h3>저장 쿼리</h3>
+    <small>SQL은 사용자가 작성하며 모델은 쿼리 ID와 바인드 값만 선택할 수 있습니다. 단일 SELECT/WITH 문을 입력하고 값은 :이름 바인드로 지정하세요. 결과는 최대 {database.max_rows}행입니다.</small>
+    {database.queries.map((q, index) => <section className="credential-card" key={index}>
+      <label className="check-label"><input type="checkbox" checked={q.enabled} onChange={e => updateQuery(index, { enabled: e.target.checked })} />이 쿼리 활성화</label>
+      <label>쿼리 ID<input aria-label={`쿼리 ${index + 1} ID`} value={q.id} placeholder="recent_orders" onChange={e => updateQuery(index, { id: e.target.value })} /></label>
+      <label>모델에게 보일 설명<textarea aria-label={`쿼리 ${index + 1} 설명`} rows={2} value={q.description} placeholder="최근 주문의 번호, 고객, 날짜를 조회합니다" onChange={e => updateQuery(index, { description: e.target.value })} /></label>
+      <label>SQL<textarea aria-label={`쿼리 ${index + 1} SQL`} rows={5} value={q.sql} placeholder="SELECT order_id, customer_name FROM orders WHERE customer_id = :customer_id" onChange={e => updateQuery(index, { sql: e.target.value })} /></label>
+      <strong>바인드 매개변수</strong>
+      {q.params.map((p, paramIndex) => <div className="field-grid" key={paramIndex}>
+        <label>이름<input aria-label={`매개변수 ${paramIndex + 1} 이름`} value={p.name} placeholder="customer_id" onChange={e => updateParam(index, paramIndex, { name: e.target.value })} /></label>
+        <label>설명<input aria-label={`매개변수 ${paramIndex + 1} 설명`} value={p.description} placeholder="조회할 고객 ID" onChange={e => updateParam(index, paramIndex, { description: e.target.value })} /></label>
+        <button type="button" className="secondary" onClick={() => updateQuery(index, { params: q.params.filter((_, i) => i !== paramIndex) })}>매개변수 삭제</button>
+      </div>)}
+      <div className="credential-options"><button type="button" className="secondary" onClick={() => updateQuery(index, { params: [...q.params, { name: "", description: "" }] })}>매개변수 추가</button><button type="button" className="text-button" onClick={() => set("queries", database.queries.filter((_, i) => i !== index))}>쿼리 삭제</button></div>
+    </section>)}
+    <button type="button" className="secondary" onClick={() => set("queries", [...database.queries, { id: "", description: "", sql: "", enabled: false, params: [] }])}>쿼리 추가</button>
+  </div>;
+}
 export default function Settings({
   config,
   credential,
@@ -311,6 +345,7 @@ export default function Settings({
         <div className="settings-body">
           <h2>{group.label}</h2>
           <p className="subtle">{group.description}</p>
+          {tab === "database" && <DatabaseEditor database={draft.database} onChange={value => change("database", value)} />}
           {tab === "connection" && (
             <div className="credential-card">
               <div className="credential-title">

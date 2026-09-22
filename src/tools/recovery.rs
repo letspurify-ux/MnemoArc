@@ -109,8 +109,18 @@ pub fn describe(message: &str) -> Value {
         (Class::MissingEvidence, "lookup_observed_evidence")
     } else if code == "unknown_symbol" {
         (Class::InvalidInput, "copy_observed_symbol_id")
-    } else if code == "verification_reserve" {
+    } else if matches!(
+        code,
+        "verification_reserve"
+            | "database_disabled"
+            | "database_query_disabled_or_unknown"
+            | "database_password_missing"
+    ) {
         (Class::Prerequisite, "complete_prerequisite")
+    } else if code == "invalid_database_query_arguments" {
+        (Class::InvalidInput, "correct_arguments")
+    } else if code == "database_query_timeout" {
+        (Class::Transient, "inspect_error_before_retry")
     } else if matches!(
         code,
         "conflicting_path_filters"

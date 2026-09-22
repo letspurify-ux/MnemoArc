@@ -60,6 +60,7 @@ pub struct Config {
     pub verification_reserve_ratio: f64,
     pub repeated_read_limit: usize,
     pub stall_round_limit: usize,
+    pub database: crate::database::DatabaseConfig,
     pub projects: Vec<Project>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -118,6 +119,7 @@ impl Default for Config {
             verification_reserve_ratio: 0.25,
             repeated_read_limit: 2,
             stall_round_limit: 8,
+            database: crate::database::DatabaseConfig::default(),
             review_limit: 3,
             document_repair_limit: 8,
             source_answer_review: true,
@@ -211,6 +213,7 @@ impl Config {
             }
         }
         reqwest::Url::parse(&self.base_url)?;
+        self.database.validate()?;
         Ok(())
     }
     pub fn runnable(&self) -> Result<()> {

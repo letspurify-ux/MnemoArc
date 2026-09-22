@@ -98,6 +98,16 @@ impl ToolRegistry {
     pub fn specs() -> Vec<ToolSpec> {
         let mut specs = vec![
             ToolSpec {
+                name: "db_query",
+                description: "Read user-approved Oracle queries. First use action=list to discover enabled query IDs, purpose and bind parameters; then action=run with an ID and params. SQL and activation are controlled only by the user in Settings. Results are bounded and read-only.",
+                optional: false,
+                read_only: true,
+                parameters: schema(
+                    json!({"action":action(&["list","run"]),"id":string(),"params":{"type":"object","description":"Named bind values declared by the selected query; strings, numbers or null"}}),
+                    &["action"],
+                ),
+            },
+            ToolSpec {
                 name: "tool_catalog",
                 description: "List/search available tools and source-docs group; shows short descriptions and active status",
                 optional: false,
@@ -392,6 +402,7 @@ impl ToolRegistry {
     }
     pub fn definitions(s: &Session) -> Vec<Value> {
         Self::specs().into_iter()
+            .filter(|t| t.name != "db_query" || s.config.database.active_queries().next().is_some())
             .filter(|t| !t.optional || s.active_tools.contains(t.name))
             .filter(|t| s.config.memory_reuse || !["memory_read", "memory_find"].contains(&t.name))
             .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
@@ -454,7 +465,16 @@ impl ToolRegistry {
                         {"properties":{"action":{"const":"read"}},"required":["action","id"],"not":{"anyOf":[{"required":["query"]},{"required":["after"]},{"required":["limit"]}]}}
                     ]);
                 }
-                json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.parameters}})
+                let description = if t.name == "db_query" {
+                    let summaries = s.config.database.active_queries().map(|q| format!("{}: {} (params: {})", q.id, q.description, q.params.iter().map(|p|p.name.as_str()).collect::<Vec<_>>().join(", "))).collect::<Vec<_>>().join("; ");
+                    t.parameters["properties"]["id"]["enum"] = json!(s.config.database.active_queries().map(|q|q.id.as_str()).collect::<Vec<_>>());
+                    t.parameters["oneOf"] = json!([
+                        {"properties":{"action":{"const":"list"}},"not":{"anyOf":[{"required":["id"]},{"required":["params"]}]}},
+                        {"properties":{"action":{"const":"run"}},"required":["id"]}
+                    ]);
+                    format!("{} Enabled queries: {}. Use list for full parameter descriptions.", t.description, summaries.chars().take(3000).collect::<String>())
+                } else { t.description.to_string() };
+                json!({"type":"function","function":{"name":t.name,"description":description,"parameters":t.parameters}})
             })
             .collect()
     }
@@ -479,6 +499,11 @@ impl ToolRegistry {
         let object = args.as_object().ok_or_else(|| {
             anyhow::anyhow!("invalid_tool_arguments: arguments must be an object")
         })?;
+        if name == "db_query" && s.config.database.active_queries().next().is_none() {
+            bail!(
+                "database_disabled: enable the database and at least one query manually in Settings"
+            );
+        }
         let fields = spec.parameters["properties"].as_object().unwrap();
         if name == "investigation" {
             validate_investigation_arguments(s, args)?;
@@ -647,12 +672,12 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
             if args.get("section").is_some() {
                 require("section")?;
             }
-            if matches!(action, "insert_before_text" | "insert_after_text") {
-                if args["text"].as_str().is_some_and(str::is_empty) {
-                    bail!(
-                        "invalid_argument_value: text must not be empty for document_edit action={action}"
-                    );
-                }
+            if matches!(action, "insert_before_text" | "insert_after_text")
+                && args["text"].as_str().is_some_and(str::is_empty)
+            {
+                bail!(
+                    "invalid_argument_value: text must not be empty for document_edit action={action}"
+                );
             }
         }
         "section" => {
@@ -751,10 +776,10 @@ fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
                 {
                     bail!("invalid_argument_value: edits[{index}].text must not be empty");
                 }
-                if let Some(section) = object.get("section") {
-                    if section.as_str().is_none_or(|value| value.trim().is_empty()) {
-                        bail!("invalid_argument_value: edits[{index}].section must not be empty");
-                    }
+                if let Some(section) = object.get("section")
+                    && section.as_str().is_none_or(|value| value.trim().is_empty())
+                {
+                    bail!("invalid_argument_value: edits[{index}].section must not be empty");
                 }
                 for key in ["expected_section_hash"] {
                     if object.contains_key(key) {
@@ -1735,6 +1760,12 @@ pub fn execute_cancellable(
         );
     }
     match name {
+        "db_query" => crate::database::execute(
+            &s.config.database,
+            &args,
+            cancel,
+            s.config.tool_timeout_secs,
+        ),
         "code_outline" | "symbol_read" => structure::execute(s, name, &args, cancel),
         "document_inspect" | "document_audit" | "symbol_search" => {
             documentation::execute(s, name, &args, cancel)
@@ -1746,7 +1777,7 @@ pub fn execute_cancellable(
                 .filter(|t| !t.is_empty())
                 .collect();
             Ok(
-                json!({"groups":["source-docs"],"tools":ToolRegistry::specs().into_iter().filter(|t|terms.is_empty() || terms.iter().any(|term| t.name.contains(term) || t.description.to_lowercase().contains(term))).map(|t|json!({"name":t.name,"description":t.description,"basic":!t.optional,"active":!t.optional||s.active_tools.contains(t.name)})).collect::<Vec<_>>()}),
+                json!({"groups":["source-docs"],"tools":ToolRegistry::specs().into_iter().filter(|t|t.name != "db_query" || s.config.database.active_queries().next().is_some()).filter(|t|terms.is_empty() || terms.iter().any(|term| t.name.contains(term) || t.description.to_lowercase().contains(term))).map(|t|json!({"name":t.name,"description":t.description,"basic":!t.optional,"active":!t.optional||s.active_tools.contains(t.name)})).collect::<Vec<_>>()}),
             )
         }
         "tool_select" => {
