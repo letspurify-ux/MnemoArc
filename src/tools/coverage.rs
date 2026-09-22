@@ -31,15 +31,13 @@ pub fn record_delivered_read(s: &mut Session, call: &crate::llm::ToolCall, resul
     if shown.is_empty() && data["content"]["last_line_complete"] != true {
         return;
     }
-    let (start, mut end) = if matches!(call.name.as_str(), "file_read" | "symbol_read") {
+    let raw_start = if matches!(call.name.as_str(), "file_read" | "symbol_read") {
         let line = data["read_start"].as_u64().unwrap_or(1) as usize;
-        let start = normalized
-            .split_inclusive('\n')
+        doc.split_inclusive('\n')
             .take(line.saturating_sub(1))
             .map(|l| l.chars().count())
             .sum::<usize>()
-            + data["read_offset"].as_u64().unwrap_or(0) as usize;
-        (start, start + shown.chars().count())
+            + data["read_offset"].as_u64().unwrap_or(0) as usize
     } else {
         let Some(section) = data["section"].as_str() else {
             return;
@@ -47,18 +45,18 @@ pub fn record_delivered_read(s: &mut Session, call: &crate::llm::ToolCall, resul
         let Ok(heading) = documentation::resolve_heading(&doc, section) else {
             return;
         };
-        let raw_start = doc[..heading.start].chars().count() + n(data, "read_offset", 0);
-        let normalized_offset = |raw: usize| {
-            doc.char_indices()
-                .take(raw)
-                .filter(|&(i, _)| !doc[i..].starts_with("\r\n"))
-                .count()
-        };
-        (
-            normalized_offset(raw_start),
-            normalized_offset(raw_start + shown.chars().count()),
-        )
+        doc[..heading.start].chars().count() + n(data, "read_offset", 0)
     };
+    // All reads retain raw line endings; coverage uses LF-normalized character
+    // positions. Map each endpoint separately, including a split within CRLF.
+    let normalized_offset = |raw: usize| {
+        doc.char_indices()
+            .take(raw)
+            .filter(|&(i, _)| !doc[i..].starts_with("\r\n"))
+            .count()
+    };
+    let start = normalized_offset(raw_start);
+    let mut end = normalized_offset(raw_start + shown.chars().count());
     // file_read omits the range's final line terminator. The boundary flag
     // certifies that the full line body was delivered, including empty lines.
     if matches!(call.name.as_str(), "file_read" | "symbol_read")

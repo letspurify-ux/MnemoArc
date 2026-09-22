@@ -613,10 +613,13 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
                 "missing_argument: {key} for document_edit action={action}"
             ));
         }
-        if args[key]
-            .as_str()
-            .is_some_and(|value| value.trim().is_empty())
-        {
+        if args[key].as_str().is_some_and(|value| {
+            if key == "old_text" {
+                value.is_empty()
+            } else {
+                value.trim().is_empty()
+            }
+        }) {
             return Err(anyhow::anyhow!(
                 "invalid_argument_value: {key} must not be empty for document_edit action={action}"
             ));
@@ -2360,11 +2363,17 @@ fn read_file(
         );
     }
     let selected = contents
-        .lines()
+        .split_inclusive('\n')
         .skip(start - 1)
         .take(lines)
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<String>();
+    // Preserve internal line endings so a delivered multiline range can be
+    // copied into an exact patch. Omit only the final line terminator, as
+    // before; cursor offsets now count characters in the original text.
+    let selected = selected
+        .strip_suffix("\r\n")
+        .or_else(|| selected.strip_suffix('\n'))
+        .unwrap_or(&selected);
     if offset > selected.chars().count() {
         bail!(
             "invalid_offset: offset {offset} exceeds {} characters in start_line={start}, max_lines={lines}. Offset is relative to this range, not the file. Copy next_cursor.cursor for continuation, or omit offset for a new range",
@@ -2396,13 +2405,20 @@ fn read_file(
             json!({"path":path,"hash":hash(contents.as_bytes()),"total_lines":contents.lines().count(),"repeated_read":true,"suppressed":true,"guidance":"Unchanged range already present repeatedly in active context. Reuse it, read another range, use document_inspect for output metadata, or force_read=true for deliberate verification."}),
         );
     }
-    let mut content = bounded_text(s, &selected, offset);
+    let mut content = bounded_text(s, selected, offset);
     let shown = content["text"].as_str().unwrap();
     let observed_start = start + selected.chars().take(offset).filter(|c| *c == '\n').count();
     let first_line_complete = offset == 0 || selected.chars().nth(offset - 1) == Some('\n');
     let shown_end = offset + shown.chars().count();
-    let last_line_complete =
-        shown.ends_with('\n') || selected.chars().nth(shown_end).is_none_or(|c| c == '\n');
+    let last_line_complete = if shown.ends_with('\n') {
+        true
+    } else {
+        match selected.chars().nth(shown_end) {
+            None => true,
+            Some('\n') => !shown.ends_with('\r'),
+            Some(_) => false,
+        }
+    };
     let source = observe_hashed_quality(
         s,
         &path,

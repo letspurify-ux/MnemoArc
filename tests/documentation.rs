@@ -1061,3 +1061,208 @@ fn local_edit_preserves_unrelated_verification_and_batch_reuses_it() {
     assert_eq!(result["retry_ids"], json!(["entry"]));
     assert_eq!(s.investigations[0].status, "written");
 }
+
+#[test]
+fn patch_inside_h2_handles_blockquote_and_two_line_text() {
+    let (_dir, mut s) = setup();
+    let document = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Root\n## H2 block\nintro\n> blockquote\n# heading\n>\nRemoved_marker\n## Next\nend\n"}),
+    );
+    let first = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"patch","expected_hash":document["hash"],"old_text":"> blockquote\n# heading","text":"> changed\n### heading"}),
+    );
+    let second = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"patch","expected_hash":first["hash"],"old_text":">\nRemoved_marker","text":"kept"}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Root\n## H2 block\nintro\n> changed\n### heading\nkept\n## Next\nend\n"
+    );
+    assert_eq!(second["total_lines"], 8);
+}
+
+#[test]
+fn multiline_patch_round_trips_file_read_line_endings() {
+    for target in [
+        ">\nRemoved_marker",
+        ">\r\nRemoved_marker",
+        "> quote\r\n> # heading",
+        "한글🙂\r\n\r\n\t본문  \n끝",
+    ] {
+        for batch in [false, true] {
+            let (_dir, mut s) = setup();
+            let body = format!("# Root\r\n## H2\r\n{target}\r\n## Next\r\nend\r\n");
+            std::fs::write(&s.project.output, &body).unwrap();
+            let read = run(
+                &mut s,
+                "file_read",
+                json!({"path":"summary.md","start_line":3,"max_lines":target.lines().count()}),
+            );
+            assert_eq!(read["content"]["text"], target);
+            // Copy the model-visible text without its line-number labels.
+            let shown = tools::model_result(&tools::envelope(Ok(read.clone())));
+            let copied: String = shown["data"]["content"]["numbered_text"]
+                .as_str()
+                .unwrap()
+                .split_inclusive('\n')
+                .map(|line| line.split_once('|').unwrap().1)
+                .collect();
+            assert_eq!(copied, target);
+            let mut edit = json!({"action":"patch","old_text":copied,"text":"updated\r\n한글"});
+            let (name, args) = if batch {
+                (
+                    "document_edit_batch",
+                    json!({"expected_hash":read["hash"],"edits":[edit]}),
+                )
+            } else {
+                edit["expected_hash"] = read["hash"].clone();
+                ("document_edit", edit)
+            };
+            let result = tools::run_call(
+                &mut s,
+                &mnemoarc::llm::ToolCall {
+                    id: "patch-round-trip".into(),
+                    name: name.into(),
+                    arguments: args.to_string(),
+                },
+            );
+            assert_eq!(result["status"], "ok", "{result}");
+            assert_eq!(
+                std::fs::read_to_string(&s.project.output).unwrap(),
+                body.replacen(target, "updated\r\n한글", 1)
+            );
+        }
+    }
+}
+
+#[test]
+fn multiline_patch_accepts_unique_whitespace_but_rejects_empty_targets() {
+    for target in ["\n\n\n", "\r\n\r\n", " \n\t", ""] {
+        for batch in [false, true] {
+            let (_dir, mut s) = setup();
+            let body = format!("# Root\n## H2\nbefore{target}after\n");
+            std::fs::write(&s.project.output, &body).unwrap();
+            let mut edit = json!({"action":"patch","old_text":target,"text":"\n"});
+            let (name, args) = if batch {
+                (
+                    "document_edit_batch",
+                    json!({"expected_hash":tools::hash(body.as_bytes()),"edits":[edit]}),
+                )
+            } else {
+                edit["expected_hash"] = json!(tools::hash(body.as_bytes()));
+                ("document_edit", edit)
+            };
+            let result = tools::execute(&mut s, name, args);
+            let expected = if target.is_empty() {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("must not be empty")
+                );
+                body
+            } else {
+                result.unwrap();
+                body.replacen(target, "\n", 1)
+            };
+            assert_eq!(
+                std::fs::read_to_string(&s.project.output).unwrap(),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_file_cursor_preserves_mixed_line_endings_and_coverage() {
+    let (_dir, mut s) = setup();
+    let target = format!("{}끝", "한글🙂\r\n\r\n본문\n".repeat(30));
+    let body = format!("# Root\r\n## H2\r\n{target}\r\n## Next\r\nend\r\n");
+    std::fs::write(&s.project.output, &body).unwrap();
+    let mut args = json!({"path":"summary.md","start_line":3,"max_lines":target.lines().count()});
+    let mut reconstructed = String::new();
+    let mut pages = 0;
+    for _ in 0..100 {
+        let page = deliver(&mut s, "file_read", args, 700);
+        let text = page["data"]["content"]["text"].as_str().unwrap();
+        assert!(!text.is_empty());
+        assert_eq!(page["data"]["read_offset"], reconstructed.chars().count());
+        reconstructed.push_str(text);
+        assert!(target.starts_with(&reconstructed));
+        pages += 1;
+        if page["data"]["content"]["truncated"] != true {
+            break;
+        }
+        args = json!({"cursor":page["next_cursor"]["cursor"]});
+    }
+    assert!(pages > 1);
+    assert_eq!(reconstructed, target);
+    let inspected = run(&mut s, "document_inspect", json!({}));
+    assert_eq!(
+        inspected["coverage"]["fully_read_lines"],
+        target.lines().count()
+    );
+    assert_eq!(
+        inspected["coverage"]["missing_ranges"],
+        json!([
+            {"start_line":1,"end_line":2},
+            {"start_line":target.lines().count()+3,"end_line":target.lines().count()+4}
+        ])
+    );
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"patch","expected_hash":inspected["hash"],"old_text":reconstructed,"text":"updated"}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        body.replacen(&target, "updated", 1)
+    );
+}
+
+#[test]
+fn file_read_split_crlf_does_not_claim_the_next_line() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("input.md"), "# H\r\nX\r\n").unwrap();
+    for (offset, text) in [(0, "# H\r"), (4, "\n")] {
+        let call = mnemoarc::llm::ToolCall {
+            id: format!("split-{offset}"),
+            name: "file_read".into(),
+            arguments: json!({"path":"input.md","offset":offset}).to_string(),
+        };
+        let mut result = tools::run_call(&mut s, &call);
+        assert!(
+            result["data"]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with(text)
+        );
+        // Simulate a delivery budget ending between CR and LF, then after LF.
+        result["data"]["content"]["text"] = json!(text);
+        result["data"]["content"]["truncated"] = json!(true);
+        result["data"]["content"]["last_line_complete"] = json!(offset != 0);
+        tools::record_delivered_read(&mut s, &call, &result);
+        let outline = run(&mut s, "document_inspect", json!({"path":"input.md"}));
+        assert_eq!(outline["coverage"]["fully_read_lines"], 1);
+        assert_eq!(
+            outline["coverage"]["missing_ranges"],
+            json!([{"start_line":2,"end_line":2}])
+        );
+    }
+    deliver(
+        &mut s,
+        "file_read",
+        json!({"path":"input.md","offset":5}),
+        4000,
+    );
+    assert_eq!(
+        run(&mut s, "document_inspect", json!({"path":"input.md"}))["coverage"]["complete"],
+        true
+    );
+}
