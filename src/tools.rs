@@ -55,7 +55,7 @@ fn memory_input_schema() -> Value {
             "kind":action(&["fact","decision","failure","question","procedure"]),
             "inferred":{"type":"boolean"},
             "source_ids":strings(),
-            "metadata":{"type":"object"},
+            "metadata":{"description":"Optional JSON value preserved exactly as supplied; may be an object, array, string, number, boolean or null"},
             "expected_revision":number()
         }),
         &["title", "summary", "body", "kind"],
@@ -294,7 +294,7 @@ impl ToolRegistry {
                 optional: true,
                 read_only: false,
                 parameters: schema(
-                    json!({"action":action(&["list","upsert","verify","verify_batch","final_check"]),"id":{"type":"string","minLength":1},"title":{"type":"string","description":"Non-empty title required for a NEW item. Omit when updating an existing id to preserve its title."},"status":action(&["uninvestigated","in_progress","written"]),"memory_ids":strings(),"source_ids":strings(),"section":string(),"verification_note":string(),"items":{"type":"object","description":"ONLY for action=verify_batch. Object keyed by existing investigation IDs; not an array and not used by upsert.","minProperties":1,"maxProperties":20,"additionalProperties":{"type":"object","properties":{"source_ids":strings(),"verification_note":string()},"required":["source_ids","verification_note"],"additionalProperties":false}},"offset":number(),"limit":number()}),
+                    json!({"action":action(&["list","upsert","verify","verify_batch","final_check"]),"id":{"type":"string","minLength":1},"title":{"type":"string","minLength":1,"description":"Non-empty title required for a NEW item. Omit when updating an existing id to preserve its title."},"status":action(&["uninvestigated","in_progress","written"]),"memory_ids":strings(),"source_ids":strings(),"section":string(),"verification_note":string(),"items":{"type":"object","description":"ONLY for action=verify_batch. Object keyed by existing investigation IDs; not an array and not used by upsert.","minProperties":1,"maxProperties":20,"additionalProperties":{"type":"object","properties":{"source_ids":strings(),"verification_note":string()},"required":["source_ids","verification_note"],"additionalProperties":false}},"offset":number(),"limit":number()}),
                     &["action"],
                 ),
             },
@@ -315,7 +315,20 @@ impl ToolRegistry {
                 properties.insert("action".into(), json!({"const":name}));
                 let mut required = required.to_vec();
                 required.push("action");
-                json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
+                let mut branch = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
+                if name == "upsert" {
+                    // The existing-item title omission is state-dependent and
+                    // therefore cannot be expressed as one unconditional
+                    // required field. Still reject the common new-item form
+                    // without an ID or title before it reaches execution;
+                    // an ID branch remains available for existing updates and
+                    // runtime validation handles an unknown new ID.
+                    branch["oneOf"] = json!([
+                        {"required":["title"],"not":{"required":["id"]}},
+                        {"required":["id"]}
+                    ]);
+                }
+                branch
             }).collect();
         spec.parameters["oneOf"] = json!(branches);
         specs
@@ -1911,6 +1924,11 @@ pub fn execute_cancellable(
             if context::count(&compact, &s.config.model) > s.config.state_tokens {
                 bail!(
                     "task_state_limit: shorten checkpoint progress/next; original progress retained"
+                );
+            }
+            if serde_json::to_vec(&task)?.len() > s.config.memory_bytes {
+                bail!(
+                    "task_detail_limit: shorten checkpoint progress/next; original progress retained"
                 );
             }
             s.task = task;

@@ -162,6 +162,7 @@ impl Config {
         }
         if [
             self.memory_count,
+            self.memory_bytes,
             self.memory_body_bytes,
             self.history_bytes,
             self.state_tokens,
