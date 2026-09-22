@@ -969,6 +969,22 @@ fn validate_investigation_arguments(s: &Session, args: &Value) -> Result<()> {
     Ok(())
 }
 
+fn activate_workflow_tools(s: &mut Session) {
+    if s.task.require_investigation || s.task.workflow == "document_edit" {
+        for name in [
+            "investigation",
+            "document_edit",
+            "document_edit_batch",
+            "document_audit",
+        ] {
+            s.active_tools.insert(name.into());
+            if let Some(pending) = &mut s.pending_tools {
+                pending.insert(name.into());
+            }
+        }
+    }
+}
+
 fn text<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args[key]
         .as_str()
@@ -1759,19 +1775,7 @@ pub fn execute_cancellable(
                     bail!("task_detail_limit");
                 }
                 s.task = next;
-                if s.task.require_investigation || s.task.workflow == "document_edit" {
-                    for name in [
-                        "investigation",
-                        "document_edit",
-                        "document_edit_batch",
-                        "document_audit",
-                    ] {
-                        s.active_tools.insert(name.into());
-                        if let Some(pending) = &mut s.pending_tools {
-                            pending.insert(name.into());
-                        }
-                    }
-                }
+                activate_workflow_tools(s);
                 Ok(json!({"revision":s.task.revision}))
             }
             _ => unreachable!(),
@@ -2222,7 +2226,11 @@ pub fn execute_cancellable(
                 Ok(json!({"verified":id}))
             }
             "final_check" => {
-                s.task.require_investigation = true;
+                if !s.task.require_investigation {
+                    s.task.require_investigation = true;
+                    s.task.revision = s.task.revision.saturating_add(1);
+                }
+                activate_workflow_tools(s);
                 revalidate(s)?;
                 if s.investigations.is_empty()
                     || s.investigations.iter().any(|i| i.status != "verified")
