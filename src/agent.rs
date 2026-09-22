@@ -1019,8 +1019,17 @@ pub async fn run_session_controlled(
         let mut batch_document_hash: Option<String> = None;
         while i < execution_calls.len() {
             let call = &execution_calls[i];
-            let (effective_call, rebased_document_call) =
-                rebase_document_call(call, batch_document_hash.as_deref());
+            // A provider may replay a complete response after a transport
+            // retry. Ledger entries keep the original call signature, so a
+            // cached call must be looked up with its original arguments
+            // before considering the in-response document hash. Rebasing a
+            // replayed later edit would otherwise turn an idempotent retry
+            // into a false call_id_collision.
+            let (effective_call, rebased_document_call) = if s.ledger.contains_key(&call.id) {
+                (call.clone(), false)
+            } else {
+                rebase_document_call(call, batch_document_hash.as_deref())
+            };
             let malformed_call = call.id.trim().is_empty() || call.name.trim().is_empty();
             let duplicate_call_id = seen_call_ids.contains(&call.id);
             let parallel = ["file_list", "file_read", "source_search"]
