@@ -245,6 +245,11 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             &["document_inspect", "document_edit_batch"]
         }
         "correct_arguments" if call.name == "file_read" => &["file_read"],
+        "correct_arguments" if call.name == "file_list" => &["file_list"],
+        "correct_arguments" if call.name == "source_search" => &["source_search"],
+        "correct_arguments" if call.name == "symbol_search" => &["symbol_search"],
+        "correct_arguments" if call.name == "code_outline" => &["code_outline"],
+        "correct_arguments" if call.name == "symbol_read" => &["symbol_read", "code_outline"],
         "refresh_matching_state" if call.name.starts_with("memory_") => {
             &["memory_read", "memory_find"]
         }
