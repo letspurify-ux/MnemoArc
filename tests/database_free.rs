@@ -99,6 +99,18 @@ fn free_execution_requires_manual_mode_switches() {
         )
         .is_err()
     );
+    session.config.database.procedure_enabled = true;
+    let invalid_args = tools::execute(
+        &mut session,
+        "db_execute",
+        json!({"mode":"procedure","name":"TEST_PROC","args":"not an array"}),
+    )
+    .unwrap_err();
+    assert!(
+        invalid_args
+            .to_string()
+            .contains("invalid_argument_type: args")
+    );
 }
 
 #[test]
@@ -124,7 +136,7 @@ fn oracle_free_execution_round_trips_sql_procedure_function_and_cursor() -> Resu
     )?;
     ensure!(create["committed"] == true, "create result: {create}");
     let test = (|| -> Result<()> {
-        conn.execute(&format!("CREATE OR REPLACE PROCEDURE {procedure}(p_in IN VARCHAR2, p_out OUT VARCHAR2, p_cursor OUT SYS_REFCURSOR, p_num IN OUT NUMBER, p_flag OUT BOOLEAN) AS BEGIN INSERT INTO {table}(NOTE) VALUES (p_in); p_out := UPPER(p_in); OPEN p_cursor FOR SELECT NOTE FROM {table} ORDER BY NOTE; p_num := p_num + 1; p_flag := TRUE; END;"), &[])?;
+        conn.execute(&format!("CREATE OR REPLACE PROCEDURE {procedure}(p_in IN VARCHAR2, p_out OUT VARCHAR2, p_cursor OUT SYS_REFCURSOR, p_num IN OUT NUMBER, p_flag OUT BOOLEAN) AS BEGIN INSERT INTO {table}(NOTE) VALUES (p_in); p_out := UPPER(p_in); OPEN p_cursor FOR SELECT NOTE, TO_CLOB(RPAD('x', 2000, 'x')) AS BIG_NOTE FROM {table} ORDER BY NOTE; p_num := p_num + 1; p_flag := TRUE; END;"), &[])?;
         conn.execute(&format!("CREATE OR REPLACE FUNCTION {function}(p_in IN NUMBER) RETURN NUMBER AS BEGIN RETURN p_in + 1; END;"), &[])?;
         conn.execute(&format!("CREATE OR REPLACE FUNCTION {cursor_function} RETURN SYS_REFCURSOR AS c SYS_REFCURSOR; BEGIN OPEN c FOR SELECT NOTE FROM {table} ORDER BY NOTE; RETURN c; END;"), &[])?;
         conn.execute(&format!("CREATE OR REPLACE PROCEDURE {failing_procedure} AS BEGIN INSERT INTO {table}(NOTE) VALUES ('uncommitted'); RAISE_APPLICATION_ERROR(-20000, 'expected failure'); END;"), &[])?;
@@ -148,6 +160,71 @@ fn oracle_free_execution_round_trips_sql_procedure_function_and_cursor() -> Resu
             30,
         )?;
         ensure!(read["rows"] == json!([["first"]]), "read result: {read}");
+        let types = execute_free(
+            &config,
+            &json!({"mode":"query","sql":"SELECT TO_CLOB('hello') AS C, TO_NCLOB('가나다') AS N, HEXTORAW('DEADBEEF') AS R, TO_BLOB(HEXTORAW('ABCD')) AS B FROM dual"}),
+            &cancel,
+            30,
+        )?;
+        ensure!(
+            types["rows"] == json!([["hello", "가나다", "DEADBEEF", "ABCD"]]),
+            "mixed types: {types}"
+        );
+        let free_binds = execute_free(
+            &config,
+            &json!({"mode":"query","sql":"SELECT :second AS SECOND, :first AS FIRST, :first AS AGAIN FROM dual","params":{"first":"one","second":"two"}}),
+            &cancel,
+            30,
+        )?;
+        ensure!(
+            free_binds["rows"] == json!([["two", "one", "one"]]),
+            "free binds: {free_binds}"
+        );
+        let large_lobs = execute_free(
+            &config,
+            &json!({"mode":"query","sql":"SELECT TO_CLOB(RPAD('x', 4000, 'x')) || TO_CLOB(RPAD('x', 4000, 'x')) AS BIG_CLOB, TO_BLOB(UTL_RAW.CAST_TO_RAW(RPAD('y', 2000, 'y'))) AS BIG_BLOB FROM dual"}),
+            &cancel,
+            30,
+        )?;
+        ensure!(large_lobs["truncated"] == true, "large LOBs: {large_lobs}");
+        ensure!(
+            large_lobs["rows"][0].as_array().is_some_and(|cells| cells
+                .iter()
+                .all(|cell| cell.as_str().is_some_and(|s| s.len() <= 1024))),
+            "large LOB byte limits: {large_lobs}"
+        );
+        let unicode_lob = execute_free(
+            &config,
+            &json!({"mode":"query","sql":"SELECT TO_NCLOB(RPAD('가', 2000, '가')) AS UNICODE_CLOB FROM dual"}),
+            &cancel,
+            30,
+        )?;
+        ensure!(
+            unicode_lob["truncated"] == true,
+            "unicode LOB: {unicode_lob}"
+        );
+        ensure!(
+            unicode_lob["rows"][0][0]
+                .as_str()
+                .is_some_and(|cell| cell.len() <= 1024 && cell.ends_with('…')),
+            "unicode LOB limit: {unicode_lob}"
+        );
+        let long_cell = execute_free(
+            &config,
+            &json!({"mode":"query","sql":"SELECT RPAD('x', 1100, 'x') AS LONG_VALUE FROM dual"}),
+            &cancel,
+            30,
+        )?;
+        ensure!(
+            long_cell["truncated"] == true,
+            "long cell truncation: {long_cell}"
+        );
+        ensure!(
+            long_cell["rows"][0][0]
+                .as_str()
+                .is_some_and(|cell| cell.len() <= 1024),
+            "long cell byte limit: {long_cell}"
+        );
         let call = execute_free(
             &config,
             &json!({"mode":"procedure","name":procedure,"args":[
@@ -164,8 +241,22 @@ fn oracle_free_execution_round_trips_sql_procedure_function_and_cursor() -> Resu
         ensure!(call["out"]["p_num"] == "6", "procedure INOUT: {call}");
         ensure!(call["out"]["p_flag"] == true, "procedure BOOLEAN: {call}");
         ensure!(
-            call["out"]["p_cursor"]["rows"] == json!([["first"], ["second"]]),
+            call["out"]["p_cursor"]["rows"][0][0] == "first",
             "procedure cursor: {call}"
+        );
+        ensure!(
+            call["out"]["p_cursor"]["rows"][1][0] == "second",
+            "procedure cursor: {call}"
+        );
+        ensure!(
+            call["out"]["p_cursor"]["truncated"] == true,
+            "procedure cursor LOB: {call}"
+        );
+        ensure!(
+            call["out"]["p_cursor"]["rows"][0][1]
+                .as_str()
+                .is_some_and(|cell| cell.len() <= 1024),
+            "procedure cursor LOB limit: {call}"
         );
         let value = execute_free(
             &config,

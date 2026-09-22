@@ -88,6 +88,10 @@ fn invalid_query_configuration_is_rejected() {
         .queries
         .push(query("test", false, "DELETE FROM users"));
     assert!(config.validate().is_err());
+    config.queries[0].sql = "SELECT ';' AS MARKER FROM dual".into();
+    assert!(config.validate().is_ok());
+    config.queries[0].sql = "SELECT\t1 FROM dual".into();
+    assert!(config.validate().is_ok());
     config.queries[0].sql = "SELECT 1 FROM dual".into();
     config
         .queries
@@ -127,6 +131,22 @@ fn oracle_docker_query_uses_binds_and_limits_rows() {
     });
     config.queries = vec![
         named,
+        SavedQuery {
+            id: "two_binds".into(),
+            description: "Check named bind order".into(),
+            sql: "SELECT :second AS SECOND, :first AS FIRST, :first AS REPEATED FROM dual".into(),
+            enabled: true,
+            params: vec![
+                QueryParam {
+                    name: "first".into(),
+                    description: "First value".into(),
+                },
+                QueryParam {
+                    name: "second".into(),
+                    description: "Second value".into(),
+                },
+            ],
+        },
         query(
             "three_rows",
             true,
@@ -136,6 +156,17 @@ fn oracle_docker_query_uses_binds_and_limits_rows() {
             "date_and_number",
             true,
             "SELECT SYSDATE AS TODAY, 7 AS N FROM dual",
+        ),
+        query("quoted_semicolon", true, "SELECT ';' AS MARKER FROM dual"),
+        query(
+            "large_clob",
+            true,
+            "SELECT TO_CLOB(RPAD('x', 4000, 'x')) AS LARGE_CLOB FROM dual",
+        ),
+        query(
+            "multiple_statements",
+            true,
+            "SELECT 1 FROM dual; SELECT 2 FROM dual",
         ),
     ];
     config.validate().unwrap();
@@ -147,6 +178,44 @@ fn oracle_docker_query_uses_binds_and_limits_rows() {
     )
     .unwrap();
     assert_eq!(result["rows"], json!([["x' OR 1=1 --"]]));
+    let two_binds = mnemoarc::database::execute(
+        &config,
+        &json!({"action":"run","id":"two_binds","params":{"first":"one","second":"two"}}),
+        &CancellationToken::new(),
+        30,
+    )
+    .unwrap();
+    assert_eq!(two_binds["rows"], json!([["two", "one", "one"]]));
+    let quoted_semicolon = mnemoarc::database::execute(
+        &config,
+        &json!({"action":"run","id":"quoted_semicolon"}),
+        &CancellationToken::new(),
+        30,
+    )
+    .unwrap();
+    assert_eq!(quoted_semicolon["rows"], json!([[";"]]));
+    let large_clob = mnemoarc::database::execute(
+        &config,
+        &json!({"action":"run","id":"large_clob"}),
+        &CancellationToken::new(),
+        30,
+    )
+    .unwrap();
+    assert_eq!(large_clob["truncated"], true);
+    assert!(
+        large_clob["rows"][0][0]
+            .as_str()
+            .is_some_and(|cell| cell.len() <= 1024)
+    );
+    assert!(
+        mnemoarc::database::execute(
+            &config,
+            &json!({"action":"run","id":"multiple_statements"}),
+            &CancellationToken::new(),
+            30,
+        )
+        .is_err()
+    );
     let bounded = mnemoarc::database::execute(
         &config,
         &json!({"action":"run","id":"three_rows"}),

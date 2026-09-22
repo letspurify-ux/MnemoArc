@@ -315,7 +315,8 @@ pub fn execute_free(
             if mode == "query" {
                 conn.execute("SET TRANSACTION READ ONLY", &[])?;
                 conn.set_call_timeout(Some(remaining(deadline)?))?;
-                let mut rows = conn.query_named(sql, &binds)?;
+                let mut stmt = conn.statement(sql).lob_locator().build()?;
+                let mut rows = stmt.query_named(&binds)?;
                 let mut result = collect_rows(&conn, &mut rows, config, cancel, deadline)?;
                 conn.rollback()?;
                 result["mode"] = json!(mode);
@@ -367,7 +368,7 @@ pub fn execute_free(
             };
             let conn = connect(config, timeout_secs, deadline)?;
             let operation = (|| -> Result<Value> {
-                let mut stmt = conn.statement(&block).build()?;
+                let mut stmt = conn.statement(&block).lob_locator().build()?;
                 if let Some(kind) = return_type {
                     if kind == "cursor" {
                         stmt.bind("mnemoarc_result", &None::<RefCursor>)?;

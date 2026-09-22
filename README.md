@@ -152,7 +152,7 @@ cargo run -- run --project /path/to/project --output docs/source-summary.md \
 
 전체 활성화와 **각 쿼리 활성화**는 모두 기본으로 꺼져 있습니다. 사용자가 설정 화면이나 TOML에서 직접 켜야 하며 모델의 `tool_select`로 켤 수 없습니다. 두 스위치가 켜진 쿼리만 모델에 보입니다. 설정 변경은 진행 중인 호출이 끝난 후 적용됩니다.
 
-쿼리 ID와 설명은 모델이 용도를 구분할 수 있게 작성하세요. SQL은 단일 `SELECT`/`WITH` 문으로 저장하고, 매개변수는 `:name` 형식으로 바인드합니다. 예를 들어 SQL이 `SELECT employee_id, first_name FROM employees WHERE department_id = :dept_id`라면 매개변수 `dept_id`와 설명을 추가합니다. 모델은 `db_query`의 `list`로 활성 쿼리를 확인하고 `run`에 쿼리 ID와 바인드 값만 전달합니다. `db_query`는 임의 SQL이나 활성화 변경을 받지 않습니다. Oracle 읽기 전용 트랜잭션을 사용하며 결과는 기본 100행, 최대 500행으로 제한하고 각 셀도 잘라서 반환합니다.
+쿼리 ID와 설명은 모델이 용도를 구분할 수 있게 작성하세요. SQL은 단일 `SELECT`/`WITH` 문으로 저장하고, 매개변수는 `:name` 형식으로 바인드합니다. 예를 들어 SQL이 `SELECT employee_id, first_name FROM employees WHERE department_id = :dept_id`라면 매개변수 `dept_id`와 설명을 추가합니다. 모델은 `db_query`의 `list`로 활성 쿼리를 확인하고 `run`에 쿼리 ID와 바인드 값만 전달합니다. `db_query`는 임의 SQL이나 활성화 변경을 받지 않습니다. Oracle 읽기 전용 트랜잭션을 사용하며 결과는 기본 100행, 최대 500행으로 제한하고 각 셀도 1,024바이트로 잘라서 반환합니다. 행 또는 셀 값이 잘리면 `truncated`가 `true`입니다. RAW/BLOB 값은 16진수 문자열로 표시합니다.
 
 `db_execute`는 자유 실행 모드를 하나라도 수동으로 켰을 때만 모델에 보입니다. **자유 SELECT/WITH 조회**, **자유 변경 SQL 실행**, **프로시저 호출**, **함수 호출**은 각각 별도 스위치이며 기본값은 모두 `false`입니다. 모델이 스위치를 바꿀 수는 없습니다. 필요한 작업에 맞는 DB 권한을 계정에 부여하세요.
 

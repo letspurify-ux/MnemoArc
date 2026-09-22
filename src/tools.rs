@@ -99,7 +99,7 @@ impl ToolRegistry {
         let mut specs = vec![
             ToolSpec {
                 name: "db_query",
-                description: "Read user-approved Oracle queries. First use action=list to discover enabled query IDs, purpose and bind parameters; then action=run with an ID and params. SQL and activation are controlled only by the user in Settings. Results are bounded and read-only.",
+                description: "Read user-approved Oracle queries. First use action=list to discover enabled query IDs, purpose and bind parameters; then action=run with an ID and params. SQL and activation are controlled only by the user in Settings. Results use a read-only transaction, bound rows and cells; truncated=true includes shortened cells. RAW/BLOB cells are hexadecimal strings.",
                 optional: false,
                 read_only: true,
                 parameters: schema(
@@ -109,7 +109,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "db_execute",
-                description: "Execute manually enabled ad hoc Oracle operations. mode=query runs a SELECT/WITH with read-only transaction; mode=statement runs SQL and commits; mode=procedure calls a named PL/SQL procedure and commits; mode=function calls a named PL/SQL function and commits. Use named binds. Procedure/function args are ordered positional parameters with name, direction=in|out|inout, type=string|number|boolean|cursor, and value for IN/INOUT. Function requires return_type. These modes are enabled only by the user in Settings; procedures/functions can have side effects.",
+                description: "Execute manually enabled ad hoc Oracle operations. mode=query runs a SELECT/WITH with read-only transaction; mode=statement runs SQL and commits; mode=procedure calls a named PL/SQL procedure and commits; mode=function calls a named PL/SQL function and commits. Use named binds. Procedure/function args are ordered positional parameters with name, direction=in|out|inout, type=string|number|boolean|cursor, and value for IN/INOUT. Function requires return_type. Result rows and cells are bounded; truncated=true includes shortened cells, and RAW/BLOB cells are hexadecimal strings. These modes are enabled only by the user in Settings; procedures/functions can have side effects.",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -569,11 +569,11 @@ impl ToolRegistry {
                 Some("string") => v.is_string(),
                 Some("integer") => v.as_u64().is_some(),
                 Some("boolean") => v.is_boolean(),
-                Some("array") => {
-                    ((name == "document_edit_batch" && k == "edits")
-                        || (name == "db_execute" && k == "args"))
-                        || v.as_array().is_some_and(|a| a.iter().all(Value::is_string))
-                }
+                Some("array") => v.as_array().is_some_and(|items| {
+                    (name == "document_edit_batch" && k == "edits")
+                        || (name == "db_execute" && k == "args")
+                        || items.iter().all(Value::is_string)
+                }),
                 Some("object") => v.is_object(),
                 _ => true,
             };

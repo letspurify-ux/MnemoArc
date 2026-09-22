@@ -2,11 +2,15 @@
 mod free;
 use anyhow::{Result, bail};
 pub use free::execute_free;
-use oracle::{Connection, sql_type::ToSql};
+use oracle::{
+    Connection,
+    sql_type::{Blob, Clob, Nclob, OracleType, ToSql},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
+    io::Read,
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
@@ -117,16 +121,10 @@ impl DatabaseConfig {
                 bail!("database query {} needs a description", q.id);
             }
             let sql = q.sql.trim_start();
-            if !(sql.to_ascii_uppercase().starts_with("SELECT ")
-                || sql.to_ascii_uppercase().starts_with("SELECT\n")
-                || sql.to_ascii_uppercase().starts_with("WITH ")
-                || sql.to_ascii_uppercase().starts_with("WITH\n"))
-                || sql.contains(';')
-            {
-                bail!(
-                    "database query {} must be a single SELECT or WITH query without a semicolon",
-                    q.id
-                );
+            if !sql.split_whitespace().next().is_some_and(|keyword| {
+                keyword.eq_ignore_ascii_case("SELECT") || keyword.eq_ignore_ascii_case("WITH")
+            }) {
+                bail!("database query {} must be a SELECT or WITH query", q.id);
             }
             let mut params = BTreeSet::new();
             for p in &q.params {
@@ -185,6 +183,99 @@ fn connect(config: &DatabaseConfig, timeout_secs: u64, deadline: Instant) -> Res
     Ok(conn)
 }
 
+fn lob_prefix(
+    mut lob: impl Read,
+    limit: usize,
+    conn: &Connection,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<(Vec<u8>, bool)> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        if cancel.is_cancelled() {
+            bail!("cancelled");
+        }
+        conn.set_call_timeout(Some(remaining(deadline)?))?;
+        let read = lob.read(&mut buffer)?;
+        if read == 0 {
+            return Ok((bytes, false));
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if bytes.len() > limit {
+            return Ok((bytes, true));
+        }
+    }
+}
+
+fn truncate_cell(value: &str) -> (String, bool) {
+    let mut text = String::new();
+    for ch in value.chars() {
+        if text.len() + ch.len_utf8() > 1024 {
+            while text.len() + '…'.len_utf8() > 1024 {
+                text.pop();
+            }
+            text.push('…');
+            return (text, true);
+        }
+        text.push(ch);
+    }
+    (text, false)
+}
+
+fn cell_text(
+    row: &oracle::Row,
+    index: usize,
+    kind: &OracleType,
+    conn: &Connection,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<(Option<String>, bool)> {
+    match kind {
+        OracleType::CLOB => {
+            let lob: Option<Clob> = row.get(index)?;
+            let Some(lob) = lob else {
+                return Ok((None, false));
+            };
+            let (bytes, more) = lob_prefix(lob, 1024, conn, cancel, deadline)?;
+            let (text, cut) = truncate_cell(std::str::from_utf8(&bytes)?);
+            Ok((Some(text), more || cut))
+        }
+        OracleType::NCLOB => {
+            let lob: Option<Nclob> = row.get(index)?;
+            let Some(lob) = lob else {
+                return Ok((None, false));
+            };
+            let (bytes, more) = lob_prefix(lob, 1024, conn, cancel, deadline)?;
+            let (text, cut) = truncate_cell(std::str::from_utf8(&bytes)?);
+            Ok((Some(text), more || cut))
+        }
+        OracleType::BLOB => {
+            let lob: Option<Blob> = row.get(index)?;
+            let Some(lob) = lob else {
+                return Ok((None, false));
+            };
+            let (bytes, more) = lob_prefix(lob, 512, conn, cancel, deadline)?;
+            let mut hex = String::with_capacity(bytes.len() * 2);
+            const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+            for byte in bytes {
+                hex.push(DIGITS[(byte >> 4) as usize] as char);
+                hex.push(DIGITS[(byte & 15) as usize] as char);
+            }
+            let (text, cut) = truncate_cell(&hex);
+            Ok((Some(text), more || cut))
+        }
+        _ => {
+            let value: Option<String> = row.get(index)?;
+            let Some(value) = value else {
+                return Ok((None, false));
+            };
+            let (text, cut) = truncate_cell(&value);
+            Ok((Some(text), cut))
+        }
+    }
+}
+
 fn collect_rows(
     conn: &Connection,
     results: &mut oracle::ResultSet<'_, oracle::Row>,
@@ -192,6 +283,11 @@ fn collect_rows(
     cancel: &CancellationToken,
     deadline: Instant,
 ) -> Result<Value> {
+    let kinds: Vec<_> = results
+        .column_info()
+        .iter()
+        .map(|c| c.oracle_type().clone())
+        .collect();
     let columns: Vec<_> = results
         .column_info()
         .iter()
@@ -204,8 +300,14 @@ fn collect_rows(
     let mut truncated = false;
     let mut result_bytes = 0usize;
     loop {
+        if cancel.is_cancelled() {
+            bail!("cancelled");
+        }
         conn.set_call_timeout(Some(remaining(deadline)?))?;
         let Some(item) = results.next() else {
+            if cancel.is_cancelled() {
+                bail!("cancelled");
+            }
             break;
         };
         if cancel.is_cancelled() {
@@ -217,19 +319,9 @@ fn collect_rows(
         }
         let row = item?;
         let mut cells = Vec::with_capacity(columns.len());
-        for index in 0..columns.len() {
-            let value: Option<String> = row.get(index)?;
-            let value = value.map(|v| {
-                let mut text = String::new();
-                for ch in v.chars() {
-                    if text.len() + ch.len_utf8() > 1024 {
-                        text.push('…');
-                        break;
-                    }
-                    text.push(ch);
-                }
-                text
-            });
+        for (index, kind) in kinds.iter().enumerate() {
+            let (value, cut) = cell_text(&row, index, kind, conn, cancel, deadline)?;
+            truncated |= cut;
             cells.push(value);
         }
         let row_bytes: usize = cells
@@ -322,7 +414,8 @@ pub fn execute(
         .zip(&values)
         .map(|(p, v)| (p.name.as_str(), v as &dyn ToSql))
         .collect();
-    let mut results = conn.query_named(&query.sql, &binds)?;
+    let mut stmt = conn.statement(&query.sql).lob_locator().build()?;
+    let mut results = stmt.query_named(&binds)?;
     let mut result = collect_rows(&conn, &mut results, config, cancel, deadline)?;
     conn.rollback()?;
     result["query_id"] = json!(id);
