@@ -336,6 +336,12 @@ impl Session {
             self.task.phase.clear();
             self.task.require_investigation = false;
             self.task.workflow.clear();
+            // Investigation items and review attempts belong to the previous
+            // task. Keeping them makes finalization audit an old document (or
+            // consume the old review budget) when a new, unrelated request is
+            // answered in the same session.
+            self.investigations.clear();
+            self.reviews = 0;
             self.document_review = Default::default();
             self.document_written = false;
             self.last_document_write = None;
