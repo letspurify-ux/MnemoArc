@@ -226,6 +226,9 @@ OpenCode 비교는 동일 소스 지문, 같은 모델·요청, 비슷한 시간
 `source-docs`에 문서 목차·섹션 조회(`document_inspect`), 섹션 단위 수정,
 출처 일괄 점검(`document_audit`), 조사 항목 일괄 검증(`verify_batch`),
 선언 검색(`symbol_search`)이 포함된다. 파일 읽기는 실제 줄 수와 줄 위치를 제공한다.
+일반 프로젝트 텍스트 파일에는 `file_edit`(정확한 문자열 교체), `file_write`(생성·전체 교체),
+`file_patch`(여러 파일의 추가·수정·교체·이동·삭제)를 사용할 수 있다.
+기존 파일의 수정에는 현재 파일 해시가 필요하며 설정된 Markdown 출력은 `document_edit`로 편집한다.
 설정 화면의 **실행과 예산**에서 작성·검증 예산 비율과 반복 조회·중단 제한을 조절할 수 있다.
 상세 사용법과 검증 범위는 [문서 도구 개선](docs/documentation-tools.md)을 참고한다.
 

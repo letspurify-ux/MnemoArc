@@ -237,6 +237,9 @@ impl Session {
             coverage_cursors: BTreeMap::new(),
             active_tools: [
                 "file_read",
+                "file_edit",
+                "file_write",
+                "file_patch",
                 "document_inspect",
                 "file_list",
                 "source_search",

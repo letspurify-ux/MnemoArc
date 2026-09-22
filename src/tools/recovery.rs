@@ -57,6 +57,17 @@ pub fn describe(message: &str) -> Value {
         (Class::Prerequisite, "complete_prerequisite")
     } else if code == "file_not_found" || code == "document_missing" {
         (Class::MissingPath, "resolve_path")
+    } else if code == "file_patch_rollback_failed" || code == "file_patch_write_failed" {
+        (Class::OutcomeUnknown, "inspect_outcome_before_retry")
+    } else if code == "file_hash_required" {
+        (Class::InvalidInput, "copy_file_hash")
+    } else if code == "configured_output_requires_document_edit" {
+        (Class::InvalidInput, "use_document_editor")
+    } else if matches!(
+        code,
+        "file_exists" | "empty_old_text" | "text_not_found" | "ambiguous_text"
+    ) {
+        (Class::InvalidInput, "correct_arguments")
     } else if code == "file_permission_denied" {
         (Class::Unavailable, "check_file_permissions")
     } else if code == "path_is_directory" {
@@ -239,6 +250,8 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "select_file_from_directory" => &["file_list", "file_read"],
         "choose_allowed_path" => &["file_list", "document_inspect"],
         "copy_document_hash" => &["document_inspect"],
+        "copy_file_hash" => &["file_read"],
+        "use_document_editor" => &["document_inspect", "document_edit", "document_edit_batch"],
         "restart_document_inspection" | "inspect_document_outline" => &["document_inspect"],
         "choose_exact_section" => &["document_inspect", "file_read"],
         "repair_document_citation" => &["document_inspect", "document_edit", "document_edit_batch"],
@@ -263,6 +276,14 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             &["document_inspect", "document_edit_batch"]
         }
         "correct_arguments" if call.name == "file_read" => &["file_read"],
+        "correct_arguments"
+            if matches!(
+                call.name.as_str(),
+                "file_edit" | "file_write" | "file_patch"
+            ) =>
+        {
+            &["file_read", "file_edit", "file_write", "file_patch"]
+        }
         "correct_arguments" if call.name == "tool_select" => &["tool_select", "task_state"],
         "correct_arguments" if call.name == "task_state" => &["task_state"],
         "correct_arguments" if call.name == "file_list" => &["file_list"],
@@ -305,9 +326,18 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         }
         "refresh_matching_state" if call.name == "source_search" => &["source_search", "file_read"],
         "refresh_matching_state" if call.name == "file_list" => &["file_list"],
+        "refresh_matching_state"
+            if matches!(
+                call.name.as_str(),
+                "file_edit" | "file_write" | "file_patch"
+            ) =>
+        {
+            &["file_read", "file_list"]
+        }
         "refresh_matching_state" if call.name == "symbol_search" => &["symbol_search", "file_read"],
         "refresh_matching_state" => &["code_outline", "file_read", "source_lookup", "history"],
         "reduce_request_or_cleanup" if call.name == "source_search" => &["source_search"],
+        "reduce_request_or_cleanup" if call.name == "file_patch" => &["file_patch", "file_read"],
         "reduce_request_or_cleanup" if call.name == "code_outline" => &["code_outline"],
         "reduce_request_or_cleanup" => &[
             "memory_manage",

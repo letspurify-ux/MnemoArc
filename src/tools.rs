@@ -2,6 +2,7 @@ pub mod answer_review;
 mod coverage;
 pub mod document_review;
 mod documentation;
+mod file_edit;
 pub mod recovery;
 mod search;
 mod structure;
@@ -295,6 +296,36 @@ impl ToolRegistry {
                 ),
             },
             ToolSpec {
+                name: "file_edit",
+                description: "Replace exact text in an existing UTF-8 project file. Read the file first and copy its hash to expected_hash. old_text must occur exactly once unless replace_all=true. For the configured Markdown output use document_edit instead.",
+                optional: true,
+                read_only: false,
+                parameters: schema(
+                    json!({"path":string(),"old_text":string(),"new_text":string(),"expected_hash":string(),"replace_all":{"type":"boolean"}}),
+                    &["path", "old_text", "new_text", "expected_hash"],
+                ),
+            },
+            ToolSpec {
+                name: "file_write",
+                description: "Create or replace one UTF-8 project file. To create, omit expected_hash; to replace an existing file, read it first and provide expected_hash. For small changes use file_edit. For the configured Markdown output use document_edit instead.",
+                optional: true,
+                read_only: false,
+                parameters: schema(
+                    json!({"path":string(),"content":string(),"expected_hash":string()}),
+                    &["path", "content"],
+                ),
+            },
+            ToolSpec {
+                name: "file_patch",
+                description: "Apply 1..32 ordered operations across UTF-8 project files: add {path,content}, update {path,old_text,new_text,replace_all?}, replace {path,content}, move {path,to_path}, or delete {path}. The first operation on each existing file requires expected_hash from file_read. Later operations on the same file in this patch may omit it and observe prior edits; an explicitly supplied hash must match that intermediate version. Validation completes before writing. For the configured Markdown output use document_edit_batch instead.",
+                optional: true,
+                read_only: false,
+                parameters: schema(
+                    json!({"operations":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"action":action(&["add","update","replace","move","delete"]),"path":string(),"to_path":string(),"content":string(),"old_text":string(),"new_text":string(),"expected_hash":string(),"replace_all":{"type":"boolean"}},"required":["action","path"],"additionalProperties":false}}}),
+                    &["operations"],
+                ),
+            },
+            ToolSpec {
                 name: "document_edit",
                 description: "Edit ONLY configured Markdown output. Save one investigated section at a time. Inspect the outline and copy section_path when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree, and insertion keeps the anchor and inserts text verbatim. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash. Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and also requires expected_section_hash; its text must retain the original full heading. Simple edits do not require investigation items; source documentation must first set task_state patch.require_investigation=true. Returns measured lines and new hash",
                 optional: true,
@@ -571,6 +602,7 @@ impl ToolRegistry {
                 Some("boolean") => v.is_boolean(),
                 Some("array") => v.as_array().is_some_and(|items| {
                     (name == "document_edit_batch" && k == "edits")
+                        || (name == "file_patch" && k == "operations")
                         || (name == "db_execute" && k == "args")
                         || items.iter().all(Value::is_string)
                 }),
@@ -2235,6 +2267,7 @@ pub fn execute_cancellable(
         }
         "source_search" => search::execute(s, &args, cancel),
         "file_read" => read_file(s, &mut args, cancel),
+        "file_edit" | "file_write" | "file_patch" => file_edit::execute(s, name, &args, cancel),
         "document_edit" => {
             let path = output_path(&s.project)?;
             let exists = path.exists();
