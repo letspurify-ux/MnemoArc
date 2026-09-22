@@ -252,20 +252,9 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "correct_arguments" if call.name == "symbol_search" => &["symbol_search"],
         "correct_arguments" if call.name == "code_outline" => &["code_outline"],
         "correct_arguments" if call.name == "symbol_read" => &["symbol_read", "code_outline"],
-        "refresh_matching_state" if call.name.starts_with("memory_") => {
-            &["memory_read", "memory_find"]
-        }
-        "refresh_matching_state"
-            if matches!(call.name.as_str(), "document_edit" | "document_edit_batch") =>
-        {
-            &["document_inspect", "document_edit", "document_edit_batch"]
-        }
-        "refresh_matching_state" if call.name == "document_inspect" => {
-            &["document_inspect", "file_read"]
-        }
-        "refresh_matching_state" if call.name == "document_audit" => {
-            &["document_audit", "document_inspect"]
-        }
+        // Memory-specific stale errors need the broader recovery set below:
+        // the generic memory branch would otherwise match first and make the
+        // code-specific branch unreachable.
         "refresh_matching_state"
             if matches!(
                 result["recovery"]["code"].as_str(),
@@ -281,6 +270,20 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
                 "source_lookup",
                 "history",
             ]
+        }
+        "refresh_matching_state" if call.name.starts_with("memory_") => {
+            &["memory_read", "memory_find"]
+        }
+        "refresh_matching_state"
+            if matches!(call.name.as_str(), "document_edit" | "document_edit_batch") =>
+        {
+            &["document_inspect", "document_edit", "document_edit_batch"]
+        }
+        "refresh_matching_state" if call.name == "document_inspect" => {
+            &["document_inspect", "file_read"]
+        }
+        "refresh_matching_state" if call.name == "document_audit" => {
+            &["document_audit", "document_inspect"]
         }
         "refresh_matching_state" if call.name == "source_search" => &["source_search", "file_read"],
         "refresh_matching_state" if call.name == "file_list" => &["file_list"],
