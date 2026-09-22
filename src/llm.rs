@@ -81,6 +81,19 @@ pub struct OpenAiClient;
 pub(crate) const STREAM_DELTAS_MARKER: &str = "__mnemoarc_stream_deltas";
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
+fn apply_thinking_settings(request: &mut Value, c: &Config) {
+    if c.enable_thinking {
+        if let Some(effort) = &c.reasoning_effort {
+            request["reasoning_effort"] = json!(effort);
+        }
+    } else {
+        // OpenAI-compatible providers, including OpenRouter/Qwen, map the
+        // standard `none` effort to the model's non-thinking mode. This must
+        // override a stale effort value kept in settings for re-enabling.
+        request["reasoning_effort"] = json!("none");
+    }
+}
+
 fn response_format_rejected(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     // OpenAI-compatible servers do not agree on the error body: some name
@@ -176,9 +189,7 @@ impl OpenAiClient {
         if c.stream_usage {
             request["stream_options"] = json!({"include_usage":true});
         }
-        if let Some(e) = &c.reasoning_effort {
-            request["reasoning_effort"] = json!(e);
-        }
+        apply_thinking_settings(&mut request, c);
         let mut req = Self::client(c)?
             .post(format!(
                 "{}/chat/completions",
@@ -327,9 +338,7 @@ impl OpenAiClient {
         } else {
             "max_completion_tokens"
         }] = json!(c.output_tokens);
-        if let Some(effort) = &c.reasoning_effort {
-            body["reasoning_effort"] = json!(effort);
-        }
+        apply_thinking_settings(&mut body, c);
         let mut req = Self::client(c)?
             .post(format!(
                 "{}/chat/completions",

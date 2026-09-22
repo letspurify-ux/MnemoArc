@@ -26,6 +26,10 @@ pub struct Config {
     pub context_tokens: usize,
     pub output_tokens: usize,
     pub reasoning_effort: Option<String>,
+    /// Controls Qwen-style thinking/reasoning. When false, the client sends
+    /// the provider's standard no-reasoning value even if reasoning_effort is
+    /// still populated for a later re-enable.
+    pub enable_thinking: bool,
     pub legacy_max_tokens: bool,
     pub stream_usage: bool,
     pub memory_count: usize,
@@ -87,6 +91,7 @@ impl Default for Config {
             context_tokens: 64000,
             output_tokens: 8000,
             reasoning_effort: None,
+            enable_thinking: true,
             legacy_max_tokens: false,
             stream_usage: true,
             memory_count: 1000,

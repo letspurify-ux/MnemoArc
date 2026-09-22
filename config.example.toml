@@ -1,12 +1,14 @@
-base_url = "https://api.openai.com/v1"
-# Set an actual provider model and its documented combined context limit.
-model = ""
-# model_context = 128000
+base_url = "https://openrouter.ai/api/v1"
+# OpenRouter model ID. Set its documented combined context limit below.
+model = "qwen/qwen3.8-27b"
+model_context = 1000000
 # proxy = "http://localhost:8080"
 # Takes precedence over proxy and disables environment/system proxy detection.
 disable_proxy = false
-# reasoning_effort = "medium"
-api_key_env = "OPENAI_API_KEY"
+# reasoning_effort = "xhigh"
+# Qwen thinking/reasoning toggle. false maps to reasoning_effort = "none".
+enable_thinking = true
+api_key_env = "OPENROUTER_API_KEY"
 context_tokens = 64000
 output_tokens = 8000
 legacy_max_tokens = false

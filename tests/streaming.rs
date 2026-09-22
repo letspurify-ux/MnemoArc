@@ -103,6 +103,61 @@ async fn missing_usage_is_not_zero() {
 }
 
 #[tokio::test]
+async fn disabling_thinking_overrides_saved_qwen_reasoning_effort() {
+    use axum::extract::Json as RequestJson;
+    use std::sync::{Arc, Mutex};
+
+    let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let captured = requests.clone();
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move |RequestJson(body): RequestJson<serde_json::Value>| {
+            let captured = captured.clone();
+            async move {
+                captured.lock().unwrap().push(body);
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    format!(
+                        "{}data: [DONE]\n\n",
+                        event(json!({
+                            "choices": [{
+                                "delta": {"content": "OK"},
+                                "finish_reason": "stop"
+                            }]
+                        }))
+                    ),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let c = Config {
+        base_url: url,
+        model: "qwen/qwen3.8-27b".into(),
+        model_context: Some(1_000_000),
+        reasoning_effort: Some("xhigh".into()),
+        enable_thinking: false,
+        ..Default::default()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    OpenAiClient
+        .complete(
+            json!({"model":"qwen/qwen3.8-27b","messages":[]}),
+            &c,
+            CancellationToken::new(),
+            tx,
+        )
+        .await
+        .unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["reasoning_effort"], "none");
+    server.abort();
+}
+
+#[tokio::test]
 async fn retries_transient_http_error_before_accepting_a_complete_stream() {
     use std::sync::{
         Arc,

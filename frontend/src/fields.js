@@ -42,7 +42,13 @@ export const groups = [
         "reasoning_effort",
         "추론 강도",
         "optional",
-        "서버가 지원하는 값 (예: low, medium, high). 미지원이면 비워 두세요.",
+        "추론을 켰을 때 서버가 지원하는 값 (예: low, medium, high, xhigh). 아래에서 끄면 이 값보다 비활성화가 우선합니다.",
+      ],
+      [
+        "enable_thinking",
+        "LLM 추론 사용",
+        "boolean",
+        "끄면 qwen/qwen3.8-27b의 thinking/reasoning을 완전히 비활성화하고 reasoning_effort=none으로 요청합니다.",
       ],
       [
         "legacy_max_tokens",
