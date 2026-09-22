@@ -100,6 +100,10 @@ fn example_configuration_keeps_database_disabled() {
     let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
     config.validate().unwrap();
     assert!(!config.database.enabled);
+    assert!(!config.database.raw_query_enabled);
+    assert!(!config.database.raw_statement_enabled);
+    assert!(!config.database.procedure_enabled);
+    assert!(!config.database.function_enabled);
     assert!(config.database.queries.iter().all(|query| !query.enabled));
 }
 

@@ -1,4 +1,4 @@
-//! User-approved, named Oracle queries. The model never supplies SQL or changes enable flags.
+//! User-controlled Oracle access: saved queries and individually enabled free execution modes.
 mod free;
 use anyhow::{Result, bail};
 pub use free::execute_free;

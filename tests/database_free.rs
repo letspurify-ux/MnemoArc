@@ -112,6 +112,7 @@ fn oracle_free_execution_round_trips_sql_procedure_function_and_cursor() -> Resu
     let function = format!("MA_FUNC_{suffix}");
     let cursor_function = format!("MA_FCUR_{suffix}");
     let failing_procedure = format!("MA_FAIL_{suffix}");
+    let implicit_procedure = format!("MA_IMPL_{suffix}");
     let conn = Connection::connect("SYSTEM", &password, "//localhost:1521/FREEPDB1")?;
     let config = configured();
     let cancel = CancellationToken::new();
@@ -127,6 +128,7 @@ fn oracle_free_execution_round_trips_sql_procedure_function_and_cursor() -> Resu
         conn.execute(&format!("CREATE OR REPLACE FUNCTION {function}(p_in IN NUMBER) RETURN NUMBER AS BEGIN RETURN p_in + 1; END;"), &[])?;
         conn.execute(&format!("CREATE OR REPLACE FUNCTION {cursor_function} RETURN SYS_REFCURSOR AS c SYS_REFCURSOR; BEGIN OPEN c FOR SELECT NOTE FROM {table} ORDER BY NOTE; RETURN c; END;"), &[])?;
         conn.execute(&format!("CREATE OR REPLACE PROCEDURE {failing_procedure} AS BEGIN INSERT INTO {table}(NOTE) VALUES ('uncommitted'); RAISE_APPLICATION_ERROR(-20000, 'expected failure'); END;"), &[])?;
+        conn.execute(&format!("CREATE OR REPLACE PROCEDURE {implicit_procedure} AS c SYS_REFCURSOR; BEGIN OPEN c FOR SELECT NOTE FROM {table} ORDER BY NOTE; DBMS_SQL.RETURN_RESULT(c); END;"), &[])?;
         // Oracle read-only snapshots can reject a table changed in the same second.
         std::thread::sleep(std::time::Duration::from_secs(2));
         let write = execute_free(
@@ -182,6 +184,16 @@ fn oracle_free_execution_round_trips_sql_procedure_function_and_cursor() -> Resu
             cursor_value["result"]["rows"] == json!([["first"], ["second"]]),
             "function cursor: {cursor_value}"
         );
+        let implicit = execute_free(
+            &config,
+            &json!({"mode":"procedure","name":implicit_procedure}),
+            &cancel,
+            30,
+        )?;
+        ensure!(
+            implicit["implicit_results"][0]["rows"] == json!([["first"], ["second"]]),
+            "implicit cursor: {implicit}"
+        );
         ensure!(
             execute_free(
                 &config,
@@ -208,6 +220,7 @@ fn oracle_free_execution_round_trips_sql_procedure_function_and_cursor() -> Resu
     let _ = conn.execute(&format!("DROP FUNCTION {cursor_function}"), &[]);
     let _ = conn.execute(&format!("DROP PROCEDURE {procedure}"), &[]);
     let _ = conn.execute(&format!("DROP PROCEDURE {failing_procedure}"), &[]);
+    let _ = conn.execute(&format!("DROP PROCEDURE {implicit_procedure}"), &[]);
     let _ = conn.execute(&format!("DROP TABLE {table} PURGE"), &[]);
     test
 }

@@ -46,6 +46,11 @@ projects = []
 # Put the password in the named environment variable or .env, not here.
 [database]
 enabled = false
+# Each free execution mode needs its own explicit opt-in.
+raw_query_enabled = false
+raw_statement_enabled = false
+procedure_enabled = false
+function_enabled = false
 host = "localhost"
 port = 1521
 service = "FREEPDB1"

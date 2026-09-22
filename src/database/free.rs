@@ -407,12 +407,18 @@ pub fn execute_free(
                 };
                 let mut implicit_results = Vec::new();
                 for _ in 0..4 {
-                    let Some(mut cursor) = stmt.implicit_result()? else { break; };
+                    let Some(mut cursor) = stmt.implicit_result()? else {
+                        break;
+                    };
                     let mut rows = cursor.query()?;
-                    implicit_results.push(collect_rows(&conn, &mut rows, config, cancel, deadline)?);
+                    implicit_results
+                        .push(collect_rows(&conn, &mut rows, config, cancel, deadline)?);
                 }
-                let implicit_truncated = implicit_results.len() == 4 && stmt.implicit_result()?.is_some();
-                Ok(json!({"mode":mode,"name":name,"out":outs,"result":result,"implicit_results":implicit_results,"implicit_truncated":implicit_truncated}))
+                let implicit_truncated =
+                    implicit_results.len() == 4 && stmt.implicit_result()?.is_some();
+                Ok(
+                    json!({"mode":mode,"name":name,"out":outs,"result":result,"implicit_results":implicit_results,"implicit_truncated":implicit_truncated}),
+                )
             })();
             finish_mutation(&conn, operation, cancel, deadline)
         }

@@ -146,15 +146,28 @@ cargo run -- run --project /path/to/project --output docs/source-summary.md \
 
 알려진 모델은 `tiktoken-rs` 토크나이저를 사용합니다. 알 수 없는 모델 이름은 `cl100k_base` 기준 토큰 수에 25% 여유를 더해 추정하며, UI에서 실제 API 사용량과 컨텍스트 추정 여부를 구분합니다. 공급자 토크나이저와 정확히 일치하는 값은 아닙니다. 기억 메타데이터에는 항목별 160 토큰 거부 한도가 없으며, 기억 인덱스 컨텍스트는 `index_tokens` 예산에 맞는 항목만 포함합니다. 예산을 넘은 항목은 저장된 상태로 남고 생략된 ID가 상태에 표시되며 `memory_find`·`memory_read`로 조회할 수 있습니다. 긴 설명은 본문에 저장하세요. 서버가 제공하지 않은 사용량·캐시 사용량은 0으로 취급하지 않습니다.
 
-## Oracle DB 조회
+## Oracle DB 조회와 실행
 
 **모든 설정 → 데이터베이스**에서 호스트·포트·서비스·사용자·암호 환경변수 이름을 한 번 입력하고, 여러 저장 쿼리를 추가할 수 있습니다. Oracle Client 라이브러리가 앱 실행 환경에 설치되어 있어야 합니다. 암호는 설정 파일이나 화면에 저장하지 않고 지정한 환경변수 또는 실행 폴더의 `.env`에서 읽습니다.
 
 전체 활성화와 **각 쿼리 활성화**는 모두 기본으로 꺼져 있습니다. 사용자가 설정 화면이나 TOML에서 직접 켜야 하며 모델의 `tool_select`로 켤 수 없습니다. 두 스위치가 켜진 쿼리만 모델에 보입니다. 설정 변경은 진행 중인 호출이 끝난 후 적용됩니다.
 
-쿼리 ID와 설명은 모델이 용도를 구분할 수 있게 작성하세요. SQL은 단일 `SELECT`/`WITH` 문으로 저장하고, 매개변수는 `:name` 형식으로 바인드합니다. 예를 들어 SQL이 `SELECT employee_id, first_name FROM employees WHERE department_id = :dept_id`라면 매개변수 `dept_id`와 설명을 추가합니다. 모델은 `db_query`의 `list`로 활성 쿼리를 확인하고 `run`에 쿼리 ID와 바인드 값만 전달합니다. 임의 SQL이나 활성화 변경은 도구 인자로 허용하지 않습니다. Oracle 읽기 전용 트랜잭션을 사용하며 결과는 기본 100행, 최대 500행으로 제한하고 각 셀도 잘라서 반환합니다. DB 계정에도 조회 권한만 부여하세요.
+쿼리 ID와 설명은 모델이 용도를 구분할 수 있게 작성하세요. SQL은 단일 `SELECT`/`WITH` 문으로 저장하고, 매개변수는 `:name` 형식으로 바인드합니다. 예를 들어 SQL이 `SELECT employee_id, first_name FROM employees WHERE department_id = :dept_id`라면 매개변수 `dept_id`와 설명을 추가합니다. 모델은 `db_query`의 `list`로 활성 쿼리를 확인하고 `run`에 쿼리 ID와 바인드 값만 전달합니다. `db_query`는 임의 SQL이나 활성화 변경을 받지 않습니다. Oracle 읽기 전용 트랜잭션을 사용하며 결과는 기본 100행, 최대 500행으로 제한하고 각 셀도 잘라서 반환합니다.
 
-로컬 Oracle 테스트는 설치된 `gvenzl/oracle-free` 컨테이너의 `FREEPDB1` 서비스에서 `MNEMOARC_TEST_DB_PASSWORD=password cargo test --test database`로 검증했습니다. 이 환경변수가 없으면 연결 테스트만 건너뜁니다.
+`db_execute`는 자유 실행 모드를 하나라도 수동으로 켰을 때만 모델에 보입니다. **자유 SELECT/WITH 조회**, **자유 변경 SQL 실행**, **프로시저 호출**, **함수 호출**은 각각 별도 스위치이며 기본값은 모두 `false`입니다. 모델이 스위치를 바꿀 수는 없습니다. 필요한 작업에 맞는 DB 권한을 계정에 부여하세요.
+
+| 모드 | 주요 인자 | 결과 |
+|---|---|---|
+| `query` | `sql`, 선택적 `params` 객체 | 열 이름, 행, 잘림 여부. 읽기 전용 트랜잭션 |
+| `statement` | `sql`, 선택적 `params` 객체 | 영향받은 행 수, 커밋 여부 |
+| `procedure` | `name`, 선택적 `args` 배열 | `out` 값과 커서, 암묵적 결과 집합, 커밋 여부 |
+| `function` | `name`, `return_type`, 선택적 `args` 배열 | `result`, `out` 값과 커서, 암묵적 결과 집합, 커밋 여부 |
+
+`params`에는 SQL의 `:name`에 해당하는 문자열·숫자·불리언·`null`을 넣습니다. 프로시저·함수의 `args`는 **선언된 인자 순서**대로 작성하고 각 항목에 `name`, `direction`(`in`/`out`/`inout`, 기본 `in`), `type`(`string`/`number`/`boolean`/`cursor`, 기본 `string`)을 넣습니다. `in`/`inout`에는 `value`가 필요하고 `out`에서는 생략합니다. 커서는 `out` 인자나 함수 반환값으로 사용할 수 있습니다. `name`은 스키마·패키지를 포함한 최대 3단계의 일반 Oracle 식별자를 받습니다. 숫자 출력은 정밀도 보존을 위해 문자열로 반환합니다.
+
+예를 들어 `{"mode":"procedure","name":"MY_PACKAGE.FIND_ITEMS","args":[{"name":"p_id","value":42,"type":"number"},{"name":"p_rows","direction":"out","type":"cursor"}]}`처럼 호출할 수 있습니다. `statement`·프로시저·함수는 성공하면 커밋하고 실패하면 롤백을 시도합니다. Oracle DDL은 [자체적으로 커밋](https://docs.oracle.com/en/database/oracle/oracle-database/19/tdddg/committing-transactions.html)할 수 있으며 프로시저·함수 내부의 커밋도 되돌릴 수 없습니다. 자유 실행 권한을 켤 때는 이 동작을 고려하세요. 결과 행과 셀의 크기는 저장 쿼리와 같이 제한합니다.
+
+로컬 Oracle 테스트는 설치된 `gvenzl/oracle-free` 컨테이너의 `FREEPDB1` 서비스에서 `MNEMOARC_TEST_DB_PASSWORD=password cargo test --test database --test database_free`로 실행할 수 있습니다. 이 환경변수가 없으면 연결 테스트만 건너뜁니다.
 
 ## 파일 조사와 검증
 
