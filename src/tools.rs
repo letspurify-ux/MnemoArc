@@ -770,7 +770,18 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
         }
         "patch" => {
             let target = text(args, "old_text")?;
-            if target.is_empty() || old.matches(target).count() != 1 {
+            // `str::matches` counts only non-overlapping occurrences. A target
+            // such as `aa` in `aaa` occurs at two valid starting positions, so
+            // treating it as unique would make a patch choose an arbitrary
+            // location and silently modify the wrong text.
+            let occurrences = if target.is_empty() {
+                0
+            } else {
+                old.char_indices()
+                    .filter(|(start, _)| old[*start..].starts_with(target))
+                    .count()
+            };
+            if occurrences != 1 {
                 bail!("patch_target_must_match_once");
             }
             Ok(old.replacen(target, new, 1))
