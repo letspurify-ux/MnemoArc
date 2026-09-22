@@ -8,12 +8,86 @@ pub(super) struct Heading {
     pub(super) level: usize,
 }
 
-/// ATX headings outside fenced code. Byte offsets preserve Unicode and CRLF.
+fn html_comment_state(line: &str, in_comment: bool) -> bool {
+    if !in_comment && !line.contains("<!--") {
+        return false;
+    }
+    let mut state = in_comment;
+    let _ = visible_without_html_comments(line, &mut state);
+    state
+}
+
+fn visible_without_html_comments(line: &str, in_comment: &mut bool) -> String {
+    if !*in_comment && !line.contains("<!--") {
+        return line.to_owned();
+    }
+    if *in_comment && !line.contains("-->") {
+        return String::new();
+    }
+    let bytes = line.as_bytes();
+    let mut runs = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'`' {
+            let start = index;
+            while index < bytes.len() && bytes[index] == b'`' {
+                index += 1;
+            }
+            runs.push((start, index));
+        } else {
+            index += 1;
+        }
+    }
+    let mut next_for_width = std::collections::HashMap::<usize, usize>::new();
+    let mut closing = vec![None; runs.len()];
+    for run_index in (0..runs.len()).rev() {
+        let width = runs[run_index].1 - runs[run_index].0;
+        closing[run_index] = next_for_width
+            .get(&width)
+            .map(|&next_index| runs[next_index].1);
+        next_for_width.insert(width, run_index);
+    }
+    let mut visible = String::new();
+    let mut offset = 0;
+    let mut run_index = 0;
+    while offset < line.len() {
+        if *in_comment {
+            let Some(end) = line[offset..].find("-->") else {
+                break;
+            };
+            offset += end + 3;
+            *in_comment = false;
+            visible.push(' ');
+        } else if line[offset..].starts_with("<!--") {
+            visible.push(' ');
+            offset += 4;
+            *in_comment = true;
+        } else {
+            while run_index < runs.len() && runs[run_index].0 < offset {
+                run_index += 1;
+            }
+            if run_index < runs.len() && runs[run_index].0 == offset {
+                let end = closing[run_index].unwrap_or(runs[run_index].1);
+                visible.push_str(&line[offset..end]);
+                offset = end;
+            } else {
+                let ch = line[offset..].chars().next().expect("valid UTF-8 boundary");
+                visible.push(ch);
+                offset += ch.len_utf8();
+            }
+        }
+    }
+    visible
+}
+
+/// ATX headings outside fenced code and HTML comments. Byte offsets preserve Unicode and CRLF.
 pub(super) fn headings(doc: &str) -> Vec<Heading> {
     let mut result: Vec<Heading> = Vec::new();
     let mut fence: Option<(char, usize)> = None;
+    let mut in_comment = false;
     let mut offset = 0;
     for (i, line) in doc.split_inclusive('\n').enumerate() {
+        let was_fenced = fence.is_some();
         let trimmed = line.trim_start_matches(' ');
         let indent = line.len() - trimmed.len();
         let first = trimmed.chars().next().unwrap_or(' ');
@@ -23,14 +97,15 @@ pub(super) fn headings(doc: &str) -> Vec<Heading> {
                 if first == ch && run >= size && trimmed[run..].trim().is_empty() {
                     fence = None;
                 }
-            } else if (first == '`' || first == '~') && run >= 3 {
+            } else if !in_comment && (first == '`' || first == '~') && run >= 3 {
                 fence = Some((first, run));
-            } else if first == '#'
+            } else if !in_comment
+                && first == '#'
                 && (1..=6).contains(&run)
                 && trimmed
                     .as_bytes()
                     .get(run)
-                    .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+                    .is_none_or(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
             {
                 for prior in result.iter_mut().rev() {
                     if prior.end == doc.len() && prior.level >= run {
@@ -45,6 +120,9 @@ pub(super) fn headings(doc: &str) -> Vec<Heading> {
                     level: run,
                 });
             }
+        }
+        if !was_fenced && fence.is_none() && (in_comment || indent < 4) {
+            in_comment = html_comment_state(line, in_comment);
         }
         offset += line.len();
     }
@@ -531,17 +609,19 @@ pub(super) fn citation_spans(doc: &str) -> Result<Vec<Citation>> {
     let continuation = regex::Regex::new(r"^\s*,\s*([0-9]+)(?:[-–]L?([0-9]+))?")?;
     let mut spans = vec![];
     let mut fence: Option<(char, usize, bool)> = None;
+    let mut in_comment = false;
     for (document_line, line) in doc.lines().enumerate() {
         let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
         let marker = trimmed.chars().next().unwrap_or(' ');
         let width = trimmed.chars().take_while(|c| *c == marker).count();
-        if line.len() - trimmed.len() <= 3 {
+        if indent <= 3 {
             if let Some((open, size, _)) = fence {
                 if marker == open && width >= size && trimmed[width..].trim().is_empty() {
                     fence = None;
                     continue;
                 }
-            } else if (marker == '`' || marker == '~') && width >= 3 {
+            } else if !in_comment && (marker == '`' || marker == '~') && width >= 3 {
                 fence = Some((
                     marker,
                     width,
@@ -553,8 +633,19 @@ pub(super) fn citation_spans(doc: &str) -> Result<Vec<Citation>> {
         if fence.is_some_and(|(_, _, mermaid)| !mermaid) {
             continue;
         }
-        for c in pattern.captures_iter(line) {
-            let before = &line[..c.get(0).unwrap().start()];
+        if fence.is_none() && indent >= 4 {
+            if in_comment {
+                let _ = visible_without_html_comments(line, &mut in_comment);
+            }
+            continue;
+        }
+        let visible = if fence.is_some() {
+            line.to_owned()
+        } else {
+            visible_without_html_comments(line, &mut in_comment)
+        };
+        for c in pattern.captures_iter(&visible) {
+            let before = &visible[..c.get(0).unwrap().start()];
             let prefix = before
                 .rsplit(|ch: char| ch.is_whitespace() || ['`', '(', '"'].contains(&ch))
                 .next()
@@ -576,7 +667,7 @@ pub(super) fn citation_spans(doc: &str) -> Result<Vec<Citation>> {
                 document_line: document_line + 1,
             });
             // Repeat the path internally for grouped citations such as a.js:3, 8-10.
-            let mut tail = &line[c.get(0).unwrap().end()..];
+            let mut tail = &visible[c.get(0).unwrap().end()..];
             while let Some(extra) = continuation.captures(tail) {
                 let begin = extra[1].parse().unwrap_or(0);
                 let end = extra

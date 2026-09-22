@@ -804,6 +804,99 @@ fn tab_separated_markdown_headings_can_be_inspected_and_edited() {
 }
 
 #[test]
+fn empty_atx_heading_remains_addressable_for_section_insertion() {
+    let (_dir, mut s) = setup();
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n##\nUntitled body.\n## Next\nLater.\n"}),
+    );
+    let outline = run(&mut s, "document_inspect", json!({}));
+    assert!(
+        outline["outline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|heading| heading["heading"] == "##"),
+        "{outline}"
+    );
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after","section":"##","expected_hash":created["hash"],"text":"## Inserted\nNew body."}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\n##\nUntitled body.\n## Inserted\nNew body.\n## Next\nLater.\n"
+    );
+}
+
+#[test]
+fn html_comment_headings_do_not_enter_the_editable_outline() {
+    let (_dir, mut s) = setup();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n<!--\n```md\n## Template\nDo not edit.\n-->\n## Real\nEditable.\n"}),
+    );
+    let outline = run(&mut s, "document_inspect", json!({}));
+    let headings = outline["outline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|heading| heading["heading"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(headings, ["# Guide", "## Real"]);
+    assert!(tools::execute(&mut s, "document_inspect", json!({"section":"## Template"})).is_err());
+}
+
+#[test]
+fn document_edit_ignores_citation_examples_inside_html_comments() {
+    let (_dir, mut s) = setup();
+    let result = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n<!-- Example citation: missing.rs:9999 -->\n<!--\n```md\nmissing.rs:9999\n-->\n## Real\nText.\n"}),
+    );
+    assert_eq!(result["citation_check"]["citations_checked"], 0, "{result}");
+    assert_eq!(result["citation_check"]["issue_count"], 0);
+}
+
+#[test]
+fn inline_code_comment_marker_does_not_hide_following_citation() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("source.rs"), "fn source() {}\n").unwrap();
+    let result = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n`<!--`\n## Real\nSee source.rs:1 <!-- missing.rs:9999 --> and source.rs:1.\n"}),
+    );
+    assert_eq!(result["citation_check"]["citations_checked"], 2, "{result}");
+    assert_eq!(result["citation_check"]["issue_count"], 0);
+    assert_eq!(
+        run(&mut s, "document_inspect", json!({"section":"## Real"}))["section"],
+        "## Real"
+    );
+}
+
+#[test]
+fn indented_code_comment_marker_does_not_hide_following_document_content() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("source.rs"), "fn source() {}\n").unwrap();
+    let result = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n    missing.rs:9999\n    <!--\n## Real\nSee source.rs:1.\n"}),
+    );
+    assert_eq!(result["citation_check"]["citations_checked"], 1, "{result}");
+    assert_eq!(result["citation_check"]["issue_count"], 0);
+    assert_eq!(
+        run(&mut s, "document_inspect", json!({"section":"## Real"}))["section"],
+        "## Real"
+    );
+}
+
+#[test]
 fn section_replacement_cannot_insert_peer_or_ancestor_headings() {
     for batch in [false, true] {
         let (_dir, mut s) = setup();
