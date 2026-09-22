@@ -386,11 +386,27 @@ impl Session {
         self.history
             .push(vec![json!({"role":"user","content":text})], true);
     }
+    /// Return the serialized size of session metadata that is retained outside
+    /// the memory and history stores. Runtime turns use the same bound to
+    /// avoid silently discarding observations or receipts.
+    pub fn ancillary_bytes(&self) -> usize {
+        serde_json::to_vec(&(
+            &self.sources,
+            &self.ledger,
+            &self.investigations,
+            &self.task,
+            &self.file_cursors,
+            &self.read_coverage,
+            &self.coverage_cursors,
+        ))
+        .map_or(usize::MAX, |v| v.len())
+    }
     pub fn check_limits(&self, c: &Config) -> Result<()> {
         c.validate()?;
         if self.memory.entries.len() > c.memory_count
             || self.memory.bytes() > c.memory_bytes
             || self.history.bytes() > c.history_bytes
+            || self.ancillary_bytes() > c.memory_bytes
         {
             bail!("New limits require cleanup first; current settings retained");
         }

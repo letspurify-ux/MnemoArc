@@ -1264,17 +1264,7 @@ pub async fn run_session_controlled(
             break;
         }
         // Bound ancillary session data too; never silently discard observations or receipts.
-        if serde_json::to_vec(&(
-            &s.sources,
-            &s.ledger,
-            &s.investigations,
-            &s.task,
-            &s.file_cursors,
-            &s.read_coverage,
-            &s.coverage_cursors,
-        ))
-        .map_or(true, |v| v.len() > s.config.memory_bytes)
-        {
+        if s.ancillary_bytes() > s.config.memory_bytes {
             failure = Some(
                 "session_metadata_capacity: start another session or reduce retained details"
                     .into(),
