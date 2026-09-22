@@ -226,13 +226,29 @@ button:hover {
   display: flex;
   align-items: flex-start;
   gap: 11px;
+  flex: 1;
+  min-width: 0;
   width: 100%;
   padding: 12px;
   border-radius: 8px;
   text-align: left;
   font-size: 12px;
-  margin-bottom: 3px;
+  margin-bottom: 0;
   line-height: 1.6;
+}
+.session-row {
+  display: flex;
+  align-items: stretch;
+  width: 100%;
+  margin-bottom: 3px;
+  border-radius: 8px;
+}
+.session-row:hover {
+  background: #e7eee4;
+}
+.session-row.active {
+  background: #e1eae1;
+  color: #285c50;
 }
 .session-button > i {
   width: 5px;
@@ -253,15 +269,29 @@ button:hover {
   margin-top: 3px;
 }
 .session-button.active {
-  background: #e1eae1;
+  background: transparent;
   color: #285c50;
 }
-.session-button.active > i {
+.session-row.active .session-button > i {
   background: #518571;
   border-color: #518571;
 }
 .session-button:hover {
-  background: #e7eee4;
+  background: transparent;
+}
+.session-close {
+  flex: 0 0 30px;
+  align-self: stretch;
+  border-radius: 0 8px 8px 0;
+  color: #809083;
+  font-size: 17px;
+  line-height: 1;
+  opacity: 0.52;
+}
+.session-close:hover,
+.session-close:focus-visible {
+  color: #a16d65;
+  opacity: 1;
 }
 .sidebar-bottom {
   padding-top: 18px;
@@ -372,7 +402,7 @@ button:hover {
   flex: 1;
 }
 .workarea.with-details {
-  grid-template-columns: minmax(0, 1fr) 295px;
+  grid-template-columns: minmax(0, 1fr) var(--inspector-width, 295px);
 }
 .chat-column {
   display: flex;
@@ -596,11 +626,44 @@ button:hover {
   text-decoration: underline;
 }
 .inspector {
+  position: relative;
   border-left: 1px solid #e6ebe2;
   background: #fff;
+  width: var(--inspector-width, 295px);
+  min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
+}
+.inspector-resizer {
+  position: absolute;
+  z-index: 3;
+  top: 0;
+  bottom: 0;
+  left: -7px;
+  width: 14px;
+  display: grid;
+  place-items: center;
+  cursor: col-resize;
+  touch-action: none;
+}
+.inspector-resizer > span {
+  width: 3px;
+  height: 34px;
+  border-radius: 3px;
+  background: #d5dfd5;
+  opacity: 0.55;
+  transition: opacity 120ms ease, background 120ms ease;
+}
+.inspector-resizer:hover > span,
+.inspector-resizer:focus-visible > span,
+.inspector-resizer.dragging > span {
+  background: #6d9a82;
+  opacity: 1;
+}
+.inspector-resizer:focus-visible {
+  outline: 3px solid #8fbbb0;
+  outline-offset: -2px;
 }
 .inspector-tabs {
   display: flex;
@@ -1222,7 +1285,7 @@ button:hover {
 }
 @media (min-width: 1600px) {
   .workarea.with-details {
-    grid-template-columns: minmax(0, 1fr) 330px;
+    grid-template-columns: minmax(0, 1fr) var(--inspector-width, 330px);
   }
   .chat-scroll {
     padding: 0 50px;
@@ -1238,7 +1301,7 @@ button:hover {
     padding: 26px 12px 15px;
   }
   .workarea.with-details {
-    grid-template-columns: minmax(0, 1fr) 260px;
+    grid-template-columns: minmax(0, 1fr) var(--inspector-width, 260px);
   }
   .session-heading {
     padding: 20px;
@@ -1278,7 +1341,7 @@ button:hover {
     right: 0;
     top: 63px;
     bottom: 0;
-    width: 310px;
+    width: min(var(--inspector-width, 295px), calc(100vw - 24px));
     z-index: 10;
     box-shadow: -8px 0 35px #28412613;
   }
@@ -1389,7 +1452,7 @@ button:hover {
     width: 100%;
   }
   .inspector {
-    width: min(310px, 90vw);
+    width: min(var(--inspector-width, 295px), 90vw);
   }
   .running-link {
     font-size: 9px;

@@ -4,6 +4,29 @@ import Settings, { ProjectForm, cleanProject } from "./Settings.jsx";
 import { Message } from "./chat/Message.jsx";
 import { api, send, statusLabel, toolLabels } from "./api.js";
 
+const DEFAULT_INSPECTOR_WIDTH = 295;
+const MIN_INSPECTOR_WIDTH = 240;
+const MAX_INSPECTOR_WIDTH = 560;
+const INSPECTOR_WIDTH_KEY = "mnemoarc.inspector-width";
+
+function clampInspectorWidth(value) {
+  return Math.min(
+    MAX_INSPECTOR_WIDTH,
+    Math.max(
+      MIN_INSPECTOR_WIDTH,
+      Math.round(Number(value) || DEFAULT_INSPECTOR_WIDTH),
+    ),
+  );
+}
+
+function loadInspectorWidth() {
+  try {
+    return clampInspectorWidth(window.localStorage.getItem(INSPECTOR_WIDTH_KEY));
+  } catch {
+    return DEFAULT_INSPECTOR_WIDTH;
+  }
+}
+
 export default function App() {
   const [state, setState] = useState(null),
     [session, setSession] = useState(null),
@@ -15,7 +38,8 @@ export default function App() {
     [mobileNav, setMobileNav] = useState(false),
     [navigating, setNavigating] = useState(false),
     [stopped, setStopped] = useState(false),
-    [stopping, setStopping] = useState(false);
+    [stopping, setStopping] = useState(false),
+    [inspectorWidth, setInspectorWidth] = useState(loadInspectorWidth);
   const selection = useRef(window.location.hash.slice(1)),
     fetching = useRef(false),
     pending = useRef(false),
@@ -103,6 +127,14 @@ export default function App() {
       clearTimeout(timer.current);
     };
   }, [refresh, stopped]);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(INSPECTOR_WIDTH_KEY, String(inspectorWidth));
+    } catch {
+      // A private browsing context or disabled storage should not prevent
+      // resizing the panel for the current page.
+    }
+  }, [inspectorWidth]);
   function choose(id) {
     selection.current = id;
     window.history.replaceState(null, "", `#${id}`);
@@ -134,6 +166,15 @@ export default function App() {
     } finally {
       setNavigating(false);
     }
+  }
+  async function closeSession(id) {
+    if (
+      !window.confirm(
+        "이 세션을 닫을까요? 대화와 기억은 사라지고 결과 문서는 유지됩니다.",
+      )
+    )
+      return;
+    await send(`/sessions/${id}`, undefined, "DELETE");
   }
   async function shutdown() {
     if (
@@ -218,6 +259,8 @@ export default function App() {
                     session={s}
                     active={s.id === selected && page === "chat"}
                     onClick={() => choose(s.id)}
+                    onClose={safe(() => closeSession(s.id))}
+                    closing={state.running?.id === s.id && state.running.closing}
                   />
                 ))}
             </div>
@@ -233,6 +276,8 @@ export default function App() {
                 session={s}
                 active={s.id === selected}
                 onClick={() => choose(s.id)}
+                onClose={safe(() => closeSession(s.id))}
+                closing={state.running?.id === s.id && state.running.closing}
               />
             ))}
         </div>
@@ -342,7 +387,14 @@ export default function App() {
             onCreate={(project) => act(() => create(project))}
           />
         ) : session && !navigating ? (
-          <div className={`workarea ${detail ? "with-details" : ""}`}>
+          <div
+            className={`workarea ${detail ? "with-details" : ""}`}
+            style={
+              detail
+                ? { "--inspector-width": `${inspectorWidth}px` }
+                : undefined
+            }
+          >
             <div className="chat-column">
               <div className="session-heading">
                 <div>
@@ -370,20 +422,12 @@ export default function App() {
                   </button>
                   <button
                     className="danger-text"
-                    onClick={safe(async () => {
-                      if (
-                        confirm(
-                          "이 세션의 대화와 기억을 지울까요? 결과 문서는 남습니다.",
-                        )
-                      )
-                        await send(
-                          `/sessions/${selected}`,
-                          undefined,
-                          "DELETE",
-                        );
-                    })}
+                    disabled={
+                      state.running?.id === selected && state.running.closing
+                    }
+                    onClick={safe(() => closeSession(selected))}
                   >
-                    세션 종료
+                    세션 닫기
                   </button>
                 </div>
               </div>
@@ -431,6 +475,10 @@ export default function App() {
                 tools={state.tools}
                 running={state.running}
                 onAction={act}
+                width={inspectorWidth}
+                onWidthChange={(next) =>
+                  setInspectorWidth(clampInspectorWidth(next))
+                }
               />
             )}
           </div>
@@ -450,21 +498,37 @@ export default function App() {
     </div>
   );
 }
-function SessionButton({ session, active, onClick }) {
+function SessionButton({ session, active, onClick, onClose, closing }) {
+  const title = session.title || "새 대화";
   return (
-    <button
-      className={`session-button ${active ? "active" : ""}`}
-      onClick={onClick}
-    >
-      <i className={session.status === "running" ? "pulse" : ""} />
-      <span>
-        {session.title || "새 대화"}
-        <small>
-          {session.memory_count}개 기억 ·{" "}
-          {statusLabel[session.status] || session.status}
-        </small>
-      </span>
-    </button>
+    <div className={`session-row ${active ? "active" : ""}`}>
+      <button
+        className="session-button"
+        onClick={onClick}
+        title={title}
+      >
+        <i className={session.status === "running" ? "pulse" : ""} />
+        <span>
+          {title}
+          <small>
+            {session.memory_count}개 기억 ·{" "}
+            {statusLabel[session.status] || session.status}
+          </small>
+        </span>
+      </button>
+      <button
+        className="session-close"
+        aria-label="세션 닫기"
+        title="세션 닫기"
+        disabled={closing}
+        onClick={(event) => {
+          event.stopPropagation();
+          onClose();
+        }}
+      >
+        ×
+      </button>
+    </div>
   );
 }
 function Projects({ config, onSaved, onCreate }) {
@@ -602,7 +666,88 @@ function Projects({ config, onSaved, onCreate }) {
     </section>
   );
 }
-function Inspector({ session, tools, running, onAction }) {
+function InspectorResizeHandle({ width, onWidthChange }) {
+  const drag = useRef(null);
+  const [dragging, setDragging] = useState(false);
+
+  useEffect(() => {
+    if (!dragging) return;
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.classList.add("inspector-resizing");
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    return () => {
+      document.body.classList.remove("inspector-resizing");
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+    };
+  }, [dragging]);
+
+  function finish(event) {
+    if (event?.currentTarget?.hasPointerCapture?.(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    drag.current = null;
+    setDragging(false);
+  }
+
+  return (
+    <div
+      className={`inspector-resizer ${dragging ? "dragging" : ""}`}
+      role="separator"
+      aria-label="오른쪽 패널 너비 조절"
+      aria-orientation="vertical"
+      aria-valuemin={MIN_INSPECTOR_WIDTH}
+      aria-valuemax={MAX_INSPECTOR_WIDTH}
+      aria-valuenow={Math.round(width)}
+      aria-valuetext={`${Math.round(width)}픽셀`}
+      tabIndex={0}
+      title="드래그하여 패널 너비 조절 · 더블클릭하면 기본 너비로 복원"
+      onPointerDown={(event) => {
+        if (event.button !== 0) return;
+        event.preventDefault();
+        drag.current = { x: event.clientX, width };
+        event.currentTarget.setPointerCapture?.(event.pointerId);
+        setDragging(true);
+      }}
+      onPointerMove={(event) => {
+        if (!drag.current) return;
+        onWidthChange(drag.current.width + drag.current.x - event.clientX);
+      }}
+      onPointerUp={finish}
+      onPointerCancel={finish}
+      onDoubleClick={() => onWidthChange(DEFAULT_INSPECTOR_WIDTH)}
+      onKeyDown={(event) => {
+        const step = event.shiftKey ? 40 : 16;
+        if (event.key === "ArrowLeft") {
+          event.preventDefault();
+          onWidthChange(width + step);
+        } else if (event.key === "ArrowRight") {
+          event.preventDefault();
+          onWidthChange(width - step);
+        } else if (event.key === "Home") {
+          event.preventDefault();
+          onWidthChange(MIN_INSPECTOR_WIDTH);
+        } else if (event.key === "End") {
+          event.preventDefault();
+          onWidthChange(MAX_INSPECTOR_WIDTH);
+        }
+      }}
+    >
+      <span aria-hidden="true" />
+    </div>
+  );
+}
+
+function Inspector({
+  session,
+  tools,
+  running,
+  onAction,
+  width,
+  onWidthChange,
+}) {
   const [toolSelection, setToolSelection] = useState(session.active_tools);
   const [toolsSaving, setToolsSaving] = useState(false);
   const activeToolsKey = JSON.stringify(session.active_tools);
@@ -622,6 +767,7 @@ function Inspector({ session, tools, running, onAction }) {
   );
   return (
     <aside className="inspector">
+      <InspectorResizeHandle width={width} onWidthChange={onWidthChange} />
       <div className="inspector-tabs" role="tablist">
         {[
           ["memory", "기억"],
