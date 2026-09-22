@@ -72,6 +72,8 @@ pub fn describe(message: &str) -> Value {
         (Class::InvalidInput, "choose_allowed_path")
     } else if code == "document_hash_required" {
         (Class::InvalidInput, "copy_document_hash")
+    } else if code == "document_audit_revision_required" {
+        (Class::InvalidInput, "correct_arguments")
     } else if code == "document_revision_conflict" {
         (Class::StaleState, "restart_document_inspection")
     } else if code == "document_batch_operation_failed" {
@@ -224,7 +226,17 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "repair_document_citation" => &["document_inspect", "document_edit", "document_edit_batch"],
         "copy_observed_symbol_id" => &["code_outline", "symbol_read"],
         "check_file_permissions" => &["file_list", "file_read", "document_inspect"],
+        "inspect_timeout_before_retry" => &[
+            "history",
+            "document_inspect",
+            "file_read",
+            "source_search",
+            "code_outline",
+        ],
         "inspect_outcome_before_retry" => &["history", "document_inspect", "file_read"],
+        "use_available_tools" if result["recovery"]["code"] == "unsupported_language" => {
+            &["source_search", "file_read", "tool_catalog", "tool_select"]
+        }
         "correct_arguments" if call.name == "document_inspect" => {
             &["document_inspect", "file_read"]
         }
@@ -247,6 +259,22 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "refresh_matching_state" if call.name == "document_audit" => {
             &["document_audit", "document_inspect"]
         }
+        "refresh_matching_state"
+            if matches!(
+                result["recovery"]["code"].as_str(),
+                Some("memory_not_found" | "memory_changed")
+            ) =>
+        {
+            &[
+                "memory_find",
+                "memory_read",
+                "memory_manage",
+                "investigation",
+                "task_state",
+                "source_lookup",
+                "history",
+            ]
+        }
         "refresh_matching_state" if call.name == "source_search" => &["source_search", "file_read"],
         "refresh_matching_state" if call.name == "file_list" => &["file_list"],
         "refresh_matching_state" if call.name == "symbol_search" => &["symbol_search", "file_read"],
@@ -260,7 +288,8 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             "checkpoint_complete",
         ],
         "use_available_tools" => &["tool_catalog", "tool_select", "checkpoint_complete"],
-        _ => &[],
+        "stop" => &[],
+        _ => &["history"],
     };
     let definitions = ToolRegistry::definitions(s);
     let available: Vec<_> = candidates
