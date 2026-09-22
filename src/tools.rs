@@ -347,6 +347,20 @@ impl ToolRegistry {
             &[]
         }
     }
+    pub fn validate_tool_selection(s: &Session, names: &BTreeSet<String>) -> Result<()> {
+        let missing: Vec<_> = Self::workflow_required_tools(s)
+            .iter()
+            .filter(|name| !names.contains(**name))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            bail!(
+                "workflow_locked: required workflow tools cannot be removed; keep {} in the tool_select set",
+                missing.join(", ")
+            );
+        }
+        Ok(())
+    }
     pub fn definitions(s: &Session) -> Vec<Value> {
         Self::specs().into_iter()
             .filter(|t| !t.optional || s.active_tools.contains(t.name))
@@ -1539,17 +1553,7 @@ pub fn execute_cancellable(
                 "replace" => pending = chosen,
                 _ => unreachable!(),
             };
-            let missing: Vec<_> = ToolRegistry::workflow_required_tools(s)
-                .iter()
-                .filter(|name| !pending.contains(**name))
-                .copied()
-                .collect();
-            if !missing.is_empty() {
-                bail!(
-                    "workflow_locked: required workflow tools cannot be removed; keep {} in the tool_select set",
-                    missing.join(", ")
-                );
-            }
+            ToolRegistry::validate_tool_selection(s, &pending)?;
             s.pending_tools = Some(pending.clone());
             Ok(json!({"pending":pending,"applies":"next_request"}))
         }

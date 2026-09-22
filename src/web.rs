@@ -558,6 +558,8 @@ async fn session_tools(
     if !c.sessions.contains_key(&id) {
         return Err(missing());
     }
+    let session = c.sessions.get(&id).ok_or_else(missing)?;
+    ToolRegistry::validate_tool_selection(session, &input.names)?;
     if let Some(r) = &c.running
         && r.id == id
     {
