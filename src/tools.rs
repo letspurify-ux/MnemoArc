@@ -210,7 +210,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_inspect",
-                description: "Inspect a document using path (relative to project.root); omit path for project.output. Uses file_read path restrictions. Returns session delivery coverage for the current hash, not proof of understanding or current context retention. coverage_offset pages missing line ranges; copy coverage.revision as expected_coverage_revision on continuation to detect intervening reads. With no section, offset is an OUTLINE HEADING INDEX, not a document line number; copy next_offset from the prior outline page. With section, offset is a CHARACTER INDEX inside that section; copy content.next_offset or the returned next_cursor arguments. For a document line number use file_read with start_line. section accepts a full Markdown heading or a unique title without #; duplicate titles require disambiguation. For any offset or coverage_offset > 0, copy expected_hash from the first result's hash; if unavailable, restart at offset 0 with coverage_offset 0.",
+                description: "Inspect a document using path (relative to project.root); omit path for project.output. Uses file_read path restrictions. Returns session delivery coverage for the current hash, not proof of understanding or current context retention. coverage_offset pages missing line ranges; copy coverage.revision as expected_coverage_revision on continuation to detect intervening reads. With no section, offset is an OUTLINE HEADING INDEX, not a document line number; copy next_offset from the prior outline page. Outline entries provide level and section_path (newline-separated ancestor headings); copy section_path into section for nested or repeated headings. With section, offset is a CHARACTER INDEX inside that section; copy content.next_offset or the returned next_cursor arguments. For a document line number use file_read with start_line. section also accepts a full Markdown heading or a unique title without #; ambiguous headings are rejected. For any offset or coverage_offset > 0, copy expected_hash from the first result's hash; if unavailable, restart at offset 0 with coverage_offset 0.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -270,27 +270,27 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit",
-                description: "Edit ONLY configured Markdown output: create, replace entire file, append, or unique exact text patch. Existing file requires expected_hash. Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section accepts a full heading or a unique title without # and also requires expected_section_hash. Replacement text must retain the original full Markdown heading including #. Simple edits do not require investigation items; source documentation must first set task_state patch.require_investigation=true. Returns measured lines and new hash",
+                description: "Edit ONLY configured Markdown output. Save one investigated section at a time. Inspect the outline and copy section_path when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree, and insertion keeps the anchor and inserts text verbatim. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash. Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and also requires expected_section_hash; its text must retain the original full heading. Simple edits do not require investigation items; source documentation must first set task_state patch.require_investigation=true. Returns measured lines and new hash",
                 optional: true,
                 read_only: false,
                 parameters: schema(
-                    json!({"action":action(&["create","write","append","patch","section"]),"text":string(),"old_text":string(),"expected_hash":string(),"section":string(),"expected_section_hash":string()}),
-                    &["action", "text"],
+                    json!({"action":action(&["create","write","append","insert_before","insert_after","insert_first_child","insert_last_child","patch","replace_text","delete_text","insert_before_text","insert_after_text","section"]),"text":string(),"old_text":string(),"expected_hash":string(),"section":string(),"expected_section_hash":string()}),
+                    &["action"],
                 ),
             },
             ToolSpec {
                 name: "document_edit_batch",
-                description: "Apply 1..32 related edits to the existing configured Markdown output in order using one base expected_hash. Each edit is write, append, patch or section and observes the document produced by prior edits. All edits are prepared in memory and persisted only if every operation succeeds; a failed operation leaves the file unchanged. Use this for multiple edits from one document snapshot and retry only after inspecting the reported operation index. section operations require their own expected_section_hash.",
+                description: "Apply 1..32 related edits to the existing configured Markdown output in order using one base expected_hash. Each edit is write, append, insert_before, insert_after, insert_first_child, insert_last_child, patch, replace_text, delete_text, insert_before_text, insert_after_text or section and observes prior edits. Copy section_path from document_inspect for repeated headings. Sibling insertion uses a same-level section anchor; child insertion uses a parent section and a heading one level deeper. Text edits use an exact unique old_text anchor, optionally within section. All edits are prepared in memory and persisted only if every operation succeeds. Use this for related corrections from one snapshot; save newly investigated sections as progress is made. section replaces descendants and requires expected_section_hash.",
                 optional: true,
                 read_only: false,
                 parameters: schema(
-                    json!({"expected_hash":string(),"edits":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"action":action(&["write","append","patch","section"]),"text":string(),"old_text":string(),"section":string(),"expected_section_hash":string()},"required":["action","text"],"additionalProperties":false}}}),
+                    json!({"expected_hash":string(),"edits":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"action":action(&["write","append","insert_before","insert_after","insert_first_child","insert_last_child","patch","replace_text","delete_text","insert_before_text","insert_after_text","section"]),"text":string(),"old_text":string(),"section":string(),"expected_section_hash":string()},"required":["action"],"additionalProperties":false}}}),
                     &["expected_hash", "edits"],
                 ),
             },
             ToolSpec {
                 name: "investigation",
-                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. Both verify and verify_batch require existing written items. If not written, write the section and upsert with status=written and section first; source IDs alone do not mark an item written. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified; summary groups failures by code and retry_ids identifies only failed items. Already verified items in verify_batch reuse their existing evidence after section/source/memory freshness checks; new supplied evidence is ignored for those items. Use single verify to explicitly replace evidence. After edits, verify only verification_required_ids returned by document_edit. Coverage failures return all missing_ranges together. Verification coverage counts only complete file lines; partial file_read boundaries, truncated search lines and code outlines are navigation context and require a full file_read. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. status=written requires a non-empty section (supplied now or preserved from the existing item). For written items, upsert checks the current document and normalizes section to its full heading; a unique title without # is accepted, including numbering. Planned sections may be registered before writing with status=in_progress",
+                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. Both verify and verify_batch require existing written items. If not written, write the section and upsert with status=written and section first; source IDs alone do not mark an item written. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified; summary groups failures by code and retry_ids identifies only failed items. Already verified items in verify_batch reuse their existing evidence after section/source/memory freshness checks; new supplied evidence is ignored for those items. Use single verify to explicitly replace evidence. After edits, verify only verification_required_ids returned by document_edit. Coverage failures return all missing_ranges together. Verification coverage counts only complete file lines; partial file_read boundaries, truncated search lines and code outlines are navigation context and require a full file_read. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. status=written requires a non-empty section (supplied now or preserved from the existing item). For written items, upsert checks the current document and normalizes section to its section_path from document_inspect, including ancestors for nested headings. A unique title without # is accepted, including numbering. Planned sections may be registered before writing with status=in_progress",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -407,10 +407,12 @@ impl ToolRegistry {
                 }
                 if t.name == "document_edit" {
                     t.parameters["oneOf"] = json!([
-                        {"type":"object","properties":{"action":{"enum":["create","write"]},"text":fields["text"],"expected_hash":fields["expected_hash"]},"additionalProperties":false},
-                        {"type":"object","properties":{"action":{"const":"append"},"text":fields["text"],"expected_hash":fields["expected_hash"]},"required":["expected_hash"],"additionalProperties":false},
-                        {"type":"object","properties":{"action":{"const":"patch"},"text":fields["text"],"expected_hash":fields["expected_hash"],"old_text":fields["old_text"]},"required":["expected_hash","old_text"],"additionalProperties":false},
-                        {"type":"object","properties":{"action":{"const":"section"},"text":fields["text"],"expected_hash":fields["expected_hash"],"section":fields["section"],"expected_section_hash":fields["expected_section_hash"]},"required":["expected_hash","section","expected_section_hash"],"additionalProperties":false}
+                        {"type":"object","properties":{"action":{"enum":["create","write"]},"text":fields["text"],"expected_hash":fields["expected_hash"]},"required":["text"],"additionalProperties":false},
+                        {"type":"object","properties":{"action":{"const":"append"},"text":fields["text"],"expected_hash":fields["expected_hash"]},"required":["text","expected_hash"],"additionalProperties":false},
+                        {"type":"object","properties":{"action":{"enum":["insert_before","insert_after","insert_first_child","insert_last_child"]},"text":fields["text"],"expected_hash":fields["expected_hash"],"section":fields["section"]},"required":["text","expected_hash","section"],"additionalProperties":false},
+                        {"type":"object","properties":{"action":{"enum":["patch","replace_text","insert_before_text","insert_after_text"]},"text":fields["text"],"expected_hash":fields["expected_hash"],"old_text":fields["old_text"],"section":fields["section"]},"required":["text","expected_hash","old_text"],"additionalProperties":false},
+                        {"type":"object","properties":{"action":{"const":"delete_text"},"expected_hash":fields["expected_hash"],"old_text":fields["old_text"],"section":fields["section"]},"required":["expected_hash","old_text"],"additionalProperties":false},
+                        {"type":"object","properties":{"action":{"const":"section"},"text":fields["text"],"expected_hash":fields["expected_hash"],"section":fields["section"],"expected_section_hash":fields["expected_section_hash"]},"required":["text","expected_hash","section","expected_section_hash"],"additionalProperties":false}
                     ]);
                 }
                 if t.name == "document_edit_batch" {
@@ -419,7 +421,9 @@ impl ToolRegistry {
                         "oneOf":[
                             {"type":"object","properties":{"action":{"const":"write"},"text":item_fields["text"]},"required":["action","text"],"additionalProperties":false},
                             {"type":"object","properties":{"action":{"const":"append"},"text":item_fields["text"]},"required":["action","text"],"additionalProperties":false},
-                            {"type":"object","properties":{"action":{"const":"patch"},"text":item_fields["text"],"old_text":item_fields["old_text"]},"required":["action","text","old_text"],"additionalProperties":false},
+                            {"type":"object","properties":{"action":{"enum":["insert_before","insert_after","insert_first_child","insert_last_child"]},"text":item_fields["text"],"section":item_fields["section"]},"required":["action","text","section"],"additionalProperties":false},
+                            {"type":"object","properties":{"action":{"enum":["patch","replace_text","insert_before_text","insert_after_text"]},"text":item_fields["text"],"old_text":item_fields["old_text"],"section":item_fields["section"]},"required":["action","text","old_text"],"additionalProperties":false},
+                            {"type":"object","properties":{"action":{"const":"delete_text"},"old_text":item_fields["old_text"],"section":item_fields["section"]},"required":["action","old_text"],"additionalProperties":false},
                             {"type":"object","properties":{"action":{"const":"section"},"text":item_fields["text"],"section":item_fields["section"],"expected_section_hash":item_fields["expected_section_hash"]},"required":["action","text","section","expected_section_hash"],"additionalProperties":false}
                         ]
                     });
@@ -596,7 +600,13 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
         args,
         match action {
             "create" | "write" | "append" => &["action", "text", "expected_hash"][..],
-            "patch" => &["action", "text", "expected_hash", "old_text"][..],
+            "patch" | "replace_text" | "insert_before_text" | "insert_after_text" => {
+                &["action", "text", "expected_hash", "old_text", "section"][..]
+            }
+            "delete_text" => &["action", "expected_hash", "old_text", "section"][..],
+            "insert_before" | "insert_after" | "insert_first_child" | "insert_last_child" => {
+                &["action", "text", "expected_hash", "section"][..]
+            }
             "section" => &[
                 "action",
                 "text",
@@ -626,16 +636,33 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
         }
         Ok(())
     };
+    if action != "delete_text" && args.get("text").is_none() {
+        bail!("missing_argument: text for document_edit action={action}");
+    }
     match action {
         "append" => require("expected_hash")?,
-        "patch" => {
+        "patch" | "replace_text" | "insert_before_text" | "insert_after_text" | "delete_text" => {
             require("expected_hash")?;
             require("old_text")?;
+            if args.get("section").is_some() {
+                require("section")?;
+            }
+            if matches!(action, "insert_before_text" | "insert_after_text") {
+                if args["text"].as_str().is_some_and(str::is_empty) {
+                    bail!(
+                        "invalid_argument_value: text must not be empty for document_edit action={action}"
+                    );
+                }
+            }
         }
         "section" => {
             require("expected_hash")?;
             require("section")?;
             require("expected_section_hash")?;
+        }
+        "insert_before" | "insert_after" | "insert_first_child" | "insert_last_child" => {
+            require("expected_hash")?;
+            require("section")?;
         }
         "create" | "write" => {}
         _ => {}
@@ -660,9 +687,7 @@ fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
     }
     for (index, edit) in edits.iter().enumerate() {
         let object = edit.as_object().ok_or_else(|| {
-            anyhow::anyhow!(
-                "invalid_argument_type: edits[{index}] must be an object with action and text"
-            )
+            anyhow::anyhow!("invalid_argument_type: edits[{index}] must be an object with action")
         })?;
         for key in object.keys() {
             if ![
@@ -683,19 +708,35 @@ fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
         let action = action_value
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("invalid_argument_type: edits[{index}].action"))?;
-        if !["write", "append", "patch", "section"].contains(&action) {
-            bail!(
-                "invalid_argument_value: edits[{index}].action must be write, append, patch or section"
-            );
+        if ![
+            "write",
+            "append",
+            "insert_before",
+            "insert_after",
+            "insert_first_child",
+            "insert_last_child",
+            "patch",
+            "replace_text",
+            "delete_text",
+            "insert_before_text",
+            "insert_after_text",
+            "section",
+        ]
+        .contains(&action)
+        {
+            bail!("invalid_argument_value: edits[{index}].action is not a supported document edit");
         }
-        let text_value = object
-            .get("text")
-            .ok_or_else(|| anyhow::anyhow!("missing_argument: edits[{index}].text"))?;
-        text_value
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("invalid_argument_type: edits[{index}].text"))?;
+        if action != "delete_text" {
+            let text_value = object
+                .get("text")
+                .ok_or_else(|| anyhow::anyhow!("missing_argument: edits[{index}].text"))?;
+            text_value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("invalid_argument_type: edits[{index}].text"))?;
+        }
         match action {
-            "patch" => {
+            "patch" | "replace_text" | "delete_text" | "insert_before_text"
+            | "insert_after_text" => {
                 let old_text_value = object
                     .get("old_text")
                     .ok_or_else(|| anyhow::anyhow!("missing_argument: edits[{index}].old_text"))?;
@@ -705,12 +746,27 @@ fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
                 if old_text.is_empty() {
                     bail!("invalid_argument_value: edits[{index}].old_text must not be empty");
                 }
-                for key in ["section", "expected_section_hash"] {
+                if matches!(action, "insert_before_text" | "insert_after_text")
+                    && object["text"].as_str().is_some_and(str::is_empty)
+                {
+                    bail!("invalid_argument_value: edits[{index}].text must not be empty");
+                }
+                if let Some(section) = object.get("section") {
+                    if section.as_str().is_none_or(|value| value.trim().is_empty()) {
+                        bail!("invalid_argument_value: edits[{index}].section must not be empty");
+                    }
+                }
+                for key in ["expected_section_hash"] {
                     if object.contains_key(key) {
                         bail!(
                             "unknown_argument: edits[{index}].{key} is not valid for action=patch"
                         );
                     }
+                }
+                if action == "delete_text" && object.contains_key("text") {
+                    bail!(
+                        "unknown_argument: edits[{index}].text is not valid for action=delete_text"
+                    );
                 }
             }
             "section" => {
@@ -740,6 +796,22 @@ fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
                     );
                 }
             }
+            "insert_before" | "insert_after" | "insert_first_child" | "insert_last_child" => {
+                let section = object
+                    .get("section")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing_argument: edits[{index}].section"))?;
+                if section.trim().is_empty() {
+                    bail!("invalid_argument_value: edits[{index}].section must not be empty");
+                }
+                for key in ["old_text", "expected_section_hash"] {
+                    if object.contains_key(key) {
+                        bail!(
+                            "unknown_argument: edits[{index}].{key} is not valid for action={action}"
+                        );
+                    }
+                }
+            }
             "write" | "append" => {
                 for key in ["old_text", "section", "expected_section_hash"] {
                     if object.contains_key(key) {
@@ -755,12 +827,81 @@ fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
     Ok(())
 }
 
+fn unique_document_text_span(old: &str, target: &str) -> Result<(usize, usize)> {
+    if target.is_empty() {
+        bail!("patch_target_must_match_once");
+    }
+    let Some(first) = old.find(target) else {
+        bail!("patch_target_must_match_once");
+    };
+    // Start one Unicode character after the first match so overlapping
+    // occurrences such as `aa` in `aaa` are treated as ambiguous.
+    let next_start = first + old[first..].chars().next().unwrap().len_utf8();
+    if old[next_start..].contains(target) {
+        bail!("patch_target_must_match_once");
+    }
+    Ok((first, first + target.len()))
+}
+
 fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
     let action = text(args, "action")?;
-    let new = text(args, "text")?;
+    let new = if action == "delete_text" {
+        ""
+    } else {
+        text(args, "text")?
+    };
     match action {
         "create" | "write" => Ok(new.to_string()),
         "append" => Ok(format!("{old}{new}")),
+        "insert_before" | "insert_after" | "insert_first_child" | "insert_last_child" => {
+            let anchor = documentation::resolve_heading(old, text(args, "section")?)?;
+            let new_headings = documentation::headings(new);
+            let child = matches!(action, "insert_first_child" | "insert_last_child");
+            if child && anchor.level == 6 {
+                bail!(
+                    "invalid_argument_value: a level-6 heading cannot have a Markdown heading child"
+                );
+            }
+            let required_level = anchor.level + usize::from(child);
+            if new_headings
+                .first()
+                .is_none_or(|heading| heading.start != 0 || heading.level != required_level)
+                || new_headings
+                    .iter()
+                    .skip(1)
+                    .any(|heading| heading.level <= required_level)
+            {
+                bail!(
+                    "invalid_argument_value: {action} text must contain one section starting with a level-{required_level} heading"
+                );
+            }
+            let position = match action {
+                "insert_before" => anchor.start,
+                "insert_first_child" => documentation::headings(old)
+                    .into_iter()
+                    .find(|heading| {
+                        heading.start > anchor.start
+                            && heading.start < anchor.end
+                            && heading.level == required_level
+                    })
+                    .map_or(anchor.end, |heading| heading.start),
+                _ => anchor.end,
+            };
+            let delimiter = if old.contains("\r\n") { "\r\n" } else { "\n" };
+            let mut prefix = old[..position].to_string();
+            if !prefix.is_empty() && !prefix.ends_with('\n') {
+                prefix.push_str(delimiter);
+            }
+            let inserted_start = prefix.len();
+            let mut inserted = new.to_string();
+            if !inserted.ends_with('\n') {
+                inserted.push_str(delimiter);
+            }
+            let candidate = format!("{}{}{}", prefix, inserted, &old[position..]);
+            let path = documentation::heading_path(&candidate, inserted_start)?;
+            documentation::resolve_heading(&candidate, &path)?;
+            Ok(candidate)
+        }
         "section" => {
             let heading = text(args, "section")?;
             let resolved = documentation::resolve_heading(old, heading)?;
@@ -793,26 +934,21 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             section_text(&candidate, heading)?;
             Ok(candidate)
         }
-        "patch" => {
+        "patch" | "replace_text" | "delete_text" | "insert_before_text" | "insert_after_text" => {
             let target = text(args, "old_text")?;
-            if target.is_empty() {
-                bail!("patch_target_must_match_once");
-            }
-            let Some(first) = old.find(target) else {
-                bail!("patch_target_must_match_once");
+            let (base, scope) = if let Some(section) = args.get("section").and_then(Value::as_str) {
+                let heading = documentation::resolve_heading(old, section)?;
+                (heading.start, &old[heading.start..heading.end])
+            } else {
+                (0, old)
             };
-            // Start one Unicode character after the first match, not after
-            // the entire target: matches such as `aa` in `aaa` overlap.
-            let next_start = first + old[first..].chars().next().unwrap().len_utf8();
-            if old[next_start..].contains(target) {
-                bail!("patch_target_must_match_once");
-            }
-            Ok(format!(
-                "{}{}{}",
-                &old[..first],
-                new,
-                &old[first + target.len()..]
-            ))
+            let (relative_start, relative_end) = unique_document_text_span(scope, target)?;
+            let (start, end) = (base + relative_start, base + relative_end);
+            Ok(match action {
+                "insert_before_text" => format!("{}{}{}", &old[..start], new, &old[start..]),
+                "insert_after_text" => format!("{}{}{}", &old[..end], new, &old[end..]),
+                _ => format!("{}{}{}", &old[..start], new, &old[end..]),
+            })
         }
         _ => bail!("invalid_argument_value: unsupported document edit action"),
     }
@@ -2139,7 +2275,8 @@ pub fn execute_cancellable(
                 }
                 if item.status == "written" {
                     let doc = read_text(&output_path(&s.project)?)?;
-                    item.section = documentation::resolve_heading(&doc, &item.section)?.heading;
+                    let resolved = documentation::resolve_heading(&doc, &item.section)?;
+                    item.section = documentation::heading_path(&doc, resolved.start)?;
                 }
                 let registered = json!({"id":id,"status":item.status,"section":item.section});
                 if let Some(existing) = s.investigations.iter_mut().find(|i| i.id == id) {
@@ -2794,6 +2931,23 @@ pub fn limit_result(
             .and_then(|(_, offset)| offset.parse::<usize>().ok())
             .or_else(|| args["offset"].as_u64().map(|offset| offset as usize))
             .unwrap_or(0);
+        if field == "outline" {
+            let next_offset = start + retained_len;
+            data["next_offset"] = json!(next_offset);
+            let mut cursor = json!({"tool":"document_inspect","offset":next_offset,"expected_hash":data["hash"]});
+            for key in [
+                "path",
+                "limit",
+                "coverage_offset",
+                "expected_coverage_revision",
+            ] {
+                if let Some(value) = args.get(key) {
+                    cursor[key] = value.clone();
+                }
+            }
+            output["next_cursor"] = cursor;
+            return;
+        }
         if let Some(cursor) = data["next_cursor"].as_str()
             && let Some((prefix, _)) = cursor.rsplit_once(':')
         {
@@ -2822,7 +2976,7 @@ pub fn limit_result(
 
     // Collections stay structured; a shortened native page resumes at the
     // first omitted item, while non-paginated collections use the archive.
-    for field in ["paths", "matches", "items"] {
+    for field in ["paths", "matches", "items", "outline"] {
         let original_len = output["data"][field].as_array().map_or(0, Vec::len);
         while output["data"][field]
             .as_array()

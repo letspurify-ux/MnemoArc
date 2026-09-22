@@ -5,7 +5,7 @@ pub(super) struct Heading {
     pub start: usize,
     pub end: usize,
     pub(super) line: usize,
-    level: usize,
+    pub(super) level: usize,
 }
 
 /// ATX headings outside fenced code. Byte offsets preserve Unicode and CRLF.
@@ -48,30 +48,71 @@ pub(super) fn headings(doc: &str) -> Vec<Heading> {
     result
 }
 
-/// Full headings match exactly; bare titles are accepted only when unique.
+pub(super) fn heading_paths(headings: &[Heading]) -> Vec<String> {
+    let mut stack: Vec<(usize, &str)> = Vec::new();
+    headings
+        .iter()
+        .map(|heading| {
+            while stack
+                .last()
+                .is_some_and(|(level, _)| *level >= heading.level)
+            {
+                stack.pop();
+            }
+            stack.push((heading.level, &heading.heading));
+            stack
+                .iter()
+                .map(|(_, title)| *title)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect()
+}
+
+pub(super) fn heading_path(doc: &str, start: usize) -> Result<String> {
+    let headings = headings(doc);
+    let paths = heading_paths(&headings);
+    headings
+        .iter()
+        .position(|heading| heading.start == start)
+        .map(|index| paths[index].clone())
+        .ok_or_else(|| anyhow::anyhow!("section_not_found: heading position changed"))
+}
+
+/// Full headings, unique bare titles, or newline-separated ancestor paths.
 pub(super) fn resolve_heading(doc: &str, requested: &str) -> Result<Heading> {
     let requested = requested.trim();
     let headings = headings(doc);
-    let matches = |h: &&Heading| {
+    let paths = heading_paths(&headings);
+    let requested_path = requested
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let is_path = requested_path.contains('\n');
+    let matches = |(index, h): &(usize, &Heading)| {
         if requested.is_empty() {
             return false;
         }
-        if requested.starts_with('#') {
+        if is_path {
+            paths[*index] == requested_path
+        } else if requested.starts_with('#') {
             h.heading == requested
         } else {
             h.heading.trim_start_matches('#').trim_start() == requested
         }
     };
-    let matching: Vec<_> = headings.iter().filter(matches).collect();
+    let matching: Vec<_> = headings.iter().enumerate().filter(matches).collect();
     if matching.len() != 1 {
-        let candidates: Vec<_> = if matching.is_empty() {
-            headings.iter().take(8).collect()
+        let candidate_indices: Vec<_> = if matching.is_empty() {
+            (0..headings.len()).take(8).collect()
         } else {
-            matching.iter().copied().take(8).collect()
+            matching.iter().map(|(index, _)| *index).take(8).collect()
         };
-        let candidates: Vec<_> = candidates
+        let candidates: Vec<_> = candidate_indices
             .into_iter()
-            .map(|h| json!({"heading":h.heading,"start_line":h.line}))
+            .map(|index| json!({"heading":headings[index].heading,"section_path":paths[index],"start_line":headings[index].line}))
             .collect();
         if matching.is_empty() {
             bail!(
@@ -80,12 +121,12 @@ pub(super) fn resolve_heading(doc: &str, requested: &str) -> Result<Heading> {
             );
         }
         bail!(
-            "ambiguous_section: {requested:?} matches {} headings; supply an exact heading including # when levels differ. If exact headings repeat, use file_read with start_line for reading. Matches: {}",
+            "ambiguous_section: {requested:?} matches {} headings; copy section_path from the document_inspect outline to distinguish nested headings. If the full paths also repeat, use a unique text anchor for editing. Matches: {}",
             matching.len(),
             json!(candidates)
         );
     }
-    let start = matching[0].start;
+    let start = matching[0].1.start;
     Ok(headings.into_iter().find(|h| h.start == start).unwrap())
 }
 
@@ -136,6 +177,7 @@ pub(super) fn execute(
                     );
                 }
                 result["section"] = json!(resolved.heading);
+                result["section_path"] = json!(heading_path(&doc, resolved.start)?);
                 result["section_hash"] = json!(hash(section.as_bytes()));
                 result["read_offset"] = json!(n(args, "offset", 0));
                 result["content"] = bounded_text(s, section, n(args, "offset", 0));
@@ -143,6 +185,7 @@ pub(super) fn execute(
                 result["section_lines"] = json!(section.lines().count());
             } else {
                 let headings = headings(&doc);
+                let paths = heading_paths(&headings);
                 let offset = n(args, "offset", 0);
                 if offset > headings.len() {
                     bail!(
@@ -189,9 +232,9 @@ pub(super) fn execute(
                         .insert(coverage_key(next as usize), revision.into());
                 }
                 result["coverage"] = coverage;
-                result["outline"] = json!(headings[offset..end].iter().map(|h| {
+                result["outline"] = json!(headings[offset..end].iter().enumerate().map(|(relative, h)| {
                     let lines = doc[h.start..h.end].lines().count();
-                    json!({"heading":h.heading,"start_line":h.line,"lines":lines,"hash":hash(&doc.as_bytes()[h.start..h.end]),"fully_read":read_lines[h.line-1..h.line-1+lines].iter().all(|&v|v)})
+                    json!({"heading":h.heading,"section_path":paths[offset+relative],"level":h.level,"start_line":h.line,"lines":lines,"hash":hash(&doc.as_bytes()[h.start..h.end]),"fully_read":read_lines[h.line-1..h.line-1+lines].iter().all(|&v|v)})
                 }).collect::<Vec<_>>());
                 result["next_offset"] = json!((end < headings.len()).then_some(end));
             }

@@ -57,7 +57,7 @@ MnemoArc는 세션 안에서 기억을 저장·검색·재사용하며, 소스 �
 2. **예산·페이즈 판정**: 실행 시간/토큰 예산을 초과하면 `run_budget_exhausted`로 중단합니다. 남은 예산 비율에 따라 페이즈를 `investigate → draft → verify`로 전환하고, `finalization_attempts > 0`이면 항상 `verify`로 되돌립니다 (src/agent.rs:194-235). 각 라운드마다 `run_guidance`에 페이즈 지침을 담아 모델에 전달합니다 (src/agent.rs:238-241).
 3. **컨텍스트 준비**: `ContextManager::request/prepare`로 요청을 구성하고, 요청 토큰 + 출력 토큰 + 512 마진이 `context_tokens`를 넘거나 남은 실행 예산을 넘으면 원본 컨텍스트를 유지한 채 실패 처리합니다 (src/agent.rs:248-309).
 4. **LLM 호출**: `client.complete(...)`를 타임아웃·취소와 함께 `tokio::select!`로 실행하고, 스트리밍 델타를 `AgentEvent::Delta`로 릴레이합니다 (src/agent.rs:310-335). 사용량이 없으면 토큰을 추산하고 `usage_incomplete`를 표시합니다.
-5. **길이 초과 복구**: 응답이 출력 한도에 걸리면 부분 텍스트를 히스토리에 저장하고 다음 요청으로 이어가며(`continues_previous`), 3회 초과 시 `length_recovery_limit` 실패 (src/agent.rs:362-383).
+5. **길이 초과 복구**: 응답이 출력 한도에 걸리면 부분 텍스트를 히스토리에 저장하고 다음 요청으로 이어가며(`continues_previous`), 8회 연속 발생 시 `length_recovery_limit` 실패 (src/agent.rs:362-383).
 6. **도구 호출 실행**: 배치 한도(최대 32개)를 초과하면 실패합니다 (src/agent.rs:392-397). 호출이 없으면 종료 판정을 합니다 — `verify_document_write`, `require_investigation` 조사 항목 검증, `audit_document` 구조 감사를 통과해야 `complete`이고, 실패 시 `partial` + `finalization_attempts` 카운트 후 검증 페이즈로 복귀합니다 (src/agent.rs:418-449).
 7. **도구 실행 상세**: 단일 변경 도구는 `spawn_blocking` + 타임아웃으로 실행하며, 취소 후에도 완료된 쓰기를 반드시 join해 회수합니다 (src/agent.rs:42-67). 읽기 병렬 호출은 `buffered(read_parallelism)`로 실행하고 각 결과의 소스·파일 커서를 소유 세션에 병합하며, 잘린 결과는 히스토리 아카이브 ID를 소유 세션 번들로 치환합니다 (src/agent.rs:69-127).
 
@@ -136,7 +136,7 @@ sequenceDiagram
 - **동시 실행 충돌**: 두 번째 실행 요청은 409 CONFLICT (src/web.rs:69-76).
 - **예산 초과**: 실행 시간/토큰 예산 초과 시 `run_budget_exhausted`, 부분 결과와 기억은 보존 (src/agent.rs:194-200).
 - **컨텍스트 한도**: 입력 추정 + 출력 + 512 마진이 한도를 넘으면 원본 컨텍스트 유지 후 실패 (src/agent.rs:289-309).
-- **길이 초과 응답**: 최대 3회 복구, 초과 시 `length_recovery_limit` (src/agent.rs:362-383).
+- **길이 초과 응답**: 8회 연속 발생 시 `length_recovery_limit` (src/agent.rs:362-383).
 - **도구 타임아웃·취소**: 기한 초과 후에도 최종 결과를 회수해 쓰기 누수를 방지 (src/agent.rs:56-67).
 - **문서 완료 검증**: 조사 항목 미검증·감사 이슈 잔존 시 `partial`로 되돌려 검증 재개 (src/agent.rs:418-449).
 - **headless 실행**: `partial`/`blocked` 종료는 종료 코드 2 (src/main.rs:89-93).

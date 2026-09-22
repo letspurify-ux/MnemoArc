@@ -26,6 +26,282 @@ fn run(s: &mut Session, name: &str, args: Value) -> Value {
 }
 
 #[test]
+fn new_sections_can_be_inserted_in_outline_order() {
+    let (_dir, mut s) = setup();
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n## Overview\nStart.\n## Errors\nFailures.\n## Appendix\nExtra.\n"}),
+    );
+    let inserted = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_before","section":"## Errors","expected_hash":created["hash"],"text":"## Flow\nSteps."}),
+    );
+    let batched = run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":inserted["hash"],"edits":[{"action":"insert_before","section":"## Appendix","text":"## Limits\nBounds."}]}),
+    );
+    let expected = "# Guide\n## Overview\nStart.\n## Flow\nSteps.\n## Errors\nFailures.\n## Limits\nBounds.\n## Appendix\nExtra.\n";
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        expected
+    );
+    assert_eq!(batched["hash"], tools::hash(expected.as_bytes()));
+
+    for text in [
+        "### Wrong level\nBody.",
+        "## Flow\nDuplicate.",
+        "## One\n## Two\n",
+    ] {
+        assert!(tools::execute(&mut s, "document_edit", json!({"action":"insert_before","section":"## Errors","expected_hash":batched["hash"],"text":text})).is_err());
+    }
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn inserting_after_last_child_stays_inside_its_parent() {
+    let (_dir, mut s) = setup();
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n## Part\n### First\nOne.\n## Next\nLater.\n"}),
+    );
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after","section":"### First","expected_hash":created["hash"],"text":"### Second\nTwo."}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\n## Part\n### First\nOne.\n### Second\nTwo.\n## Next\nLater.\n"
+    );
+}
+
+#[test]
+fn nested_outline_paths_select_repeated_titles_and_scope_text_edits() {
+    let (_dir, mut s) = setup();
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n## Alpha\n### Shared\ncommon\n## Beta\n### Shared\ncommon\n"}),
+    );
+    let alpha = "# Guide\n## Alpha\n### Shared";
+    let beta = "# Guide\n## Beta\n### Shared";
+    let outline = run(&mut s, "document_inspect", json!({}));
+    assert_eq!(outline["outline"][3]["section_path"], "# Guide\n## Beta");
+    assert_eq!(outline["outline"][4]["section_path"], beta);
+    assert_eq!(outline["outline"][4]["level"], 3);
+    assert_eq!(
+        run(&mut s, "document_inspect", json!({"section":alpha}))["start_line"],
+        3
+    );
+    let beta_page = run(&mut s, "document_inspect", json!({"section":beta}));
+    assert_eq!(beta_page["start_line"], 6);
+    assert_eq!(beta_page["section_path"], beta);
+    let changed = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","section":beta,"old_text":"common","text":"beta detail","expected_hash":created["hash"]}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\n## Alpha\n### Shared\ncommon\n## Beta\n### Shared\nbeta detail\n"
+    );
+    let beta_page = run(&mut s, "document_inspect", json!({"section":beta}));
+    let changed = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":beta,"expected_hash":changed["hash"],"expected_section_hash":beta_page["section_hash"],"text":"### Shared\nbeta detail\nand more\n"}),
+    );
+    let registered = run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","title":"Beta detail","status":"written","section":beta}),
+    );
+    assert_eq!(registered["section"], beta);
+    assert_eq!(
+        changed["hash"],
+        tools::hash(std::fs::read(&s.project.output).unwrap().as_slice())
+    );
+    run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":changed["hash"],"edits":[{"action":"delete_text","section":alpha,"old_text":"common"}]}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\n## Alpha\n### Shared\n\n## Beta\n### Shared\nbeta detail\nand more\n"
+    );
+}
+
+#[test]
+fn child_insertions_handle_first_last_empty_and_repeated_leaf_titles() {
+    let (_dir, mut s) = setup();
+    for name in ["document_edit", "document_edit_batch"] {
+        let spec = ToolRegistry::definitions(&s)
+            .into_iter()
+            .find(|spec| spec["function"]["name"] == name)
+            .unwrap();
+        let schema = spec["function"]["parameters"].to_string();
+        assert!(schema.contains("insert_first_child"));
+        assert!(schema.contains("insert_last_child"));
+    }
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n## Alpha\nIntro.\n### Existing\nBody.\n## Beta\nBeta intro.\n### Existing\nBeta body.\n## Empty\nEmpty intro.\n"}),
+    );
+    let alpha = "# Guide\n## Alpha";
+    let beta = "# Guide\n## Beta";
+    let empty = "# Guide\n## Empty";
+    let first = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_first_child","section":alpha,"expected_hash":created["hash"],"text":"### First\nFirst body."}),
+    );
+    let last = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_last_child","section":beta,"expected_hash":first["hash"],"text":"### Last\nLast body."}),
+    );
+    let final_edit = run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":last["hash"],"edits":[
+            {"action":"insert_first_child","section":empty,"text":"### Only\nOnly body."},
+            {"action":"insert_after","section":"# Guide\n## Beta\n### Existing","text":"### First\nBeta first."}
+        ]}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\n## Alpha\nIntro.\n### First\nFirst body.\n### Existing\nBody.\n## Beta\nBeta intro.\n### Existing\nBeta body.\n### First\nBeta first.\n### Last\nLast body.\n## Empty\nEmpty intro.\n### Only\nOnly body.\n"
+    );
+    let before = std::fs::read_to_string(&s.project.output).unwrap();
+    for text in [
+        "## Wrong\nBody.",
+        "### First\nDuplicate.",
+        "### One\n### Two\n",
+    ] {
+        assert!(tools::execute(&mut s, "document_edit", json!({"action":"insert_last_child","section":alpha,"expected_hash":final_edit["hash"],"text":text})).is_err());
+    }
+    assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), before);
+}
+
+#[test]
+fn first_child_does_not_adopt_headings_that_skip_a_level() {
+    let (_dir, mut s) = setup();
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n## Parent\nIntro.\n#### Existing\nOld.\n## Next\nLater.\n"}),
+    );
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_first_child","section":"## Parent","expected_hash":created["hash"],"text":"### New\nNew body."}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\n## Parent\nIntro.\n#### Existing\nOld.\n### New\nNew body.\n## Next\nLater.\n"
+    );
+}
+
+#[test]
+fn partial_text_edits_insert_replace_and_delete_without_rewriting_sections() {
+    let (_dir, mut s) = setup();
+    let definitions = ToolRegistry::definitions(&s);
+    for name in ["document_edit", "document_edit_batch"] {
+        let spec = definitions
+            .iter()
+            .find(|spec| spec["function"]["name"] == name)
+            .unwrap();
+        let schema = spec["function"]["parameters"].to_string();
+        for action in [
+            "replace_text",
+            "delete_text",
+            "insert_before_text",
+            "insert_after_text",
+        ] {
+            assert!(schema.contains(action), "{name} does not expose {action}");
+        }
+    }
+    let mut result = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Notes\nfirst line\nlast line\n"}),
+    );
+    for edit in [
+        json!({"action":"insert_before_text","old_text":"last line","text":"middle line\n"}),
+        json!({"action":"insert_after_text","old_text":"first line\n","text":"detail line\n"}),
+        json!({"action":"replace_text","old_text":"middle line","text":"revised line"}),
+        json!({"action":"delete_text","old_text":"detail line\n"}),
+    ] {
+        let mut edit = edit;
+        edit["expected_hash"] = result["hash"].clone();
+        result = run(&mut s, "document_edit", edit);
+    }
+    let expected = "# Notes\nfirst line\nrevised line\nlast line\n";
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        expected
+    );
+    assert_eq!(result["hash"], tools::hash(expected.as_bytes()));
+    assert!(
+        tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"delete_text","expected_hash":result["hash"],"old_text":"line"})
+        )
+        .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn batch_partial_text_edits_are_ordered_and_atomic() {
+    let (_dir, mut s) = setup();
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"start\nold\nend\n"}),
+    );
+    let failed = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":created["hash"],"edits":[
+            {"action":"insert_after_text","old_text":"start\n","text":"new\n"},
+            {"action":"delete_text","old_text":"missing\n"}
+        ]}),
+    );
+    assert!(failed.is_err());
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "start\nold\nend\n"
+    );
+    run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":created["hash"],"edits":[
+            {"action":"insert_after_text","old_text":"start\n","text":"new\n"},
+            {"action":"delete_text","old_text":"old\n"},
+            {"action":"replace_text","old_text":"end","text":"finish"}
+        ]}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "start\nnew\nfinish\n"
+    );
+}
+
+#[test]
 fn investigation_updates_preserve_title_but_new_items_still_require_it() {
     let (_dir, mut s) = setup();
     std::fs::write(
@@ -520,6 +796,38 @@ fn deliver(s: &mut Session, name: &str, args: Value, budget: usize) -> Value {
     let result = tools::limit_result(s, &call, result, budget);
     tools::record_delivered_read(s, &call, &result);
     result
+}
+
+#[test]
+fn nested_outline_stays_pageable_when_result_budget_is_small() {
+    let (_dir, mut s) = setup();
+    let mut doc = String::from("# Guide\n");
+    for index in 0..35 {
+        doc.push_str(&format!(
+            "## Section {index} with a descriptive heading\n### Detail {index}\nBody.\n"
+        ));
+    }
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":doc}),
+    );
+    let page = deliver(&mut s, "document_inspect", json!({"limit":100}), 1200);
+    let outline = page["data"]["outline"]
+        .as_array()
+        .expect("bounded outline page");
+    assert!(!outline.is_empty());
+    assert!(outline.len() < 100);
+    assert_eq!(page["data"]["next_offset"], outline.len());
+    assert_eq!(page["next_cursor"]["tool"], "document_inspect");
+    assert_eq!(page["next_cursor"]["offset"], outline.len());
+    let mut next_args = page["next_cursor"].clone();
+    next_args.as_object_mut().unwrap().remove("tool");
+    let next = deliver(&mut s, "document_inspect", next_args, 1200);
+    assert!(
+        next["data"]["outline"][0]["start_line"].as_u64().unwrap()
+            > outline.last().unwrap()["start_line"].as_u64().unwrap()
+    );
 }
 
 #[test]

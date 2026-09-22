@@ -73,7 +73,7 @@ fn source_workflow_activates_tools_and_schema_prevents_guessing() {
         .unwrap();
     assert_eq!(
         edit["function"]["parameters"]["oneOf"][1]["required"],
-        json!(["expected_hash"])
+        json!(["text", "expected_hash"])
     );
     let revision = s.task.revision;
     tools::execute(&mut s, "task_state", json!({"action":"update","patch":{}})).unwrap();
@@ -666,7 +666,7 @@ async fn malformed_review_has_bounded_recovery_without_consuming_valid_review_bu
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let result = run_session(s, model.clone(), CancellationToken::new(), tx).await;
         drain.await.unwrap();
-        assert_eq!(*model.calls.lock().unwrap(), if always_bad { 3 } else { 2 });
+        assert_eq!(*model.calls.lock().unwrap(), if always_bad { 8 } else { 2 });
         if always_bad {
             assert_eq!(result.status, "partial");
             assert!(

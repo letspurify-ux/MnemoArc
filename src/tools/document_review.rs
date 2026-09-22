@@ -74,7 +74,7 @@ fn reset_stale_review(state: &mut ReviewState) {
     state.source_hashes.clear();
 }
 
-const MAX_REVIEW_RESTARTS: usize = 4;
+const MAX_REVIEW_RESTARTS: usize = 8;
 
 pub fn request(s: &mut Session) -> Result<Value> {
     request_with_restarts(s, 0)

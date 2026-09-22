@@ -15,6 +15,10 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+const FINALIZATION_RETRY_LIMIT: usize = 8;
+const LENGTH_RECOVERY_LIMIT: usize = 8;
+const REVIEW_RESPONSE_LIMIT: usize = 8;
+
 #[derive(Clone, Debug)]
 pub enum RunCommand {
     Configure(Box<Config>),
@@ -507,7 +511,7 @@ pub async fn run_session_controlled(
             "document_repair_requests_remaining":s.config.document_repair_limit.saturating_sub(s.document_review.repair_requests),
             "pending_count":s.investigations.iter().filter(|i|i.status != "verified").count(),
             "completion_error":if finalization_attempts > 0 { s.last_error.as_deref() } else { None },
-            "instruction":match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, batch targeted reads for missing evidence, then repair all known issues in the relevant original sections in one cohesive write/patch when safe. Review findings are edit instructions, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Run verify_batch once after all edits, not after every small correction. Only requests containing document_edit or document_edit_batch consume the repair budget (one per request, including failed edits); reads and verification do not. At zero remaining, finish verification and review without another edit. The remaining edit request budget is in document_repair_requests_remaining; audit existing sections and fix factual errors within that budget. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, write investigated sections now and preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>"For source documentation, investigate incrementally and write completed sections. For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. Answer once evidence is sufficient; no source audit or document write is required."}});
+            "instruction":match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, batch targeted reads for missing evidence, then repair known issues in their original locations with targeted section or text edits when safe. Review findings are edit instructions, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Run verify_batch once after all edits, not after every small correction. Only requests containing document_edit or document_edit_batch consume the repair budget (one per request, including failed edits); reads and verification do not. At zero remaining, finish verification and review without another edit. The remaining edit request budget is in document_repair_requests_remaining; audit existing sections and fix factual errors within that budget. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, save each investigated section in a separate edit as soon as its evidence is ready. Check the current outline; use insert_before/insert_after for siblings and insert_first_child/insert_last_child for nested sections when that preserves the document flow. Copy section_path to identify repeated headings; preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>"For source documentation, investigate one section, save it, then move to the next. Create only a short opening with the first ready section; inspect the outline before each later addition, copy section_path when headings repeat, and use sibling or child insertion to place it within the hierarchy. For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. Answer once evidence is sufficient; no source audit or document write is required."}});
         let definitions = ToolRegistry::definitions(&s);
         let mut request = match ContextManager::request(&s, definitions.clone()) {
             Ok(r) => r,
@@ -727,7 +731,7 @@ pub async fn run_session_controlled(
                 let reason = error.to_string();
                 review_response_failures += 1;
                 s.last_error = Some(reason.clone());
-                if review_response_failures < 3
+                if review_response_failures < REVIEW_RESPONSE_LIMIT
                     && (reason.starts_with("document_review_invalid:")
                         || reason.starts_with("document_review_incomplete:")
                         || reason.starts_with("document_review_stale:"))
@@ -776,7 +780,7 @@ pub async fn run_session_controlled(
             let reason = "answer_review_incomplete: review must return one complete answer without tools; draft retained";
             review_response_failures += 1;
             s.last_error = Some(reason.into());
-            if review_response_failures < 3 {
+            if review_response_failures < REVIEW_RESPONSE_LIMIT {
                 snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
                 continue;
             }
@@ -821,8 +825,10 @@ pub async fn run_session_controlled(
             length_recoveries += 1;
             s.activity = json!({"stage":"continuing","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds});
             snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
-            if length_recoveries >= 3 {
-                failure = Some("length_recovery_limit: partial text retained after 3 output-limit responses; shorten the requested answer or adjust output/reasoning settings before resuming".into());
+            if length_recoveries >= LENGTH_RECOVERY_LIMIT {
+                failure = Some(format!(
+                    "length_recovery_limit: partial text retained after {LENGTH_RECOVERY_LIMIT} output-limit responses; shorten the requested answer or adjust output/reasoning settings before resuming"
+                ));
                 break;
             }
             // Use the normal next-request path for budget, timeout, cancellation
@@ -954,7 +960,7 @@ pub async fn run_session_controlled(
                 s.status = "complete".into();
                 s.last_error = None;
             }
-            if s.status == "partial" && finalization_attempts < s.config.review_limit.min(2) {
+            if s.status == "partial" && finalization_attempts < FINALIZATION_RETRY_LIMIT {
                 finalization_attempts += 1;
                 s.status = "running".into();
                 emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"Completion checks failed; returning to pending evidence verification within the remaining budget".into() }, &cancel, run_deadline(started, &s.config)).await;

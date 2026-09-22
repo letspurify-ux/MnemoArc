@@ -8,6 +8,7 @@ use mnemoarc::{
 use serde_json::json;
 use std::{collections::BTreeMap, path::Path};
 use tokio_util::sync::CancellationToken;
+const REVIEW_RESPONSE_LIMIT: usize = 8;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let dry_run = std::env::args().any(|arg| arg == "--dry-run");
@@ -76,9 +77,12 @@ async fn main() -> anyhow::Result<()> {
                 "document_review_incomplete: review must return complete JSON without tools".into(),
             );
             eprintln!(
-                "Incomplete review response {response_failures}/3; retrying same evidence page"
+                "Incomplete review response {response_failures}/{REVIEW_RESPONSE_LIMIT}; retrying same evidence page"
             );
-            anyhow::ensure!(response_failures < 3, "Incomplete review response limit");
+            anyhow::ensure!(
+                response_failures < REVIEW_RESPONSE_LIMIT,
+                "Incomplete review response limit"
+            );
             continue;
         }
         println!(
@@ -93,7 +97,8 @@ async fn main() -> anyhow::Result<()> {
             response_failures += 1;
             s.last_error = Some(error.to_string());
             anyhow::ensure!(
-                response_failures < 3 && error.to_string().starts_with("document_review_invalid:"),
+                response_failures < REVIEW_RESPONSE_LIMIT
+                    && error.to_string().starts_with("document_review_invalid:"),
                 "{error}"
             );
             continue;

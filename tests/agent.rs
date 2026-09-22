@@ -451,6 +451,7 @@ impl LlmClient for InvalidCleanup {
 async fn early_ack_cannot_hide_failed_saves_in_the_same_batch() {
     let dir = tempfile::tempdir().unwrap();
     let mut session = s(dir.path());
+    session.config.stall_round_limit = 9;
     session.add_user("Preserve this original constraint".into());
     session.add_user("Next observation".into());
     mnemoarc::context::ContextManager::prepare(&mut session, 60000).unwrap();
@@ -468,14 +469,16 @@ async fn early_ack_cannot_hide_failed_saves_in_the_same_batch() {
     assert!(
         result
             .last_error
-            .unwrap()
-            .contains("checkpoint_retry_limit")
+            .as_deref()
+            .is_some_and(|error| error.contains("checkpoint_retry_limit")),
+        "{:?}",
+        result.last_error
     );
     assert_eq!(result.checkpoints_completed, 0);
     assert!(result.history.bundles.iter().all(|b| b.active));
     let cp = result.checkpoint.unwrap();
-    assert_eq!(cp.attempts, 3);
-    assert_eq!(cp.failed_attempts, 3);
+    assert_eq!(cp.attempts, 8);
+    assert_eq!(cp.failed_attempts, 8);
     assert!(
         !cp.last_failure
             .unwrap()
@@ -691,7 +694,7 @@ async fn premature_final_is_retried_but_never_claimed_complete_without_coverage(
     let result = run_session(session, client.clone(), CancellationToken::new(), tx).await;
     drain.await.unwrap();
     assert_eq!(result.status, "partial");
-    assert_eq!(*client.calls.lock().unwrap(), 3);
+    assert_eq!(*client.calls.lock().unwrap(), 9);
     assert_eq!(result.run_guidance["phase"], "verify");
     // Rejected completion claims must not appear as final answers in UI history.
     assert!(result.history.bundles.is_empty());
@@ -1027,7 +1030,7 @@ async fn length_continues_text_and_bounds_empty_reasoning_loops() {
                     .unwrap()
                     .starts_with("length_recovery_limit")
             );
-            assert_eq!(result.task_rounds, 3);
+            assert_eq!(result.task_rounds, 8);
             assert!(result.continuation.is_some());
         } else {
             assert_eq!(result.status, "complete");
@@ -1404,7 +1407,7 @@ async fn successful_maintenance_without_ack_is_still_bounded() {
     drain.await.unwrap();
     assert_eq!(result.status, "blocked");
     let cp = result.checkpoint.unwrap();
-    assert_eq!(cp.attempts, 6);
+    assert_eq!(cp.attempts, 8);
     assert_eq!(cp.failed_attempts, 0);
     assert!(
         result
