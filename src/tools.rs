@@ -361,6 +361,22 @@ impl ToolRegistry {
         }
         Ok(())
     }
+    /// Add tools that became mandatory after a selection was validated.
+    ///
+    /// The web layer validates a running-session selection against its owner
+    /// snapshot, while the agent consumes that selection later on a private
+    /// session copy. A workflow can become locked in between those two
+    /// points, so applying the selection must be safe at the request boundary
+    /// as well as at enqueue time.
+    pub fn normalize_tool_selection(s: &Session, names: &BTreeSet<String>) -> BTreeSet<String> {
+        let mut normalized = names.clone();
+        normalized.extend(
+            Self::workflow_required_tools(s)
+                .iter()
+                .map(|name| (*name).to_owned()),
+        );
+        normalized
+    }
     pub fn definitions(s: &Session) -> Vec<Value> {
         Self::specs().into_iter()
             .filter(|t| !t.optional || s.active_tools.contains(t.name))

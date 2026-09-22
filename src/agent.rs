@@ -384,7 +384,11 @@ pub async fn run_session_controlled(
             match command {
                 RunCommand::Configure(config) => s.pending_config = Some(*config),
                 RunCommand::Tools(names) => {
-                    s.active_tools = names;
+                    // The web layer validates against its owner snapshot, but
+                    // this private session may have advanced before the
+                    // command is consumed. Preserve any workflow tools that
+                    // became mandatory in that interval.
+                    s.active_tools = ToolRegistry::normalize_tool_selection(&s, &names);
                     // An explicit web selection supersedes a model's older
                     // tool_select request that was waiting for the next batch.
                     s.pending_tools = None;

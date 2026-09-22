@@ -696,6 +696,13 @@ async fn run(
                                 }
                             }
                             if let Some(pending) = owner.pending_tools.clone() {
+                                // The private agent can advance its workflow
+                                // after this selection was validated on the
+                                // owner snapshot. Normalize at merge time so
+                                // a stale pending set cannot remove newly
+                                // mandatory workflow tools.
+                                let pending =
+                                    ToolRegistry::normalize_tool_selection(&snapshot, &pending);
                                 if snapshot.active_tools == pending {
                                     snapshot.pending_tools = None;
                                 } else {
@@ -760,6 +767,12 @@ async fn run(
                         .get(&id)
                         .and_then(|owner| owner.pending_tools.clone())
                     {
+                        // Apply the same request-boundary normalization used
+                        // by the running agent. This closes the cancellation
+                        // path where a stale private copy would otherwise
+                        // restore a selection that violates the final task
+                        // workflow.
+                        let pending = ToolRegistry::normalize_tool_selection(&session, &pending);
                         if session.active_tools == pending {
                             // The command was consumed by the agent. A model
                             // tool_select queued on the private copy must not
