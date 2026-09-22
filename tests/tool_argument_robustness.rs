@@ -1,5 +1,6 @@
 use mnemoarc::{
     config::{Config, Project},
+    llm::{MAX_TOOL_CALL_ID_BYTES, ToolCall},
     session::Session,
     tools::{self, ToolRegistry},
 };
@@ -16,6 +17,22 @@ fn session(root: &std::path::Path) -> Session {
     );
     session.active_tools = ToolRegistry::optional_names();
     session
+}
+
+#[test]
+fn oversized_call_id_is_rejected_before_tool_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut current = session(dir.path());
+    let call = ToolCall {
+        id: "x".repeat(MAX_TOOL_CALL_ID_BYTES + 1),
+        name: "tool_select".into(),
+        arguments: json!({"action":"add","names":["document_edit"]}).to_string(),
+    };
+    let result = tools::run_call(&mut current, &call);
+    assert_eq!(result["status"], "error");
+    assert_eq!(result["recovery"]["code"], "malformed_tool_call");
+    assert!(current.pending_tools.is_none());
+    assert!(current.ledger.is_empty());
 }
 
 fn placeholder(field: &Value) -> Value {

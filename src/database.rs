@@ -223,6 +223,16 @@ fn truncate_cell(value: &str) -> (String, bool) {
     (text, false)
 }
 
+fn lob_text_prefix(bytes: &[u8], more: bool) -> Result<&str> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Ok(text),
+        Err(error) if more && error.error_len().is_none() => {
+            Ok(std::str::from_utf8(&bytes[..error.valid_up_to()])?)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn cell_text(
     row: &oracle::Row,
     index: usize,
@@ -238,7 +248,7 @@ fn cell_text(
                 return Ok((None, false));
             };
             let (bytes, more) = lob_prefix(lob, 1024, conn, cancel, deadline)?;
-            let (text, cut) = truncate_cell(std::str::from_utf8(&bytes)?);
+            let (text, cut) = truncate_cell(lob_text_prefix(&bytes, more)?);
             Ok((Some(text), more || cut))
         }
         OracleType::NCLOB => {
@@ -247,7 +257,7 @@ fn cell_text(
                 return Ok((None, false));
             };
             let (bytes, more) = lob_prefix(lob, 1024, conn, cancel, deadline)?;
-            let (text, cut) = truncate_cell(std::str::from_utf8(&bytes)?);
+            let (text, cut) = truncate_cell(lob_text_prefix(&bytes, more)?);
             Ok((Some(text), more || cut))
         }
         OracleType::BLOB => {
@@ -420,4 +430,19 @@ pub fn execute(
     conn.rollback()?;
     result["query_id"] = json!(id);
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lob_text_prefix;
+
+    #[test]
+    fn lob_prefix_keeps_complete_utf8_when_a_read_ends_mid_character() {
+        let split = "가".as_bytes();
+        let mut bytes = vec![b'x'; 1023];
+        bytes.extend_from_slice(&split[..2]);
+        assert_eq!(lob_text_prefix(&bytes, true).unwrap(), "x".repeat(1023));
+        assert!(lob_text_prefix(&bytes, false).is_err());
+        assert!(lob_text_prefix(b"a\xffb", true).is_err());
+    }
 }

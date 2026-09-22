@@ -23,6 +23,30 @@ pub struct ToolCall {
     pub name: String,
     pub arguments: String,
 }
+pub const MAX_TOOL_CALL_ID_BYTES: usize = 256;
+pub const MAX_TOOL_NAME_BYTES: usize = 128;
+pub const MAX_COMPLETION_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_TOOL_CALLS: usize = 32;
+
+pub fn validate_completion_bounds(completion: &Completion) -> Result<()> {
+    if completion.calls.len() > MAX_TOOL_CALLS {
+        bail!("tool_call_batch_limit: at most {MAX_TOOL_CALLS} calls");
+    }
+    let mut bytes = completion.text.len();
+    for call in &completion.calls {
+        if call.id.len() > MAX_TOOL_CALL_ID_BYTES || call.name.len() > MAX_TOOL_NAME_BYTES {
+            bail!("malformed_tool_call: call ID or name is too long");
+        }
+        bytes = bytes
+            .saturating_add(call.id.len())
+            .saturating_add(call.name.len())
+            .saturating_add(call.arguments.len());
+    }
+    if bytes > MAX_COMPLETION_BYTES {
+        bail!("response_size_limit");
+    }
+    Ok(())
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input: usize,
@@ -298,11 +322,23 @@ impl OpenAiClient {
                         if let Some(args) = call["function"]["arguments"].as_str() {
                             target.arguments.push_str(args);
                         }
+                        if target.id.len() > MAX_TOOL_CALL_ID_BYTES
+                            || target.name.len() > MAX_TOOL_NAME_BYTES
+                        {
+                            bail!("malformed_tool_call: call ID or name is too long");
+                        }
                     }
                 }
-                if out.text.len() + calls.values().map(|c| c.arguments.len()).sum::<usize>()
-                    > 8 * 1024 * 1024
-                {
+                if calls.len() > MAX_TOOL_CALLS {
+                    bail!("tool_call_batch_limit: at most {MAX_TOOL_CALLS} calls");
+                }
+                let bytes = calls.values().fold(out.text.len(), |bytes, call| {
+                    bytes
+                        .saturating_add(call.id.len())
+                        .saturating_add(call.name.len())
+                        .saturating_add(call.arguments.len())
+                });
+                if bytes > MAX_COMPLETION_BYTES {
                     bail!("response_size_limit");
                 }
             }
@@ -328,6 +364,7 @@ impl OpenAiClient {
                 .map_err(|e| anyhow::anyhow!("invalid_tool_arguments: {e}"))?;
         }
         out.calls = calls.into_values().collect();
+        validate_completion_bounds(&out)?;
         Ok(out)
     }
     pub async fn probe(&self, c: &Config) -> Result<String> {

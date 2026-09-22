@@ -3,7 +3,7 @@ use mnemoarc::{
     agent,
     config::{Config, Project},
     context::ContextManager,
-    llm::{Completion, LlmClient, Usage},
+    llm::{Completion, LlmClient, MAX_TOOL_CALL_ID_BYTES, ToolCall, Usage},
     session::Session,
     tools,
 };
@@ -127,6 +127,55 @@ impl LlmClient for HugeUsage {
             ..Default::default()
         })
     }
+}
+
+struct OversizedToolIdentity;
+#[async_trait]
+impl LlmClient for OversizedToolIdentity {
+    async fn complete(
+        &self,
+        _: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> anyhow::Result<Completion> {
+        Ok(Completion {
+            calls: vec![ToolCall {
+                id: "x".repeat(MAX_TOOL_CALL_ID_BYTES + 1),
+                name: "tool_select".into(),
+                arguments: json!({"action":"add","names":["document_edit"]}).to_string(),
+            }],
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn alternate_client_cannot_execute_oversized_tool_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, mut rx) = mpsc::channel(32);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        agent::run_session(
+            session(dir.path()),
+            Arc::new(OversizedToolIdentity),
+            CancellationToken::new(),
+            tx,
+        ),
+    )
+    .await
+    .unwrap();
+    drain.await.unwrap();
+    assert_eq!(result.status, "blocked");
+    assert!(
+        result
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("malformed_tool_call"))
+    );
+    assert!(result.pending_tools.is_none());
+    assert!(result.ledger.is_empty());
 }
 
 #[tokio::test]

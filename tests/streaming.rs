@@ -1,7 +1,10 @@
 use axum::{Router, http::header, response::IntoResponse, routing::post};
 use mnemoarc::{
     config::Config,
-    llm::{LlmClient, OpenAiClient, SseDecoder},
+    llm::{
+        LlmClient, MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_CALLS, MAX_TOOL_NAME_BYTES, OpenAiClient,
+        SseDecoder,
+    },
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -62,6 +65,49 @@ async fn assemble_interleaved_calls_and_usage() {
     assert_eq!(out.calls[0].arguments, "{\"id\":\"a\"}");
     assert_eq!(out.usage.unwrap().cached, Some(3));
     server.abort();
+}
+#[tokio::test]
+async fn oversized_tool_identity_and_batch_are_rejected_during_streaming() {
+    let oversized_id = format!(
+        "{}data: [DONE]\n\n",
+        event(
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"x".repeat(MAX_TOOL_CALL_ID_BYTES + 1),"function":{"name":"tool_catalog","arguments":"{}"}}]},"finish_reason":"tool_calls"}]})
+        )
+    );
+    let oversized_name = [
+        event(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"x".repeat(MAX_TOOL_NAME_BYTES / 2 + 1),"arguments":"{}"}}]},"finish_reason":null}]})),
+        event(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"x".repeat(MAX_TOOL_NAME_BYTES / 2 + 1)}}]},"finish_reason":"tool_calls"}]})),
+        "data: [DONE]\n\n".into(),
+    ].concat();
+    let entries: Vec<_> = (0..=MAX_TOOL_CALLS).map(|index| json!({"index":index,"id":format!("call-{index}"),"function":{"name":"tool_catalog","arguments":"{}"}})).collect();
+    let too_many_calls = format!(
+        "{}data: [DONE]\n\n",
+        event(json!({"choices":[{"delta":{"tool_calls":entries},"finish_reason":"tool_calls"}]}))
+    );
+    for (body, expected) in [
+        (oversized_id, "malformed_tool_call"),
+        (oversized_name, "malformed_tool_call"),
+        (too_many_calls, "tool_call_batch_limit"),
+    ] {
+        let (url, server) = server(body).await;
+        let config = Config {
+            base_url: url,
+            retries: 0,
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let error = OpenAiClient
+            .complete(
+                json!({"messages":[]}),
+                &config,
+                CancellationToken::new(),
+                tx,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+        server.abort();
+    }
 }
 #[tokio::test]
 async fn incomplete_stream_never_returns_calls() {

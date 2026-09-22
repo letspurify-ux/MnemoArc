@@ -164,6 +164,11 @@ fn oracle_docker_query_uses_binds_and_limits_rows() {
             "SELECT TO_CLOB(RPAD('x', 4000, 'x')) AS LARGE_CLOB FROM dual",
         ),
         query(
+            "unicode_clob",
+            true,
+            "SELECT TO_CLOB(RPAD('가', 2000, '가')) AS UNICODE_CLOB FROM dual",
+        ),
+        query(
             "multiple_statements",
             true,
             "SELECT 1 FROM dual; SELECT 2 FROM dual",
@@ -206,6 +211,19 @@ fn oracle_docker_query_uses_binds_and_limits_rows() {
         large_clob["rows"][0][0]
             .as_str()
             .is_some_and(|cell| cell.len() <= 1024)
+    );
+    let unicode_clob = mnemoarc::database::execute(
+        &config,
+        &json!({"action":"run","id":"unicode_clob"}),
+        &CancellationToken::new(),
+        30,
+    )
+    .unwrap();
+    assert_eq!(unicode_clob["truncated"], true);
+    assert!(
+        unicode_clob["rows"][0][0]
+            .as_str()
+            .is_some_and(|cell| cell.starts_with('가') && cell.len() <= 1024)
     );
     assert!(
         mnemoarc::database::execute(

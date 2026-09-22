@@ -669,6 +669,28 @@ pub async fn run_session_controlled(
                 break;
             }
         };
+        if let Err(error) = crate::llm::validate_completion_bounds(&completion) {
+            let extra_attempts = completion.attempts.saturating_sub(1);
+            if extra_attempts > 0 {
+                s.usage_incomplete = true;
+            }
+            s.input_tokens = s
+                .input_tokens
+                .saturating_add(request_tokens.saturating_mul(extra_attempts));
+            if let Some(usage) = completion.usage {
+                s.input_tokens = s.input_tokens.saturating_add(usage.input);
+                s.output_tokens = s.output_tokens.saturating_add(usage.output);
+                if let Some(cached) = usage.cached {
+                    s.cached_tokens = Some(s.cached_tokens.unwrap_or(0).saturating_add(cached));
+                }
+            } else {
+                s.usage_incomplete = true;
+                s.input_tokens = s.input_tokens.saturating_add(request_tokens);
+                s.output_tokens = s.output_tokens.saturating_add(request_config.output_tokens);
+            }
+            failure = Some(error.to_string());
+            break;
+        }
         if completion.attempts > 1 {
             s.usage_incomplete = true;
             s.input_tokens = s

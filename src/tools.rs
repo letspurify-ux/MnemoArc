@@ -3172,6 +3172,16 @@ fn run_call_inner(
             "malformed_tool_call: tool call id and name must be non-empty"
         )));
     }
+    if call.id.len() > crate::llm::MAX_TOOL_CALL_ID_BYTES
+        || call.name.len() > crate::llm::MAX_TOOL_NAME_BYTES
+    {
+        return envelope(Err(anyhow::anyhow!(
+            "malformed_tool_call: call ID or name is too long"
+        )));
+    }
+    if call.arguments.len() > crate::llm::MAX_COMPLETION_BYTES {
+        return envelope(Err(anyhow::anyhow!("response_size_limit")));
+    }
     let signature = format!("{}:{}", call.name, call.arguments);
     if let Some((stored, result)) = s.ledger.get(&call.id) {
         return if stored == &signature {
