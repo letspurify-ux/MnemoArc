@@ -241,6 +241,15 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         {
             &["document_inspect", "document_edit", "document_edit_batch"]
         }
+        "refresh_matching_state" if call.name == "document_inspect" => {
+            &["document_inspect", "file_read"]
+        }
+        "refresh_matching_state" if call.name == "document_audit" => {
+            &["document_audit", "document_inspect"]
+        }
+        "refresh_matching_state" if call.name == "source_search" => &["source_search", "file_read"],
+        "refresh_matching_state" if call.name == "file_list" => &["file_list"],
+        "refresh_matching_state" if call.name == "symbol_search" => &["symbol_search", "file_read"],
         "refresh_matching_state" => &["code_outline", "file_read", "source_lookup", "history"],
         "reduce_request_or_cleanup" if call.name == "source_search" => &["source_search"],
         "reduce_request_or_cleanup" if call.name == "code_outline" => &["code_outline"],
