@@ -306,7 +306,7 @@ async fn events(
 async fn state_get(State(s): State<WebState>) -> Json<Value> {
     let c = s.core.lock().await;
     Json(
-        json!({"revision":c.revision,"config":c.config,"defaults":Config::default(),"credential":{"configured":OpenAiClient::has_key(&c.config),"saved":c.credentials.contains_key(&c.config.api_key_env)},"running":c.running.as_ref().map(|r|json!({"id":r.id,"closing":r.closing})),"sessions":c.order.iter().filter_map(|id|c.sessions.get(id)).map(|v|json!({"id":v.id,"project":v.project,"status":v.status,"title":v.latest_request.chars().take(60).collect::<String>(),"memory_count":v.memory.entries.len()})).collect::<Vec<_>>(),"tools":ToolRegistry::specs().iter().filter(|t|t.name != "db_query").map(|t|json!({"name":t.name,"description":t.description,"optional":t.optional})).collect::<Vec<_>>()}),
+        json!({"revision":c.revision,"config":c.config,"defaults":Config::default(),"credential":{"configured":OpenAiClient::has_key(&c.config),"saved":c.credentials.contains_key(&c.config.api_key_env)},"running":c.running.as_ref().map(|r|json!({"id":r.id,"closing":r.closing})),"sessions":c.order.iter().filter_map(|id|c.sessions.get(id)).map(|v|json!({"id":v.id,"project":v.project,"status":v.status,"title":v.latest_request.chars().take(60).collect::<String>(),"memory_count":v.memory.entries.len()})).collect::<Vec<_>>(),"tools":ToolRegistry::specs().iter().filter(|t|t.name != "db_query" && t.name != "db_execute").map(|t|json!({"name":t.name,"description":t.description,"optional":t.optional})).collect::<Vec<_>>()}),
     )
 }
 #[derive(Default, Deserialize)]

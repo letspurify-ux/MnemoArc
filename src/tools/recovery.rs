@@ -115,10 +115,18 @@ pub fn describe(message: &str) -> Value {
             | "database_disabled"
             | "database_query_disabled_or_unknown"
             | "database_password_missing"
+            | "database_execution_disabled"
     ) {
         (Class::Prerequisite, "complete_prerequisite")
-    } else if code == "invalid_database_query_arguments" {
+    } else if matches!(
+        code,
+        "invalid_database_query_arguments" | "invalid_database_execution_arguments"
+    ) {
         (Class::InvalidInput, "correct_arguments")
+    } else if code == "database_commit_uncertain" {
+        (Class::OutcomeUnknown, "inspect_outcome_before_retry")
+    } else if code == "database_result_too_wide" {
+        (Class::Capacity, "reduce_request_or_cleanup")
     } else if code == "database_query_timeout" {
         (Class::Transient, "inspect_error_before_retry")
     } else if matches!(

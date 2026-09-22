@@ -162,14 +162,25 @@ function DatabaseEditor({ database, onChange }) {
     updateQuery(queryIndex, { params: q.params.map((p, i) => i === paramIndex ? { ...p, ...patch } : p) });
   };
   return <div className="project-fields">
-    <label className="check-label"><input type="checkbox" checked={database.enabled} onChange={e => set("enabled", e.target.checked)} />DB 조회 전체 활성화</label>
-    <small>기본값은 꺼짐입니다. 모델은 이 설정이나 개별 쿼리 스위치를 변경할 수 없습니다. 전체와 쿼리가 모두 켜져야 도구가 노출됩니다.</small>
+    <label className="check-label"><input type="checkbox" checked={database.enabled} onChange={e => set("enabled", e.target.checked)} />DB 도구 전체 활성화</label>
+    <small>기본값은 꺼짐입니다. 모델은 이 설정이나 아래 스위치를 변경할 수 없습니다. 전체 스위치와 해당 기능 스위치가 모두 켜져야 도구가 노출됩니다.</small>
     <div className="field-grid">
       {[["host", "호스트", "localhost"], ["port", "포트", "1521"], ["service", "서비스 이름", "FREEPDB1"], ["username", "사용자", "READ_ONLY_USER"], ["password_env", "암호 환경변수 이름", "MNEMOARC_DB_PASSWORD"], ["max_rows", "최대 결과 행", "100"]].map(([key, label, placeholder]) =>
         <label className="setting-field" key={key}><span>{label}</span><input aria-label={label} type={["port", "max_rows"].includes(key) ? "number" : "text"} value={database[key]} placeholder={placeholder} onChange={e => set(key, ["port", "max_rows"].includes(key) ? Number(e.target.value) : e.target.value)} /></label>
       )}
     </div>
-    <small>암호 값은 이 화면이나 설정 파일에 저장하지 않습니다. 앱 실행 환경변수 또는 실행 폴더의 .env에 지정하세요. DB 사용자는 조회 권한만 부여하는 것이 좋습니다.</small>
+    <small>암호 값은 이 화면이나 설정 파일에 저장하지 않습니다. 앱 실행 환경변수 또는 실행 폴더의 .env에 지정하세요. DB 사용자에게 필요한 권한만 부여하세요.</small>
+    <h3>자유 실행 도구</h3>
+    <small>모델이 실행할 SQL 또는 프로시저·함수 이름과 바인드 값을 직접 지정할 수 있습니다. 변경 SQL과 프로시저·함수는 DB 내용을 바꿀 수 있으며 성공 시 커밋됩니다. 필요한 모드만 사용자가 직접 켜세요.</small>
+    {[
+      ["raw_query_enabled", "자유 SELECT/WITH 조회", "읽기 전용 트랜잭션과 결과 제한을 적용합니다."],
+      ["raw_statement_enabled", "자유 변경 SQL 실행", "INSERT/UPDATE/DELETE/DDL 등을 실행합니다. DDL은 Oracle에서 자체 커밋될 수 있습니다."],
+      ["procedure_enabled", "프로시저 호출", "IN/OUT/IN OUT 값과 REF CURSOR 결과를 지원합니다."],
+      ["function_enabled", "함수 호출", "반환값과 OUT/IN OUT 값, REF CURSOR 결과를 지원합니다."],
+    ].map(([key, label, help]) => <label className="check-label" key={key}>
+      <input type="checkbox" checked={database[key]} onChange={e => set(key, e.target.checked)} />
+      <span>{label}<br /><small>{help}</small></span>
+    </label>)}
     <h3>저장 쿼리</h3>
     <small>SQL은 사용자가 작성하며 모델은 쿼리 ID와 바인드 값만 선택할 수 있습니다. 단일 SELECT/WITH 문을 입력하고 값은 :이름 바인드로 지정하세요. 결과는 최대 {database.max_rows}행입니다.</small>
     {database.queries.map((q, index) => <section className="credential-card" key={index}>

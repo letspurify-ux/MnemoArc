@@ -1,5 +1,7 @@
 //! User-approved, named Oracle queries. The model never supplies SQL or changes enable flags.
+mod free;
 use anyhow::{Result, bail};
+pub use free::execute_free;
 use oracle::{Connection, sql_type::ToSql};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -13,6 +15,10 @@ use tokio_util::sync::CancellationToken;
 #[serde(default, deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub enabled: bool,
+    pub raw_query_enabled: bool,
+    pub raw_statement_enabled: bool,
+    pub procedure_enabled: bool,
+    pub function_enabled: bool,
     pub host: String,
     pub port: u16,
     pub service: String,
@@ -44,6 +50,10 @@ impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            raw_query_enabled: false,
+            raw_statement_enabled: false,
+            procedure_enabled: false,
+            function_enabled: false,
             host: "localhost".into(),
             port: 1521,
             service: String::new(),
@@ -68,6 +78,13 @@ fn connect_component(value: &str) -> bool {
 }
 
 impl DatabaseConfig {
+    pub fn free_execution_enabled(&self) -> bool {
+        self.enabled
+            && (self.raw_query_enabled
+                || self.raw_statement_enabled
+                || self.procedure_enabled
+                || self.function_enabled)
+    }
     pub fn active_queries(&self) -> impl Iterator<Item = &SavedQuery> {
         self.queries.iter().filter(|q| self.enabled && q.enabled)
     }
@@ -156,6 +173,82 @@ fn remaining(deadline: Instant) -> Result<Duration> {
     Ok(left.min(Duration::from_secs(15)))
 }
 
+fn connect(config: &DatabaseConfig, timeout_secs: u64, deadline: Instant) -> Result<Connection> {
+    let secret = password(&config.password_env)?;
+    let connect_timeout = timeout_secs.clamp(1, 5);
+    let connect = format!(
+        "(DESCRIPTION=(CONNECT_TIMEOUT={connect_timeout})(RETRY_COUNT=0)(ADDRESS=(PROTOCOL=TCP)(HOST={})(PORT={}))(CONNECT_DATA=(SERVICE_NAME={})))",
+        config.host, config.port, config.service
+    );
+    let conn = Connection::connect(&config.username, &secret, &connect)?;
+    conn.set_call_timeout(Some(remaining(deadline)?))?;
+    Ok(conn)
+}
+
+fn collect_rows(
+    conn: &Connection,
+    results: &mut oracle::ResultSet<'_, oracle::Row>,
+    config: &DatabaseConfig,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<Value> {
+    let columns: Vec<_> = results
+        .column_info()
+        .iter()
+        .map(|c| json!({"name":c.name(),"type":c.oracle_type().to_string()}))
+        .collect();
+    if columns.len() > 64 {
+        bail!("database_result_too_wide: select fewer than 65 columns");
+    }
+    let mut rows = Vec::new();
+    let mut truncated = false;
+    let mut result_bytes = 0usize;
+    loop {
+        conn.set_call_timeout(Some(remaining(deadline)?))?;
+        let Some(item) = results.next() else {
+            break;
+        };
+        if cancel.is_cancelled() {
+            bail!("cancelled");
+        }
+        if rows.len() == config.max_rows {
+            truncated = true;
+            break;
+        }
+        let row = item?;
+        let mut cells = Vec::with_capacity(columns.len());
+        for index in 0..columns.len() {
+            let value: Option<String> = row.get(index)?;
+            let value = value.map(|v| {
+                let mut text = String::new();
+                for ch in v.chars() {
+                    if text.len() + ch.len_utf8() > 1024 {
+                        text.push('…');
+                        break;
+                    }
+                    text.push(ch);
+                }
+                text
+            });
+            cells.push(value);
+        }
+        let row_bytes: usize = cells
+            .iter()
+            .map(|v: &Option<String>| v.as_ref().map_or(4, String::len))
+            .sum();
+        if !rows.is_empty() && result_bytes.saturating_add(row_bytes) > 64 * 1024 {
+            truncated = true;
+            break;
+        }
+        result_bytes = result_bytes.saturating_add(row_bytes);
+        rows.push(cells);
+    }
+    let row_count = rows.len();
+    Ok(
+        json!({"columns":columns,"rows":rows,"row_count":row_count,"truncated":truncated,"max_rows":config.max_rows}),
+    )
+}
+
 pub fn execute(
     config: &DatabaseConfig,
     args: &Value,
@@ -219,14 +312,7 @@ pub fn execute(
         bail!("cancelled");
     }
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let secret = password(&config.password_env)?;
-    let connect_timeout = timeout_secs.clamp(1, 5);
-    let connect = format!(
-        "(DESCRIPTION=(CONNECT_TIMEOUT={connect_timeout})(RETRY_COUNT=0)(ADDRESS=(PROTOCOL=TCP)(HOST={})(PORT={}))(CONNECT_DATA=(SERVICE_NAME={})))",
-        config.host, config.port, config.service
-    );
-    let conn = Connection::connect(&config.username, &secret, &connect)?;
-    conn.set_call_timeout(Some(remaining(deadline)?))?;
+    let conn = connect(config, timeout_secs, deadline)?;
     // Oracle enforces transaction read-only in addition to the SELECT-only query API.
     conn.execute("SET TRANSACTION READ ONLY", &[])?;
     conn.set_call_timeout(Some(remaining(deadline)?))?;
@@ -237,60 +323,8 @@ pub fn execute(
         .map(|(p, v)| (p.name.as_str(), v as &dyn ToSql))
         .collect();
     let mut results = conn.query_named(&query.sql, &binds)?;
-    let columns: Vec<_> = results
-        .column_info()
-        .iter()
-        .map(|c| json!({"name":c.name(),"type":c.oracle_type().to_string()}))
-        .collect();
-    if columns.len() > 64 {
-        bail!("db_query result has over 64 columns; select fewer columns");
-    }
-    let mut rows = Vec::new();
-    let mut truncated = false;
-    let mut result_bytes = 0usize;
-    loop {
-        conn.set_call_timeout(Some(remaining(deadline)?))?;
-        let Some(item) = results.next() else {
-            break;
-        };
-        if cancel.is_cancelled() {
-            bail!("cancelled");
-        }
-        if rows.len() == config.max_rows {
-            truncated = true;
-            break;
-        }
-        let row = item?;
-        let mut cells = Vec::with_capacity(columns.len());
-        for index in 0..columns.len() {
-            let value: Option<String> = row.get(index)?;
-            let value = value.map(|v| {
-                let mut text = String::new();
-                for ch in v.chars() {
-                    if text.len() + ch.len_utf8() > 1024 {
-                        text.push('…');
-                        break;
-                    }
-                    text.push(ch);
-                }
-                text
-            });
-            cells.push(value);
-        }
-        let row_bytes: usize = cells
-            .iter()
-            .map(|v: &Option<String>| v.as_ref().map_or(4, String::len))
-            .sum();
-        if !rows.is_empty() && result_bytes.saturating_add(row_bytes) > 64 * 1024 {
-            truncated = true;
-            break;
-        }
-        result_bytes = result_bytes.saturating_add(row_bytes);
-        rows.push(cells);
-    }
+    let mut result = collect_rows(&conn, &mut results, config, cancel, deadline)?;
     conn.rollback()?;
-    let row_count = rows.len();
-    Ok(
-        json!({"query_id":id,"columns":columns,"rows":rows,"row_count":row_count,"truncated":truncated,"max_rows":config.max_rows}),
-    )
+    result["query_id"] = json!(id);
+    Ok(result)
 }

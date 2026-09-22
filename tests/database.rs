@@ -30,8 +30,15 @@ fn database_is_user_gated_and_queries_are_individual() {
             .iter()
             .any(|v| v["function"]["name"] == "db_query")
     );
-    let hidden_catalog = tools::execute(&mut session, "tool_catalog", json!({"query":"db_query"})).unwrap();
-    assert!(!hidden_catalog["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "db_query"));
+    let hidden_catalog =
+        tools::execute(&mut session, "tool_catalog", json!({"query":"db_query"})).unwrap();
+    assert!(
+        !hidden_catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "db_query")
+    );
     assert!(tools::execute(&mut session, "db_query", json!({"action":"list"})).is_err());
     config.database.enabled = true;
     config.database.service = "FREEPDB1".into();
@@ -121,7 +128,11 @@ fn oracle_docker_query_uses_binds_and_limits_rows() {
             true,
             "SELECT level AS N FROM dual CONNECT BY level <= 3",
         ),
-        query("date_and_number", true, "SELECT SYSDATE AS TODAY, 7 AS N FROM dual"),
+        query(
+            "date_and_number",
+            true,
+            "SELECT SYSDATE AS TODAY, 7 AS N FROM dual",
+        ),
     ];
     config.validate().unwrap();
     let result = mnemoarc::database::execute(
@@ -146,7 +157,12 @@ fn oracle_docker_query_uses_binds_and_limits_rows() {
         &json!({"action":"run","id":"date_and_number"}),
         &CancellationToken::new(),
         30,
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(typed["rows"][0][1], "7");
-    assert!(typed["rows"][0][0].as_str().is_some_and(|value| !value.is_empty()));
+    assert!(
+        typed["rows"][0][0]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
 }

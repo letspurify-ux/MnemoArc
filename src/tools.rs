@@ -108,6 +108,22 @@ impl ToolRegistry {
                 ),
             },
             ToolSpec {
+                name: "db_execute",
+                description: "Execute manually enabled ad hoc Oracle operations. mode=query runs a SELECT/WITH with read-only transaction; mode=statement runs SQL and commits; mode=procedure calls a named PL/SQL procedure and commits; mode=function calls a named PL/SQL function and commits. Use named binds. Procedure/function args are ordered positional parameters with name, direction=in|out|inout, type=string|number|boolean|cursor, and value for IN/INOUT. Function requires return_type. These modes are enabled only by the user in Settings; procedures/functions can have side effects.",
+                optional: false,
+                read_only: false,
+                parameters: schema(
+                    json!({
+                        "mode":action(&["query","statement","procedure","function"]),
+                        "sql":string(),"name":string(),
+                        "params":{"type":"object","description":"Named SQL bind values: string, number, boolean or null"},
+                        "args":{"type":"array","items":{"type":"object","properties":{"name":string(),"direction":action(&["in","out","inout"]),"type":action(&["string","number","boolean","cursor"]),"value":{}},"required":["name"],"additionalProperties":false}},
+                        "return_type":action(&["string","number","boolean","cursor"])
+                    }),
+                    &["mode"],
+                ),
+            },
+            ToolSpec {
                 name: "tool_catalog",
                 description: "List/search available tools and source-docs group; shows short descriptions and active status",
                 optional: false,
@@ -403,6 +419,7 @@ impl ToolRegistry {
     pub fn definitions(s: &Session) -> Vec<Value> {
         Self::specs().into_iter()
             .filter(|t| t.name != "db_query" || s.config.database.active_queries().next().is_some())
+            .filter(|t| t.name != "db_execute" || s.config.database.free_execution_enabled())
             .filter(|t| !t.optional || s.active_tools.contains(t.name))
             .filter(|t| s.config.memory_reuse || !["memory_read", "memory_find"].contains(&t.name))
             .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
@@ -473,6 +490,21 @@ impl ToolRegistry {
                         {"properties":{"action":{"const":"run"}},"required":["id"]}
                     ]);
                     format!("{} Enabled queries: {}. Use list for full parameter descriptions.", t.description, summaries.chars().take(3000).collect::<String>())
+                } else if t.name == "db_execute" {
+                    let db = &s.config.database;
+                    let mut modes = Vec::new();
+                    if db.raw_query_enabled { modes.push("query"); }
+                    if db.raw_statement_enabled { modes.push("statement"); }
+                    if db.procedure_enabled { modes.push("procedure"); }
+                    if db.function_enabled { modes.push("function"); }
+                    t.parameters["properties"]["mode"]["enum"] = json!(modes);
+                    t.parameters["oneOf"] = json!([
+                        {"properties":{"mode":{"const":"query"}},"required":["sql"],"not":{"anyOf":[{"required":["name"]},{"required":["args"]},{"required":["return_type"]}]}},
+                        {"properties":{"mode":{"const":"statement"}},"required":["sql"],"not":{"anyOf":[{"required":["name"]},{"required":["args"]},{"required":["return_type"]}]}},
+                        {"properties":{"mode":{"const":"procedure"}},"required":["name"],"not":{"anyOf":[{"required":["sql"]},{"required":["params"]},{"required":["return_type"]}]}},
+                        {"properties":{"mode":{"const":"function"}},"required":["name","return_type"],"not":{"anyOf":[{"required":["sql"]},{"required":["params"]}]}}
+                    ]);
+                    format!("{} Enabled modes: {}.", t.description, modes.join(", "))
                 } else { t.description.to_string() };
                 json!({"type":"function","function":{"name":t.name,"description":description,"parameters":t.parameters}})
             })
@@ -504,6 +536,11 @@ impl ToolRegistry {
                 "database_disabled: enable the database and at least one query manually in Settings"
             );
         }
+        if name == "db_execute" && !s.config.database.free_execution_enabled() {
+            bail!(
+                "database_execution_disabled: enable an ad hoc execution mode manually in Settings"
+            );
+        }
         let fields = spec.parameters["properties"].as_object().unwrap();
         if name == "investigation" {
             validate_investigation_arguments(s, args)?;
@@ -533,7 +570,8 @@ impl ToolRegistry {
                 Some("integer") => v.as_u64().is_some(),
                 Some("boolean") => v.is_boolean(),
                 Some("array") => {
-                    (name == "document_edit_batch" && k == "edits")
+                    ((name == "document_edit_batch" && k == "edits")
+                        || (name == "db_execute" && k == "args"))
                         || v.as_array().is_some_and(|a| a.iter().all(Value::is_string))
                 }
                 Some("object") => v.is_object(),
@@ -1760,6 +1798,12 @@ pub fn execute_cancellable(
         );
     }
     match name {
+        "db_execute" => crate::database::execute_free(
+            &s.config.database,
+            &args,
+            cancel,
+            s.config.tool_timeout_secs,
+        ),
         "db_query" => crate::database::execute(
             &s.config.database,
             &args,
@@ -1777,7 +1821,7 @@ pub fn execute_cancellable(
                 .filter(|t| !t.is_empty())
                 .collect();
             Ok(
-                json!({"groups":["source-docs"],"tools":ToolRegistry::specs().into_iter().filter(|t|t.name != "db_query" || s.config.database.active_queries().next().is_some()).filter(|t|terms.is_empty() || terms.iter().any(|term| t.name.contains(term) || t.description.to_lowercase().contains(term))).map(|t|json!({"name":t.name,"description":t.description,"basic":!t.optional,"active":!t.optional||s.active_tools.contains(t.name)})).collect::<Vec<_>>()}),
+                json!({"groups":["source-docs"],"tools":ToolRegistry::specs().into_iter().filter(|t|t.name != "db_query" || s.config.database.active_queries().next().is_some()).filter(|t|t.name != "db_execute" || s.config.database.free_execution_enabled()).filter(|t|terms.is_empty() || terms.iter().any(|term| t.name.contains(term) || t.description.to_lowercase().contains(term))).map(|t|json!({"name":t.name,"description":t.description,"basic":!t.optional,"active":!t.optional||s.active_tools.contains(t.name)})).collect::<Vec<_>>()}),
             )
         }
         "tool_select" => {

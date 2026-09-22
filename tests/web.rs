@@ -254,8 +254,14 @@ async fn local_api_rejects_cross_origin_mutation_and_invalid_project() {
         get(&c, &url, "/api/state").await["config"]["run_tokens"],
         500000
     );
-    assert_eq!(get(&c, &url, &format!("/api/sessions/{id}")).await["config"]["document_repair_limit"], 16);
-    assert_eq!(get(&c, &url, "/api/state").await["config"]["document_repair_limit"], 8);
+    assert_eq!(
+        get(&c, &url, &format!("/api/sessions/{id}")).await["config"]["document_repair_limit"],
+        16
+    );
+    assert_eq!(
+        get(&c, &url, "/api/state").await["config"]["document_repair_limit"],
+        8
+    );
     assert!(!dir.path().join("config.toml").exists());
     state.shutdown().await;
     server.abort();
