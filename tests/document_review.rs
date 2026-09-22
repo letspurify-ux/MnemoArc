@@ -98,6 +98,10 @@ fn review_reads_declarations_is_bounded_and_invalidates_on_change() {
     let (dir, mut s) = fixture();
     let request = document_review::request(&mut s).unwrap();
     assert!(request.get("tools").is_none());
+    let review_instruction = request["messages"][0]["content"].as_str().unwrap();
+    assert!(review_instruction.contains("Inspect the document headings"));
+    assert!(review_instruction.contains("edits in the relevant original sections"));
+    assert!(review_instruction.contains("Preserve a user-requested follow-up section"));
     let payload: Value =
         serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
     assert!(payload["evidence"].to_string().contains("for (let i = 0"));
