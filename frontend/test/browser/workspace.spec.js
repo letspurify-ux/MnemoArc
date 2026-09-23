@@ -31,7 +31,7 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
   await page.getByLabel("작성·검증 예산 비율", { exact: true }).fill("60");
   await page.getByLabel("검증 예산 비율", { exact: true }).fill("30");
   await page.getByLabel("동일 범위 반복 조회 제한", { exact: true }).fill("3");
-  await page.getByLabel("반복 작업 중단 횟수", { exact: true }).fill("10");
+  await page.getByLabel("진행 정체 감지 횟수", { exact: true }).fill("10");
   await page.getByRole("button", { name: "설정 저장", exact: true }).click();
   await expect(page.getByRole("status")).toContainText("설정을 저장했습니다");
   await page.screenshot({
@@ -104,6 +104,39 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
     page.getByRole("checkbox", { name: "심볼 검색", exact: true }),
   ).toBeVisible();
   expect(errors).toEqual([]);
+});
+
+test("ordered to-do list follows prerequisites and preserves running work on reload", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  await page
+    .getByRole("textbox", { name: "메시지", exact: true })
+    .fill("할 일 목록 테스트");
+  await page.getByRole("button", { name: "메시지 보내기" }).click();
+  await page.getByRole("tab", { name: "진행", exact: true }).click();
+  const plan = page.getByRole("region", { name: "할 일 목록" });
+  await expect(plan.locator("li")).toHaveCount(3);
+  await expect(plan.locator("li").nth(0)).toContainText("완료");
+  await expect(plan.locator("li").nth(0)).toContainText("선행 근거 확인");
+  await expect(plan.locator("[aria-current=step]")).toContainText("본문 작성");
+  await expect(plan.locator("li").nth(2)).toContainText("대기");
+  await expect(plan).not.toContainText("불필요 작업");
+  await expect(plan).toContainText("남은 항목 2/8 · 누적 완료 1개");
+  await expect(page.getByRole("button", { name: "■ 중지" })).toBeVisible();
+  await page.reload();
+  await page.getByRole("tab", { name: "진행", exact: true }).click();
+  await expect(plan.locator("[aria-current=step]")).toContainText("본문 작성");
+  await expect(
+    page.getByRole("button", { name: "● 다른 세션 작업 중" }),
+  ).toHaveCount(0);
+  await page.screenshot({
+    path: "test-artifacts/task-plan.png",
+    fullPage: true,
+  });
+  await page.getByRole("button", { name: "■ 중지" }).click();
+  await expect(page.locator(".status-pill")).toHaveText("중지됨");
 });
 
 test("project folder picker, settings validation and narrow screen", async ({

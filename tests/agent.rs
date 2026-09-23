@@ -240,7 +240,7 @@ impl LlmClient for ConfigureDuringCall {
             Ok(call(
                 "goals",
                 "task_state",
-                json!({"action":"update","patch":{"current":"compare documents","next":"report"}}),
+                json!({"action":"update","patch":{"findings":["compare documents"]}}),
             ))
         } else {
             assert_eq!(config.output_tokens, 4000);
@@ -276,7 +276,7 @@ async fn settings_apply_at_next_request_and_generic_tasks_work() {
     .await;
     drain.await.unwrap();
     assert_eq!(result.config.output_tokens, 4000);
-    assert_eq!(result.task.current, "compare documents");
+    assert_eq!(result.task.findings, ["compare documents"]);
     assert!(result.active_tools.contains("file_read"));
     assert!(!result.active_tools.contains("document_edit"));
     assert_eq!(result.status, "complete");
@@ -329,7 +329,7 @@ impl LlmClient for RetryCleanup {
                 Completion {
                     calls: vec![
                         ToolCall{id:format!("ack-{}",state["checkpoint"]["id"]),name:"checkpoint_complete".into(),arguments:json!({"id":state["checkpoint"]["id"],"progress":"필요한 기억을 보존했고 원본 수정 금지를 유지한다. 다음은 문서 작성이다."}).to_string()},
-                        ToolCall{id:format!("progress-{}",state["checkpoint"]["id"]),name:"task_state".into(),arguments:json!({"action":"update","patch":{"current":"실패 근거와 다음 작업 저장 완료"}}).to_string()},
+                        ToolCall{id:format!("progress-{}",state["checkpoint"]["id"]),name:"task_state".into(),arguments:json!({"action":"update","patch":{"findings":["실패 근거와 다음 작업 저장 완료"]}}).to_string()},
                     ], ..Default::default()
                 }
             }
@@ -532,11 +532,26 @@ struct RepeatedRead {
 impl LlmClient for RepeatedRead {
     async fn complete(
         &self,
-        _: Value,
+        request: Value,
         _: &Config,
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
+        let state: Value = serde_json::from_str(
+            request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        if state["run_guidance"]["progress_recovery"]["active"] == true {
+            return Ok(Completion {
+                text: "The source was already read; proceeding with the answer.".into(),
+                ..Default::default()
+            });
+        }
         let mut step = self.step.lock().unwrap();
         *step += 1;
         Ok(call(
@@ -547,7 +562,7 @@ impl LlmClient for RepeatedRead {
     }
 }
 #[tokio::test]
-async fn unchanged_parallel_reads_are_suppressed_then_stop_recoverably() {
+async fn unchanged_parallel_reads_are_suppressed_then_answer_without_blocking() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
     let mut session = s(dir.path());
@@ -565,8 +580,7 @@ async fn unchanged_parallel_reads_are_suppressed_then_stop_recoverably() {
     )
     .await;
     drain.await.unwrap();
-    assert_eq!(result.status, "blocked");
-    assert!(result.last_error.unwrap().contains("repeated_work_limit"));
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
     assert!(
         result
             .history
@@ -577,7 +591,121 @@ async fn unchanged_parallel_reads_are_suppressed_then_stop_recoverably() {
                 .as_str()
                 .is_some_and(|t| t.contains("\"suppressed\":true")))
     );
-    assert_eq!(result.history.bundles.len(), 4);
+    assert_eq!(result.history.bundles.len(), 5);
+}
+
+struct VariedReadsThenWrites(Mutex<usize>);
+#[async_trait]
+impl LlmClient for VariedReadsThenWrites {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let state: Value = serde_json::from_str(
+            request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        let mut step = self.0.lock().unwrap();
+        let response = if *step < 3 {
+            assert_eq!(state["run_guidance"]["progress_recovery"]["active"], false);
+            call(
+                &format!("read-{step}"),
+                "file_read",
+                json!({"path":"main.rs","start_line":*step+1,"max_lines":1}),
+            )
+        } else if *step == 3 {
+            assert_eq!(state["run_guidance"]["progress_recovery"]["active"], true);
+            assert_eq!(state["run_guidance"]["phase"], "draft");
+            let tools = request["tools"].as_array().unwrap();
+            assert!(
+                tools
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "document_edit")
+            );
+            assert!(
+                tools
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "file_read")
+            );
+            assert!(
+                !tools
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "source_search")
+            );
+            call(
+                "write",
+                "document_edit",
+                json!({"action":"create","text":"# Summary\nThe requested summary is saved.\n"}),
+            )
+        } else {
+            assert_eq!(state["run_guidance"]["progress_recovery"]["active"], false);
+            Completion {
+                text: "Saved the summary.".into(),
+                ..Default::default()
+            }
+        };
+        *step += 1;
+        Ok(response)
+    }
+}
+
+#[tokio::test]
+async fn varied_reads_without_deliverable_progress_focus_on_writing_and_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.rs"), "one\ntwo\nthree\n").unwrap();
+    let mut session = s(dir.path());
+    session.config.stall_round_limit = 3;
+    session.task.workflow = "document_edit".into();
+    session.task.deliverables = vec!["docs/source-summary.md".into()];
+    session.active_tools.insert("document_edit".into());
+    session.add_user("Save a summary of the source".into());
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(
+        session,
+        Arc::new(VariedReadsThenWrites(Mutex::new(0))),
+        CancellationToken::new(),
+        tx,
+    )
+    .await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert_eq!(result.task_rounds, 5);
+    assert!(dir.path().join("docs/source-summary.md").exists());
+}
+
+#[tokio::test]
+async fn resumed_document_work_retains_no_progress_count() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.rs"), "one\ntwo\nthree\n").unwrap();
+    let mut session = s(dir.path());
+    session.config.stall_round_limit = 3;
+    session.task.workflow = "document_edit".into();
+    session.task.deliverables = vec!["docs/source-summary.md".into()];
+    session.active_tools.insert("document_edit".into());
+    session.add_user("Save a summary of the source".into());
+    session.run_guidance =
+        json!({"progress_recovery":{"rounds_without_progress":2,"repeated_read":false}});
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(
+        session,
+        Arc::new(VariedReadsThenWrites(Mutex::new(2))),
+        CancellationToken::new(),
+        tx,
+    )
+    .await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert_eq!(result.task_rounds, 3);
 }
 
 struct BudgetPhases {
@@ -1489,7 +1617,7 @@ impl LlmClient for ChangingBadSources {
         response.calls.push(ToolCall {
             id: format!("progress-{round}"),
             name: "task_state".into(),
-            arguments: json!({"action":"update","patch":{"current":format!("round {round}")}})
+            arguments: json!({"action":"update","patch":{"findings":[format!("round {round}")]}})
                 .to_string(),
         });
         Ok(response)
@@ -1514,5 +1642,5 @@ async fn changing_bad_arguments_and_unrelated_writes_cannot_evade_recovery_limit
             .contains("tool_recovery_limit: memory_write")
     );
     assert_eq!(result.memory.entries.len(), 0);
-    assert_eq!(result.task.current, "round 2"); // No later writes after terminal failure.
+    assert_eq!(result.task.findings, ["round 2"]); // No later writes after terminal failure.
 }

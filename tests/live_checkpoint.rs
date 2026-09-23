@@ -36,7 +36,7 @@ async fn configured_model_completes_checkpoint_with_inline_progress() {
         config,
     );
     s.task.constraints = vec!["원본 파일을 변경하지 않는다".into()];
-    s.task.current = "기억을 사용해 중단 없이 이어가는 프로토콜을 테스트한다".into();
+    s.task.checkpoint_summary = "기억을 사용해 중단 없이 이어가는 프로토콜을 테스트한다".into();
     s.add_user("테스트 사실: Alpha는 RAM 기억을 사용한다. Beta는 기억을 파일에 저장한다. 이 사실과 파일 수정 금지를 유지한다.".into());
     s.memory.save(MemoryInput {
         key:Some("comparison".into()), title:"설계 차이".into(), summary:"Alpha RAM, Beta file".into(),

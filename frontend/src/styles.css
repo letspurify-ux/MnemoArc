@@ -1250,6 +1250,36 @@ button:hover {
   font-size: 11px;
   line-height: 1.8;
 }
+.task-plan {
+  padding-left: 22px;
+  font-size: 12px;
+}
+.task-plan li {
+  padding: 9px 8px;
+  border-bottom: 1px solid #edf1e6;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.task-plan .active {
+  background: #f0f5e8;
+  border-radius: 6px;
+}
+.task-plan .done {
+  color: #68765c;
+}
+.todo-status {
+  display: block;
+  font-size: 10px;
+  font-weight: 600;
+}
+.task-plan small {
+  display: block;
+  margin-top: 4px;
+}
+.plan-recovery {
+  font-size: 11px;
+  color: #617440;
+}
 .tool-toggle {
   display: flex;
   flex-direction: row;

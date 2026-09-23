@@ -6,6 +6,7 @@ mod file_edit;
 pub mod recovery;
 mod search;
 mod structure;
+pub mod task_plan;
 use crate::{
     config::Project,
     context::{self},
@@ -68,14 +69,13 @@ fn action(values: &[&str]) -> Value {
 pub struct ToolRegistry;
 fn task_patch_schema() -> Value {
     let mut properties = serde_json::Map::new();
-    for field in ["purpose", "scope", "current", "next"] {
+    for field in ["purpose", "scope"] {
         properties.insert(field.into(), string());
     }
     for field in [
         "deliverables",
         "constraints",
         "completion",
-        "done",
         "findings",
         "unresolved",
         "memory_ids",
@@ -177,7 +177,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "task_state",
-                description: "Read/update structured goals and compact progress, or read/write detailed work list. State fields belong inside patch, e.g. {action:update,patch:{phase:verify}}; phase is not a top-level argument. A new user task starts with a request-based completion condition; refine it into concrete checks before substantial work. For source documentation START with patch.workflow=source_document and completion criteria matching the user request; this locks evidence requirements and activates investigation/document_edit/document_edit_batch/document_audit immediately. Use investigation upsert for investigation items, NOT task_state. Do not send empty patches or completion:[]. Updates preserve omitted fields. Set patch.require_investigation=true BEFORE source-documentation work requiring evidence coverage; simple document edits do not need it. Once required, it cannot be disabled during the same request. Preserve user constraints unless explicitly changed by user",
+                description: "Read/update goals, constraints and completion criteria. Manage ordered work through task_plan; current/next/done and todos are not patch fields. State fields belong inside patch, e.g. {action:update,patch:{phase:verify}}. A new user task starts with a request-based completion condition; refine it into concrete checks before substantial work. For source documentation START with patch.workflow=source_document and completion criteria matching the user request; this activates investigation/document_edit/document_edit_batch/document_audit. Use investigation upsert for evidence items. Do not send empty patches or completion:[]. Updates preserve omitted fields. Evidence requirements and explicit user constraints remain in force even when a plan item is removed.",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -185,6 +185,7 @@ impl ToolRegistry {
                     &["action"],
                 ),
             },
+            task_plan::spec(),
             ToolSpec {
                 name: "history",
                 description: "Search retained raw conversation/tool bundles, or read one by ID and character offset (read requires id); unavailable/pruned ranges are explicit",
@@ -207,7 +208,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "checkpoint_complete",
-                description: "Finish a checkpoint and save progress in ONE call. Required progress is a concise current/next-work summary. Save needed memories first, or explain no new memory is needed with no_save_reason. Evaluated after other calls in this batch.",
+                description: "Finish a checkpoint and preserve the ordered task_plan in ONE call. Required progress is a concise checkpoint summary; it does not complete or replace plan items. Save needed memories first, or explain no new memory is needed with no_save_reason. Evaluated after other calls in this batch. Continue the first unfinished plan item after cleanup.",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -397,6 +398,7 @@ impl ToolRegistry {
             "memory_find",
             "memory_manage",
             "task_state",
+            "task_plan",
             "history",
             "checkpoint_complete",
             "source_lookup",
@@ -448,12 +450,22 @@ impl ToolRegistry {
         normalized
     }
     pub fn definitions(s: &Session) -> Vec<Value> {
+        let recovery_focus = s.run_guidance["progress_recovery"]["active"] == true
+            && (s.task.workflow == "source_document"
+                || s.task.workflow == "document_edit"
+                || s.task.require_investigation);
         Self::specs().into_iter()
             .filter(|t| t.name != "db_query" || s.config.database.active_queries().next().is_some())
             .filter(|t| t.name != "db_execute" || s.config.database.free_execution_enabled())
             .filter(|t| !t.optional || s.active_tools.contains(t.name))
             .filter(|t| s.config.memory_reuse || !["memory_read", "memory_find"].contains(&t.name))
             .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
+            // Keep exact source reads available for a concrete evidence gap,
+            // while removing broad rediscovery and memory churn until the
+            // document changes or an investigation is verified.
+            .filter(|t| !recovery_focus || s.checkpoint.is_some() || !matches!(t.name,
+                "file_list" | "source_search" | "symbol_search" | "code_outline"
+                    | "memory_write" | "memory_find" | "history"))
             .map(|mut t| {
                 let fields = t.parameters["properties"].clone();
                 // Keep offset for old clients, but offer the model only opaque continuation.
@@ -499,6 +511,11 @@ impl ToolRegistry {
                         {"properties":{"action":{"const":"details"}},"required":["action"],"not":{"required":["patch"]}},
                         {"properties":{"action":{"const":"update"}},"required":["action","patch"],"not":{"anyOf":[{"required":["offset"]},{"required":["limit"]}]}}
                     ]);
+                }
+                if t.name == "checkpoint_complete" {
+                    // Accept old callers' next summaries, but new plans have
+                    // one ordered source of truth through task_plan.
+                    t.parameters["properties"].as_object_mut().unwrap().remove("next");
                 }
                 if t.name == "memory_manage" {
                     t.parameters["oneOf"] = json!([
@@ -603,6 +620,7 @@ impl ToolRegistry {
                 Some("array") => v.as_array().is_some_and(|items| {
                     (name == "document_edit_batch" && k == "edits")
                         || (name == "file_patch" && k == "operations")
+                        || (name == "task_plan" && k == "operations")
                         || (name == "db_execute" && k == "args")
                         || items.iter().all(Value::is_string)
                 }),
@@ -1999,6 +2017,7 @@ pub fn execute_cancellable(
                 _ => unreachable!(),
             }
         }
+        "task_plan" => task_plan::execute(s, &args),
         "task_state" => match text(&args, "action")? {
             "read" => {
                 let mut task = json!(s.task);
@@ -2195,22 +2214,18 @@ pub fn execute_cancellable(
                 bail!("invalid_argument_value: checkpoint progress must be nonempty");
             }
             let mut task = s.task.clone();
-            task.current = progress.to_string();
-            if let Some(next) = args["next"].as_str() {
-                task.next = next.to_string();
+            task.checkpoint_summary = progress.to_string();
+            if let Some(next) = args["next"].as_str().filter(|next| !next.trim().is_empty()) {
+                task.checkpoint_summary.push_str(&format!("\n{next}"));
             }
             task.revision += 1;
             let mut compact = json!(task);
             compact.as_object_mut().unwrap().remove("details");
             if context::count(&compact, &s.config.model) > s.config.state_tokens {
-                bail!(
-                    "task_state_limit: shorten checkpoint progress/next; original progress retained"
-                );
+                bail!("task_state_limit: shorten checkpoint summary; original plan retained");
             }
             if serde_json::to_vec(&task)?.len() > s.config.memory_bytes {
-                bail!(
-                    "task_detail_limit: shorten checkpoint progress/next; original progress retained"
-                );
+                bail!("task_detail_limit: shorten checkpoint summary; original plan retained");
             }
             s.task = task;
             s.checkpoint.as_mut().unwrap().acknowledged = true;

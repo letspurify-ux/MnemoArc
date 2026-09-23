@@ -130,8 +130,25 @@ impl LlmClient for Script {
 }
 #[tokio::test]
 async fn one_review_replaces_draft_without_streaming_it_and_checks_final_citations() {
-    for (bad_citation, limited_draft) in [(false, false), (true, false), (false, true)] {
-        let (_dir, s) = setup();
+    for (bad_citation, limited_draft, with_plan) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+        (true, false, true),
+    ] {
+        let (_dir, mut s) = setup();
+        if with_plan {
+            tools::execute(
+                &mut s,
+                "task_plan",
+                json!({"action":"apply","expected_revision":0,"operations":[
+                    {"op":"insert","texts":["Prepare the review fixture"]},
+                    {"op":"complete","id":"T1","result":"Created the source fixture"}
+                ]}),
+            )
+            .unwrap();
+        }
         let client = Arc::new(Script {
             step: Mutex::new(0),
             bad_citation,
@@ -153,7 +170,7 @@ async fn one_review_replaces_draft_without_streaming_it_and_checks_final_citatio
         assert!(s.answer_reviewed);
         let shown = drain.await.unwrap();
         assert!(!shown.contains("\"always_true\":true"));
-        assert!(shown.contains("\"always_true\":false"));
+        assert_eq!(shown.matches("\"always_true\":false").count(), 1);
         assert!(s.answer_draft.is_none());
         if bad_citation {
             assert!(s.last_error.unwrap().contains("answer_citation_check"));

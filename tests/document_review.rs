@@ -514,8 +514,18 @@ impl LlmClient for StallingRepair {
         let content = request["messages"].as_array().unwrap().last().unwrap()["content"]
             .as_str()
             .unwrap();
-        if content.contains("[Current program state") {
+        if content.contains("[Current program state") || content.starts_with("CHECKPOINT CONTROL") {
             let state: Value = serde_json::from_str(content.split_once('\n').unwrap().1).unwrap();
+            if let Some(id) = state["checkpoint"]["id"].as_str() {
+                return Ok(Completion {
+                    calls: vec![mnemoarc::llm::ToolCall {
+                        id: format!("cleanup-{id}"),
+                        name: "checkpoint_complete".into(),
+                        arguments: json!({"id":id,"progress":"Document repair remains pending","no_save_reason":"Unchanged edits produced no new findings"}).to_string(),
+                    }],
+                    ..Default::default()
+                });
+            }
             if state["document_review"]["attempts"] == 1 {
                 return Ok(Completion {
                     calls: vec![mnemoarc::llm::ToolCall {
@@ -543,10 +553,12 @@ async fn failed_review_cannot_open_an_unbounded_repair_loop() {
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result = run_session(s, Arc::new(StallingRepair), CancellationToken::new(), tx).await;
     drain.await.unwrap();
-    assert_eq!(result.status, "partial");
+    assert_eq!(result.status, "partial", "{:?}", result.last_error);
     assert_eq!(result.document_review.attempts, 1);
     assert!(result.last_error.unwrap().contains("document_repair_limit"));
-    assert_eq!(result.task_rounds, 11); // initial final + review + eight edits + rejected edit
+    assert_eq!(result.document_review.repair_requests, 8);
+    // Initial final + review + eight edits + rejected edit; maintenance is separate.
+    assert_eq!(result.task_rounds, 11 + result.checkpoints_completed);
 }
 
 #[test]

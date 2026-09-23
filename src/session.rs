@@ -7,6 +7,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TodoItem {
+    pub id: String,
+    pub text: String,
+    pub done: bool,
+    #[serde(default)]
+    pub result: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TaskState {
@@ -17,15 +27,64 @@ pub struct TaskState {
     pub completion: Vec<String>,
     pub require_investigation: bool,
     pub workflow: String,
-    pub done: Vec<String>,
+    pub todos: Vec<TodoItem>,
+    pub plan_revision: u64,
+    pub todo_sequence: u64,
+    pub todos_completed_total: usize,
+    pub checkpoint_summary: String,
     pub findings: Vec<String>,
+    // Read old snapshots, then migrate once before running. These fields are
+    // neither exposed to the model nor maintained alongside the ordered plan.
+    #[serde(skip_serializing)]
+    pub done: Vec<String>,
+    #[serde(skip_serializing)]
     pub current: String,
     pub phase: String,
+    #[serde(skip_serializing)]
     pub next: String,
     pub unresolved: Vec<String>,
     pub memory_ids: Vec<String>,
     pub details: Vec<Value>,
     pub revision: u64,
+}
+impl TaskState {
+    pub fn current_todo(&self) -> Option<&TodoItem> {
+        self.todos.iter().find(|item| !item.done)
+    }
+
+    pub fn migrate_legacy_plan(&mut self) {
+        let current = std::mem::take(&mut self.current);
+        let next = std::mem::take(&mut self.next);
+        if self.checkpoint_summary.is_empty() {
+            self.checkpoint_summary = current;
+        }
+        let mut legacy: Vec<_> = std::mem::take(&mut self.done)
+            .into_iter()
+            .map(|text| (text, true))
+            .collect();
+        if self.todos.is_empty() {
+            legacy.push((next, false));
+        }
+        for (text, done) in legacy {
+            let text: String = text.trim().chars().take(160).collect();
+            if text.is_empty() || self.todos.iter().any(|item| item.text == text) {
+                continue;
+            }
+            self.todo_sequence = self.todo_sequence.saturating_add(1);
+            self.todos.push(TodoItem {
+                id: format!("T{}", self.todo_sequence),
+                text,
+                done,
+                result: String::new(),
+            });
+            self.todos_completed_total += usize::from(done);
+            self.plan_revision = self.plan_revision.saturating_add(1);
+        }
+        while self.todos.iter().filter(|item| item.done).count() > 5 {
+            let at = self.todos.iter().position(|item| item.done).unwrap();
+            self.todos.remove(at);
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Investigation {
@@ -323,7 +382,7 @@ impl Session {
                         let mut candidates: Vec<_> = self.sources.values().collect();
                         candidates.sort_by_key(|s| std::cmp::Reverse(s.observed_at));
                         let choices: Vec<_> = candidates.into_iter().take(8).map(|s| json!({"id":s.id,"path":s.path,"start_line":s.start_line,"end_line":s.end_line})).collect();
-                        anyhow::anyhow!("unknown_source: {id}; Use source_lookup with the matching path to recover an observed ID, or history to inspect the original result. A compact code_outline is navigation only and supplies no evidence ID. If no matching evidence exists, record missing evidence in checkpoint_complete.next and read the source after checkpoint completion; do not save an unsupported fact. Do not substitute unrelated IDs or remove source_ids to bypass this error. Recent sources (not automatic replacements): {}", json!(choices))
+                        anyhow::anyhow!("unknown_source: {id}; Use source_lookup with the matching path to recover an observed ID, or history to inspect the original result. A compact code_outline is navigation only and supplies no evidence ID. If no matching evidence exists, record missing evidence in checkpoint_complete.progress and the current task_plan item and read the source after checkpoint completion; do not save an unsupported fact. Do not substitute unrelated IDs or remove source_ids to bypass this error. Recent sources (not automatic replacements): {}", json!(choices))
                     })
             })
             .collect()

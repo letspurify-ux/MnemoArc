@@ -810,7 +810,7 @@ fn completion_cannot_be_emptied_by_task_state_update() {
     tools::execute(
         &mut s,
         "task_state",
-        json!({"action":"update","patch":{"current":"Reading route code"}}),
+        json!({"action":"update","patch":{"findings":["Reading route code"]}}),
     )
     .unwrap();
     assert_eq!(s.task.completion, original);

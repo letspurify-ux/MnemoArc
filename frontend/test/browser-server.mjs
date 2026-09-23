@@ -45,6 +45,54 @@ const provider = createServer(async (req, res) => {
     res.end("data: [DONE]\n\n");
     return;
   }
+  const planTest = data.messages.some(
+    (m) => m.role === "user" && m.content === "할 일 목록 테스트",
+  );
+  if (planTest) {
+    const stateMessage = data.messages.at(-1).content;
+    const state = JSON.parse(
+      stateMessage.slice(stateMessage.indexOf("\n") + 1),
+    );
+    const revision = state.task.plan_revision;
+    const operations = [
+      [{ op: "insert", texts: ["본문 작성", "결과 검증", "불필요 작업"] }],
+      [
+        { op: "insert", texts: ["선행 근거 확인"], before: "T1" },
+        { op: "remove", id: "T3", reason: "요청 범위 밖" },
+      ],
+      [{ op: "complete", id: "T4", result: "필요한 선언을 확인했습니다." }],
+    ][revision];
+    if (!operations) {
+      const keep = setInterval(() => res.write(": keepalive\n\n"), 1000);
+      res.on("close", () => clearInterval(keep));
+      return;
+    }
+    event({
+      choices: [
+        {
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: `plan-${revision}`,
+                function: {
+                  name: "task_plan",
+                  arguments: JSON.stringify({
+                    action: "apply",
+                    expected_revision: revision,
+                    operations,
+                  }),
+                },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+    });
+    res.end("data: [DONE]\n\n");
+    return;
+  }
   const continuation = data.messages.some(
     (m) => m.role === "user" && m.content === "길이 이어받기 테스트",
   );

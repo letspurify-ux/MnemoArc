@@ -40,6 +40,7 @@ export const toolLabels = {
   memory_find: "기억 검색",
   memory_manage: "기억 정리",
   task_state: "목표·진행 관리",
+  task_plan: "할 일 목록 관리",
   history: "원문 조회",
   source_lookup: "기존 출처 조회",
   checkpoint_complete: "체크포인트 확인",

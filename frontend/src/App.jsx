@@ -30,7 +30,7 @@ function loadInspectorWidth() {
 export default function App() {
   const [state, setState] = useState(null),
     [session, setSession] = useState(null),
-    [selected, setSelected] = useState(""),
+    [selected, setSelected] = useState(() => window.location.hash.slice(1)),
     [page, setPage] = useState("chat"),
     [error, setError] = useState(""),
     [connected, setConnected] = useState(false),
@@ -40,7 +40,7 @@ export default function App() {
     [stopped, setStopped] = useState(false),
     [stopping, setStopping] = useState(false),
     [inspectorWidth, setInspectorWidth] = useState(loadInspectorWidth);
-  const selection = useRef(window.location.hash.slice(1)),
+  const selection = useRef(selected),
     fetching = useRef(false),
     pending = useRef(false),
     timer = useRef(null),
@@ -765,6 +765,10 @@ function Inspector({
   const memories = session.memories.filter((m) =>
     JSON.stringify(m).toLowerCase().includes(query.toLowerCase()),
   );
+  const recovering =
+    session.status === "running" && session.run_guidance?.progress_recovery?.active;
+  const todos = session.task.todos || [];
+  const currentTodo = todos.find((item) => !item.done);
   return (
     <aside className="inspector">
       <InspectorResizeHandle width={width} onWidthChange={onWidthChange} />
@@ -902,6 +906,7 @@ function Inspector({
                     investigate: "조사",
                     draft: "작성 우선",
                     verify: "검증 우선",
+                    answer: "답변 작성",
                   }[session.run_guidance.phase]
                 }
                 {" · 남은 실행 예산 "}
@@ -910,41 +915,76 @@ function Inspector({
                 {session.run_guidance.pending_count}개
               </p>
             )}
+            <section className="task-plan-section" aria-label="할 일 목록">
+              <h4>할 일 목록</h4>
+              <p className="subtle">
+                남은 항목 {todos.filter((item) => !item.done).length}/8 · 누적
+                완료 {session.task.todos_completed_total || 0}개
+              </p>
+              {recovering && (
+                <p role="status" className="plan-recovery">
+                  반복을 감지해 현재 항목의 실제 결과를 만드는 데 집중하고
+                  있습니다.
+                </p>
+              )}
+              {todos.length ? (
+                <ol className="task-plan">
+                  {todos.map((item) => (
+                    <li
+                      key={item.id}
+                      className={
+                        item.done
+                          ? "done"
+                          : item.id === currentTodo?.id
+                            ? "active"
+                            : "pending"
+                      }
+                      aria-current={
+                        item.id === currentTodo?.id ? "step" : undefined
+                      }
+                    >
+                      <span className="todo-status">
+                        {item.done
+                          ? "완료"
+                          : item.id === currentTodo?.id
+                            ? "진행 중"
+                            : "대기"}
+                      </span>
+                      <span>{item.text}</span>
+                      {item.result && <small>{item.result}</small>}
+                    </li>
+                  ))}
+                </ol>
+              ) : (
+                <p className="subtle">
+                  여러 단계가 필요한 작업을 시작하면 순서대로 표시됩니다.
+                </p>
+              )}
+              {session.task.todos_completed_total > 5 && (
+                <small className="subtle">
+                  완료 기록은 최근 5개를 표시합니다.
+                </small>
+              )}
+            </section>
             <p>{session.task.purpose}</p>
-            {[
-              "constraints",
-              "completion",
-              "done",
-              "findings",
-              "unresolved",
-            ].map((key, i) => (
-              <section className="progress-section" key={key}>
-                <h4>
-                  {
-                    [
-                      "제약",
-                      "완료 조건",
-                      "완료한 일",
-                      "발견한 내용",
-                      "미확인 사항",
-                    ][i]
-                  }
-                </h4>
-                {session.task[key].length ? (
-                  <ul>
-                    {session.task[key].map((v, i) => (
-                      <li key={i}>{v}</li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="subtle">아직 등록된 내용이 없습니다.</p>
-                )}
-              </section>
-            ))}
-            <h4>현재 작업</h4>
-            <p>{session.task.current || "대기 중"}</p>
-            <h4>다음 작업</h4>
-            <p>{session.task.next || "—"}</p>
+            {["constraints", "completion", "findings", "unresolved"].map(
+              (key, i) => (
+                <section className="progress-section" key={key}>
+                  <h4>
+                    {["제약", "완료 조건", "발견한 내용", "미확인 사항"][i]}
+                  </h4>
+                  {session.task[key].length ? (
+                    <ul>
+                      {session.task[key].map((v, i) => (
+                        <li key={i}>{v}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="subtle">아직 등록된 내용이 없습니다.</p>
+                  )}
+                </section>
+              ),
+            )}
             <h4>조사 목록</h4>
             {session.investigations.map((item) => (
               <div className="source-card" key={item.id}>

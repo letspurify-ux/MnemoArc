@@ -21,6 +21,7 @@ fn results(s: &Session) -> impl Iterator<Item = Value> + '_ {
 
 pub fn eligible(s: &Session) -> bool {
     s.config.source_answer_review
+        && s.task.current_todo().is_none()
         && !s.answer_reviewed
         && s.answer_draft.is_none()
         && !s.document_written
