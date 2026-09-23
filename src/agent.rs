@@ -47,6 +47,83 @@ const REPEATED_OUTCOME_ERROR: &str = "progress_recovery_exhausted: repeated resp
 const NAVIGATION_STALL_ERROR: &str = "progress_recovery_exhausted: navigation and bookkeeping did not produce source evidence, a changed artifact or a verified result; current work is retained for a changed approach";
 const ARTIFACT_CHURN_ERROR: &str = "artifact_progress_exhausted: many distinct edits produced no completed task item, verified section or improved completion check; current files and requirements are retained for a changed approach";
 
+/// Document recovery is bounded by the run budget, not an independent retry
+/// quota. Keep the cause visible so the next request must change its approach.
+fn recover_document(s: &mut Session, reason: &str) -> bool {
+    if !s.is_document_work() {
+        return false;
+    }
+    s.progress_recovery.recovery_reason = Some(reason.into());
+    true
+}
+
+/// A tool-free reviewer cannot repair a missing citation, an oversized draft,
+/// or invalid metadata. Return such failures to the agent with the cause intact.
+fn recover_review_setup(s: &mut Session, reason: &str) -> bool {
+    if !s.is_document_work()
+        || !tools::recovery::correctable_document_error(&json!({
+            "recovery": tools::recovery::describe(reason)
+        }))
+    {
+        return false;
+    }
+    if s.document_review.pending {
+        tools::document_review::defer_for_repair(s);
+    }
+    s.completion_review.pending = false;
+    s.completion_review.approved = false;
+    s.status = "running".into();
+    s.last_error = Some(reason.into());
+    s.progress_recovery.action_required = !reason.starts_with("completion_review_budget:");
+    recover_document(
+        s,
+        &format!(
+            "Review preparation failed: {reason}. Correct the cited content, missing evidence or task metadata with tools, or shorten only the final chat report if it exceeded review input. Preserve the original requirements and requested document content, then request final verification again."
+        ),
+    )
+}
+
+fn recover_unexecuted_batch(s: &mut Session, reason: &str) -> bool {
+    let code = reason.split(':').next().unwrap_or(reason);
+    if !s.is_document_work()
+        || !matches!(
+            code,
+            "tool_call_batch_limit" | "invalid_tool_arguments" | "malformed_tool_call"
+        )
+    {
+        return false;
+    }
+    // The provider parser and completion validator reject the whole response
+    // before execution. Recover malformed calls just like oversized batches;
+    // they must not bypass the tool executor's correctable-input policy.
+    // Review requests have no executable tools. Their next request needs JSON
+    // protocol feedback, not an instruction to reissue a smaller tool batch.
+    if s.checkpoint.is_none() && s.completion_review.pending {
+        s.last_error = Some(format!(
+            "completion_review_invalid: {reason}; return complete checks JSON without tool calls"
+        ));
+        return true;
+    }
+    if s.checkpoint.is_none() && s.document_review.pending {
+        s.last_error = Some(format!(
+            "document_review_incomplete: {reason}; return complete issues JSON without tool calls"
+        ));
+        return true;
+    }
+    let budget = if s.checkpoint.is_some() {
+        ContextManager::cleanup_result_budget(&s.config)
+    } else {
+        s.config.batch_tokens
+    };
+    let limit = crate::llm::MAX_TOOL_CALLS.min(budget / 200);
+    let guidance = format!(
+        "{reason}; none of this batch executed. Reissue necessary calls in batches of at most {limit} with valid JSON object arguments, short unique call IDs and exact available tool names."
+    );
+    s.last_error = Some(reason.into());
+    s.progress_recovery.action_required = true;
+    recover_document(s, &guidance)
+}
+
 #[derive(Clone, Debug)]
 pub enum RunCommand {
     Configure(Box<Config>),
@@ -543,13 +620,13 @@ pub async fn run_session_controlled(
             // even if the model previously declared itself ready to answer.
             phase = "verify".into();
         }
-        let document_work = s.task.workflow == "source_document"
-            || s.task.workflow == "document_edit"
-            || s.task.require_investigation;
+        let document_work = s.is_document_work();
         let planned_work = s.task.current_todo().is_some();
         let focused_repair = s.completion_review.stalled_reviews
             >= COMPLETION_REVIEW_NO_PROGRESS_LIMIT
-            || s.completion_review.repair_rounds >= COMPLETION_REPAIR_ROUND_LIMIT;
+            || s.completion_review.repair_rounds >= COMPLETION_REPAIR_ROUND_LIMIT
+            || s.document_review.stalled_attempts >= s.config.review_limit
+            || s.progress_recovery.recovery_reason.is_some();
         let repeated_outcome_focus =
             s.progress_recovery.repeated_outcome_rounds >= s.config.stall_round_limit;
         let substantive_focus = s.progress_recovery.rounds_without_substantive_progress
@@ -565,7 +642,7 @@ pub async fn run_session_controlled(
                 || artifact_focus);
         if progress_recovery {
             phase = if document_work {
-                if s.document_written || !s.investigations.is_empty() {
+                if phase == "verify" || s.document_written || !s.investigations.is_empty() {
                     "verify"
                 } else {
                     "draft"
@@ -578,10 +655,12 @@ pub async fn run_session_controlled(
             .into();
         }
         s.task.phase = phase.clone();
-        let focused_instruction = "Focused recovery: choose the first unmet completion check or current to-do and perform one concrete action that changes the requested result or verifies specific missing evidence. A task_plan applied=false or unchanged=true result did no work: use its corrected example or a different tool. Do not submit another final answer with an unfinished to-do, cycle between earlier file versions, merely rewrite the plan, or save another summary. After a real edit, advance its to-do or verify the resulting section; many different rewrites without a completed milestone do not count as unlimited progress. If the original result already exists, verify it with the relevant tool, then complete only the actual remaining work. Keep the original requirements.";
+        let focused_instruction = "Focused recovery: choose the first document_review issue, unmet completion check or current to-do and perform one concrete action that changes the requested result or verifies specific missing evidence. Read recovery_reason and the last tool's recovery contract; correct the cause or choose a different action before retrying. A task_plan applied=false or unchanged=true result did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, merely rewrite the plan, or save another summary. After a real edit, advance its to-do or verify the resulting section. If the original result already exists, verify it with the relevant tool, then complete only the actual remaining work. Document retry counts are recovery signals, not permission to stop or weaken requirements: continue to final verification within the remaining tokens and time.";
         s.run_guidance = json!({"task_rounds":s.task_rounds,"finalization_attempts":finalization_attempts,"phase":phase,"remaining_tokens":remaining,"remaining_seconds":seconds_remaining,
+            "recovery_reason":s.progress_recovery.recovery_reason,"action_required":s.progress_recovery.action_required,
             "progress_recovery":{"active":progress_recovery,"focused":focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus,"rounds_without_progress":rounds_without_progress,"rounds_without_substantive_progress":s.progress_recovery.rounds_without_substantive_progress,"repeated_outcome_rounds":s.progress_recovery.repeated_outcome_rounds,"artifact_edits_without_milestone":s.progress_recovery.artifact_edits_without_milestone,"repeated_read":repeated_read_detected},
             "current_todo":s.task.current_todo(),
+            "max_tool_calls":32.min(if s.checkpoint.is_some() { ContextManager::cleanup_result_budget(&s.config) } else { s.config.batch_tokens } / 200),
             "plan_pending_count":s.task.todos.iter().filter(|item| !item.done).count(),
             "plan_instruction":"Execute current_todo before later items. Insert a concrete prerequisite before it when needed, or split a broad pending item into ordered smaller outcomes while preserving its goal. Complete the current item through task_plan with the observed result; plan edits do not reset no-progress recovery. If the plan is full, finish the current item or remove obsolete pending items; do not stop the task.",
             "writing_reserve_tokens":(s.config.run_tokens as f64*s.config.writing_reserve_ratio) as usize,
@@ -591,7 +670,7 @@ pub async fn run_session_controlled(
             "document_repair_requests_remaining":s.config.document_repair_limit.saturating_sub(s.document_review.repair_requests),
             "pending_count":s.investigations.iter().filter(|i|i.status != "verified").count(),
             "completion_error":if finalization_attempts > 0 || s.last_error.as_deref().is_some_and(|error| error.starts_with("task_plan_pending:") || error.starts_with("completion_review") || error.starts_with("documentation_coverage")) { s.last_error.as_deref() } else { None },
-            "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: repeated investigation has not changed the document or verified an item. Use the evidence already gathered to make one small, safe document_edit now, or verify an existing written item. Inspect the output hash if needed. Read only a specific missing source range that directly blocks that action. Do not gather more general evidence or save another memory first. If a claim cannot be supported, mark that gap in the relevant section and continue with supported work; do not invent evidence. A checkpoint remains the only exception for memory maintenance." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, batch targeted reads for missing evidence, then repair known issues in their original locations with targeted section or text edits when safe. Review findings are edit instructions, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Run verify_batch once after all edits, not after every small correction. Only requests containing document_edit or document_edit_batch consume the repair budget (one per request, including failed edits); reads and verification do not. At zero remaining, finish verification and review without another edit. The remaining edit request budget is in document_repair_requests_remaining; audit existing sections and fix factual errors within that budget. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, save each investigated section in a separate edit as soon as its evidence is ready. Check the current outline; use insert_before/insert_after for siblings and insert_first_child/insert_last_child for nested sections when that preserves the document flow. Copy section_path when headings repeat; preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>"For source documentation, investigate one section, save it, then move to the next. Create only a short opening with the first ready section; inspect the outline before each later addition, copy section_path when headings repeat, and use sibling or child insertion to place it within the hierarchy. For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. Answer once evidence is sufficient; no source audit or document write is required."} }});
+            "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: repeated investigation has not changed the document or verified an item. Use the evidence already gathered to make one small, safe document_edit now, or verify an existing written item. Inspect the output hash if needed. Read only a specific missing source range that directly blocks that action. Do not gather more general evidence or save another memory first. If a claim cannot be supported, mark that gap in the relevant section and continue with supported work; do not invent evidence. A checkpoint remains the only exception for memory maintenance." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, batch targeted reads for missing evidence, then repair known issues in their original locations with targeted section or text edits when safe. Review findings are edit instructions, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Run verify_batch once after all edits, not after every small correction. Only requests containing document_edit or document_edit_batch advance the review interval (one per request, including failed edits); reads and verification do not. The runtime reviews after an executed edit batch reaches the interval, preserving all sibling calls. Unchanged rejected documents reuse their findings. This interval is not a total edit allowance: keep correcting the original requirements within the remaining run tokens and time. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, save each investigated section in a separate edit as soon as its evidence is ready. Check the current outline; use insert_before/insert_after for siblings and insert_first_child/insert_last_child for nested sections when that preserves the document flow. Copy section_path when headings repeat; preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>"For source documentation, investigate one section, save it, then move to the next. Create only a short opening with the first ready section; inspect the outline before each later addition, copy section_path when headings repeat, and use sibling or child insertion to place it within the hierarchy. For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. Answer once evidence is sufficient; no source audit or document write is required."} }});
         let definitions = ToolRegistry::definitions(&s);
         let mut request = match ContextManager::request(&s, definitions.clone()) {
             Ok(r) => r,
@@ -606,8 +685,9 @@ pub async fn run_session_controlled(
             break;
         }
         if let Some(cp) = &mut s.checkpoint {
-            if cp.attempts >= context::CHECKPOINT_MAX_REQUESTS
-                || cp.failed_attempts >= context::CHECKPOINT_MAX_FAILURES
+            if !document_work
+                && (cp.attempts >= context::CHECKPOINT_MAX_REQUESTS
+                    || cp.failed_attempts >= context::CHECKPOINT_MAX_FAILURES)
             {
                 failure = Some(format!(
                     "checkpoint_retry_limit: {} requests, {} failed requests; last cause: {}; original context retained",
@@ -638,6 +718,9 @@ pub async fn run_session_controlled(
             request = match tools::completion_review::request(&mut s) {
                 Ok(request) => request,
                 Err(error) => {
+                    if recover_review_setup(&mut s, &error.to_string()) {
+                        continue;
+                    }
                     s.status = "partial".into();
                     s.last_error = Some(error.to_string());
                     break;
@@ -648,6 +731,9 @@ pub async fn run_session_controlled(
             request = match tools::document_review::request(&mut s) {
                 Ok(request) => request,
                 Err(error) => {
+                    if recover_review_setup(&mut s, &error.to_string()) {
+                        continue;
+                    }
                     failure = Some(error.to_string());
                     break;
                 }
@@ -661,6 +747,17 @@ pub async fn run_session_controlled(
                     break;
                 }
             };
+        }
+        if document_work
+            && s.progress_recovery.action_required
+            && s.checkpoint.is_none()
+            && !reviewing_completion
+            && !reviewing_document
+            && !reviewing_answer
+        {
+            // A rejected final must return to a concrete tool action. Review
+            // requests remain tool-free, and a subsequent final is still gated.
+            request["tool_choice"] = json!("required");
         }
         let buffer_answer = reviewing_completion
             || reviewing_document
@@ -711,10 +808,7 @@ pub async fn run_session_controlled(
         if let Some(cp) = &mut s.checkpoint {
             cp.attempts += 1;
         }
-        let document_workflow = s.task.require_investigation
-            || s.task.workflow == "source_document"
-            || s.task.workflow == "document_edit"
-            || tools::completion_review::required(&s);
+        let document_workflow = s.is_document_work() || tools::completion_review::required(&s);
         request[crate::llm::STREAM_DELTAS_MARKER] = json!(!(buffer_answer || document_workflow));
         let (tx, mut rx) = mpsc::channel(64);
         let event_tx = events.clone();
@@ -761,6 +855,15 @@ pub async fn run_session_controlled(
                 s.input_tokens = s
                     .input_tokens
                     .saturating_add(request_tokens.saturating_mul(attempts));
+                if recover_unexecuted_batch(&mut s, &e.to_string()) {
+                    // Parsing failures have no trusted usage receipt. Charge
+                    // the reserved output as well as every attempted input so
+                    // malformed responses cannot escape the run token budget.
+                    s.output_tokens = s
+                        .output_tokens
+                        .saturating_add(request_config.output_tokens.saturating_mul(attempts));
+                    continue;
+                }
                 failure = Some(e.to_string());
                 break;
             }
@@ -783,6 +886,9 @@ pub async fn run_session_controlled(
                 s.usage_incomplete = true;
                 s.input_tokens = s.input_tokens.saturating_add(request_tokens);
                 s.output_tokens = s.output_tokens.saturating_add(request_config.output_tokens);
+            }
+            if recover_unexecuted_batch(&mut s, &error.to_string()) {
+                continue;
             }
             failure = Some(error.to_string());
             break;
@@ -836,9 +942,17 @@ pub async fn run_session_controlled(
             };
             match result {
                 Err(error) => {
+                    let reason = error.to_string();
+                    if s.is_document_work() && !reason.starts_with("completion_review_invalid:") {
+                        if recover_review_setup(&mut s, &reason) {
+                            continue;
+                        }
+                        failure = Some(reason);
+                        break;
+                    }
                     review_response_failures += 1;
-                    s.last_error = Some(error.to_string());
-                    if review_response_failures >= REVIEW_RESPONSE_LIMIT {
+                    s.last_error = Some(reason);
+                    if review_response_failures >= REVIEW_RESPONSE_LIMIT && !s.is_document_work() {
                         s.status = "partial".into();
                         break;
                     }
@@ -872,10 +986,18 @@ pub async fn run_session_controlled(
                         s.completion_review.stalled_reviews =
                             s.completion_review.stalled_reviews.saturating_add(1);
                         tools::completion_review::schedule_repairs(&mut s);
-                        if s.completion_review.stalled_reviews >= COMPLETION_REVIEW_EXHAUST_LIMIT {
+                        if s.completion_review.stalled_reviews >= COMPLETION_REVIEW_EXHAUST_LIMIT
+                            && !recover_document(
+                                &mut s,
+                                "Completion checks still fail. Follow the first unmet check using different evidence or a concrete correction.",
+                            )
+                        {
                             s.status = "partial".into();
                             s.last_error = Some("completion_review_no_progress: focused repairs did not satisfy another criterion; repair tasks and unmet checks retained for a changed approach".into());
                             break;
+                        }
+                        if s.is_document_work() {
+                            s.progress_recovery.action_required = true;
                         }
                         emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"완료 조건에 미충족 또는 확인 불가 항목이 있어 보완 작업을 이어갑니다.".into() }, &cancel, run_deadline(started, &s.config)).await;
                     }
@@ -923,7 +1045,7 @@ pub async fn run_session_controlled(
                 let reason = error.to_string();
                 review_response_failures += 1;
                 s.last_error = Some(reason.clone());
-                if review_response_failures < REVIEW_RESPONSE_LIMIT
+                if (s.is_document_work() || review_response_failures < REVIEW_RESPONSE_LIMIT)
                     && (reason.starts_with("document_review_invalid:")
                         || reason.starts_with("document_review_incomplete:")
                         || reason.starts_with("document_review_stale:"))
@@ -931,10 +1053,11 @@ pub async fn run_session_controlled(
                     snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
                     continue;
                 }
-                // A malformed provider response must not discard the written
-                // document or turn a resumable review into a hard worker
-                // failure. Keep the review pending and expose a resumable
-                // partial result after the bounded retries.
+                if recover_review_setup(&mut s, &reason) {
+                    continue;
+                }
+                // Document retries retain the pending page until the run budget.
+                // Other workflows retain the bounded protocol-recovery policy.
                 if reason.starts_with("document_review_invalid:")
                     || reason.starts_with("document_review_incomplete:")
                     || reason.starts_with("document_review_stale:")
@@ -952,10 +1075,12 @@ pub async fn run_session_controlled(
                     "document_review: {}",
                     s.document_review.issues.join("; ")
                 ));
+                s.progress_recovery.action_required = true;
                 if s.document_review.stalled_attempts >= s.config.review_limit {
-                    s.status = "partial".into();
-                    s.last_error = Some("document_review_no_progress: repeated reviews did not resolve or reduce an issue; current document and findings are retained".into());
-                    break;
+                    recover_document(
+                        &mut s,
+                        "Document review still has unresolved findings. Correct the first finding in its original section, then verify that section; do not request another unchanged review.",
+                    );
                 }
             }
             snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
@@ -988,6 +1113,13 @@ pub async fn run_session_controlled(
             && completion.calls.is_empty()
             && completion.text.trim().is_empty()
         {
+            if recover_document(
+                &mut s,
+                "The model returned an empty response. Use a concrete document repair or verification tool before the final answer.",
+            ) {
+                s.progress_recovery.action_required = true;
+                continue;
+            }
             // A provider may legally return stop with an empty content field.
             // Treating that as a successful final answer would mark the task
             // complete while persisting an empty assistant message.
@@ -1019,10 +1151,15 @@ pub async fn run_session_controlled(
             s.activity = json!({"stage":"continuing","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds});
             snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
             if length_recoveries >= LENGTH_RECOVERY_LIMIT {
-                failure = Some(format!(
-                    "length_recovery_limit: partial text retained after {LENGTH_RECOVERY_LIMIT} output-limit responses; shorten the requested answer or adjust output/reasoning settings before resuming"
-                ));
-                break;
+                let reason = format!(
+                    "length_recovery_limit: {length_recoveries} consecutive output-limit responses. Split document edits into smaller complete calls and keep final reports concise; discarded tool batches did not execute."
+                );
+                if !recover_document(&mut s, &reason) {
+                    failure = Some(format!(
+                        "length_recovery_limit: partial text retained after {LENGTH_RECOVERY_LIMIT} output-limit responses; shorten the requested answer or adjust output/reasoning settings before resuming"
+                    ));
+                    break;
+                }
             }
             // Use the normal next-request path for budget, timeout, cancellation
             // and checkpoint checks; never execute a length-limited tool batch.
@@ -1043,9 +1180,12 @@ pub async fn run_session_controlled(
         };
         let call_limit = 32.min(batch_limit / 200);
         if completion.calls.len() > call_limit {
-            failure = Some(format!(
-                "tool_call_batch_limit: maximum {call_limit} calls at this result budget"
-            ));
+            let reason =
+                format!("tool_call_batch_limit: maximum {call_limit} calls at this result budget");
+            if recover_unexecuted_batch(&mut s, &reason) {
+                continue;
+            }
+            failure = Some(reason);
             break;
         }
         if completion.calls.is_empty() {
@@ -1131,7 +1271,15 @@ pub async fn run_session_controlled(
                 s.run_guidance["progress_recovery"]["active"] = json!(
                     repeated_read_detected || rounds_without_progress >= s.config.stall_round_limit
                 );
-                if repeated_outcome_exhausted(&s) {
+                if s.is_document_work() {
+                    s.progress_recovery.action_required = true;
+                }
+                if repeated_outcome_exhausted(&s)
+                    && !recover_document(
+                        &mut s,
+                        "Repeated final claims left the current to-do unfinished. Complete its actual work and record the result before answering.",
+                    )
+                {
                     s.status = "partial".into();
                     s.last_error = Some(REPEATED_OUTCOME_ERROR.into());
                     break;
@@ -1164,7 +1312,13 @@ pub async fn run_session_controlled(
                                 s.progress_recovery.coverage_stalls = 0;
                             }
                             tools::capabilities::enqueue(&mut s, &audit);
-                            if s.progress_recovery.coverage_stalls >= FINALIZATION_RETRY_LIMIT {
+                            s.progress_recovery.action_required = true;
+                            if s.progress_recovery.coverage_stalls >= FINALIZATION_RETRY_LIMIT
+                                && !recover_document(
+                                    &mut s,
+                                    "Documentation coverage is unchanged. Resolve the first inventory gap with its source evidence and document binding.",
+                                )
+                            {
                                 s.status = "partial".into();
                                 s.last_error = Some("documentation_coverage_no_progress: unchanged gaps remain; inventory, evidence and repair tasks retained for resume".into());
                                 break;
@@ -1205,18 +1359,22 @@ pub async fn run_session_controlled(
                                 && s.config.source_document_review
                                 && !tools::document_review::approved(&s)
                             {
-                                if tools::document_review::stalled_on_current_result(&s) {
+                                if tools::document_review::rejected_on_current_result(&s) {
                                     s.status = "partial".into();
-                                    s.last_error = Some("document_review_no_progress: current document has no successful review after repeated unchanged findings".into());
-                                    break;
+                                    s.last_error = Some(format!(
+                                        "document_review: unchanged document still requires correction: {}",
+                                        s.document_review.issues.join("; ")
+                                    ));
+                                } else {
+                                    s.document_review.pending = true;
+                                    s.status = "running".into();
+                                    emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"Reviewing the document against source evidence and requested coverage.".into() }, &cancel, run_deadline(started, &s.config)).await;
+                                    continue;
                                 }
-                                s.document_review.pending = true;
-                                s.status = "running".into();
-                                emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"Reviewing the document against source evidence and requested coverage (bounded same-model review).".into() }, &cancel, run_deadline(started, &s.config)).await;
-                                continue;
+                            } else {
+                                s.status = "complete".into();
+                                s.last_error = None;
                             }
-                            s.status = "complete".into();
-                            s.last_error = None;
                         }
                         Ok(audit) => {
                             s.status = "partial".into();
@@ -1256,7 +1414,15 @@ pub async fn run_session_controlled(
                         tools::completion_review::schedule_repairs(&mut s);
                         s.completion_review.stalled_reviews =
                             s.completion_review.stalled_reviews.saturating_add(1);
-                        if s.completion_review.stalled_reviews >= COMPLETION_REVIEW_EXHAUST_LIMIT {
+                        if s.is_document_work() {
+                            s.progress_recovery.action_required = true;
+                        }
+                        if s.completion_review.stalled_reviews >= COMPLETION_REVIEW_EXHAUST_LIMIT
+                            && !recover_document(
+                                &mut s,
+                                "The unchanged result still fails completion checks. Perform the repair against actual content, not plan bookkeeping or another final claim.",
+                            )
+                        {
                             s.status = "partial".into();
                             s.last_error = Some("completion_review_no_progress: unchanged results still fail acceptance after focused repair; repair tasks and unmet checks retained for a changed approach".into());
                             break;
@@ -1265,15 +1431,29 @@ pub async fn run_session_controlled(
                         continue;
                     }
                     Err(error) => {
+                        if recover_review_setup(&mut s, &error.to_string()) {
+                            continue;
+                        }
                         s.status = "partial".into();
                         s.last_error = Some(error.to_string());
                         break;
                     }
                 }
             }
-            if s.status == "partial" && finalization_attempts < FINALIZATION_RETRY_LIMIT {
-                finalization_attempts += 1;
+            if s.status == "partial"
+                && (s.is_document_work() || finalization_attempts < FINALIZATION_RETRY_LIMIT)
+            {
+                finalization_attempts = finalization_attempts.saturating_add(1);
                 s.progress_recovery.finalization_attempts = finalization_attempts;
+                if s.is_document_work() {
+                    s.progress_recovery.action_required = true;
+                    if finalization_attempts >= FINALIZATION_RETRY_LIMIT {
+                        recover_document(
+                            &mut s,
+                            "Finalization still has missing evidence or document work. Resolve completion_error with tools; the remaining run budget is available for finishing.",
+                        );
+                    }
+                }
                 s.status = "running".into();
                 emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"Completion checks failed; returning to pending evidence verification within the remaining budget".into() }, &cancel, run_deadline(started, &s.config)).await;
                 continue;
@@ -1293,32 +1473,20 @@ pub async fn run_session_controlled(
             }
             break;
         }
-        // Count editing requests, not reads, verification, final answers or maintenance.
-        // The configured allowance is a review interval. Check the current
-        // result before another edit; a progressing document may then continue.
-        if s.config.source_document_review
+        if s.checkpoint.is_none() {
+            s.progress_recovery.action_required = false;
+        }
+        // Count the batch once and review AFTER it is executed. Rejecting the
+        // response at this boundary silently lost valid edits and sibling calls.
+        let repair_edit_request = s.config.source_document_review
             && s.checkpoint.is_none()
             && s.document_review.repair_started_round.is_some()
             && completion
                 .calls
                 .iter()
-                .any(|call| matches!(call.name.as_str(), "document_edit" | "document_edit_batch"))
-        {
-            if s.document_review.repair_requests >= s.config.document_repair_limit {
-                s.document_review.pending = true;
-                emit(
-                    &events,
-                    AgentEvent::Notice {
-                        session: s.id.clone(),
-                        text: "Rechecking the current document before more edits.".into(),
-                    },
-                    &cancel,
-                    run_deadline(started, &s.config),
-                )
-                .await;
-                continue;
-            }
-            s.document_review.repair_requests += 1;
+                .any(|call| matches!(call.name.as_str(), "document_edit" | "document_edit_batch"));
+        if repair_edit_request {
+            s.document_review.repair_requests = s.document_review.repair_requests.saturating_add(1);
         }
         if (buffer_answer || document_workflow) && !completion.text.is_empty() {
             emit(
@@ -1487,7 +1655,10 @@ pub async fn run_session_controlled(
                     tool_failures.observe(&call.name, &result, s.config.stall_round_limit)
                     && failure.is_none()
                 {
-                    failure = Some(reason);
+                    let correctable = tools::recovery::correctable_document_error(&result);
+                    if !correctable || !recover_document(&mut s, &reason) {
+                        failure = Some(reason);
+                    }
                 }
                 if result["error"]
                     .as_str()
@@ -1654,6 +1825,7 @@ pub async fn run_session_controlled(
                 .saturating_add(1);
         }
         if novel_artifact_change || verified_progress {
+            s.progress_recovery.recovery_reason = None;
             rounds_without_progress = 0;
             repeated_read_detected = false;
             finalization_attempts = 0;
@@ -1755,14 +1927,25 @@ pub async fn run_session_controlled(
                 .any(|check| check.status != "met")
         {
             s.completion_review.repair_rounds = s.completion_review.repair_rounds.saturating_add(1);
-            if s.completion_review.repair_rounds >= COMPLETION_REPAIR_EXHAUST_LIMIT {
+            if s.completion_review.repair_rounds >= COMPLETION_REPAIR_EXHAUST_LIMIT
+                && !recover_document(
+                    &mut s,
+                    "Repair rounds have not satisfied a completion check. Resolve the first check through a targeted edit or missing evidence, then request acceptance.",
+                )
+            {
                 tools::completion_review::schedule_repairs(&mut s);
                 s.status = "partial".into();
                 s.last_error = Some("completion_review_no_progress: focused repair rounds did not satisfy another criterion; repair tasks and unmet checks retained for a changed approach".into());
                 break;
             }
         }
-        if !checkpoint_batch && repeated_outcome_exhausted(&s) {
+        if !checkpoint_batch
+            && repeated_outcome_exhausted(&s)
+            && !recover_document(
+                &mut s,
+                "Repeated actions produced no new result. Use the existing evidence to repair or verify the current document section; change the failing arguments or action.",
+            )
+        {
             s.status = "partial".into();
             s.last_error = Some(REPEATED_OUTCOME_ERROR.into());
             break;
@@ -1770,6 +1953,10 @@ pub async fn run_session_controlled(
         if !checkpoint_batch
             && s.progress_recovery.rounds_without_substantive_progress
                 >= substantive_progress_limit(&s.config)
+            && !recover_document(
+                &mut s,
+                "Navigation and bookkeeping are not completing the document. Write the current section from available evidence or read only its specific missing source range.",
+            )
         {
             s.status = "partial".into();
             s.last_error = Some(NAVIGATION_STALL_ERROR.into());
@@ -1778,10 +1965,29 @@ pub async fn run_session_controlled(
         if !checkpoint_batch
             && s.progress_recovery.artifact_edits_without_milestone
                 >= artifact_exhaust_limit(&s.config)
+            && !recover_document(
+                &mut s,
+                "Different rewrites have not completed a milestone. Verify the current section and resolve its concrete findings instead of another general rewrite.",
+            )
         {
             s.status = "partial".into();
             s.last_error = Some(ARTIFACT_CHURN_ERROR.into());
             break;
+        }
+        if repair_edit_request
+            && s.document_review.repair_requests >= s.config.document_repair_limit
+        {
+            if tools::document_review::rejected_on_current_result(&s) {
+                // Failed/no-op edits did not create a new review target. Retain
+                // the findings and renew the correction interval without a call.
+                s.document_review.repair_requests = 0;
+                recover_document(
+                    &mut s,
+                    "The edit interval left the reviewed document unchanged. Correct the failed/no-op edit using the tool result; the existing review findings still apply.",
+                );
+            } else {
+                s.document_review.pending = true;
+            }
         }
         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
     }

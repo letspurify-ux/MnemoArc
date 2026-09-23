@@ -546,6 +546,44 @@ fn documentation_tools_respect_permissions_and_reserve() {
 }
 
 #[test]
+fn verification_recovery_can_locate_and_register_missing_required_coverage() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("helper.rs"), "fn normalize() {}\n").unwrap();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"existing","title":"Existing flow","section":"# Flow"}),
+    );
+    s.run_guidance = json!({"phase":"verify","progress_recovery":{"active":true}});
+    let definitions = tools::ToolRegistry::definitions(&s);
+    for name in ["file_list", "source_search", "code_outline"] {
+        assert!(
+            definitions
+                .iter()
+                .any(|definition| definition["function"]["name"] == name)
+        );
+    }
+    assert!(tools::execute(&mut s, "file_list", json!({})).is_err());
+    let found = run(
+        &mut s,
+        "file_list",
+        json!({"mode":"paths","path_glob":"**/helper.rs"}),
+    );
+    assert!(found.to_string().contains("helper.rs"));
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"missing","title":"Required normalization","section":"# Normalization"}),
+    );
+    assert_eq!(s.investigations.len(), 2);
+    assert!(
+        s.investigations
+            .iter()
+            .all(|item| item.status != "verified")
+    );
+}
+
+#[test]
 fn long_korean_section_survives_result_limiting_and_resumes_exactly() {
     let (_dir, mut s) = setup();
     let body = format!(

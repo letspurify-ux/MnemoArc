@@ -52,7 +52,9 @@ pub struct Config {
     pub retries: usize,
     pub run_timeout_secs: u64,
     pub run_tokens: usize,
+    /// Stalled document reviews before focused recovery (not a stop quota).
     pub review_limit: usize,
+    /// Edit requests per automatic document re-review interval.
     pub document_repair_limit: usize,
     pub source_answer_review: bool,
     pub source_document_review: bool,

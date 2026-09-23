@@ -462,10 +462,8 @@ impl ToolRegistry {
         normalized
     }
     pub fn definitions(s: &Session) -> Vec<Value> {
-        let recovery_focus = s.run_guidance["progress_recovery"]["active"] == true
-            && (s.task.workflow == "source_document"
-                || s.task.workflow == "document_edit"
-                || s.task.require_investigation);
+        let recovery_focus =
+            s.run_guidance["progress_recovery"]["active"] == true && s.is_document_work();
         Self::specs().into_iter()
             .filter(|t| t.name != "db_query" || s.config.database.active_queries().next().is_some())
             .filter(|t| t.name != "db_execute" || s.config.database.free_execution_enabled())
@@ -475,13 +473,21 @@ impl ToolRegistry {
             .filter(|t| t.name != "documentation_coverage" || s.capabilities.active)
             .filter(|t| s.config.memory_reuse || !["memory_read", "memory_find"].contains(&t.name))
             .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
-            // Keep exact source reads available for a concrete evidence gap,
-            // while removing broad rediscovery and memory churn until the
-            // document changes or an investigation is verified.
+            // Draft recovery discourages rediscovery. Verification must still
+            // be able to locate a missing helper/path and finish source coverage.
             .filter(|t| !recovery_focus || s.checkpoint.is_some() || !matches!(t.name,
-                "file_list" | "source_search" | "symbol_search" | "code_outline"
-                    | "memory_write" | "memory_find" | "history"))
+                "memory_write" | "memory_find" | "history")
+                && (s.run_guidance["phase"] == "verify" || !matches!(t.name,
+                    "file_list" | "source_search" | "symbol_search" | "code_outline")))
             .map(|mut t| {
+                if recovery_focus && s.checkpoint.is_none() {
+                    if t.name == "file_list" {
+                        t.parameters["anyOf"] = json!([{"required":["path_glob"]},{"required":["pattern"]},{"required":["cursor"]}]);
+                    }
+                    if t.name == "source_search" {
+                        t.parameters["anyOf"] = json!([{"required":["path"]},{"required":["path_glob"]},{"required":["pattern"]},{"required":["cursor"]}]);
+                    }
+                }
                 if t.name == "capability_inventory" && !s.capabilities.active {
                     t.description = "Start a paged UI/server function inventory for comprehensive documentation. Scanning exposes source review, classification, registration and documentation_coverage tools; static discovery is heuristic.";
                     t.parameters = schema(json!({"action":action(&["scan"])}), &["action"]);
@@ -1867,17 +1873,26 @@ pub fn execute_cancellable(
     }
     if s.run_guidance["phase"] == "verify"
         && !s.investigations.is_empty()
-        && (name == "file_list"
+        && ((name == "file_list"
+            && args["cursor"].as_str().is_none()
+            && !["path_glob", "pattern"].iter().any(|key| {
+                args[*key]
+                    .as_str()
+                    .is_some_and(|pattern| !matches!(pattern.trim(), "" | "*" | "**" | "**/*"))
+            }))
             || (name == "symbol_search" && args["query"].as_str().unwrap_or("").is_empty())
             || (name == "investigation"
                 && args["action"] == "upsert"
                 && !capabilities::allows_investigation(s, &args)
+                && args["section"]
+                    .as_str()
+                    .is_none_or(|section| section.trim().is_empty())
                 && args["id"]
                     .as_str()
                     .is_none_or(|id| !s.investigations.iter().any(|item| item.id == id))))
     {
         bail!(
-            "verification_reserve: focus on existing investigation items; broad discovery and new items are paused"
+            "verification_reserve: use a targeted path_glob or nonempty symbol query for missing evidence; register missing original requirements with a concrete document section; broad discovery is paused"
         );
     }
     match name {
@@ -2636,10 +2651,9 @@ pub fn execute_cancellable(
                         json!({"complete":false,"audit":audit,"review":s.reviews,"guidance":"Fix structural evidence issues before final review."}),
                     );
                 }
-                if s.reviews >= s.config.review_limit {
-                    bail!("review_budget_exhausted");
-                }
-                s.reviews += 1;
+                // This is a read-only structural preflight, not a model review
+                // allowance. Later edits must remain eligible for verification.
+                s.reviews = s.reviews.saturating_add(1);
                 revalidate(s)?;
                 let incomplete: Vec<_> = s
                     .investigations

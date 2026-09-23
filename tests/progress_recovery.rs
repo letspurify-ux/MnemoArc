@@ -639,6 +639,11 @@ impl LlmClient for BlankDocumentChurn {
                 name: "document_edit".into(),
                 arguments: args.to_string(),
             }],
+            usage: Some(mnemoarc::llm::Usage {
+                input: 5_000,
+                output: 10,
+                cached: None,
+            }),
             ..Default::default()
         })
     }
@@ -648,7 +653,7 @@ impl LlmClient for BlankDocumentChurn {
 async fn empty_line_growth_does_not_keep_a_document_loop_alive() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
-    s.config.run_tokens = 5_000_000;
+    s.config.run_tokens = 220_000;
     s.config.source_document_review = false;
     s.task.workflow = "document_edit".into();
     s.active_tools.insert("document_edit".into());
@@ -660,13 +665,13 @@ async fn empty_line_growth_does_not_keep_a_document_loop_alive() {
         }),
     )
     .await;
-    assert_eq!(result.status, "partial", "{:?}", result.last_error);
+    assert_eq!(result.status, "blocked", "{:?}", result.last_error);
     assert!(
         result
             .last_error
             .as_deref()
             .unwrap_or("")
-            .starts_with("artifact_progress_exhausted")
+            .starts_with("run_budget_exhausted")
     );
     assert_eq!(result.progress_recovery.best_document_content_lines, 1);
 }

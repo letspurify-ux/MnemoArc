@@ -497,6 +497,7 @@ async fn empty_todos_cannot_bypass_inventory_gate_and_unchanged_churn_is_bounded
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.unknown"), "runtime_register(config)\n").unwrap();
     let mut s = session(dir.path());
+    s.config.context_tokens = 128_000;
     s.add_user("Document every registered function".into());
     scan(&mut s);
     let (tx, mut rx) = mpsc::channel(128);
@@ -509,16 +510,16 @@ async fn empty_todos_cannot_bypass_inventory_gate_and_unchanged_churn_is_bounded
     )
     .await;
     drain.await.unwrap();
-    assert_eq!(s.status, "partial", "{:?}", s.last_error);
+    assert_eq!(s.status, "blocked", "{:?}", s.last_error);
     assert!(
         s.last_error
             .as_deref()
             .unwrap()
-            .starts_with("documentation_coverage_no_progress"),
+            .starts_with("run_budget_exhausted"),
         "{:?}",
         s.last_error
     );
-    assert!(s.task.current_todo().is_some());
+    assert!(!audit(&s).ready);
     assert!(s.capabilities.active);
     assert!(s.progress_recovery.coverage_stalls >= 8);
     let stalls = s.progress_recovery.coverage_stalls;

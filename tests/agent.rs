@@ -874,8 +874,15 @@ async fn premature_final_is_retried_but_never_claimed_complete_without_coverage(
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result = run_session(session, client.clone(), CancellationToken::new(), tx).await;
     drain.await.unwrap();
-    assert_eq!(result.status, "partial");
-    assert_eq!(*client.calls.lock().unwrap(), 9);
+    assert_eq!(result.status, "blocked");
+    assert!(
+        result
+            .last_error
+            .as_deref()
+            .unwrap()
+            .starts_with("run_budget_exhausted")
+    );
+    assert!(*client.calls.lock().unwrap() > 9);
     assert_eq!(result.run_guidance["phase"], "verify");
     // Rejected completion claims must not appear as final answers in UI history.
     assert!(result.history.bundles.is_empty());
@@ -1370,12 +1377,24 @@ async fn simple_edit_cannot_complete_if_saved_file_changes_or_disappears() {
         )
         .await;
         drain.await.unwrap();
-        assert_eq!(result.status, "partial");
-        assert!(result.last_error.unwrap().contains(if remove {
-            "document_write_verification_failed"
-        } else {
-            "document_changed_after_write"
-        }));
+        assert_eq!(result.status, "blocked");
+        assert!(
+            result
+                .last_error
+                .as_deref()
+                .unwrap()
+                .starts_with("run_budget_exhausted")
+        );
+        assert!(
+            result.run_guidance["completion_error"]
+                .as_str()
+                .unwrap()
+                .contains(if remove {
+                    "document_write_verification_failed"
+                } else {
+                    "document_changed_after_write"
+                })
+        );
     }
 }
 
@@ -1448,10 +1467,10 @@ async fn existing_unverified_investigation_still_blocks_completion() {
     )
     .await;
     drain.await.unwrap();
-    assert_eq!(result.status, "partial");
+    assert_eq!(result.status, "blocked");
     assert!(
-        result
-            .last_error
+        result.run_guidance["completion_error"]
+            .as_str()
             .unwrap()
             .contains("Unverified investigation")
     );

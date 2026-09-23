@@ -380,6 +380,37 @@ pub struct FailureTracker {
     by_tool_and_code: BTreeMap<(String, String), usize>,
     by_tool: BTreeMap<String, usize>,
 }
+
+/// Every failed item in a mixed batch must be correctable. An uncertain write
+/// cannot inherit the recovery policy of ordinary argument/evidence errors.
+pub fn correctable_document_error(result: &Value) -> bool {
+    match result["recovery"]["class"].as_str() {
+        Some(
+            "invalid_input" | "prerequisite" | "missing_path" | "missing_evidence" | "stale_state"
+            | "capacity",
+        ) => true,
+        // Tool selection, a text-reader fallback and checkpoint completion are
+        // available remedies; these do not mean the runtime itself is lost.
+        Some("unavailable") => matches!(
+            result["recovery"]["code"].as_str(),
+            Some(
+                "tool_not_active"
+                    | "unsupported_tool"
+                    | "unsupported_language"
+                    | "checkpoint_pending"
+            )
+        ),
+        Some("partial_failure") => result["data"]["results"].as_array().is_some_and(|items| {
+            !items.is_empty()
+                && items.iter().all(|item| {
+                    let result = item.get("result").unwrap_or(item);
+                    result["status"] == "ok" || correctable_document_error(result)
+                })
+        }),
+        _ => false,
+    }
+}
+
 impl FailureTracker {
     pub fn observe(&mut self, tool: &str, result: &Value, limit: usize) -> Option<String> {
         if result["status"] == "ok" {

@@ -216,6 +216,10 @@ pub struct ReadCoverage {
 /// resets it; merely restarting a run cannot make a repeated result new work.
 #[derive(Clone, Debug, Default)]
 pub struct ProgressRecovery {
+    /// A rejected document final must return to tools before trying to finish.
+    pub action_required: bool,
+    /// Recovery thresholds change the approach; document work retains its budget.
+    pub recovery_reason: Option<String>,
     pub rounds_without_progress: usize,
     /// New navigation pages alone cannot keep a stalled task alive forever.
     pub rounds_without_substantive_progress: usize,
@@ -333,6 +337,17 @@ pub struct Session {
     pub continuation: Option<bool>,
 }
 impl Session {
+    pub fn is_document_work(&self) -> bool {
+        self.task.require_investigation
+            || matches!(
+                self.task.workflow.as_str(),
+                "source_document" | "document_edit"
+            )
+            || self.document_written
+            || !self.investigations.is_empty()
+            || self.capabilities.active
+    }
+
     fn initial_completion(&self, request: &str) -> Vec<String> {
         let request = request.trim();
         let max_chars = (self.config.state_tokens / 6).clamp(24, 320);

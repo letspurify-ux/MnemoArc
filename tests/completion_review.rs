@@ -80,6 +80,108 @@ fn finish(s: &mut Session, met: bool) -> Option<String> {
 }
 
 #[test]
+fn targeted_read_keeps_evidence_beyond_the_old_receipt_character_cutoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let marker = "Example: the requested tail is present";
+    write(
+        &mut s,
+        &format!(
+            "{}\n{}\n{marker}\n",
+            "Introduction ".repeat(600),
+            "Evidence ".repeat(450)
+        ),
+    );
+    let call = ToolCall {
+        id: "read-tail".into(),
+        name: "file_read".into(),
+        arguments: json!({"path":"result.txt","start_line":2,"max_lines":2}).to_string(),
+    };
+    let result = tools::run_call(&mut s, &call);
+    assert_eq!(result["status"], "ok", "{result}");
+    assert!(
+        result["data"]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .contains(marker)
+    );
+    review::observe(&mut s, &call, &result);
+    review::begin(&mut s, "Saved result.txt").unwrap();
+    let p = payload(&review::request(&mut s).unwrap());
+    let evidence = p["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "tool_observation" && e["data"]["tool"] == "file_read")
+        .unwrap();
+    assert_eq!(evidence["data"]["truncated"], false);
+    assert!(
+        evidence["data"]["observed"]
+            .as_str()
+            .unwrap()
+            .contains(marker)
+    );
+    assert!(mnemoarc::context::count(&review::request(&mut s).unwrap(), &s.config.model) <= 16_000);
+    assert_eq!(finish(&mut s, true).as_deref(), Some("Saved result.txt"));
+}
+
+#[test]
+fn repeated_evidence_order_does_not_restart_rejected_completion_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(
+        &mut s,
+        "Conclusion only\nStill missing the requested example\n",
+    );
+    let mut reads = Vec::new();
+    for line in [1, 2] {
+        let call = ToolCall {
+            id: format!("read-{line}"),
+            name: "file_read".into(),
+            arguments: json!({"path":"result.txt","start_line":line,"max_lines":1}).to_string(),
+        };
+        let result = tools::run_call(&mut s, &call);
+        review::observe(&mut s, &call, &result);
+        reads.push((call, result));
+    }
+    assert_eq!(review::begin(&mut s, "Done").unwrap(), Gate::Review);
+    assert!(finish(&mut s, false).is_none());
+    for (call, result) in reads.iter().cycle().take(12) {
+        review::observe(&mut s, call, result);
+        assert_eq!(review::begin(&mut s, "Done").unwrap(), Gate::Repair);
+    }
+    review::observe(
+        &mut s,
+        &reads[0].0,
+        &json!({"status":"ok","data":{
+            "path":dir.path().join("result.txt"),"hash":tools::hash(&std::fs::read(dir.path().join("result.txt")).unwrap()),"suppressed":true
+        }}),
+    );
+    assert_eq!(review::begin(&mut s, "Done").unwrap(), Gate::Repair);
+    assert_eq!(s.completion_review.attempts, 1);
+}
+
+#[test]
+fn database_observation_order_remains_part_of_completion_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Conclusion only");
+    let call = ToolCall {
+        id: "query".into(),
+        name: "db_query".into(),
+        arguments: "{}".into(),
+    };
+    let before = json!({"status":"ok","data":{"rows":[{"state":"before"}]}});
+    let after = json!({"status":"ok","data":{"rows":[{"state":"after"}]}});
+    review::observe(&mut s, &call, &before);
+    review::observe(&mut s, &call, &after);
+    review::begin(&mut s, "Done").unwrap();
+    assert!(finish(&mut s, false).is_none());
+    review::observe(&mut s, &call, &before);
+    assert_eq!(review::begin(&mut s, "Done").unwrap(), Gate::Review);
+}
+
+#[test]
 fn empty_plan_is_not_acceptance_and_repair_is_deduplicated() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());

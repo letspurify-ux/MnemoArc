@@ -110,6 +110,11 @@ pub fn observe(s: &mut Session, call: &crate::llm::ToolCall, result: &Value) {
     if result["status"] != "ok" {
         return;
     }
+    // A suppressed repeat contains no new evidence. Retain the real read
+    // instead of consuming a receipt slot with another navigation reminder.
+    if result["data"]["suppressed"] == true {
+        return;
+    }
     if !mutation
         && !matches!(
             call.name.as_str(),
@@ -150,7 +155,11 @@ pub fn observe(s: &mut Session, call: &crate::llm::ToolCall, result: &Value) {
     let mut observed = data.clone();
     strip_volatile(&mut observed);
     let encoded = observed.to_string();
-    let receipt = json!({"tool":call.name,"file_versions":bindings,"observed":encoded.chars().take(3000).collect::<String>(),"truncated":encoded.chars().count()>3000});
+    // Runtime results already fit result_tokens. An extra character cutoff
+    // can repeatedly hide the exact tail the reviewer asked the agent to read.
+    let (observed, truncated) =
+        context::truncate(&encoded, s.config.result_tokens, &s.config.model);
+    let receipt = json!({"tool":call.name,"file_versions":bindings,"observed":observed,"truncated":truncated});
     s.completion_review.receipts.retain(|r| r != &receipt);
     s.completion_review.receipts.push(receipt);
     let overflow = s
@@ -332,6 +341,31 @@ pub enum Gate {
     Repair,
 }
 
+fn fingerprint(payload: &Value) -> String {
+    let mut canonical = payload.clone();
+    let mut ordered_observations = Vec::new();
+    if let Some(evidence) = canonical["evidence"].as_array_mut() {
+        for item in evidence.iter_mut() {
+            // Only the program-assigned reference is positional. Business IDs
+            // inside tool observations and all actual evidence remain intact.
+            item.as_object_mut().unwrap().remove("id");
+            if item["kind"] == "tool_observation"
+                && !matches!(
+                    item["data"]["tool"].as_str(),
+                    Some("file_read" | "symbol_read" | "source_search" | "document_inspect")
+                )
+            {
+                // Preserve write/database observation order: those can carry
+                // distinct effects even when their result sets look alike.
+                ordered_observations.push(item.clone());
+            }
+        }
+        evidence.sort_by_cached_key(Value::to_string);
+    }
+    canonical["ordered_observations"] = json!(ordered_observations);
+    hash(canonical.to_string().as_bytes())
+}
+
 /// No model call is needed again for unchanged rejected results. Plan changes
 /// do not affect this fingerprint, so completing/deleting a repair cannot evade it.
 pub fn begin(s: &mut Session, draft: &str) -> Result<Gate> {
@@ -384,7 +418,7 @@ pub fn begin_final(s: &mut Session, draft: &str, continues_previous: bool) -> Re
     }
     s.completion_review.continues_previous = continues_previous;
     let payload = snapshot(s, draft)?;
-    let fingerprint = hash(payload.to_string().as_bytes());
+    let fingerprint = fingerprint(&payload);
     let state = &mut s.completion_review;
     state.required = true;
     state.draft = draft.into();
@@ -415,7 +449,7 @@ pub fn request(s: &mut Session) -> Result<Value> {
     }
     // Rebuild on resume or concurrent edits, before consuming more review pages.
     let current = snapshot(s, &s.completion_review.draft)?;
-    let fingerprint = hash(current.to_string().as_bytes());
+    let fingerprint = fingerprint(&current);
     if fingerprint != s.completion_review.fingerprint {
         s.completion_review.fingerprint = fingerprint;
         s.completion_review.reviewed_fingerprint.clear();
@@ -462,12 +496,7 @@ pub fn finish(s: &mut Session, response: &str) -> Result<Option<String>> {
     }
     let mut verdict: Verdict = serde_json::from_str(body)
         .map_err(|e| anyhow::anyhow!("completion_review_invalid: {e}"))?;
-    if hash(
-        snapshot(s, &s.completion_review.draft)?
-            .to_string()
-            .as_bytes(),
-    ) != s.completion_review.fingerprint
-    {
+    if fingerprint(&snapshot(s, &s.completion_review.draft)?) != s.completion_review.fingerprint {
         bail!(
             "completion_review_invalid: evidence or requirements changed; retry against current result"
         );

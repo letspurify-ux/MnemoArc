@@ -5,6 +5,26 @@ use mnemoarc::{
     tools::{self, ToolRegistry, recovery::FailureTracker},
 };
 use serde_json::json;
+
+#[test]
+fn uncertain_nested_write_is_not_treated_as_a_correctable_document_error() {
+    let invalid = tools::envelope(Err(anyhow::anyhow!(
+        "document_revision_conflict: stale hash"
+    )));
+    let uncertain = tools::envelope(Err(anyhow::anyhow!(
+        "database_commit_uncertain: inspect outcome"
+    )));
+    let mut mixed = json!({"status":"error","recovery":{"class":"partial_failure"},"data":{"results":[
+        {"result":{"status":"ok"}}, {"result":invalid}
+    ]}});
+    assert!(tools::recovery::correctable_document_error(&mixed));
+    mixed["data"]["results"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"result":uncertain}));
+    assert!(!tools::recovery::correctable_document_error(&mixed));
+}
+
 fn session(root: &std::path::Path) -> Session {
     let mut s = Session::new(
         Project {
