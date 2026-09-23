@@ -110,6 +110,55 @@ fn empty_plan_is_not_acceptance_and_repair_is_deduplicated() {
 }
 
 #[test]
+fn reworded_repair_reuses_its_criterion_item_and_distinct_actions_split() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Conclusion only");
+
+    for (answer, action, distinct) in [
+        (
+            "Draft one",
+            "Add the requested example to result.txt",
+            false,
+        ),
+        ("Draft two", "Read and add the missing example", false),
+        ("Draft three", "Read and add the missing example", true),
+    ] {
+        assert_eq!(review::begin(&mut s, answer).unwrap(), Gate::Review);
+        let p = payload(&review::request(&mut s).unwrap());
+        let mut response: Value = serde_json::from_str(&verdict(&p, false)).unwrap();
+        for check in response["checks"].as_array_mut().unwrap() {
+            check["next_action"] = json!(if distinct && check["id"] == "R0" {
+                "Correct the conclusion"
+            } else {
+                action
+            });
+        }
+        assert!(
+            review::finish(&mut s, &response.to_string())
+                .unwrap()
+                .is_none()
+        );
+        review::schedule_repairs(&mut s);
+        let expected = if distinct { 2 } else { 1 };
+        assert_eq!(
+            s.task.todos.iter().filter(|item| !item.done).count(),
+            expected
+        );
+        assert!(s.task.todos.iter().any(|item| item.id == "T1"));
+        if !distinct {
+            let current = s.task.current_todo().unwrap();
+            assert_eq!(current.id, "T1");
+            assert_eq!(current.text, action);
+            plan(
+                &mut s,
+                json!([{"op":"complete","id":"T1","result":"Still incomplete"}]),
+            );
+        }
+    }
+}
+
+#[test]
 fn approval_requires_every_page_and_is_invalidated_by_files_or_requirements() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
@@ -442,6 +491,171 @@ async fn unchanged_rejection_cannot_loop_reviews_or_publish_success() {
         !events
             .iter()
             .any(|e| matches!(e,AgentEvent::Delta{text,..} if text=="Done"))
+    );
+}
+
+struct RepeatingReadClient {
+    reviews: Mutex<usize>,
+    calls: Mutex<usize>,
+}
+#[async_trait]
+impl LlmClient for RepeatingReadClient {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let p: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
+                .unwrap_or(Value::Null);
+        if p["completion_review"] == true {
+            *self.reviews.lock().unwrap() += 1;
+            return Ok(Completion {
+                text: verdict(&p, false),
+                ..Default::default()
+            });
+        }
+        if *self.reviews.lock().unwrap() == 0 {
+            return Ok(Completion {
+                text: "Done".into(),
+                ..Default::default()
+            });
+        }
+        let state: Value = serde_json::from_str(
+            request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )?;
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        let (name, arguments) = if let Some(id) = state["checkpoint"]["id"].as_str() {
+            (
+                "checkpoint_complete",
+                json!({"id":id,"progress":"The rejected completion review remains unresolved.","no_save_reason":"The review checks already preserve the missing requirement."}),
+            )
+        } else if let Some(id) = state["run_guidance"]["current_todo"]["id"].as_str() {
+            (
+                "task_plan",
+                json!({"action":"apply","expected_revision":state["task"]["plan_revision"],"operations":[{"op":"complete","id":id,"result":"Repeated the existing check"}]}),
+            )
+        } else {
+            (
+                "file_read",
+                json!({"path":"result.txt","start_line":1,"max_lines":1,"force_read":true}),
+            )
+        };
+        Ok(Completion {
+            calls: vec![ToolCall {
+                id: format!("repeat-{}", *calls),
+                name: name.into(),
+                arguments: arguments.to_string(),
+            }],
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn rejected_review_bounds_tool_only_repair_loop_and_keeps_work_for_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Conclusion only");
+    let client = Arc::new(RepeatingReadClient {
+        reviews: Mutex::new(0),
+        calls: Mutex::new(0),
+    });
+    let (result, events) = run(s, client.clone()).await;
+    assert_eq!(
+        result.status,
+        "partial",
+        "error={:?}, calls={}, reviews={}",
+        result.last_error,
+        *client.calls.lock().unwrap(),
+        *client.reviews.lock().unwrap()
+    );
+    assert!(
+        result
+            .last_error
+            .as_deref()
+            .unwrap()
+            .starts_with("completion_review_no_progress")
+    );
+    assert_eq!(*client.reviews.lock().unwrap(), 1);
+    assert!(*client.calls.lock().unwrap() <= 26);
+    assert!(result.task.current_todo().is_some());
+    assert!(!result.completion_review.checks.is_empty());
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Delta { text, .. } if text == "Done"))
+    );
+}
+
+struct ChangingAnswerClient(Mutex<usize>);
+#[async_trait]
+impl LlmClient for ChangingAnswerClient {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let p: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
+                .unwrap_or(Value::Null);
+        if p["completion_review"] == true {
+            *self.0.lock().unwrap() += 1;
+            return Ok(Completion {
+                text: verdict(&p, false),
+                ..Default::default()
+            });
+        }
+        let state: Value = serde_json::from_str(
+            request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )?;
+        if let Some(id) = state["run_guidance"]["current_todo"]["id"].as_str() {
+            return Ok(Completion {
+                calls: vec![ToolCall {
+                    id: format!("complete-{id}-{}", *self.0.lock().unwrap()),
+                    name: "task_plan".into(),
+                    arguments: json!({"action":"apply","expected_revision":state["task"]["plan_revision"],"operations":[{"op":"complete","id":id,"result":"No actual result changed"}]}).to_string(),
+                }],
+                ..Default::default()
+            });
+        }
+        Ok(Completion {
+            text: format!("Done, review {}", *self.0.lock().unwrap()),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn changing_final_words_do_not_reset_rejected_review_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Conclusion only");
+    let client = Arc::new(ChangingAnswerClient(Mutex::new(0)));
+    let (result, events) = run(s, client.clone()).await;
+    assert_eq!(result.status, "partial", "{:?}", result.last_error);
+    assert_eq!(*client.0.lock().unwrap(), 3);
+    assert!(result.task.current_todo().is_some());
+    assert!(!result.completion_review.approved);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Delta { text, .. } if text.starts_with("Done")))
     );
 }
 

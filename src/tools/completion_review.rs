@@ -40,6 +40,8 @@ pub struct ReviewState {
     offset: usize,
     #[serde(skip)]
     retention_omitted: bool,
+    #[serde(skip)]
+    repair_todos: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -550,26 +552,76 @@ pub fn schedule_repairs(s: &mut Session) {
         .checks
         .iter()
         .filter(|c| c.status != "met")
-        .map(|c| c.next_action.clone())
+        .map(|c| (c.id.clone(), c.next_action.clone()))
         .collect();
-    for action in actions {
-        let existing = s.task.todos.iter().find(|t| t.text == action);
-        let operation = match existing {
-            Some(item) if !item.done => continue,
-            Some(item) => {
-                json!({"op":"reopen","id":item.id,"reason":"완료 조건 재검증에서 미충족이 확인되었습니다."})
-            }
-            None => json!({"op":"insert","texts":[action]}),
-        };
-        let mut operations = vec![operation];
-        if let Some(item) = existing {
-            // reopen moves to the front; append it after earlier repair items.
-            operations.push(json!({"op":"move","id":item.id}));
+    let required_actions: BTreeSet<_> = actions.iter().map(|(_, action)| action.clone()).collect();
+    let mut action_ids = BTreeMap::<String, String>::new();
+    let mut used_ids = BTreeSet::<String>::new();
+    for (check_id, action) in actions {
+        if let Some(id) = action_ids.get(&action) {
+            s.completion_review
+                .repair_todos
+                .insert(check_id, id.clone());
+            continue;
         }
-        let _ = task_plan::execute(
-            s,
-            &json!({"action":"apply","expected_revision":s.task.plan_revision,"operations":operations}),
-        );
+        let mapped = s.completion_review.repair_todos.get(&check_id);
+        let existing = mapped
+            .and_then(|id| s.task.todos.iter().find(|item| &item.id == id))
+            .filter(|item| item.text == action && !used_ids.contains(&item.id))
+            .or_else(|| {
+                s.task
+                    .todos
+                    .iter()
+                    .find(|item| item.text == action && !used_ids.contains(&item.id))
+            })
+            .or_else(|| {
+                mapped
+                    .and_then(|id| s.task.todos.iter().find(|item| &item.id == id))
+                    .filter(|item| {
+                        !used_ids.contains(&item.id) && !required_actions.contains(&item.text)
+                    })
+            })
+            .cloned();
+        let mut operations = Vec::new();
+        match &existing {
+            Some(item) if item.done => {
+                operations.push(json!({"op":"reopen","id":item.id,"reason":"완료 조건 재검증에서 미충족이 확인되었습니다."}));
+                if item.text != action {
+                    operations.push(json!({"op":"update","id":item.id,"text":action}));
+                }
+                // Reopening puts the item first; keep earlier repair actions first.
+                operations.push(json!({"op":"move","id":item.id}));
+            }
+            Some(item) if item.text != action => {
+                operations.push(json!({"op":"update","id":item.id,"text":action}));
+            }
+            Some(_) => {}
+            None => operations.push(json!({"op":"insert","texts":[action]})),
+        }
+        let applied = if operations.is_empty() {
+            true
+        } else {
+            task_plan::execute(
+                s,
+                &json!({"action":"apply","expected_revision":s.task.plan_revision,"operations":operations}),
+            )
+            .is_ok_and(|result| result["applied"] == true)
+        };
+        if !applied {
+            continue;
+        }
+        let id = existing.map(|item| item.id).or_else(|| {
+            s.task
+                .todos
+                .iter()
+                .find(|item| item.text == action)
+                .map(|item| item.id.clone())
+        });
+        if let Some(id) = id {
+            used_ids.insert(id.clone());
+            action_ids.insert(action, id.clone());
+            s.completion_review.repair_todos.insert(check_id, id);
+        }
     }
     s.last_error = Some("completion_review_unmet: follow completion_review.checks; execute the repair to-dos against actual results. Do not repeat plan completion or an unchanged final answer. Preserve original requirements.".into());
 }

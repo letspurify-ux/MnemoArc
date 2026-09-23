@@ -16,6 +16,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const FINALIZATION_RETRY_LIMIT: usize = 8;
+const COMPLETION_REVIEW_NO_PROGRESS_LIMIT: usize = 3;
+const COMPLETION_REPAIR_ROUND_LIMIT: usize = 16;
 const LENGTH_RECOVERY_LIMIT: usize = 8;
 const REVIEW_RESPONSE_LIMIT: usize = 8;
 
@@ -364,6 +366,8 @@ pub async fn run_session_controlled(
     let mut length_recoveries = 0usize;
     let mut review_response_failures = 0usize;
     let mut completion_stalls = 0usize;
+    let mut completion_best_met = 0usize;
+    let mut completion_repair_rounds = 0usize;
     let mut coverage_stalls = 0usize;
     let mut coverage_fingerprint = String::new();
     let mut tool_failures = tools::recovery::FailureTracker::default();
@@ -809,7 +813,24 @@ pub async fn run_session_controlled(
                 Ok(None) => {
                     review_response_failures = 0;
                     if !s.completion_review.pending {
+                        let met = s
+                            .completion_review
+                            .checks
+                            .iter()
+                            .filter(|check| check.status == "met")
+                            .count();
+                        if met > completion_best_met {
+                            completion_best_met = met;
+                            completion_stalls = 0;
+                            completion_repair_rounds = 0;
+                        }
+                        completion_stalls = completion_stalls.saturating_add(1);
                         tools::completion_review::schedule_repairs(&mut s);
+                        if completion_stalls >= COMPLETION_REVIEW_NO_PROGRESS_LIMIT {
+                            s.status = "partial".into();
+                            s.last_error = Some("completion_review_no_progress: three reviews found no additional met criteria or changed result; repair tasks and unmet checks retained for resume".into());
+                            break;
+                        }
                         emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"완료 조건에 미충족 또는 확인 불가 항목이 있어 보완 작업을 이어갑니다.".into() }, &cancel, run_deadline(started, &s.config)).await;
                     }
                     snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
@@ -1172,7 +1193,7 @@ pub async fn run_session_controlled(
                     Ok(tools::completion_review::Gate::Repair) => {
                         tools::completion_review::schedule_repairs(&mut s);
                         completion_stalls += 1;
-                        if completion_stalls >= FINALIZATION_RETRY_LIMIT {
+                        if completion_stalls >= COMPLETION_REVIEW_NO_PROGRESS_LIMIT {
                             s.status = "partial".into();
                             s.last_error = Some("completion_review_no_progress: unchanged results still fail acceptance; repair tasks and unmet checks retained for resume".into());
                             break;
@@ -1494,6 +1515,8 @@ pub async fn run_session_controlled(
             .any(|(now, before)| *now > before);
         if document_changed || file_changed || new_verified > verified_count || inventory_progress {
             completion_stalls = 0;
+            completion_best_met = 0;
+            completion_repair_rounds = 0;
             rounds_without_progress = 0;
             repeated_read_detected = false;
         } else if !checkpoint_batch && tracking_work {
@@ -1549,6 +1572,19 @@ pub async fn run_session_controlled(
                     .into(),
             );
             break;
+        }
+        if s.completion_review
+            .checks
+            .iter()
+            .any(|check| check.status != "met")
+        {
+            completion_repair_rounds = completion_repair_rounds.saturating_add(1);
+            if completion_repair_rounds >= COMPLETION_REPAIR_ROUND_LIMIT {
+                tools::completion_review::schedule_repairs(&mut s);
+                s.status = "partial".into();
+                s.last_error = Some("completion_review_no_progress: repair rounds changed no output or verified result; repair tasks and unmet checks retained for resume".into());
+                break;
+            }
         }
         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
     }
