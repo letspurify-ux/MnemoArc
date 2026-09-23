@@ -88,7 +88,10 @@ fn recover_unexecuted_batch(s: &mut Session, reason: &str) -> bool {
     if !s.is_document_work()
         || !matches!(
             code,
-            "tool_call_batch_limit" | "invalid_tool_arguments" | "malformed_tool_call"
+            "tool_call_batch_limit"
+                | "invalid_tool_arguments"
+                | "malformed_tool_call"
+                | "response_size_limit"
         )
     {
         return false;
@@ -116,11 +119,19 @@ fn recover_unexecuted_batch(s: &mut Session, reason: &str) -> bool {
         s.config.batch_tokens
     };
     let limit = crate::llm::MAX_TOOL_CALLS.min(budget / 200);
-    let guidance = format!(
-        "{reason}; none of this batch executed. Reissue necessary calls in batches of at most {limit} with valid JSON object arguments, short unique call IDs and exact available tool names."
-    );
+    let guidance = if code == "response_size_limit" {
+        format!(
+            "{reason}; none of this response executed. Keep the next response concise and split large document edits into smaller complete calls within the output limit."
+        )
+    } else {
+        format!(
+            "{reason}; none of this batch executed. Reissue necessary calls in batches of at most {limit} with valid JSON object arguments, short unique call IDs and exact available tool names."
+        )
+    };
     s.last_error = Some(reason.into());
-    s.progress_recovery.action_required = true;
+    // An oversized text-only final can be fixed by shortening the answer;
+    // requiring a tool call here would delay acceptance for a finished file.
+    s.progress_recovery.action_required |= code != "response_size_limit";
     recover_document(s, &guidance)
 }
 
@@ -1207,7 +1218,9 @@ pub async fn run_session_controlled(
             };
             s.answer_review_issues = citation_issues.clone();
             let hold_document_final = document_workflow && s.checkpoint.is_none();
-            if buffer_answer && (!hold_document_final || !citation_issues.is_empty()) {
+            if buffer_answer
+                && (!hold_document_final || (!s.is_document_work() && !citation_issues.is_empty()))
+            {
                 emit(
                     &events,
                     AgentEvent::Delta {
@@ -1234,11 +1247,26 @@ pub async fn run_session_controlled(
                 continue;
             }
             if s.pending_config.is_some() {
-                failure =
-                    Some("Pending settings still require cleanup; old settings retained".into());
+                let reason = "Pending settings still require cleanup; use the current settings to finish the cleanup and apply the pending update before the final answer";
+                if s.is_document_work() {
+                    s.last_error = Some(reason.into());
+                    s.progress_recovery.action_required = true;
+                    recover_document(&mut s, reason);
+                    continue;
+                }
+                failure = Some(reason.into());
                 break;
             }
             if !citation_issues.is_empty() {
+                if s.is_document_work() {
+                    finalization_attempts = finalization_attempts.saturating_add(1);
+                    s.progress_recovery.finalization_attempts = finalization_attempts;
+                    s.last_error = Some(format!(
+                        "answer_citation_check: {}; correct the final citations or read the specific missing source range before answering again",
+                        citation_issues.join("; ")
+                    ));
+                    continue;
+                }
                 if hold_document_final {
                     message["partial"] = json!(true);
                     s.history.push(vec![message], true);
@@ -1488,7 +1516,10 @@ pub async fn run_session_controlled(
         if repair_edit_request {
             s.document_review.repair_requests = s.document_review.repair_requests.saturating_add(1);
         }
-        if (buffer_answer || document_workflow) && !completion.text.is_empty() {
+        if (buffer_answer || document_workflow)
+            && !s.is_document_work()
+            && !completion.text.is_empty()
+        {
             emit(
                 &events,
                 AgentEvent::Delta {
@@ -1500,7 +1531,15 @@ pub async fn run_session_controlled(
             )
             .await;
         }
-        let mut messages = vec![assistant(&completion.text, &completion.calls)];
+        // Tool-call prose is intermediate. For document work it may claim
+        // completion before the calls have run, so keep only the executable
+        // calls in user-visible history; the final verified reply is added later.
+        let history_text = if s.is_document_work() {
+            ""
+        } else {
+            &completion.text
+        };
+        let mut messages = vec![assistant(history_text, &completion.calls)];
         // A checkpoint acknowledges the whole batch. Evaluate it after writes,
         // even if a provider emits its call first; preserve other write ordering.
         let mut execution_calls = completion.calls.clone();

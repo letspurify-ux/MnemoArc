@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use mnemoarc::{
-    agent::{AgentEvent, run_session},
+    agent::{AgentEvent, RunCommand, run_session, run_session_controlled},
     config::{Config, Project},
     llm::{Completion, LlmClient, ToolCall, Usage},
     session::Session,
@@ -214,6 +214,225 @@ async fn run(s: Session, client: Arc<dyn LlmClient>) -> (Session, Vec<String>) {
     });
     let s = run_session(s, client, CancellationToken::new(), tx).await;
     (s, drain.await.unwrap())
+}
+
+fn finish_fixture(s: &mut Session) {
+    tools::execute(
+        s,
+        "document_edit",
+        json!({"action":"write",
+            "expected_hash":tools::hash(b"# Report\nDraft.\n"),"text":RESULT}),
+    )
+    .unwrap();
+    let id = s.task.current_todo().unwrap().id.clone();
+    let revision = s.task.plan_revision;
+    tools::execute(
+        s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":revision,
+            "operations":[{"op":"complete","id":id,"result":"Saved the requested document"}]}),
+    )
+    .unwrap();
+}
+
+struct InvalidCitationFinal {
+    client: DocumentClient,
+    attempts: Mutex<usize>,
+    invalid_rounds: usize,
+}
+
+#[async_trait]
+impl LlmClient for InvalidCitationFinal {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &Config,
+        cancel: CancellationToken,
+        tx: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let payload: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
+                .unwrap_or(Value::Null);
+        if payload["completion_review"] != true {
+            let mut attempts = self.attempts.lock().unwrap();
+            *attempts += 1;
+            if *attempts <= self.invalid_rounds {
+                return Ok(Completion {
+                    text: json!({"citations":"invalid"}).to_string(),
+                    ..Default::default()
+                });
+            }
+        }
+        self.client.complete(request, config, cancel, tx).await
+    }
+}
+
+#[tokio::test]
+async fn invalid_final_citation_can_be_corrected_before_document_completion() {
+    let (_dir, mut s) = fixture();
+    finish_fixture(&mut s);
+    s.answer_reviewed = true;
+    let (s, deltas) = run(
+        s,
+        Arc::new(InvalidCitationFinal {
+            client: DocumentClient {
+                path: _dir.path().join("report.md"),
+                delay: Delay::Read,
+                delay_rounds: 0,
+                calls: Mutex::new(0),
+                input_usage: 1000,
+            },
+            attempts: Mutex::new(0),
+            invalid_rounds: 12,
+        }),
+    )
+    .await;
+    assert_eq!(s.status, "complete", "{:?}", s.last_error);
+    assert!(s.completion_review.approved);
+    assert_eq!(deltas, ["Saved report.md"]);
+}
+
+struct PrematureToolText {
+    client: DocumentClient,
+    sent: Mutex<bool>,
+}
+
+#[async_trait]
+impl LlmClient for PrematureToolText {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &Config,
+        cancel: CancellationToken,
+        tx: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let first = {
+            let mut sent = self.sent.lock().unwrap();
+            let first = !*sent;
+            *sent = true;
+            first
+        };
+        if first {
+            let mut response = call(
+                950,
+                "document_edit",
+                json!({"action":"write","expected_hash":tools::hash(b"# Report\nDraft.\n"),"text":RESULT}),
+            );
+            response.text = "Done before the edit was checked".into();
+            return Ok(response);
+        }
+        self.client.complete(request, config, cancel, tx).await
+    }
+}
+
+#[tokio::test]
+async fn tool_call_prose_is_not_published_as_a_verified_document_final() {
+    let (_dir, s) = fixture();
+    let path = s.project.output.clone();
+    let (s, deltas) = run(
+        s,
+        Arc::new(PrematureToolText {
+            client: DocumentClient {
+                path,
+                delay: Delay::Read,
+                delay_rounds: 0,
+                calls: Mutex::new(0),
+                input_usage: 1000,
+            },
+            sent: Mutex::new(false),
+        }),
+    )
+    .await;
+    assert_eq!(s.status, "complete", "{:?}", s.last_error);
+    assert_eq!(deltas, ["Saved report.md"]);
+    assert!(
+        !s.history
+            .bundles
+            .iter()
+            .flat_map(|bundle| &bundle.messages)
+            .any(|message| message["role"] == "assistant"
+                && message["content"] == "Done before the edit was checked")
+    );
+}
+
+struct PendingConfigClient {
+    client: DocumentClient,
+    command_tx: mpsc::Sender<RunCommand>,
+    replacement: Config,
+    sent: Mutex<bool>,
+}
+
+#[async_trait]
+impl LlmClient for PendingConfigClient {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &Config,
+        cancel: CancellationToken,
+        tx: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let payload: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
+                .unwrap_or(Value::Null);
+        if payload["completion_review"] != true {
+            let should_send = {
+                let mut sent = self.sent.lock().unwrap();
+                let first = !*sent;
+                *sent = true;
+                first
+            };
+            if should_send {
+                self.command_tx
+                    .send(RunCommand::Configure(Box::new(self.replacement.clone())))
+                    .await?;
+            }
+        }
+        self.client.complete(request, config, cancel, tx).await
+    }
+}
+
+#[tokio::test]
+async fn pending_settings_do_not_end_document_run_before_a_later_valid_update() {
+    let (_dir, mut s) = fixture();
+    finish_fixture(&mut s);
+    let replacement = s.config.clone();
+    let mut invalid = replacement.clone();
+    invalid.memory_bytes = 256;
+    invalid.memory_body_bytes = 128;
+    s.pending_config = Some(invalid);
+    let (command_tx, command_rx) = mpsc::channel(2);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move {
+        let mut deltas = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            if let AgentEvent::Delta { text, .. } = event {
+                deltas.push(text);
+            }
+        }
+        deltas
+    });
+    let s = run_session_controlled(
+        s,
+        Arc::new(PendingConfigClient {
+            client: DocumentClient {
+                path: _dir.path().join("report.md"),
+                delay: Delay::Read,
+                delay_rounds: 0,
+                calls: Mutex::new(0),
+                input_usage: 1000,
+            },
+            command_tx,
+            replacement,
+            sent: Mutex::new(false),
+        }),
+        CancellationToken::new(),
+        event_tx,
+        command_rx,
+    )
+    .await;
+    assert_eq!(s.status, "complete", "{:?}", s.last_error);
+    assert!(s.pending_config.is_none());
+    assert_eq!(drain.await.unwrap(), ["Saved report.md"]);
 }
 
 #[tokio::test]
@@ -603,12 +822,24 @@ impl LlmClient for MalformedProviderBatch {
             *count
         };
         if (2..=13).contains(&count) {
-            assert_eq!(request["tool_choice"], "required");
+            if self.fault == "response_size_limit" {
+                assert!(request.get("tool_choice").is_none());
+            } else {
+                assert_eq!(request["tool_choice"], "required");
+            }
             assert_eq!(
                 std::fs::read_to_string(&self.client.path)?,
                 "# Report\nDraft.\n"
             );
-            assert!(request.to_string().contains("none of this batch executed"));
+            assert!(
+                request
+                    .to_string()
+                    .contains(if self.fault == "response_size_limit" {
+                        "none of this response executed"
+                    } else {
+                        "none of this batch executed"
+                    })
+            );
         }
         if count <= 12 {
             if self.fault != "oversized_identity" {
@@ -633,6 +864,7 @@ async fn rejected_provider_tool_json_returns_to_document_repair_until_completion
     for fault in [
         "invalid_tool_arguments: EOF while parsing an object",
         "malformed_tool_call",
+        "response_size_limit",
         "oversized_identity",
     ] {
         let (_dir, s) = fixture();
@@ -653,6 +885,119 @@ async fn rejected_provider_tool_json_returns_to_document_repair_until_completion
         assert!(!s.ledger.contains_key("action-800"));
         assert_eq!(deltas, ["Saved report.md"]);
     }
+}
+
+struct OversizedParsedResponse {
+    client: DocumentClient,
+    sent: Mutex<bool>,
+}
+
+#[async_trait]
+impl LlmClient for OversizedParsedResponse {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &Config,
+        cancel: CancellationToken,
+        tx: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let first = {
+            let mut sent = self.sent.lock().unwrap();
+            let first = !*sent;
+            *sent = true;
+            first
+        };
+        if first {
+            let mut response = call(
+                990,
+                "document_edit",
+                json!({"action":"append","expected_hash":tools::hash(&std::fs::read(&self.client.path)?),
+                    "text":"Do not execute an oversized response"}),
+            );
+            response.text = "x".repeat(mnemoarc::llm::MAX_COMPLETION_BYTES + 1);
+            return Ok(response);
+        }
+        self.client.complete(request, config, cancel, tx).await
+    }
+}
+
+#[tokio::test]
+async fn oversized_parsed_response_does_not_execute_its_write_and_can_recover() {
+    let (_dir, s) = fixture();
+    let client = Arc::new(OversizedParsedResponse {
+        client: DocumentClient {
+            path: s.project.output.clone(),
+            delay: Delay::Read,
+            delay_rounds: 0,
+            calls: Mutex::new(0),
+            input_usage: 1000,
+        },
+        sent: Mutex::new(false),
+    });
+    let (s, deltas) = run(s, client).await;
+    assert_eq!(s.status, "complete", "{:?}", s.last_error);
+    assert!(s.completion_review.approved);
+    assert!(!s.ledger.contains_key("action-990"));
+    assert_eq!(deltas, ["Saved report.md"]);
+}
+
+struct OversizedParsedFinal {
+    client: DocumentClient,
+    sent: Mutex<bool>,
+}
+
+#[async_trait]
+impl LlmClient for OversizedParsedFinal {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &Config,
+        cancel: CancellationToken,
+        tx: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let payload: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
+                .unwrap_or(Value::Null);
+        if payload["completion_review"] != true {
+            let first = {
+                let mut sent = self.sent.lock().unwrap();
+                let first = !*sent;
+                *sent = true;
+                first
+            };
+            if first {
+                return Ok(Completion {
+                    text: "x".repeat(mnemoarc::llm::MAX_COMPLETION_BYTES + 1),
+                    ..Default::default()
+                });
+            }
+            assert!(request.get("tool_choice").is_none());
+        }
+        self.client.complete(request, config, cancel, tx).await
+    }
+}
+
+#[tokio::test]
+async fn oversized_final_can_retry_as_a_short_answer_without_a_tool_call() {
+    let (_dir, mut s) = fixture();
+    finish_fixture(&mut s);
+    let (s, deltas) = run(
+        s,
+        Arc::new(OversizedParsedFinal {
+            client: DocumentClient {
+                path: _dir.path().join("report.md"),
+                delay: Delay::Read,
+                delay_rounds: 0,
+                calls: Mutex::new(0),
+                input_usage: 1000,
+            },
+            sent: Mutex::new(false),
+        }),
+    )
+    .await;
+    assert_eq!(s.status, "complete", "{:?}", s.last_error);
+    assert!(s.completion_review.approved);
+    assert_eq!(deltas, ["Saved report.md"]);
 }
 
 #[tokio::test]

@@ -25,6 +25,13 @@ fn sse_all_byte_boundaries() {
     }
     assert_eq!(events.len(), 2);
 }
+
+#[test]
+fn oversized_sse_event_reports_a_recoverable_response_size_code() {
+    let mut parser = SseDecoder::default();
+    let error = parser.feed(&vec![b'x'; 8 * 1024 * 1024 + 1]).unwrap_err();
+    assert!(error.to_string().starts_with("response_size_limit:"));
+}
 async fn server(body: String) -> (String, tokio::task::JoinHandle<()>) {
     let app = Router::new().route(
         "/chat/completions",

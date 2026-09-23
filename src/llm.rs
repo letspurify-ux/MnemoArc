@@ -138,7 +138,7 @@ impl SseDecoder {
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>> {
         self.buffer.extend_from_slice(bytes);
         if self.buffer.len() > 8 * 1024 * 1024 {
-            bail!("SSE event too large");
+            bail!("response_size_limit: SSE event too large");
         }
         let mut result = vec![];
         loop {
