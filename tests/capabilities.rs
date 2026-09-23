@@ -501,7 +501,7 @@ async fn empty_todos_cannot_bypass_inventory_gate_and_unchanged_churn_is_bounded
     scan(&mut s);
     let (tx, mut rx) = mpsc::channel(128);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let s = run_session(
+    let mut s = run_session(
         s,
         Arc::new(PrematureFinal(Mutex::new(0))),
         CancellationToken::new(),
@@ -520,6 +520,10 @@ async fn empty_todos_cannot_bypass_inventory_gate_and_unchanged_churn_is_bounded
     );
     assert!(s.task.current_todo().is_some());
     assert!(s.capabilities.active);
+    assert!(s.progress_recovery.coverage_stalls >= 8);
+    let stalls = s.progress_recovery.coverage_stalls;
+    s.add_user("계속".into());
+    assert_eq!(s.progress_recovery.coverage_stalls, stalls);
 }
 
 #[test]

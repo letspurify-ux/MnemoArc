@@ -7,6 +7,12 @@ use std::collections::BTreeMap;
 pub struct ReviewState {
     pub pending: bool,
     pub attempts: usize,
+    /// Consecutive full reviews with no resolved or reduced issue.
+    pub stalled_attempts: usize,
+    pub best_issue_count: Option<usize>,
+    pub last_reviewed_section_count: usize,
+    pub last_reviewed_content_lines: usize,
+    pub last_reviewed_verified_count: usize,
     pub approved_hash: Option<String>,
     pub issues: Vec<String>,
     pub input_tokens: usize,
@@ -36,6 +42,19 @@ pub fn approved(s: &Session) -> bool {
             .ok()
             .is_some_and(|doc| {
                 state.approved_hash.as_deref() == Some(hash(doc.as_bytes()).as_str())
+            })
+        && fresh(s)
+}
+
+/// A stalled verdict applies only to the result it reviewed. A later edit or
+/// source change must be eligible for another review, including after resume.
+pub fn stalled_on_current_result(s: &Session) -> bool {
+    s.document_review.stalled_attempts >= s.config.review_limit
+        && output_path(&s.project)
+            .and_then(|p| read_text(&p))
+            .ok()
+            .is_some_and(|doc| {
+                s.document_review.target_hash.as_deref() == Some(hash(doc.as_bytes()).as_str())
             })
         && fresh(s)
 }
@@ -382,6 +401,12 @@ pub fn finish(s: &mut Session, text: &str) -> Result<()> {
     if s.document_review.target_hash.as_deref() != Some(&digest) || !fresh(s) {
         bail!("document_review_stale: document or evidence changed during review");
     }
+    let (sections, content_lines) = document_content_shape(&s.project).unwrap_or((0, 0));
+    let verified = s
+        .investigations
+        .iter()
+        .filter(|item| item.status == "verified")
+        .count();
     let state = &mut s.document_review;
     for issue in verdict.issues {
         if state.page_issues.len() < 12 && !state.page_issues.contains(&issue) {
@@ -406,7 +431,42 @@ pub fn finish(s: &mut Session, text: &str) -> Result<()> {
     state.attempts += 1;
     state.pending = false;
     state.evidence_omitted = false;
-    state.issues = std::mem::take(&mut state.page_issues);
+    let next_issues = std::mem::take(&mut state.page_issues);
+    if next_issues.is_empty() {
+        state.stalled_attempts = 0;
+        state.best_issue_count = Some(0);
+    } else {
+        let improved_count = state
+            .best_issue_count
+            .is_some_and(|best| next_issues.len() < best);
+        let resolved_issue = state
+            .issues
+            .iter()
+            .any(|issue| !next_issues.contains(issue));
+        let added_section = sections > state.last_reviewed_section_count;
+        let added_content = content_lines > state.last_reviewed_content_lines;
+        let newly_verified = verified > state.last_reviewed_verified_count;
+        if state.best_issue_count.is_none()
+            || improved_count
+            || resolved_issue
+            || added_section
+            || added_content
+            || newly_verified
+        {
+            state.stalled_attempts = 0;
+        } else {
+            state.stalled_attempts = state.stalled_attempts.saturating_add(1);
+        }
+        state.best_issue_count = Some(
+            state
+                .best_issue_count
+                .map_or(next_issues.len(), |best| best.min(next_issues.len())),
+        );
+    }
+    state.last_reviewed_section_count = state.last_reviewed_section_count.max(sections);
+    state.last_reviewed_content_lines = state.last_reviewed_content_lines.max(content_lines);
+    state.last_reviewed_verified_count = state.last_reviewed_verified_count.max(verified);
+    state.issues = next_issues;
     reset_pages(state);
     state.approved_hash = state.issues.is_empty().then_some(digest);
     state.repair_requests = 0;

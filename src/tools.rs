@@ -36,6 +36,15 @@ pub struct ToolSpec {
 pub fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+/// Recognize additive document work while ignoring empty-line churn. Semantic
+/// acceptance remains the responsibility of document and completion reviews.
+pub(crate) fn document_content_shape(project: &Project) -> Result<(usize, usize)> {
+    let doc = read_text(&output_path(project)?)?;
+    Ok((
+        documentation::headings(&doc).len(),
+        doc.lines().filter(|line| !line.trim().is_empty()).count(),
+    ))
+}
 fn schema(fields: Value, required: &[&str]) -> Value {
     json!({"type":"object","properties":fields,"required":required,"additionalProperties":false})
 }
@@ -1148,6 +1157,15 @@ fn persist_document_edit(
         temp.persist_noclobber(path)?;
     }
     s.document_written = true;
+    if s.document_review.approved_hash.is_some() {
+        // A later edit starts a new review cycle. An earlier approval's zero
+        // issues must not make the first new finding look like a stalled review.
+        s.document_review.stalled_attempts = 0;
+        s.document_review.best_issue_count = None;
+        s.document_review.last_reviewed_section_count = 0;
+        s.document_review.last_reviewed_content_lines = 0;
+        s.document_review.last_reviewed_verified_count = 0;
+    }
     s.document_review.approved_hash = None;
     s.last_document_write = Some((path.to_path_buf(), hash(result.as_bytes())));
     revalidate(s)?;

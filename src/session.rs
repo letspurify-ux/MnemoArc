@@ -5,6 +5,7 @@ use crate::{
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -211,6 +212,75 @@ pub struct ReadCoverage {
     pub ranges: Vec<(usize, usize)>,
 }
 
+/// Runtime progress, retained when the same task is resumed. A new user task
+/// resets it; merely restarting a run cannot make a repeated result new work.
+#[derive(Clone, Debug, Default)]
+pub struct ProgressRecovery {
+    pub rounds_without_progress: usize,
+    /// New navigation pages alone cannot keep a stalled task alive forever.
+    pub rounds_without_substantive_progress: usize,
+    pub repeated_read: bool,
+    pub repeated_outcome_rounds: usize,
+    pub artifact_edits_without_milestone: usize,
+    pub finalization_attempts: usize,
+    pub coverage_stalls: usize,
+    pub coverage_fingerprint: String,
+    pub best_document_section_count: usize,
+    pub best_document_content_lines: usize,
+    pub seen_artifact_versions: VecDeque<String>,
+    pub seen_artifact_paths: VecDeque<String>,
+    pub seen_navigation_results: VecDeque<String>,
+}
+
+impl ProgressRecovery {
+    pub fn remember_artifact_path(&mut self, path: String) -> bool {
+        if self.seen_artifact_paths.contains(&path) {
+            return false;
+        }
+        self.seen_artifact_paths.push_back(path);
+        while self.seen_artifact_paths.len() > 256 {
+            self.seen_artifact_paths.pop_front();
+        }
+        true
+    }
+
+    pub fn remember_artifact(&mut self, path: String, digest: String) -> bool {
+        let version = format!(
+            "{:x}",
+            Sha256::digest(format!("{path}\0{digest}").as_bytes())
+        );
+        if self.seen_artifact_versions.contains(&version) {
+            return false;
+        }
+        self.seen_artifact_versions.push_back(version);
+        while self.seen_artifact_versions.len() > 256 {
+            self.seen_artifact_versions.pop_front();
+        }
+        true
+    }
+
+    pub fn remember_navigation(&mut self, tool: &str, data: &Value) -> bool {
+        let mut stable = data.clone();
+        if let Some(fields) = stable.as_object_mut() {
+            for key in ["archive_id", "cursor", "next_cursor"] {
+                fields.remove(key);
+            }
+        }
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(format!("{tool}\0{stable}").as_bytes())
+        );
+        if self.seen_navigation_results.contains(&digest) {
+            return false;
+        }
+        self.seen_navigation_results.push_back(digest);
+        while self.seen_navigation_results.len() > 256 {
+            self.seen_navigation_results.pop_front();
+        }
+        true
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Session {
     pub id: String,
@@ -245,6 +315,7 @@ pub struct Session {
     pub last_document_write: Option<(std::path::PathBuf, String)>,
     pub last_error: Option<String>,
     pub run_guidance: Value,
+    pub progress_recovery: ProgressRecovery,
     pub activity: Value,
     pub task_rounds: usize,
     pub document_review: crate::tools::document_review::ReviewState,
@@ -328,6 +399,7 @@ impl Session {
             last_document_write: None,
             last_error: None,
             run_guidance: json!({}),
+            progress_recovery: Default::default(),
             activity: json!({}),
             task_rounds: 0,
             document_review: Default::default(),
@@ -442,6 +514,7 @@ impl Session {
                 self.last_document_write = None;
                 self.task_rounds = 0;
                 self.run_guidance = json!({});
+                self.progress_recovery = Default::default();
             }
             if self.task.completion.is_empty() {
                 self.task.completion = self.initial_completion(&text);

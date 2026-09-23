@@ -235,7 +235,7 @@ async fn review_gate_honors_configured_attempt_limit() {
         );
         assert_eq!(
             result.document_review.attempts,
-            if issues { limit } else { 1 }
+            if issues { limit + 1 } else { 1 }
         );
         let finals = result
             .history
@@ -561,11 +561,15 @@ async fn failed_review_cannot_open_an_unbounded_repair_loop() {
     let result = run_session(s, Arc::new(StallingRepair), CancellationToken::new(), tx).await;
     drain.await.unwrap();
     assert_eq!(result.status, "partial", "{:?}", result.last_error);
-    assert_eq!(result.document_review.attempts, 1);
-    assert!(result.last_error.unwrap().contains("document_repair_limit"));
-    assert_eq!(result.document_review.repair_requests, 8);
-    // Initial final + review + eight edits + rejected edit; maintenance is separate.
-    assert_eq!(result.task_rounds, 11 + result.checkpoints_completed);
+    assert_eq!(result.document_review.attempts, 4);
+    assert_eq!(result.document_review.stalled_attempts, 3);
+    assert!(
+        result
+            .last_error
+            .unwrap()
+            .contains("document_review_no_progress")
+    );
+    assert!(result.task_rounds < 40 + result.checkpoints_completed);
 }
 
 #[test]
@@ -826,28 +830,31 @@ async fn run_repair_test(s: Session, client: Arc<dyn LlmClient>) -> Session {
 }
 
 #[tokio::test]
-async fn increasing_repair_limit_resumes_without_resetting_progress() {
+async fn repair_interval_rechecks_and_a_changed_document_can_resume() {
     let (_dir, mut s) = fixture();
     s.config.document_repair_limit = 2;
     let mut s = run_repair_test(s, Arc::new(StallingRepair)).await;
-    assert_eq!(s.document_review.repair_requests, 2);
-    assert_eq!(s.task_rounds, 5);
-    let issues = s.document_review.issues.clone();
-    let document = std::fs::read(&s.project.output).unwrap();
+    assert_eq!(s.status, "partial");
+    assert_eq!(s.document_review.attempts, 4);
+    assert_eq!(s.document_review.stalled_attempts, 3);
+    assert!(!document_review::approved(&s));
+    let expected = s.last_document_write.as_ref().unwrap().1.clone();
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":expected,"old_text":"A while loop runs work. main.js:4-5","text":"History is normalized before a bounded for loop runs work. main.js:2-5"}),
+    )
+    .unwrap();
+    let source = s
+        .sources
+        .values()
+        .find(|source| source.origin == "file")
+        .unwrap()
+        .id
+        .clone();
+    tools::execute(&mut s, "investigation", json!({"action":"verify","id":"flow","source_ids":[source],"verification_note":"Compared the corrected loop and history statement with the source"})).unwrap();
+    assert!(!document_review::stalled_on_current_result(&s));
     s.add_user("계속".into());
-    let mut s = run_repair_test(s, Arc::new(StallingRepair)).await;
-    assert_eq!(s.task_rounds, 6); // unchanged limit rejects the next editing request
-    let mut config = s.config.clone();
-    config.document_repair_limit = 4;
-    mnemoarc::agent::apply_config(&mut s, config).unwrap();
-    let s = run_repair_test(s, Arc::new(StallingRepair)).await;
-    assert_eq!(s.document_review.repair_requests, 4);
-    assert_eq!(s.task_rounds, 9); // two additional edits, then a rejected edit
-    assert_eq!(s.document_review.issues, issues);
-    assert_eq!(std::fs::read(&s.project.output).unwrap(), document);
-    assert!(s.last_error.as_ref().unwrap().contains("4/4"));
-    assert_eq!(s.run_guidance["document_repair_requests_remaining"], 0);
-    // Even at the cap, final verification/review is allowed without another edit.
     let s = run_repair_test(
         s,
         Arc::new(Reviewer {
@@ -858,6 +865,151 @@ async fn increasing_repair_limit_resumes_without_resetting_progress() {
     .await;
     assert_eq!(s.status, "complete");
     assert!(document_review::approved(&s));
+}
+
+#[test]
+fn resolving_review_issues_allows_more_than_the_total_review_count() {
+    let (_dir, mut s) = fixture();
+    s.config.review_limit = 2;
+    for issues in [
+        vec!["loop", "history", "bounds"],
+        vec!["history", "bounds"],
+        vec!["bounds"],
+    ] {
+        document_review::request(&mut s).unwrap();
+        document_review::finish(&mut s, &json!({"issues":issues}).to_string()).unwrap();
+        assert_eq!(s.document_review.stalled_attempts, 0);
+    }
+    document_review::request(&mut s).unwrap();
+    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    assert_eq!(s.document_review.attempts, 4);
+    assert!(document_review::approved(&s));
+}
+
+#[test]
+fn additive_sections_keep_document_review_open_for_remaining_work() {
+    let (_dir, mut s) = fixture();
+    s.config.review_limit = 2;
+    for n in 1..=3 {
+        document_review::request(&mut s).unwrap();
+        document_review::finish(&mut s, r#"{"issues":["Finish the requested overview"]}"#).unwrap();
+        assert_eq!(s.document_review.stalled_attempts, 0);
+        if n < 3 {
+            let expected = s.last_document_write.as_ref().unwrap().1.clone();
+            tools::execute(&mut s, "document_edit", json!({"action":"append","expected_hash":expected,"text":format!("\n## Extra {n}\nDocumented part {n}.\n")})).unwrap();
+        }
+    }
+    assert_eq!(s.document_review.attempts, 3);
+    assert!(!document_review::stalled_on_current_result(&s));
+}
+
+#[test]
+fn first_issue_after_an_approved_document_gets_a_repair_chance() {
+    let (_dir, mut s) = fixture();
+    s.config.review_limit = 1;
+    document_review::request(&mut s).unwrap();
+    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    assert!(document_review::approved(&s));
+    let expected = s.last_document_write.as_ref().unwrap().1.clone();
+    tools::execute(&mut s, "document_edit", json!({"action":"replace_text","expected_hash":expected,"old_text":"A while loop","text":"A for loop"})).unwrap();
+    document_review::request(&mut s).unwrap();
+    document_review::finish(&mut s, r#"{"issues":["Finish history normalization"]}"#).unwrap();
+    assert_eq!(s.document_review.stalled_attempts, 0);
+    assert!(!document_review::stalled_on_current_result(&s));
+}
+
+struct ProgressiveDocumentRepair {
+    calls: std::sync::Mutex<usize>,
+    path: std::path::PathBuf,
+    source_id: String,
+}
+
+#[async_trait]
+impl LlmClient for ProgressiveDocumentRepair {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        if let Some(review) = support::acceptance(&request) {
+            return Ok(review);
+        }
+        if request["messages"][1]["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("\"source_document_review\":true"))
+        {
+            let doc = std::fs::read_to_string(&self.path)?;
+            let issues = if doc.contains("A while loop") {
+                vec!["Flow: correct the loop and history statement"]
+            } else {
+                vec![]
+            };
+            return Ok(Completion {
+                text: json!({"issues":issues}).to_string(),
+                ..Default::default()
+            });
+        }
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        let response = match *calls {
+            1 | 7..=9 => Completion {
+                text: "The document is complete.".into(),
+                ..Default::default()
+            },
+            2 | 3 => Completion {
+                calls: vec![mnemoarc::llm::ToolCall {
+                    id: format!("add-{calls}"),
+                    name: "document_edit".into(),
+                    arguments: json!({"action":"append","expected_hash":tools::hash(&std::fs::read(&self.path)?),"text":format!("\n## Detail {calls}\nAdded detail.\n")}).to_string(),
+                }],
+                ..Default::default()
+            },
+            4 | 5 => Completion {
+                calls: vec![mnemoarc::llm::ToolCall {
+                    id: format!("correct-{calls}"),
+                    name: "document_edit".into(),
+                    arguments: json!({"action":"replace_text","expected_hash":tools::hash(&std::fs::read(&self.path)?),"old_text":"A while loop runs work. main.js:4-5","text":"History is normalized before a bounded for loop runs work. main.js:2-5"}).to_string(),
+                }],
+                ..Default::default()
+            },
+            6 => Completion {
+                calls: vec![mnemoarc::llm::ToolCall {
+                    id: "verify-flow".into(),
+                    name: "investigation".into(),
+                    arguments: json!({"action":"verify","id":"flow","source_ids":[self.source_id],"verification_note":"Compared the corrected history and loop statement with the source"}).to_string(),
+                }],
+                ..Default::default()
+            },
+            _ => anyhow::bail!("test_limit: progressive document repair did not finish at call {calls}"),
+        };
+        Ok(response)
+    }
+}
+
+#[tokio::test]
+async fn progressive_document_repairs_reach_final_approval_past_both_intervals() {
+    let (_dir, mut s) = fixture();
+    s.config.review_limit = 2;
+    s.config.document_repair_limit = 2;
+    s.config.run_tokens = 5_000_000;
+    let client = Arc::new(ProgressiveDocumentRepair {
+        calls: std::sync::Mutex::new(0),
+        path: s.project.output.clone(),
+        source_id: s
+            .sources
+            .values()
+            .find(|source| source.origin == "file")
+            .unwrap()
+            .id
+            .clone(),
+    });
+    let result = run_repair_test(s, client.clone()).await;
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert_eq!(result.document_review.attempts, 3);
+    assert!(document_review::approved(&result));
+    assert_eq!(*client.calls.lock().unwrap(), 8);
 }
 
 #[tokio::test]

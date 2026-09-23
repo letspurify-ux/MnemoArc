@@ -586,7 +586,7 @@ async fn rejected_review_bounds_tool_only_repair_loop_and_keeps_work_for_resume(
             .starts_with("completion_review_no_progress")
     );
     assert_eq!(*client.reviews.lock().unwrap(), 1);
-    assert!(*client.calls.lock().unwrap() <= 26);
+    assert!(*client.calls.lock().unwrap() <= 42);
     assert!(result.task.current_todo().is_some());
     assert!(!result.completion_review.checks.is_empty());
     assert!(
@@ -649,7 +649,8 @@ async fn changing_final_words_do_not_reset_rejected_review_limit() {
     let client = Arc::new(ChangingAnswerClient(Mutex::new(0)));
     let (result, events) = run(s, client.clone()).await;
     assert_eq!(result.status, "partial", "{:?}", result.last_error);
-    assert_eq!(*client.0.lock().unwrap(), 3);
+    assert_eq!(*client.0.lock().unwrap(), 6);
+    assert_eq!(result.completion_review.stalled_reviews, 6);
     assert!(result.task.current_todo().is_some());
     assert!(!result.completion_review.approved);
     assert!(
@@ -657,6 +658,16 @@ async fn changing_final_words_do_not_reset_rejected_review_limit() {
             .iter()
             .any(|e| matches!(e, AgentEvent::Delta { text, .. } if text.starts_with("Done")))
     );
+    let (recovered, _) = run(
+        result,
+        Arc::new(RepairClient {
+            root: dir.path().into(),
+            reviews: Mutex::new(0),
+        }),
+    )
+    .await;
+    assert_eq!(recovered.status, "complete", "{:?}", recovered.last_error);
+    assert!(recovered.completion_review.approved);
 }
 
 #[tokio::test]

@@ -15,6 +15,11 @@ pub struct ReviewState {
     pub approved: bool,
     pub attempts: usize,
     pub checks: Vec<Check>,
+    /// Rejected reviews and repair rounds are task state, not run-local limits.
+    /// A resumed run cannot replay the same unsuccessful repair allowance.
+    pub stalled_reviews: usize,
+    pub best_met: usize,
+    pub repair_rounds: usize,
     pub input_tokens: usize,
     pub output_tokens: usize,
     pub evidence_omitted: bool,
@@ -539,6 +544,11 @@ pub fn finish(s: &mut Session, response: &str) -> Result<Option<String>> {
     }
     state.pending = false;
     state.approved = state.checks.iter().all(|c| c.status == "met");
+    if state.approved {
+        state.stalled_reviews = 0;
+        state.repair_rounds = 0;
+        state.best_met = state.checks.len();
+    }
     state.reviewed_fingerprint = state.fingerprint.clone();
     Ok(state.approved.then(|| state.draft.clone()))
 }
@@ -630,6 +640,7 @@ pub fn schedule_repairs(s: &mut Session) {
 pub fn guidance(s: &Session) -> Value {
     let state = &s.completion_review;
     json!({"required":required(s),"pending":state.pending,"approved":state.approved,
+        "stalled_reviews":state.stalled_reviews,"repair_rounds":state.repair_rounds,
         "checks":state.checks.iter().filter(|c| c.status != "met").take(8).collect::<Vec<_>>(),
         "remaining":state.checks.iter().filter(|c| c.status != "met").count()})
 }
