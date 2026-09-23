@@ -129,6 +129,25 @@ impl Default for Config {
     }
 }
 impl Config {
+    pub fn completion_url(&self) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&self.base_url)?;
+        if !matches!(url.scheme(), "http" | "https") {
+            bail!("base_url must use http or https");
+        }
+        if url.fragment().is_some() {
+            bail!("base_url must not contain a fragment");
+        }
+        {
+            let mut path = url
+                .path_segments_mut()
+                .map_err(|_| anyhow::anyhow!("base_url must be a hierarchical URL"))?;
+            path.pop_if_empty();
+            path.push("chat");
+            path.push("completions");
+        }
+        Ok(url)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !(0.0 < self.low_water && self.low_water < self.high_water && self.high_water < 1.0) {
             bail!("Require 0 < low_water < high_water < 1");
@@ -212,7 +231,12 @@ impl Config {
                 bail!("Timeout exceeds supported clock range");
             }
         }
-        reqwest::Url::parse(&self.base_url)?;
+        self.completion_url()?;
+        if !self.disable_proxy
+            && let Some(proxy) = &self.proxy
+        {
+            reqwest::Proxy::all(proxy)?;
+        }
         self.database.validate()?;
         Ok(())
     }

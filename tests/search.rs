@@ -23,6 +23,34 @@ fn search(s: &mut Session, args: Value) -> Value {
 }
 
 #[test]
+fn casefolded_exclusions_apply_to_direct_reads_and_searches() {
+    let (dir, mut s) = setup();
+    std::fs::create_dir_all(dir.path().join("Secrets")).unwrap();
+    std::fs::write(
+        dir.path().join("Secrets/credentials.txt"),
+        "private-token-value\n",
+    )
+    .unwrap();
+    s.project.exclude = vec!["secrets/**".into()];
+
+    let read = tools::execute(
+        &mut s,
+        "file_read",
+        json!({"path":"Secrets/credentials.txt"}),
+    )
+    .unwrap_err();
+    assert!(read.to_string().contains("path_excluded"));
+    let result = search(&mut s, json!({"query":"private-token-value"}));
+    assert_eq!(result["total_matching_lines"], 0);
+
+    std::fs::create_dir_all(dir.path().join("Target")).unwrap();
+    std::fs::write(dir.path().join("Target/build.rs"), "private build output\n").unwrap();
+    s.project.exclude.clear();
+    let read = tools::execute(&mut s, "file_read", json!({"path":"Target/build.rs"})).unwrap_err();
+    assert!(read.to_string().contains("path_excluded"));
+}
+
+#[test]
 fn literal_regex_case_word_and_unicode_context() {
     let (dir, mut s) = setup();
     std::fs::write(

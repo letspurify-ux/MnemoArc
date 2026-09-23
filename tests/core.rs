@@ -322,6 +322,28 @@ fn settings_validation_and_lowering_keeps_original() {
     assert!(mnemoarc::agent::apply_config(&mut s, c).is_err());
     assert_eq!(s.config.memory_bytes, original);
 }
+
+#[test]
+fn llm_transport_settings_are_validated_and_endpoint_is_composed_safely() {
+    let mut c = Config::default();
+    c.base_url = "ftp://example.com/v1".into();
+    assert!(c.validate().is_err());
+
+    c.base_url = "https://example.com/v1?tenant=alpha".into();
+    assert_eq!(
+        c.completion_url().unwrap().as_str(),
+        "https://example.com/v1/chat/completions?tenant=alpha"
+    );
+    c.base_url = "https://example.com/v1#fragment".into();
+    assert!(c.validate().is_err());
+
+    c.base_url = "https://example.com/v1".into();
+    c.proxy = Some("http://[invalid".into());
+    assert!(c.validate().is_err());
+    c.disable_proxy = true;
+    assert!(c.validate().is_ok());
+}
+
 #[test]
 fn config_saved_then_session_override() {
     let dir = tempfile::tempdir().unwrap();

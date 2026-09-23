@@ -3,8 +3,8 @@ mod free;
 use anyhow::{Result, bail};
 pub use free::execute_free;
 use oracle::{
-    Connection,
-    sql_type::{Blob, Clob, Nclob, OracleType, ToSql},
+    Connection, SqlValue,
+    sql_type::{Blob, Clob, Nclob, OracleType, ToSql, ToSqlNull},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -169,6 +169,28 @@ fn remaining(deadline: Instant) -> Result<Duration> {
         bail!("database_query_timeout");
     }
     Ok(left.min(Duration::from_secs(15)))
+}
+
+enum QueryBind {
+    Text(Option<String>),
+    Number(Option<String>),
+}
+
+impl ToSql for QueryBind {
+    fn oratype(&self, conn: &Connection) -> std::result::Result<OracleType, oracle::Error> {
+        match self {
+            Self::Text(Some(value)) => value.oratype(conn),
+            Self::Text(None) => String::oratype_for_null(conn),
+            Self::Number(_) => Ok(OracleType::Number(0, -127)),
+        }
+    }
+
+    fn to_sql(&self, value: &mut SqlValue) -> std::result::Result<(), oracle::Error> {
+        match self {
+            Self::Text(Some(text)) | Self::Number(Some(text)) => Ok(text.to_sql(value)?),
+            Self::Text(None) | Self::Number(None) => value.set_null(),
+        }
+    }
 }
 
 fn connect(config: &DatabaseConfig, timeout_secs: u64, deadline: Instant) -> Result<Connection> {
@@ -397,13 +419,13 @@ pub fn execute(
                 .join(", ")
         );
     }
-    let values: Vec<Option<String>> = query
+    let values: Vec<QueryBind> = query
         .params
         .iter()
         .map(|p| match &supplied[&p.name] {
-            Value::Null => Ok(None),
-            Value::String(v) => Ok(Some(v.clone())),
-            Value::Number(v) => Ok(Some(v.to_string())),
+            Value::Null => Ok(QueryBind::Text(None)),
+            Value::String(v) => Ok(QueryBind::Text(Some(v.clone()))),
+            Value::Number(v) => Ok(QueryBind::Number(Some(v.to_string()))),
             _ => bail!(
                 "invalid_database_query_arguments: parameter {} must be a string, number or null",
                 p.name
@@ -422,7 +444,7 @@ pub fn execute(
         .params
         .iter()
         .zip(&values)
-        .map(|(p, v)| (p.name.as_str(), v as &dyn ToSql))
+        .map(|(p, value)| (p.name.as_str(), value as &dyn ToSql))
         .collect();
     let mut stmt = conn.statement(&query.sql).lob_locator().build()?;
     let mut results = stmt.query_named(&binds)?;

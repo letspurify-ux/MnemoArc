@@ -1419,34 +1419,8 @@ pub fn envelope(result: Result<Value>) -> Value {
     }
 }
 
-fn glob_match(patterns: &[String], path: &str) -> Result<bool> {
-    let mut b = globset::GlobSetBuilder::new();
-    for p in patterns {
-        b.add(globset::Glob::new(p)?);
-    }
-    Ok(b.build()?.is_match(path))
-}
 fn excluded(p: &Project, rel: &Path) -> Result<bool> {
-    let defaults = [
-        ".git",
-        ".hg",
-        ".svn",
-        "target",
-        "node_modules",
-        "vendor",
-        "dist",
-        "build",
-        ".venv",
-        "__pycache__",
-    ];
-    if rel
-        .components()
-        .any(|c| defaults.contains(&c.as_os_str().to_string_lossy().as_ref()))
-    {
-        return Ok(true);
-    }
-    let s = rel.to_string_lossy();
-    Ok((!p.include.is_empty() && !glob_match(&p.include, &s)?) || glob_match(&p.exclude, &s)?)
+    file_edit::excluded_case_alias(p, rel)
 }
 pub fn output_path(p: &Project) -> Result<PathBuf> {
     let root = p.root.canonicalize()?;

@@ -214,12 +214,7 @@ impl OpenAiClient {
             request["stream_options"] = json!({"include_usage":true});
         }
         apply_thinking_settings(&mut request, c);
-        let mut req = Self::client(c)?
-            .post(format!(
-                "{}/chat/completions",
-                c.base_url.trim_end_matches('/')
-            ))
-            .json(&request);
+        let mut req = Self::client(c)?.post(c.completion_url()?).json(&request);
         if let Some(key) = Self::key(c) {
             req = req.bearer_auth(key)
         }
@@ -376,12 +371,7 @@ impl OpenAiClient {
             "max_completion_tokens"
         }] = json!(c.output_tokens);
         apply_thinking_settings(&mut body, c);
-        let mut req = Self::client(c)?
-            .post(format!(
-                "{}/chat/completions",
-                c.base_url.trim_end_matches('/')
-            ))
-            .json(&body);
+        let mut req = Self::client(c)?.post(c.completion_url()?).json(&body);
         if let Some(k) = Self::key(c) {
             req = req.bearer_auth(k)
         }

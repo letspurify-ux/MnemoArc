@@ -2,8 +2,8 @@
 use super::{DatabaseConfig, collect_rows, connect, identifier, remaining};
 use anyhow::{Result, bail};
 use oracle::{
-    Connection, Statement,
-    sql_type::{OracleType, RefCursor, ToSql},
+    Connection, SqlValue, Statement,
+    sql_type::{OracleType, RefCursor, ToSql, ToSqlNull},
 };
 use serde_json::{Map, Value, json};
 use std::{
@@ -56,19 +56,39 @@ fn validate_shape(args: &Value, required: &[&str], allowed: &[&str]) -> Result<(
 
 enum Input {
     Text(Option<String>),
+    Number(Option<String>),
     Bool(Option<bool>),
 }
 
-impl Input {
-    fn as_sql(&self) -> &dyn ToSql {
+impl ToSql for Input {
+    fn oratype(&self, conn: &Connection) -> std::result::Result<OracleType, oracle::Error> {
         match self {
-            Self::Text(value) => value,
-            Self::Bool(value) => value,
+            Self::Text(Some(value)) => value.oratype(conn),
+            Self::Text(None) => String::oratype_for_null(conn),
+            Self::Number(_) => Ok(OracleType::Number(0, -127)),
+            Self::Bool(_) => Ok(OracleType::Boolean),
         }
     }
+
+    fn to_sql(&self, sql_value: &mut SqlValue) -> std::result::Result<(), oracle::Error> {
+        match self {
+            Self::Text(Some(text)) | Self::Number(Some(text)) => Ok(text.to_sql(sql_value)?),
+            Self::Text(None) | Self::Number(None) => sql_value.set_null(),
+            Self::Bool(input) => Ok(input.to_sql(sql_value)?),
+        }
+    }
+}
+
+impl Input {
     fn bind(&self, stmt: &mut Statement, name: &str, direction: &str, kind: &str) -> Result<()> {
         if direction == "in" {
-            stmt.bind(name, self.as_sql())?;
+            match self {
+                Self::Number(value) => {
+                    let oracle_type = OracleType::Number(0, -127);
+                    stmt.bind(name, &(value, &oracle_type))?;
+                }
+                _ => stmt.bind(name, self)?,
+            }
             return Ok(());
         }
         if direction == "out" {
@@ -81,6 +101,7 @@ impl Input {
         let oracle_type = output_type(kind)?;
         match self {
             Self::Text(value) => stmt.bind(name, &(value, &oracle_type))?,
+            Self::Number(value) => stmt.bind(name, &(value, &oracle_type))?,
             Self::Bool(value) => stmt.bind(name, &(value, &oracle_type))?,
         }
         Ok(())
@@ -94,7 +115,7 @@ fn input(value: &Value, kind: &str) -> Result<Input> {
             Value::Bool(value) => Ok(Input::Bool(Some(*value))),
             _ => Err(bad("boolean bind value must be true, false or null")),
         },
-        "string" | "number" => {
+        "string" => {
             let value = match value {
                 Value::Null => None,
                 Value::String(value) => Some(value.clone()),
@@ -105,6 +126,23 @@ fn input(value: &Value, kind: &str) -> Result<Input> {
                 return Err(bad("bind value exceeds 8192 bytes"));
             }
             Ok(Input::Text(value))
+        }
+        "number" => {
+            let value = match value {
+                Value::Null => None,
+                Value::Number(value) => Some(value.to_string()),
+                Value::String(value) => {
+                    let number = value
+                        .parse::<serde_json::Number>()
+                        .map_err(|_| bad("number bind value must be a valid decimal or null"))?;
+                    Some(number.to_string())
+                }
+                _ => return Err(bad("number bind value must be a number or null")),
+            };
+            if value.as_ref().is_some_and(|v| v.len() > 8192) {
+                return Err(bad("bind value exceeds 8192 bytes"));
+            }
+            Ok(Input::Number(value))
         }
         _ => Err(bad("type must be string, number, boolean or cursor")),
     }
@@ -122,7 +160,11 @@ fn sql_binds(args: &Value) -> Result<Vec<(String, Input)>> {
     }
     params.iter().map(|(name, value)| {
         if !identifier(name) { return Err(bad("bind names must begin with a letter and contain only letters, numbers or underscores")); }
-        let kind = if value.is_boolean() { "boolean" } else { "string" };
+        let kind = match value {
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "number",
+            _ => "string",
+        };
         Ok((name.clone(), input(value, kind)?))
     }).collect()
 }
@@ -309,7 +351,7 @@ pub fn execute_free(
             let values = sql_binds(args)?;
             let binds: Vec<(&str, &dyn ToSql)> = values
                 .iter()
-                .map(|(name, value)| (name.as_str(), value.as_sql()))
+                .map(|(name, value)| (name.as_str(), value as &dyn ToSql))
                 .collect();
             let conn = connect(config, timeout_secs, deadline)?;
             if mode == "query" {

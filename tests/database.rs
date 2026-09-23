@@ -183,6 +183,15 @@ fn oracle_docker_query_uses_binds_and_limits_rows() {
     )
     .unwrap();
     assert_eq!(result["rows"], json!([["x' OR 1=1 --"]]));
+    let numeric = mnemoarc::database::execute(
+        &config,
+        &json!({"action":"run","id":"echo_value","params":{"value":12.5}}),
+        &CancellationToken::new(),
+        30,
+    )
+    .unwrap();
+    assert_eq!(numeric["columns"][0]["type"], "NUMBER");
+    assert_eq!(numeric["rows"], json!([["12.5"]]));
     let two_binds = mnemoarc::database::execute(
         &config,
         &json!({"action":"run","id":"two_binds","params":{"first":"one","second":"two"}}),

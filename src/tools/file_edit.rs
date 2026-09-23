@@ -22,7 +22,7 @@ fn folded_alias_key(value: &str) -> String {
     value.nfd().default_case_fold().nfd().collect()
 }
 
-fn excluded_case_alias(project: &Project, relative: &Path) -> Result<bool> {
+pub(super) fn excluded_case_alias(project: &Project, relative: &Path) -> Result<bool> {
     let default_excludes = [
         ".git",
         ".hg",
@@ -43,6 +43,34 @@ fn excluded_case_alias(project: &Project, relative: &Path) -> Result<bool> {
         })
     }) {
         return Ok(true);
+    }
+    if !project.include.is_empty() {
+        let normalized_path: String = relative.to_string_lossy().nfd().collect();
+        let folded_path = folded_alias_key(&relative.to_string_lossy());
+        let mut included = false;
+        for pattern in &project.include {
+            let normalized_pattern: String = pattern.nfd().collect();
+            if globset::GlobBuilder::new(&normalized_pattern)
+                .case_insensitive(true)
+                .build()?
+                .compile_matcher()
+                .is_match(&normalized_path)
+            {
+                included = true;
+                break;
+            }
+            let folded_pattern = folded_alias_key(pattern);
+            if globset::Glob::new(&folded_pattern)
+                .ok()
+                .is_some_and(|glob| glob.compile_matcher().is_match(&folded_path))
+            {
+                included = true;
+                break;
+            }
+        }
+        if !included {
+            return Ok(true);
+        }
     }
     for pattern in &project.exclude {
         let normalized_pattern: String = pattern.nfd().collect();
@@ -92,7 +120,7 @@ fn project_path(s: &Session, raw: &str) -> Result<PathBuf> {
         bail!("invalid_file_path: use a project-relative path without . or .. components");
     }
     let root = s.project.root.canonicalize()?;
-    if excluded(&s.project, relative)? || excluded_case_alias(&s.project, relative)? {
+    if excluded(&s.project, relative)? {
         bail!("path_excluded: {raw}");
     }
     let candidate = root.join(relative);
@@ -115,9 +143,7 @@ fn project_path(s: &Session, raw: &str) -> Result<PathBuf> {
     if !path.starts_with(&root) {
         bail!("path_outside_project");
     }
-    if excluded(&s.project, path.strip_prefix(&root)?)?
-        || excluded_case_alias(&s.project, path.strip_prefix(&root)?)?
-    {
+    if excluded(&s.project, path.strip_prefix(&root)?)? {
         bail!("path_excluded: {raw}");
     }
     let normalized_output = normalize_existing_prefix(&output_path(&s.project)?)?;

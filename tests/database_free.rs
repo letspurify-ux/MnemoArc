@@ -111,6 +111,13 @@ fn free_execution_requires_manual_mode_switches() {
             .to_string()
             .contains("invalid_argument_type: args")
     );
+    let invalid_number = tools::execute(
+        &mut session,
+        "db_execute",
+        json!({"mode":"procedure","name":"TEST_PROC","args":[{"name":"p_value","type":"number","value":"not-a-number"}]}),
+    )
+    .unwrap_err();
+    assert!(invalid_number.to_string().contains("number bind value"));
 }
 
 #[test]
@@ -179,6 +186,17 @@ fn oracle_free_execution_round_trips_sql_procedure_function_and_cursor() -> Resu
         ensure!(
             free_binds["rows"] == json!([["two", "one", "one"]]),
             "free binds: {free_binds}"
+        );
+        let numeric_bind = execute_free(
+            &config,
+            &json!({"mode":"query","sql":"SELECT :value AS VALUE FROM dual","params":{"value":12.5}}),
+            &cancel,
+            30,
+        )?;
+        ensure!(
+            numeric_bind["columns"][0]["type"] == "NUMBER"
+                && numeric_bind["rows"] == json!([["12.5"]]),
+            "numeric bind: {numeric_bind}"
         );
         let large_lobs = execute_free(
             &config,
