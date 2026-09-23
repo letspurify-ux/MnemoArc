@@ -363,6 +363,7 @@ pub async fn run_session_controlled(
     let mut finalization_attempts = 0usize;
     let mut length_recoveries = 0usize;
     let mut review_response_failures = 0usize;
+    let mut completion_stalls = 0usize;
     let mut tool_failures = tools::recovery::FailureTracker::default();
     let mut repetitions = std::collections::BTreeMap::<String, usize>::new();
     let mut last_document_hash: Option<String> = None;
@@ -505,7 +506,10 @@ pub async fn run_session_controlled(
         {
             phase = "draft".into();
         }
-        if finalization_attempts > 0 || !s.document_review.issues.is_empty() {
+        if finalization_attempts > 0
+            || !s.document_review.issues.is_empty()
+            || s.completion_review.checks.iter().any(|c| c.status != "met")
+        {
             // A rejected document completion always returns to verification,
             // even if the model previously declared itself ready to answer.
             phase = "verify".into();
@@ -545,7 +549,7 @@ pub async fn run_session_controlled(
             "document_repair_requests_used":s.document_review.repair_requests,
             "document_repair_requests_remaining":s.config.document_repair_limit.saturating_sub(s.document_review.repair_requests),
             "pending_count":s.investigations.iter().filter(|i|i.status != "verified").count(),
-            "completion_error":if finalization_attempts > 0 || s.last_error.as_deref().is_some_and(|error| error.starts_with("task_plan_pending:")) { s.last_error.as_deref() } else { None },
+            "completion_error":if finalization_attempts > 0 || s.last_error.as_deref().is_some_and(|error| error.starts_with("task_plan_pending:") || error.starts_with("completion_review")) { s.last_error.as_deref() } else { None },
             "instruction":if progress_recovery { if document_work { "Progress recovery: repeated investigation has not changed the document or verified an item. Use the evidence already gathered to make one small, safe document_edit now, or verify an existing written item. Inspect the output hash if needed. Read only a specific missing source range that directly blocks that action. Do not gather more general evidence or save another memory first. If a claim cannot be supported, mark that gap in the relevant section and continue with supported work; do not invent evidence. A checkpoint remains the only exception for memory maintenance." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, batch targeted reads for missing evidence, then repair known issues in their original locations with targeted section or text edits when safe. Review findings are edit instructions, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Run verify_batch once after all edits, not after every small correction. Only requests containing document_edit or document_edit_batch consume the repair budget (one per request, including failed edits); reads and verification do not. At zero remaining, finish verification and review without another edit. The remaining edit request budget is in document_repair_requests_remaining; audit existing sections and fix factual errors within that budget. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, save each investigated section in a separate edit as soon as its evidence is ready. Check the current outline; use insert_before/insert_after for siblings and insert_first_child/insert_last_child for nested sections when that preserves the document flow. Copy section_path to identify repeated headings; preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>"For source documentation, investigate one section, save it, then move to the next. Create only a short opening with the first ready section; inspect the outline before each later addition, copy section_path when headings repeat, and use sibling or child insertion to place it within the hierarchy. For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. Answer once evidence is sufficient; no source audit or document write is required."} }});
         let definitions = ToolRegistry::definitions(&s);
         let mut request = match ContextManager::request(&s, definitions.clone()) {
@@ -584,8 +588,21 @@ pub async fn run_session_controlled(
                 }
             };
         }
-        let reviewing_document = s.document_review.pending && s.checkpoint.is_none();
-        let reviewing_answer = s.answer_draft.is_some() && s.checkpoint.is_none();
+        let reviewing_completion = s.completion_review.pending && s.checkpoint.is_none();
+        let reviewing_document =
+            !reviewing_completion && s.document_review.pending && s.checkpoint.is_none();
+        let reviewing_answer =
+            !reviewing_completion && s.answer_draft.is_some() && s.checkpoint.is_none();
+        if reviewing_completion {
+            request = match tools::completion_review::request(&mut s) {
+                Ok(request) => request,
+                Err(error) => {
+                    s.status = "partial".into();
+                    s.last_error = Some(error.to_string());
+                    break;
+                }
+            };
+        }
         if reviewing_document {
             request = match tools::document_review::request(&mut s) {
                 Ok(request) => request,
@@ -604,7 +621,8 @@ pub async fn run_session_controlled(
                 }
             };
         }
-        let buffer_answer = reviewing_document
+        let buffer_answer = reviewing_completion
+            || reviewing_document
             || reviewing_answer
             || (s.checkpoint.is_none() && tools::answer_review::eligible(&s));
         let request_tokens = context::count(&request, &s.config.model);
@@ -642,7 +660,7 @@ pub async fn run_session_controlled(
             break;
         }
         s.task_rounds += 1;
-        s.activity = json!({"stage":if reviewing_document {"document_review"} else if reviewing_answer {"answer_review"} else {"model"},"started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds});
+        s.activity = json!({"stage":if reviewing_completion {"completion_review"} else if reviewing_document {"document_review"} else if reviewing_answer {"answer_review"} else {"model"},"started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds});
         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
         let deadline = run_deadline(started, &s.config);
         if tokio::time::Instant::now() >= deadline {
@@ -655,7 +673,7 @@ pub async fn run_session_controlled(
         let document_workflow = s.task.require_investigation
             || s.task.workflow == "source_document"
             || s.task.workflow == "document_edit"
-            || !s.task.todos.is_empty();
+            || tools::completion_review::required(&s);
         request[crate::llm::STREAM_DELTAS_MARKER] = json!(!(buffer_answer || document_workflow));
         let (tx, mut rx) = mpsc::channel(64);
         let event_tx = events.clone();
@@ -692,7 +710,7 @@ pub async fn run_session_controlled(
         let response = tokio::select! {_ = cancel.cancelled()=>Err(anyhow::anyhow!("cancelled")),result=tokio::time::timeout_at(deadline,std::panic::AssertUnwindSafe(client.complete(request,&request_config,cancel.clone(),tx)).catch_unwind())=>match result{Ok(Ok(r))=>r,Ok(Err(_))=>Err(anyhow::anyhow!("model_worker_panic: model request interrupted; session retained")),Err(_)=>Err(anyhow::anyhow!("run_timeout"))}};
         relay_done.cancel();
         let _ = relay.await;
-        let completion = match response {
+        let mut completion = match response {
             Ok(r) => r,
             Err(e) => {
                 s.usage_incomplete = true;
@@ -756,6 +774,52 @@ pub async fn run_session_controlled(
                             .map(|c| context::tokens(&c.arguments, &s.config.model))
                             .sum::<usize>()
                 });
+        }
+        if reviewing_completion {
+            s.completion_review.input_tokens = s
+                .completion_review
+                .input_tokens
+                .saturating_add(s.input_tokens.saturating_sub(usage_before.0));
+            s.completion_review.output_tokens = s
+                .completion_review
+                .output_tokens
+                .saturating_add(s.output_tokens.saturating_sub(usage_before.1));
+            // As with document review, a complete validated JSON verdict can
+            // survive a provider's spurious length flag. Partial JSON cannot.
+            let result = if completion.discarded_tool_calls || !completion.calls.is_empty() {
+                Err(anyhow::anyhow!(
+                    "completion_review_invalid: return complete JSON without tool calls"
+                ))
+            } else {
+                tools::completion_review::finish(&mut s, &completion.text)
+            };
+            match result {
+                Err(error) => {
+                    review_response_failures += 1;
+                    s.last_error = Some(error.to_string());
+                    if review_response_failures >= REVIEW_RESPONSE_LIMIT {
+                        s.status = "partial".into();
+                        break;
+                    }
+                    snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
+                    continue;
+                }
+                Ok(None) => {
+                    review_response_failures = 0;
+                    if !s.completion_review.pending {
+                        tools::completion_review::schedule_repairs(&mut s);
+                        emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"완료 조건에 미충족 또는 확인 불가 항목이 있어 보완 작업을 이어갑니다.".into() }, &cancel, run_deadline(started, &s.config)).await;
+                    }
+                    snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
+                    continue;
+                }
+                Ok(Some(answer)) => {
+                    review_response_failures = 0;
+                    completion.text = answer;
+                    completion.length_limited = false;
+                    s.last_error = None;
+                }
+            }
         }
         if reviewing_document {
             s.document_review.input_tokens += s.input_tokens.saturating_sub(usage_before.0);
@@ -896,7 +960,9 @@ pub async fn run_session_controlled(
         }
         // Independent later truncations get their own bounded recovery window.
         length_recoveries = 0;
-        let continuing = s.continuation.is_some() && s.checkpoint.is_none();
+        let continuing = s.checkpoint.is_none()
+            && (s.continuation.is_some()
+                || (reviewing_completion && s.completion_review.continues_previous));
         if s.checkpoint.is_none() {
             s.continuation = None;
         }
@@ -1048,6 +1114,41 @@ pub async fn run_session_controlled(
             } else {
                 s.status = "complete".into();
                 s.last_error = None;
+            }
+            if s.status == "complete" && tools::completion_review::required(&s) {
+                match tools::completion_review::begin_final(&mut s, &completion.text, continuing) {
+                    Ok(tools::completion_review::Gate::Accepted) => {}
+                    Ok(tools::completion_review::Gate::Review) => {
+                        s.status = "running".into();
+                        emit(
+                            &events,
+                            AgentEvent::Notice {
+                                session: s.id.clone(),
+                                text: "할 일 목록 이후 실제 결과와 완료 조건을 대조합니다.".into(),
+                            },
+                            &cancel,
+                            run_deadline(started, &s.config),
+                        )
+                        .await;
+                        continue;
+                    }
+                    Ok(tools::completion_review::Gate::Repair) => {
+                        tools::completion_review::schedule_repairs(&mut s);
+                        completion_stalls += 1;
+                        if completion_stalls >= FINALIZATION_RETRY_LIMIT {
+                            s.status = "partial".into();
+                            s.last_error = Some("completion_review_no_progress: unchanged results still fail acceptance; repair tasks and unmet checks retained for resume".into());
+                            break;
+                        }
+                        s.status = "running".into();
+                        continue;
+                    }
+                    Err(error) => {
+                        s.status = "partial".into();
+                        s.last_error = Some(error.to_string());
+                        break;
+                    }
+                }
             }
             if s.status == "partial" && finalization_attempts < FINALIZATION_RETRY_LIMIT {
                 finalization_attempts += 1;
@@ -1297,6 +1398,9 @@ pub async fn run_session_controlled(
                     .max(200);
                 let result = tools::limit_result(&mut s, call, result, budget);
                 tools::record_delivered_read(&mut s, call, &result);
+                if !checkpoint_batch {
+                    tools::completion_review::observe(&mut s, call, &result);
+                }
                 if cache_parallel_result {
                     // Parallel reads run in temporary sessions, so their
                     // run_call ledger entries cannot be merged safely until
@@ -1347,6 +1451,7 @@ pub async fn run_session_controlled(
             || s.task.plan_revision > 0
             || execution_calls.iter().any(|call| call.name == "task_plan");
         if document_changed || file_changed || new_verified > verified_count {
+            completion_stalls = 0;
             rounds_without_progress = 0;
             repeated_read_detected = false;
         } else if !checkpoint_batch && tracking_work {

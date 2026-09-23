@@ -25,7 +25,11 @@ export default function Chat({
   );
   const stage = session?.activity?.stage;
   const progress =
-    stage === "answer_review"
+    stage === "completion_review"
+      ? "실제 결과와 완료 조건 확인 중"
+      : stage === "document_review"
+      ? "문서와 소스 근거 대조 중"
+      : stage === "answer_review"
       ? "소스 근거와 답변 대조 중"
       : stage === "tools"
       ? `${(session.activity.tools || []).map((name) => toolLabels[name] || name).join(" · ")} 실행 중`

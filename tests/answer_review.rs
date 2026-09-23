@@ -1,3 +1,4 @@
+mod support;
 use anyhow::Result;
 use async_trait::async_trait;
 use mnemoarc::{
@@ -92,6 +93,9 @@ impl LlmClient for Script {
         _: CancellationToken,
         delta: mpsc::Sender<String>,
     ) -> Result<Completion> {
+        if let Some(review) = support::acceptance(&request) {
+            return Ok(review);
+        }
         let mut step = self.step.lock().unwrap();
         let answer = match *step {
             0 => Completion {

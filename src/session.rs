@@ -248,6 +248,7 @@ pub struct Session {
     pub activity: Value,
     pub task_rounds: usize,
     pub document_review: crate::tools::document_review::ReviewState,
+    pub completion_review: crate::tools::completion_review::ReviewState,
     pub answer_draft: Option<String>,
     pub answer_reviewed: bool,
     pub answer_review_original: Option<String>,
@@ -329,6 +330,7 @@ impl Session {
             activity: json!({}),
             task_rounds: 0,
             document_review: Default::default(),
+            completion_review: Default::default(),
             answer_draft: None,
             answer_reviewed: false,
             answer_review_original: None,
@@ -401,6 +403,8 @@ impl Session {
             // successful results across a new user task can replay a stale read
             // or suppress a new mutation if a provider reuses an ID.
             self.ledger.clear();
+            self.completion_review = Default::default();
+            self.completion_review.required = first_request && !self.task.completion.is_empty();
             self.answer_draft = None;
             self.answer_reviewed = false;
             self.answer_review_original = None;

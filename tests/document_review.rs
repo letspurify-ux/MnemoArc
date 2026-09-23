@@ -1,3 +1,4 @@
+mod support;
 use anyhow::Result;
 use async_trait::async_trait;
 use mnemoarc::{
@@ -163,6 +164,9 @@ impl LlmClient for Reviewer {
         _: CancellationToken,
         tx: mpsc::Sender<String>,
     ) -> Result<Completion> {
+        if let Some(review) = support::acceptance(&request) {
+            return Ok(review);
+        }
         let review = request["messages"][1]["content"]
             .as_str()
             .is_some_and(|s| s.contains("\"source_document_review\":true"));
@@ -511,6 +515,9 @@ impl LlmClient for StallingRepair {
         cancel: CancellationToken,
         tx: mpsc::Sender<String>,
     ) -> Result<Completion> {
+        if let Some(review) = support::acceptance(&request) {
+            return Ok(review);
+        }
         let content = request["messages"].as_array().unwrap().last().unwrap()["content"]
             .as_str()
             .unwrap();
@@ -608,6 +615,9 @@ async fn checkpoint_maintenance_does_not_consume_document_repair_requests() {
             _: CancellationToken,
             _: mpsc::Sender<String>,
         ) -> Result<Completion> {
+            if let Some(review) = support::acceptance(&request) {
+                return Ok(review);
+            }
             let content = request["messages"].as_array().unwrap().last().unwrap()["content"]
                 .as_str()
                 .unwrap();
@@ -644,6 +654,9 @@ impl LlmClient for MalformedReview {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
+        if let Some(review) = support::acceptance(&request) {
+            return Ok(review);
+        }
         let payload = request["messages"][1]["content"].as_str().unwrap();
         if payload.contains("\"source_document_review\":true") {
             let mut calls = self.calls.lock().unwrap();
@@ -859,6 +872,9 @@ async fn reads_and_verification_can_finish_even_at_the_edit_limit() {
             cancel: CancellationToken,
             tx: mpsc::Sender<String>,
         ) -> Result<Completion> {
+            if let Some(review) = support::acceptance(&request) {
+                return Ok(review);
+            }
             let round = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if round < 9 {
                 let content = request["messages"].as_array().unwrap().last().unwrap()["content"]

@@ -1,3 +1,4 @@
+mod support;
 use anyhow::Result;
 use async_trait::async_trait;
 use mnemoarc::{
@@ -539,6 +540,9 @@ impl LlmClient for PlanChurn {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
+        if let Some(review) = support::acceptance(&request) {
+            return Ok(review);
+        }
         let state: Value = serde_json::from_str(
             request["messages"].as_array().unwrap().last().unwrap()["content"]
                 .as_str()
@@ -650,6 +654,9 @@ impl LlmClient for EmptyPlanChurn {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
+        if let Some(review) = support::acceptance(&request) {
+            return Ok(review);
+        }
         let state: Value = serde_json::from_str(
             request["messages"].as_array().unwrap().last().unwrap()["content"]
                 .as_str()
@@ -717,6 +724,9 @@ impl LlmClient for InvalidPlanRecovery {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
+        if let Some(review) = support::acceptance(&request) {
+            return Ok(review);
+        }
         let state: Value = serde_json::from_str(
             request["messages"].as_array().unwrap().last().unwrap()["content"]
                 .as_str()

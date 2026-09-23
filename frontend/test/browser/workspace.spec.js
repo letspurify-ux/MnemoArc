@@ -141,6 +141,28 @@ test("ordered to-do list follows prerequisites and preserves running work on rel
   await expect(page.locator(".status-pill")).toHaveText("중지됨");
 });
 
+test("completed to-dos return to missing acceptance criteria before final publication", async ({ page, request }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  await page.getByRole("textbox", { name: "메시지", exact: true }).fill("완료 조건 검증 테스트");
+  await page.getByRole("tab", { name: "진행", exact: true }).click();
+  await page.getByRole("button", { name: "메시지 보내기" }).click();
+  const acceptance = page.getByRole("region", { name: "완료 조건 검증", exact: true });
+  await expect(acceptance).toContainText("미충족");
+  await expect(page.locator(".task-plan")).toContainText("누락된 예시를 답변에 추가합니다.");
+  await expect(page.locator(".status-pill")).toHaveText("완료");
+  await expect(acceptance).toContainText("모든 완료 조건의 검증을 통과했습니다.");
+  await expect(page.locator(".chat-content")).toContainText("요약과 예시를 모두 작성했습니다.");
+  await expect(page.locator(".chat-content")).not.toContainText("요약을 작성했습니다.");
+  const state = await (await request.get("/api/state")).json();
+  const item = state.sessions.find((s) => s.title === "완료 조건 검증 테스트");
+  const detail = await (await request.get(`/api/sessions/${item.id}`)).json();
+  expect(detail.completion_review.approved).toBe(true);
+  expect(detail.completion_review.attempts).toBe(2);
+  expect(detail.task.todos_completed_total).toBe(2);
+  await page.screenshot({ path: "test-artifacts/completion-review.png", fullPage: true });
+});
+
 test("project folder picker, settings validation and narrow screen", async ({
   page,
 }) => {

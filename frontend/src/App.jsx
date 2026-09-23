@@ -966,6 +966,33 @@ function Inspector({
                 </small>
               )}
             </section>
+            {session.completion_review?.required && (
+              <section className="progress-section" aria-label="완료 조건 검증">
+                <h4>완료 조건 검증</h4>
+                <p role="status">
+                  {session.completion_review.pending
+                    ? "실제 결과를 검증하고 있습니다."
+                    : session.completion_review.approved
+                      ? "모든 완료 조건의 검증을 통과했습니다."
+                      : "할 일 완료 후에도 조건이 충족될 때까지 보완합니다."}
+                </p>
+                <ul>
+                  {(session.completion_review.checks || []).map((check) => (
+                    <li key={check.id}>
+                      <strong>
+                        {{ met: "충족", unmet: "미충족", unverified: "확인 불가" }[check.status]}
+                        {" · "}{check.id === "R0" ? "원래 요청" : check.criterion || "완료 조건"}
+                      </strong>
+                      <p>{check.reason}</p>
+                      {check.next_action && <p>보완: {check.next_action}</p>}
+                    </li>
+                  ))}
+                </ul>
+                <small className="subtle">
+                  최근 검증 결과입니다. 결과물이나 조건이 바뀌면 다시 확인합니다.
+                </small>
+              </section>
+            )}
             <p>{session.task.purpose}</p>
             {["constraints", "completion", "findings", "unresolved"].map(
               (key, i) => (

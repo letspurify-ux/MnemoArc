@@ -1,0 +1,561 @@
+use anyhow::Result;
+use async_trait::async_trait;
+use mnemoarc::{
+    agent::{AgentEvent, run_session},
+    config::{Config, Project},
+    llm::{Completion, LlmClient, ToolCall},
+    session::Session,
+    tools::{
+        self,
+        completion_review::{self as review, Gate},
+    },
+};
+use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+fn session(root: &std::path::Path) -> Session {
+    let mut s = Session::new(
+        Project {
+            root: root.into(),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128000),
+            source_answer_review: false,
+            ..Default::default()
+        },
+    );
+    s.add_user("Save result.txt with a conclusion and an example".into());
+    s.task.completion = vec!["Conclusion is saved".into(), "An example is saved".into()];
+    s
+}
+
+fn write(s: &mut Session, content: &str) {
+    let path = s.project.root.join("result.txt");
+    let mut args = json!({"path":"result.txt","content":content});
+    if path.exists() {
+        args["expected_hash"] = json!(tools::hash(&std::fs::read(path).unwrap()));
+    }
+    let call = ToolCall {
+        id: format!("write-{}", tools::hash(content.as_bytes())),
+        name: "file_write".into(),
+        arguments: args.to_string(),
+    };
+    let result = tools::run_call(s, &call);
+    assert_eq!(result["status"], "ok", "{result}");
+    review::observe(s, &call, &result);
+}
+
+fn plan(s: &mut Session, operations: Value) {
+    let result = tools::execute(
+        s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":s.task.plan_revision,"operations":operations}),
+    )
+    .unwrap();
+    assert_eq!(result["applied"], true, "{result}");
+}
+
+fn payload(request: &Value) -> Value {
+    serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap()
+}
+
+fn verdict(payload: &Value, met: bool) -> String {
+    let evidence = payload["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "current_file")
+        .map(|e| e["id"].clone())
+        .unwrap_or(json!("answer"));
+    json!({"checks":payload["criteria"].as_array().unwrap().iter().map(|c|json!({"id":c["id"],"status":if met {"met"} else {"unmet"},"reason":if met {"Saved content meets this condition"} else {"Saved file has no example"},"evidence":[evidence],"next_action":if met {""} else {"Add the requested example to result.txt"}})).collect::<Vec<_>>()}).to_string()
+}
+
+fn finish(s: &mut Session, met: bool) -> Option<String> {
+    let p = payload(&review::request(s).unwrap());
+    review::finish(s, &verdict(&p, met)).unwrap()
+}
+
+#[test]
+fn empty_plan_is_not_acceptance_and_repair_is_deduplicated() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Conclusion\n");
+    plan(
+        &mut s,
+        json!([{"op":"insert","texts":["Write result"]},{"op":"complete","id":"T1","result":"Saved file"}]),
+    );
+    assert!(s.task.current_todo().is_none());
+    assert_eq!(review::begin(&mut s, "Done").unwrap(), Gate::Review);
+    assert!(finish(&mut s, false).is_none());
+    review::schedule_repairs(&mut s);
+    review::schedule_repairs(&mut s);
+    assert_eq!(s.task.todos.iter().filter(|t| !t.done).count(), 1);
+    assert!(!s.completion_review.approved);
+    let id = s.task.current_todo().unwrap().id.clone();
+    plan(
+        &mut s,
+        json!([{"op":"complete","id":id,"result":"Only marked done"}]),
+    );
+    assert_eq!(review::begin(&mut s, "Done").unwrap(), Gate::Repair);
+    review::schedule_repairs(&mut s);
+    assert_eq!(s.task.current_todo().unwrap().id, id);
+    assert_eq!(s.completion_review.attempts, 1);
+    write(&mut s, "Conclusion\nExample: real result\n");
+    assert_eq!(review::begin(&mut s, "Done").unwrap(), Gate::Review);
+    assert_eq!(finish(&mut s, true).as_deref(), Some("Done"));
+}
+
+#[test]
+fn approval_requires_every_page_and_is_invalidated_by_files_or_requirements() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Conclusion and Example\n");
+    s.task.completion = (0..20).map(|i| format!("Condition {i}")).collect();
+    assert_eq!(review::begin(&mut s, "Done").unwrap(), Gate::Review);
+    assert!(finish(&mut s, true).is_none());
+    assert!(s.completion_review.pending);
+    assert!(finish(&mut s, true).is_none());
+    assert!(!s.completion_review.approved);
+    assert_eq!(finish(&mut s, true).as_deref(), Some("Done"));
+    assert_eq!(s.completion_review.checks.len(), 21);
+    assert_eq!(review::begin(&mut s, "Done").unwrap(), Gate::Accepted);
+    std::fs::write(dir.path().join("result.txt"), "Changed outside agent").unwrap();
+    assert_eq!(review::begin(&mut s, "Done").unwrap(), Gate::Review);
+    let p = payload(&review::request(&mut s).unwrap());
+    s.task.completion = vec!["Weakened requirement".into()];
+    assert!(review::finish(&mut s, &verdict(&p, true)).is_err());
+    let p = payload(&review::request(&mut s).unwrap());
+    assert_eq!(
+        p["original_request"],
+        "Save result.txt with a conclusion and an example"
+    );
+    assert_eq!(p["criteria"][0]["id"], "R0");
+}
+
+#[test]
+fn malformed_missing_duplicate_and_invented_evidence_never_approve() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Conclusion");
+    review::begin(&mut s, "Done").unwrap();
+    let p = payload(&review::request(&mut s).unwrap());
+    let valid: Value = serde_json::from_str(&verdict(&p, true)).unwrap();
+    let mut unknown = valid.clone();
+    unknown["checks"][0]["evidence"] = json!(["invented"]);
+    let mut duplicate = valid.clone();
+    duplicate["checks"][1] = duplicate["checks"][0].clone();
+    let mut missing = valid.clone();
+    missing["checks"].as_array_mut().unwrap().pop();
+    let mut self_claim = valid.clone();
+    self_claim["checks"][0]["evidence"] = json!(["answer"]);
+    for response in [
+        "not json".into(),
+        json!({"checks":[]}).to_string(),
+        unknown.to_string(),
+        duplicate.to_string(),
+        missing.to_string(),
+        self_claim.to_string(),
+    ] {
+        assert!(review::finish(&mut s, &response).is_err(), "{response}");
+        assert!(!s.completion_review.approved);
+        assert!(s.completion_review.checks.is_empty());
+    }
+    let mut unknown = valid;
+    unknown["checks"][0]["status"] = json!("unverified");
+    unknown["checks"][0]["next_action"] = json!("Read the saved example section");
+    assert!(
+        review::finish(&mut s, &unknown.to_string())
+            .unwrap()
+            .is_none()
+    );
+    assert!(!s.completion_review.approved);
+}
+
+#[test]
+fn unresolved_and_capacity_remain_visible_without_stopping_or_overflow() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Conclusion and Example");
+    s.task.unresolved = vec!["Unverified requested output".into()];
+    review::begin(&mut s, "Done").unwrap();
+    assert!(finish(&mut s, true).is_none());
+    assert_eq!(s.completion_review.checks.last().unwrap().id, "unresolved");
+    plan(
+        &mut s,
+        json!([{"op":"insert","texts":(0..100).map(|i|format!("Work {i}")).collect::<Vec<_>>()}]),
+    );
+    s.status = "running".into();
+    review::schedule_repairs(&mut s);
+    assert_eq!(s.status, "running");
+    assert_eq!(s.task.todos.iter().filter(|t| !t.done).count(), 100);
+    assert!(
+        s.last_error
+            .as_deref()
+            .unwrap()
+            .contains("completion_review_unmet")
+    );
+    s.add_user("계속 진행".into());
+    assert!(!s.completion_review.checks.is_empty());
+    assert_eq!(
+        s.answer_review_question,
+        "Save result.txt with a conclusion and an example"
+    );
+    s.add_user("New question".into());
+    assert!(s.completion_review.checks.is_empty());
+    assert!(!review::required(&s));
+}
+
+struct RepairClient {
+    root: std::path::PathBuf,
+    reviews: Mutex<usize>,
+}
+#[async_trait]
+impl LlmClient for RepairClient {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let p: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
+                .unwrap_or(Value::Null);
+        if p["completion_review"] == true {
+            *self.reviews.lock().unwrap() += 1;
+            let saved = std::fs::read_to_string(self.root.join("result.txt"))?;
+            return Ok(Completion {
+                text: verdict(&p, saved.contains("Example")),
+                ..Default::default()
+            });
+        }
+        let state: Value = serde_json::from_str(
+            request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )?;
+        let current = &state["run_guidance"]["current_todo"];
+        let saved = std::fs::read_to_string(self.root.join("result.txt"))?;
+        let call = if current.is_null() {
+            return Ok(Completion {
+                text: "Done".into(),
+                ..Default::default()
+            });
+        } else if !saved.contains("Example") {
+            ToolCall {id:"repair-file".into(),name:"file_write".into(),arguments:json!({"path":"result.txt","expected_hash":tools::hash(saved.as_bytes()),"content":"Conclusion\nExample: saved outcome\n"}).to_string()}
+        } else {
+            ToolCall {id:format!("finish-{}",state["task"]["plan_revision"]),name:"task_plan".into(),arguments:json!({"action":"apply","expected_revision":state["task"]["plan_revision"],"operations":[{"op":"complete","id":current["id"],"result":"Added and checked the saved example"}]}).to_string()}
+        };
+        Ok(Completion {
+            calls: vec![call],
+            ..Default::default()
+        })
+    }
+}
+
+async fn run(s: Session, client: Arc<dyn LlmClient>) -> (Session, Vec<AgentEvent>) {
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move {
+        let mut events = Vec::new();
+        while let Some(e) = rx.recv().await {
+            events.push(e);
+        }
+        events
+    });
+    let result = run_session(s, client, CancellationToken::new(), tx).await;
+    (result, drain.await.unwrap())
+}
+
+#[tokio::test]
+async fn all_todos_done_but_missing_criterion_repairs_and_verifies_before_final() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Conclusion\n");
+    plan(
+        &mut s,
+        json!([{"op":"insert","texts":["Write requested output"]},{"op":"complete","id":"T1","result":"Saved result.txt"}]),
+    );
+    let client = Arc::new(RepairClient {
+        root: dir.path().into(),
+        reviews: Mutex::new(0),
+    });
+    let (result, events) = run(s, client.clone()).await;
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert!(result.completion_review.approved);
+    assert_eq!(*client.reviews.lock().unwrap(), 2);
+    assert!(result.task.current_todo().is_none());
+    assert_eq!(result.task.todos_completed_total, 2);
+    assert!(
+        std::fs::read_to_string(dir.path().join("result.txt"))
+            .unwrap()
+            .contains("Example")
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e,AgentEvent::Delta{text,..} if text=="Done"))
+            .count(),
+        1
+    );
+    assert!(
+        events
+            .iter()
+            .filter_map(|e| if let AgentEvent::Snapshot(s) = e {
+                Some(s)
+            } else {
+                None
+            })
+            .filter(|s| s.status == "complete")
+            .all(|s| s.completion_review.approved)
+    );
+}
+
+struct InvalidClient;
+#[async_trait]
+impl LlmClient for InvalidClient {
+    async fn complete(
+        &self,
+        _: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        Ok(Completion {
+            text: "Done".into(),
+            ..Default::default()
+        })
+    }
+}
+#[tokio::test]
+async fn invalid_review_is_partial_and_resume_keeps_the_candidate_and_requirements() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Conclusion and Example\n");
+    let (mut result, events) = run(s, Arc::new(InvalidClient)).await;
+    assert_eq!(result.status, "partial");
+    assert!(result.completion_review.pending);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e,AgentEvent::Delta{text,..} if text=="Done"))
+    );
+    result.add_user("resume".into());
+    let client = Arc::new(RepairClient {
+        root: dir.path().into(),
+        reviews: Mutex::new(0),
+    });
+    let (result, _) = run(result, client).await;
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert!(result.completion_review.approved);
+}
+
+#[test]
+fn stale_observations_are_excluded_and_business_ids_are_preserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Old content");
+    let db = ToolCall {
+        id: "query".into(),
+        name: "db_query".into(),
+        arguments: "{}".into(),
+    };
+    review::observe(
+        &mut s,
+        &db,
+        &json!({"status":"ok","data":{"rows":[{"id":123,"observed_at":"user timestamp"}]}}),
+    );
+    std::fs::write(dir.path().join("result.txt"), "New content").unwrap();
+    review::begin(&mut s, "Done").unwrap();
+    let p = payload(&review::request(&mut s).unwrap());
+    assert_eq!(p["evidence_omitted"], true);
+    let evidence = p["evidence"].to_string();
+    assert!(evidence.contains("New content"));
+    assert!(!evidence.contains("Old content"));
+    assert!(evidence.contains("123"));
+    assert!(evidence.contains("user timestamp"));
+}
+
+struct ChurnClient(Mutex<usize>);
+#[async_trait]
+impl LlmClient for ChurnClient {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let p: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
+                .unwrap_or(Value::Null);
+        if p["completion_review"] == true {
+            *self.0.lock().unwrap() += 1;
+            return Ok(Completion {
+                text: verdict(&p, false),
+                ..Default::default()
+            });
+        }
+        let state: Value = serde_json::from_str(
+            request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )?;
+        let current = &state["run_guidance"]["current_todo"];
+        if current.is_null() {
+            return Ok(Completion {
+                text: "Done".into(),
+                ..Default::default()
+            });
+        }
+        Ok(Completion { calls:vec![ToolCall {id:format!("mark-{}",state["task"]["plan_revision"]),name:"task_plan".into(),arguments:json!({"action":"apply","expected_revision":state["task"]["plan_revision"],"operations":[{"op":"complete","id":current["id"],"result":"Claimed completion without fixing result"}]}).to_string()}], ..Default::default() })
+    }
+}
+
+#[tokio::test]
+async fn unchanged_rejection_cannot_loop_reviews_or_publish_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Conclusion only");
+    let client = Arc::new(ChurnClient(Mutex::new(0)));
+    let (result, events) = run(s, client.clone()).await;
+    assert_eq!(result.status, "partial", "{:?}", result.last_error);
+    assert!(
+        result
+            .last_error
+            .unwrap()
+            .starts_with("completion_review_no_progress")
+    );
+    assert_eq!(*client.0.lock().unwrap(), 1);
+    assert_eq!(result.task.todos.len(), 1);
+    assert!(result.task.current_todo().is_some());
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e,AgentEvent::Delta{text,..} if text=="Done"))
+    );
+}
+
+#[tokio::test]
+async fn budget_exhaustion_preserves_pending_acceptance_for_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Conclusion only");
+    review::begin(&mut s, "Done").unwrap();
+    s.config.run_tokens = 1;
+    let (result, _) = run(s, Arc::new(InvalidClient)).await;
+    assert_ne!(result.status, "complete");
+    assert!(result.completion_review.pending);
+    assert!(!result.completion_review.approved);
+    assert_eq!(result.task.completion.len(), 2);
+}
+
+struct CompatibleReview {
+    fenced: bool,
+    limited: bool,
+}
+#[async_trait]
+impl LlmClient for CompatibleReview {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let mut text = verdict(&payload(&request), true);
+        if self.fenced {
+            text = format!("```JSON\r\n{text}\r\n```");
+        }
+        Ok(Completion {
+            text,
+            length_limited: self.limited,
+            ..Default::default()
+        })
+    }
+}
+#[tokio::test]
+async fn complete_json_verdict_tolerates_fences_and_spurious_length_without_restarting_answer() {
+    for (fenced, limited) in [(true, false), (false, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session(dir.path());
+        write(&mut s, "Conclusion and Example");
+        review::begin(&mut s, "Verified final answer").unwrap();
+        let (result, events) = run(s, Arc::new(CompatibleReview { fenced, limited })).await;
+        assert_eq!(result.status, "complete", "{:?}", result.last_error);
+        assert_eq!(result.completion_review.attempts, 1);
+        assert!(result.answer_draft.is_none());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e,AgentEvent::Delta{text,..} if text=="Verified final answer"))
+        );
+    }
+}
+
+struct ContinuedAnswer(Mutex<usize>);
+#[async_trait]
+impl LlmClient for ContinuedAnswer {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let mut step = self.0.lock().unwrap();
+        let response = match *step {
+            0 => Completion {
+                text: "```mermaid\nflowchart LR\n A -->".into(),
+                length_limited: true,
+                ..Default::default()
+            },
+            1 => Completion {
+                text: " B\n```".into(),
+                ..Default::default()
+            },
+            2 => {
+                let p = payload(&request);
+                assert_eq!(p["completion_review"], true);
+                assert_eq!(
+                    p["evidence"][0]["text"],
+                    "```mermaid\nflowchart LR\n A --> B\n```"
+                );
+                assert_eq!(p["evidence"][0]["truncated"], false);
+                Completion {
+                    text: verdict(&p, true),
+                    ..Default::default()
+                }
+            }
+            _ => panic!("unexpected continuation/review loop"),
+        };
+        *step += 1;
+        Ok(response)
+    }
+}
+#[tokio::test]
+async fn planned_answer_continuation_reviews_whole_answer_and_keeps_join_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.add_user("Draw a flowchart in the final answer".into());
+    plan(
+        &mut s,
+        json!([{"op":"insert","texts":["Prepare diagram"]},{"op":"complete","id":"T1","result":"Prepared diagram"}]),
+    );
+    let (result, _) = run(s, Arc::new(ContinuedAnswer(Mutex::new(0)))).await;
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    let messages = result.history.active();
+    let final_message = messages.last().unwrap();
+    assert_eq!(final_message["continues_previous"], true);
+    assert_eq!(final_message["content"], " B\n```");
+    assert!(result.completion_review.approved);
+}

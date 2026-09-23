@@ -1,4 +1,5 @@
 pub mod answer_review;
+pub mod completion_review;
 mod coverage;
 pub mod document_review;
 mod documentation;
