@@ -325,8 +325,10 @@ fn settings_validation_and_lowering_keeps_original() {
 
 #[test]
 fn llm_transport_settings_are_validated_and_endpoint_is_composed_safely() {
-    let mut c = Config::default();
-    c.base_url = "ftp://example.com/v1".into();
+    let mut c = Config {
+        base_url: "ftp://example.com/v1".into(),
+        ..Default::default()
+    };
     assert!(c.validate().is_err());
 
     c.base_url = "https://example.com/v1?tenant=alpha".into();

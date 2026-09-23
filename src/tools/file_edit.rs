@@ -85,10 +85,10 @@ pub(super) fn excluded_case_alias(project: &Project, relative: &Path) -> Result<
         }
         let folded_pattern = folded_alias_key(pattern);
         let folded_path = folded_alias_key(&relative.to_string_lossy());
-        if let Ok(folded_glob) = globset::Glob::new(&folded_pattern) {
-            if folded_glob.compile_matcher().is_match(&folded_path) {
-                return Ok(true);
-            }
+        if let Ok(folded_glob) = globset::Glob::new(&folded_pattern)
+            && folded_glob.compile_matcher().is_match(&folded_path)
+        {
+            return Ok(true);
         }
     }
     Ok(false)

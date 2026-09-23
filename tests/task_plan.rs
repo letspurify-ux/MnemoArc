@@ -181,6 +181,24 @@ fn small_results_keep_the_operation_correction_visible() {
 }
 
 #[test]
+fn small_result_budget_preserves_successful_plan_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.config.result_tokens = 200;
+    let call = ToolCall {
+        id: "long-success".into(),
+        name: "task_plan".into(),
+        arguments: json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["세부 작업을 완료하고 결과를 저장합니다. ".repeat(6)]}]}).to_string(),
+    };
+    let result = tools::run_call(&mut s, &call);
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(result["data"]["applied"], true, "{result}");
+    assert_eq!(result["data"]["plan"]["revision"], 1, "{result}");
+    assert!(tools::result_tokens(&call, &result, &s.config.model) <= 200);
+    assert_eq!(s.task.todos.len(), 1);
+}
+
+#[test]
 fn prerequisites_insert_move_remove_and_complete_in_order_atomically() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
@@ -281,6 +299,29 @@ fn full_plan_and_stale_revision_do_not_fail_or_lose_work() {
     assert_eq!(listed.len(), 100);
     assert_eq!(listed.first().unwrap(), "T1");
     assert_eq!(listed.last().unwrap(), "T100");
+    s.config.result_tokens = 1000;
+    let page_call = ToolCall {
+        id: "bounded-plan-page".into(),
+        name: "task_plan".into(),
+        arguments: json!({"action":"list","offset":0,"limit":20}).to_string(),
+    };
+    let first_page = tools::run_call(&mut s, &page_call);
+    assert_eq!(first_page["status"], "ok", "{first_page}");
+    let shown = first_page["data"]["items"].as_array().unwrap().len();
+    assert!(shown > 0 && shown < 20, "{first_page}");
+    assert_eq!(first_page["data"]["next_offset"], shown);
+    let next_page = tools::run_call(
+        &mut s,
+        &ToolCall {
+            id: "bounded-plan-next-page".into(),
+            name: "task_plan".into(),
+            arguments: json!({"action":"list","offset":shown,"limit":20}).to_string(),
+        },
+    );
+    assert_eq!(
+        next_page["data"]["items"][0]["id"],
+        format!("T{}", shown + 1)
+    );
     let original = s.task.todos.clone();
     let refused = apply(&mut s, json!([{"op":"insert","texts":["Later work"]}]));
     assert_eq!(refused["applied"], false);
@@ -307,7 +348,7 @@ fn full_plan_and_stale_revision_do_not_fail_or_lose_work() {
         json!({"action":"update","patch":{"findings":["The first outcome is saved"]}}),
     )
     .unwrap();
-    s.add_user("Continue current plan".into());
+    s.add_user("계속".into());
     ContextManager::prepare(&mut s, 60000).unwrap();
     let checkpoint_id = s.checkpoint.as_ref().unwrap().id.clone();
     tools::execute(&mut s,"checkpoint_complete",json!({"id":checkpoint_id,"progress":"Continue with the current outcome","no_save_reason":"No new reusable facts"})).unwrap();

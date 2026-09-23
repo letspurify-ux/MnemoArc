@@ -3157,6 +3157,20 @@ pub fn limit_result(
     {
         compact["data"] = json!({"hash":result["data"]["hash"]});
     }
+    if call.name == "task_plan" && result["data"]["applied"] == true {
+        // An applied mutation must remain distinguishable from an archived
+        // read, even when long item text does not fit the result budget.
+        compact["data"] = json!({
+            "applied":true,
+            "input_normalized":result["data"]["input_normalized"],
+            "unchanged":result["data"]["unchanged"] == true,
+            "plan":{
+                "revision":result["data"]["plan"]["revision"],
+                "pending_count":result["data"]["plan"]["pending_count"],
+                "current_id":result["data"]["plan"]["current"]["id"]
+            }
+        });
+    }
     if call.name == "task_plan" && result["data"]["applied"] == false {
         // The unchanged plan can be large. Keep the correction visible so
         // the model need not rediscover it through history during recovery.
