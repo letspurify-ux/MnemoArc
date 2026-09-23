@@ -252,6 +252,117 @@ fn prerequisites_insert_move_remove_and_complete_in_order_atomically() {
 }
 
 #[test]
+fn split_refines_current_and_later_items_without_losing_the_original_goal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.task.completion = vec!["Produce and review the requested report".into()];
+    apply(
+        &mut s,
+        json!([{"op":"insert","texts":["Produce report","Publish result"]}]),
+    );
+    let split = tools::run_call(
+        &mut s,
+        &ToolCall {
+            id: "split-current".into(),
+            name: "task_plan".into(),
+            arguments: json!({"action":"apply","expected_revision":1,"operations":{"op":"split","id":"T1","texts":["Read required source","Write report","Review report"]}}).to_string(),
+        },
+    );
+    assert_eq!(split["status"], "ok", "{split}");
+    assert_eq!(split["data"]["applied"], true, "{split}");
+    assert_eq!(split["data"]["input_normalized"], true);
+    assert_eq!(s.task.current_todo().unwrap().id, "T1");
+    assert_eq!(
+        s.task
+            .todos
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        ["T1", "T3", "T4", "T2"]
+    );
+    assert_eq!(s.task.todos[0].text, "Read required source");
+    assert_eq!(
+        s.task.completion,
+        ["Produce and review the requested report"]
+    );
+
+    let original = json!(s.task);
+    for operations in [
+        json!([{"op":"split","id":"T1","texts":["Only one part"]}]),
+        json!([{"op":"split","id":"T1","texts":["Same part","Same part"]}]),
+        json!([{"op":"split","id":"T1","texts":["Read required source","New part"]}]),
+        json!([{"op":"split","id":"T1","texts":["New part","Publish result"]}]),
+        json!([
+            {"op":"split","id":"T1","texts":["Inspect source","Save findings"]},
+            {"op":"complete","id":"T2","result":"Cannot skip current"}
+        ]),
+    ] {
+        assert_eq!(apply(&mut s, operations)["applied"], false);
+        assert_eq!(json!(s.task), original);
+    }
+
+    apply(
+        &mut s,
+        json!([{"op":"complete","id":"T1","result":"Read the source"}]),
+    );
+    assert_eq!(s.task.current_todo().unwrap().id, "T3");
+    let later = apply(
+        &mut s,
+        json!([{"op":"split","id":"T2","texts":["Prepare release","Send result"]}]),
+    );
+    assert_eq!(later["applied"], true, "{later}");
+    assert_eq!(
+        s.task
+            .todos
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        ["T1", "T3", "T4", "T2", "T5"]
+    );
+    assert_eq!(s.task.current_todo().unwrap().id, "T3");
+    let completed = apply(
+        &mut s,
+        json!([{"op":"split","id":"T1","texts":["Reread source","Check source"]}]),
+    );
+    assert_eq!(completed["applied"], false);
+    assert_eq!(s.task.todos.len(), 5);
+}
+
+#[test]
+fn split_at_capacity_is_recoverable_and_can_share_a_batch_with_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.status = "running".into();
+    let texts = (1..=100)
+        .map(|i| format!("Outcome {i}"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        apply(&mut s, json!([{"op":"insert","texts":texts}]))["applied"],
+        true
+    );
+    let original = json!(s.task);
+    let refused = apply(
+        &mut s,
+        json!([{"op":"split","id":"T1","texts":["Inspect first outcome","Finish first outcome"]}]),
+    );
+    assert_eq!(refused["applied"], false);
+    assert_eq!(json!(s.task), original);
+    assert_eq!(s.status, "running");
+    let applied = apply(
+        &mut s,
+        json!([
+            {"op":"remove","id":"T100","reason":"No longer needed"},
+            {"op":"split","id":"T1","texts":["Inspect first outcome","Finish first outcome"]}
+        ]),
+    );
+    assert_eq!(applied["applied"], true, "{applied}");
+    assert_eq!(s.task.todos.iter().filter(|item| !item.done).count(), 100);
+    assert_eq!(s.task.todos[0].id, "T1");
+    assert_eq!(s.task.todos[1].id, "T101");
+    assert_eq!(s.task.current_todo().unwrap().text, "Inspect first outcome");
+}
+
+#[test]
 fn full_plan_and_stale_revision_do_not_fail_or_lose_work() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());

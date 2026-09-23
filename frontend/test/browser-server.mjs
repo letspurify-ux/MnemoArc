@@ -61,6 +61,13 @@ const provider = createServer(async (req, res) => {
         { op: "remove", id: "T3", reason: "요청 범위 밖" },
       ],
       [{ op: "complete", id: "T4", result: "필요한 선언을 확인했습니다." }],
+      [
+        {
+          op: "split",
+          id: "T1",
+          texts: ["본문 초안 작성", "본문 내용 검증"],
+        },
+      ],
     ][revision];
     if (!operations) {
       const keep = setInterval(() => res.write(": keepalive\n\n"), 1000);

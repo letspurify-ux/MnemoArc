@@ -117,17 +117,19 @@ test("ordered to-do list follows prerequisites and preserves running work on rel
   await page.getByRole("button", { name: "메시지 보내기" }).click();
   await page.getByRole("tab", { name: "진행", exact: true }).click();
   const plan = page.getByRole("region", { name: "할 일 목록" });
-  await expect(plan.locator("li")).toHaveCount(3);
+  await expect(plan.locator("li")).toHaveCount(4);
   await expect(plan.locator("li").nth(0)).toContainText("완료");
   await expect(plan.locator("li").nth(0)).toContainText("선행 근거 확인");
-  await expect(plan.locator("[aria-current=step]")).toContainText("본문 작성");
+  await expect(plan.locator("[aria-current=step]")).toContainText("본문 초안 작성");
   await expect(plan.locator("li").nth(2)).toContainText("대기");
+  await expect(plan.locator("li").nth(2)).toContainText("본문 내용 검증");
+  await expect(plan.locator("li").nth(3)).toContainText("결과 검증");
   await expect(plan).not.toContainText("불필요 작업");
-  await expect(plan).toContainText("남은 항목 2/100 · 누적 완료 1개");
+  await expect(plan).toContainText("남은 항목 3/100 · 누적 완료 1개");
   await expect(page.getByRole("button", { name: "■ 중지" })).toBeVisible();
   await page.reload();
   await page.getByRole("tab", { name: "진행", exact: true }).click();
-  await expect(plan.locator("[aria-current=step]")).toContainText("본문 작성");
+  await expect(plan.locator("[aria-current=step]")).toContainText("본문 초안 작성");
   await expect(
     page.getByRole("button", { name: "● 다른 세션 작업 중" }),
   ).toHaveCount(0);

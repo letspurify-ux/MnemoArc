@@ -538,7 +538,7 @@ pub async fn run_session_controlled(
             "progress_recovery":{"active":progress_recovery,"rounds_without_progress":rounds_without_progress,"repeated_read":repeated_read_detected},
             "current_todo":s.task.current_todo(),
             "plan_pending_count":s.task.todos.iter().filter(|item| !item.done).count(),
-            "plan_instruction":"Execute current_todo before later items. Insert a concrete prerequisite before it when needed. Complete it through task_plan with the observed result; changes to the plan do not reset no-progress recovery. If the plan is full, finish the current item or merge/remove obsolete pending items; do not stop the task.",
+            "plan_instruction":"Execute current_todo before later items. Insert a concrete prerequisite before it when needed, or split a broad pending item into ordered smaller outcomes while preserving its goal. Complete the current item through task_plan with the observed result; plan edits do not reset no-progress recovery. If the plan is full, finish the current item or remove obsolete pending items; do not stop the task.",
             "writing_reserve_tokens":(s.config.run_tokens as f64*s.config.writing_reserve_ratio) as usize,
             "verification_reserve_tokens":(s.config.run_tokens as f64*s.config.verification_reserve_ratio) as usize,
             "document_repair_limit":s.config.document_repair_limit,

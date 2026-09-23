@@ -24,6 +24,10 @@ enum Operation {
         id: String,
         text: String,
     },
+    Split {
+        id: String,
+        texts: Vec<String>,
+    },
     Move {
         id: String,
         before: Option<String>,
@@ -59,8 +63,8 @@ pub fn spec() -> ToolSpec {
                 // providers that handle nested union schemas poorly. Rust
                 // still enforces each operation's required/allowed fields.
                 "items":schema(json!({
-                    "op":action(&["insert","update","move","remove","complete","reopen"]),
-                    "texts":{"type":"array","minItems":1,"maxItems":MAX_PENDING,"items":short,"description":"insert only; required array of concise item descriptions"},
+                    "op":action(&["insert","update","split","move","remove","complete","reopen"]),
+                    "texts":{"type":"array","minItems":1,"maxItems":MAX_PENDING,"items":short,"description":"insert or split; split needs at least two smaller outcomes in execution order"},
                     "before":id,"id":id,"text":short,"result":note,"reason":note
                 }), &["op"])
             }
@@ -73,7 +77,7 @@ pub fn spec() -> ToolSpec {
     ]);
     ToolSpec {
         name: "task_plan",
-        description: "Manage an ordered to-do list. Read with {\"action\":\"list\"}; use offset/limit to page through the full list (default 10, maximum 20). Change with {\"action\":\"apply\",\"expected_revision\":0,\"operations\":[{\"op\":\"insert\",\"texts\":[\"Write the requested section\"]}]}; copy the actual revision, and keep operations as an array, not quoted JSON. Applies 1..16 operations atomically. insert requires texts; optional before is a pending ID (omit to append). update requires id/text. move requires id and optional before. complete requires the CURRENT item's id/result after actually doing the work. remove and reopen require id/reason; reopen puts a completed item before current. Keep at most 100 unfinished small concrete outcomes; split investigation and saving when each is a meaningful result, and move promptly to writing. Retain only the latest 5 completed items and cumulative completed_total. Input/transition/capacity conflicts return applied=false without stopping; follow the correction or continue current work. Plan edits are not actual progress. Preserve user requirements in task_state.completion.",
+        description: "Manage an ordered to-do list. Read with {\"action\":\"list\"}; use offset/limit to page through the full list (default 10, maximum 20). Change with {\"action\":\"apply\",\"expected_revision\":0,\"operations\":[{\"op\":\"insert\",\"texts\":[\"Write the requested section\"]}]}; copy the actual revision, and keep operations as an array, not quoted JSON. Applies 1..16 operations atomically. insert requires texts; optional before is a pending ID (omit to append). update requires id/text. split requires an unfinished id and 2..100 smaller texts in execution order; it keeps the original ID for the first subtask and creates IDs for the rest. Split a broad item only when its parts together preserve the original outcome. move requires id and optional before. complete requires the CURRENT item's id/result after actually doing the work. remove and reopen require id/reason; reopen puts a completed item before current. Keep at most 100 unfinished small concrete outcomes; split investigation and saving when each is a meaningful result, and move promptly to writing. Retain only the latest 5 completed items and cumulative completed_total. Input/transition/capacity conflicts return applied=false without stopping; follow the correction or continue current work. Plan edits are not actual progress. Preserve user requirements in task_state.completion.",
         optional: false,
         read_only: false,
         parameters,
@@ -169,6 +173,45 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
             let text = nonempty(&text, MAX_TEXT_CHARS)?;
             unique(task, text, Some(&id))?;
             task.todos[at].text = text.into();
+        }
+        Operation::Split { id, texts } => {
+            let at = index(task, &id)?;
+            if task.todos[at].done {
+                bail!("Reopen a completed item before splitting it");
+            }
+            if !(2..=MAX_PENDING).contains(&texts.len()) {
+                bail!("Split into 2..{MAX_PENDING} smaller unfinished outcomes");
+            }
+            let original = task.todos[at].text.clone();
+            let mut parts = Vec::with_capacity(texts.len());
+            let mut seen = std::collections::BTreeSet::new();
+            for text in texts {
+                let text = nonempty(&text, MAX_TEXT_CHARS)?;
+                if text == original.as_str() {
+                    bail!("Each split item must be more specific than the original item");
+                }
+                unique(task, text, Some(&id))?;
+                if !seen.insert(text.to_string()) {
+                    bail!("Split items must have distinct descriptions");
+                }
+                parts.push(text.to_string());
+            }
+            task.todos[at].text = parts.remove(0);
+            for (offset, text) in parts.into_iter().enumerate() {
+                task.todo_sequence = task
+                    .todo_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("Plan ID capacity reached"))?;
+                task.todos.insert(
+                    at + offset + 1,
+                    TodoItem {
+                        id: format!("T{}", task.todo_sequence),
+                        text,
+                        done: false,
+                        result: String::new(),
+                    },
+                );
+            }
         }
         Operation::Move { id, before } => {
             let at = index(task, &id)?;
