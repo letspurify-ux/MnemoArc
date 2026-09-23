@@ -234,6 +234,27 @@ test("length-limited Mermaid answer continues as one rendered diagram", async ({
   expect(replies[1].continues_previous).toBe(true);
 });
 
+test("shared inventory shows unfinished source review and survives reload", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  await page.getByRole("textbox", { name: "메시지", exact: true }).fill("기능 문서 범위 테스트");
+  await page.getByRole("button", { name: "메시지 보내기" }).click();
+  await page.getByRole("tab", { name: "진행", exact: true }).click();
+  const inventory = page.getByRole("region", { name: "기능 문서 범위", exact: true });
+  await expect(inventory).toContainText("파일 수집");
+  await expect(inventory).toContainText("검토 0");
+  await expect(inventory).toContainText("최근 누락 점검: 보완");
+  await expect(page.locator(".chat-content")).toContainText("기능 목록과 문서에 확인할 항목이 남아 있어 보완 작업을 진행합니다.");
+  await expect(page.locator(".task-plan")).toContainText("review_file");
+  await page.reload();
+  await page.getByRole("tab", { name: "진행", exact: true }).click();
+  await expect(inventory).toContainText("최근 누락 점검: 보완");
+  await expect(page.getByRole("button", { name: "■ 중지" })).toBeVisible();
+  await page.screenshot({ path: "test-artifacts/capability-inventory.png", fullPage: true });
+  await page.getByRole("button", { name: "■ 중지" }).click();
+  await expect(page.locator(".status-pill")).toHaveText("중지됨");
+});
+
 test("app exit can be cancelled and stops reconnecting after confirmation", async ({
   page,
 }) => {

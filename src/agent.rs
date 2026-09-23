@@ -364,6 +364,8 @@ pub async fn run_session_controlled(
     let mut length_recoveries = 0usize;
     let mut review_response_failures = 0usize;
     let mut completion_stalls = 0usize;
+    let mut coverage_stalls = 0usize;
+    let mut coverage_fingerprint = String::new();
     let mut tool_failures = tools::recovery::FailureTracker::default();
     let mut repetitions = std::collections::BTreeMap::<String, usize>::new();
     let mut last_document_hash: Option<String> = None;
@@ -549,7 +551,7 @@ pub async fn run_session_controlled(
             "document_repair_requests_used":s.document_review.repair_requests,
             "document_repair_requests_remaining":s.config.document_repair_limit.saturating_sub(s.document_review.repair_requests),
             "pending_count":s.investigations.iter().filter(|i|i.status != "verified").count(),
-            "completion_error":if finalization_attempts > 0 || s.last_error.as_deref().is_some_and(|error| error.starts_with("task_plan_pending:") || error.starts_with("completion_review")) { s.last_error.as_deref() } else { None },
+            "completion_error":if finalization_attempts > 0 || s.last_error.as_deref().is_some_and(|error| error.starts_with("task_plan_pending:") || error.starts_with("completion_review") || error.starts_with("documentation_coverage")) { s.last_error.as_deref() } else { None },
             "instruction":if progress_recovery { if document_work { "Progress recovery: repeated investigation has not changed the document or verified an item. Use the evidence already gathered to make one small, safe document_edit now, or verify an existing written item. Inspect the output hash if needed. Read only a specific missing source range that directly blocks that action. Do not gather more general evidence or save another memory first. If a claim cannot be supported, mark that gap in the relevant section and continue with supported work; do not invent evidence. A checkpoint remains the only exception for memory maintenance." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, batch targeted reads for missing evidence, then repair known issues in their original locations with targeted section or text edits when safe. Review findings are edit instructions, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Run verify_batch once after all edits, not after every small correction. Only requests containing document_edit or document_edit_batch consume the repair budget (one per request, including failed edits); reads and verification do not. At zero remaining, finish verification and review without another edit. The remaining edit request budget is in document_repair_requests_remaining; audit existing sections and fix factual errors within that budget. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, save each investigated section in a separate edit as soon as its evidence is ready. Check the current outline; use insert_before/insert_after for siblings and insert_first_child/insert_last_child for nested sections when that preserves the document flow. Copy section_path to identify repeated headings; preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>"For source documentation, investigate one section, save it, then move to the next. Create only a short opening with the first ready section; inspect the outline before each later addition, copy section_path when headings repeat, and use sibling or child insertion to place it within the hierarchy. For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. Answer once evidence is sufficient; no source audit or document write is required."} }});
         let definitions = ToolRegistry::definitions(&s);
         let mut request = match ContextManager::request(&s, definitions.clone()) {
@@ -1066,7 +1068,42 @@ pub async fn run_session_controlled(
                 )
                 .await;
                 continue;
-            } else if let Err(error) = tools::verify_document_write(&s) {
+            }
+            if s.capabilities.active {
+                match tools::capabilities::audit(&s, &cancel) {
+                    Ok(audit) => {
+                        tools::capabilities::remember(&mut s, &audit);
+                        if !audit.ready {
+                            if coverage_fingerprint == audit.progress_fingerprint {
+                                coverage_stalls += 1;
+                            } else {
+                                coverage_fingerprint = audit.progress_fingerprint.clone();
+                                coverage_stalls = 0;
+                            }
+                            tools::capabilities::enqueue(&mut s, &audit);
+                            if coverage_stalls >= FINALIZATION_RETRY_LIMIT {
+                                s.status = "partial".into();
+                                s.last_error = Some("documentation_coverage_no_progress: unchanged gaps remain; inventory, evidence and repair tasks retained for resume".into());
+                                break;
+                            }
+                            s.status = "running".into();
+                            emit(&events, AgentEvent::Notice {session:s.id.clone(),text:"기능 목록과 문서의 누락 항목을 확인해 보완 작업을 계속합니다.".into()}, &cancel, run_deadline(started,&s.config)).await;
+                            continue;
+                        }
+                    }
+                    Err(error) => {
+                        s.status = if cancel.is_cancelled() {
+                            "cancelled"
+                        } else {
+                            "partial"
+                        }
+                        .into();
+                        s.last_error = Some(format!("documentation_coverage_audit: {error}"));
+                        break;
+                    }
+                }
+            }
+            if let Err(error) = tools::verify_document_write(&s) {
                 s.status = "partial".into();
                 s.last_error = Some(error.to_string());
             } else if s.task.require_investigation && s.investigations.is_empty() {
@@ -1213,6 +1250,7 @@ pub async fn run_session_controlled(
         let mut remaining = batch_limit;
         let mut seen_call_ids = std::collections::BTreeSet::new();
         let mut batch_document_hash: Option<String> = None;
+        let prior_inventory_progress = tools::capabilities::progress(&s);
         let prior_document_hash = s.last_document_write.as_ref().map(|(_, hash)| hash.clone());
         let checkpoint_batch = s.checkpoint.is_some();
         let mut file_changed = false;
@@ -1450,7 +1488,11 @@ pub async fn run_session_controlled(
             || tracking_plan
             || s.task.plan_revision > 0
             || execution_calls.iter().any(|call| call.name == "task_plan");
-        if document_changed || file_changed || new_verified > verified_count {
+        let inventory_progress = tools::capabilities::progress(&s)
+            .iter()
+            .zip(prior_inventory_progress)
+            .any(|(now, before)| *now > before);
+        if document_changed || file_changed || new_verified > verified_count || inventory_progress {
             completion_stalls = 0;
             rounds_without_progress = 0;
             repeated_read_detected = false;

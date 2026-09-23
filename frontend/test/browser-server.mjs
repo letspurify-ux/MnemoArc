@@ -61,7 +61,37 @@ const provider = createServer(async (req, res) => {
     })) }));
     return;
   }
-  const acceptanceTest = data.messages.some((m) => m.role === "user" && m.content === "완료 조건 검증 테스트");
+  let retainedState;
+  try {
+    const raw = data.messages.at(-1).content;
+    retainedState = JSON.parse(raw.slice(raw.indexOf("\n") + 1));
+  } catch {}
+  if (retainedState?.checkpoint) {
+    // Fixtures keep their entire working state in program-owned task fields;
+    // acknowledge cleanup when schemas/history cross the context watermark.
+    event({ choices: [{ delta: { tool_calls: [{ index: 0, id: `checkpoint-${retainedState.checkpoint.id}`, function: {
+      name: "checkpoint_complete", arguments: JSON.stringify({ id: retainedState.checkpoint.id, no_save_reason: "Fixture requirements and findings are already retained in program task state.", progress: "Continue the current fixture task." }),
+    } }] }, finish_reason: "tool_calls" }] });
+    res.end("data: [DONE]\n\n");
+    return;
+  }
+  const isRequest = (text) => retainedState?.latest_request === text || data.messages.some((m) => m.role === "user" && m.content === text);
+  const inventoryTest = isRequest("기능 문서 범위 테스트");
+  if (inventoryTest) {
+    const raw = data.messages.at(-1).content;
+    const state = JSON.parse(raw.slice(raw.indexOf("\n") + 1));
+    if (state.capability_inventory.active && state.capability_inventory.last_audit) {
+      const keep = setInterval(() => res.write(": keepalive\n\n"), 1000);
+      res.on("close", () => clearInterval(keep));
+      return;
+    }
+    const name = state.capability_inventory.active ? "documentation_coverage" : "capability_inventory";
+    const args = { action: state.capability_inventory.active ? "enqueue" : "scan" };
+    event({ choices: [{ delta: { tool_calls: [{ index: 0, id: name, function: { name, arguments: JSON.stringify(args) } }] }, finish_reason: "tool_calls" }] });
+    res.end("data: [DONE]\n\n");
+    return;
+  }
+  const acceptanceTest = isRequest("완료 조건 검증 테스트");
   if (acceptanceTest) {
     const message = data.messages.at(-1).content;
     const state = JSON.parse(message.slice(message.indexOf("\n") + 1));
@@ -80,9 +110,7 @@ const provider = createServer(async (req, res) => {
     res.end("data: [DONE]\n\n");
     return;
   }
-  const planTest = data.messages.some(
-    (m) => m.role === "user" && m.content === "할 일 목록 테스트",
-  );
+  const planTest = isRequest("할 일 목록 테스트");
   if (planTest) {
     const stateMessage = data.messages.at(-1).content;
     const state = JSON.parse(
@@ -135,9 +163,7 @@ const provider = createServer(async (req, res) => {
     res.end("data: [DONE]\n\n");
     return;
   }
-  const continuation = data.messages.some(
-    (m) => m.role === "user" && m.content === "길이 이어받기 테스트",
-  );
+  const continuation = isRequest("길이 이어받기 테스트");
   if (continuation) {
     const resumed = data.messages.some(
       (m) =>
@@ -161,9 +187,7 @@ const provider = createServer(async (req, res) => {
     res.end("data: [DONE]\n\n");
     return;
   }
-  const slow = data.messages.some(
-    (m) => m.role === "user" && m.content === "느린 요청 테스트",
-  );
+  const slow = isRequest("느린 요청 테스트");
   if (slow) {
     await new Promise((resolve) => setTimeout(resolve, 1800));
     if (res.destroyed) return;

@@ -40,6 +40,8 @@ export const toolLabels = {
   memory_find: "기억 검색",
   memory_manage: "기억 정리",
   task_state: "목표·진행 관리",
+  capability_inventory: "화면·서버 기능 목록",
+  documentation_coverage: "기능 문서 누락 점검",
   task_plan: "할 일 목록 관리",
   history: "원문 조회",
   source_lookup: "기존 출처 조회",
@@ -47,3 +49,13 @@ export const toolLabels = {
   tool_catalog: "도구 조회",
   tool_select: "도구 선택",
 };
+
+export function sessionErrorLabel(error = "") {
+  if (error.startsWith("documentation_coverage_pending:"))
+    return "기능 목록과 문서에 확인할 항목이 남아 있어 보완 작업을 진행합니다.";
+  if (error.startsWith("documentation_coverage_no_progress:"))
+    return "같은 누락 항목이 해결되지 않아 부분 결과와 보완 목록을 보존했습니다. 진행 패널의 항목을 확인한 뒤 이어서 진행할 수 있습니다.";
+  if (error.startsWith("documentation_coverage_audit:"))
+    return "기능 문서 점검을 마치지 못했습니다. 작업 기록은 보존되어 있으며 도구 결과를 확인한 뒤 재개할 수 있습니다.";
+  return error;
+}

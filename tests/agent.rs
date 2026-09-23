@@ -61,6 +61,28 @@ impl LlmClient for Script {
             });
         }
         let mut step = self.step.lock().unwrap();
+        let state: Value = serde_json::from_str(
+            request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )?;
+        if state["checkpoint"].is_object() {
+            // Tool definitions can push this complete workflow across the
+            // cleanup watermark. All source facts are already in memory and
+            // the investigation; a final-answer-only mock cannot acknowledge it.
+            assert!(
+                *step >= 7,
+                "Unexpected cleanup before source verification: {step}"
+            );
+            return Ok(call(
+                "fixture-checkpoint",
+                "checkpoint_complete",
+                json!({"id":state["checkpoint"]["id"],"no_save_reason":"Entry source facts and document verification are already stored in memory and the investigation.","progress":"Source documentation and verification are finished; continue final acceptance."}),
+            ));
+        }
         let result = match *step {
             0 => call(
                 "select",

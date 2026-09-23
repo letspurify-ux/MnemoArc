@@ -61,7 +61,8 @@ struct Verdict {
 }
 
 pub fn required(s: &Session) -> bool {
-    s.completion_review.required
+    s.capabilities.active
+        || s.completion_review.required
         || s.task.plan_revision > 0
         || !s.task.todos.is_empty()
         || s.task.require_investigation
@@ -276,7 +277,15 @@ fn snapshot(s: &Session, draft: &str) -> Result<Value> {
     for (i, item) in evidence.iter_mut().enumerate().skip(1) {
         item["id"] = json!(format!("E{i}"));
     }
-    let mut payload = json!({"completion_review":true,"original_request":s.answer_review_question,
+    // Include a live inventory fingerprint, so accepted verdicts cannot survive
+    // a changed source, exclusion, binding or incomplete discovery page.
+    let inventory = capabilities::audit(s, &tokio_util::sync::CancellationToken::new())?;
+    let inventory_evidence = if !inventory.active {
+        json!({"active":false})
+    } else {
+        json!({"active":inventory.active,"ready":inventory.ready,"fingerprint":inventory.fingerprint,"features":inventory.total,"documented":inventory.documented,"excluded":inventory.excluded,"issue_count":inventory.issues.len(),"exclusions":s.capabilities.features.iter().filter(|f|f.present&&f.status=="excluded").take(20).map(|f|json!({"id":f.id,"title":f.title,"path":f.path,"start_line":f.start_line,"end_line":f.end_line,"reason":f.reason})).collect::<Vec<_>>(),"exclusions_omitted":inventory.excluded>20,"limitation":"Exclusion reasons are model-authored assertions; compare them with original scope and actual evidence. Static candidates require explicit per-file source review. Literal excerpt coverage is structural, not semantic proof; check original requested scope and documentation truth independently."})
+    };
+    let mut payload = json!({"capability_inventory":inventory_evidence,"completion_review":true,"original_request":s.answer_review_question,
         "criteria":criteria(s),"constraints":s.task.constraints,"deliverables":s.task.deliverables,
         "unresolved":s.task.unresolved,"artifact_work":s.completion_review.artifact_work || s.document_written || !s.task.deliverables.is_empty(),"evidence":[],"evidence_omitted":false,
         "file_versions":versions,"document_review_approved":s.document_written && document_review::approved(s),
@@ -290,7 +299,7 @@ fn snapshot(s: &Session, draft: &str) -> Result<Value> {
         );
     }
     let mut accepted = Vec::new();
-    let mut omitted = stale || s.completion_review.retention_omitted;
+    let mut omitted = stale || s.completion_review.retention_omitted || inventory.excluded > 20;
     for item in evidence {
         accepted.push(item);
         payload["evidence"] = json!(&accepted);

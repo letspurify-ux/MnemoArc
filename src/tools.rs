@@ -1,4 +1,5 @@
 pub mod answer_review;
+pub mod capabilities;
 pub mod completion_review;
 mod coverage;
 pub mod document_review;
@@ -358,6 +359,7 @@ impl ToolRegistry {
                 ),
             },
         ];
+        specs.extend(capabilities::specs());
         let spec = specs
             .iter_mut()
             .find(|spec| spec.name == "investigation")
@@ -459,6 +461,9 @@ impl ToolRegistry {
             .filter(|t| t.name != "db_query" || s.config.database.active_queries().next().is_some())
             .filter(|t| t.name != "db_execute" || s.config.database.free_execution_enabled())
             .filter(|t| !t.optional || s.active_tools.contains(t.name))
+            // The full inventory contract is substantial. Offer a small start
+            // action until it is used, so unrelated tasks retain their budget.
+            .filter(|t| t.name != "documentation_coverage" || s.capabilities.active)
             .filter(|t| s.config.memory_reuse || !["memory_read", "memory_find"].contains(&t.name))
             .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
             // Keep exact source reads available for a concrete evidence gap,
@@ -468,6 +473,10 @@ impl ToolRegistry {
                 "file_list" | "source_search" | "symbol_search" | "code_outline"
                     | "memory_write" | "memory_find" | "history"))
             .map(|mut t| {
+                if t.name == "capability_inventory" && !s.capabilities.active {
+                    t.description = "Start a paged UI/server function inventory for comprehensive documentation. Scanning exposes source review, classification, registration and documentation_coverage tools; static discovery is heuristic.";
+                    t.parameters = schema(json!({"action":action(&["scan"])}), &["action"]);
+                }
                 let fields = t.parameters["properties"].clone();
                 // Keep offset for old clients, but offer the model only opaque continuation.
                 if t.name == "file_read" {
@@ -580,6 +589,11 @@ impl ToolRegistry {
         let object = args.as_object().ok_or_else(|| {
             anyhow::anyhow!("invalid_tool_arguments: arguments must be an object")
         })?;
+        // These transactional tools decode action-specific fields and return
+        // recoverable applied=false. The common object envelope stays required.
+        if matches!(name, "capability_inventory" | "documentation_coverage") {
+            return Ok(spec);
+        }
         if name == "db_query" && s.config.database.active_queries().next().is_none() {
             bail!(
                 "database_disabled: enable the database and at least one query manually in Settings"
@@ -1839,6 +1853,7 @@ pub fn execute_cancellable(
             || (name == "symbol_search" && args["query"].as_str().unwrap_or("").is_empty())
             || (name == "investigation"
                 && args["action"] == "upsert"
+                && !capabilities::allows_investigation(s, &args)
                 && args["id"]
                     .as_str()
                     .is_none_or(|id| !s.investigations.iter().any(|item| item.id == id))))
@@ -2024,6 +2039,9 @@ pub fn execute_cancellable(
             }
         }
         "task_plan" => task_plan::execute(s, &args),
+        "capability_inventory" | "documentation_coverage" => {
+            capabilities::execute(s, name, &args, cancel)
+        }
         "task_state" => match text(&args, "action")? {
             "read" => Ok(context::ContextManager::task_snapshot(
                 &s.task,
@@ -3081,6 +3099,14 @@ pub fn limit_result(
             .and_then(|(_, offset)| offset.parse::<usize>().ok())
             .or_else(|| args["offset"].as_u64().map(|offset| offset as usize))
             .unwrap_or(0);
+        if matches!(
+            call.name.as_str(),
+            "capability_inventory" | "documentation_coverage"
+        ) && field == "items"
+        {
+            data["next_offset"] = json!(start + retained_len);
+            return;
+        }
         if field == "outline" {
             let next_offset = start + retained_len;
             data["next_offset"] = json!(next_offset);
@@ -3185,6 +3211,30 @@ pub fn limit_result(
             });
         }
     }
+    if matches!(
+        call.name.as_str(),
+        "capability_inventory" | "documentation_coverage"
+    ) {
+        compact["data"] =
+            json!({"applied":result["data"]["applied"],"revision":result["data"]["revision"]});
+        if let Some(id) = result["data"].get("id") {
+            compact["data"]["id"] = id.clone();
+        }
+        if result["data"]["applied"] == false {
+            compact["data"]["reason"] = json!(
+                context::truncate(
+                    result["data"]["reason"]
+                        .as_str()
+                        .unwrap_or("Inventory unchanged"),
+                    32,
+                    &s.config.model
+                )
+                .0
+            );
+        } else if let Some(cursor) = result["data"]["summary"].get("next_cursor") {
+            compact["data"]["scan_cursor"] = cursor.clone();
+        }
+    }
     if let Some(recovery) = result.get("recovery") {
         compact["recovery"] = recovery.clone();
         // Detailed recovery tools remain in the archive if the tiny result
@@ -3275,7 +3325,10 @@ fn run_call_inner(
         .map_err(|e| anyhow::anyhow!("invalid_tool_arguments: {e}"))
         .and_then(|args| execute_cancellable(s, &call.name, args, cancel));
     let result = envelope(result);
-    let unapplied_plan = call.name == "task_plan" && result["data"]["applied"] == false;
+    let unapplied_plan = matches!(
+        call.name.as_str(),
+        "task_plan" | "capability_inventory" | "documentation_coverage"
+    ) && result["data"]["applied"] == false;
     let output = limit_result(s, call, result, s.config.result_tokens);
     // Failed mutations are not cached, allowing deliberate recovery with corrected arguments.
     if output["status"] == "ok" && !unapplied_plan {
