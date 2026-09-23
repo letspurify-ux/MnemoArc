@@ -612,6 +612,12 @@ impl ToolRegistry {
             }
         }
         for (k, v) in object {
+            if name == "task_plan" && k == "operations" {
+                // The plan parser accepts unambiguous JSON wrappers and
+                // returns an unchanged plan for bad shapes. Rejecting here
+                // would turn recoverable bookkeeping into a terminal error.
+                continue;
+            }
             let field = &fields[k];
             let valid = match field["type"].as_str() {
                 Some("string") => v.is_string(),
@@ -620,7 +626,6 @@ impl ToolRegistry {
                 Some("array") => v.as_array().is_some_and(|items| {
                     (name == "document_edit_batch" && k == "edits")
                         || (name == "file_patch" && k == "operations")
-                        || (name == "task_plan" && k == "operations")
                         || (name == "db_execute" && k == "args")
                         || items.iter().all(Value::is_string)
                 }),
@@ -2019,11 +2024,11 @@ pub fn execute_cancellable(
         }
         "task_plan" => task_plan::execute(s, &args),
         "task_state" => match text(&args, "action")? {
-            "read" => {
-                let mut task = json!(s.task);
-                task.as_object_mut().unwrap().remove("details");
-                Ok(task)
-            }
+            "read" => Ok(context::ContextManager::task_snapshot(
+                &s.task,
+                &s.config.model,
+                s.config.state_tokens,
+            )),
             "details" => {
                 let offset = n(&args, "offset", 0);
                 let limit = n(&args, "limit", 20).clamp(1, 100);
@@ -2106,8 +2111,11 @@ pub fn execute_cancellable(
                 next.memory_ids.sort();
                 next.memory_ids.dedup();
                 next.revision = s.task.revision + 1;
-                let mut compact = json!(next);
-                compact.as_object_mut().unwrap().remove("details");
+                let compact = context::ContextManager::task_snapshot(
+                    &next,
+                    &s.config.model,
+                    s.config.state_tokens,
+                );
                 if context::count(&compact, &s.config.model) > s.config.state_tokens {
                     bail!("task_state_limit");
                 }
@@ -2219,8 +2227,11 @@ pub fn execute_cancellable(
                 task.checkpoint_summary.push_str(&format!("\n{next}"));
             }
             task.revision += 1;
-            let mut compact = json!(task);
-            compact.as_object_mut().unwrap().remove("details");
+            let compact = context::ContextManager::task_snapshot(
+                &task,
+                &s.config.model,
+                s.config.state_tokens,
+            );
             if context::count(&compact, &s.config.model) > s.config.state_tokens {
                 bail!("task_state_limit: shorten checkpoint summary; original plan retained");
             }
@@ -3146,6 +3157,19 @@ pub fn limit_result(
     {
         compact["data"] = json!({"hash":result["data"]["hash"]});
     }
+    if call.name == "task_plan" && result["data"]["applied"] == false {
+        // The unchanged plan can be large. Keep the correction visible so
+        // the model need not rediscover it through history during recovery.
+        compact["data"] = json!({
+            "applied":false,"plan":{"revision":result["data"]["plan"]["revision"]},
+            "reason":context::truncate(result["data"]["reason"].as_str().unwrap_or("Plan unchanged"), 32, &s.config.model).0
+        });
+        if let Some(input) = result["data"].get("input_error") {
+            compact["data"]["input_error"] = json!({
+                "field":input["field"],"expected":input["expected"],"received":input["received"]
+            });
+        }
+    }
     if let Some(recovery) = result.get("recovery") {
         compact["recovery"] = recovery.clone();
         // Detailed recovery tools remain in the archive if the tiny result
@@ -3235,9 +3259,11 @@ fn run_call_inner(
     let result = serde_json::from_str(&call.arguments)
         .map_err(|e| anyhow::anyhow!("invalid_tool_arguments: {e}"))
         .and_then(|args| execute_cancellable(s, &call.name, args, cancel));
-    let output = limit_result(s, call, envelope(result), s.config.result_tokens);
+    let result = envelope(result);
+    let unapplied_plan = call.name == "task_plan" && result["data"]["applied"] == false;
+    let output = limit_result(s, call, result, s.config.result_tokens);
     // Failed mutations are not cached, allowing deliberate recovery with corrected arguments.
-    if output["status"] == "ok" {
+    if output["status"] == "ok" && !unapplied_plan {
         s.ledger
             .insert(call.id.clone(), (signature, output.clone()));
     }

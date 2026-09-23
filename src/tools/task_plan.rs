@@ -4,10 +4,14 @@ use super::*;
 use crate::session::TodoItem;
 use serde::Deserialize;
 
-pub const MAX_PENDING: usize = 8;
+pub const MAX_PENDING: usize = 100;
 pub const MAX_COMPLETED: usize = 5;
+const DEFAULT_PAGE: usize = 10;
+const MAX_PAGE: usize = 20;
 const MAX_TEXT_CHARS: usize = 160;
 const MAX_RESULT_CHARS: usize = 240;
+const MAX_OPERATIONS: usize = 16;
+const MAX_ENCODED_BYTES: usize = 128 * 1024;
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -42,32 +46,48 @@ pub fn spec() -> ToolSpec {
     let id = json!({"type":"string","minLength":1});
     let short = json!({"type":"string","minLength":1,"maxLength":MAX_TEXT_CHARS});
     let note = json!({"type":"string","minLength":1,"maxLength":MAX_RESULT_CHARS});
+    let mut parameters = schema(
+        json!({
+            "action":action(&["list","apply"]),
+            "offset":{"type":"integer","minimum":0,"description":"list only; zero-based item offset, including retained completed items"},
+            "limit":{"type":"integer","minimum":1,"maximum":MAX_PAGE,"description":"list only; page size (default 10, maximum 20)"},
+            "expected_revision":{"type":"integer","minimum":0,"description":"Required for apply. Copy plan_revision from task state or revision from task_plan list."},
+            "operations":{
+                "type":"array","minItems":1,"maxItems":MAX_OPERATIONS,
+                "description":"Required for apply: a JSON array of operation objects, NOT a JSON string or an object keyed by item ID. Example: [{\"op\":\"insert\",\"texts\":[\"Write the requested section\"]}]",
+                // Keep the item type and discriminator explicit even for
+                // providers that handle nested union schemas poorly. Rust
+                // still enforces each operation's required/allowed fields.
+                "items":schema(json!({
+                    "op":action(&["insert","update","move","remove","complete","reopen"]),
+                    "texts":{"type":"array","minItems":1,"maxItems":MAX_PENDING,"items":short,"description":"insert only; required array of concise item descriptions"},
+                    "before":id,"id":id,"text":short,"result":note,"reason":note
+                }), &["op"])
+            }
+        }),
+        &["action"],
+    );
+    parameters["oneOf"] = json!([
+        {"properties":{"action":{"const":"list"}},"required":["action"],"not":{"anyOf":[{"required":["expected_revision"]},{"required":["operations"]}]}},
+        {"properties":{"action":{"const":"apply"}},"required":["action","expected_revision","operations"],"not":{"anyOf":[{"required":["offset"]},{"required":["limit"]}]}}
+    ]);
     ToolSpec {
         name: "task_plan",
-        description: "Manage an ordered to-do list for multi-step work. list returns revision, stable item IDs and current (first unfinished item). apply atomically applies 1..16 operations using expected_revision. insert takes texts and optional before pending-item ID; omit before to append. update changes a pending item's text. move reorders a pending item before another pending ID, or to the end. complete requires the CURRENT item's ID and a specific result after actually doing the work. remove needs a reason; preserve user requirements in task_state.completion. reopen needs a reason and puts a completed item before the current item. Maximum 8 unfinished items; plan the next few concrete outcomes, not every read. Keep source investigation and writing in the same section-sized item. Only the latest 5 completed items are retained; completed_total is preserved. A stale revision, full list or invalid transition returns applied=false with the unchanged plan; continue the current work, then retry only if needed. Plan edits do not count as actual work progress.",
+        description: "Manage an ordered to-do list. Read with {\"action\":\"list\"}; use offset/limit to page through the full list (default 10, maximum 20). Change with {\"action\":\"apply\",\"expected_revision\":0,\"operations\":[{\"op\":\"insert\",\"texts\":[\"Write the requested section\"]}]}; copy the actual revision, and keep operations as an array, not quoted JSON. Applies 1..16 operations atomically. insert requires texts; optional before is a pending ID (omit to append). update requires id/text. move requires id and optional before. complete requires the CURRENT item's id/result after actually doing the work. remove and reopen require id/reason; reopen puts a completed item before current. Keep at most 100 unfinished small concrete outcomes; split investigation and saving when each is a meaningful result, and move promptly to writing. Retain only the latest 5 completed items and cumulative completed_total. Input/transition/capacity conflicts return applied=false without stopping; follow the correction or continue current work. Plan edits are not actual progress. Preserve user requirements in task_state.completion.",
         optional: false,
         read_only: false,
-        parameters: schema(
-            json!({
-                "action":action(&["list","apply"]),
-                "expected_revision":number(),
-                "operations":{"type":"array","minItems":1,"maxItems":16,"items":{"oneOf":[
-                    schema(json!({"op":{"const":"insert"},"texts":{"type":"array","minItems":1,"maxItems":MAX_PENDING,"items":short},"before":id}), &["op","texts"]),
-                    schema(json!({"op":{"const":"update"},"id":id,"text":short}), &["op","id","text"]),
-                    schema(json!({"op":{"const":"move"},"id":id,"before":id}), &["op","id"]),
-                    schema(json!({"op":{"const":"remove"},"id":id,"reason":note}), &["op","id","reason"]),
-                    schema(json!({"op":{"const":"complete"},"id":id,"result":note}), &["op","id","result"]),
-                    schema(json!({"op":{"const":"reopen"},"id":id,"reason":note}), &["op","id","reason"])
-                ]}}
-            }),
-            &["action"],
-        ),
+        parameters,
     }
 }
 
-pub fn view(task: &TaskState) -> Value {
+pub fn view(task: &TaskState, offset: usize, limit: usize) -> Value {
+    let limit = limit.clamp(1, MAX_PAGE);
+    let items: Vec<_> = task.todos.iter().skip(offset).take(limit).collect();
+    let end = offset.saturating_add(items.len());
     json!({
-        "revision":task.plan_revision,"items":task.todos,"current":task.current_todo(),
+        "revision":task.plan_revision,"items":items,"current":task.current_todo(),
+        "offset":offset,"total_items":task.todos.len(),
+        "next_offset":(end < task.todos.len()).then_some(end),
         "pending_count":task.todos.iter().filter(|item| !item.done).count(),
         "completed_total":task.todos_completed_total,
         "limits":{"pending":MAX_PENDING,"retained_completed":MAX_COMPLETED}
@@ -201,12 +221,88 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
 }
 
 fn unchanged(task: &TaskState, reason: String) -> Value {
-    json!({"applied":false,"reason":reason,"plan":view(task),"guidance":"The task is still running. Continue the current item's concrete work. Use the returned revision/IDs for a necessary plan correction; keep at most 8 unfinished items by completing, merging or removing obsolete work. Do not repeat the unchanged request."})
+    json!({"applied":false,"reason":reason,"plan":view(task, 0, DEFAULT_PAGE),"guidance":"This result does not stop the task. Continue the current item's concrete work. Use the returned revision/IDs for a necessary plan correction; keep at most 100 unfinished items by completing or removing obsolete work. Do not repeat the unchanged request."})
+}
+
+fn value_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn decode_json(text: &str) -> Result<Value> {
+    if text.len() > MAX_ENCODED_BYTES {
+        bail!("Encoded operations exceed {MAX_ENCODED_BYTES} bytes; use a smaller batch");
+    }
+    // Strict JSON only: never repair partial JSON, evaluate text, or guess
+    // operation ordering from a map. Each string wrapper is decoded once.
+    serde_json::from_str(text).map_err(|error| anyhow::anyhow!("Invalid JSON: {error}"))
+}
+
+fn parse_operations(value: &Value) -> Result<(Vec<Operation>, bool)> {
+    let decoded;
+    let mut normalized = false;
+    let value = if let Some(text) = value.as_str() {
+        decoded = decode_json(text)?;
+        normalized = true;
+        &decoded
+    } else {
+        value
+    };
+    let items: Vec<&Value> = match value {
+        Value::Array(items) => {
+            if items.is_empty() || items.len() > MAX_OPERATIONS {
+                bail!("Use 1..{MAX_OPERATIONS} operation objects in a batch");
+            }
+            items.iter().collect()
+        }
+        Value::Object(item) if item.contains_key("op") => {
+            normalized = true;
+            vec![value]
+        }
+        _ => bail!(
+            "operations must be an array of operation objects; received {}",
+            value_type(value)
+        ),
+    };
+    let mut operations = Vec::with_capacity(items.len());
+    for (i, item) in items.into_iter().enumerate() {
+        let decoded;
+        let item = if let Some(text) = item.as_str() {
+            decoded =
+                decode_json(text).map_err(|error| anyhow::anyhow!("operations[{i}]: {error}"))?;
+            normalized = true;
+            &decoded
+        } else {
+            item
+        };
+        if !item.is_object() {
+            bail!(
+                "operations[{i}] must be an operation object; received {}",
+                value_type(item)
+            );
+        }
+        let operation = serde_json::from_value(item.clone()).map_err(|error| {
+            let detail: String = error.to_string().chars().take(240).collect();
+            anyhow::anyhow!("operations[{i}]: {detail}")
+        })?;
+        operations.push(operation);
+    }
+    Ok((operations, normalized))
 }
 
 pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
     if args["action"] == "list" {
-        return Ok(view(&s.task));
+        return Ok(view(
+            &s.task,
+            n(args, "offset", 0),
+            n(args, "limit", DEFAULT_PAGE),
+        ));
     }
     if args["expected_revision"].as_u64() != Some(s.task.plan_revision) {
         return Ok(unchanged(
@@ -214,18 +310,18 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
             "Plan revision changed or expected_revision is missing".into(),
         ));
     }
-    let operations: Vec<Operation> = match serde_json::from_value(args["operations"].clone()) {
+    let (operations, normalized) = match parse_operations(&args["operations"]) {
         Ok(operations) => operations,
         Err(error) => {
-            return Ok(unchanged(
-                &s.task,
-                format!("Invalid plan operation: {error}"),
-            ));
+            let mut result = unchanged(&s.task, format!("Invalid plan operation: {error}"));
+            result["input_error"] = json!({
+                "field":"operations", "expected":"array of operation objects",
+                "received":args.get("operations").map_or("missing", value_type),
+                "example":{"action":"apply","expected_revision":s.task.plan_revision,"operations":[{"op":"insert","texts":["Write the requested section"]}]}
+            });
+            return Ok(result);
         }
     };
-    if operations.is_empty() || operations.len() > 16 {
-        return Ok(unchanged(&s.task, "Use 1..16 operations in a batch".into()));
-    }
     let mut next = s.task.clone();
     for operation in operations {
         if let Err(error) = apply(&mut next, operation) {
@@ -248,17 +344,19 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
         && next.todo_sequence == s.task.todo_sequence
         && next.todos_completed_total == s.task.todos_completed_total
     {
-        return Ok(json!({"applied":true,"unchanged":true,"plan":view(&s.task)}));
+        return Ok(
+            json!({"applied":true,"unchanged":true,"input_normalized":normalized,"plan":view(&s.task, 0, DEFAULT_PAGE)}),
+        );
     }
     next.plan_revision = next.plan_revision.saturating_add(1);
     next.revision = next.revision.saturating_add(1);
-    let mut compact = json!(next);
-    compact.as_object_mut().unwrap().remove("details");
+    let compact =
+        context::ContextManager::task_snapshot(&next, &s.config.model, s.config.state_tokens);
     if context::count(&compact, &s.config.model) > s.config.state_tokens
         || serde_json::to_vec(&next)?.len() > s.config.memory_bytes
     {
         return Ok(unchanged(&s.task, "Task state budget is full; shorten item text or task_state findings/details before extending the plan".into()));
     }
     s.task = next;
-    Ok(json!({"applied":true,"plan":view(&s.task)}))
+    Ok(json!({"applied":true,"input_normalized":normalized,"plan":view(&s.task, 0, DEFAULT_PAGE)}))
 }

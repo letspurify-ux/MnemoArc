@@ -38,6 +38,149 @@ fn apply(s: &mut Session, operations: Value) -> Value {
 }
 
 #[test]
+fn operation_encodings_are_normalized_and_replayed_without_duplicate_items() {
+    let operation = json!({"op":"insert","texts":["조사한 섹션 저장"]});
+    for operations in [
+        json!([operation]),
+        json!(json!([operation]).to_string()),
+        operation.clone(),
+        json!(operation.to_string()),
+        json!([operation.to_string()]),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session(dir.path());
+        let call = ToolCall {
+            id: "create-plan".into(),
+            name: "task_plan".into(),
+            arguments: json!({"action":"apply","expected_revision":0,"operations":operations})
+                .to_string(),
+        };
+        let result = tools::run_call(&mut s, &call);
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(result["data"]["applied"], true, "{result}");
+        assert_eq!(
+            result["data"]["input_normalized"],
+            !operations.is_array() || operations[0].is_string()
+        );
+        assert_eq!(s.task.current_todo().unwrap().text, "조사한 섹션 저장");
+        assert_eq!(tools::run_call(&mut s, &call), result);
+        assert_eq!(s.task.todos.len(), 1);
+        assert_eq!(s.task.plan_revision, 1);
+    }
+}
+
+#[test]
+fn invalid_operation_shapes_preserve_plan_without_poisoning_error_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.status = "running".into();
+    apply(
+        &mut s,
+        json!([{"op":"insert","texts":["Continue actual work"]}]),
+    );
+    let original = json!(s.task);
+    let mut failures = tools::recovery::FailureTracker::default();
+    for (i, operations) in [
+        Value::Null,
+        json!(true),
+        json!(42),
+        json!("[unfinished JSON"),
+        json!({"T1":{"op":"complete","result":"Ambiguous keyed operation"}}),
+        json!([{"op":"remove","id":"T1","reason":"Must remain atomic"}, false]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let call = ToolCall {
+            id: format!("invalid-{i}"), name: "task_plan".into(),
+            arguments: json!({"action":"apply","expected_revision":s.task.plan_revision,"operations":operations}).to_string(),
+        };
+        let result = tools::run_call(&mut s, &call);
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(result["data"]["applied"], false);
+        assert_eq!(result["data"]["input_error"]["field"], "operations");
+        assert!(failures.observe("task_plan", &result, 2).is_none());
+        assert_eq!(json!(s.task), original);
+        assert_eq!(s.status, "running");
+        assert!(!s.ledger.contains_key(&call.id));
+    }
+    let corrected = tools::run_call(&mut s, &ToolCall {
+        id: "invalid-0".into(), name: "task_plan".into(),
+        arguments: json!({"action":"apply","expected_revision":1,"operations":{"op":"insert","texts":["Follow-up work"]}}).to_string(),
+    });
+    assert_eq!(corrected["data"]["applied"], true, "{corrected}");
+    assert_eq!(s.task.todos.len(), 2);
+}
+
+#[test]
+fn normalized_inputs_still_enforce_revision_order_bounds_and_atomicity() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(
+        &mut s,
+        json!([{"op":"insert","texts":["First outcome","Second outcome"]}]),
+    );
+    let original = json!(s.task);
+    let stale = tools::execute(&mut s, "task_plan", json!({"action":"apply","expected_revision":0,"operations":json!({"op":"complete","id":"T1","result":"Stale result"}).to_string()})).unwrap();
+    assert_eq!(stale["applied"], false);
+    for operations in [
+        json!(json!({"op":"complete","id":"T2","result":"Cannot skip current"}).to_string()),
+        json!(
+            json!([
+                {"op":"remove","id":"T1","reason":"Do not commit part of a batch"},
+                {"op":"insert","texts":["Too long".repeat(30)]}
+            ])
+            .to_string()
+        ),
+        json!({"op":"insert","texts":["Must reject extra fields"],"done":true}),
+        json!(json!(vec![json!({"op":"move","id":"T1"}); 17]).to_string()),
+        json!([{"op":"insert","texts":(0..101).map(|i|format!("Overflow {i}")).collect::<Vec<_>>()}]),
+        json!([]),
+        json!(" ".repeat(128 * 1024 + 1)),
+    ] {
+        let refused = apply(&mut s, operations);
+        assert_eq!(refused["applied"], false, "{refused}");
+        assert_eq!(json!(s.task), original);
+    }
+}
+
+#[test]
+fn small_results_keep_the_operation_correction_visible() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.config.state_tokens = 12000;
+    let descriptions: Vec<_> = (0..8)
+        .map(|i| {
+            format!(
+                "{i}: {}",
+                "확인한 근거를 바탕으로 해당 섹션을 작성하고 결과를 검증합니다. ".repeat(3)
+            )
+        })
+        .collect();
+    assert_eq!(
+        apply(&mut s, json!([{"op":"insert","texts":descriptions}]))["applied"],
+        true
+    );
+    s.config.result_tokens = 200;
+    let call = ToolCall {
+        id: "bad-shape".into(),
+        name: "task_plan".into(),
+        arguments: json!({"action":"apply","expected_revision":1,"operations":false}).to_string(),
+    };
+    let result = tools::run_call(&mut s, &call);
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(result["data"]["applied"], false, "{result}");
+    assert_eq!(result["data"]["input_error"]["field"], "operations");
+    assert_eq!(
+        result["data"]["input_error"]["expected"],
+        "array of operation objects"
+    );
+    assert!(tools::result_tokens(&call, &result, &s.config.model) <= 200);
+    assert_eq!(s.task.todos.len(), 8);
+    assert!(!s.ledger.contains_key(&call.id));
+}
+
+#[test]
 fn prerequisites_insert_move_remove_and_complete_in_order_atomically() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
@@ -95,8 +238,49 @@ fn full_plan_and_stale_revision_do_not_fail_or_lose_work() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     s.status = "running".into();
-    let texts: Vec<_> = (1..=8).map(|i| format!("Outcome {i}")).collect();
-    apply(&mut s, json!([{"op":"insert","texts":texts}]));
+    let texts: Vec<_> = (1..=100)
+        .map(|i| {
+            format!(
+                "Outcome {i}: {}",
+                "작업 결과를 확인하고 저장합니다. ".repeat(5)
+            )
+        })
+        .collect();
+    assert_eq!(
+        apply(&mut s, json!([{"op":"insert","texts":texts}]))["applied"],
+        true
+    );
+    let state = ContextManager::state(&s).unwrap();
+    assert_eq!(state["task"]["todo_window"]["pending_count"], 100);
+    assert!(state["task"]["todos"].as_array().unwrap().len() <= 6);
+    assert_eq!(s.task.todos.len(), 100);
+    let mut offset = 0;
+    let mut listed = Vec::new();
+    loop {
+        let page = tools::execute(
+            &mut s,
+            "task_plan",
+            json!({"action":"list","offset":offset,"limit":20}),
+        )
+        .unwrap();
+        assert_eq!(page["pending_count"], 100);
+        assert_eq!(page["total_items"], 100);
+        listed.extend(
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["id"].as_str().unwrap().to_string()),
+        );
+        if let Some(next) = page["next_offset"].as_u64() {
+            offset = next;
+        } else {
+            break;
+        }
+    }
+    assert_eq!(listed.len(), 100);
+    assert_eq!(listed.first().unwrap(), "T1");
+    assert_eq!(listed.last().unwrap(), "T100");
     let original = s.task.todos.clone();
     let refused = apply(&mut s, json!([{"op":"insert","texts":["Later work"]}]));
     assert_eq!(refused["applied"], false);
@@ -111,8 +295,23 @@ fn full_plan_and_stale_revision_do_not_fail_or_lose_work() {
             {"op":"insert","texts":["Later work"]}
         ]),
     );
-    assert_eq!(s.task.todos.iter().filter(|item| !item.done).count(), 8);
+    assert_eq!(s.task.todos.iter().filter(|item| !item.done).count(), 100);
     assert_eq!(s.task.current_todo().unwrap().id, "T2");
+    assert_eq!(
+        ContextManager::state(&s).unwrap()["task"]["todo_window"]["pending_count"],
+        100
+    );
+    tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"findings":["The first outcome is saved"]}}),
+    )
+    .unwrap();
+    s.add_user("Continue current plan".into());
+    ContextManager::prepare(&mut s, 60000).unwrap();
+    let checkpoint_id = s.checkpoint.as_ref().unwrap().id.clone();
+    tools::execute(&mut s,"checkpoint_complete",json!({"id":checkpoint_id,"progress":"Continue with the current outcome","no_save_reason":"No new reusable facts"})).unwrap();
+    assert_eq!(s.task.todos.iter().filter(|item| !item.done).count(), 100);
 }
 
 #[test]
@@ -137,6 +336,20 @@ fn completed_history_is_bounded_and_checkpoint_preserves_the_plan() {
     s.add_user("Continue current plan".into());
     ContextManager::prepare(&mut s, 60000).unwrap();
     let id = s.checkpoint.as_ref().unwrap().id.clone();
+    let plan_revision = s.task.plan_revision;
+    let invalid = tools::run_call(
+        &mut s,
+        &ToolCall {
+            id: "bad-maintenance-plan".into(),
+            name: "task_plan".into(),
+            arguments:
+                json!({"action":"apply","expected_revision":plan_revision,"operations":false})
+                    .to_string(),
+        },
+    );
+    assert_eq!(invalid["status"], "ok");
+    assert_eq!(invalid["data"]["applied"], false);
+    assert!(!s.checkpoint.as_ref().unwrap().failed);
     tools::execute(&mut s,"checkpoint_complete",json!({"id":id,"progress":"Necessary facts are stored","next":"Legacy summary must not overwrite the list","no_save_reason":"No new facts"})).unwrap();
     ContextManager::commit(&mut s).unwrap();
     assert_eq!(s.task.todos, plan);
@@ -340,4 +553,94 @@ async fn completing_and_removing_items_does_not_masquerade_as_actual_progress() 
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
     assert!(result.task.todos.is_empty());
     assert_eq!(result.task.todos_completed_total, 3);
+}
+
+struct InvalidPlanRecovery(Mutex<usize>);
+#[async_trait]
+impl LlmClient for InvalidPlanRecovery {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let state: Value = serde_json::from_str(
+            request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        let mut step = self.0.lock().unwrap();
+        let (name, args) = match *step {
+            0..=2 => (
+                "task_plan",
+                json!({"action":"apply","expected_revision":0,"operations":false}),
+            ),
+            3 => {
+                assert_eq!(state["run_guidance"]["progress_recovery"]["active"], true);
+                assert_eq!(state["task"]["plan_revision"], 0);
+                (
+                    "task_plan",
+                    json!({"action":"apply","expected_revision":0,"operations":json!([{"op":"insert","texts":["Write the output"]}]).to_string()}),
+                )
+            }
+            4 => {
+                assert_eq!(state["run_guidance"]["progress_recovery"]["active"], true);
+                (
+                    "file_write",
+                    json!({"path":"note.txt","content":"Actual requested result\n"}),
+                )
+            }
+            5 => {
+                assert_eq!(state["run_guidance"]["progress_recovery"]["active"], false);
+                (
+                    "task_plan",
+                    json!({"action":"apply","expected_revision":1,"operations":{"op":"complete","id":"T1","result":"Saved note.txt"}}),
+                )
+            }
+            _ => {
+                return Ok(Completion {
+                    text: "Saved note.txt".into(),
+                    ..Default::default()
+                });
+            }
+        };
+        *step += 1;
+        Ok(Completion {
+            calls: vec![ToolCall {
+                id: format!("step-{step}"),
+                name: name.into(),
+                arguments: args.to_string(),
+            }],
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn invalid_operations_recover_even_before_the_first_plan_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.config.stall_round_limit = 3;
+    s.add_user("Write the requested output".into());
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(
+        s,
+        Arc::new(InvalidPlanRecovery(Mutex::new(0))),
+        CancellationToken::new(),
+        tx,
+    )
+    .await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert_eq!(result.task.todos_completed_total, 1);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("note.txt")).unwrap(),
+        "Actual requested result\n"
+    );
 }

@@ -123,7 +123,7 @@ test("ordered to-do list follows prerequisites and preserves running work on rel
   await expect(plan.locator("[aria-current=step]")).toContainText("본문 작성");
   await expect(plan.locator("li").nth(2)).toContainText("대기");
   await expect(plan).not.toContainText("불필요 작업");
-  await expect(plan).toContainText("남은 항목 2/8 · 누적 완료 1개");
+  await expect(plan).toContainText("남은 항목 2/100 · 누적 완료 1개");
   await expect(page.getByRole("button", { name: "■ 중지" })).toBeVisible();
   await page.reload();
   await page.getByRole("tab", { name: "진행", exact: true }).click();

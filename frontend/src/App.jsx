@@ -918,7 +918,7 @@ function Inspector({
             <section className="task-plan-section" aria-label="할 일 목록">
               <h4>할 일 목록</h4>
               <p className="subtle">
-                남은 항목 {todos.filter((item) => !item.done).length}/8 · 누적
+                남은 항목 {todos.filter((item) => !item.done).length}/100 · 누적
                 완료 {session.task.todos_completed_total || 0}개
               </p>
               {recovering && (
