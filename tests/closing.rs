@@ -380,6 +380,7 @@ fn cleanup_output_reservation_is_bounded_so_large_outputs_keep_input_room() {
 struct Scripted {
     steps: Mutex<Vec<Completion>>,
     guidance: Mutex<Vec<Value>>,
+    tools: Mutex<Vec<Vec<String>>>,
 }
 
 #[async_trait]
@@ -403,6 +404,17 @@ impl LlmClient for Scripted {
             .lock()
             .unwrap()
             .push(state["run_guidance"].clone());
+        self.tools.lock().unwrap().push(
+            request["tools"]
+                .as_array()
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
         let mut steps = self.steps.lock().unwrap();
         if steps.is_empty() {
             anyhow::bail!("script_exhausted");
@@ -433,16 +445,26 @@ fn verified_fixture() -> (tempfile::TempDir, Session) {
 }
 
 async fn run_scripted(s: Session, steps: Vec<Completion>) -> (Session, Vec<Value>) {
+    let (session, guidance, _) = run_scripted_tools(s, steps).await;
+    (session, guidance)
+}
+
+async fn run_scripted_tools(
+    s: Session,
+    steps: Vec<Completion>,
+) -> (Session, Vec<Value>, Vec<Vec<String>>) {
     let client = Arc::new(Scripted {
         steps: Mutex::new(steps),
         guidance: Mutex::new(vec![]),
+        tools: Mutex::new(vec![]),
     });
     let (tx, mut rx) = mpsc::channel(256);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result = run_session(s, client.clone(), CancellationToken::new(), tx).await;
     drain.await.unwrap();
     let guidance = client.guidance.lock().unwrap().clone();
-    (result, guidance)
+    let tools = client.tools.lock().unwrap().clone();
+    (result, guidance, tools)
 }
 
 #[tokio::test]
@@ -736,4 +758,127 @@ async fn reading_new_sources_before_the_first_write_is_progress() {
 
 fn numbered(lines: usize) -> String {
     (1..=lines).map(|i| format!("let v{i} = {i};\n")).collect()
+}
+
+#[tokio::test]
+async fn discovery_tools_stay_available_until_the_document_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("backend/src")).unwrap();
+    std::fs::write(dir.path().join("backend/src/agent.js"), numbered(40)).unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128_000),
+            context_tokens: 128_000,
+            output_tokens: 1_024,
+            stall_round_limit: 2,
+            source_answer_review: false,
+            ..Default::default()
+        },
+    );
+    s.add_user("Document backend/src/agent.js with source evidence".into());
+    s.active_tools = ToolRegistry::optional_names();
+    tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"workflow":"source_document"}}),
+    )
+    .unwrap();
+    // Wrong guesses first (no new evidence), then real distinct reads: both
+    // stretches exceed the stall limit before any document is written.
+    let mut steps: Vec<Completion> = (0..5)
+        .map(|i| call(&format!("guess-{i}"), "file_read", json!({"path":format!("backend/agent{i}.py")})))
+        .collect();
+    steps.extend((0..6).map(|i| {
+        call(
+            &format!("read-{i}"),
+            "file_read",
+            json!({"path":"backend/src/agent.js","start_line":i * 5 + 1,"max_lines":5}),
+        )
+    }));
+    let (_, _, offered) = run_scripted_tools(s, steps).await;
+    assert!(offered.len() >= 11);
+    for (round, names) in offered.iter().take(11).enumerate() {
+        for discovery in ["file_list", "source_search"] {
+            assert!(
+                names.iter().any(|name| name == discovery),
+                "{discovery} withheld at request {round} before the document existed"
+            );
+        }
+    }
+}
+
+#[test]
+fn missing_paths_suggest_similar_project_files_and_directories_list_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("backend/src")).unwrap();
+    std::fs::write(dir.path().join("backend/src/agent.js"), "run();\n").unwrap();
+    std::fs::write(dir.path().join("backend/src/server.js"), "listen();\n").unwrap();
+    std::fs::write(dir.path().join("README.md"), "# App\n").unwrap();
+    std::fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            exclude: vec![".env*".into()],
+            ..Default::default()
+        },
+        Config::default(),
+    );
+    // Same stem, different extension.
+    let error = tools::execute(&mut s, "file_read", json!({"path":"backend/agent.py"}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("file_not_found"), "{error}");
+    assert!(error.contains("backend/src/agent.js"), "{error}");
+    // Same file name under a wrong prefix.
+    let error = tools::execute(&mut s, "file_read", json!({"path":"llm_agent/README.md"}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("README.md. Copy one exactly"), "{error}");
+    // Nothing similar: point to file_list. Excluded files are never offered.
+    let error = tools::execute(&mut s, "file_read", json!({"path":"main.py"}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("No project file has this name"), "{error}");
+    let error = tools::execute(&mut s, "file_read", json!({"path":"config/.env"}))
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("Copy one exactly"), "{error}");
+    // A directory read shows what it contains.
+    let error = tools::execute(&mut s, "file_read", json!({"path":"backend/src"}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("path_is_directory"), "{error}");
+    assert!(error.contains("agent.js, server.js"), "{error}");
+}
+
+#[test]
+fn source_search_accepts_a_directory_as_its_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("backend/src")).unwrap();
+    std::fs::write(dir.path().join("backend/src/server.js"), "app.post('/api/chat', chat);\n").unwrap();
+    std::fs::write(dir.path().join("other.js"), "app.post('/api/chat', other);\n").unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        Config::default(),
+    );
+    let result = tools::execute(
+        &mut s,
+        "source_search",
+        json!({"path":"backend","query":"/api/chat"}),
+    )
+    .unwrap();
+    let matches = result["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1, "{result}");
+    assert!(matches[0]["path"].as_str().unwrap().ends_with("backend/src/server.js"));
 }

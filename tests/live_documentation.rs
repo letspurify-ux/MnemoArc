@@ -120,7 +120,7 @@ async fn registered_source_documentation() {
                         if message["role"] == "tool"
                             && let Some(id) = message["tool_call_id"].as_str()
                             && seen_result_ids.insert(id.to_owned())
-                            && let Some((name, _)) = call_signatures.get(id)
+                            && let Some((name, arguments)) = call_signatures.get(id)
                             && let Some(result) = message["content"]
                                 .as_str()
                                 .and_then(|content| serde_json::from_str::<Value>(content).ok())
@@ -135,9 +135,21 @@ async fn registered_source_documentation() {
                                 .and_then(|signature| signature_counts.get(signature))
                                 .copied()
                                 .unwrap_or(1);
+                            // Arguments and the error text make a failure
+                            // diagnosable while the run is still going.
+                            let clip = |text: &str, max: usize| -> String {
+                                text.chars()
+                                    .map(|c| if c == '\n' { ' ' } else { c })
+                                    .take(max)
+                                    .collect()
+                            };
                             eprintln!(
-                                "[live] tool_failure name={} code={} same_call_count={}",
-                                name, code, repeat_count
+                                "[live] tool_failure name={} code={} same_call_count={} args={} error={}",
+                                name,
+                                code,
+                                repeat_count,
+                                clip(arguments, 200),
+                                clip(result["error"].as_str().unwrap_or(""), 300)
                             );
                         }
                     }

@@ -45,10 +45,28 @@ pub(super) fn execute(
             "conflicting_arguments: use path for one exact file OR path_glob/pattern for a file glob"
         );
     }
-    let exact_path = args["path"]
+    let mut exact_path = args["path"]
         .as_str()
         .map(|p| read_path(&s.project, p))
         .transpose()?;
+    // A directory given as path scopes the search to everything below it,
+    // which is what a model asking to search "backend" means.
+    let mut directory_glob = None;
+    if let Some(path) = exact_path.as_ref().filter(|path| path.is_dir()) {
+        let root = s.project.root.canonicalize()?;
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        directory_glob = Some(if relative.is_empty() {
+            "**".to_owned()
+        } else {
+            format!("{}/**", relative.trim_end_matches('/'))
+        });
+        exact_path = None;
+    }
+    let scope_glob = path_glob(args)?.or(directory_glob.as_deref());
     let mode = args["mode"].as_str().unwrap_or("matches");
     let before = n(args, "before", 0);
     let after = n(args, "after", 0);
@@ -86,7 +104,7 @@ pub(super) fn execute(
     // matching lines cannot be reused as an offset into matching files.
     fingerprint.update(serde_json::to_vec(&json!({
         "expression":expression,"case_sensitive":case_sensitive,
-        "mode":mode,"before":before,"after":after,"path_glob":path_glob(args)?,"path":exact_path
+        "mode":mode,"before":before,"after":after,"path_glob":scope_glob,"path":exact_path
     }))?);
     let requested_offset = if let Some(cursor) = args["cursor"].as_str() {
         cursor
@@ -106,7 +124,7 @@ pub(super) fn execute(
     let mut total_matching_lines = 0usize;
     let candidates = match exact_path {
         Some(path) => vec![path],
-        None => candidate_paths(&s.project, path_glob(args)?, cancel)?,
+        None => candidate_paths(&s.project, scope_glob, cancel)?,
     };
     for path in candidates {
         if cancel.is_cancelled() {

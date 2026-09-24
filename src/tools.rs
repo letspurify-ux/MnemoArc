@@ -238,7 +238,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "source_search",
-                description: "Search source lines: query is literal text by default. Prefer queries:[\"agent\",\"run\",\"db\"] for literal OR without regex escaping. Supply exactly one of query or queries. Use regex:true only for intentional regular expressions; punctuation such as .on( is literal unless regex:true. case_sensitive defaults true; whole_word defaults false (Unicode word boundaries). path selects one exact file (no glob syntax); path_glob filters multiple files (pattern is a legacy alias). Do not combine path with path_glob or pattern. mode=matches (default) returns matching lines and source IDs; files returns matching paths; count returns matching-line counts per file. before/after add up to 20 context lines each in matches mode. Each displayed line is capped at 500 characters with truncation marked; truncated matches are navigation only and do not satisfy citation coverage, so read the full line with file_read. Reuse the same search options with cursor for pagination; limit may change. Hashes detect source changes",
+                description: "Search source lines: query is literal text by default. Prefer queries:[\"agent\",\"run\",\"db\"] for literal OR without regex escaping. Supply exactly one of query or queries. Use regex:true only for intentional regular expressions; punctuation such as .on( is literal unless regex:true. case_sensitive defaults true; whole_word defaults false (Unicode word boundaries). path selects one exact file, or a directory to search everything below it (no glob syntax); path_glob filters multiple files (pattern is a legacy alias). Do not combine path with path_glob or pattern. mode=matches (default) returns matching lines and source IDs; files returns matching paths; count returns matching-line counts per file. before/after add up to 20 context lines each in matches mode. Each displayed line is capped at 500 characters with truncation marked; truncated matches are navigation only and do not satisfy citation coverage, so read the full line with file_read. Reuse the same search options with cursor for pagination; limit may change. Hashes detect source changes",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -497,8 +497,11 @@ impl ToolRegistry {
     /// Offered only in closing mode, where it is accepted.
     const MARK_GAP_GUIDANCE: &str = " mark_gap requires id and a specific reason; it settles an item whose claim cannot be verified with gathered evidence, and the final result lists it as unconfirmed. Qualify the related claim in its section; verifying the item later replaces the gap.";
     pub fn definitions(s: &Session) -> Vec<Value> {
-        let recovery_focus =
-            s.run_guidance["progress_recovery"]["active"] == true && s.is_document_work();
+        // Recovery focus steers an existing draft toward writing. Before any
+        // document is saved, discovery is still required to find the sources.
+        let recovery_focus = s.run_guidance["progress_recovery"]["active"] == true
+            && s.is_document_work()
+            && s.document_written;
         Self::specs().into_iter()
             .filter(|t| t.name != "db_query" || s.config.database.active_queries().next().is_some())
             .filter(|t| t.name != "db_execute" || s.config.database.free_execution_enabled())
@@ -512,6 +515,7 @@ impl ToolRegistry {
             .filter(|t| {
                 s.checkpoint.is_some()
                     || !s.is_document_work()
+                    || !s.document_written
                     || s.progress_recovery.rounds_since_best
                         < s.config.stall_round_limit.saturating_mul(2)
                     || !matches!(t.name, "file_list" | "source_search" | "symbol_search" | "code_outline")
@@ -1594,7 +1598,15 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
             std::io::ErrorKind::PermissionDenied => "file_permission_denied",
             _ => "file_access_error",
         };
-        anyhow::anyhow!("{code}: resolved path {}; project root {}; configured output {}. Relative paths use project.root; use document_inspect with no path for configured output. {e}", candidate.display(), root.display(), p.output.display())
+        let hint = if e.kind() == std::io::ErrorKind::NotFound {
+            match similar_paths(p, &candidate).as_slice() {
+                [] => " No project file has this name; list files with file_list mode=paths and path_glob before reading.".to_owned(),
+                similar => format!(" Existing project files with a similar name: {}. Copy one exactly.", similar.join(", ")),
+            }
+        } else {
+            String::new()
+        };
+        anyhow::anyhow!("{code}: resolved path {}; project root {}; configured output {}. Relative paths use project.root; use document_inspect with no path for configured output.{hint} {e}", candidate.display(), root.display(), p.output.display())
     })?;
     let output = output_path(p)?;
     if output.exists() && canonical == output.canonicalize()? {
@@ -1608,11 +1620,82 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
     }
     Ok(canonical)
 }
+/// Project files whose name matches a missing path: the same file name
+/// first, then the same stem with another extension (agent.py -> agent.js).
+/// Ignore and exclude rules apply, so hidden files are never suggested.
+fn similar_paths(p: &Project, missing: &Path) -> Vec<String> {
+    const MAX_SUGGESTIONS: usize = 5;
+    const MAX_SCANNED: usize = 20_000;
+    let Some(name) = missing.file_name().map(|n| n.to_string_lossy().to_lowercase()) else {
+        return vec![];
+    };
+    let stem = missing
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let Ok(root) = p.root.canonicalize() else {
+        return vec![];
+    };
+    let Ok(paths) = candidate_paths(p, None, &tokio_util::sync::CancellationToken::new()) else {
+        return vec![];
+    };
+    let mut exact = vec![];
+    let mut same_stem = vec![];
+    for path in paths.iter().take(MAX_SCANNED) {
+        let Ok(relative) = path.strip_prefix(&root) else {
+            continue;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        let file = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if file == name {
+            exact.push(relative);
+        } else if !stem.is_empty()
+            && path
+                .file_stem()
+                .is_some_and(|s| s.to_string_lossy().to_lowercase() == stem)
+        {
+            same_stem.push(relative);
+        }
+    }
+    exact.sort_by_key(|path| (path.len(), path.clone()));
+    same_stem.sort_by_key(|path| (path.len(), path.clone()));
+    exact.into_iter().chain(same_stem).take(MAX_SUGGESTIONS).collect()
+}
+/// Visible entries of a directory, for a read that named a directory.
+fn directory_entries(path: &Path) -> Vec<String> {
+    const MAX_ENTRIES: usize = 12;
+    let mut entries: Vec<String> = std::fs::read_dir(path)
+        .map(|read| {
+            read.flatten()
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let hidden = name.starts_with('.')
+                        || matches!(name.as_str(), "node_modules" | "target" | "dist" | "build");
+                    (!hidden).then(|| {
+                        if entry.path().is_dir() { format!("{name}/") } else { name }
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort();
+    entries.truncate(MAX_ENTRIES);
+    entries
+}
 fn regular_metadata(metadata: &std::fs::Metadata, path: &Path) -> Result<()> {
     if metadata.is_dir() {
+        let entries = directory_entries(path);
         bail!(
-            "path_is_directory: {} is a directory; use file_list with path_glob (e.g. backend/**), then file_read with a file path",
-            path.display()
+            "path_is_directory: {} is a directory{}; use file_list with path_glob (e.g. backend/**), then file_read with a file path",
+            path.display(),
+            if entries.is_empty() {
+                String::new()
+            } else {
+                format!(" containing {}", entries.join(", "))
+            }
         );
     }
     if !metadata.is_file() {

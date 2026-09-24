@@ -682,8 +682,11 @@ impl LlmClient for VariedReadsThenWrites {
                     .iter()
                     .any(|tool| tool["function"]["name"] == "file_read")
             );
+            // Focus steers toward writing through guidance. Before any
+            // document exists, discovery stays available: hiding it left a
+            // model that had not found its sources guessing file paths.
             assert!(
-                !tools
+                tools
                     .iter()
                     .any(|tool| tool["function"]["name"] == "source_search")
             );
