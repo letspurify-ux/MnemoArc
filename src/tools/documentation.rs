@@ -495,7 +495,7 @@ impl std::fmt::Display for CoverageMissing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "source_coverage_missing: item {} has {} missing ranges; use source_lookup for matching evidence or file_read for these ranges, then supply all relevant source_ids: {}",
+            "source_coverage_missing: item {} has {} ranges never delivered as complete lines of the current file version; file_read exactly these ranges, then verify again (delivered evidence is added automatically): {}",
             self.item_id,
             self.missing_ranges.len(),
             json!(self.missing_ranges)

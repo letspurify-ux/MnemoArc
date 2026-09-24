@@ -1998,3 +1998,147 @@ fn document_edits_reject_embedded_nul_bytes() {
     assert!(error.contains("unsupported_binary_file"));
     assert!(!s.project.output.exists());
 }
+
+fn numbered_source(lines: usize) -> String {
+    (1..=lines).map(|i| format!("let value_{i} = {i};\n")).collect()
+}
+
+#[test]
+fn verification_reuses_delivered_evidence_when_source_ids_are_lost() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.rs"), numbered_source(20)).unwrap();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# A\nValues are assigned in order. a.rs:1-20\n\n# B\nThe same values again. a.rs:1-20\n"}),
+    );
+    for (id, section) in [("a", "# A"), ("b", "# B")] {
+        run(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":id,"title":id,"section":section,"status":"written"}),
+        );
+    }
+    let first = run(
+        &mut s,
+        "file_read",
+        json!({"path":"a.rs","start_line":1,"max_lines":10}),
+    )["source"]["id"]
+        .clone();
+    let second = run(
+        &mut s,
+        "file_read",
+        json!({"path":"a.rs","start_line":11,"max_lines":10}),
+    )["source"]["id"]
+        .clone();
+    // Only one of the two delivered ranges is named: the other is added.
+    let result = run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"a","source_ids":[first],"verification_note":"Compared all twenty assignments with section A"}),
+    );
+    assert_eq!(result["supplemented_source_ids"], json!([second]));
+    let item = s.investigations.iter().find(|i| i.id == "a").unwrap();
+    assert_eq!(item.status, "verified");
+    assert_eq!(item.sources.len(), 2);
+    // A project path stands in for the evidence delivered from that file.
+    let result = run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"b","source_ids":["a.rs"],"verification_note":"Compared all twenty assignments with section B"}),
+    );
+    assert_eq!(result["verified"], "b");
+    assert_eq!(result["supplemented_source_ids"], json!([first, second]));
+}
+
+#[test]
+fn delivered_evidence_of_an_older_file_version_is_not_reused() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.rs"), numbered_source(20)).unwrap();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# A\nValues are assigned in order. a.rs:1-20\n"}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"a","title":"a","section":"# A","status":"written"}),
+    );
+    run(
+        &mut s,
+        "file_read",
+        json!({"path":"a.rs","start_line":1,"max_lines":20}),
+    );
+    std::fs::write(
+        dir.path().join("a.rs"),
+        format!("{}// changed\n", numbered_source(20)),
+    )
+    .unwrap();
+    let fresh = run(
+        &mut s,
+        "file_read",
+        json!({"path":"a.rs","start_line":1,"max_lines":10}),
+    )["source"]["id"]
+        .clone();
+    let error = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"a","source_ids":[fresh],"verification_note":"Compared the assignments"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("source_coverage_missing"), "{error}");
+    assert!(error.contains("\"start_line\":11"), "{error}");
+    assert_ne!(
+        s.investigations.iter().find(|i| i.id == "a").unwrap().status,
+        "verified"
+    );
+}
+
+#[test]
+fn planned_section_names_rebind_to_the_written_heading_by_title() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.rs"), numbered_source(3)).unwrap();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"flow","title":"2. Agent branches and termination","section":"## 2. Agent branches","status":"in_progress"}),
+    );
+    let edit = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n\n## 2. Agent branches and termination\nThree values are assigned. a.rs:1-3\n"}),
+    );
+    assert_eq!(edit["written_items"], json!(["flow"]));
+    let item = s.investigations.iter().find(|i| i.id == "flow").unwrap();
+    assert_eq!(item.status, "written");
+    assert_eq!(
+        item.section,
+        "# Guide\n## 2. Agent branches and termination"
+    );
+    let source = run(&mut s, "file_read", json!({"path":"a.rs"}))["source"]["id"].clone();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"flow","source_ids":[source],"verification_note":"Compared the three assignments"}),
+    );
+}
+
+#[test]
+fn appended_heading_starts_a_new_line() {
+    let (_dir, mut s) = setup();
+    std::fs::write(&s.project.output, "# A\nFirst section ends here.").unwrap();
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":hash,"text":"## B\nSecond section.\n"}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# A\nFirst section ends here.\n## B\nSecond section.\n"
+    );
+    let outline = run(&mut s, "document_inspect", json!({}));
+    assert!(outline.to_string().contains("## B"));
+}

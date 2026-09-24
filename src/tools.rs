@@ -358,7 +358,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "investigation",
-                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. Both verify and verify_batch require existing written items. If not written, write the section and upsert with status=written and section first; source IDs alone do not mark an item written. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified; summary groups failures by code and retry_ids identifies only failed items. Already verified items in verify_batch reuse their existing evidence after section/source/memory freshness checks; new supplied evidence is ignored for those items. Use single verify to explicitly replace evidence. After edits, verify only verification_required_ids returned by document_edit. Coverage failures return all missing_ranges together. Verification coverage counts only complete file lines; partial file_read boundaries, truncated search lines and code outlines are navigation context and require a full file_read. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. status=written requires a non-empty section (supplied now or preserved from the existing item). For written items, upsert checks the current document and normalizes section to its section_path from document_inspect, including ancestors for nested headings. A unique title without # is accepted, including numbering. Planned sections may be registered before writing with status=in_progress.",
+                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. Both verify and verify_batch require existing written items. If not written, write the section and upsert with status=written and section first; source IDs alone do not mark an item written. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified; summary groups failures by code and retry_ids identifies only failed items. Already verified items in verify_batch reuse their existing evidence after section/source/memory freshness checks; new supplied evidence is ignored for those items. Use single verify to explicitly replace evidence. Verification also uses complete lines already delivered in this session for the current file version, so a lost source ID needs no re-read; a project path may stand in for its delivered sources. After edits, verify only verification_required_ids returned by document_edit. Coverage failures return all missing_ranges together. Verification coverage counts only complete file lines; partial file_read boundaries, truncated search lines and code outlines are navigation context and require a full file_read. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. status=written requires a non-empty section (supplied now or preserved from the existing item). For written items, upsert checks the current document and normalizes section to its section_path from document_inspect, including ancestors for nested headings. A unique title without # is accepted, including numbering. Planned sections may be registered before writing with status=in_progress.",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -1065,6 +1065,15 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
     };
     match action {
         "create" | "write" => Ok(new.to_string()),
+        // An appended heading starts a new block. Without a line break it
+        // would join the previous sentence and stop being a heading.
+        "append"
+            if !old.is_empty()
+                && !old.ends_with('\n')
+                && new.trim_start_matches(' ').starts_with('#') =>
+        {
+            Ok(format!("{old}\n{new}"))
+        }
         "append" => Ok(format!("{old}{new}")),
         "insert_before" | "insert_after" | "insert_first_child" | "insert_last_child" => {
             let anchor = documentation::resolve_heading(old, text(args, "section")?)?;
@@ -1229,17 +1238,7 @@ fn persist_document_edit(
     s.document_review.approved_hash = None;
     s.last_document_write = Some((path.to_path_buf(), hash(result.as_bytes())));
     revalidate(s)?;
-    let mut written_items = Vec::new();
-    for item in &mut s.investigations {
-        if !item.is_settled()
-            && !item.section.trim().is_empty()
-            && section_text(&result, &item.section)
-                .is_ok_and(|text| text.lines().skip(1).any(|line| !line.trim().is_empty()))
-        {
-            item.status = "written".into();
-            written_items.push(item.id.clone());
-        }
-    }
+    let written_items = bind_written_sections(s, &result);
     let hash = hash(result.as_bytes());
     let bytes = result.len();
     let total_lines = result.lines().count();
@@ -1859,6 +1858,79 @@ pub fn revalidate(s: &mut Session) -> Result<()> {
         }
     }
     Ok(())
+}
+/// Session sources that cover part of a missing cited range: complete lines
+/// of the current file version, not already supplied. Truncated excerpts and
+/// stale versions never attest a citation.
+fn delivered_sources_for(
+    s: &Session,
+    missing: &[Value],
+    supplied: &[crate::memory::Source],
+) -> Result<Vec<crate::memory::Source>> {
+    let mut wanted = Vec::new();
+    for range in missing {
+        let (Some(path), Some(start), Some(end)) = (
+            range["path"].as_str(),
+            range["start_line"].as_u64(),
+            range["end_line"].as_u64(),
+        ) else {
+            continue;
+        };
+        let resolved = read_path(&s.project, path)?;
+        let current = hash_file(&resolved)?;
+        wanted.push((resolved, current, start as usize, end as usize));
+    }
+    let mut found: Vec<crate::memory::Source> = Vec::new();
+    for source in s.sources.values() {
+        if source.origin != "file"
+            || source.evidence_truncated
+            || supplied.iter().chain(&found).any(|known| known.id == source.id)
+        {
+            continue;
+        }
+        let (Some(path), Some(start), Some(end)) =
+            (source.path.as_deref(), source.start_line, source.end_line)
+        else {
+            continue;
+        };
+        let Ok(resolved) = read_path(&s.project, path) else {
+            continue;
+        };
+        if wanted.iter().any(|(want_path, current, want_start, want_end)| {
+            *want_path == resolved
+                && source.hash.as_deref() == Some(current.as_str())
+                && start <= *want_end
+                && end >= *want_start
+        }) {
+            found.push(source.clone());
+        }
+    }
+    found.sort_by_key(|source| (source.path.clone(), source.start_line));
+    Ok(found)
+}
+
+/// Mark unsettled items written once their section has body text. A section
+/// registered while planning often differs from the heading finally written;
+/// when it no longer resolves, rebind it to the unique heading matching the
+/// item title so the written section can be verified.
+fn bind_written_sections(s: &mut Session, doc: &str) -> Vec<String> {
+    let mut written = Vec::new();
+    for item in s.investigations.iter_mut().filter(|item| !item.is_settled()) {
+        if section_text(doc, &item.section).is_err()
+            && let Ok(heading) = documentation::resolve_heading(doc, &item.title)
+            && let Ok(path) = documentation::heading_path(doc, heading.start)
+        {
+            item.section = path;
+        }
+        if !item.section.trim().is_empty()
+            && section_text(doc, &item.section)
+                .is_ok_and(|text| text.lines().skip(1).any(|line| !line.trim().is_empty()))
+        {
+            item.status = "written".into();
+            written.push(item.id.clone());
+        }
+    }
+    written
 }
 fn section_text<'a>(doc: &'a str, heading: &str) -> Result<&'a str> {
     let h = documentation::resolve_heading(doc, heading)?;
@@ -2623,6 +2695,13 @@ pub fn execute_cancellable(
             "verify" => {
                 revalidate(s)?;
                 let id = text(&args, "id")?;
+                // A section written under a heading other than the planned one
+                // is rebound by title before the written-state check.
+                if s.investigations.iter().any(|i| i.id == id && !i.is_settled())
+                    && let Ok(doc) = output_path(&s.project).and_then(|path| read_text(&path))
+                {
+                    bind_written_sections(s, &doc);
+                }
                 let item = s
                     .investigations
                     .iter()
@@ -2643,8 +2722,18 @@ pub fn execute_cancellable(
                 if note.trim().is_empty() {
                     bail!("missing_argument: verification_note must be non-empty");
                 }
-                let sources = s.source_refs(&list(&args, "source_ids"))?;
-                if sources.is_empty()
+                // A project path in place of an ID names the file whose
+                // delivered evidence should be used; coverage supplements it.
+                let mut ids = list(&args, "source_ids");
+                let path_hints = ids.len();
+                ids.retain(|id| {
+                    s.source_refs(std::slice::from_ref(id)).is_ok()
+                        || !(id.contains('/') || id.contains('.'))
+                        || read_path(&s.project, id).is_err()
+                });
+                let path_hints = path_hints - ids.len();
+                let mut sources = s.source_refs(&ids)?;
+                if (sources.is_empty() && path_hints == 0)
                     || sources.iter().any(|source| {
                         source.origin != "file"
                             || source.path.is_none()
@@ -2674,7 +2763,25 @@ pub fn execute_cancellable(
                     }
                 }
                 let section = section_text(&doc, &item.section)?;
-                let missing = documentation::missing_citation_ranges(s, section, &sources)?;
+                let mut missing = documentation::missing_citation_ranges(s, section, &sources)?;
+                // Evidence already delivered in this session at the current
+                // file version is not re-read just because its ID was lost to
+                // context cleanup. Add only sources that cover a missing range.
+                let mut supplemented = Vec::new();
+                if !missing.is_empty() {
+                    for source in delivered_sources_for(s, &missing, &sources)? {
+                        supplemented.push(source.id.clone());
+                        sources.push(source);
+                    }
+                    if !supplemented.is_empty() {
+                        missing = documentation::missing_citation_ranges(s, section, &sources)?;
+                    }
+                }
+                if sources.is_empty() {
+                    bail!(
+                        "verification_sources_required: pass non-empty observed file source_ids returned by file_read/source_search/symbol_search"
+                    );
+                }
                 if !missing.is_empty() {
                     return Err(documentation::CoverageMissing {
                         item_id: id.into(),
@@ -2687,7 +2794,11 @@ pub fn execute_cancellable(
                 item.sources = sources;
                 item.note = note.into();
                 item.status = "verified".into();
-                Ok(json!({"verified":id}))
+                if supplemented.is_empty() {
+                    Ok(json!({"verified":id}))
+                } else {
+                    Ok(json!({"verified":id,"supplemented_source_ids":supplemented}))
+                }
             }
             "mark_gap" => {
                 if s.progress_recovery.closing.is_none() {
