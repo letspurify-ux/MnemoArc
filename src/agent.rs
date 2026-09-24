@@ -1124,9 +1124,12 @@ pub async fn run_session_controlled(
             || reviewing_answer
             || (s.checkpoint.is_none() && tools::answer_review::eligible(&s));
         let request_tokens = context::count(&request, &s.config.model);
-        // Reasoning models spend output tokens on reasoning too; retain the
-        // configured output allowance and reserve it for every cleanup round.
+        // Reasoning models spend output tokens on reasoning too. Cleanup
+        // requests use the bounded cleanup allowance that input_budget reserves.
         let mut request_config = s.config.clone();
+        if s.checkpoint.is_some() {
+            request_config.output_tokens = ContextManager::cleanup_output_tokens(&s.config);
+        }
         if reviewing_document {
             // A short first response keeps ordinary review calls bounded. If
             // the provider exhausts that allowance before emitting JSON, give

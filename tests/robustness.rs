@@ -57,6 +57,13 @@ fn extreme_pagination_and_budget_inputs_do_not_panic() {
         output_tokens: usize::MAX / 3,
         ..Default::default()
     };
+    // Saturating arithmetic: an extreme output limit never panics.
+    assert!(ContextManager::input_budget(&c) < c.context_tokens);
+    let c = Config {
+        context_tokens: 10_000,
+        output_tokens: usize::MAX / 3,
+        ..Default::default()
+    };
     assert_eq!(ContextManager::input_budget(&c), 0);
     assert!(c.validate().is_err());
     for field in [

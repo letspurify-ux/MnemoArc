@@ -354,3 +354,23 @@ async fn closing_reserve_finishes_steady_work_before_the_budget() {
     let spent = result.input_tokens + result.output_tokens;
     assert!((900_000..1_000_000).contains(&spent), "{spent}");
 }
+
+#[test]
+fn cleanup_output_reservation_is_bounded_so_large_outputs_keep_input_room() {
+    use mnemoarc::context::{CLEANUP_OUTPUT_CAP, ContextManager};
+    let large = Config {
+        context_tokens: 230_000,
+        output_tokens: 32_000,
+        ..Default::default()
+    };
+    assert_eq!(ContextManager::cleanup_output_tokens(&large), CLEANUP_OUTPUT_CAP);
+    // One full response plus three bounded cleanup rounds, not four outputs.
+    let budget = ContextManager::input_budget(&large);
+    assert!(budget > 130_000, "{budget}");
+    let small = Config {
+        context_tokens: 64_000,
+        output_tokens: 8_000,
+        ..Default::default()
+    };
+    assert_eq!(ContextManager::cleanup_output_tokens(&small), 8_000);
+}

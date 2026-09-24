@@ -155,7 +155,7 @@ export const groups = [
         "number",
         "독립적인 읽기 도구에만 적용합니다.",
       ],
-      ["request_timeout_secs", "LLM 요청 시간 제한", "number", "초"],
+      ["request_timeout_secs", "LLM 응답 대기 제한", "number", "초. 응답 시작과 스트림이 멈춘 간격에 적용하며, 계속 전송되는 긴 응답은 끊지 않습니다. 시간 초과는 일시 오류로 재시도합니다"],
       ["tool_timeout_secs", "도구 시간 제한", "number", "초"],
       ["retries", "일시 오류 재시도", "number", "추가 시도 횟수"],
       ["run_timeout_secs", "작업 시간 예산", "number", "초"],

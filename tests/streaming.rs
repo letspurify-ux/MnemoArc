@@ -588,3 +588,95 @@ async fn rejected_json_schema_degrades_to_json_mode_and_is_remembered() {
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn request_timeout_bounds_silence_not_a_long_streaming_answer() {
+    use futures_util::stream;
+    let app = Router::new().route(
+        "/chat/completions",
+        post(|| async {
+            // Six chunks 400ms apart: 2.4s in total, never 1s of silence.
+            let chunks = stream::unfold(0, |i| async move {
+                if i == 6 {
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                let body = if i == 5 {
+                    format!(
+                        "{}data: [DONE]\n\n",
+                        event(json!({"choices":[{"delta":{"content":"."},"finish_reason":"stop"}]}))
+                    )
+                } else {
+                    event(json!({"choices":[{"delta":{"content":"."}}]}))
+                };
+                Some((Ok::<_, std::convert::Infallible>(body), i + 1))
+            });
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                axum::body::Body::from_stream(chunks),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let c = Config {
+        base_url: format!("http://{}", listener.local_addr().unwrap()),
+        request_timeout_secs: 1,
+        retries: 0,
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let result = OpenAiClient
+        .complete(json!({"messages":[]}), &c, CancellationToken::new(), tx)
+        .await
+        .unwrap();
+    assert_eq!(result.text, "......");
+    assert_eq!(result.attempts, 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn silent_request_times_out_and_is_retried() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move || {
+            let count = counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if count == 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    format!(
+                        "{}data: [DONE]\n\n",
+                        event(json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}))
+                    ),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let c = Config {
+        base_url: format!("http://{}", listener.local_addr().unwrap()),
+        request_timeout_secs: 1,
+        retries: 1,
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let result = OpenAiClient
+        .complete(json!({"messages":[]}), &c, CancellationToken::new(), tx)
+        .await
+        .unwrap();
+    assert_eq!(result.text, "OK");
+    assert_eq!(result.attempts, 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}

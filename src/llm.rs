@@ -236,7 +236,17 @@ impl OpenAiClient {
         if let Some(key) = Self::key(c) {
             req = req.bearer_auth(key)
         }
-        let response = tokio::select! {_ = cancel.cancelled()=>bail!("cancelled"),r=req.send()=>r?};
+        // request_timeout_secs bounds waiting for response headers and each
+        // silent gap in the stream, not the whole response: a long reasoning
+        // answer that keeps streaming (or sends keepalives) is not cut off.
+        // The run deadline bounds total duration.
+        let idle = Duration::from_secs(c.request_timeout_secs);
+        let response = tokio::select! {
+            _ = cancel.cancelled() => bail!("cancelled"),
+            r = tokio::time::timeout(idle, req.send()) => r.map_err(|_| {
+                anyhow::anyhow!("request_timeout: no response within {}s", c.request_timeout_secs)
+            })??,
+        };
         if !response.status().is_success() {
             let status = response.status();
             // Error responses can have a slow or unbounded body too. Keep
@@ -246,9 +256,9 @@ impl OpenAiClient {
             while bytes.len() < MAX_ERROR_BODY_BYTES {
                 let next = tokio::select! {
                     _ = cancel.cancelled() => bail!("cancelled"),
-                    chunk = stream.next() => chunk,
+                    chunk = tokio::time::timeout(idle, stream.next()) => chunk,
                 };
-                let Some(chunk) = next else {
+                let Ok(Some(chunk)) = next else {
                     break;
                 };
                 let Ok(chunk) = chunk else { break };
@@ -268,7 +278,12 @@ impl OpenAiClient {
         let mut calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
         let (mut done, mut finish) = (false, false);
         loop {
-            let next = tokio::select! {_ = cancel.cancelled()=>bail!("cancelled"),chunk=stream.next()=>chunk};
+            let next = tokio::select! {
+                _ = cancel.cancelled() => bail!("cancelled"),
+                chunk = tokio::time::timeout(idle, stream.next()) => chunk.map_err(|_| {
+                    anyhow::anyhow!("request_timeout: no stream data for {}s", c.request_timeout_secs)
+                })?,
+            };
             let Some(chunk) = next else { break };
             let chunk = chunk.map_err(|e| anyhow::anyhow!("stream_interrupted: {e}"))?;
             for event in parser.feed(&chunk)? {
@@ -462,21 +477,14 @@ impl LlmClient for OpenAiClient {
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => bail!("cancelled"),
-                    result = tokio::time::timeout(
-                        Duration::from_secs(c.request_timeout_secs),
-                        self.attempt(
-                            request.clone(),
-                            c,
-                            cancel.clone(),
-                            delta.clone(),
-                            emitted_text.clone(),
-                            stream_deltas,
-                        ),
-                    ) => result,
-            };
-            let result = match result {
-                Ok(r) => r,
-                Err(_) => Err(anyhow::anyhow!("request_timeout")),
+                result = self.attempt(
+                    request.clone(),
+                    c,
+                    cancel.clone(),
+                    delta.clone(),
+                    emitted_text.clone(),
+                    stream_deltas,
+                ) => result,
             };
             match result {
                 Ok(mut r) => {
@@ -517,6 +525,7 @@ impl LlmClient for OpenAiClient {
                         && (text.starts_with("provider_stream_error:")
                             || (attempt == 0 && text.starts_with("invalid_tool_arguments:"))
                             || (attempt == 0 && text.starts_with("invalid_stream_event:"))
+                            || text.starts_with("request_timeout")
                             || text.starts_with("http_429")
                             || text.starts_with("http_5")
                             || text.contains("error sending request"));

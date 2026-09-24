@@ -28,6 +28,8 @@ checkpoint_tokens = 4000
 high_water = 0.8
 low_water = 0.6
 read_parallelism = 4
+# Seconds to wait for response headers and for each silent gap in the stream;
+# a long answer that keeps streaming is not cut off. Timeouts are retried.
 request_timeout_secs = 180
 tool_timeout_secs = 30
 retries = 2
