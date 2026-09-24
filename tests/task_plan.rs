@@ -100,7 +100,11 @@ fn invalid_operation_shapes_preserve_plan_without_poisoning_error_recovery() {
         assert_eq!(result["status"], "ok", "{result}");
         assert_eq!(result["data"]["applied"], false);
         assert_eq!(result["data"]["input_error"]["field"], "operations");
-        assert!(failures.observe("task_plan", &result, 2).is_none());
+        assert!(
+            failures
+                .observe("task_plan", &call.arguments, &result, 2)
+                .is_none()
+        );
         assert_eq!(json!(s.task), original);
         assert_eq!(s.status, "running");
         assert!(!s.ledger.contains_key(&call.id));

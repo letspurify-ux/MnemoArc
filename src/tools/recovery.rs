@@ -373,12 +373,14 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
 }
 
 /// Failures cannot evade the bound by changing an ID, argument or recovery
-/// code every round. A success resets only that tool's failures; unrelated
-/// writes cannot hide it.
+/// code every round. Identical invalid calls are surfaced immediately so the
+/// agent can change approach before the general per-tool budget is exhausted.
+/// A success resets only that tool's failures; unrelated writes cannot hide it.
 #[derive(Default)]
 pub struct FailureTracker {
     by_tool_and_code: BTreeMap<(String, String), usize>,
     by_tool: BTreeMap<String, usize>,
+    by_invocation: BTreeMap<(String, String, String), (String, usize)>,
 }
 
 /// Every failed item in a mixed batch must be correctable. An uncertain write
@@ -411,17 +413,60 @@ pub fn correctable_document_error(result: &Value) -> bool {
     }
 }
 
+/// Replace the ordinary retry hint after an identical document-edit failure
+/// with an explicit instruction to inspect state and change the edit strategy.
+pub fn annotate_identical_document_failure(result: &mut Value) {
+    result["recovery"]["repeat_detected"] = json!(true);
+    result["recovery"]["action"] = json!("change_approach");
+    result["recovery"]["tools"] = json!(["document_inspect", "document_edit"]);
+    result["recovery"]["guidance"] = json!(
+        "This exact request already failed with the same cause. Do not resubmit it. Inspect the current outline and failure cause, then make one targeted document_edit using the current document hash."
+    );
+}
+
 impl FailureTracker {
-    pub fn observe(&mut self, tool: &str, result: &Value, limit: usize) -> Option<String> {
+    pub fn observe(
+        &mut self,
+        tool: &str,
+        arguments: &str,
+        result: &Value,
+        limit: usize,
+    ) -> Option<String> {
         if result["status"] == "ok" {
             self.by_tool_and_code.retain(|(name, _), _| name != tool);
             self.by_tool.remove(tool);
+            self.by_invocation.retain(|(name, _, _), _| name != tool);
             return None;
         }
         if result["status"] == "cancelled" {
             return None;
         }
         let code = result["recovery"]["code"].as_str().unwrap_or("tool_error");
+        let error = result["error"].as_str().unwrap_or("unknown failure");
+        if matches!(tool, "document_edit" | "document_edit_batch")
+            && result["recovery"]["class"] == "invalid_input"
+        {
+            let key = (
+                tool.to_owned(),
+                super::hash(arguments.as_bytes()),
+                code.to_owned(),
+            );
+            let (previous_error, count) = self
+                .by_invocation
+                .entry(key)
+                .or_insert_with(|| (error.to_owned(), 0));
+            if previous_error == error {
+                *count += 1;
+            } else {
+                *previous_error = error.to_owned();
+                *count = 1;
+            }
+            if *count >= 2 {
+                return Some(format!(
+                    "identical_tool_failure: {tool} repeated the same invalid arguments and identical cause ({code}); inspect the current state and use one targeted edit with corrected arguments instead of resubmitting this call"
+                ));
+            }
+        }
         let code_count = self
             .by_tool_and_code
             .entry((tool.into(), code.into()))
@@ -430,8 +475,7 @@ impl FailureTracker {
         let total_count = self.by_tool.entry(tool.into()).or_default();
         *total_count += 1;
         (*total_count >= limit).then(|| format!(
-            "tool_recovery_limit: {tool} failed {total_count} times (latest code {code}, code count {code_count}); last cause: {}; state and completed writes retained",
-            result["error"].as_str().unwrap_or("unknown failure")
+            "tool_recovery_limit: {tool} failed {total_count} times (latest code {code}, code count {code_count}); last cause: {error}; state and completed writes retained"
         ))
     }
 }

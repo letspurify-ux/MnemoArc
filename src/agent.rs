@@ -1700,10 +1700,16 @@ pub async fn run_session_controlled(
                 }
                 let cache_parallel_result = parallel && result["status"] == "ok";
                 tools::recovery::attach(&s, call, &mut result);
-                if let Some(reason) =
-                    tool_failures.observe(&call.name, &result, s.config.stall_round_limit)
-                    && failure.is_none()
+                if let Some(reason) = tool_failures.observe(
+                    &call.name,
+                    &call.arguments,
+                    &result,
+                    s.config.stall_round_limit,
+                ) && failure.is_none()
                 {
+                    if reason.starts_with("identical_tool_failure:") {
+                        tools::recovery::annotate_identical_document_failure(&mut result);
+                    }
                     let correctable = tools::recovery::correctable_document_error(&result);
                     if !correctable || !recover_document(&mut s, &reason) {
                         failure = Some(reason);

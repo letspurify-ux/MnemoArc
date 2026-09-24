@@ -99,22 +99,61 @@ fn failure_budget_is_per_tool_and_error_not_arguments_or_unrelated_success() {
     let mut failures = FailureTracker::default();
     for i in 0..3 {
         let error = tools::envelope(Err(anyhow::anyhow!("unknown_source: invented-{i}")));
-        assert!(failures.observe("memory_write", &error, 3).is_some() == (i == 2));
+        assert!(failures.observe("memory_write", "{}", &error, 3).is_some() == (i == 2));
         assert!(
             failures
-                .observe("task_state", &json!({"status":"ok"}), 3)
+                .observe("task_state", "{}", &json!({"status":"ok"}), 3)
                 .is_none()
         );
     }
-    failures.observe("memory_write", &json!({"status":"ok"}), 3);
+    failures.observe("memory_write", "{}", &json!({"status":"ok"}), 3);
     assert!(
         failures
             .observe(
                 "memory_write",
+                "{}",
                 &tools::envelope(Err(anyhow::anyhow!("unknown_source: again"))),
                 3
             )
             .is_none()
+    );
+}
+
+#[test]
+fn identical_invalid_document_call_is_reported_on_second_failure() {
+    let mut failures = FailureTracker::default();
+    let arguments = json!({
+        "expected_hash":"abc123",
+        "edits":[{"action":"replace_section","section":"## 2","content":"revised"}]
+    })
+    .to_string();
+    let error = tools::envelope(Err(anyhow::anyhow!(
+        "document_batch_operation_failed: index=0; cause=ambiguous_section: ## 2"
+    )));
+
+    assert!(
+        failures
+            .observe("document_edit_batch", &arguments, &error, 16)
+            .is_none()
+    );
+    let repeated = failures
+        .observe("document_edit_batch", &arguments, &error, 16)
+        .unwrap();
+    assert!(repeated.starts_with("identical_tool_failure:"));
+
+    let mut corrected = error.clone();
+    tools::recovery::annotate_identical_document_failure(&mut corrected);
+    assert_eq!(corrected["recovery"]["repeat_detected"], true);
+    assert_eq!(corrected["recovery"]["action"], "change_approach");
+    assert_eq!(
+        corrected["recovery"]["tools"],
+        json!(["document_inspect", "document_edit"])
+    );
+    assert!(
+        corrected["recovery"]["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("Do not resubmit it")
     );
 }
 #[test]

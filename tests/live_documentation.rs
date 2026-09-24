@@ -7,7 +7,12 @@ use mnemoarc::{
     tools,
 };
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 
 fn env_bool(name: &str, fallback: bool) -> bool {
@@ -45,6 +50,13 @@ async fn registered_source_documentation() {
     }
     config.source_document_review = env_bool("MNEMOARC_LIVE_SOURCE_DOCUMENT_REVIEW", true);
     config.completion_review_enabled = env_bool("MNEMOARC_LIVE_COMPLETION_REVIEW", true);
+    eprintln!(
+        "[live] budget_tokens={} budget_seconds={} source_document_review={} completion_review={}",
+        config.run_tokens,
+        config.run_timeout_secs,
+        config.source_document_review,
+        config.completion_review_enabled
+    );
     let mut project = config
         .projects
         .iter()
@@ -69,12 +81,66 @@ async fn registered_source_documentation() {
         let mut first_write = None;
         let mut reviews = Vec::new();
         let mut last_round = 0;
+        let mut seen_call_ids = BTreeSet::new();
+        let mut seen_result_ids = BTreeSet::new();
+        let mut call_signatures = BTreeMap::<String, (String, String)>::new();
+        let mut signature_counts = BTreeMap::<(String, String), usize>::new();
         while let Some(event) = rx.recv().await {
             match event {
                 AgentEvent::Tool { name, status, .. } => {
                     eprintln!("[live] tool={name} status={status}");
                 }
                 AgentEvent::Snapshot(s) => {
+                    for message in s.history.bundles.iter().flat_map(|bundle| &bundle.messages) {
+                        if let Some(calls) = message["tool_calls"].as_array() {
+                            for call in calls {
+                                let Some(id) = call["id"].as_str() else {
+                                    continue;
+                                };
+                                if !seen_call_ids.insert(id.to_owned()) {
+                                    continue;
+                                }
+                                let name = call["function"]["name"]
+                                    .as_str()
+                                    .unwrap_or("unknown")
+                                    .to_owned();
+                                let arguments = call["function"]["arguments"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_owned();
+                                let signature = (name.clone(), arguments);
+                                let count = signature_counts.entry(signature.clone()).or_default();
+                                *count += 1;
+                                call_signatures.insert(id.to_owned(), signature.clone());
+                                if *count == 2 {
+                                    eprintln!("[live] repeated_exact_call name={} count=2", name);
+                                }
+                            }
+                        }
+                        if message["role"] == "tool"
+                            && let Some(id) = message["tool_call_id"].as_str()
+                            && seen_result_ids.insert(id.to_owned())
+                            && let Some((name, _)) = call_signatures.get(id)
+                            && let Some(result) = message["content"]
+                                .as_str()
+                                .and_then(|content| serde_json::from_str::<Value>(content).ok())
+                            && result["status"] != "ok"
+                        {
+                            let code = result["recovery"]["code"]
+                                .as_str()
+                                .or_else(|| result["code"].as_str())
+                                .unwrap_or("tool_error");
+                            let repeat_count = call_signatures
+                                .get(id)
+                                .and_then(|signature| signature_counts.get(signature))
+                                .copied()
+                                .unwrap_or(1);
+                            eprintln!(
+                                "[live] tool_failure name={} code={} same_call_count={}",
+                                name, code, repeat_count
+                            );
+                        }
+                    }
                     if s.document_written && first_write.is_none() {
                         first_write = Some(
                             json!({"round":s.task_rounds,"input_tokens":s.input_tokens,"output_tokens":s.output_tokens}),
@@ -149,6 +215,9 @@ async fn registered_source_documentation() {
     }
     let report = json!({"status":result.status,"error":result.last_error,"model":result.config.model,
         "budget_tokens":result.config.run_tokens,"budget_seconds":result.config.run_timeout_secs,
+        "source_document_review_enabled":result.config.source_document_review,
+        "completion_review_enabled":result.config.completion_review_enabled,
+        "completion_review":result.completion_review,
         "elapsed_seconds":start.elapsed().as_secs_f64(),"input_tokens":result.input_tokens,"output_tokens":result.output_tokens,
         "usage_incomplete":result.usage_incomplete,"model_rounds":result.task_rounds,"first_write":first_write,"review_attempts":reviews,
         "tool_calls":calls,"tool_errors":errors,"document_review":result.document_review,"audit":audit,
@@ -176,6 +245,10 @@ async fn registered_source_documentation() {
         assert!(tools::document_review::approved(&result));
     } else {
         assert_eq!(result.document_review.attempts, 0);
+    }
+    if result.config.completion_review_enabled {
+        assert!(result.completion_review.attempts > 0);
+        assert!(result.completion_review.approved);
     }
     assert!(
         result.investigations.len() >= 4
