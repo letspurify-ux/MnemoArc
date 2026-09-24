@@ -352,6 +352,9 @@ pub struct Session {
     /// Recent provider input tokens per locally estimated token, for models
     /// without a known tokenizer. See ContextManager::token_ratio.
     pub token_ratios: VecDeque<f64>,
+    /// file_list cursor fingerprint -> the mode and path_glob it was issued
+    /// for, so a continuation that omits them keeps its original scope.
+    pub list_cursor_scopes: VecDeque<(String, Value)>,
     pub activity: Value,
     pub task_rounds: usize,
     pub document_review: crate::tools::document_review::ReviewState,
@@ -447,6 +450,7 @@ impl Session {
             progress_recovery: Default::default(),
             completion_gaps: vec![],
             token_ratios: VecDeque::new(),
+            list_cursor_scopes: VecDeque::new(),
             activity: json!({}),
             task_rounds: 0,
             document_review: Default::default(),

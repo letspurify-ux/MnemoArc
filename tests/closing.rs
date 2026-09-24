@@ -882,3 +882,48 @@ fn source_search_accepts_a_directory_as_its_scope() {
     assert_eq!(matches.len(), 1, "{result}");
     assert!(matches[0]["path"].as_str().unwrap().ends_with("backend/src/server.js"));
 }
+
+#[test]
+fn list_cursor_keeps_its_scope_when_the_glob_is_omitted() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    for i in 0..120 {
+        std::fs::write(dir.path().join(format!("src/m{i:03}.js")), "x();\n").unwrap();
+    }
+    std::fs::write(dir.path().join("README.md"), "# App\n").unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        Config::default(),
+    );
+    let first = tools::execute(
+        &mut s,
+        "file_list",
+        json!({"mode":"paths","path_glob":"src/**"}),
+    )
+    .unwrap();
+    assert_eq!(first["total_files"], 120);
+    let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    // The continuation drops path_glob, as the live model did.
+    let second = tools::execute(
+        &mut s,
+        "file_list",
+        json!({"mode":"paths","cursor":cursor}),
+    )
+    .unwrap();
+    let rest = second["paths"].as_array().unwrap();
+    assert_eq!(rest.len(), 20);
+    assert!(rest.iter().all(|path| path.as_str().unwrap().starts_with("src/")));
+    // A different explicit scope is a real mismatch, explained as such.
+    let error = tools::execute(
+        &mut s,
+        "file_list",
+        json!({"mode":"paths","path_glob":"**","cursor":cursor}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("issued for different arguments"), "{error}");
+}

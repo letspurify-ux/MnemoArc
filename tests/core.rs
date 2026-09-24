@@ -930,11 +930,11 @@ fn file_cursors_reject_mixed_ranges_changed_files_and_other_sessions() {
     let result = tools::run_call(&mut s, &call);
     let cursor = result["next_cursor"]["cursor"].clone();
     assert!(cursor.is_string());
+    // New-range arguments with a cursor are ambiguous and rejected.
     for extra in [
         json!({"start_line":90}),
         json!({"offset":0}),
         json!({"path":"pages.md"}),
-        json!({"max_lines":20}),
     ] {
         let mut args = extra;
         args["cursor"] = cursor.clone();
@@ -945,6 +945,18 @@ fn file_cursors_reject_mixed_ranges_changed_files_and_other_sessions() {
                 .contains("cursor_arguments_conflict")
         );
     }
+    // A page size with a cursor changes nothing: the cursor continues its
+    // original range and the ignored argument is reported.
+    let continued = tools::execute(
+        &mut s,
+        "file_read",
+        json!({"cursor":cursor,"max_lines":20}),
+    )
+    .unwrap();
+    assert_eq!(continued["ignored_arguments"], json!(["max_lines"]));
+    assert_eq!(continued["read_start"], result["data"]["read_start"]);
+    assert_eq!(continued["read_max_lines"], result["data"]["read_max_lines"]);
+    assert!(continued["read_offset"].as_u64().unwrap() > 0);
     let mut other = session(dir.path());
     assert!(
         tools::execute(&mut other, "file_read", json!({"cursor":cursor}))

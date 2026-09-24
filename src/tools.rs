@@ -2045,7 +2045,9 @@ fn page_cursor(args: &Value, fingerprint: &str) -> Result<usize> {
             .split_once(':')
             .ok_or_else(|| anyhow::anyhow!("invalid_cursor"))?;
         if h != fingerprint {
-            bail!("cursor_expired: source listing changed");
+            bail!(
+                "cursor_expired: this cursor was issued for different arguments (path_glob, mode, query or filters) or the listing changed; pass the cursor with exactly the original arguments, or restart without a cursor"
+            );
         }
         index
             .parse::<usize>()
@@ -2511,6 +2513,24 @@ pub fn execute_cancellable(
             Ok(json!({"acknowledged":true,"state_revision":s.task.revision}))
         }
         "file_list" => {
+            // A continuation that omits the original mode/path_glob keeps the
+            // scope its cursor was issued for.
+            if let Some(scope) = args["cursor"]
+                .as_str()
+                .and_then(|cursor| cursor.split_once(':'))
+                .and_then(|(fingerprint, _)| {
+                    s.list_cursor_scopes
+                        .iter()
+                        .find(|(known, _)| known == fingerprint)
+                        .map(|(_, scope)| scope.clone())
+                })
+            {
+                for key in ["mode", "path_glob"] {
+                    if args.get(key).is_none() && !scope[key].is_null() {
+                        args[key] = scope[key].clone();
+                    }
+                }
+            }
             let mode = args["mode"].as_str().unwrap_or("text");
             let files = if mode == "paths" {
                 candidate_paths(&s.project, path_glob(&args)?, cancel)?
@@ -2529,12 +2549,37 @@ pub fn execute_cancellable(
                 bail!("invalid_cursor");
             }
             let end = (offset + n(&args, "limit", 100).clamp(1, 500)).min(names.len());
+            if end < names.len() && !s.list_cursor_scopes.iter().any(|(known, _)| *known == fingerprint) {
+                s.list_cursor_scopes
+                    .push_back((fingerprint.clone(), json!({"mode":mode,"path_glob":path_glob(&args)?})));
+                while s.list_cursor_scopes.len() > 32 {
+                    s.list_cursor_scopes.pop_front();
+                }
+            }
             Ok(
                 json!({"hash":fingerprint,"mode":mode,"total_files":names.len(),"paths":names[offset..end],"next_cursor":(end<names.len()).then(||format!("{fingerprint}:{end}"))}),
             )
         }
         "source_search" => search::execute(s, &args, cancel),
-        "file_read" => read_file(s, &mut args, cancel),
+        "file_read" => {
+            // A cursor continues its original range, so a page size sent with
+            // it changes nothing. Ignore it rather than reject a correct
+            // continuation; new-range arguments with a cursor still conflict.
+            let ignored_page_size = args["cursor"].is_string()
+                && args.get("max_lines").is_some()
+                && !["path", "start_line", "offset"]
+                    .iter()
+                    .any(|key| args.get(key).is_some());
+            if ignored_page_size {
+                args.as_object_mut().unwrap().remove("max_lines");
+            }
+            let mut result = read_file(s, &mut args, cancel)?;
+            if ignored_page_size {
+                result["ignored_arguments"] = json!(["max_lines"]);
+                result["ignored_note"] = json!("A cursor continues its original range; max_lines was ignored. Pass only the cursor to continue.");
+            }
+            Ok(result)
+        }
         "file_edit" | "file_write" | "file_patch" => file_edit::execute(s, name, &args, cancel),
         "document_edit" => {
             let path = output_path(&s.project)?;
