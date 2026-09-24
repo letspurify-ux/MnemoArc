@@ -1556,13 +1556,27 @@ async fn source_document_can_finish_after_stalled_reviews_or_many_rejected_final
             premature_finals,
         });
         let s = run_repair_test(s, client).await;
+        if premature_finals {
+            // Final answers that never edit the rejected document are not
+            // repair: after two unchanged rejections the run closes and
+            // reports the open finding instead of waiting for a late fix.
+            assert_eq!(s.status, "complete_with_gaps", "{:?}", s.last_error);
+            assert_eq!(
+                s.progress_recovery.closing.as_ref().unwrap().reason,
+                "review_unrepaired"
+            );
+            assert!(
+                s.completion_gaps
+                    .iter()
+                    .any(|gap| gap.contains("correct the loop and history statement"))
+            );
+            assert_eq!(s.document_review.attempts, 1);
+            continue;
+        }
         assert_eq!(s.status, "complete", "{:?}", s.last_error);
         assert!(document_review::approved(&s));
         assert!(s.completion_review.approved);
         assert_eq!(s.investigations[0].status, "verified");
-        assert_eq!(
-            s.document_review.attempts,
-            if premature_finals { 2 } else { 16 }
-        );
+        assert_eq!(s.document_review.attempts, 16);
     }
 }

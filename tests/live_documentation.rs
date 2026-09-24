@@ -169,7 +169,7 @@ async fn registered_source_documentation() {
                             .filter(|item| item.status == "verified")
                             .count();
                         eprintln!(
-                            "[live] round={} input={} output={} document_written={} investigations={}/{} document_reviews={} completion_reviews={} checkpoint={}",
+                            "[live] round={} input={} output={} document_written={} investigations={}/{} document_reviews={} completion_reviews={} checkpoint={} ladder={}/{} best={} closing={} unrepaired_finals={}",
                             s.task_rounds,
                             s.input_tokens,
                             s.output_tokens,
@@ -180,7 +180,17 @@ async fn registered_source_documentation() {
                             s.completion_review.attempts,
                             s.checkpoint
                                 .as_ref()
-                                .map_or(0, |checkpoint| checkpoint.attempts)
+                                .map_or(0, |checkpoint| checkpoint.attempts),
+                            // Progress ladder state: rounds without a better
+                            // score / closing threshold, and why closing began.
+                            s.progress_recovery.rounds_since_best,
+                            s.config.stall_round_limit * 3,
+                            s.progress_recovery.best_score,
+                            s.progress_recovery
+                                .closing
+                                .as_ref()
+                                .map_or("none".to_owned(), |closing| format!("{}:{}", closing.reason, closing.rounds)),
+                            s.progress_recovery.unrepaired_finals
                         );
                     }
                 }

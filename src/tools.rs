@@ -426,6 +426,24 @@ impl ToolRegistry {
         ]
         .contains(&name)
     }
+    const REPAIR_TOOLS: &'static [&'static str] = &[
+        "document_edit",
+        "document_edit_batch",
+        "file_read",
+        "source_search",
+        "symbol_read",
+        "investigation",
+    ];
+    /// A final answer was rejected by a review whose findings the unchanged
+    /// document still carries. The required tool call must be a repair step,
+    /// not a plan, outline or audit call that merely satisfies the requirement.
+    pub fn repair_only(s: &Session) -> bool {
+        s.checkpoint.is_none()
+            && s.progress_recovery.action_required
+            && s.is_document_work()
+            && !s.document_review.issues.is_empty()
+            && document_review::rejected_on_current_result(s)
+    }
     /// Tools withheld in closing mode for this session. Before any document is
     /// saved, source reading is withheld as well: the only way forward is to
     /// write the document from the evidence already gathered.
@@ -509,6 +527,7 @@ impl ToolRegistry {
             .filter(|t| s.config.memory_reuse || !["memory_read", "memory_find"].contains(&t.name))
             .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
             .filter(|t| !Self::closing_withholds(s, t.name))
+            .filter(|t| !Self::repair_only(s) || Self::REPAIR_TOOLS.contains(&t.name))
             // Second stage of the document progress ladder: after twice the
             // stall limit without a better result, stop broad discovery even
             // in the verify phase. Targeted file_read/symbol_read remain.
@@ -2471,7 +2490,10 @@ pub fn execute_cancellable(
                 .checkpoint
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("no_checkpoint"))?;
-            if cp.id != text(&args, "id")? {
+            // Only one checkpoint is active, so a copied ID that the model cut
+            // short still identifies it; a mismatching or tiny prefix does not.
+            let supplied = text(&args, "id")?.trim();
+            if cp.id != supplied && !(supplied.len() >= 8 && cp.id.starts_with(supplied)) {
                 bail!("checkpoint_id_mismatch: expected checkpoint ID {}", cp.id);
             }
             if cp.failed {

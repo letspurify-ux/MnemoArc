@@ -265,6 +265,26 @@ fn abandon_failing_review(s: &mut Session, failures: usize) -> bool {
     true
 }
 
+/// Unchanged-document final answers rejected by a review before closing.
+const UNREPAIRED_FINAL_LIMIT: usize = 2;
+
+/// Count a final answer rejected because the reviewed document was not
+/// edited. An edit changes the document hash and restarts the count.
+fn note_unrepaired_final(s: &mut Session) -> usize {
+    let current = tools::output_path(&s.project)
+        .ok()
+        .and_then(|path| std::fs::read(path).ok())
+        .map(|bytes| tools::hash(&bytes));
+    let recovery = &mut s.progress_recovery;
+    if current.is_some() && recovery.unrepaired_final_hash == current {
+        recovery.unrepaired_finals = recovery.unrepaired_finals.saturating_add(1);
+    } else {
+        recovery.unrepaired_final_hash = current;
+        recovery.unrepaired_finals = 1;
+    }
+    recovery.unrepaired_finals
+}
+
 const REVIEW_UNAVAILABLE_NOTICE: &str =
     "검토 응답이 반복해서 형식에 맞지 않아 이 결과의 검토를 생략하고, 완료 보고에 미검토로 표시합니다.";
 
@@ -274,6 +294,7 @@ fn finish_cause_text(cause: &str) -> &'static str {
         "closing_round_limit" => "마감 단계의 요청 한도에 도달해 마감했습니다.",
         "budget" => "마감 예산에 도달해 마감했습니다.",
         "stall" => "진행이 오래 멈춰 마감했습니다.",
+        "review_unrepaired" => "검토 지적이 반영되지 않은 채 최종 답변이 반복돼 마감했습니다.",
         _ => "마감했습니다.",
     }
 }
@@ -1881,6 +1902,23 @@ pub async fn run_session_controlled(
                                         "document_review: unchanged document still requires correction: {}",
                                         s.document_review.issues.join("; ")
                                     ));
+                                    // Repeating the final answer without editing the
+                                    // rejected document is not repair. After a second
+                                    // unchanged rejection, close instead of waiting for
+                                    // the stall ladder; the next final is accepted with
+                                    // the findings reported. One review stays available:
+                                    // an edit made while closing is reviewed again, an
+                                    // unchanged document reuses the rejection.
+                                    if s.progress_recovery.closing.is_none()
+                                        && note_unrepaired_final(&mut s) >= UNREPAIRED_FINAL_LIMIT
+                                    {
+                                        s.progress_recovery.closing = Some(crate::session::Closing {
+                                            reason: "review_unrepaired".into(),
+                                            final_attempts: 1,
+                                            ..Default::default()
+                                        });
+                                        emit(&events, AgentEvent::Notice { session: s.id.clone(), text: "검토 지적을 반영하지 않은 채 최종 답변이 반복돼 마감 단계로 전환합니다. 남은 지적은 결과에 명시합니다.".into() }, &cancel, run_deadline(started, &s.config)).await;
+                                    }
                                 } else {
                                     s.document_review.pending = true;
                                     s.status = "running".into();
@@ -1975,6 +2013,31 @@ pub async fn run_session_controlled(
                         break;
                     }
                 }
+            }
+            // Before accepting, spend closing's one review on a document that
+            // changed since its rejection, so a real fix is not reported as an
+            // open finding. An unchanged document keeps the rejection.
+            if s.status == "partial"
+                && accept_gaps
+                && s.document_written
+                && s.config.source_document_review
+                && !s.document_review.issues.is_empty()
+                && !tools::document_review::approved(&s)
+                && !tools::document_review::rejected_on_current_result(&s)
+                && !tools::document_review::unavailable_on_current(&s)
+                && s.progress_recovery
+                    .closing
+                    .as_ref()
+                    .is_some_and(|closing| !closing.document_review_used)
+            {
+                if let Some(closing) = &mut s.progress_recovery.closing {
+                    closing.document_review_used = true;
+                }
+                s.document_review.pending = true;
+                s.status = "running".into();
+                s.last_error = None;
+                emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"Reviewing the corrected document once before closing.".into() }, &cancel, run_deadline(started, &s.config)).await;
+                continue;
             }
             if s.status == "partial" && accept_gaps {
                 // Second closing final: accept the saved document and report

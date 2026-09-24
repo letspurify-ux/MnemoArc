@@ -392,14 +392,14 @@ impl LlmClient for Scripted {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        let state: Value = serde_json::from_str(
-            request["messages"].as_array().unwrap().last().unwrap()["content"]
-                .as_str()
-                .unwrap()
-                .split_once('\n')
-                .unwrap()
-                .1,
-        )?;
+        // Review requests carry a JSON payload instead of the program state.
+        let state: Value = request["messages"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .and_then(|message| message["content"].as_str())
+            .and_then(|content| content.split_once('\n'))
+            .and_then(|(_, json)| serde_json::from_str(json).ok())
+            .unwrap_or(Value::Null);
         self.guidance
             .lock()
             .unwrap()
@@ -926,4 +926,133 @@ fn list_cursor_keeps_its_scope_when_the_glob_is_omitted() {
     .unwrap_err()
     .to_string();
     assert!(error.contains("issued for different arguments"), "{error}");
+}
+
+#[tokio::test]
+async fn repeated_final_answers_on_an_unrepaired_review_close_the_run() {
+    let (_dir, mut s) = verified_fixture();
+    s.config.source_document_review = true;
+    let final_answer = || Completion {
+        text: "Saved out.md".into(),
+        ..Default::default()
+    };
+    let steps = vec![
+        final_answer(),
+        // The document review rejects the result.
+        Completion {
+            text: r#"{"issues":["Flow: state that the loop runs five times"]}"#.into(),
+            ..Default::default()
+        },
+        final_answer(),                                  // rejected, unchanged (1)
+        call("read-1", "file_read", json!({"path":"main.js"})), // forced step
+        final_answer(),                                  // rejected, unchanged (2) -> closing
+        call("read-2", "file_read", json!({"path":"main.js"})), // forced step
+        final_answer(),                                  // accepted with reported gaps
+    ];
+    let (result, guidance, offered) = run_scripted_tools(s, steps).await;
+    assert_eq!(result.status, "complete_with_gaps", "{:?}", result.last_error);
+    assert_eq!(result.progress_recovery.closing.as_ref().unwrap().reason, "review_unrepaired");
+    assert!(
+        result
+            .completion_gaps
+            .iter()
+            .any(|gap| gap.contains("loop runs five times")),
+        "{:?}",
+        result.completion_gaps
+    );
+    // The forced step after a rejected final offers repair tools only.
+    for forced in [3, 5] {
+        let names = &offered[forced];
+        assert!(names.iter().any(|name| name == "document_edit_batch"), "{names:?}");
+        for trivial in ["task_plan", "task_state", "document_inspect", "document_audit", "history"] {
+            assert!(!names.iter().any(|name| name == trivial), "{trivial} offered: {names:?}");
+        }
+    }
+    assert!(guidance[6]["closing"]["active"] == true);
+}
+
+#[test]
+fn a_truncated_checkpoint_id_still_acknowledges_the_checkpoint() {
+    use mnemoarc::context::ContextManager;
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(64_000),
+            context_tokens: 64_000,
+            output_tokens: 4_000,
+            ..Default::default()
+        },
+    );
+    s.add_user("Work".into());
+    for i in 0..6 {
+        s.history.push(
+            vec![json!({"role":"user","content":format!("{i} {}", "context ".repeat(2500))})],
+            true,
+        );
+    }
+    let budget = ContextManager::input_budget(&s.config);
+    assert!(ContextManager::prepare(&mut s, budget).unwrap());
+    let id = s.checkpoint.as_ref().unwrap().id.clone();
+    let ack = |id: &str| json!({"id":id,"progress":"Continue the work","no_save_reason":"Nothing new to save"});
+    // Too short to identify anything.
+    let error = tools::execute(&mut s, "checkpoint_complete", ack(&id[..6]))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("checkpoint_id_mismatch"), "{error}");
+    // The model cut the last characters of the 36-character ID.
+    let result = tools::execute(&mut s, "checkpoint_complete", ack(&id[..30])).unwrap();
+    assert_eq!(result["acknowledged"], true, "{result}");
+}
+
+#[tokio::test]
+async fn a_fix_made_after_closing_on_an_unrepaired_review_is_reviewed_again() {
+    let (dir, mut s) = verified_fixture();
+    s.config.source_document_review = true;
+    let final_answer = || Completion {
+        text: "Saved out.md".into(),
+        ..Default::default()
+    };
+    let path = dir.path().join("out.md");
+    let fixed = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("A for loop runs work five times.", "A for loop runs work exactly five times.");
+    let steps = vec![
+        final_answer(),
+        Completion {
+            text: r#"{"issues":["Flow: say exactly how many times the loop runs"]}"#.into(),
+            ..Default::default()
+        },
+        final_answer(), // rejected, unchanged (1)
+        call("read-1", "file_read", json!({"path":"main.js"})),
+        final_answer(), // rejected, unchanged (2) -> closing
+        // The forced step finally edits the document.
+        call(
+            "fix",
+            "document_edit",
+            json!({"action":"write","expected_hash":tools::hash(&std::fs::read(&path).unwrap()),"text":fixed}),
+        ),
+        final_answer(), // changed document: reviewed once more
+        Completion {
+            text: r#"{"issues":[]}"#.into(),
+            ..Default::default()
+        },
+        final_answer(),
+    ];
+    let (result, _, _) = run_scripted_tools(s, steps).await;
+    assert_eq!(result.document_review.attempts, 2, "{:?}", result.last_error);
+    assert!(document_review::approved(&result));
+    assert!(
+        !result
+            .completion_gaps
+            .iter()
+            .any(|gap| gap.starts_with("문서 검토")),
+        "{:?}",
+        result.completion_gaps
+    );
 }

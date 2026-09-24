@@ -249,6 +249,10 @@ pub struct ProgressRecovery {
     /// Set once document work must converge: exploration stops and the run
     /// finishes within a fixed number of requests, reporting unresolved items.
     pub closing: Option<Closing>,
+    /// Final answers rejected by an unrepaired document review while the
+    /// reviewed document stayed unchanged (keyed by that document's hash).
+    pub unrepaired_finals: usize,
+    pub unrepaired_final_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
