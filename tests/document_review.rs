@@ -201,7 +201,7 @@ impl LlmClient for Reviewer {
 }
 
 #[tokio::test]
-async fn unchanged_review_is_reused_until_the_run_budget() {
+async fn unchanged_review_is_reused_until_closing_reports_its_findings() {
     for (limit, issues) in [(1, false), (1, true), (2, true), (10, true)] {
         let (_dir, mut s) = fixture();
         s.config.review_limit = limit;
@@ -227,22 +227,23 @@ async fn unchanged_review_is_reused_until_the_run_budget() {
         )
         .await;
         let deltas = drain.await.unwrap();
+        // An unchanged rejected document is never re-reviewed. Closing mode
+        // finishes it and reports the unresolved findings instead of looping.
         assert_eq!(
             result.status,
-            if issues { "blocked" } else { "complete" },
+            if issues { "complete_with_gaps" } else { "complete" },
             "{:?}",
             result.last_error
         );
         assert_eq!(result.document_review.attempts, 1);
         if issues {
+            assert!(document_review::rejected_on_current_result(&result));
             assert!(
                 result
-                    .last_error
-                    .as_deref()
-                    .unwrap()
-                    .starts_with("run_budget_exhausted")
+                    .completion_gaps
+                    .iter()
+                    .any(|gap| gap.starts_with("문서 검토 지적"))
             );
-            assert!(document_review::rejected_on_current_result(&result));
         }
         let finals = result
             .history
@@ -251,15 +252,14 @@ async fn unchanged_review_is_reused_until_the_run_budget() {
             .flat_map(|b| &b.messages)
             .filter(|m| m["role"] == "assistant" && m.get("tool_calls").is_none())
             .count();
-        assert_eq!(finals, if issues { 0 } else { 1 });
-        assert_eq!(
-            deltas,
-            if issues {
-                vec![]
-            } else {
-                vec!["Done".to_string()]
-            }
-        );
+        assert_eq!(finals, 1);
+        assert_eq!(deltas.len(), 1);
+        // The final is the model's answer, or the runtime's report when the
+        // budget ran out during closing; either way unresolved items are listed.
+        assert_eq!(deltas[0].contains("확인하지 못한 항목"), issues, "{deltas:?}");
+        if !issues {
+            assert_eq!(deltas[0], "Done");
+        }
     }
 }
 
@@ -283,13 +283,14 @@ async fn required_document_before_investigations_is_not_forced_to_chat_answer() 
     )
     .await;
     drain.await.unwrap();
+    // No document was saved in this task, so closing mode cannot finish it.
     assert_eq!(result.status, "blocked");
     assert!(
         result
             .last_error
             .as_deref()
             .unwrap()
-            .starts_with("run_budget_exhausted")
+            .starts_with("closing_round_limit")
     );
     assert!(ContextManager::state(&result).unwrap()["document_review"].is_object());
 }
@@ -666,10 +667,15 @@ async fn failed_review_cannot_open_an_unbounded_repair_loop() {
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result = run_session(s, Arc::new(StallingRepair), CancellationToken::new(), tx).await;
     drain.await.unwrap();
-    assert_eq!(result.status, "blocked", "{:?}", result.last_error);
+    assert_eq!(result.status, "complete_with_gaps", "{:?}", result.last_error);
     assert_eq!(result.document_review.attempts, 1);
     assert_eq!(result.document_review.stalled_attempts, 0);
-    assert!(result.last_error.unwrap().contains("run_budget_exhausted"));
+    assert!(
+        result
+            .completion_gaps
+            .iter()
+            .any(|gap| gap.starts_with("문서 검토 지적"))
+    );
     assert!(result.task_rounds < 40 + result.checkpoints_completed);
 }
 
@@ -770,7 +776,7 @@ impl LlmClient for MalformedReview {
                 assert!(payload.contains("document_review_invalid"));
             }
             return Ok(Completion {
-                text: if self.always_bad || *calls <= 12 {
+                text: if self.always_bad || *calls <= 2 {
                     "invalid JSON".into()
                 } else {
                     r#"{"issues":[]}"#.into()
@@ -802,19 +808,20 @@ async fn malformed_review_has_bounded_recovery_without_consuming_valid_review_bu
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let result = run_session(s, model.clone(), CancellationToken::new(), tx).await;
         drain.await.unwrap();
+        // Three consecutive invalid verdicts abandon the review for this
+        // unchanged document; two are recovered by the retry.
+        assert_eq!(*model.calls.lock().unwrap(), 3);
         if always_bad {
-            assert!(*model.calls.lock().unwrap() > 12);
-            assert_eq!(result.status, "blocked");
+            assert_eq!(result.status, "complete_with_gaps");
             assert!(
                 result
-                    .last_error
-                    .unwrap()
-                    .starts_with("run_budget_exhausted")
+                    .completion_gaps
+                    .iter()
+                    .any(|gap| gap.contains("검토 응답 오류"))
             );
             assert_eq!(result.document_review.attempts, 0);
-            assert!(result.document_review.pending);
+            assert!(!result.document_review.pending);
         } else {
-            assert_eq!(*model.calls.lock().unwrap(), 13);
             assert_eq!(result.status, "complete", "{:?}", result.last_error);
             assert_eq!(result.document_review.attempts, 1);
         }
@@ -943,12 +950,11 @@ async fn repair_interval_rechecks_and_a_changed_document_can_resume() {
     s.config.document_repair_limit = 2;
     s.config.run_tokens = 200_000;
     let mut s = run_repair_test(s, Arc::new(StallingRepair)).await;
-    assert_eq!(s.status, "blocked");
+    assert_eq!(s.status, "complete_with_gaps");
     assert!(
-        s.last_error
-            .as_deref()
-            .unwrap()
-            .starts_with("run_budget_exhausted")
+        s.completion_gaps
+            .iter()
+            .any(|gap| gap.starts_with("문서 검토 지적"))
     );
     assert_eq!(s.document_review.attempts, 1);
     assert_eq!(s.document_review.stalled_attempts, 0);

@@ -416,7 +416,12 @@ pub(super) fn execute(
                 issues.push(json!({"kind":"no_investigation_coverage"}));
             }
             for item in &s.investigations {
-                if item.status != "verified" {
+                // A closing-mode gap is reported as unconfirmed by the final
+                // result; it is settled, and it may never have been written.
+                if item.status == "gap" && item.section.trim().is_empty() {
+                    continue;
+                }
+                if !item.is_settled() {
                     issues.push(json!({"kind":"pending_verification","id":item.id,"section":item.section,"status":item.status,"next":"Read the linked document section and sources, then verify_batch with evidence and a comparison note."}));
                 }
                 if section_text(&doc, &item.section).is_err() {

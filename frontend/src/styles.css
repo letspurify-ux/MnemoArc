@@ -384,7 +384,8 @@ button:hover {
   border-color: #c5dbc9;
   background: #f0f7ef;
 }
-.status-pill.blocked {
+.status-pill.blocked,
+.status-pill.complete_with_gaps {
   color: #a56c38;
 }
 .icon-button {
@@ -1279,6 +1280,10 @@ button:hover {
 .plan-recovery {
   font-size: 11px;
   color: #617440;
+}
+.completion-gaps li {
+  font-size: 11px;
+  color: #8a5a2e;
 }
 .tool-toggle {
   display: flex;

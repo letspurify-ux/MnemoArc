@@ -62,6 +62,8 @@ pub struct Config {
     pub completion_review_enabled: bool,
     pub writing_reserve_ratio: f64,
     pub verification_reserve_ratio: f64,
+    /// Remaining-budget fraction at which document work enters closing mode.
+    pub closing_reserve_ratio: f64,
     pub repeated_read_limit: usize,
     pub stall_round_limit: usize,
     pub database: crate::database::DatabaseConfig,
@@ -121,6 +123,7 @@ impl Default for Config {
             run_tokens: 500000,
             writing_reserve_ratio: 0.5,
             verification_reserve_ratio: 0.25,
+            closing_reserve_ratio: 0.1,
             repeated_read_limit: 2,
             stall_round_limit: 8,
             database: crate::database::DatabaseConfig::default(),
@@ -217,11 +220,14 @@ impl Config {
             || self.verification_reserve_ratio == 0.0
             || !(self.verification_reserve_ratio..1.0).contains(&self.writing_reserve_ratio)
             || self.writing_reserve_ratio == self.verification_reserve_ratio
+            || !self.closing_reserve_ratio.is_finite()
+            || self.closing_reserve_ratio <= 0.0
+            || self.closing_reserve_ratio >= self.verification_reserve_ratio
             || self.repeated_read_limit == 0
             || self.stall_round_limit == 0
         {
             bail!(
-                "Require 0 < verification reserve < writing reserve < 1 and positive repetition limits"
+                "Require 0 < closing reserve < verification reserve < writing reserve < 1 and positive repetition limits"
             );
         }
         for seconds in [

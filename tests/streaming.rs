@@ -527,3 +527,64 @@ async fn cancelling_openai_client_unblocks_a_full_delta_channel() {
             .contains("cancelled")
     );
 }
+
+#[tokio::test]
+async fn rejected_json_schema_degrades_to_json_mode_and_is_remembered() {
+    use std::sync::{Arc, Mutex};
+    let formats = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = formats.clone();
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let seen = seen.clone();
+            async move {
+                let format = body["response_format"]["type"]
+                    .as_str()
+                    .unwrap_or("none")
+                    .to_owned();
+                seen.lock().unwrap().push(format.clone());
+                if format == "json_schema" {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "response_format json_schema is not supported",
+                    )
+                        .into_response();
+                }
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    format!(
+                        "{}data: [DONE]\n\n",
+                        event(json!({"choices":[{"delta":{"content":"{\"issues\":[]}"},"finish_reason":"stop"}]}))
+                    ),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let c = Config {
+        base_url: format!("http://{}", listener.local_addr().unwrap()),
+        model: "schema-fallback-test-model".into(),
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let first = OpenAiClient
+        .complete(request.clone(), &c, CancellationToken::new(), tx)
+        .await
+        .unwrap();
+    assert_eq!(first.text, "{\"issues\":[]}");
+    assert_eq!(first.attempts, 2);
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let second = OpenAiClient
+        .complete(request, &c, CancellationToken::new(), tx)
+        .await
+        .unwrap();
+    assert_eq!(second.attempts, 1);
+    assert_eq!(
+        *formats.lock().unwrap(),
+        ["json_schema", "json_object", "json_object"]
+    );
+    server.abort();
+}

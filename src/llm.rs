@@ -130,6 +130,24 @@ fn response_format_rejected(error: &str) -> bool {
                 || error.contains("unsupported parameter")))
 }
 
+/// Endpoints (base URL and model) that rejected strict JSON Schema output.
+/// Later requests use plain JSON mode directly instead of paying a failed
+/// attempt each time.
+static JSON_SCHEMA_REJECTED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn schema_endpoint(c: &Config) -> String {
+    format!("{}\0{}", c.base_url, c.model)
+}
+
+fn downgrade_json_schema(request: &mut Value) -> bool {
+    if request["response_format"]["type"] != "json_schema" {
+        return false;
+    }
+    request["response_format"] = json!({"type":"json_object"});
+    true
+}
+
 #[derive(Default)]
 pub struct SseDecoder {
     buffer: Vec<u8>,
@@ -423,6 +441,12 @@ impl LlmClient for OpenAiClient {
         if let Some(fields) = request.as_object_mut() {
             fields.remove(STREAM_DELTAS_MARKER);
         }
+        if JSON_SCHEMA_REJECTED
+            .lock()
+            .is_ok_and(|rejected| rejected.contains(&schema_endpoint(c)))
+        {
+            downgrade_json_schema(&mut request);
+        }
         let emitted_text = Arc::new(AtomicBool::new(false));
         let mut attempt = 0usize;
         // The optional response-format fallback is a compatibility attempt,
@@ -465,6 +489,18 @@ impl LlmClient for OpenAiClient {
                     // JSON mode. Retry once without the optional structured
                     // output hint when the server explicitly rejects it;
                     // finish() still validates the returned object.
+                    // Strict schemas degrade to plain JSON mode first, then to
+                    // no response format; each step is one compatibility attempt.
+                    if request.get("response_format").is_some()
+                        && response_format_rejected(&text)
+                        && downgrade_json_schema(&mut request)
+                    {
+                        if let Ok(mut rejected) = JSON_SCHEMA_REJECTED.lock() {
+                            rejected.insert(schema_endpoint(c));
+                        }
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
                     if !response_format_fallback
                         && request.get("response_format").is_some()
                         && response_format_rejected(&text)

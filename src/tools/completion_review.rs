@@ -23,6 +23,11 @@ pub struct ReviewState {
     pub input_tokens: usize,
     pub output_tokens: usize,
     pub evidence_omitted: bool,
+    /// The current result could not receive a valid verdict; it finishes
+    /// without acceptance and is reported as unchecked.
+    pub unavailable: bool,
+    #[serde(skip)]
+    unavailable_fingerprint: String,
     #[serde(skip)]
     draft: String,
     #[serde(skip)]
@@ -331,6 +336,30 @@ pub enum Gate {
     Review,
     Accepted,
     Repair,
+    /// Review responses repeatedly failed validation for this exact result.
+    Unavailable,
+}
+
+/// Stop retrying a review whose responses keep failing validation. A changed
+/// result or answer produces a new fingerprint and becomes reviewable again.
+pub fn mark_unavailable(s: &mut Session) {
+    let state = &mut s.completion_review;
+    state.unavailable_fingerprint = state.fingerprint.clone();
+    state.unavailable = true;
+    state.pending = false;
+    state.approved = false;
+    state.offset = 0;
+    state.checks.clear();
+}
+
+pub fn response_format() -> Value {
+    json!({"type":"json_schema","json_schema":{"name":"completion_review","strict":true,"schema":{
+        "type":"object","properties":{"checks":{"type":"array","items":{"type":"object","properties":{
+            "id":{"type":"string"},"status":{"type":"string","enum":["met","unmet","unverified"]},
+            "reason":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}},
+            "next_action":{"type":"string"}},
+            "required":["id","status","reason","evidence","next_action"],"additionalProperties":false}}},
+        "required":["checks"],"additionalProperties":false}}})
 }
 
 fn fingerprint(payload: &Value) -> String {
@@ -421,6 +450,13 @@ pub fn begin_final(s: &mut Session, draft: &str, continues_previous: bool) -> Re
     state.required = true;
     state.draft = draft.into();
     state.evidence_omitted = payload["evidence_omitted"] == true;
+    if fingerprint == state.unavailable_fingerprint {
+        state.unavailable = true;
+        state.pending = false;
+        state.approved = false;
+        return Ok(Gate::Unavailable);
+    }
+    state.unavailable = false;
     if fingerprint == state.reviewed_fingerprint {
         state.approved = !state.checks.is_empty() && state.checks.iter().all(|c| c.status == "met");
         return Ok(if state.approved {
@@ -473,7 +509,7 @@ pub fn request(s: &mut Session) -> Result<Value> {
     );
     state.attempts = state.attempts.saturating_add(1);
     Ok(
-        json!({"model":s.config.model,"response_format":{"type":"json_object"},"messages":[
+        json!({"model":s.config.model,"response_format":response_format(),"messages":[
             {"role":"system","content":INSTRUCTION}, {"role":"user","content":payload.to_string()}
         ]}),
     )

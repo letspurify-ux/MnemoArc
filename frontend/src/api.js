@@ -22,6 +22,7 @@ export const statusLabel = {
   running: "작업 중",
   complete: "완료",
   completed: "완료",
+  complete_with_gaps: "완료 · 미확인 있음",
   partial: "추가 확인 필요",
   blocked: "확인 필요",
   cancelled: "중지됨",

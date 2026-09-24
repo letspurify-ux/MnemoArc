@@ -358,11 +358,11 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "investigation",
-                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. Both verify and verify_batch require existing written items. If not written, write the section and upsert with status=written and section first; source IDs alone do not mark an item written. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified; summary groups failures by code and retry_ids identifies only failed items. Already verified items in verify_batch reuse their existing evidence after section/source/memory freshness checks; new supplied evidence is ignored for those items. Use single verify to explicitly replace evidence. After edits, verify only verification_required_ids returned by document_edit. Coverage failures return all missing_ranges together. Verification coverage counts only complete file lines; partial file_read boundaries, truncated search lines and code outlines are navigation context and require a full file_read. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. status=written requires a non-empty section (supplied now or preserved from the existing item). For written items, upsert checks the current document and normalizes section to its section_path from document_inspect, including ancestors for nested headings. A unique title without # is accepted, including numbering. Planned sections may be registered before writing with status=in_progress",
+                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. Both verify and verify_batch require existing written items. If not written, write the section and upsert with status=written and section first; source IDs alone do not mark an item written. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified; summary groups failures by code and retry_ids identifies only failed items. Already verified items in verify_batch reuse their existing evidence after section/source/memory freshness checks; new supplied evidence is ignored for those items. Use single verify to explicitly replace evidence. After edits, verify only verification_required_ids returned by document_edit. Coverage failures return all missing_ranges together. Verification coverage counts only complete file lines; partial file_read boundaries, truncated search lines and code outlines are navigation context and require a full file_read. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. status=written requires a non-empty section (supplied now or preserved from the existing item). For written items, upsert checks the current document and normalizes section to its section_path from document_inspect, including ancestors for nested headings. A unique title without # is accepted, including numbering. Planned sections may be registered before writing with status=in_progress.",
                 optional: true,
                 read_only: false,
                 parameters: schema(
-                    json!({"action":action(&["list","upsert","verify","verify_batch","final_check"]),"id":{"type":"string","minLength":1},"title":{"type":"string","minLength":1,"description":"Non-empty title required for a NEW item. Omit when updating an existing id to preserve its title."},"status":action(&["uninvestigated","in_progress","written"]),"memory_ids":strings(),"source_ids":strings(),"section":string(),"verification_note":string(),"items":{"type":"object","description":"ONLY for action=verify_batch. Object keyed by existing investigation IDs; not an array and not used by upsert.","minProperties":1,"maxProperties":20,"additionalProperties":{"type":"object","properties":{"source_ids":strings(),"verification_note":string()},"required":["source_ids","verification_note"],"additionalProperties":false}},"offset":number(),"limit":number()}),
+                    json!({"action":action(&["list","upsert","verify","verify_batch","final_check","mark_gap"]),"reason":{"type":"string","minLength":10,"maxLength":400,"description":"ONLY for action=mark_gap: why this item cannot be verified with the gathered evidence."},"id":{"type":"string","minLength":1},"title":{"type":"string","minLength":1,"description":"Non-empty title required for a NEW item. Omit when updating an existing id to preserve its title."},"status":action(&["uninvestigated","in_progress","written"]),"memory_ids":strings(),"source_ids":strings(),"section":string(),"verification_note":string(),"items":{"type":"object","description":"ONLY for action=verify_batch. Object keyed by existing investigation IDs; not an array and not used by upsert.","minProperties":1,"maxProperties":20,"additionalProperties":{"type":"object","properties":{"source_ids":strings(),"verification_note":string()},"required":["source_ids","verification_note"],"additionalProperties":false}},"offset":number(),"limit":number()}),
                     &["action"],
                 ),
             },
@@ -372,7 +372,14 @@ impl ToolRegistry {
             .find(|spec| spec.name == "investigation")
             .unwrap();
         let fields = spec.parameters["properties"].as_object().unwrap();
-        let branches: Vec<Value> = ["list", "upsert", "verify", "verify_batch", "final_check"]
+        let branches: Vec<Value> = [
+            "list",
+            "upsert",
+            "verify",
+            "verify_batch",
+            "final_check",
+            "mark_gap",
+        ]
             .into_iter()
             .map(|name| {
                 let (allowed, required, _) = investigation_contract(name, true).unwrap();
@@ -400,6 +407,24 @@ impl ToolRegistry {
             }).collect();
         spec.parameters["oneOf"] = json!(branches);
         specs
+    }
+    /// Closing mode finishes from gathered evidence. Broad discovery and
+    /// memory maintenance are withheld; targeted reads of cited ranges remain.
+    pub fn closing_blocked(name: &str) -> bool {
+        [
+            "file_list",
+            "source_search",
+            "symbol_search",
+            "code_outline",
+            "memory_write",
+            "memory_read",
+            "memory_find",
+            "memory_manage",
+            "history",
+            "tool_catalog",
+            "tool_select",
+        ]
+        .contains(&name)
     }
     fn checkpoint_allowed(name: &str) -> bool {
         [
@@ -459,6 +484,8 @@ impl ToolRegistry {
         );
         normalized
     }
+    /// Offered only in closing mode, where it is accepted.
+    const MARK_GAP_GUIDANCE: &str = " mark_gap requires id and a specific reason; it settles an item whose claim cannot be verified with gathered evidence, and the final result lists it as unconfirmed. Qualify the related claim in its section; verifying the item later replaces the gap.";
     pub fn definitions(s: &Session) -> Vec<Value> {
         let recovery_focus =
             s.run_guidance["progress_recovery"]["active"] == true && s.is_document_work();
@@ -468,6 +495,21 @@ impl ToolRegistry {
             .filter(|t| !t.optional || s.active_tools.contains(t.name))
             .filter(|t| s.config.memory_reuse || !["memory_read", "memory_find"].contains(&t.name))
             .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
+            .filter(|t| {
+                s.checkpoint.is_some()
+                    || s.progress_recovery.closing.is_none()
+                    || !Self::closing_blocked(t.name)
+            })
+            // Second stage of the document progress ladder: after twice the
+            // stall limit without a better result, stop broad discovery even
+            // in the verify phase. Targeted file_read/symbol_read remain.
+            .filter(|t| {
+                s.checkpoint.is_some()
+                    || !s.is_document_work()
+                    || s.progress_recovery.rounds_since_best
+                        < s.config.stall_round_limit.saturating_mul(2)
+                    || !matches!(t.name, "file_list" | "source_search" | "symbol_search" | "code_outline")
+            })
             // Draft recovery discourages rediscovery. Verification must still
             // be able to locate a missing helper/path and finish source coverage.
             .filter(|t| !recovery_focus || s.checkpoint.is_some() || !matches!(t.name,
@@ -485,6 +527,24 @@ impl ToolRegistry {
                 }
                 let fields = t.parameters["properties"].clone();
                 // Keep offset for old clients, but offer the model only opaque continuation.
+                if t.name == "investigation" {
+                    if s.progress_recovery.closing.is_some() {
+                        static CLOSING: std::sync::OnceLock<&'static str> =
+                            std::sync::OnceLock::new();
+                        let base = t.description;
+                        t.description = CLOSING.get_or_init(|| {
+                            format!("{base}{}", Self::MARK_GAP_GUIDANCE).leak()
+                        });
+                    } else {
+                        t.parameters["properties"].as_object_mut().unwrap().remove("reason");
+                        if let Some(actions) = t.parameters["properties"]["action"]["enum"].as_array_mut() {
+                            actions.retain(|action| action != "mark_gap");
+                        }
+                        if let Some(branches) = t.parameters["oneOf"].as_array_mut() {
+                            branches.retain(|branch| branch["properties"]["action"]["const"] != "mark_gap");
+                        }
+                    }
+                }
                 if t.name == "file_read" {
                     t.parameters["properties"].as_object_mut().unwrap().remove("offset");
                     t.parameters["oneOf"] = json!([
@@ -588,6 +648,14 @@ impl ToolRegistry {
             .ok_or_else(|| anyhow::anyhow!("unsupported_tool: {name}"))?;
         if spec.optional && !s.active_tools.contains(name) {
             bail!("tool_not_active: {name}");
+        }
+        if s.checkpoint.is_none()
+            && s.progress_recovery.closing.is_some()
+            && Self::closing_blocked(name)
+        {
+            bail!(
+                "closing_mode: {name} is withheld while the document is finalized; use gathered evidence, file_read for one specific cited range, or investigation mark_gap"
+            );
         }
         if !s.config.memory_reuse && ["memory_find", "memory_read"].contains(&name) {
             bail!("unsupported: memory reuse disabled for evaluation");
@@ -1163,7 +1231,7 @@ fn persist_document_edit(
     revalidate(s)?;
     let mut written_items = Vec::new();
     for item in &mut s.investigations {
-        if item.status != "verified"
+        if !item.is_settled()
             && !item.section.trim().is_empty()
             && section_text(&result, &item.section)
                 .is_ok_and(|text| text.lines().skip(1).any(|line| !line.trim().is_empty()))
@@ -1178,7 +1246,7 @@ fn persist_document_edit(
     let citation_check = documentation::citation_check(s, path, &result)?;
     Ok(json!({
         "written_items":written_items,
-        "verification_required_ids":s.investigations.iter().filter(|i| i.status != "verified").map(|i| &i.id).collect::<Vec<_>>(),
+        "verification_required_ids":s.investigations.iter().filter(|i| !i.is_settled()).map(|i| &i.id).collect::<Vec<_>>(),
         "preserved_verified_ids":s.investigations.iter().filter(|i| i.status == "verified").map(|i| &i.id).collect::<Vec<_>>(),
         "verification_guidance":"Verify only verification_required_ids. Unchanged sections retain verification; do not resubmit all items after a local edit. If none remain, proceed to final completion and document review.",
         "path":path,
@@ -1276,6 +1344,11 @@ fn investigation_contract(action: &str, updating: bool) -> Option<InvestigationC
             r#"{"action":"list","offset":0,"limit":20}"#,
         ),
         "final_check" => (&["action"], &[], r#"{"action":"final_check"}"#),
+        "mark_gap" => (
+            &["action", "id", "reason"],
+            &["id", "reason"],
+            r#"{"action":"mark_gap","id":"existing-id","reason":"The retry bound is not visible in the delivered sources"}"#,
+        ),
         _ => return None,
     })
 }
@@ -2555,7 +2628,10 @@ pub fn execute_cancellable(
                     .iter()
                     .find(|i| i.id == id)
                     .ok_or_else(|| anyhow::anyhow!("item_not_found"))?;
-                if item.status != "written" && item.status != "verified" {
+                if !(item.status == "written"
+                    || item.status == "verified"
+                    || (item.status == "gap" && !item.section.trim().is_empty()))
+                {
                     bail!(
                         "item_must_be_written_before_verification: id={}, status={}, section={:?}. Inspect the document section first; if its content is written, use investigation upsert with this id, the exact section heading from document_inspect, and status=written together, then verify. Otherwise write the section before verifying.",
                         item.id,
@@ -2613,6 +2689,31 @@ pub fn execute_cancellable(
                 item.status = "verified".into();
                 Ok(json!({"verified":id}))
             }
+            "mark_gap" => {
+                if s.progress_recovery.closing.is_none() {
+                    bail!(
+                        "gap_requires_closing: mark_gap is available only in closing mode; verify the item with delivered source evidence instead"
+                    );
+                }
+                let id = text(&args, "id")?;
+                let reason = text(&args, "reason")?.trim().to_owned();
+                if !(10..=400).contains(&reason.chars().count()) {
+                    bail!("invalid_argument_value: reason requires 10..400 characters");
+                }
+                let item = s
+                    .investigations
+                    .iter_mut()
+                    .find(|i| i.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("item_not_found"))?;
+                if item.status == "verified" {
+                    bail!("item_already_verified: {id} needs no gap");
+                }
+                item.status = "gap".into();
+                item.note = reason;
+                Ok(
+                    json!({"gap":id,"guidance":"Qualify the related claim in its section as unconfirmed. The final result lists this gap; do not describe it as verified."}),
+                )
+            }
             "final_check" => {
                 if !s.task.require_investigation {
                     s.task.require_investigation = true;
@@ -2621,10 +2722,10 @@ pub fn execute_cancellable(
                 activate_workflow_tools(s);
                 revalidate(s)?;
                 if s.investigations.is_empty()
-                    || s.investigations.iter().any(|i| i.status != "verified")
+                    || s.investigations.iter().any(|i| !i.is_settled())
                 {
                     return Ok(
-                        json!({"complete":false,"incomplete":s.investigations.iter().filter(|i|i.status != "verified").map(|i|json!({"id":i.id,"title":i.title,"status":i.status,"section":i.section})).collect::<Vec<_>>(),"review":s.reviews,"guidance":"Verify pending items first; incomplete preflight does not consume a document review."}),
+                        json!({"complete":false,"incomplete":s.investigations.iter().filter(|i|!i.is_settled()).map(|i|json!({"id":i.id,"title":i.title,"status":i.status,"section":i.section})).collect::<Vec<_>>(),"review":s.reviews,"guidance":"Verify pending items first; incomplete preflight does not consume a document review."}),
                     );
                 }
                 let audit = documentation::execute(s, "document_audit", &json!({}), cancel)?;
@@ -2640,7 +2741,7 @@ pub fn execute_cancellable(
                 let incomplete: Vec<_> = s
                     .investigations
                     .iter()
-                    .filter(|i| i.status != "verified")
+                    .filter(|i| !i.is_settled())
                     .map(|i| json!({"id":i.id,"title":i.title,"status":i.status}))
                     .collect();
                 Ok(

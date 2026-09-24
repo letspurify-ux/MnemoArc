@@ -874,13 +874,15 @@ async fn premature_final_is_retried_but_never_claimed_complete_without_coverage(
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result = run_session(session, client.clone(), CancellationToken::new(), tx).await;
     drain.await.unwrap();
+    // Without a saved, verified document there is nothing to finish with
+    // reported gaps. Closing mode stops the repetition before the budget.
     assert_eq!(result.status, "blocked");
     assert!(
         result
             .last_error
             .as_deref()
             .unwrap()
-            .starts_with("run_budget_exhausted")
+            .starts_with("closing_round_limit")
     );
     assert!(*client.calls.lock().unwrap() > 9);
     assert_eq!(result.run_guidance["phase"], "verify");
@@ -1377,13 +1379,15 @@ async fn simple_edit_cannot_complete_if_saved_file_changes_or_disappears() {
         )
         .await;
         drain.await.unwrap();
+        // A missing or externally changed file is not the agent's result, so
+        // closing mode cannot finish it with reported gaps.
         assert_eq!(result.status, "blocked");
         assert!(
             result
                 .last_error
                 .as_deref()
                 .unwrap()
-                .starts_with("run_budget_exhausted")
+                .starts_with("closing_round_limit")
         );
         assert!(
             result.run_guidance["completion_error"]

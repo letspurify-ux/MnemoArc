@@ -182,8 +182,10 @@ pub fn describe(message: &str) -> Value {
         (Class::StaleState, "refresh_matching_state")
     } else if code.contains("capacity") || code.contains("limit") || code.contains("budget") {
         (Class::Capacity, "reduce_request_or_cleanup")
-    } else if matches!(code, "checkpoint_pending" | "tool_not_active")
-        || code.starts_with("unsupported")
+    } else if matches!(
+        code,
+        "checkpoint_pending" | "tool_not_active" | "closing_mode" | "gap_requires_closing"
+    ) || code.starts_with("unsupported")
     {
         (Class::Unavailable, "use_available_tools")
     } else if code.contains("timeout") {
@@ -194,6 +196,7 @@ pub fn describe(message: &str) -> Value {
         || code == "unknown_optional_tool_or_basic_tool"
         || code == "ambiguous_file_read_range"
         || code == "conflicting_arguments"
+        || code == "item_already_verified"
     {
         (Class::InvalidInput, "correct_arguments")
     } else {
@@ -400,6 +403,8 @@ pub fn correctable_document_error(result: &Value) -> bool {
                     | "unsupported_tool"
                     | "unsupported_language"
                     | "checkpoint_pending"
+                    | "closing_mode"
+                    | "gap_requires_closing"
             )
         ),
         Some("partial_failure") => result["data"]["results"].as_array().is_some_and(|items| {

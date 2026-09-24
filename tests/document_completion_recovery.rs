@@ -270,6 +270,8 @@ impl LlmClient for InvalidCitationFinal {
 #[tokio::test]
 async fn invalid_final_citation_can_be_corrected_before_document_completion() {
     let (_dir, mut s) = fixture();
+    // Twelve rejected finals stay below the closing threshold (3 x 5).
+    s.config.stall_round_limit = 5;
     finish_fixture(&mut s);
     s.answer_reviewed = true;
     let (s, deltas) = run(
@@ -436,7 +438,7 @@ async fn pending_settings_do_not_end_document_run_before_a_later_valid_update() 
 }
 
 #[tokio::test]
-async fn document_recovery_can_finish_after_every_old_no_progress_cutoff() {
+async fn document_recovery_can_finish_after_focus_guidance_before_closing() {
     for delay in [
         Delay::Final,
         Delay::InvalidEdit,
@@ -452,22 +454,81 @@ async fn document_recovery_can_finish_after_every_old_no_progress_cutoff() {
         let client = Arc::new(DocumentClient {
             path: path.clone(),
             delay,
-            delay_rounds: 40,
+            // Past the focus stages (3 and 6 requests), below closing (9).
+            delay_rounds: 8,
             calls: Mutex::new(0),
             input_usage: 1000,
         });
         let (s, deltas) = run(s, client.clone()).await;
-        assert_eq!(s.status, "complete", "{:?}", s.last_error);
+        assert_eq!(s.status, "complete", "{:?}: {:?}", delay_name(delay), s.last_error);
         assert!(s.completion_review.approved);
         assert!(s.task.current_todo().is_none());
+        assert!(s.completion_gaps.is_empty());
         assert_eq!(std::fs::read_to_string(path).unwrap(), RESULT);
-        assert!(*client.calls.lock().unwrap() > 40);
+        assert!(*client.calls.lock().unwrap() > 8);
         assert_eq!(deltas, ["Saved report.md"]);
     }
 }
 
+fn delay_name(delay: Delay) -> &'static str {
+    match delay {
+        Delay::Final => "final",
+        Delay::InvalidEdit => "invalid_edit",
+        Delay::Read => "read",
+        Delay::Rewrite => "rewrite",
+        Delay::Empty => "empty",
+        Delay::Bookkeeping => "bookkeeping",
+        Delay::InactiveTool => "inactive_tool",
+        Delay::UnknownTool => "unknown_tool",
+        Delay::Truncated => "truncated",
+    }
+}
+
 #[tokio::test]
-async fn persistent_document_loop_obeys_budget_and_resume_can_finish() {
+async fn sustained_document_no_progress_finishes_with_reported_gaps() {
+    for delay in [
+        Delay::Final,
+        Delay::InvalidEdit,
+        Delay::Read,
+        Delay::Rewrite,
+        Delay::Empty,
+        Delay::Bookkeeping,
+        Delay::InactiveTool,
+        Delay::Truncated,
+    ] {
+        let (_dir, s) = fixture();
+        let client = Arc::new(DocumentClient {
+            path: s.project.output.clone(),
+            delay,
+            delay_rounds: usize::MAX,
+            calls: Mutex::new(0),
+            input_usage: 1000,
+        });
+        let (s, deltas) = run(s, client.clone()).await;
+        let name = delay_name(delay);
+        assert_eq!(s.status, "complete_with_gaps", "{name}: {:?}", s.last_error);
+        assert!(s.last_error.is_none(), "{name}");
+        // Closing starts after 3 x stall_round_limit requests without a better
+        // result and finishes within its own request limit.
+        let calls = *client.calls.lock().unwrap();
+        assert!((9..=9 + 12 + 2).contains(&calls), "{name}: {calls} requests");
+        // The draft is reported as unfinished: either its to-do is still open
+        // or, after bookkeeping-only completion, acceptance checks are unmet.
+        assert!(
+            s.completion_gaps
+                .iter()
+                .any(|gap| gap.starts_with("미완료 할 일") || gap.starts_with("완료 조건")),
+            "{name}: {:?}",
+            s.completion_gaps
+        );
+        assert_eq!(deltas.len(), 1, "{name}");
+        assert!(deltas[0].contains("확인하지 못한 항목"), "{name}");
+        assert!(!s.completion_review.approved, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn persistent_document_loop_closes_with_gaps_and_resume_can_finish() {
     let (_dir, mut s) = fixture();
     s.config.run_tokens = 120_000;
     let path = s.project.output.clone();
@@ -479,15 +540,13 @@ async fn persistent_document_loop_obeys_budget_and_resume_can_finish() {
         input_usage: 5000,
     });
     let (s, deltas) = run(s, client.clone()).await;
-    assert_eq!(s.status, "blocked");
-    assert!(
-        s.last_error
-            .as_deref()
-            .unwrap()
-            .starts_with("run_budget_exhausted")
-    );
-    assert!(*client.calls.lock().unwrap() > 12);
-    assert!(deltas.is_empty());
+    // Repeated final claims no longer run until the budget: closing mode
+    // accepts the saved draft and lists the unfinished work.
+    assert_eq!(s.status, "complete_with_gaps", "{:?}", s.last_error);
+    assert!(*client.calls.lock().unwrap() > 9);
+    assert!(*client.calls.lock().unwrap() < 24);
+    assert_eq!(deltas.len(), 1);
+    assert!(deltas[0].contains("미완료 할 일"));
     assert!(s.task.current_todo().is_some());
     assert!(!s.completion_review.approved);
     let (s, _) = run(
@@ -508,6 +567,9 @@ async fn persistent_document_loop_obeys_budget_and_resume_can_finish() {
 #[tokio::test]
 async fn rejected_acceptance_does_not_stop_a_late_document_repair() {
     let (_dir, mut s) = fixture();
+    // Forty unproductive reads stay below the closing threshold (3 x 14)
+    // while crossing the older completion-repair focus limits.
+    s.config.stall_round_limit = 14;
     let path = s.project.output.clone();
     tools::completion_review::begin(&mut s, "Saved report.md").unwrap();
     let request = tools::completion_review::request(&mut s).unwrap();
@@ -542,6 +604,7 @@ struct LateAcceptance {
     client: DocumentClient,
     reviews: Mutex<usize>,
     too_many_tools: bool,
+    invalid_reviews: usize,
 }
 
 #[async_trait]
@@ -567,7 +630,7 @@ impl LlmClient for LateAcceptance {
                         .starts_with("completion_review_invalid:")
                 );
             }
-            if *reviews <= 12 {
+            if *reviews <= self.invalid_reviews {
                 return Ok(Completion {
                     text: "invalid JSON".into(),
                     calls: if self.too_many_tools {
@@ -596,7 +659,7 @@ impl LlmClient for LateAcceptance {
 }
 
 #[tokio::test]
-async fn malformed_document_acceptance_can_recover_after_eight_responses() {
+async fn malformed_document_acceptance_recovers_below_the_unavailable_limit() {
     for too_many_tools in [false, true] {
         let (_dir, s) = fixture();
         let client = Arc::new(LateAcceptance {
@@ -609,12 +672,49 @@ async fn malformed_document_acceptance_can_recover_after_eight_responses() {
             },
             reviews: Mutex::new(0),
             too_many_tools,
+            invalid_reviews: 2,
         });
         let (s, deltas) = run(s, client.clone()).await;
         assert_eq!(s.status, "complete", "{:?}", s.last_error);
-        assert_eq!(*client.reviews.lock().unwrap(), 13);
+        assert_eq!(*client.reviews.lock().unwrap(), 3);
         assert!(s.completion_review.approved);
         assert_eq!(deltas, ["Saved report.md"]);
+        assert!(
+            !s.ledger
+                .keys()
+                .any(|id| id.starts_with("forbidden-review-tool-"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn persistently_invalid_acceptance_is_reported_as_unchecked() {
+    for too_many_tools in [false, true] {
+        let (_dir, s) = fixture();
+        let client = Arc::new(LateAcceptance {
+            client: DocumentClient {
+                path: s.project.output.clone(),
+                delay: Delay::Read,
+                delay_rounds: 0,
+                calls: Mutex::new(0),
+                input_usage: 1000,
+            },
+            reviews: Mutex::new(0),
+            too_many_tools,
+            invalid_reviews: usize::MAX,
+        });
+        let (s, deltas) = run(s, client.clone()).await;
+        assert_eq!(s.status, "complete_with_gaps", "{:?}", s.last_error);
+        assert_eq!(*client.reviews.lock().unwrap(), 3);
+        assert!(s.completion_review.unavailable);
+        assert!(!s.completion_review.approved);
+        assert!(
+            s.completion_gaps
+                .iter()
+                .any(|gap| gap.starts_with("완료 조건 검증") && gap.contains("응답 오류"))
+        );
+        assert_eq!(deltas.len(), 1);
+        assert!(deltas[0].starts_with("Saved report.md"));
         assert!(
             !s.ledger
                 .keys()
@@ -1028,7 +1128,7 @@ async fn unknown_tool_names_can_be_corrected_without_stopping_document_work() {
 }
 
 #[tokio::test]
-async fn malformed_provider_recovery_charges_output_and_stops_at_run_budget() {
+async fn malformed_provider_recovery_charges_output_and_finishes_at_run_budget() {
     let (_dir, mut s) = fixture();
     s.config.run_tokens = 30_000;
     let output_budget = s.config.output_tokens;
@@ -1046,13 +1146,9 @@ async fn malformed_provider_recovery_charges_output_and_stops_at_run_budget() {
     let (s, deltas) = run(s, client.clone()).await;
     let attempts = *client.calls.lock().unwrap();
     assert!((1..12).contains(&attempts));
-    assert_eq!(s.status, "blocked");
-    assert!(
-        s.last_error
-            .as_deref()
-            .unwrap()
-            .starts_with("run_budget_exhausted:")
-    );
+    // The exhausted run finishes the saved draft and reports what is missing;
+    // the malformed batches never executed.
+    assert_eq!(s.status, "complete_with_gaps", "{:?}", s.last_error);
     assert_eq!(s.output_tokens, output_budget * attempts);
     assert!(s.usage_incomplete);
     assert!(!s.completion_review.approved);
@@ -1060,7 +1156,8 @@ async fn malformed_provider_recovery_charges_output_and_stops_at_run_budget() {
         std::fs::read_to_string(&s.project.output).unwrap(),
         "# Report\nDraft.\n"
     );
-    assert!(deltas.is_empty());
+    assert_eq!(deltas.len(), 1);
+    assert!(deltas[0].contains("실행 예산이 소진되어 마감했습니다"));
 }
 
 #[async_trait]

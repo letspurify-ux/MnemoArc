@@ -98,6 +98,13 @@ pub struct Investigation {
     pub document_hash: Option<String>,
     pub note: String,
 }
+impl Investigation {
+    /// Verified items and closing-mode gaps are settled. A gap is reported to
+    /// the user as unconfirmed; it never counts as verified evidence.
+    pub fn is_settled(&self) -> bool {
+        matches!(self.status.as_str(), "verified" | "gap")
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Bundle {
     pub id: u64,
@@ -232,6 +239,28 @@ pub struct ProgressRecovery {
     pub seen_artifact_versions: VecDeque<String>,
     pub seen_artifact_paths: VecDeque<String>,
     pub seen_navigation_results: VecDeque<String>,
+    /// Highest progress score reached in this run and model requests since.
+    /// One monotonic measure prevents recovery counters from resetting each other.
+    pub best_score: usize,
+    pub rounds_since_best: usize,
+    /// Distinct delivered sources credited as progress. Frozen once the run
+    /// leaves the investigate phase, where only result improvements count.
+    pub evidence_credit: usize,
+    /// Set once document work must converge: exploration stops and the run
+    /// finishes within a fixed number of requests, reporting unresolved items.
+    pub closing: Option<Closing>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Closing {
+    /// "budget" when the reserve is reached, "stall" after sustained no progress.
+    pub reason: String,
+    /// Non-review model requests (and failed review retries) since closing began.
+    pub rounds: usize,
+    /// Final answers submitted during closing. The second accepts reported gaps.
+    pub final_attempts: usize,
+    pub document_review_used: bool,
+    pub completion_review_used: bool,
 }
 
 impl ProgressRecovery {
@@ -318,6 +347,8 @@ pub struct Session {
     pub last_error: Option<String>,
     pub run_guidance: Value,
     pub progress_recovery: ProgressRecovery,
+    /// Unresolved items reported with a complete_with_gaps result.
+    pub completion_gaps: Vec<String>,
     pub activity: Value,
     pub task_rounds: usize,
     pub document_review: crate::tools::document_review::ReviewState,
@@ -411,6 +442,7 @@ impl Session {
             last_error: None,
             run_guidance: json!({}),
             progress_recovery: Default::default(),
+            completion_gaps: vec![],
             activity: json!({}),
             task_rounds: 0,
             document_review: Default::default(),
@@ -522,6 +554,7 @@ impl Session {
                 self.task_rounds = 0;
                 self.run_guidance = json!({});
                 self.progress_recovery = Default::default();
+                self.completion_gaps.clear();
             }
             if self.task.completion.is_empty() {
                 self.task.completion = self.initial_completion(&text);

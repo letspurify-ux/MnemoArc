@@ -665,13 +665,15 @@ async fn empty_line_growth_does_not_keep_a_document_loop_alive() {
         }),
     )
     .await;
+    // Blank lines are not progress. A heading-only file has no body to
+    // finish, so closing mode stops the loop before the run budget.
     assert_eq!(result.status, "blocked", "{:?}", result.last_error);
     assert!(
         result
             .last_error
             .as_deref()
             .unwrap_or("")
-            .starts_with("run_budget_exhausted")
+            .starts_with("closing_round_limit")
     );
     assert_eq!(result.progress_recovery.best_document_content_lines, 1);
 }

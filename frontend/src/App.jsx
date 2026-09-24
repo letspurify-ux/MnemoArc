@@ -921,11 +921,24 @@ function Inspector({
                 남은 항목 {todos.filter((item) => !item.done).length}/100 · 누적
                 완료 {session.task.todos_completed_total || 0}개
               </p>
-              {recovering && (
+              {session.status === "running" &&
+              session.run_guidance?.closing?.active ? (
                 <p role="status" className="plan-recovery">
-                  반복을 감지해 현재 항목의 실제 결과를 만드는 데 집중하고
-                  있습니다.
+                  마감 단계입니다 (
+                  {session.run_guidance.closing.reason === "budget"
+                    ? "예산 도달"
+                    : "진행 정체"}
+                  , 요청 {session.run_guidance.closing.rounds}/
+                  {session.run_guidance.closing.round_limit}). 수집한 근거로
+                  문서를 마무리하고 확인하지 못한 항목은 결과에 명시합니다.
                 </p>
+              ) : (
+                recovering && (
+                  <p role="status" className="plan-recovery">
+                    반복을 감지해 현재 항목의 실제 결과를 만드는 데 집중하고
+                    있습니다.
+                  </p>
+                )
               )}
               {todos.length ? (
                 <ol className="task-plan">
@@ -966,6 +979,23 @@ function Inspector({
                 </small>
               )}
             </section>
+            {session.completion_gaps?.length > 0 && (
+              <section
+                className="progress-section completion-gaps"
+                aria-label="확인하지 못한 항목"
+              >
+                <h4>확인하지 못한 항목 {session.completion_gaps.length}건</h4>
+                <p className="subtle">
+                  문서는 완료로 처리했지만 아래 항목은 검증되지 않았습니다.
+                  이어서 진행하면 보완할 수 있습니다.
+                </p>
+                <ul>
+                  {session.completion_gaps.map((gap, i) => (
+                    <li key={i}>{gap}</li>
+                  ))}
+                </ul>
+              </section>
+            )}
             {session.completion_review?.required && (
               <section className="progress-section" aria-label="완료 조건 검증">
                 <h4>완료 조건 검증</h4>
@@ -1016,7 +1046,15 @@ function Inspector({
             {session.investigations.map((item) => (
               <div className="source-card" key={item.id}>
                 <strong>{item.title}</strong>
-                <small>{item.status}</small>
+                <small>
+                  {{
+                    uninvestigated: "미조사",
+                    in_progress: "조사 중",
+                    written: "작성됨",
+                    verified: "검증됨",
+                    gap: "미확인",
+                  }[item.status] || item.status}
+                </small>
                 <p>{item.note}</p>
               </div>
             ))}

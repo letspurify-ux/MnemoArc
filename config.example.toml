@@ -34,6 +34,11 @@ retries = 2
 run_timeout_secs = 1800
 run_tokens = 500000
 review_limit = 3
+# Budget fractions: prioritize drafting, then verification, then close out the
+# document with unresolved items reported (0 < closing < verification < writing).
+writing_reserve_ratio = 0.5
+verification_reserve_ratio = 0.25
+closing_reserve_ratio = 0.1
 # Document edit requests after each failed review (reads/checks excluded); increase to resume.
 document_repair_limit = 8
 # One bounded same-model revision for source answers; incurs an extra request.
