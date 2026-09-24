@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Message, StreamingMessage } from "./chat/Message.jsx";
 import { continuationMessages } from "./chat/continuation.js";
-import { toolLabels, sessionErrorLabel } from "./api.js";
+import { toolLabels } from "./api.js";
 
 export default function Chat({
   session,
@@ -186,11 +186,8 @@ export default function Chat({
             </div>
           )}
           {session?.error && (
-            <div
-              className={session.error.startsWith("documentation_coverage_pending:") ? "setup-note" : "inline-error"}
-              role={session.error.startsWith("documentation_coverage_pending:") ? "status" : "alert"}
-            >
-              {sessionErrorLabel(session.error)}
+            <div className="inline-error" role="alert">
+              {session.error}
             </div>
           )}
         </div>

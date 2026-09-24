@@ -76,21 +76,6 @@ const provider = createServer(async (req, res) => {
     return;
   }
   const isRequest = (text) => retainedState?.latest_request === text || data.messages.some((m) => m.role === "user" && m.content === text);
-  const inventoryTest = isRequest("기능 문서 범위 테스트");
-  if (inventoryTest) {
-    const raw = data.messages.at(-1).content;
-    const state = JSON.parse(raw.slice(raw.indexOf("\n") + 1));
-    if (state.capability_inventory.active && state.capability_inventory.last_audit) {
-      const keep = setInterval(() => res.write(": keepalive\n\n"), 1000);
-      res.on("close", () => clearInterval(keep));
-      return;
-    }
-    const name = state.capability_inventory.active ? "documentation_coverage" : "capability_inventory";
-    const args = { action: state.capability_inventory.active ? "enqueue" : "scan" };
-    event({ choices: [{ delta: { tool_calls: [{ index: 0, id: name, function: { name, arguments: JSON.stringify(args) } }] }, finish_reason: "tool_calls" }] });
-    res.end("data: [DONE]\n\n");
-    return;
-  }
   const acceptanceTest = isRequest("완료 조건 검증 테스트");
   if (acceptanceTest) {
     const message = data.messages.at(-1).content;

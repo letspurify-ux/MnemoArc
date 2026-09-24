@@ -966,21 +966,6 @@ function Inspector({
                 </small>
               )}
             </section>
-            {session.capability_inventory?.summary?.active && (
-              <section className="progress-section" aria-label="기능 문서 범위">
-                <h4>화면·서버 기능 문서</h4>
-                <p>파일 수집 {session.capability_inventory.summary.scanned_files}/{session.capability_inventory.summary.files} · 검토 {session.capability_inventory.summary.reviewed_files}</p>
-                <p>문서 대상 {session.capability_inventory.summary.included} · 미분류 {session.capability_inventory.summary.unclassified} · 제외 {session.capability_inventory.summary.excluded}</p>
-                <p>문서 연결 {session.capability_inventory.summary.linked}/{session.capability_inventory.summary.included}</p>
-                {session.capability_inventory.summary.last_audit && (
-                  <p role="status">최근 누락 점검: {session.capability_inventory.summary.last_audit.ready ? "통과 · 내용 검증 별도" : `보완 ${session.capability_inventory.summary.last_audit.issue_count}건`}</p>
-                )}
-                <ul>{(session.capability_inventory.items || []).map((item) => (
-                  <li key={item.id}>{item.id} · {item.title} · {{candidate:"미분류", included:item.linked ? "문서 연결" : "문서 필요", excluded:"제외"}[item.status]}</li>
-                ))}</ul>
-                <small className="subtle">첫 10개 기능을 표시합니다. 자동 탐색 후 파일별 검토가 필요하며, 소스나 문서가 바뀌면 완료 전에 다시 점검합니다.</small>
-              </section>
-            )}
             {session.completion_review?.required && (
               <section className="progress-section" aria-label="완료 조건 검증">
                 <h4>완료 조건 검증</h4>

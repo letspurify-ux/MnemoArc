@@ -227,8 +227,6 @@ pub struct ProgressRecovery {
     pub repeated_outcome_rounds: usize,
     pub artifact_edits_without_milestone: usize,
     pub finalization_attempts: usize,
-    pub coverage_stalls: usize,
-    pub coverage_fingerprint: String,
     pub best_document_section_count: usize,
     pub best_document_content_lines: usize,
     pub seen_artifact_versions: VecDeque<String>,
@@ -323,7 +321,6 @@ pub struct Session {
     pub activity: Value,
     pub task_rounds: usize,
     pub document_review: crate::tools::document_review::ReviewState,
-    pub capabilities: crate::tools::capabilities::Inventory,
     pub completion_review: crate::tools::completion_review::ReviewState,
     pub answer_draft: Option<String>,
     pub answer_reviewed: bool,
@@ -345,7 +342,6 @@ impl Session {
             )
             || self.document_written
             || !self.investigations.is_empty()
-            || self.capabilities.active
     }
 
     fn initial_completion(&self, request: &str) -> Vec<String> {
@@ -418,7 +414,6 @@ impl Session {
             activity: json!({}),
             task_rounds: 0,
             document_review: Default::default(),
-            capabilities: Default::default(),
             completion_review: Default::default(),
             answer_draft: None,
             answer_reviewed: false,
@@ -492,9 +487,6 @@ impl Session {
             // successful results across a new user task can replay a stale read
             // or suppress a new mutation if a provider reuses an ID.
             self.ledger.clear();
-            if !first_request {
-                self.capabilities = Default::default();
-            }
             self.completion_review = Default::default();
             self.completion_review.required = first_request && !self.task.completion.is_empty();
             self.answer_draft = None;
@@ -574,7 +566,6 @@ impl Session {
             &self.file_cursors,
             &self.read_coverage,
             &self.coverage_cursors,
-            &self.capabilities,
         ))
         .map_or(usize::MAX, |v| v.len())
     }
