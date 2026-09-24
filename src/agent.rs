@@ -696,14 +696,24 @@ pub async fn run_session_controlled(
             break;
         }
         if let Some(cp) = &mut s.checkpoint {
-            if !document_work
-                && (cp.attempts >= context::CHECKPOINT_MAX_REQUESTS
-                    || cp.failed_attempts >= context::CHECKPOINT_MAX_FAILURES)
-            {
+            let (max_requests, max_failures) = if document_work {
+                (
+                    context::DOCUMENT_CHECKPOINT_MAX_REQUESTS,
+                    context::DOCUMENT_CHECKPOINT_MAX_FAILURES,
+                )
+            } else {
+                (
+                    context::CHECKPOINT_MAX_REQUESTS,
+                    context::CHECKPOINT_MAX_FAILURES,
+                )
+            };
+            if cp.attempts >= max_requests || cp.failed_attempts >= max_failures {
                 failure = Some(format!(
-                    "checkpoint_retry_limit: {} requests, {} failed requests; last cause: {}; original context retained",
+                    "checkpoint_retry_limit: {} of {} requests, {} of {} failed requests; last cause: {}; original context retained",
                     cp.attempts,
+                    max_requests,
                     cp.failed_attempts,
+                    max_failures,
                     cp.last_failure
                         .as_deref()
                         .unwrap_or("checkpoint_complete was not called successfully")

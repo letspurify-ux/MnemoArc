@@ -2254,7 +2254,7 @@ pub fn execute_cancellable(
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("no_checkpoint"))?;
             if cp.id != text(&args, "id")? {
-                bail!("checkpoint_id_mismatch");
+                bail!("checkpoint_id_mismatch: expected checkpoint ID {}", cp.id);
             }
             if cp.failed {
                 bail!(

@@ -5,7 +5,7 @@ use mnemoarc::{
     agent::{RunCommand, run_session, run_session_controlled},
     config::{Config, Project},
     llm::{Completion, LlmClient, ToolCall},
-    session::Session,
+    session::{Checkpoint, Session},
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -1634,6 +1634,160 @@ async fn successful_maintenance_without_ack_is_still_bounded() {
             .contains("checkpoint_complete was not called")
     );
     assert!(result.history.bundles.iter().all(|b| b.active));
+}
+
+struct RepeatsWrongDocumentCheckpointId;
+#[async_trait]
+impl LlmClient for RepeatsWrongDocumentCheckpointId {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        if let Some(review) = support::acceptance(&request) {
+            return Ok(review);
+        }
+        let state: Value = serde_json::from_str(
+            request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )?;
+        Ok(call(
+            &format!("wrong-checkpoint-id-{}", state["checkpoint"]["attempts"]),
+            "checkpoint_complete",
+            json!({
+                "id":"stale-checkpoint-id",
+                "no_save_reason":"Existing memories preserve the source facts",
+                "progress":"Document work is complete"
+            }),
+        ))
+    }
+}
+
+struct RepeatsDocumentCheckpointMaintenanceWithoutAck;
+#[async_trait]
+impl LlmClient for RepeatsDocumentCheckpointMaintenanceWithoutAck {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        if let Some(review) = support::acceptance(&request) {
+            return Ok(review);
+        }
+        let state: Value = serde_json::from_str(
+            request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )?;
+        Ok(call(
+            &format!("repeat-source-lookup-{}", state["checkpoint"]["attempts"]),
+            "source_lookup",
+            json!({"path":"unobserved.rs"}),
+        ))
+    }
+}
+
+fn document_checkpoint_session(dir: &std::path::Path) -> Session {
+    let mut session = s(dir);
+    session.config.source_document_review = false;
+    session.add_user("Document this source code with evidence".into());
+    session.task.workflow = "source_document".into();
+    session.task.require_investigation = true;
+    session.checkpoint = Some(Checkpoint {
+        id: "expected-checkpoint-id".into(),
+        bundle_ids: vec![],
+        maintenance_bundle_ids: vec![],
+        acknowledged: false,
+        attempts: 0,
+        failed_attempts: 0,
+        last_failure: None,
+        starting_state_revision: session.task.revision,
+        starting_memory_generation: session.memory.generation,
+        failed: false,
+    });
+    session
+}
+
+#[tokio::test]
+async fn document_checkpoint_wrong_id_retries_are_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = document_checkpoint_session(dir.path());
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(
+        session,
+        Arc::new(RepeatsWrongDocumentCheckpointId),
+        CancellationToken::new(),
+        tx,
+    )
+    .await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "blocked");
+    assert!(
+        result.last_error.as_deref().is_some_and(|error| {
+            error.contains("checkpoint_retry_limit") && error.contains("checkpoint_id_mismatch")
+        }),
+        "{:?}",
+        result.last_error
+    );
+    let cp = result.checkpoint.unwrap();
+    assert_eq!(
+        cp.attempts,
+        mnemoarc::context::DOCUMENT_CHECKPOINT_MAX_REQUESTS
+    );
+    assert_eq!(
+        cp.failed_attempts,
+        mnemoarc::context::DOCUMENT_CHECKPOINT_MAX_FAILURES
+    );
+    assert!(
+        cp.last_failure.as_deref().is_some_and(|error| {
+            error.contains("expected checkpoint ID expected-checkpoint-id")
+        })
+    );
+    assert_eq!(result.checkpoints_completed, 0);
+}
+
+#[tokio::test]
+async fn document_checkpoint_without_acknowledgement_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = document_checkpoint_session(dir.path());
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(
+        session,
+        Arc::new(RepeatsDocumentCheckpointMaintenanceWithoutAck),
+        CancellationToken::new(),
+        tx,
+    )
+    .await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "blocked");
+    assert!(
+        result.last_error.as_deref().is_some_and(|error| {
+            error.contains("checkpoint_retry_limit")
+                && error.contains("checkpoint_complete was not called successfully")
+        }),
+        "{:?}",
+        result.last_error
+    );
+    let cp = result.checkpoint.unwrap();
+    assert_eq!(
+        cp.attempts,
+        mnemoarc::context::DOCUMENT_CHECKPOINT_MAX_REQUESTS
+    );
+    assert_eq!(cp.failed_attempts, 0);
+    assert_eq!(result.checkpoints_completed, 0);
 }
 
 struct SeparateLengthRecoveries(Mutex<usize>);

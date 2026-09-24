@@ -79,6 +79,10 @@ pub fn truncate(text: &str, limit: usize, model: &str) -> (String, bool) {
 }
 pub const CHECKPOINT_MAX_REQUESTS: usize = 8;
 pub const CHECKPOINT_MAX_FAILURES: usize = 8;
+// Document work gets more room to repair a checkpoint than ordinary chat,
+// while still bounding a stale or missing acknowledgement loop.
+pub const DOCUMENT_CHECKPOINT_MAX_REQUESTS: usize = CHECKPOINT_MAX_REQUESTS * 2;
+pub const DOCUMENT_CHECKPOINT_MAX_FAILURES: usize = CHECKPOINT_MAX_FAILURES * 2;
 pub struct ContextManager;
 
 fn model_message(mut message: Value) -> Value {
@@ -257,20 +261,20 @@ impl ContextManager {
     pub fn request(s: &Session, tools: Vec<Value>) -> Result<Value> {
         let mut instruction = SYSTEM.to_string();
         if let Some(cp) = &s.checkpoint {
-            let allowance = if s.is_document_work() {
-                format!(
-                    "cleanup request {}, failed requests {}. Continue correcting cleanup within remaining context, run tokens and time; retry counts are not a stop quota",
-                    cp.attempts.saturating_add(1),
-                    cp.failed_attempts
+            let (max_requests, max_failures) = if s.is_document_work() {
+                (
+                    DOCUMENT_CHECKPOINT_MAX_REQUESTS,
+                    DOCUMENT_CHECKPOINT_MAX_FAILURES,
                 )
             } else {
-                format!(
-                    "cleanup request {}/{CHECKPOINT_MAX_REQUESTS}, failed requests {}/{CHECKPOINT_MAX_FAILURES}",
-                    cp.attempts.saturating_add(1),
-                    cp.failed_attempts
-                )
+                (CHECKPOINT_MAX_REQUESTS, CHECKPOINT_MAX_FAILURES)
             };
-            instruction.push_str(&format!("\nCheckpoint {}: {allowance}. Preserve concise findings and progress. Include checkpoint_complete after successful saves in the SAME batch; prose does not commit a checkpoint. It runs after all other calls and saves progress. Use source_lookup to recover existing evidence IDs; never invent IDs for compact outlines. If evidence was never read, record that work as unresolved rather than asserting it as fact.{}", cp.id, if !s.is_document_work() && cp.attempts.saturating_add(1) >= CHECKPOINT_MAX_REQUESTS { " LAST cleanup request: finish saves and acknowledgement together." } else { "" }));
+            let allowance = format!(
+                "cleanup request {}/{max_requests}, failed requests {}/{max_failures}",
+                cp.attempts.saturating_add(1),
+                cp.failed_attempts
+            );
+            instruction.push_str(&format!("\nCheckpoint {}: {allowance}. Preserve concise findings and progress. Include checkpoint_complete after successful saves in the SAME batch; prose does not commit a checkpoint. It runs after all other calls and saves progress. Use source_lookup to recover existing evidence IDs; never invent IDs for compact outlines. If evidence was never read, record that work as unresolved rather than asserting it as fact. Retry counts are bounded for every workflow; correct the reported cause and do not repeat an unchanged failed acknowledgement.{}", cp.id, if cp.attempts.saturating_add(1) >= max_requests { " LAST cleanup request: finish saves and acknowledgement together." } else { "" }));
         }
         if s.checkpoint.is_none()
             && let Some(discarded_tools) = s.continuation
@@ -284,14 +288,12 @@ impl ContextManager {
         let mut messages = vec![json!({"role":"system","content":instruction})];
         messages.extend(s.history.active().into_iter().map(model_message));
         let header = if let Some(cp) = &s.checkpoint {
-            let allowance = if s.is_document_work() {
-                cp.attempts.saturating_add(1).to_string()
+            let max_requests = if s.is_document_work() {
+                DOCUMENT_CHECKPOINT_MAX_REQUESTS
             } else {
-                format!(
-                    "{}/{CHECKPOINT_MAX_REQUESTS}",
-                    cp.attempts.saturating_add(1)
-                )
+                CHECKPOINT_MAX_REQUESTS
             };
+            let allowance = format!("{}/{max_requests}", cp.attempts.saturating_add(1));
             format!(
                 "CHECKPOINT CONTROL REQUEST {} (request {allowance}): Pause source investigation NOW. Do NOT call file_read, source_search or investigation. Use source_lookup for existing evidence IDs. Preserve necessary facts using concise memory_write calls, then call checkpoint_complete with a concise progress summary. Preserve the ordered task_plan; cleanup does not complete its items. If facts already exist in memory, provide no_save_reason. A separate task_state call is not required. At most {} tool calls in this batch. Resume the original user task only AFTER checkpoint_complete succeeds. The following JSON is program state.",
                 cp.id,

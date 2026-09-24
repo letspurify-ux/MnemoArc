@@ -648,9 +648,17 @@ impl LlmClient for LateCheckpoint {
             let mut attempts = self.attempts.lock().unwrap();
             *attempts += 1;
             assert!(*attempts < 100, "checkpoint failed to honor the run budget");
-            if *attempts > 8 {
+            if *attempts > 8 && *attempts < mnemoarc::context::DOCUMENT_CHECKPOINT_MAX_REQUESTS {
                 assert!(
                     !request["messages"][0]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("LAST cleanup request")
+                );
+            }
+            if *attempts == mnemoarc::context::DOCUMENT_CHECKPOINT_MAX_REQUESTS {
+                assert!(
+                    request["messages"][0]["content"]
                         .as_str()
                         .unwrap()
                         .contains("LAST cleanup request")
@@ -675,7 +683,7 @@ impl LlmClient for LateCheckpoint {
 }
 
 #[tokio::test]
-async fn document_checkpoint_can_recover_after_eight_failures() {
+async fn document_checkpoint_recovers_after_twelve_failures_below_extended_limit() {
     let (_dir, mut s) = fixture();
     mnemoarc::context::ContextManager::prepare(&mut s, 120_000).unwrap();
     assert!(s.checkpoint.is_some());
@@ -699,7 +707,7 @@ async fn document_checkpoint_can_recover_after_eight_failures() {
 }
 
 #[tokio::test]
-async fn document_checkpoint_stops_at_budget_without_losing_original_context() {
+async fn document_checkpoint_stops_after_repeated_missing_ack_without_losing_context() {
     let (_dir, mut s) = fixture();
     s.config.run_tokens = 200_000;
     mnemoarc::context::ContextManager::prepare(&mut s, 120_000).unwrap();
@@ -721,9 +729,12 @@ async fn document_checkpoint_stops_at_budget_without_losing_original_context() {
         s.last_error
             .as_deref()
             .unwrap()
-            .starts_with("run_budget_exhausted")
+            .starts_with("checkpoint_retry_limit")
     );
-    assert!(*client.attempts.lock().unwrap() > 8);
+    assert_eq!(
+        *client.attempts.lock().unwrap(),
+        mnemoarc::context::DOCUMENT_CHECKPOINT_MAX_REQUESTS
+    );
     assert!(s.checkpoint.is_some());
     assert_eq!(s.checkpoints_completed, 0);
     for bundle in original {
