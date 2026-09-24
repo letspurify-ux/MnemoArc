@@ -64,6 +64,7 @@ export const groups = [
       ],
       ["source_answer_review", "소스 답변 검토", "boolean", "읽은 소스 근거로 답변을 한 번 검토합니다. 추가 모델 호출 비용이 발생합니다."],
       ["source_document_review", "소스 문서 검토", "boolean", "생성 문서를 소스·요구사항과 별도로 대조합니다. 검토 페이지와 보완 재검토에 추가 모델 호출 비용이 발생합니다."],
+      ["completion_review_enabled", "완료 조건 검증", "boolean", "결과물을 완료하기 전에 원래 요청과 완료 조건을 실제 결과와 대조합니다. 추가 모델 호출 비용이 발생합니다."],
       [
         "stream_usage",
         "스트리밍 사용량 요청",
