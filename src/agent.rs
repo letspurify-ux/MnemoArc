@@ -63,6 +63,11 @@ fn progress_score(s: &Session) -> usize {
 fn closing_instruction(s: &Session) -> String {
     let closing = s.progress_recovery.closing.as_ref();
     let remaining = CLOSING_ROUND_LIMIT.saturating_sub(closing.map_or(0, |c| c.rounds));
+    if !s.document_written {
+        return format!(
+            "Closing mode: no document is saved yet and source reading is withheld. Create the requested document NOW with document_edit action=create (or document_edit_batch) from the evidence already gathered. Write every requested section; where a fact was not confirmed from delivered sources, say so in the text instead of guessing. Then register or update investigation items with their sections, verify what the delivered evidence supports, mark the rest with investigation action=mark_gap, and give a concise final answer. At most {remaining} requests remain; without a saved document the run stops unfinished."
+        );
+    }
     format!(
         "Closing mode: finish the requested document now from the evidence already gathered; discovery tools are withheld. 1) Write any missing requested section from gathered evidence, stating in the text when a fact is unconfirmed. 2) Verify written items whose evidence was already delivered (verify_batch). 3) For an item that cannot be verified with available evidence, call investigation action=mark_gap with its id and a specific reason, and qualify the related claim in its section. 4) Fix remaining document_review findings or completion checks with targeted edits when possible; otherwise leave them, the runtime reports them as unresolved. 5) Complete or remove remaining to-dos with actual results, then give a concise final answer. At most {remaining} requests remain; afterwards the runtime finishes the document and lists every unresolved item. Do not invent evidence or describe gaps as verified."
     )
@@ -980,7 +985,10 @@ pub async fn run_session_controlled(
         let counts_as_round = std::mem::replace(&mut ladder_request_completed, true)
             && (!review_request || review_response_failures > 0);
         if s.checkpoint.is_none() {
-            if phase == "investigate" {
+            // Reading new sources is progress until the document exists, even
+            // after the budget or a required investigation switches the
+            // guidance to drafting; afterwards only result improvements count.
+            if phase == "investigate" || !s.document_written {
                 s.progress_recovery.evidence_credit =
                     s.progress_recovery.evidence_credit.max(s.sources.len());
             }

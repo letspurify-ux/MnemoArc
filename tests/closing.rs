@@ -636,3 +636,104 @@ async fn audits_during_review_repair_return_a_short_page() {
     assert_eq!(output["data"]["next_offset"], 5);
     assert!(output["data"]["issue_count"].as_u64().unwrap() > 5);
 }
+
+#[test]
+fn closing_without_a_document_withholds_reading_until_it_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.js"), "run();\n").unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128_000),
+            ..Default::default()
+        },
+    );
+    s.add_user("Write out.md about main.js".into());
+    s.active_tools = ToolRegistry::optional_names();
+    s.progress_recovery.closing = Some(Closing::default());
+    let names = tool_names(&s);
+    for withheld in ["file_read", "symbol_read", "source_search"] {
+        assert!(!names.iter().any(|name| name == withheld), "{withheld}");
+    }
+    assert!(names.iter().any(|name| name == "document_edit"));
+    let error = tools::execute(&mut s, "file_read", json!({"path":"main.js"}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("withheld until the document is saved"), "{error}");
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Main\nIt runs. main.js:1-1\n"}),
+    )
+    .unwrap();
+    // With a saved document, a targeted read of a cited range is allowed again.
+    assert!(tool_names(&s).iter().any(|name| name == "file_read"));
+    tools::execute(&mut s, "file_read", json!({"path":"main.js"})).unwrap();
+}
+
+#[tokio::test]
+async fn reading_new_sources_before_the_first_write_is_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.js"), numbered(40)).unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128_000),
+            context_tokens: 128_000,
+            output_tokens: 1_024,
+            stall_round_limit: 2,
+            source_answer_review: false,
+            ..Default::default()
+        },
+    );
+    s.add_user("Document main.js with source evidence".into());
+    tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"workflow":"source_document"}}),
+    )
+    .unwrap();
+    // Twelve distinct ranges: four times the closing threshold (3 x 2).
+    let mut steps: Vec<Completion> = (0..12)
+        .map(|i| {
+            call(
+                &format!("read-{i}"),
+                "file_read",
+                json!({"path":"main.js","start_line":i * 3 + 1,"max_lines":3}),
+            )
+        })
+        .collect();
+    steps.push(call(
+        "write",
+        "document_edit",
+        json!({"action":"create","text":"# Main\nForty values. main.js:1-40\n"}),
+    ));
+    let (result, guidance) = run_scripted(s, steps).await;
+    assert!(
+        result.document_written,
+        "{:?} {:?}",
+        result.status,
+        result.last_error
+    );
+    assert!(
+        guidance.iter().take(13).all(|g| g["closing"].is_null()),
+        "{:?}",
+        guidance.iter().map(|g| &g["closing"]).collect::<Vec<_>>()
+    );
+    // The guidance still moved to drafting; only closing was not triggered.
+    assert!(guidance.iter().any(|g| g["phase"] == "draft"));
+}
+
+fn numbered(lines: usize) -> String {
+    (1..=lines).map(|i| format!("let v{i} = {i};\n")).collect()
+}

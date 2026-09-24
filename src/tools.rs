@@ -426,6 +426,16 @@ impl ToolRegistry {
         ]
         .contains(&name)
     }
+    /// Tools withheld in closing mode for this session. Before any document is
+    /// saved, source reading is withheld as well: the only way forward is to
+    /// write the document from the evidence already gathered.
+    pub fn closing_withholds(s: &Session, name: &str) -> bool {
+        s.checkpoint.is_none()
+            && s.progress_recovery.closing.is_some()
+            && (Self::closing_blocked(name)
+                || (!s.document_written
+                    && matches!(name, "file_read" | "symbol_read" | "source_lookup")))
+    }
     fn checkpoint_allowed(name: &str) -> bool {
         [
             "memory_write",
@@ -495,11 +505,7 @@ impl ToolRegistry {
             .filter(|t| !t.optional || s.active_tools.contains(t.name))
             .filter(|t| s.config.memory_reuse || !["memory_read", "memory_find"].contains(&t.name))
             .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
-            .filter(|t| {
-                s.checkpoint.is_some()
-                    || s.progress_recovery.closing.is_none()
-                    || !Self::closing_blocked(t.name)
-            })
+            .filter(|t| !Self::closing_withholds(s, t.name))
             // Second stage of the document progress ladder: after twice the
             // stall limit without a better result, stop broad discovery even
             // in the verify phase. Targeted file_read/symbol_read remain.
@@ -649,13 +655,13 @@ impl ToolRegistry {
         if spec.optional && !s.active_tools.contains(name) {
             bail!("tool_not_active: {name}");
         }
-        if s.checkpoint.is_none()
-            && s.progress_recovery.closing.is_some()
-            && Self::closing_blocked(name)
-        {
-            bail!(
+        if Self::closing_withholds(s, name) {
+            bail!(if s.document_written {
                 "closing_mode: {name} is withheld while the document is finalized; use gathered evidence, file_read for one specific cited range, or investigation mark_gap"
-            );
+            } else {
+                "closing_mode: {name} is withheld until the document is saved; create it now with document_edit action=create from the evidence already gathered"
+            }
+            .replace("{name}", name));
         }
         if !s.config.memory_reuse && ["memory_find", "memory_read"].contains(&name) {
             bail!("unsupported: memory reuse disabled for evaluation");
