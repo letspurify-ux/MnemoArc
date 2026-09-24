@@ -68,18 +68,19 @@ struct Verdict {
 }
 
 pub fn required(s: &Session) -> bool {
-    s.capabilities.active
-        || s.completion_review.required
-        || s.task.plan_revision > 0
-        || !s.task.todos.is_empty()
-        || s.task.require_investigation
-        || matches!(
-            s.task.workflow.as_str(),
-            "source_document" | "document_edit"
-        )
-        || s.document_written
-        || !s.task.deliverables.is_empty()
-        || !s.task.unresolved.is_empty()
+    s.config.completion_review_enabled
+        && (s.capabilities.active
+            || s.completion_review.required
+            || s.task.plan_revision > 0
+            || !s.task.todos.is_empty()
+            || s.task.require_investigation
+            || matches!(
+                s.task.workflow.as_str(),
+                "source_document" | "document_edit"
+            )
+            || s.document_written
+            || !s.task.deliverables.is_empty()
+            || !s.task.unresolved.is_empty())
 }
 
 /// Persist bounded, delivered observations across checkpoints. Bookkeeping and
@@ -402,6 +403,12 @@ fn answer_prefix(s: &Session) -> (String, bool) {
 }
 
 pub fn begin_final(s: &mut Session, draft: &str, continues_previous: bool) -> Result<Gate> {
+    if !s.config.completion_review_enabled {
+        s.completion_review.required = false;
+        s.completion_review.pending = false;
+        s.completion_review.approved = false;
+        return Ok(Gate::Accepted);
+    }
     // Review the whole answer but keep the original final transport fragment.
     // A pending review/resume may prune history; retain its captured prefix.
     if !(continues_previous

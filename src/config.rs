@@ -58,6 +58,8 @@ pub struct Config {
     pub document_repair_limit: usize,
     pub source_answer_review: bool,
     pub source_document_review: bool,
+    /// Run the general read-only acceptance review before completing artifacts.
+    pub completion_review_enabled: bool,
     pub writing_reserve_ratio: f64,
     pub verification_reserve_ratio: f64,
     pub repeated_read_limit: usize,
@@ -126,6 +128,7 @@ impl Default for Config {
             document_repair_limit: 8,
             source_answer_review: true,
             source_document_review: true,
+            completion_review_enabled: true,
             projects: vec![],
         }
     }

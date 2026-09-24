@@ -10,6 +10,15 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
+fn env_bool(name: &str, fallback: bool) -> bool {
+    match std::env::var(name).ok().as_deref() {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        Some(value) => panic!("{name} must be a boolean, got {value:?}"),
+        None => fallback,
+    }
+}
+
 #[tokio::test]
 #[ignore = "paid provider; explicitly set MNEMOARC_LIVE_TEST=1"]
 async fn registered_source_documentation() {
@@ -23,8 +32,19 @@ async fn registered_source_documentation() {
         .unwrap();
         config.api_key = keys.get(&config.api_key_env).cloned().map(Secret);
     }
-    config.run_timeout_secs = config.run_timeout_secs.min(900);
-    config.source_document_review = true;
+    config.run_timeout_secs = std::env::var("MNEMOARC_LIVE_TIMEOUT_SECS")
+        .map(|v| {
+            v.parse()
+                .expect("MNEMOARC_LIVE_TIMEOUT_SECS must be an integer")
+        })
+        .unwrap_or_else(|_| config.run_timeout_secs.min(900));
+    if let Ok(tokens) = std::env::var("MNEMOARC_LIVE_TOKENS") {
+        config.run_tokens = tokens
+            .parse()
+            .expect("MNEMOARC_LIVE_TOKENS must be an integer");
+    }
+    config.source_document_review = env_bool("MNEMOARC_LIVE_SOURCE_DOCUMENT_REVIEW", true);
+    config.completion_review_enabled = env_bool("MNEMOARC_LIVE_COMPLETION_REVIEW", true);
     let mut project = config
         .projects
         .iter()
@@ -48,16 +68,45 @@ async fn registered_source_documentation() {
     let drain = tokio::spawn(async move {
         let mut first_write = None;
         let mut reviews = Vec::new();
+        let mut last_round = 0;
         while let Some(event) = rx.recv().await {
-            if let AgentEvent::Snapshot(s) = event {
-                if s.document_written && first_write.is_none() {
-                    first_write = Some(
-                        json!({"round":s.task_rounds,"input_tokens":s.input_tokens,"output_tokens":s.output_tokens}),
-                    );
+            match event {
+                AgentEvent::Tool { name, status, .. } => {
+                    eprintln!("[live] tool={name} status={status}");
                 }
-                if s.document_review.attempts > reviews.len() {
-                    reviews.push(json!(s.document_review));
+                AgentEvent::Snapshot(s) => {
+                    if s.document_written && first_write.is_none() {
+                        first_write = Some(
+                            json!({"round":s.task_rounds,"input_tokens":s.input_tokens,"output_tokens":s.output_tokens}),
+                        );
+                    }
+                    if s.document_review.attempts > reviews.len() {
+                        reviews.push(json!(s.document_review));
+                    }
+                    if s.task_rounds > last_round {
+                        last_round = s.task_rounds;
+                        let verified = s
+                            .investigations
+                            .iter()
+                            .filter(|item| item.status == "verified")
+                            .count();
+                        eprintln!(
+                            "[live] round={} input={} output={} document_written={} investigations={}/{} document_reviews={} completion_reviews={} checkpoint={}",
+                            s.task_rounds,
+                            s.input_tokens,
+                            s.output_tokens,
+                            s.document_written,
+                            verified,
+                            s.investigations.len(),
+                            s.document_review.attempts,
+                            s.completion_review.attempts,
+                            s.checkpoint
+                                .as_ref()
+                                .map_or(0, |checkpoint| checkpoint.attempts)
+                        );
+                    }
                 }
+                _ => {}
             }
         }
         (first_write, reviews)
@@ -123,7 +172,11 @@ async fn registered_source_documentation() {
     );
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
     assert_eq!(audit["structural_ok"], true);
-    assert!(tools::document_review::approved(&result));
+    if result.config.source_document_review {
+        assert!(tools::document_review::approved(&result));
+    } else {
+        assert_eq!(result.document_review.attempts, 0);
+    }
     assert!(
         result.investigations.len() >= 4
             && result.investigations.iter().all(|i| i.status == "verified")

@@ -40,6 +40,8 @@ document_repair_limit = 8
 source_answer_review = true
 # Source-document review: read-only same-model pass, up to two attempts per task.
 source_document_review = true
+# General read-only acceptance review before completing artifacts.
+completion_review_enabled = true
 projects = []
 
 # DB access remains off until you explicitly enable both switches.

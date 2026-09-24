@@ -33,6 +33,24 @@ fn session(root: &std::path::Path) -> Session {
     s
 }
 
+#[test]
+fn disabled_completion_review_does_not_gate_artifact_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.config.completion_review_enabled = false;
+    s.task.workflow = "source_document".into();
+    s.task.require_investigation = true;
+    s.document_written = true;
+
+    assert!(!review::required(&s));
+    assert_eq!(
+        review::begin_final(&mut s, "The requested artifact is complete.", false).unwrap(),
+        Gate::Accepted
+    );
+    assert!(!s.completion_review.pending);
+    assert!(!s.completion_review.approved);
+}
+
 fn write(s: &mut Session, content: &str) {
     let path = s.project.root.join("result.txt");
     let mut args = json!({"path":"result.txt","content":content});
