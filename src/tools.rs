@@ -901,6 +901,39 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
     Ok(())
 }
 
+/// A batch has one document hash. Models often repeat it inside each edit;
+/// accept that when every copy agrees, and supply a missing top-level value
+/// from them. Differing copies are a real conflict.
+fn hoist_batch_expected_hash(args: &mut Value) -> Result<()> {
+    let Some(edits) = args.get_mut("edits").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    let mut nested: Option<Value> = None;
+    for (index, edit) in edits.iter_mut().enumerate() {
+        let Some(value) = edit.as_object_mut().and_then(|object| object.remove("expected_hash"))
+        else {
+            continue;
+        };
+        match &nested {
+            Some(previous) if *previous != value => bail!(
+                "conflicting_arguments: edits[{index}].expected_hash differs from another edit; a batch applies to one document version, so pass a single top-level expected_hash"
+            ),
+            _ => nested = Some(value),
+        }
+    }
+    let Some(nested) = nested else {
+        return Ok(());
+    };
+    match args.get("expected_hash") {
+        None => args["expected_hash"] = nested,
+        Some(top) if *top == nested => {}
+        Some(_) => bail!(
+            "conflicting_arguments: an edit's expected_hash differs from the batch expected_hash; pass only the top-level expected_hash of the current document"
+        ),
+    }
+    Ok(())
+}
+
 fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
     let expected_hash = args
         .get("expected_hash")
@@ -1056,6 +1089,34 @@ fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Explain a batch operation whose old_text did not match exactly once.
+/// `states[k]` is the document before operation k (states[0] = original).
+fn batch_target_hint(states: &[String], edit: &Value, error: &str) -> String {
+    if !error.starts_with("patch_target_must_match_once") {
+        return String::new();
+    }
+    let Some(target) = edit["old_text"].as_str().filter(|t| !t.is_empty()) else {
+        return String::new();
+    };
+    let current = states.last().map_or("", String::as_str);
+    let count = current.matches(target).count();
+    if count > 1 {
+        return format!(
+            ". old_text occurs {count} times; include more surrounding text so it matches once"
+        );
+    }
+    // Present in the original but removed by an earlier operation here.
+    if let Some(changed_by) = (1..states.len())
+        .find(|&k| states[k - 1].contains(target) && !states[k].contains(target))
+    {
+        return format!(
+            ". old_text existed in the original document but edits[{}] in this same batch already changed it; operations apply in order, so copy old_text from the text after that edit, merge the two corrections, or send them as separate requests",
+            changed_by - 1
+        );
+    }
+    ". old_text is not in the current document; copy it exactly (including spacing and line breaks) from document_inspect or file_read of the output".into()
 }
 
 fn unique_document_text_span(old: &str, target: &str) -> Result<(usize, usize)> {
@@ -2089,6 +2150,9 @@ pub fn execute_cancellable(
         bail!("cancelled");
     }
     normalize_integer_arguments(name, &mut args);
+    if name == "document_edit_batch" {
+        hoist_batch_expected_hash(&mut args)?;
+    }
     if name == "file_read"
         && let Some(fields) = args.as_object_mut()
         && let Some(limit) = fields.remove("limit")
@@ -2639,6 +2703,7 @@ pub fn execute_cancellable(
             }
             let edits = args["edits"].as_array().expect("validated edits array");
             let mut current = old.clone();
+            let mut states = vec![old.clone()];
             let mut operations = Vec::with_capacity(edits.len());
             for (index, edit) in edits.iter().enumerate() {
                 if cancel.is_cancelled() {
@@ -2647,11 +2712,13 @@ pub fn execute_cancellable(
                 let action = edit["action"].as_str().unwrap_or("unknown");
                 let before_hash = hash(current.as_bytes());
                 let next = apply_document_edit_operation(&current, edit).map_err(|error| {
+                    let hint = batch_target_hint(&states, edit, &error.to_string());
                     anyhow::anyhow!(
-                        "document_batch_operation_failed: index={index}; action={action}; cause={error}; no changes persisted"
+                        "document_batch_operation_failed: index={index}; action={action}; cause={error}{hint}; no changes persisted"
                     )
                 })?;
                 current = next;
+                states.push(current.clone());
                 operations.push(json!({
                     "index":index,
                     "action":action,

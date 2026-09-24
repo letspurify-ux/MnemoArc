@@ -2142,3 +2142,85 @@ fn appended_heading_starts_a_new_line() {
     let outline = run(&mut s, "document_inspect", json!({}));
     assert!(outline.to_string().contains("## B"));
 }
+
+#[test]
+fn batch_accepts_a_repeated_nested_expected_hash_and_rejects_conflicts() {
+    let (_dir, mut s) = setup();
+    std::fs::write(&s.project.output, "# A\nOne.\n\n# B\nTwo.\n").unwrap();
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    // The hash repeated inside every edit, as the live model sent it.
+    let result = run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":hash,"edits":[
+            {"action":"replace_text","expected_hash":hash,"old_text":"One.","text":"First."},
+            {"action":"replace_text","expected_hash":hash,"old_text":"Two.","text":"Second."}
+        ]}),
+    );
+    let hash = result["hash"].as_str().unwrap().to_owned();
+    // Only nested copies: the batch hash is taken from them.
+    run(
+        &mut s,
+        "document_edit_batch",
+        json!({"edits":[{"action":"replace_text","expected_hash":hash,"old_text":"First.","text":"1st."}]}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# A\n1st.\n\n# B\nSecond.\n"
+    );
+    let current = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    let error = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":current,"edits":[
+            {"action":"replace_text","expected_hash":"stale","old_text":"1st.","text":"x"}
+        ]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("conflicting_arguments"), "{error}");
+}
+
+#[test]
+fn batch_target_failures_say_why_old_text_did_not_match() {
+    let (_dir, mut s) = setup();
+    std::fs::write(&s.project.output, "# A\nThe loop runs five times.\nIt stops.\n").unwrap();
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    // edits[0] rewrites the sentence edits[1] was copied from.
+    let error = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":hash,"edits":[
+            {"action":"replace_text","old_text":"The loop runs five times.","text":"The for loop runs exactly five times."},
+            {"action":"replace_text","old_text":"loop runs five","text":"loop runs 5"}
+        ]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("edits[0] in this same batch already changed it"), "{error}");
+    let error = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":hash,"edits":[
+            {"action":"replace_text","old_text":"never written","text":"x"}
+        ]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("not in the current document"), "{error}");
+    let error = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":hash,"edits":[
+            {"action":"replace_text","old_text":"t","text":"x"}
+        ]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("occurs") && error.contains("times"), "{error}");
+    // Nothing was persisted by the failed batches.
+    assert_eq!(
+        tools::hash(&std::fs::read(&s.project.output).unwrap()),
+        hash
+    );
+}
