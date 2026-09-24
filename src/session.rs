@@ -349,6 +349,9 @@ pub struct Session {
     pub progress_recovery: ProgressRecovery,
     /// Unresolved items reported with a complete_with_gaps result.
     pub completion_gaps: Vec<String>,
+    /// Recent provider input tokens per locally estimated token, for models
+    /// without a known tokenizer. See ContextManager::token_ratio.
+    pub token_ratios: VecDeque<f64>,
     pub activity: Value,
     pub task_rounds: usize,
     pub document_review: crate::tools::document_review::ReviewState,
@@ -443,6 +446,7 @@ impl Session {
             run_guidance: json!({}),
             progress_recovery: Default::default(),
             completion_gaps: vec![],
+            token_ratios: VecDeque::new(),
             activity: json!({}),
             task_rounds: 0,
             document_review: Default::default(),

@@ -374,3 +374,265 @@ fn cleanup_output_reservation_is_bounded_so_large_outputs_keep_input_room() {
     };
     assert_eq!(ContextManager::cleanup_output_tokens(&small), 8_000);
 }
+
+/// Scripted document run: two identical outline requests, then a final.
+/// Records each request's run_guidance for assertions.
+struct Scripted {
+    steps: Mutex<Vec<Completion>>,
+    guidance: Mutex<Vec<Value>>,
+}
+
+#[async_trait]
+impl LlmClient for Scripted {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let state: Value = serde_json::from_str(
+            request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )?;
+        self.guidance
+            .lock()
+            .unwrap()
+            .push(state["run_guidance"].clone());
+        let mut steps = self.steps.lock().unwrap();
+        if steps.is_empty() {
+            anyhow::bail!("script_exhausted");
+        }
+        Ok(steps.remove(0))
+    }
+}
+
+fn call(id: &str, name: &str, args: Value) -> Completion {
+    Completion {
+        calls: vec![ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args.to_string(),
+        }],
+        ..Default::default()
+    }
+}
+
+fn verified_fixture() -> (tempfile::TempDir, Session) {
+    let (dir, mut s, source) = fixture();
+    s.config.source_document_review = false;
+    s.config.completion_review_enabled = false;
+    for id in ["flow", "history"] {
+        tools::execute(&mut s, "investigation", json!({"action":"verify","id":id,"source_ids":[source],"verification_note":"Compared the cited lines with the section"})).unwrap();
+    }
+    (dir, s)
+}
+
+async fn run_scripted(s: Session, steps: Vec<Completion>) -> (Session, Vec<Value>) {
+    let client = Arc::new(Scripted {
+        steps: Mutex::new(steps),
+        guidance: Mutex::new(vec![]),
+    });
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(s, client.clone(), CancellationToken::new(), tx).await;
+    drain.await.unwrap();
+    let guidance = client.guidance.lock().unwrap().clone();
+    (result, guidance)
+}
+
+#[tokio::test]
+async fn unchanged_outline_repeat_returns_a_short_marker() {
+    let (_dir, s) = verified_fixture();
+    let (result, _) = run_scripted(
+        s,
+        vec![
+            call("inspect-1", "document_inspect", json!({})),
+            call("inspect-2", "document_inspect", json!({})),
+            Completion {
+                text: "Saved out.md".into(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await;
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    let outputs: Vec<Value> = result
+        .history
+        .bundles
+        .iter()
+        .flat_map(|bundle| &bundle.messages)
+        .filter(|message| message["role"] == "tool")
+        .map(|message| serde_json::from_str(message["content"].as_str().unwrap()).unwrap())
+        .collect();
+    assert_eq!(outputs.len(), 2);
+    assert!(outputs[0]["data"]["outline"].is_array());
+    assert_eq!(outputs[1]["data"]["unchanged"], true);
+    assert!(outputs[1]["data"]["outline"].is_null());
+}
+
+#[tokio::test]
+async fn finished_bookkeeping_asks_for_the_final_answer() {
+    let (_dir, s) = verified_fixture();
+    let (result, guidance) = run_scripted(
+        s,
+        vec![Completion {
+            text: "Saved out.md".into(),
+            ..Default::default()
+        }],
+    )
+    .await;
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert_eq!(guidance[0]["ready_for_final"], true);
+    assert!(
+        guidance[0]["instruction"]
+            .as_str()
+            .unwrap()
+            .starts_with("Ready to finish")
+    );
+
+    // An unverified item keeps the ordinary guidance.
+    let (_dir, s, _) = fixture();
+    let (_, guidance) = run_scripted(
+        s,
+        vec![Completion {
+            text: "Saved out.md".into(),
+            ..Default::default()
+        }],
+    )
+    .await;
+    assert!(guidance[0]["ready_for_final"].is_null());
+}
+
+#[test]
+fn provider_usage_calibrates_estimated_token_counts() {
+    use mnemoarc::context::ContextManager;
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "unknown-provider-model".into(),
+            model_context: Some(140_000),
+            context_tokens: 140_000,
+            output_tokens: 12_000,
+            ..Default::default()
+        },
+    );
+    assert_eq!(ContextManager::token_ratio(&s), 1.0);
+    // Enough complete history groups to evict.
+    for i in 0..6 {
+        s.history.push(
+            vec![json!({"role":"user","content":format!("{i} {}", "context ".repeat(2000))})],
+            true,
+        );
+    }
+    let budget = ContextManager::input_budget(&s.config);
+    let request = budget * 85 / 100;
+    // Above the 80% high-water mark by the uncalibrated estimate.
+    let mut uncalibrated = s.clone();
+    assert!(ContextManager::prepare(&mut uncalibrated, request).unwrap());
+    // The provider measured 20% fewer tokens: the same request fits.
+    for _ in 0..3 {
+        ContextManager::record_usage(&mut s, 10_000, 8_000);
+    }
+    assert!((ContextManager::token_ratio(&s) - 0.8).abs() < 1e-9);
+    assert_eq!(ContextManager::calibrated(&s, 10_000), 8_000);
+    assert!(!ContextManager::prepare(&mut s, request).unwrap());
+    // The highest recent ratio wins, so a larger measurement is never hidden.
+    ContextManager::record_usage(&mut s, 10_000, 11_000);
+    assert!((ContextManager::token_ratio(&s) - 1.1).abs() < 1e-9);
+    // Known tokenizers are exact and never calibrated.
+    s.config.model = "gpt-4o".into();
+    ContextManager::record_usage(&mut s, 10_000, 5_000);
+    assert_eq!(ContextManager::token_ratio(&s), 1.0);
+}
+
+#[tokio::test]
+async fn rejected_review_asks_for_one_batched_repair() {
+    let (_dir, mut s, _) = fixture();
+    s.config.completion_review_enabled = false;
+    s.document_review.issues = vec![
+        "Flow: state the loop bound".into(),
+        "History: name the helper".into(),
+    ];
+    let (_, guidance) = run_scripted(
+        s,
+        vec![Completion {
+            text: "Saved out.md".into(),
+            ..Default::default()
+        }],
+    )
+    .await;
+    assert_eq!(guidance[0]["review_repair"]["findings"], 2);
+    assert!(
+        guidance[0]["instruction"]
+            .as_str()
+            .unwrap()
+            .starts_with("Review repair: fix ALL findings")
+    );
+
+    // Once repairs are verified, the final-answer guidance names the open
+    // findings so each one is confirmed before a costly re-review.
+    let (_dir, mut s) = verified_fixture();
+    s.document_review.issues = vec!["Flow: state the loop bound".into()];
+    let (_, guidance) = run_scripted(
+        s,
+        vec![Completion {
+            text: "Saved out.md".into(),
+            ..Default::default()
+        }],
+    )
+    .await;
+    assert_eq!(guidance[0]["ready_for_final"], true);
+    assert!(
+        guidance[0]["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("all 1 findings in document_review.issues")
+    );
+}
+
+#[tokio::test]
+async fn audits_during_review_repair_return_a_short_page() {
+    let (dir, mut s, _) = fixture();
+    s.config.completion_review_enabled = false;
+    s.config.source_document_review = false;
+    s.document_review.issues = vec!["Flow: fix citations".into()];
+    // Seven citations to a file that does not exist: seven audit issues.
+    let hash = tools::hash(&std::fs::read(dir.path().join("out.md")).unwrap());
+    let broken: String = (1..=7)
+        .map(|i| format!("Claim {i}. missing.js:{i}-{i}\n"))
+        .collect();
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":hash,"text":format!("\n# Extra\n{broken}")}),
+    )
+    .unwrap();
+    let (result, _) = run_scripted(
+        s,
+        vec![call("audit", "document_audit", json!({}))],
+    )
+    .await;
+    let output: Value = result
+        .history
+        .bundles
+        .iter()
+        .flat_map(|bundle| &bundle.messages)
+        .filter(|message| message["role"] == "tool")
+        .map(|message| serde_json::from_str(message["content"].as_str().unwrap()).unwrap())
+        .next()
+        .unwrap();
+    assert_eq!(output["data"]["compacted_for_review_repair"], true, "{output}");
+    assert_eq!(output["data"]["issues"].as_array().unwrap().len(), 5);
+    assert_eq!(output["data"]["next_offset"], 5);
+    assert!(output["data"]["issue_count"].as_u64().unwrap() > 5);
+}

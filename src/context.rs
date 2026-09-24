@@ -7,6 +7,8 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
+/// Provider/estimate ratios kept for calibration.
+const CALIBRATION_SAMPLES: usize = 8;
 /// Upper bound on a cleanup request's output (reasoning included).
 pub const CLEANUP_OUTPUT_CAP: usize = 16_384;
 pub const SYSTEM: &str = r#"You are MnemoArc, a single agent with session-local memory. Complete the user's task with evidence.
@@ -332,16 +334,43 @@ impl ContextManager {
                 .saturating_add(1024),
         )
     }
+    /// Record a provider-reported input size against the local estimate of
+    /// the same request. Only estimated tokenizers are calibrated.
+    pub fn record_usage(s: &mut Session, estimated: usize, actual: usize) {
+        if !is_estimated(&s.config.model) || estimated < 1_000 || actual == 0 {
+            return;
+        }
+        let ratio = (actual as f64 / estimated as f64).clamp(0.5, 1.5);
+        s.token_ratios.push_back(ratio);
+        while s.token_ratios.len() > CALIBRATION_SAMPLES {
+            s.token_ratios.pop_front();
+        }
+    }
+    /// Provider tokens per estimated token: the highest recent ratio, so a
+    /// calibrated size never undercounts what the provider recently measured.
+    /// The fallback tokenizer adds 25% headroom; without samples it stays.
+    pub fn token_ratio(s: &Session) -> f64 {
+        if !is_estimated(&s.config.model) {
+            return 1.0;
+        }
+        s.token_ratios.iter().copied().reduce(f64::max).unwrap_or(1.0)
+    }
+    pub fn calibrated(s: &Session, estimate: usize) -> usize {
+        (estimate as f64 * Self::token_ratio(s)).ceil() as usize
+    }
     pub fn prepare(s: &mut Session, request_tokens: usize) -> Result<bool> {
         if s.checkpoint.is_some() {
             return Ok(true);
         }
-        let budget = s
+        // Thresholds are converted into local-estimate units, so eviction
+        // arithmetic below stays consistent with the estimated group sizes.
+        let budget = (s
             .pending_config
             .as_ref()
             .map_or(Self::input_budget(&s.config), |c| {
                 Self::input_budget(c).min(Self::input_budget(&s.config))
-            });
+            }) as f64
+            / Self::token_ratio(s)) as usize;
         if request_tokens < (budget as f64 * s.config.high_water) as usize
             && s.history.bytes()
                 < s.pending_config

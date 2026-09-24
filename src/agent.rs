@@ -148,6 +148,95 @@ fn collect_gaps(s: &mut Session, extra: &[String]) -> Vec<String> {
     gaps
 }
 
+const READY_FOR_FINAL_INSTRUCTION: &str = "Ready to finish: every investigation item is verified or reported, no to-do remains and no review finding is open for this document version. Give the concise final answer now (output path, verification scope, remaining limitations). The runtime then runs the document review and completion checks and returns any finding as a repair. Do not inspect, audit or re-verify again unless you change the document.";
+
+const REVIEW_REPAIR_INSTRUCTION: &str = "Review repair: fix ALL findings in document_review.issues together. Read any source range a finding needs, then apply every correction in ONE document_edit_batch from the current document hash (operations apply in order), then run ONE verify_batch for the returned verification_required_ids, then give the final answer to start the re-review. Do not alternate single edits with document_audit or document_inspect; each separate edit invalidates verification again. Fix findings in their original sections; do not add a review-notes section.";
+
+/// A completed document review rejected the result and no re-review is
+/// running: the next work is repairing its findings.
+fn review_repair_pending(s: &Session) -> bool {
+    s.checkpoint.is_none()
+        && s.is_document_work()
+        && s.document_written
+        && !s.document_review.pending
+        && !s.document_review.issues.is_empty()
+        && !tools::document_review::approved(s)
+}
+
+/// During review repair an audit between edits needs only its verdict and a
+/// few issues; the full list is available by paging with offset.
+fn compact_repair_audit(s: &Session, call: &ToolCall, mut result: Value) -> Value {
+    const REPAIR_AUDIT_ISSUES: usize = 5;
+    if call.name != "document_audit" || result["status"] != "ok" || !review_repair_pending(s) {
+        return result;
+    }
+    if let Some(issues) = result["data"]["issues"].as_array_mut()
+        && issues.len() > REPAIR_AUDIT_ISSUES
+    {
+        let offset = serde_json::from_str::<Value>(&call.arguments)
+            .ok()
+            .and_then(|args| args["offset"].as_u64())
+            .unwrap_or(0) as usize;
+        issues.truncate(REPAIR_AUDIT_ISSUES);
+        result["data"]["next_offset"] = json!(offset + REPAIR_AUDIT_ISSUES);
+        result["data"]["compacted_for_review_repair"] = json!(true);
+    }
+    result
+}
+
+/// Document work whose own bookkeeping is finished: the next useful step is
+/// the final answer, which starts the runtime's review and acceptance checks.
+fn ready_for_final(s: &Session) -> bool {
+    s.checkpoint.is_none()
+        && s.is_document_work()
+        && s.document_written
+        && !s.investigations.is_empty()
+        && s.investigations.iter().all(|item| item.is_settled())
+        && s.task.current_todo().is_none()
+        && !s.document_review.pending
+        && !s.completion_review.pending
+        && !tools::document_review::rejected_on_current_result(s)
+        && s.completion_review
+            .checks
+            .iter()
+            .all(|check| check.status == "met")
+        && tools::verify_document_write(s).is_ok()
+}
+
+/// An outline or audit identical to one already in active context carries no
+/// new information. Return a short marker instead of the same payload, so a
+/// repeated check costs little context and does not look like progress.
+fn suppress_unchanged_repeat(
+    s: &Session,
+    pending: &[Value],
+    call: &ToolCall,
+    result: Value,
+) -> Value {
+    if !matches!(call.name.as_str(), "document_inspect" | "document_audit")
+        || result["status"] != "ok"
+        || !result["data"].is_object()
+    {
+        return result;
+    }
+    let seen = s
+        .history
+        .bundles
+        .iter()
+        .filter(|bundle| bundle.active)
+        .flat_map(|bundle| &bundle.messages)
+        .chain(pending)
+        .filter(|message| message["role"] == "tool")
+        .filter_map(|message| message["content"].as_str())
+        .filter_map(|content| serde_json::from_str::<Value>(content).ok())
+        .any(|prior| prior["status"] == "ok" && prior["data"] == result["data"]);
+    if !seen {
+        return result;
+    }
+    json!({"status":"ok","data":{"unchanged":true,"suppressed":true,
+        "hash":result["data"]["hash"],
+        "guidance":"Identical result is already in active context: the document and its evidence have not changed since. Use that result and act on it: edit, verify, or give the final answer. Do not repeat this check until something changes."}})
+}
+
 /// Abandon a pending review whose responses keep failing validation, for
 /// document work only. In closing mode the first failure is enough. The
 /// result then finishes without that review and reports it as unchecked.
@@ -1015,6 +1104,18 @@ pub async fn run_session_controlled(
         s.run_guidance["progress_recovery"]["rounds_since_progress"] = json!(stall_rounds);
         s.run_guidance["progress_recovery"]["closing_after"] =
             json!(closing_stall_limit(&s.config));
+        if s.progress_recovery.closing.is_none() && ready_for_final(&s) {
+            s.run_guidance["ready_for_final"] = json!(true);
+            let open = s.document_review.issues.len();
+            s.run_guidance["instruction"] = json!(if open > 0 {
+                format!("{READY_FOR_FINAL_INSTRUCTION} Before answering, confirm that all {open} findings in document_review.issues are fixed in the document: the re-review rechecks every one, and an unaddressed finding costs another full review.")
+            } else {
+                READY_FOR_FINAL_INSTRUCTION.to_owned()
+            });
+        } else if s.progress_recovery.closing.is_none() && review_repair_pending(&s) {
+            s.run_guidance["review_repair"] = json!({"findings":s.document_review.issues.len()});
+            s.run_guidance["instruction"] = json!(REVIEW_REPAIR_INSTRUCTION);
+        }
         if let Some(closing) = &s.progress_recovery.closing {
             s.run_guidance["closing"] = json!({"active":true,"reason":closing.reason,
                 "rounds":closing.rounds,"round_limit":CLOSING_ROUND_LIMIT,
@@ -1123,7 +1224,8 @@ pub async fn run_session_controlled(
             || reviewing_document
             || reviewing_answer
             || (s.checkpoint.is_none() && tools::answer_review::eligible(&s));
-        let request_tokens = context::count(&request, &s.config.model);
+        let raw_request_tokens = context::count(&request, &s.config.model);
+        let request_tokens = ContextManager::calibrated(&s, raw_request_tokens);
         // Reasoning models spend output tokens on reasoning too. Cleanup
         // requests use the bounded cleanup allowance that input_budget reserves.
         let mut request_config = s.config.clone();
@@ -1279,6 +1381,9 @@ pub async fn run_session_controlled(
                 .saturating_add(request_tokens.saturating_mul(completion.attempts - 1));
         }
         if let Some(u) = completion.usage {
+            if completion.attempts <= 1 {
+                ContextManager::record_usage(&mut s, raw_request_tokens, u.input);
+            }
             s.input_tokens = s.input_tokens.saturating_add(u.input);
             s.output_tokens = s.output_tokens.saturating_add(u.output);
             if let Some(c) = u.cached {
@@ -2200,6 +2305,8 @@ pub async fn run_session_controlled(
                     .min(s.config.result_tokens)
                     .max(200);
                 let result = tools::limit_result(&mut s, call, result, budget);
+                let result = suppress_unchanged_repeat(&s, &messages, call, result);
+                let result = compact_repair_audit(&s, call, result);
                 tools::record_delivered_read(&mut s, call, &result);
                 if result["status"] == "ok"
                     && [
@@ -2505,6 +2612,10 @@ pub fn apply_config(s: &mut Session, config: Config) -> Result<()> {
         > copy.config.context_tokens
     {
         bail!("New context budget requires checkpoint first; current settings retained");
+    }
+    if s.config.model != copy.config.model {
+        // Calibration samples describe the previous model's tokenizer.
+        s.token_ratios.clear();
     }
     s.config = copy.config;
     Ok(())
