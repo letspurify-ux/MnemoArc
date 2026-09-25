@@ -43,6 +43,42 @@ pub struct ReviewState {
     /// result is finished without approval and reported as unreviewed.
     #[serde(skip)]
     unavailable_hash: Option<String>,
+    /// Document passages each current finding quoted, as they appeared in the
+    /// reviewed document. A later finding that quotes only passages which
+    /// have since disappeared is about text that was already changed.
+    #[serde(skip)]
+    issue_quotes: Vec<Vec<String>>,
+}
+
+/// Quoted passages in a finding: text in '…', "…", ‘…’, “…”, `…` or 「…」,
+/// without a trailing ellipsis, at least 8 characters long.
+fn quoted_passages(issue: &str) -> Vec<String> {
+    const PAIRS: [(char, char); 6] = [
+        ('\'', '\''),
+        ('"', '"'),
+        ('‘', '’'),
+        ('“', '”'),
+        ('`', '`'),
+        ('「', '」'),
+    ];
+    let mut quotes = Vec::new();
+    for (open, close) in PAIRS {
+        let mut rest = issue;
+        while let Some(start) = rest.find(open) {
+            let after = &rest[start + open.len_utf8()..];
+            let Some(end) = after.find(close) else { break };
+            let quote = after[..end]
+                .trim()
+                .trim_end_matches('…')
+                .trim_end_matches("...")
+                .trim();
+            if quote.chars().count() >= 8 && !quotes.iter().any(|q| q == quote) {
+                quotes.push(quote.to_owned());
+            }
+            rest = &after[end + close.len_utf8()..];
+        }
+    }
+    quotes
 }
 
 fn requirements(s: &Session) -> String {
@@ -593,7 +629,21 @@ pub fn finish(s: &mut Session, text: &str) -> Result<()> {
     state.attempts += 1;
     state.pending = false;
     state.evidence_omitted = false;
-    let next_issues = std::mem::take(&mut state.page_issues);
+    let mut next_issues = std::mem::take(&mut state.page_issues);
+    // A reviewer asked to repeat unresolved findings may repeat one whose
+    // passage was already rewritten. Drop a finding only when every passage
+    // it quotes was document text at the previous review and is gone now;
+    // source quotes, loose paraphrases and still-present text are kept.
+    let doc = read_text(&output_path(&s.project)?)?;
+    let recorded: std::collections::BTreeSet<&String> =
+        state.issue_quotes.iter().flatten().collect();
+    next_issues.retain(|issue| {
+        let quotes = quoted_passages(issue);
+        quotes.is_empty()
+            || !quotes
+                .iter()
+                .all(|quote| recorded.contains(quote) && !doc.contains(quote.as_str()))
+    });
     if next_issues.is_empty() {
         state.stalled_attempts = 0;
         state.best_issue_count = Some(0);
@@ -623,8 +673,17 @@ pub fn finish(s: &mut Session, text: &str) -> Result<()> {
     state.last_reviewed_section_count = state.last_reviewed_section_count.max(sections);
     state.last_reviewed_content_lines = state.last_reviewed_content_lines.max(content_lines);
     state.last_reviewed_verified_count = state.last_reviewed_verified_count.max(verified);
+    state.issue_quotes = next_issues
+        .iter()
+        .map(|issue| {
+            quoted_passages(issue)
+                .into_iter()
+                .filter(|quote| doc.contains(quote.as_str()))
+                .collect()
+        })
+        .collect();
     state.issues = next_issues;
-    state.reviewed_sections = section_hashes(&read_text(&output_path(&s.project)?)?);
+    state.reviewed_sections = section_hashes(&doc);
     state.unavailable_hash = None;
     state.reviewed_requirements = state.target_requirements.clone();
     reset_pages(state);

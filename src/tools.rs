@@ -1864,6 +1864,17 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
     if let Some(spec) = ToolRegistry::specs().into_iter().find(|t| t.name == name)
         && let Some(fields) = args.as_object_mut()
     {
+        // For a read-only tool an explicit null optional argument means "not
+        // given"; models often spell every optional field out. Write tools
+        // keep rejecting it, since null there could mean "clear". A required
+        // argument stays and is reported by validation.
+        if spec.read_only {
+            let required = spec.parameters["required"].as_array();
+            fields.retain(|key, value| {
+                !value.is_null()
+                    || required.is_some_and(|required| required.iter().any(|r| r == key.as_str()))
+            });
+        }
         for (key, value) in &mut *fields {
             let kind = &spec.parameters["properties"][key]["type"];
             if *kind == "integer"
@@ -2461,6 +2472,25 @@ fn bind_written_sections(s: &mut Session, doc: &str) -> Vec<String> {
     written
 }
 
+/// The heading path an item names. An exact heading wins; otherwise the same
+/// safe fallback as planned sections applies (a unique level-free title or
+/// section number, such as the requested "1. …" for a written "## 1. …"),
+/// provided no other item uses that heading. Failing both, the original
+/// resolution error is returned.
+fn resolve_named_section(s: &Session, doc: &str, section: &str, id: &str) -> Result<String> {
+    match documentation::resolve_heading(doc, section) {
+        Ok(heading) => documentation::heading_path(doc, heading.start),
+        Err(error) => planned_heading(doc, section, "")
+            .filter(|path| {
+                !s.investigations.iter().any(|other| {
+                    other.id != id
+                        && resolved_section_path(doc, &other.section).as_ref() == Some(path)
+                })
+            })
+            .ok_or(error),
+    }
+}
+
 /// Verification may name the section of an item registered without one (or
 /// whose section no longer resolves), saving a separate upsert round. It
 /// never moves an item that already has a section, or takes another item's.
@@ -2471,8 +2501,8 @@ fn bind_verify_section(s: &mut Session, id: &str, section: &str) -> Result<()> {
         .iter()
         .find(|i| i.id == id)
         .ok_or_else(|| anyhow::anyhow!("item_not_found"))?;
-    let heading = documentation::resolve_heading(&doc, section)?;
-    let path = documentation::heading_path(&doc, heading.start)?;
+    let path = resolve_named_section(s, &doc, section, id)?;
+    let heading = documentation::resolve_heading(&doc, &path)?;
     if let Some(current) = resolved_section_path(&doc, &item.section) {
         if current == path {
             return Ok(());
@@ -3349,8 +3379,7 @@ fn execute_repaired(
                     {
                         item.section = path;
                     }
-                    let resolved = documentation::resolve_heading(&doc, &item.section)?;
-                    item.section = documentation::heading_path(&doc, resolved.start)?;
+                    item.section = resolve_named_section(s, &doc, &item.section, &id)?;
                 }
                 let registered = json!({"id":id,"status":item.status,"section":item.section});
                 if let Some(existing) = s.investigations.iter_mut().find(|i| i.id == id) {

@@ -294,6 +294,16 @@ impl OpenAiClient {
                 let v: Value = serde_json::from_str(&event)
                     .map_err(|e| anyhow::anyhow!("invalid_stream_event: {e}"))?;
                 if !v["error"].is_null() {
+                    // Gateways such as OpenRouter open the stream with 200 and
+                    // report an upstream overload or rate limit as an error
+                    // event. Classify it like the matching HTTP status so the
+                    // transient retry applies; other errors stay terminal.
+                    let code = v["error"]["code"]
+                        .as_u64()
+                        .or_else(|| v["error"]["code"].as_str().and_then(|c| c.parse().ok()));
+                    if code.is_some_and(|code| code == 429 || (500..600).contains(&code)) {
+                        bail!("provider_stream_error: {}", v["error"]);
+                    }
                     bail!("provider_error: {}", v["error"]);
                 }
                 if let Some(u) = v.get("usage").filter(|u| !u.is_null())

@@ -684,3 +684,59 @@ async fn silent_request_times_out_and_is_retried() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     server.abort();
 }
+
+#[tokio::test]
+async fn transient_error_events_in_a_stream_are_retried_and_others_are_not() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    for (error, retried) in [
+        // The live shape: OpenRouter relays an upstream overload as an event.
+        (
+            json!({"code":503,"message":"Upstream error from DigitalOcean","metadata":{"error_type":"provider_overloaded"}}),
+            true,
+        ),
+        (json!({"code":"429","message":"rate limited"}), true),
+        (json!({"code":400,"message":"bad request"}), false),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let count = counter.fetch_add(1, Ordering::SeqCst);
+                let body = if count == 0 {
+                    event(json!({"error":error}))
+                } else {
+                    format!(
+                        "{}data: [DONE]\n\n",
+                        event(
+                            json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]})
+                        )
+                    )
+                };
+                async move { ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response() }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = Config {
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            retries: 1,
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = OpenAiClient
+            .complete(json!({"messages":[]}), &c, CancellationToken::new(), tx)
+            .await;
+        if retried {
+            assert_eq!(result.unwrap().text, "OK");
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        } else {
+            assert!(result.unwrap_err().to_string().contains("provider_error"));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+        server.abort();
+    }
+}

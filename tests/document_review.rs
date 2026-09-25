@@ -1597,3 +1597,62 @@ async fn source_document_can_finish_after_stalled_reviews_or_many_rejected_final
         assert_eq!(s.document_review.attempts, 16);
     }
 }
+
+#[test]
+fn a_repeated_finding_about_rewritten_text_is_dropped() {
+    let (_dir, mut s) = fixture();
+    document_review::request(&mut s).unwrap();
+    // First review quotes a document passage and a source passage.
+    document_review::finish(
+        &mut s,
+        r#"{"issues":["Flow: 'A while loop runs work…' is wrong; the source uses 'for (let i = 0; i < 5'","Flow: add the history step 'A while loop runs work' with normalization"]}"#,
+    )
+    .unwrap();
+    assert_eq!(s.document_review.issues.len(), 2);
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":hash,"old_text":"A while loop runs work.","text":"A bounded for loop runs work."}),
+    )
+    .unwrap();
+    // The live shape: the re-review repeats the finding with the old quote.
+    // A finding that also quotes source text, or one without a quote, stays.
+    document_review::request(&mut s).unwrap();
+    document_review::finish(
+        &mut s,
+        r#"{"issues":["F2: Flow: add the history step 'A while loop runs work' with normalization","F1: Flow: 'A while loop runs work…' is wrong; the source uses 'for (let i = 0; i < 5'","Flow: normalization of history is not described"]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        s.document_review.issues,
+        [
+            "F1: Flow: 'A while loop runs work…' is wrong; the source uses 'for (let i = 0; i < 5'",
+            "Flow: normalization of history is not described"
+        ]
+    );
+    // A finding whose quoted passage is still in the document is kept.
+    document_review::request(&mut s).unwrap();
+    document_review::finish(
+        &mut s,
+        r#"{"issues":["F1: Flow: 'A bounded for loop runs work' omits the bound"]}"#,
+    )
+    .unwrap();
+    assert_eq!(s.document_review.issues.len(), 1);
+    // Once only the rewritten passage was flagged, dropping it approves.
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":hash,"old_text":"A bounded for loop runs work.","text":"A for loop runs work five times."}),
+    )
+    .unwrap();
+    document_review::request(&mut s).unwrap();
+    document_review::finish(
+        &mut s,
+        r#"{"issues":["F1: Flow: 'A bounded for loop runs work' omits the bound"]}"#,
+    )
+    .unwrap();
+    assert!(s.document_review.issues.is_empty());
+    assert!(document_review::approved(&s));
+}

@@ -2678,6 +2678,53 @@ fn verify_binds_the_section_of_an_item_registered_without_one() {
 }
 
 #[test]
+fn a_named_section_falls_back_to_the_unique_numbered_heading() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.rs"), numbered_source(4)).unwrap();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Manual\n## 1. 첫 화면과 질문 입력·전송\nBody a.rs:1\n## 2. 답변 읽기\nBody a.rs:2\n"}),
+    );
+    // The live shape: the section named as in the request, not as written.
+    let registered = run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"one","title":"One","section":"1. 첫 화면과 질문 입력·전송, 스트리밍 중 진행 표시와 중단","status":"written"}),
+    );
+    assert_eq!(
+        registered["section"],
+        "# Manual\n## 1. 첫 화면과 질문 입력·전송"
+    );
+    // verify takes the same fallback for an item without a section.
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"two","title":"Two","status":"in_progress"}),
+    );
+    let source = run(&mut s, "file_read", json!({"path":"a.rs"}))["source"]["id"].clone();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"two","section":"2. 답변 읽기: 표와 차트","source_ids":[source],"verification_note":"Compared a.rs:2"}),
+    );
+    let two = s.investigations.iter().find(|i| i.id == "two").unwrap();
+    assert_eq!(
+        (two.status.as_str(), two.section.as_str()),
+        ("verified", "# Manual\n## 2. 답변 읽기")
+    );
+    // A heading already used by another item is not taken; the original error remains.
+    let error = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"three","title":"Three","section":"1. 다른 이름","status":"written"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("section_not_found"), "{error}");
+}
+
+#[test]
 fn appended_heading_starts_a_new_line() {
     let (_dir, mut s) = setup();
     std::fs::write(&s.project.output, "# A\nFirst section ends here.").unwrap();

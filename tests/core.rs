@@ -1261,3 +1261,24 @@ fn an_invented_cursor_explains_how_to_page() {
     assert!(error.starts_with("invalid_cursor: "), "{error}");
     assert!(error.contains("copy next_cursor exactly"), "{error}");
 }
+
+#[test]
+fn explicit_null_optional_read_arguments_are_treated_as_omitted() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.js"), "button\n").unwrap();
+    let mut s = session(dir.path());
+    // The live shape: every optional field of a read-only tool spelled out,
+    // unused ones as null. Write tools keep rejecting null.
+    let result = tools::execute(
+        &mut s,
+        "source_search",
+        json!({"path":"a.js","query":"button","cursor":null,"queries":null,"limit":10}),
+    )
+    .unwrap();
+    assert!(result.to_string().contains("button"), "{result}");
+    // A required argument given as null is still reported.
+    let error = tools::execute(&mut s, "file_read", json!({"path":null}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("path"), "{error}");
+}
