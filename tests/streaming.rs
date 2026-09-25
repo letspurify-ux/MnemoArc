@@ -604,7 +604,9 @@ async fn request_timeout_bounds_silence_not_a_long_streaming_answer() {
                 let body = if i == 5 {
                     format!(
                         "{}data: [DONE]\n\n",
-                        event(json!({"choices":[{"delta":{"content":"."},"finish_reason":"stop"}]}))
+                        event(
+                            json!({"choices":[{"delta":{"content":"."},"finish_reason":"stop"}]})
+                        )
                     )
                 } else {
                     event(json!({"choices":[{"delta":{"content":"."}}]}))
@@ -655,7 +657,9 @@ async fn silent_request_times_out_and_is_retried() {
                     [(header::CONTENT_TYPE, "text/event-stream")],
                     format!(
                         "{}data: [DONE]\n\n",
-                        event(json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}))
+                        event(
+                            json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]})
+                        )
                     ),
                 )
                     .into_response()

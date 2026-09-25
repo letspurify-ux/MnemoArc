@@ -128,6 +128,22 @@ fn nested_outline_paths_select_repeated_titles_and_scope_text_edits() {
     );
     let beta_page = run(&mut s, "document_inspect", json!({"section":beta}));
     assert_eq!(beta_page["start_line"], 6);
+    // Lines of a path may mix full headings and bare titles.
+    for mixed in ["Guide\n## Beta\nShared", "# Guide\nBeta\n### Shared"] {
+        assert_eq!(
+            run(&mut s, "document_inspect", json!({"section":mixed}))["start_line"],
+            6
+        );
+    }
+    let error = tools::execute(
+        &mut s,
+        "document_inspect",
+        json!({"section":"Guide\n## Gamma"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("section_not_found:"), "{error}");
+
     assert_eq!(beta_page["section_path"], beta);
     let changed = run(
         &mut s,
@@ -669,6 +685,50 @@ fn audit_ignores_example_citations_inside_fenced_code() {
             .iter()
             .any(|i| i["kind"] == "citation_path")
     );
+}
+
+#[test]
+fn verify_names_source_ids_that_are_not_file_evidence() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    s.add_user("Document main.rs".into());
+    let user = s
+        .sources
+        .values()
+        .find(|source| source.origin == "user")
+        .unwrap()
+        .id
+        .clone();
+    let file = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Entry\nmain.rs:1\n"}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"entry","title":"entry","status":"written","section":"# Entry"}),
+    );
+    let error = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"entry","source_ids":[file, user],"verification_note":"Compared main.rs:1."}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("verification_sources_required:"),
+        "{error}"
+    );
+    assert!(error.contains(&format!("{user} (origin=user)")), "{error}");
+    assert!(!error.contains(file.as_str().unwrap()), "{error}");
+    let verified = run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"entry","source_ids":[file],"verification_note":"Compared main.rs:1."}),
+    );
+    assert_eq!(s.investigations[0].status, "verified", "{verified}");
 }
 
 #[test]
@@ -1862,6 +1922,56 @@ fn batch_failure_after_successful_edit_leaves_file_unchanged() {
 }
 
 #[test]
+fn patch_names_html_entities_in_old_text() {
+    let body = "# Doc\n`onClick={() => ask(x)}` & <b>\n";
+    for batch in [false, true] {
+        let (_dir, mut s) = setup();
+        std::fs::write(&s.project.output, body).unwrap();
+        let edit = json!({"action":"insert_after_text","old_text":"() =&gt; ask(x)}` &amp; &lt;b&gt;","text":" more"});
+        let error = if batch {
+            tools::execute(
+                &mut s,
+                "document_edit_batch",
+                json!({"expected_hash":tools::hash(body.as_bytes()),"edits":[edit]}),
+            )
+        } else {
+            let mut edit = edit;
+            edit["expected_hash"] = json!(tools::hash(body.as_bytes()));
+            tools::execute(&mut s, "document_edit", edit)
+        }
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("patch_target_must_match_once"), "{error}");
+        assert!(
+            error.contains("HTML entities (&lt;, &gt;, &amp;)"),
+            "{error}"
+        );
+        assert!(!error.contains("copy it exactly"), "{error}");
+        assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), body);
+    }
+
+    // A document that really contains the entity text still matches as written,
+    // and an unrelated miss keeps the generic message.
+    let (_dir, mut s) = setup();
+    let body = "# Doc\nuse &gt; here\n";
+    std::fs::write(&s.project.output, body).unwrap();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"patch","expected_hash":tools::hash(body.as_bytes()),"old_text":"use &gt; here","text":"done"}),
+    );
+    let body = std::fs::read_to_string(&s.project.output).unwrap();
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"patch","expected_hash":tools::hash(body.as_bytes()),"old_text":"missing &gt;","text":"x"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(!error.contains("HTML entities"), "{error}");
+}
+
+#[test]
 fn patch_rejects_overlapping_matches_and_handles_large_unique_text() {
     for (body, target) in [("aaa", "aa"), ("ééé", "éé"), ("ababa", "aba")] {
         for batch in [false, true] {
@@ -2000,7 +2110,9 @@ fn document_edits_reject_embedded_nul_bytes() {
 }
 
 fn numbered_source(lines: usize) -> String {
-    (1..=lines).map(|i| format!("let value_{i} = {i};\n")).collect()
+    (1..=lines)
+        .map(|i| format!("let value_{i} = {i};\n"))
+        .collect()
 }
 
 #[test]
@@ -2091,7 +2203,11 @@ fn delivered_evidence_of_an_older_file_version_is_not_reused() {
     assert!(error.starts_with("source_coverage_missing"), "{error}");
     assert!(error.contains("\"start_line\":11"), "{error}");
     assert_ne!(
-        s.investigations.iter().find(|i| i.id == "a").unwrap().status,
+        s.investigations
+            .iter()
+            .find(|i| i.id == "a")
+            .unwrap()
+            .status,
         "verified"
     );
 }
@@ -2123,6 +2239,341 @@ fn planned_section_names_rebind_to_the_written_heading_by_title() {
         "investigation",
         json!({"action":"verify","id":"flow","source_ids":[source],"verification_note":"Compared the three assignments"}),
     );
+}
+
+#[test]
+fn planned_sections_rebind_by_level_free_title_or_section_number() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.rs"), numbered_source(3)).unwrap();
+    // The shapes from a live run: planned as level-1 headings, written as
+    // level-2 headings, and the first one also reworded.
+    for (id, title, section) in [
+        (
+            "first",
+            "Start screen",
+            "# 1. First screen, streaming progress and stop",
+        ),
+        ("second", "Reading answers", "# 2. Reading answers"),
+        ("dup_a", "Admin A", "# 3. Admin"),
+        ("dup_b", "Admin B", "# 3. Admin panel"),
+        ("year", "Release", "# 2024 release"),
+    ] {
+        run(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":id,"title":title,"section":section,"status":"in_progress"}),
+        );
+    }
+    let edit = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Manual\n\n## 1. First screen, progress and stop\nBody a.rs:1\n\n## 2. Reading answers\nBody a.rs:2\n\n## 3. Admin settings\nBody a.rs:3\n\n## 2025 release\nBody\n"}),
+    );
+    assert_eq!(edit["written_items"], json!(["first", "second"]));
+    let section = |id: &str| {
+        s.investigations
+            .iter()
+            .find(|item| item.id == id)
+            .unwrap()
+            .section
+            .clone()
+    };
+    assert_eq!(
+        section("first"),
+        "# Manual\n## 1. First screen, progress and stop"
+    );
+    assert_eq!(section("second"), "# Manual\n## 2. Reading answers");
+    // Two items numbered 3 and a year are left for an explicit section.
+    assert_eq!(section("dup_a"), "# 3. Admin");
+    assert_eq!(section("dup_b"), "# 3. Admin panel");
+    assert_eq!(section("year"), "# 2024 release");
+
+    // Settling one duplicate by hand lets status=written alone bind nothing
+    // already claimed, and the reported error still lists the headings.
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"dup_a","section":"## 3. Admin settings","status":"written"}),
+    );
+    let error = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"dup_b","status":"written"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("section_not_found:"), "{error}");
+}
+
+#[test]
+fn written_status_alone_rebinds_a_planned_section() {
+    let (_dir, mut s) = setup();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"flow","title":"Flow","section":"# 4. Admin panel and binding edits","status":"in_progress"}),
+    );
+    // Written by hand so no document edit rebinds it first.
+    std::fs::write(&s.project.output, "# Manual\n## 4. Admin panel\nBody\n").unwrap();
+    let registered = run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"flow","status":"written"}),
+    );
+    assert_eq!(registered["section"], "# Manual\n## 4. Admin panel");
+}
+
+#[test]
+fn section_insert_errors_name_the_heading_that_breaks_the_rule() {
+    let body = "# Manual\n## 1. Start\nBody\n";
+    let cases = [
+        // The live-run shape: starts at the right level, then a sibling.
+        (
+            "### 1-1. Overview\ntext\n### 1-2. Details\nmore\n",
+            "line 3 of text starts another level-3 section \"### 1-2. Details\"",
+        ),
+        (
+            "#### Too deep\ntext\n",
+            "starts with level-4 \"#### Too deep\"",
+        ),
+        (
+            "Intro\n### Late\ntext\n",
+            "must start on its first line with a level-3 heading",
+        ),
+    ];
+    for (text, expected) in cases {
+        for batch in [false, true] {
+            let (_dir, mut s) = setup();
+            std::fs::write(&s.project.output, body).unwrap();
+            let edit = json!({"action":"insert_last_child","section":"## 1. Start","text":text});
+            let error = if batch {
+                tools::execute(
+                    &mut s,
+                    "document_edit_batch",
+                    json!({"expected_hash":tools::hash(body.as_bytes()),"edits":[edit]}),
+                )
+            } else {
+                let mut edit = edit;
+                edit["expected_hash"] = json!(tools::hash(body.as_bytes()));
+                tools::execute(&mut s, "document_edit", edit)
+            }
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("invalid_argument_value"), "{error}");
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), body);
+        }
+    }
+    // The live shape: re-inserting an existing heading beside itself to
+    // expand it names the duplicate instead of an ambiguous section.
+    for (action, section) in [
+        ("insert_after", "## 1. Start"),
+        ("insert_last_child", "# Manual"),
+    ] {
+        let (_dir, mut s) = setup();
+        std::fs::write(&s.project.output, body).unwrap();
+        let error = tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":action,"section":section,"expected_hash":tools::hash(body.as_bytes()),"text":"## 1. Start\nMore\n"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with(&format!("invalid_argument_value: {action} text starts with \"## 1. Start\", which already exists")),
+            "{error}"
+        );
+        assert!(error.contains("level-3 headings"), "{error}");
+    }
+    // Leading blank lines are dropped, and deeper nested headings inside the
+    // one section remain accepted.
+    let (_dir, mut s) = setup();
+    std::fs::write(&s.project.output, body).unwrap();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_last_child","section":"## 1. Start","expected_hash":tools::hash(body.as_bytes()),"text":"\n  \n### 1-1. Blank first\ntext\n"}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Manual\n## 1. Start\nBody\n### 1-1. Blank first\ntext\n"
+    );
+    let (_dir, mut s) = setup();
+    std::fs::write(&s.project.output, body).unwrap();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_last_child","section":"## 1. Start","expected_hash":tools::hash(body.as_bytes()),"text":"### 1-1. Overview\n#### Step\ntext\n"}),
+    );
+}
+
+#[test]
+fn audit_reports_cited_sections_without_an_investigation_item() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.rs"), numbered_source(6)).unwrap();
+    let doc = "# Manual\nIntro.\n## 1. Start\nBody a.rs:1-2\n## 2. Answers\nBody a.rs:3-4\n### 2-1. Tables\nMore a.rs:5\n## Notes\nNo citation here.\n";
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":doc}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"start","title":"Start","section":"## 1. Start","status":"written"}),
+    );
+    let source = run(&mut s, "file_read", json!({"path":"a.rs"}))["source"]["id"].clone();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"start","source_ids":[source],"verification_note":"Compared a.rs:1-2"}),
+    );
+    let uncovered = |s: &mut Session| -> Vec<Value> {
+        run(s, "document_audit", json!({}))["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|issue| issue["kind"] == "uncovered_section")
+            .cloned()
+            .collect()
+    };
+    // Each cited section names its innermost heading; the uncited one is
+    // not reported, and every item being settled does not hide the gap.
+    let issues = uncovered(&mut s);
+    assert_eq!(issues.len(), 2, "{issues:?}");
+    assert_eq!(issues[0]["section"], "# Manual\n## 2. Answers");
+    assert_eq!(
+        issues[1]["section"],
+        "# Manual\n## 2. Answers\n### 2-1. Tables"
+    );
+    assert_eq!(issues[1]["citations"], 1);
+    let check = run(&mut s, "investigation", json!({"action":"final_check"}));
+    assert_eq!(check["complete"], false, "{check}");
+    assert_eq!(check["audit"]["structural_ok"], false);
+
+    // An item on the parent section covers its child as well.
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"answers","title":"Answers","section":"## 2. Answers","status":"written"}),
+    );
+    assert!(uncovered(&mut s).is_empty());
+}
+
+#[test]
+fn revision_conflict_names_a_malformed_hash() {
+    for batch in [false, true] {
+        let (_dir, mut s) = setup();
+        let body = "# A\nOne.\n";
+        std::fs::write(&s.project.output, body).unwrap();
+        let real = tools::hash(body.as_bytes());
+        // The live shape: a retyped 65-character hash.
+        for (expected, message) in [
+            (format!("{real}c"), "got 65"),
+            (
+                "0".repeat(64),
+                "the document changed since this expected_hash",
+            ),
+        ] {
+            let edit = json!({"action":"replace_text","old_text":"One.","text":"Two."});
+            let error = if batch {
+                tools::execute(
+                    &mut s,
+                    "document_edit_batch",
+                    json!({"expected_hash":expected,"edits":[edit]}),
+                )
+            } else {
+                let mut edit = edit;
+                edit["expected_hash"] = json!(expected);
+                tools::execute(&mut s, "document_edit", edit)
+            }
+            .unwrap_err()
+            .to_string();
+            assert!(error.starts_with("document_revision_conflict:"), "{error}");
+            assert!(error.contains(message), "{error}");
+            assert!(
+                !error.contains(&real),
+                "the current hash is not handed out: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn array_arguments_sent_as_json_text_are_decoded() {
+    let (_dir, mut s) = setup();
+    let body = "# A\nOne.\n";
+    std::fs::write(&s.project.output, body).unwrap();
+    // The live shape: edits as the JSON text of the array.
+    let edits = json!([{"action":"replace_text","old_text":"One.","text":"Two."}]).to_string();
+    run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":tools::hash(body.as_bytes()),"edits":edits}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# A\nTwo.\n"
+    );
+    // Text that is not an array of that shape is still rejected.
+    let body = std::fs::read_to_string(&s.project.output).unwrap();
+    let error = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":tools::hash(body.as_bytes()),"edits":"{\"action\":\"append\"}"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("invalid_argument_type"), "{error}");
+}
+
+#[test]
+fn source_changed_names_the_source_and_output_document_reads() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.rs"), numbered_source(3)).unwrap();
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\nBody a.rs:1\n"}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"guide","title":"Guide","section":"# Guide","status":"written"}),
+    );
+    // The live shape: a read of the output document passed as evidence
+    // after the document was edited again.
+    let doc_read = run(&mut s, "file_read", json!({"path":"summary.md"}))["source"]["id"].clone();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":created["hash"],"old_text":"Body","text":"Text"}),
+    );
+    let verify = |s: &mut Session, id: &Value| {
+        tools::execute(
+            s,
+            "investigation",
+            json!({"action":"verify","id":"guide","source_ids":[id],"verification_note":"Compared a.rs:1"}),
+        )
+        .unwrap_err()
+        .to_string()
+    };
+    let error = verify(&mut s, &doc_read);
+    assert!(error.starts_with("source_changed:"), "{error}");
+    assert!(
+        error.contains("is a read of the output document"),
+        "{error}"
+    );
+    assert!(error.contains(doc_read.as_str().unwrap()), "{error}");
+    // A project file that changed names its ID and path.
+    let source = run(&mut s, "file_read", json!({"path":"a.rs"}))["source"]["id"].clone();
+    std::fs::write(dir.path().join("a.rs"), numbered_source(4)).unwrap();
+    let error = verify(&mut s, &source);
+    assert!(
+        error.starts_with(&format!("source_changed: {} (", source.as_str().unwrap())),
+        "{error}"
+    );
+    assert!(error.contains("a.rs) changed since it was read"), "{error}");
 }
 
 #[test]
@@ -2184,7 +2635,11 @@ fn batch_accepts_a_repeated_nested_expected_hash_and_rejects_conflicts() {
 #[test]
 fn batch_target_failures_say_why_old_text_did_not_match() {
     let (_dir, mut s) = setup();
-    std::fs::write(&s.project.output, "# A\nThe loop runs five times.\nIt stops.\n").unwrap();
+    std::fs::write(
+        &s.project.output,
+        "# A\nThe loop runs five times.\nIt stops.\n",
+    )
+    .unwrap();
     let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
     // edits[0] rewrites the sentence edits[1] was copied from.
     let error = tools::execute(
@@ -2197,7 +2652,10 @@ fn batch_target_failures_say_why_old_text_did_not_match() {
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("edits[0] in this same batch already changed it"), "{error}");
+    assert!(
+        error.contains("edits[0] in this same batch already changed it"),
+        "{error}"
+    );
     let error = tools::execute(
         &mut s,
         "document_edit_batch",
@@ -2217,7 +2675,10 @@ fn batch_target_failures_say_why_old_text_did_not_match() {
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("occurs") && error.contains("times"), "{error}");
+    assert!(
+        error.contains("occurs") && error.contains("times"),
+        "{error}"
+    );
     // Nothing was persisted by the failed batches.
     assert_eq!(
         tools::hash(&std::fs::read(&s.project.output).unwrap()),

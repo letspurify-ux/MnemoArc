@@ -175,7 +175,8 @@ fn bare_heading_title(heading: &str) -> &str {
     }
 }
 
-/// Full headings, unique bare titles, or newline-separated ancestor paths.
+/// Full headings, unique bare titles, or newline-separated ancestor paths
+/// whose lines may be either form.
 pub(super) fn resolve_heading(doc: &str, requested: &str) -> Result<Heading> {
     let requested = requested.trim();
     let headings = headings(doc);
@@ -199,7 +200,22 @@ pub(super) fn resolve_heading(doc: &str, requested: &str) -> Result<Heading> {
             bare_heading_title(&h.heading) == requested
         }
     };
-    let matching: Vec<_> = headings.iter().enumerate().filter(matches).collect();
+    let mut matching: Vec<_> = headings.iter().enumerate().filter(matches).collect();
+    // A path may mix full headings and bare titles line by line; compare bare
+    // titles only when the exact path found nothing.
+    if matching.is_empty() && is_path {
+        let requested: Vec<_> = requested_path.split('\n').map(bare_heading_title).collect();
+        matching = headings
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                paths[*index]
+                    .split('\n')
+                    .map(bare_heading_title)
+                    .eq(requested.iter().copied())
+            })
+            .collect();
+    }
     if matching.len() != 1 {
         let candidate_indices: Vec<_> = if matching.is_empty() {
             (0..headings.len()).take(8).collect()
@@ -439,6 +455,9 @@ pub(super) fn execute(
                     }
                 }
             }
+            if !s.investigations.is_empty() {
+                issues.extend(uncovered_sections(s, &doc)?);
+            }
             // The issue list includes source and investigation state as well
             // as document citations. Bind every continuation page to the
             // exact list that produced the first page.
@@ -474,6 +493,50 @@ pub(super) fn execute(
         }
         _ => bail!("unsupported_tool"),
     }
+}
+
+/// Sections whose citations no investigation item covers. Verification only
+/// compares the sections items point at, so a cited section without an item
+/// would otherwise pass unchecked. An item covers its section's descendants.
+fn uncovered_sections(s: &Session, doc: &str) -> Result<Vec<Value>> {
+    let headings = headings(doc);
+    let paths = heading_paths(&headings);
+    let covered: Vec<(usize, usize)> = s
+        .investigations
+        .iter()
+        .filter(|item| !item.section.trim().is_empty())
+        .filter_map(|item| resolve_heading(doc, &item.section).ok())
+        .map(|heading| (heading.start, heading.end))
+        .collect();
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(doc.match_indices('\n').map(|(index, _)| index + 1))
+        .collect();
+    let mut uncovered = std::collections::BTreeMap::<usize, usize>::new();
+    for citation in citation_spans(doc)? {
+        let Some(&offset) = line_starts.get(citation.document_line - 1) else {
+            continue;
+        };
+        if covered
+            .iter()
+            .any(|&(start, end)| start <= offset && offset < end)
+        {
+            continue;
+        }
+        // The innermost heading holding the citation names the section.
+        if let Some(index) = headings
+            .iter()
+            .rposition(|heading| heading.start <= offset && offset < heading.end)
+        {
+            *uncovered.entry(index).or_default() += 1;
+        }
+    }
+    Ok(uncovered
+        .into_iter()
+        .map(|(index, citations)| {
+            json!({"kind":"uncovered_section","section":paths[index],"citations":citations,
+                "next":"No investigation item covers this cited section. Register one with investigation upsert (section = this path, status=written), then verify it against its sources; or give an existing item a parent section that includes it."})
+        })
+        .collect())
 }
 
 /// Citations in prose and Mermaid are references; other fenced code is an example.

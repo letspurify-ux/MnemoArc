@@ -92,12 +92,15 @@ pub fn mark_unavailable(s: &mut Session) {
 }
 
 pub fn unavailable_on_current(s: &Session) -> bool {
-    s.document_review.unavailable_hash.as_deref().is_some_and(|target| {
-        output_path(&s.project)
-            .and_then(|p| read_text(&p))
-            .ok()
-            .is_some_and(|doc| hash(doc.as_bytes()) == target)
-    })
+    s.document_review
+        .unavailable_hash
+        .as_deref()
+        .is_some_and(|target| {
+            output_path(&s.project)
+                .and_then(|p| read_text(&p))
+                .ok()
+                .is_some_and(|doc| hash(doc.as_bytes()) == target)
+        })
 }
 
 /// Hash each heading's own body (up to the next heading of any level), keyed
@@ -249,7 +252,9 @@ fn request_with_restarts(s: &mut Session, restarts: usize) -> Result<Value> {
         payload["changed_sections"] = json!(
             current
                 .iter()
-                .filter(|(key, digest)| s.document_review.reviewed_sections.get(*key) != Some(*digest))
+                .filter(
+                    |(key, digest)| s.document_review.reviewed_sections.get(*key) != Some(*digest)
+                )
                 .map(|(key, _)| key.replace('\n', " > "))
                 .collect::<Vec<_>>()
         );

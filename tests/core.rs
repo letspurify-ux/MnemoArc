@@ -947,15 +947,14 @@ fn file_cursors_reject_mixed_ranges_changed_files_and_other_sessions() {
     }
     // A page size with a cursor changes nothing: the cursor continues its
     // original range and the ignored argument is reported.
-    let continued = tools::execute(
-        &mut s,
-        "file_read",
-        json!({"cursor":cursor,"max_lines":20}),
-    )
-    .unwrap();
+    let continued =
+        tools::execute(&mut s, "file_read", json!({"cursor":cursor,"max_lines":20})).unwrap();
     assert_eq!(continued["ignored_arguments"], json!(["max_lines"]));
     assert_eq!(continued["read_start"], result["data"]["read_start"]);
-    assert_eq!(continued["read_max_lines"], result["data"]["read_max_lines"]);
+    assert_eq!(
+        continued["read_max_lines"],
+        result["data"]["read_max_lines"]
+    );
     assert!(continued["read_offset"].as_u64().unwrap() > 0);
     let mut other = session(dir.path());
     assert!(
@@ -1150,4 +1149,98 @@ fn oversized_tool_error_keeps_cause_and_archive_for_recovery() {
     );
     assert_eq!(limited["next_cursor"]["tool"], "history");
     assert!(tools::result_tokens(&call, &limited, &s.config.model) <= 200);
+}
+
+#[test]
+fn leaked_native_tool_call_markup_is_split_into_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    // The live shape: the tags value and the title key fused into one key
+    // that holds the title, with and without an <arg_value> opener.
+    for (key, leaked) in [
+        (
+            "first",
+            r#"tags</arg_key> ["manual","frontend"]</arg_value><arg_key>title"#,
+        ),
+        (
+            "second",
+            r#"tags</arg_key><arg_value>["manual","frontend"]</arg_value><arg_key>title"#,
+        ),
+    ] {
+        let mut args = json!({"key":key,"summary":"s","body":"b","kind":"fact"});
+        args[leaked] = json!("Frontend facts");
+        tools::execute(&mut s, "memory_write", args).unwrap();
+        let memory = s.memory.get(key).unwrap();
+        assert_eq!(memory.title, "Frontend facts");
+        assert_eq!(memory.tags, ["manual", "frontend"]);
+    }
+    // A repaired call that still fails names the fields that did arrive, so
+    // the model resends the missing one instead of repeating the call.
+    s.active_tools = tools::ToolRegistry::optional_names();
+    let error = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","section</arg_key> \"1. Start\"</arg_value><arg_key>status":"in_progress"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("missing_argument: title"), "{error}");
+    assert!(
+        error.contains("only these fields were received: action, section, status"),
+        "{error}"
+    );
+    // An ordinary failure without leaked markup carries no such note.
+    let error = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","section":"1. Start","status":"in_progress"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(!error.contains("<arg_key>"), "{error}");
+    // A leaked value that disagrees with an explicit field is not dropped.
+    let error = tools::execute(
+        &mut s,
+        "memory_write",
+        json!({"key":"third","title":"Other","summary":"s","body":"b","kind":"fact",
+            "title</arg_key>Leaked</arg_value><arg_key>tags":["x"]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("conflicting_arguments: title"), "{error}");
+    // Markup that does not parse completely stays an unknown argument.
+    let error = tools::execute(
+        &mut s,
+        "memory_write",
+        json!({"key":"fourth","title":"t","summary":"s","body":"b","kind":"fact","tags</arg_key>[\"x\"]":"y"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("unknown_argument:"), "{error}");
+}
+
+#[test]
+fn type_errors_name_the_expected_and_received_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    // The live shape: patch as JavaScript-like text with an unquoted key.
+    let error = tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":"{completion:[\"check\"]}"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("invalid_argument_type: patch must be object, got string"),
+        "{error}"
+    );
+    assert!(error.contains("object keys need double quotes"), "{error}");
+    let error = tools::execute(&mut s, "task_state", json!({"action":"update","patch":3}))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "invalid_argument_type: patch must be object, got number"
+    );
 }

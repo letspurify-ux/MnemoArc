@@ -71,11 +71,12 @@ async fn registered_source_documentation() {
     let dir = tempfile::tempdir().unwrap();
     project.output = dir.path().join("generated.md");
     let mut session = Session::new(project, config);
-    session.add_user(
-        include_str!("fixtures/llm-agent-document-request.txt")
-            .trim()
-            .into(),
-    );
+    // MNEMOARC_LIVE_PROMPT_FILE swaps in another request against the same project.
+    let request = match std::env::var("MNEMOARC_LIVE_PROMPT_FILE") {
+        Ok(path) => std::fs::read_to_string(&path).expect("MNEMOARC_LIVE_PROMPT_FILE"),
+        Err(_) => include_str!("fixtures/llm-agent-document-request.txt").into(),
+    };
+    session.add_user(request.trim().into());
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
     let drain = tokio::spawn(async move {
         let mut first_write = None;
@@ -117,6 +118,28 @@ async fn registered_source_documentation() {
                                 }
                             }
                         }
+                        // A plan result can be status=ok yet change nothing;
+                        // log it so bookkeeping loops are visible.
+                        if message["role"] == "tool"
+                            && let Some(id) = message["tool_call_id"].as_str()
+                            && !seen_result_ids.contains(id)
+                            && let Some((name, arguments)) = call_signatures.get(id)
+                            && name == "task_plan"
+                            && let Some(result) = message["content"]
+                                .as_str()
+                                .and_then(|content| serde_json::from_str::<Value>(content).ok())
+                            && result["status"] == "ok"
+                        {
+                            let data = &result["data"];
+                            eprintln!(
+                                "[live] task_plan applied={} unchanged={} reason={} pending={} args={}",
+                                data["applied"],
+                                data["unchanged"],
+                                data["reason"].as_str().unwrap_or(""),
+                                data["plan"]["pending_count"],
+                                arguments.chars().take(200).collect::<String>()
+                            );
+                        }
                         if message["role"] == "tool"
                             && let Some(id) = message["tool_call_id"].as_str()
                             && seen_result_ids.insert(id.to_owned())
@@ -151,6 +174,19 @@ async fn registered_source_documentation() {
                                 clip(arguments, 200),
                                 clip(result["error"].as_str().unwrap_or(""), 300)
                             );
+                            // A partial batch hides each item's cause one level down.
+                            for item in result["data"]["results"].as_array().into_iter().flatten() {
+                                let nested = &item["result"];
+                                if nested["status"] != "ok" {
+                                    eprintln!(
+                                        "[live] tool_failure_item name={} id={} code={} error={}",
+                                        name,
+                                        item["id"].as_str().unwrap_or("?"),
+                                        nested["recovery"]["code"].as_str().unwrap_or("tool_error"),
+                                        clip(nested["error"].as_str().unwrap_or(""), 300)
+                                    );
+                                }
+                            }
                         }
                     }
                     if s.document_written && first_write.is_none() {
@@ -186,10 +222,10 @@ async fn registered_source_documentation() {
                             s.progress_recovery.rounds_since_best,
                             s.config.stall_round_limit * 3,
                             s.progress_recovery.best_score,
-                            s.progress_recovery
-                                .closing
-                                .as_ref()
-                                .map_or("none".to_owned(), |closing| format!("{}:{}", closing.reason, closing.rounds)),
+                            s.progress_recovery.closing.as_ref().map_or(
+                                "none".to_owned(),
+                                |closing| format!("{}:{}", closing.reason, closing.rounds)
+                            ),
                             s.progress_recovery.unrepaired_finals
                         );
                     }

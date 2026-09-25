@@ -231,7 +231,11 @@ async fn unchanged_review_is_reused_until_closing_reports_its_findings() {
         // finishes it and reports the unresolved findings instead of looping.
         assert_eq!(
             result.status,
-            if issues { "complete_with_gaps" } else { "complete" },
+            if issues {
+                "complete_with_gaps"
+            } else {
+                "complete"
+            },
             "{:?}",
             result.last_error
         );
@@ -256,7 +260,11 @@ async fn unchanged_review_is_reused_until_closing_reports_its_findings() {
         assert_eq!(deltas.len(), 1);
         // The final is the model's answer, or the runtime's report when the
         // budget ran out during closing; either way unresolved items are listed.
-        assert_eq!(deltas[0].contains("확인하지 못한 항목"), issues, "{deltas:?}");
+        assert_eq!(
+            deltas[0].contains("확인하지 못한 항목"),
+            issues,
+            "{deltas:?}"
+        );
         if !issues {
             assert_eq!(deltas[0], "Done");
         }
@@ -667,7 +675,11 @@ async fn failed_review_cannot_open_an_unbounded_repair_loop() {
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result = run_session(s, Arc::new(StallingRepair), CancellationToken::new(), tx).await;
     drain.await.unwrap();
-    assert_eq!(result.status, "complete_with_gaps", "{:?}", result.last_error);
+    assert_eq!(
+        result.status, "complete_with_gaps",
+        "{:?}",
+        result.last_error
+    );
     assert_eq!(result.document_review.attempts, 1);
     assert_eq!(result.document_review.stalled_attempts, 0);
     assert!(
@@ -1185,8 +1197,9 @@ async fn reads_and_verification_can_finish_even_at_the_edit_limit() {
     document_review::finish(&mut s, r#"{"issues":["Check the existing section"]}"#).unwrap();
     // A real correction creates a new target. Merely asking again must not
     // replace the rejected verdict for unchanged content with a random pass.
+    // It cites nothing, so no investigation item has to cover it.
     let expected = s.last_document_write.as_ref().unwrap().1.clone();
-    tools::execute(&mut s, "document_edit", json!({"action":"append","expected_hash":expected,"text":"# Bounds\nThe loop has a finite bound. main.js:3-5\n"})).unwrap();
+    tools::execute(&mut s, "document_edit", json!({"action":"append","expected_hash":expected,"text":"# Bounds\nThe loop has a finite bound.\n"})).unwrap();
     // This test exercises the edit cap across many reads, not checkpoint cleanup.
     s.config.context_tokens = 128_000;
     s.config.document_repair_limit = 2;

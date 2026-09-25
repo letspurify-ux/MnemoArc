@@ -460,7 +460,13 @@ async fn document_recovery_can_finish_after_focus_guidance_before_closing() {
             input_usage: 1000,
         });
         let (s, deltas) = run(s, client.clone()).await;
-        assert_eq!(s.status, "complete", "{:?}: {:?}", delay_name(delay), s.last_error);
+        assert_eq!(
+            s.status,
+            "complete",
+            "{:?}: {:?}",
+            delay_name(delay),
+            s.last_error
+        );
         assert!(s.completion_review.approved);
         assert!(s.task.current_todo().is_none());
         assert!(s.completion_gaps.is_empty());
@@ -511,7 +517,10 @@ async fn sustained_document_no_progress_finishes_with_reported_gaps() {
         // Closing starts after 3 x stall_round_limit requests without a better
         // result and finishes within its own request limit.
         let calls = *client.calls.lock().unwrap();
-        assert!((9..=9 + 12 + 2).contains(&calls), "{name}: {calls} requests");
+        assert!(
+            (9..=9 + 12 + 2).contains(&calls),
+            "{name}: {calls} requests"
+        );
         // The draft is reported as unfinished: either its to-do is still open
         // or, after bookkeeping-only completion, acceptance checks are unmet.
         assert!(

@@ -133,8 +133,15 @@ fn collect_gaps(s: &mut Session, extra: &[String]) -> Vec<String> {
             .collect();
         if !unmet.is_empty() {
             for check in unmet.iter().take(12) {
-                let status = if check.status == "unmet" { "미충족" } else { "확인 불가" };
-                gaps.push(format!("완료 조건 {} ({status}) — {}", check.id, check.reason));
+                let status = if check.status == "unmet" {
+                    "미충족"
+                } else {
+                    "확인 불가"
+                };
+                gaps.push(format!(
+                    "완료 조건 {} ({status}) — {}",
+                    check.id, check.reason
+                ));
             }
         } else if s.completion_review.unavailable {
             gaps.push("완료 조건 검증 — 검토 응답 오류로 검증을 마치지 못했습니다.".into());
@@ -154,6 +161,8 @@ fn collect_gaps(s: &mut Session, extra: &[String]) -> Vec<String> {
     }
     gaps
 }
+
+const PLAN_CLOSEOUT_INSTRUCTION: &str = "The document is written and every investigation item is settled; only the to-dos in plan_closeout remain, and the final answer is refused while any is open. Close them in ONE task_plan apply using plan_closeout.expected_revision: one operation per item in the listed order, complete with the actual observed result when its work is done, or remove with a reason when it is obsolete. complete must follow list order, because only the current item can complete. Do real work first only for an item whose result is truly missing. Then give the final answer.";
 
 const READY_FOR_FINAL_INSTRUCTION: &str = "Ready to finish: every investigation item is verified or reported, no to-do remains and no review finding is open for this document version. Give the concise final answer now (output path, verification scope, remaining limitations). The runtime then runs the document review and completion checks and returns any finding as a repair. Do not inspect, audit or re-verify again unless you change the document.";
 
@@ -194,12 +203,18 @@ fn compact_repair_audit(s: &Session, call: &ToolCall, mut result: Value) -> Valu
 /// Document work whose own bookkeeping is finished: the next useful step is
 /// the final answer, which starts the runtime's review and acceptance checks.
 fn ready_for_final(s: &Session) -> bool {
+    s.task.current_todo().is_none() && ready_except_plan(s)
+}
+
+/// Everything the final answer needs except that to-dos remain open. The
+/// final answer is refused until they close, and closing them one per request
+/// only spends rounds, so the runtime lists them for one batched update.
+fn ready_except_plan(s: &Session) -> bool {
     s.checkpoint.is_none()
         && s.is_document_work()
         && s.document_written
         && !s.investigations.is_empty()
         && s.investigations.iter().all(|item| item.is_settled())
-        && s.task.current_todo().is_none()
         && !s.document_review.pending
         && !s.completion_review.pending
         && !tools::document_review::rejected_on_current_result(s)
@@ -208,6 +223,17 @@ fn ready_for_final(s: &Session) -> bool {
             .iter()
             .all(|check| check.status == "met")
         && tools::verify_document_write(s).is_ok()
+}
+
+/// The open to-dos in order, bounded by one task_plan batch.
+fn plan_closeout(s: &Session) -> Value {
+    let pending: Vec<_> = s.task.todos.iter().filter(|item| !item.done).collect();
+    json!({
+        "expected_revision":s.task.plan_revision,
+        "pending_count":pending.len(),
+        "items":pending.iter().take(16).map(|item| json!({"id":item.id,"text":item.text})).collect::<Vec<_>>(),
+        "batch_limit":16
+    })
 }
 
 /// An outline or audit identical to one already in active context carries no
@@ -290,8 +316,7 @@ fn note_unrepaired_final(s: &mut Session) -> usize {
     recovery.unrepaired_finals
 }
 
-const REVIEW_UNAVAILABLE_NOTICE: &str =
-    "검토 응답이 반복해서 형식에 맞지 않아 이 결과의 검토를 생략하고, 완료 보고에 미검토로 표시합니다.";
+const REVIEW_UNAVAILABLE_NOTICE: &str = "검토 응답이 반복해서 형식에 맞지 않아 이 결과의 검토를 생략하고, 완료 보고에 미검토로 표시합니다.";
 
 fn finish_cause_text(cause: &str) -> &'static str {
     match cause {
@@ -330,7 +355,7 @@ fn gap_report(s: &Session, answer: Option<&str>, cause: Option<&str>) -> String 
 fn document_saved(s: &Session) -> bool {
     s.document_written
         && tools::document_content_shape(&s.project)
-        .is_ok_and(|(headings, content_lines)| content_lines > headings)
+            .is_ok_and(|(headings, content_lines)| content_lines > headings)
         && tools::verify_document_write(s).is_ok()
 }
 
@@ -1143,10 +1168,18 @@ pub async fn run_session_controlled(
             s.run_guidance["ready_for_final"] = json!(true);
             let open = s.document_review.issues.len();
             s.run_guidance["instruction"] = json!(if open > 0 {
-                format!("{READY_FOR_FINAL_INSTRUCTION} Before answering, confirm that all {open} findings in document_review.issues are fixed in the document: the re-review rechecks every one, and an unaddressed finding costs another full review.")
+                format!(
+                    "{READY_FOR_FINAL_INSTRUCTION} Before answering, confirm that all {open} findings in document_review.issues are fixed in the document: the re-review rechecks every one, and an unaddressed finding costs another full review."
+                )
             } else {
                 READY_FOR_FINAL_INSTRUCTION.to_owned()
             });
+        } else if s.progress_recovery.closing.is_none()
+            && s.task.current_todo().is_some()
+            && ready_except_plan(&s)
+        {
+            s.run_guidance["plan_closeout"] = plan_closeout(&s);
+            s.run_guidance["instruction"] = json!(PLAN_CLOSEOUT_INSTRUCTION);
         } else if s.progress_recovery.closing.is_none() && review_repair_pending(&s) {
             s.run_guidance["review_repair"] = json!({"findings":s.document_review.issues.len()});
             s.run_guidance["instruction"] = json!(REVIEW_REPAIR_INSTRUCTION);
@@ -1473,7 +1506,16 @@ pub async fn run_session_controlled(
                     s.last_error = Some(reason);
                     if abandon_failing_review(&mut s, review_response_failures) {
                         review_response_failures = 0;
-                        emit(&events, AgentEvent::Notice { session: s.id.clone(), text: REVIEW_UNAVAILABLE_NOTICE.into() }, &cancel, run_deadline(started, &s.config)).await;
+                        emit(
+                            &events,
+                            AgentEvent::Notice {
+                                session: s.id.clone(),
+                                text: REVIEW_UNAVAILABLE_NOTICE.into(),
+                            },
+                            &cancel,
+                            run_deadline(started, &s.config),
+                        )
+                        .await;
                         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
                         continue;
                     }
@@ -1576,7 +1618,16 @@ pub async fn run_session_controlled(
                     && abandon_failing_review(&mut s, review_response_failures)
                 {
                     review_response_failures = 0;
-                    emit(&events, AgentEvent::Notice { session: s.id.clone(), text: REVIEW_UNAVAILABLE_NOTICE.into() }, &cancel, run_deadline(started, &s.config)).await;
+                    emit(
+                        &events,
+                        AgentEvent::Notice {
+                            session: s.id.clone(),
+                            text: REVIEW_UNAVAILABLE_NOTICE.into(),
+                        },
+                        &cancel,
+                        run_deadline(started, &s.config),
+                    )
+                    .await;
                     snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
                     continue;
                 }
@@ -1808,7 +1859,10 @@ pub async fn run_session_controlled(
             // Closing mode gives a rejected final one repair turn. The next
             // final is accepted and every unresolved item is reported instead.
             let closing_attempt = if reviewing_completion {
-                s.progress_recovery.closing.as_ref().map(|c| c.final_attempts)
+                s.progress_recovery
+                    .closing
+                    .as_ref()
+                    .map(|c| c.final_attempts)
             } else {
                 s.progress_recovery.closing.as_mut().map(|closing| {
                     closing.final_attempts = closing.final_attempts.saturating_add(1);
@@ -1942,11 +1996,12 @@ pub async fn run_session_controlled(
                                     if s.progress_recovery.closing.is_none()
                                         && note_unrepaired_final(&mut s) >= UNREPAIRED_FINAL_LIMIT
                                     {
-                                        s.progress_recovery.closing = Some(crate::session::Closing {
-                                            reason: "review_unrepaired".into(),
-                                            final_attempts: 1,
-                                            ..Default::default()
-                                        });
+                                        s.progress_recovery.closing =
+                                            Some(crate::session::Closing {
+                                                reason: "review_unrepaired".into(),
+                                                final_attempts: 1,
+                                                ..Default::default()
+                                            });
                                         emit(&events, AgentEvent::Notice { session: s.id.clone(), text: "검토 지적을 반영하지 않은 채 최종 답변이 반복돼 마감 단계로 전환합니다. 남은 지적은 결과에 명시합니다.".into() }, &cancel, run_deadline(started, &s.config)).await;
                                     }
                                 } else {
@@ -2066,7 +2121,16 @@ pub async fn run_session_controlled(
                 s.document_review.pending = true;
                 s.status = "running".into();
                 s.last_error = None;
-                emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"Reviewing the corrected document once before closing.".into() }, &cancel, run_deadline(started, &s.config)).await;
+                emit(
+                    &events,
+                    AgentEvent::Notice {
+                        session: s.id.clone(),
+                        text: "Reviewing the corrected document once before closing.".into(),
+                    },
+                    &cancel,
+                    run_deadline(started, &s.config),
+                )
+                .await;
                 continue;
             }
             if s.status == "partial" && accept_gaps {
@@ -2103,7 +2167,11 @@ pub async fn run_session_controlled(
                 s.completion_gaps = collect_gaps(&mut s, &waived);
                 if !s.completion_gaps.is_empty() {
                     s.status = "complete_with_gaps".into();
-                    let cause = s.progress_recovery.closing.as_ref().map(|c| c.reason.clone());
+                    let cause = s
+                        .progress_recovery
+                        .closing
+                        .as_ref()
+                        .map(|c| c.reason.clone());
                     final_text = gap_report(&s, Some(&completion.text), cause.as_deref());
                     message["content"] = json!(final_text);
                 }

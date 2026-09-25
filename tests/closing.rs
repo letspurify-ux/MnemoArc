@@ -149,7 +149,13 @@ fn closing_mode_and_second_stall_stage_withhold_discovery_tools() {
 
     s.progress_recovery.closing = Some(Closing::default());
     let names = tool_names(&s);
-    for blocked in ["file_list", "source_search", "symbol_search", "code_outline", "memory_write"] {
+    for blocked in [
+        "file_list",
+        "source_search",
+        "symbol_search",
+        "code_outline",
+        "memory_write",
+    ] {
         assert!(!names.iter().any(|name| name == blocked), "{blocked}");
     }
     for kept in ["file_read", "document_edit", "investigation", "task_plan"] {
@@ -363,7 +369,10 @@ fn cleanup_output_reservation_is_bounded_so_large_outputs_keep_input_room() {
         output_tokens: 32_000,
         ..Default::default()
     };
-    assert_eq!(ContextManager::cleanup_output_tokens(&large), CLEANUP_OUTPUT_CAP);
+    assert_eq!(
+        ContextManager::cleanup_output_tokens(&large),
+        CLEANUP_OUTPUT_CAP
+    );
     // One full response plus three bounded cleanup rounds, not four outputs.
     let budget = ContextManager::input_budget(&large);
     assert!(budget > 130_000, "{budget}");
@@ -530,6 +539,53 @@ async fn finished_bookkeeping_asks_for_the_final_answer() {
     assert!(guidance[0]["ready_for_final"].is_null());
 }
 
+#[tokio::test]
+async fn open_todos_on_a_finished_document_are_closed_in_one_batch() {
+    let (_dir, mut s) = verified_fixture();
+    // The live shape: the document is done but three plan items remain,
+    // which previously cost a request each.
+    tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Read sources","Write sections","Verify sections"]}]}),
+    )
+    .unwrap();
+    let operations: Vec<Value> = ["T1", "T2", "T3"]
+        .iter()
+        .map(|id| json!({"op":"complete","id":id,"result":"Done in out.md"}))
+        .collect();
+    let (result, guidance) = run_scripted(
+        s,
+        vec![
+            call(
+                "closeout",
+                "task_plan",
+                json!({"action":"apply","expected_revision":1,"operations":operations}),
+            ),
+            Completion {
+                text: "Saved out.md".into(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await;
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    let closeout = &guidance[0]["plan_closeout"];
+    assert_eq!(closeout["expected_revision"], 1);
+    assert_eq!(closeout["pending_count"], 3);
+    assert_eq!(closeout["items"][0]["id"], "T1");
+    assert!(guidance[0]["ready_for_final"].is_null());
+    assert!(
+        guidance[0]["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("Close them in ONE task_plan apply")
+    );
+    // One batched update was enough: the next request is ready to finish.
+    assert_eq!(guidance[1]["ready_for_final"], true);
+    assert!(result.task.current_todo().is_none());
+}
+
 #[test]
 fn provider_usage_calibrates_estimated_token_counts() {
     use mnemoarc::context::ContextManager;
@@ -639,11 +695,7 @@ async fn audits_during_review_repair_return_a_short_page() {
         json!({"action":"append","expected_hash":hash,"text":format!("\n# Extra\n{broken}")}),
     )
     .unwrap();
-    let (result, _) = run_scripted(
-        s,
-        vec![call("audit", "document_audit", json!({}))],
-    )
-    .await;
+    let (result, _) = run_scripted(s, vec![call("audit", "document_audit", json!({}))]).await;
     let output: Value = result
         .history
         .bundles
@@ -653,7 +705,10 @@ async fn audits_during_review_repair_return_a_short_page() {
         .map(|message| serde_json::from_str(message["content"].as_str().unwrap()).unwrap())
         .next()
         .unwrap();
-    assert_eq!(output["data"]["compacted_for_review_repair"], true, "{output}");
+    assert_eq!(
+        output["data"]["compacted_for_review_repair"], true,
+        "{output}"
+    );
     assert_eq!(output["data"]["issues"].as_array().unwrap().len(), 5);
     assert_eq!(output["data"]["next_offset"], 5);
     assert!(output["data"]["issue_count"].as_u64().unwrap() > 5);
@@ -686,7 +741,10 @@ fn closing_without_a_document_withholds_reading_until_it_is_written() {
     let error = tools::execute(&mut s, "file_read", json!({"path":"main.js"}))
         .unwrap_err()
         .to_string();
-    assert!(error.contains("withheld until the document is saved"), "{error}");
+    assert!(
+        error.contains("withheld until the document is saved"),
+        "{error}"
+    );
     tools::execute(
         &mut s,
         "document_edit",
@@ -744,8 +802,7 @@ async fn reading_new_sources_before_the_first_write_is_progress() {
     assert!(
         result.document_written,
         "{:?} {:?}",
-        result.status,
-        result.last_error
+        result.status, result.last_error
     );
     assert!(
         guidance.iter().take(13).all(|g| g["closing"].is_null()),
@@ -792,7 +849,13 @@ async fn discovery_tools_stay_available_until_the_document_exists() {
     // Wrong guesses first (no new evidence), then real distinct reads: both
     // stretches exceed the stall limit before any document is written.
     let mut steps: Vec<Completion> = (0..5)
-        .map(|i| call(&format!("guess-{i}"), "file_read", json!({"path":format!("backend/agent{i}.py")})))
+        .map(|i| {
+            call(
+                &format!("guess-{i}"),
+                "file_read",
+                json!({"path":format!("backend/agent{i}.py")}),
+            )
+        })
         .collect();
     steps.extend((0..6).map(|i| {
         call(
@@ -862,8 +925,16 @@ fn missing_paths_suggest_similar_project_files_and_directories_list_entries() {
 fn source_search_accepts_a_directory_as_its_scope() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("backend/src")).unwrap();
-    std::fs::write(dir.path().join("backend/src/server.js"), "app.post('/api/chat', chat);\n").unwrap();
-    std::fs::write(dir.path().join("other.js"), "app.post('/api/chat', other);\n").unwrap();
+    std::fs::write(
+        dir.path().join("backend/src/server.js"),
+        "app.post('/api/chat', chat);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("other.js"),
+        "app.post('/api/chat', other);\n",
+    )
+    .unwrap();
     let mut s = Session::new(
         Project {
             root: dir.path().into(),
@@ -880,7 +951,12 @@ fn source_search_accepts_a_directory_as_its_scope() {
     .unwrap();
     let matches = result["matches"].as_array().unwrap();
     assert_eq!(matches.len(), 1, "{result}");
-    assert!(matches[0]["path"].as_str().unwrap().ends_with("backend/src/server.js"));
+    assert!(
+        matches[0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("backend/src/server.js")
+    );
 }
 
 #[test]
@@ -908,15 +984,14 @@ fn list_cursor_keeps_its_scope_when_the_glob_is_omitted() {
     assert_eq!(first["total_files"], 120);
     let cursor = first["next_cursor"].as_str().unwrap().to_owned();
     // The continuation drops path_glob, as the live model did.
-    let second = tools::execute(
-        &mut s,
-        "file_list",
-        json!({"mode":"paths","cursor":cursor}),
-    )
-    .unwrap();
+    let second =
+        tools::execute(&mut s, "file_list", json!({"mode":"paths","cursor":cursor})).unwrap();
     let rest = second["paths"].as_array().unwrap();
     assert_eq!(rest.len(), 20);
-    assert!(rest.iter().all(|path| path.as_str().unwrap().starts_with("src/")));
+    assert!(
+        rest.iter()
+            .all(|path| path.as_str().unwrap().starts_with("src/"))
+    );
     // A different explicit scope is a real mismatch, explained as such.
     let error = tools::execute(
         &mut s,
@@ -943,15 +1018,22 @@ async fn repeated_final_answers_on_an_unrepaired_review_close_the_run() {
             text: r#"{"issues":["Flow: state that the loop runs five times"]}"#.into(),
             ..Default::default()
         },
-        final_answer(),                                  // rejected, unchanged (1)
+        final_answer(), // rejected, unchanged (1)
         call("read-1", "file_read", json!({"path":"main.js"})), // forced step
-        final_answer(),                                  // rejected, unchanged (2) -> closing
+        final_answer(), // rejected, unchanged (2) -> closing
         call("read-2", "file_read", json!({"path":"main.js"})), // forced step
-        final_answer(),                                  // accepted with reported gaps
+        final_answer(), // accepted with reported gaps
     ];
     let (result, guidance, offered) = run_scripted_tools(s, steps).await;
-    assert_eq!(result.status, "complete_with_gaps", "{:?}", result.last_error);
-    assert_eq!(result.progress_recovery.closing.as_ref().unwrap().reason, "review_unrepaired");
+    assert_eq!(
+        result.status, "complete_with_gaps",
+        "{:?}",
+        result.last_error
+    );
+    assert_eq!(
+        result.progress_recovery.closing.as_ref().unwrap().reason,
+        "review_unrepaired"
+    );
     assert!(
         result
             .completion_gaps
@@ -963,9 +1045,21 @@ async fn repeated_final_answers_on_an_unrepaired_review_close_the_run() {
     // The forced step after a rejected final offers repair tools only.
     for forced in [3, 5] {
         let names = &offered[forced];
-        assert!(names.iter().any(|name| name == "document_edit_batch"), "{names:?}");
-        for trivial in ["task_plan", "task_state", "document_inspect", "document_audit", "history"] {
-            assert!(!names.iter().any(|name| name == trivial), "{trivial} offered: {names:?}");
+        assert!(
+            names.iter().any(|name| name == "document_edit_batch"),
+            "{names:?}"
+        );
+        for trivial in [
+            "task_plan",
+            "task_state",
+            "document_inspect",
+            "document_audit",
+            "history",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == trivial),
+                "{trivial} offered: {names:?}"
+            );
         }
     }
     assert!(guidance[6]["closing"]["active"] == true);
@@ -1019,9 +1113,10 @@ async fn a_fix_made_after_closing_on_an_unrepaired_review_is_reviewed_again() {
         ..Default::default()
     };
     let path = dir.path().join("out.md");
-    let fixed = std::fs::read_to_string(&path)
-        .unwrap()
-        .replace("A for loop runs work five times.", "A for loop runs work exactly five times.");
+    let fixed = std::fs::read_to_string(&path).unwrap().replace(
+        "A for loop runs work five times.",
+        "A for loop runs work exactly five times.",
+    );
     let steps = vec![
         final_answer(),
         Completion {
@@ -1045,7 +1140,11 @@ async fn a_fix_made_after_closing_on_an_unrepaired_review_is_reviewed_again() {
         final_answer(),
     ];
     let (result, _, _) = run_scripted_tools(s, steps).await;
-    assert_eq!(result.document_review.attempts, 2, "{:?}", result.last_error);
+    assert_eq!(
+        result.document_review.attempts, 2,
+        "{:?}",
+        result.last_error
+    );
     assert!(document_review::approved(&result));
     assert!(
         !result
@@ -1161,7 +1260,10 @@ async fn an_output_limit_truncation_withholds_whole_document_writes() {
         .find(|tool| tool["function"]["name"] == "document_edit")
         .unwrap();
     let actions = edit["function"]["parameters"]["properties"]["action"]["enum"].clone();
-    assert!(!actions.as_array().unwrap().iter().any(|a| a == "write"), "{actions}");
+    assert!(
+        !actions.as_array().unwrap().iter().any(|a| a == "write"),
+        "{actions}"
+    );
     assert!(actions.as_array().unwrap().iter().any(|a| a == "section"));
     let path = dir.path().join("out.md");
     let hash = tools::hash(&std::fs::read(&path).unwrap());
@@ -1210,7 +1312,14 @@ fn repair_reverification_counts_as_fresh_progress() {
         json!({"action":"replace_text","expected_hash":hash,"old_text":"A for loop runs work five times.","text":"A for loop runs work exactly five times."}),
     )
     .unwrap();
-    assert_ne!(s.investigations.iter().find(|i| i.id == "flow").unwrap().status, "verified");
+    assert_ne!(
+        s.investigations
+            .iter()
+            .find(|i| i.id == "flow")
+            .unwrap()
+            .status,
+        "verified"
+    );
     verify(&mut s, "flow");
     assert_eq!(s.progress_recovery.verification_events, 2);
 }

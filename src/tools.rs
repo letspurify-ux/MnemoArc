@@ -751,7 +751,28 @@ impl ToolRegistry {
                 _ => true,
             };
             if !valid {
-                bail!("invalid_argument_type: {k}");
+                let expected = field["type"].as_str().unwrap_or("value");
+                let actual = match v {
+                    Value::Null => "null",
+                    Value::Bool(_) => "boolean",
+                    Value::Number(_) => "number",
+                    Value::String(_) => "string",
+                    Value::Array(_) => "array",
+                    Value::Object(_) => "object",
+                };
+                // Text that should have been structured JSON is the common
+                // case; name why it could not be taken as that value.
+                let hint = match (expected, v.as_str()) {
+                    ("array" | "object", Some(raw)) => match serde_json::from_str::<Value>(raw) {
+                        Err(error) => format!(
+                            "; send it as a JSON {expected}, not as text (the text is not valid JSON: {error}; object keys need double quotes)"
+                        ),
+                        Ok(_) => format!("; send it as a JSON {expected}, not as text"),
+                    },
+                    ("array", None) if actual == "array" => "; every item must be a string".into(),
+                    _ => String::new(),
+                };
+                bail!("invalid_argument_type: {k} must be {expected}, got {actual}{hint}");
             }
             if let Some(values) = field["enum"].as_array()
                 && !values.contains(v)
@@ -906,17 +927,77 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Some providers leak a model's native `<arg_key>k</arg_key><arg_value>v</arg_value>`
+/// tool-call markup into one JSON key, e.g. `tags</arg_key>["a"]</arg_value><arg_key>title`
+/// holding the title. Split such a key back into its arguments; a key that
+/// does not parse completely is left for normal validation to reject.
+/// Returns whether any key was repaired.
+fn repair_leaked_argument_markup(args: &mut Value) -> Result<bool> {
+    fn split(key: &str) -> Option<Vec<(String, Option<Value>)>> {
+        let mut pairs = Vec::new();
+        let mut rest = key;
+        while let Some((name, after)) = rest.split_once("</arg_key>") {
+            let after = after.trim_start();
+            let after = after.strip_prefix("<arg_value>").unwrap_or(after);
+            let (value, next) = after.split_once("</arg_value>")?;
+            let value = value.trim();
+            let value = serde_json::from_str(value).unwrap_or_else(|_| json!(value));
+            pairs.push((name.trim().to_owned(), Some(value)));
+            rest = next.trim_start().strip_prefix("<arg_key>")?;
+        }
+        pairs.push((rest.trim().to_owned(), None));
+        pairs
+            .iter()
+            .all(|(name, _)| !name.is_empty() && !name.contains(['<', '>']))
+            .then_some(pairs)
+    }
+    let Some(object) = args.as_object_mut() else {
+        return Ok(false);
+    };
+    let mut repaired = false;
+    let leaked: Vec<String> = object
+        .keys()
+        .filter(|key| key.contains("</arg_key>"))
+        .cloned()
+        .collect();
+    for key in leaked {
+        let Some(pairs) = split(&key) else {
+            continue;
+        };
+        let last = object.remove(&key).expect("leaked key present");
+        repaired = true;
+        for (name, value) in pairs {
+            let value = value.unwrap_or_else(|| last.clone());
+            match object.get(&name) {
+                Some(existing) if *existing != value => bail!(
+                    "conflicting_arguments: {name} was sent twice with different values (once inside leaked <arg_key> markup); pass each argument once as a JSON field"
+                ),
+                Some(_) => {}
+                None => {
+                    object.insert(name, value);
+                }
+            }
+        }
+    }
+    Ok(repaired)
+}
+
 /// Accept argument names models commonly use for an unambiguous meaning.
 /// A conflicting pair is still rejected so no value is silently dropped.
 fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Result<()> {
-    fn rename(object: &mut serde_json::Map<String, Value>, alias: &str, key: &str, at: &str) -> Result<()> {
+    fn rename(
+        object: &mut serde_json::Map<String, Value>,
+        alias: &str,
+        key: &str,
+        at: &str,
+    ) -> Result<()> {
         let Some(value) = object.remove(alias) else {
             return Ok(());
         };
         match object.get(key) {
-            Some(existing) if *existing != value => bail!(
-                "conflicting_arguments: {at}{alias} and {at}{key} differ; pass only {key}"
-            ),
+            Some(existing) if *existing != value => {
+                bail!("conflicting_arguments: {at}{alias} and {at}{key} differ; pass only {key}")
+            }
             Some(_) => {}
             None => {
                 object.insert(key.into(), value);
@@ -956,7 +1037,10 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
                 let section = section.trim();
                 let same = !section.is_empty()
                     && (registered.trim() == section
-                        || registered.lines().last().is_some_and(|last| last.trim() == section));
+                        || registered
+                            .lines()
+                            .last()
+                            .is_some_and(|last| last.trim() == section));
                 if same {
                     args.as_object_mut().unwrap().remove("section");
                 }
@@ -976,7 +1060,9 @@ fn hoist_batch_expected_hash(args: &mut Value) -> Result<()> {
     };
     let mut nested: Option<Value> = None;
     for (index, edit) in edits.iter_mut().enumerate() {
-        let Some(value) = edit.as_object_mut().and_then(|object| object.remove("expected_hash"))
+        let Some(value) = edit
+            .as_object_mut()
+            .and_then(|object| object.remove("expected_hash"))
         else {
             continue;
         };
@@ -1166,6 +1252,10 @@ fn batch_target_hint(states: &[String], edit: &Value, error: &str) -> String {
     let Some(target) = edit["old_text"].as_str().filter(|t| !t.is_empty()) else {
         return String::new();
     };
+    // The operation's own error already names the cause.
+    if error.contains("HTML entities") {
+        return String::new();
+    }
     let current = states.last().map_or("", String::as_str);
     let count = current.matches(target).count();
     if count > 1 {
@@ -1174,8 +1264,8 @@ fn batch_target_hint(states: &[String], edit: &Value, error: &str) -> String {
         );
     }
     // Present in the original but removed by an earlier operation here.
-    if let Some(changed_by) = (1..states.len())
-        .find(|&k| states[k - 1].contains(target) && !states[k].contains(target))
+    if let Some(changed_by) =
+        (1..states.len()).find(|&k| states[k - 1].contains(target) && !states[k].contains(target))
     {
         return format!(
             ". old_text existed in the original document but edits[{}] in this same batch already changed it; operations apply in order, so copy old_text from the text after that edit, merge the two corrections, or send them as separate requests",
@@ -1185,11 +1275,31 @@ fn batch_target_hint(states: &[String], edit: &Value, error: &str) -> String {
     ". old_text is not in the current document; copy it exactly (including spacing and line breaks) from document_inspect or file_read of the output".into()
 }
 
+/// A stale hash means the document changed; a malformed one was never issued
+/// by a tool, so rereading alone would not tell the model what went wrong.
+fn revision_conflict(args: &Value) -> anyhow::Error {
+    let expected = args["expected_hash"].as_str().unwrap_or("");
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return anyhow::anyhow!(
+            "document_revision_conflict: expected_hash is not a document hash (a SHA-256 hash is 64 hex characters; got {}); copy the hash field exactly from the latest document_inspect or document_edit result instead of retyping it",
+            expected.chars().count()
+        );
+    }
+    anyhow::anyhow!(
+        "document_revision_conflict: the document changed since this expected_hash; read output and retry with its current hash"
+    )
+}
+
 fn unique_document_text_span(old: &str, target: &str) -> Result<(usize, usize)> {
     if target.is_empty() {
         bail!("patch_target_must_match_once");
     }
     let Some(first) = old.find(target) else {
+        if let Some(entities) = html_escaped_target(old, target) {
+            bail!(
+                "patch_target_must_match_once: old_text contains HTML entities ({entities}) but the document has the literal characters; send old_text and text unescaped (for example => instead of =&gt;)"
+            );
+        }
         bail!("patch_target_must_match_once");
     };
     // Start one Unicode character after the first match so overlapping
@@ -1199,6 +1309,29 @@ fn unique_document_text_span(old: &str, target: &str) -> Result<(usize, usize)> 
         bail!("patch_target_must_match_once");
     }
     Ok((first, first + target.len()))
+}
+
+/// Entities in a target that only matches once they are decoded.
+fn html_escaped_target(old: &str, target: &str) -> Option<String> {
+    const ENTITIES: [(&str, &str); 6] = [
+        ("&lt;", "<"),
+        ("&gt;", ">"),
+        ("&quot;", "\""),
+        ("&#39;", "'"),
+        ("&#x27;", "'"),
+        ("&amp;", "&"),
+    ];
+    let found: Vec<&str> = ENTITIES
+        .iter()
+        .filter(|(entity, _)| target.contains(entity))
+        .map(|(entity, _)| *entity)
+        .collect();
+    let decoded = ENTITIES
+        .iter()
+        .fold(target.to_owned(), |text, (entity, raw)| {
+            text.replace(entity, raw)
+        });
+    (!found.is_empty() && old.contains(&decoded)).then(|| found.join(", "))
 }
 
 fn line_delimiter_at(text: &str, position: usize) -> &str {
@@ -1232,6 +1365,14 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
         }
         "append" => Ok(format!("{old}{new}")),
         "insert_before" | "insert_after" | "insert_first_child" | "insert_last_child" => {
+            // Blank lines before the heading carry no content; drop them so
+            // the section still starts on its first line.
+            let mut new = new;
+            while let Some((line, rest)) = new.split_once('\n')
+                && line.trim().is_empty()
+            {
+                new = rest;
+            }
             let anchor = documentation::resolve_heading(old, text(args, "section")?)?;
             let new_headings = documentation::headings(new);
             let child = matches!(action, "insert_first_child" | "insert_last_child");
@@ -1241,16 +1382,38 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                 );
             }
             let required_level = anchor.level + usize::from(child);
-            if new_headings
-                .first()
-                .is_none_or(|heading| heading.start != 0 || heading.level != required_level)
-                || new_headings
-                    .iter()
-                    .skip(1)
-                    .any(|heading| heading.level <= required_level)
+            let hashes = "#".repeat(required_level);
+            // Name the heading that breaks the rule; the generic rule alone
+            // reads as wrong when the text does start at the right level.
+            match new_headings.first() {
+                Some(first) if first.start == 0 && first.level == required_level => {}
+                Some(first) if first.start == 0 => bail!(
+                    "invalid_argument_value: {action} text must start with a level-{required_level} heading ({hashes} ...), but it starts with level-{} {:?}",
+                    first.level,
+                    first.heading
+                ),
+                _ => bail!(
+                    "invalid_argument_value: {action} text must start on its first line with a level-{required_level} heading ({hashes} ...); remove any text or blank line before it"
+                ),
+            }
+            if let Some(extra) = new_headings
+                .iter()
+                .skip(1)
+                .find(|heading| heading.level <= required_level)
             {
+                let nest = if required_level < 6 {
+                    format!(
+                        ", or make nested headings level {} or deeper",
+                        required_level + 1
+                    )
+                } else {
+                    String::new()
+                };
                 bail!(
-                    "invalid_argument_value: {action} text must contain one section starting with a level-{required_level} heading"
+                    "invalid_argument_value: {action} text must contain one section starting with a level-{required_level} heading, but line {} of text starts another level-{} section {:?}; insert each section with its own operation{nest}",
+                    extra.line,
+                    extra.level,
+                    extra.heading
                 );
             }
             let position = match action {
@@ -1277,7 +1440,16 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             }
             let candidate = format!("{}{}{}", prefix, inserted, &old[position..]);
             let path = documentation::heading_path(&candidate, inserted_start)?;
-            documentation::resolve_heading(&candidate, &path)?;
+            // The only way the new heading's path repeats is that the same
+            // heading already exists there. Reporting it as an ambiguous
+            // section argument would point at the wrong mistake.
+            if documentation::resolve_heading(&candidate, &path).is_err() {
+                let heading = new_headings[0].heading.as_str();
+                bail!(
+                    "invalid_argument_value: {action} text starts with {heading:?}, which already exists under the same parent; inserting it would duplicate that section. To extend it, use insert_first_child or insert_last_child on it with level-{} headings, replace_text/insert_after_text inside it, or action=section to rewrite it",
+                    new_headings[0].level + 1
+                );
+            }
             Ok(candidate)
         }
         "section" => {
@@ -1672,13 +1844,26 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
         && let Some(fields) = args.as_object_mut()
     {
         for (key, value) in &mut *fields {
-            if spec.parameters["properties"][key]["type"] == "integer"
+            let kind = &spec.parameters["properties"][key]["type"];
+            if *kind == "integer"
                 && let Some(raw) = value.as_str()
                 && !raw.is_empty()
                 && raw.bytes().all(|b| b.is_ascii_digit())
                 && let Ok(number) = raw.parse::<u64>()
             {
                 *value = json!(number);
+            }
+            // Models sometimes send an array or object argument as its JSON
+            // text, e.g. edits:"[{...}]". Decode it only when it is that type.
+            // task_plan decodes its operations itself and reports doing so.
+            if name != "task_plan"
+                && (*kind == "array" || *kind == "object")
+                && let Some(raw) = value.as_str()
+                && let Ok(decoded) = serde_json::from_str::<Value>(raw.trim())
+                && (decoded.is_array() && *kind == "array"
+                    || decoded.is_object() && *kind == "object")
+            {
+                *value = decoded;
             }
         }
         // memory_manage carries the memory_write payload under replacement.
@@ -1819,7 +2004,10 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
 fn similar_paths(p: &Project, missing: &Path) -> Vec<String> {
     const MAX_SUGGESTIONS: usize = 5;
     const MAX_SCANNED: usize = 20_000;
-    let Some(name) = missing.file_name().map(|n| n.to_string_lossy().to_lowercase()) else {
+    let Some(name) = missing
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+    else {
         return vec![];
     };
     let stem = missing
@@ -1855,7 +2043,11 @@ fn similar_paths(p: &Project, missing: &Path) -> Vec<String> {
     }
     exact.sort_by_key(|path| (path.len(), path.clone()));
     same_stem.sort_by_key(|path| (path.len(), path.clone()));
-    exact.into_iter().chain(same_stem).take(MAX_SUGGESTIONS).collect()
+    exact
+        .into_iter()
+        .chain(same_stem)
+        .take(MAX_SUGGESTIONS)
+        .collect()
 }
 /// Visible entries of a directory, for a read that named a directory.
 fn directory_entries(path: &Path) -> Vec<String> {
@@ -1868,7 +2060,11 @@ fn directory_entries(path: &Path) -> Vec<String> {
                     let hidden = name.starts_with('.')
                         || matches!(name.as_str(), "node_modules" | "target" | "dist" | "build");
                     (!hidden).then(|| {
-                        if entry.path().is_dir() { format!("{name}/") } else { name }
+                        if entry.path().is_dir() {
+                            format!("{name}/")
+                        } else {
+                            name
+                        }
                     })
                 })
                 .collect()
@@ -2166,7 +2362,10 @@ fn delivered_sources_for(
     for source in s.sources.values() {
         if source.origin != "file"
             || source.evidence_truncated
-            || supplied.iter().chain(&found).any(|known| known.id == source.id)
+            || supplied
+                .iter()
+                .chain(&found)
+                .any(|known| known.id == source.id)
         {
             continue;
         }
@@ -2178,12 +2377,15 @@ fn delivered_sources_for(
         let Ok(resolved) = read_path(&s.project, path) else {
             continue;
         };
-        if wanted.iter().any(|(want_path, current, want_start, want_end)| {
-            *want_path == resolved
-                && source.hash.as_deref() == Some(current.as_str())
-                && start <= *want_end
-                && end >= *want_start
-        }) {
+        if wanted
+            .iter()
+            .any(|(want_path, current, want_start, want_end)| {
+                *want_path == resolved
+                    && source.hash.as_deref() == Some(current.as_str())
+                    && start <= *want_end
+                    && end >= *want_start
+            })
+        {
             found.push(source.clone());
         }
     }
@@ -2193,15 +2395,38 @@ fn delivered_sources_for(
 
 /// Mark unsettled items written once their section has body text. A section
 /// registered while planning often differs from the heading finally written;
-/// when it no longer resolves, rebind it to the unique heading matching the
-/// item title so the written section can be verified.
+/// when it no longer resolves, rebind it to the heading found by
+/// [`planned_heading`], unless another item points at the same heading.
 fn bind_written_sections(s: &mut Session, doc: &str) -> Vec<String> {
+    let resolved: Vec<_> = s
+        .investigations
+        .iter()
+        .map(|item| resolved_section_path(doc, &item.section))
+        .collect();
+    let targets: Vec<_> = s
+        .investigations
+        .iter()
+        .zip(&resolved)
+        .map(|(item, resolved)| {
+            (!item.is_settled() && resolved.is_none())
+                .then(|| planned_heading(doc, &item.section, &item.title))
+                .flatten()
+        })
+        .collect();
+    let mut claims = BTreeMap::<&str, usize>::new();
+    for path in resolved.iter().chain(&targets).flatten() {
+        *claims.entry(path).or_default() += 1;
+    }
+    let targets: Vec<_> = targets
+        .iter()
+        .map(|target| target.clone().filter(|path| claims[path.as_str()] == 1))
+        .collect();
     let mut written = Vec::new();
-    for item in s.investigations.iter_mut().filter(|item| !item.is_settled()) {
-        if section_text(doc, &item.section).is_err()
-            && let Ok(heading) = documentation::resolve_heading(doc, &item.title)
-            && let Ok(path) = documentation::heading_path(doc, heading.start)
-        {
+    for (item, target) in s.investigations.iter_mut().zip(targets) {
+        if item.is_settled() {
+            continue;
+        }
+        if let Some(path) = target {
             item.section = path;
         }
         if !item.section.trim().is_empty()
@@ -2214,6 +2439,70 @@ fn bind_written_sections(s: &mut Session, doc: &str) -> Vec<String> {
     }
     written
 }
+
+fn resolved_section_path(doc: &str, section: &str) -> Option<String> {
+    if section.trim().is_empty() {
+        return None;
+    }
+    let heading = documentation::resolve_heading(doc, section).ok()?;
+    documentation::heading_path(doc, heading.start).ok()
+}
+
+/// The written heading a planned section most likely became: the item title,
+/// the planned title at any heading level, or the same leading section
+/// number such as `2.` in `## 2. Flow`. Each must match a single heading.
+fn planned_heading(doc: &str, section: &str, title: &str) -> Option<String> {
+    let planned = section
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or("");
+    let bare = planned.trim_start_matches('#').trim();
+    let headings = documentation::headings(doc);
+    let unique = |found: Vec<&documentation::Heading>| match found[..] {
+        [heading] => documentation::heading_path(doc, heading.start).ok(),
+        _ => None,
+    };
+    if let Ok(heading) = documentation::resolve_heading(doc, title) {
+        return documentation::heading_path(doc, heading.start).ok();
+    }
+    if !bare.is_empty()
+        && let Some(path) = unique(
+            headings
+                .iter()
+                .filter(|h| h.heading.trim_start_matches('#').trim() == bare)
+                .collect(),
+        )
+    {
+        return Some(path);
+    }
+    let number = section_number(bare).or_else(|| section_number(title))?;
+    unique(
+        headings
+            .iter()
+            .filter(|h| section_number(h.heading.trim_start_matches('#').trim()) == Some(number))
+            .collect(),
+    )
+}
+
+/// A leading `1.`, `2.3` or `4)` label, without its trailing punctuation.
+/// A bare number such as a year is not a label.
+fn section_number(title: &str) -> Option<&str> {
+    let end = title
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(title.len());
+    let (raw, rest) = title.split_at(end);
+    let label = raw.trim_end_matches('.');
+    let (rest, paren) = match rest.strip_prefix(')') {
+        Some(rest) => (rest, true),
+        None => (rest, false),
+    };
+    (label.starts_with(|c: char| c.is_ascii_digit())
+        && (paren || raw.ends_with('.') || label.contains('.'))
+        && rest.starts_with(char::is_whitespace))
+    .then_some(label)
+}
+
 fn section_text<'a>(doc: &'a str, heading: &str) -> Result<&'a str> {
     let h = documentation::resolve_heading(doc, heading)?;
     Ok(&doc[h.start..h.end])
@@ -2262,6 +2551,38 @@ pub fn execute_cancellable(
     if cancel.is_cancelled() {
         bail!("cancelled");
     }
+    if !repair_leaked_argument_markup(&mut args)? {
+        return execute_repaired(s, name, args, cancel);
+    }
+    // The model believes it sent what its markup held. Say which fields
+    // arrived so a missing one is resent instead of repeating the call.
+    let received = args
+        .as_object()
+        .map(|object| object.keys().cloned().collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
+    execute_repaired(s, name, args, cancel).map_err(|error| {
+        // Cancellation is matched exactly and coverage carries typed data.
+        let message = error.to_string();
+        if message == "cancelled"
+            || message.starts_with("cancelled:")
+            || error
+                .downcast_ref::<documentation::CoverageMissing>()
+                .is_some()
+        {
+            return error;
+        }
+        anyhow::anyhow!(
+            "{error}. Note: this call's arguments arrived with native tool-call markup (<arg_key>/<arg_value>) inside a JSON key; they were recovered, but only these fields were received: {received}. Resend every argument, including any reported missing, as a plain JSON field without <arg_key> tags"
+        )
+    })
+}
+
+fn execute_repaired(
+    s: &mut Session,
+    name: &str,
+    mut args: Value,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Value> {
     normalize_integer_arguments(name, &mut args);
     normalize_argument_aliases(s, name, &mut args)?;
     if name == "document_edit_batch" {
@@ -2750,9 +3071,16 @@ pub fn execute_cancellable(
                 bail!("invalid_cursor");
             }
             let end = (offset + n(&args, "limit", 100).clamp(1, 500)).min(names.len());
-            if end < names.len() && !s.list_cursor_scopes.iter().any(|(known, _)| *known == fingerprint) {
-                s.list_cursor_scopes
-                    .push_back((fingerprint.clone(), json!({"mode":mode,"path_glob":path_glob(&args)?})));
+            if end < names.len()
+                && !s
+                    .list_cursor_scopes
+                    .iter()
+                    .any(|(known, _)| *known == fingerprint)
+            {
+                s.list_cursor_scopes.push_back((
+                    fingerprint.clone(),
+                    json!({"mode":mode,"path_glob":path_glob(&args)?}),
+                ));
                 while s.list_cursor_scopes.len() > 32 {
                     s.list_cursor_scopes.pop_front();
                 }
@@ -2777,7 +3105,9 @@ pub fn execute_cancellable(
             let mut result = read_file(s, &mut args, cancel)?;
             if ignored_page_size {
                 result["ignored_arguments"] = json!(["max_lines"]);
-                result["ignored_note"] = json!("A cursor continues its original range; max_lines was ignored. Pass only the cursor to continue.");
+                result["ignored_note"] = json!(
+                    "A cursor continues its original range; max_lines was ignored. Pass only the cursor to continue."
+                );
             }
             Ok(result)
         }
@@ -2798,7 +3128,7 @@ pub fn execute_cancellable(
                 bail!("document_hash_required: existing document edits require expected_hash");
             }
             if exists && args["expected_hash"].as_str() != Some(hash(old.as_bytes()).as_str()) {
-                bail!("document_revision_conflict: read output and retry");
+                return Err(revision_conflict(&args));
             }
             if !exists && action != "create" && action != "write" {
                 bail!("document_missing");
@@ -2814,7 +3144,7 @@ pub fn execute_cancellable(
             }
             let old = read_text(&path)?;
             if args["expected_hash"].as_str() != Some(hash(old.as_bytes()).as_str()) {
-                bail!("document_revision_conflict: read output and retry");
+                return Err(revision_conflict(&args));
             }
             let edits = args["edits"].as_array().expect("validated edits array");
             let mut current = old.clone();
@@ -2941,6 +3271,19 @@ pub fn execute_cancellable(
                 }
                 if item.status == "written" {
                     let doc = read_text(&output_path(&s.project)?)?;
+                    // A planned section kept from before writing is rebound
+                    // the same way document edits rebind it.
+                    if args.get("section").is_none()
+                        && section_text(&doc, &item.section).is_err()
+                        && let Some(path) = planned_heading(&doc, &item.section, &item.title)
+                        && !s.investigations.iter().any(|other| {
+                            other.id != item.id
+                                && resolved_section_path(&doc, &other.section).as_ref()
+                                    == Some(&path)
+                        })
+                    {
+                        item.section = path;
+                    }
                     let resolved = documentation::resolve_heading(&doc, &item.section)?;
                     item.section = documentation::heading_path(&doc, resolved.start)?;
                 }
@@ -3035,7 +3378,9 @@ pub fn execute_cancellable(
                 let id = text(&args, "id")?;
                 // A section written under a heading other than the planned one
                 // is rebound by title before the written-state check.
-                if s.investigations.iter().any(|i| i.id == id && !i.is_settled())
+                if s.investigations
+                    .iter()
+                    .any(|i| i.id == id && !i.is_settled())
                     && let Ok(doc) = output_path(&s.project).and_then(|path| read_text(&path))
                 {
                     bind_written_sections(s, &doc);
@@ -3071,23 +3416,52 @@ pub fn execute_cancellable(
                 });
                 let path_hints = path_hints - ids.len();
                 let mut sources = s.source_refs(&ids)?;
-                if (sources.is_empty() && path_hints == 0)
-                    || sources.iter().any(|source| {
-                        source.origin != "file"
-                            || source.path.is_none()
-                            || source.hash.is_none()
-                            || source.excerpt.trim().is_empty()
+                // Name each non-file ID so the caller drops only those.
+                let rejected: Vec<String> = sources
+                    .iter()
+                    .filter_map(|source| {
+                        let reason = if source.origin != "file" {
+                            format!("origin={}", source.origin)
+                        } else if source.path.is_none() || source.hash.is_none() {
+                            "no file version".into()
+                        } else if source.excerpt.trim().is_empty() {
+                            "empty excerpt; read a non-empty range".into()
+                        } else {
+                            return None;
+                        };
+                        Some(format!("{} ({reason})", source.id))
                     })
-                {
+                    .collect();
+                if !rejected.is_empty() {
+                    bail!(
+                        "verification_sources_required: these source_ids are not file evidence: {}; remove them and keep the file source_ids returned by file_read/source_search/symbol_search",
+                        rejected.join(", ")
+                    );
+                }
+                if sources.is_empty() && path_hints == 0 {
                     bail!(
                         "verification_sources_required: pass non-empty observed file source_ids returned by file_read/source_search/symbol_search"
                     );
                 }
+                let output = output_path(&s.project)
+                    .ok()
+                    .and_then(|path| path.canonicalize().ok());
                 for source in &sources {
-                    if let Some(path) = &source.path {
-                        let path = read_path(&s.project, path)?;
+                    if let Some(recorded) = &source.path {
+                        let path = read_path(&s.project, recorded)?;
                         if Some(hash_file(&path)?) != source.hash {
-                            bail!("source_changed: read again");
+                            // A read of the output document goes stale with
+                            // every edit and was never source evidence.
+                            if output.is_some() && output == path.canonicalize().ok() {
+                                bail!(
+                                    "source_changed: {} is a read of the output document {recorded}, which has changed since; the document is not source evidence, so remove it and pass file_read/source_search IDs of the cited project files",
+                                    source.id
+                                );
+                            }
+                            bail!(
+                                "source_changed: {} ({recorded}) changed since it was read; file_read it again and pass the new ID",
+                                source.id
+                            );
                         }
                     }
                 }
@@ -3175,9 +3549,7 @@ pub fn execute_cancellable(
                 }
                 activate_workflow_tools(s);
                 revalidate(s)?;
-                if s.investigations.is_empty()
-                    || s.investigations.iter().any(|i| !i.is_settled())
-                {
+                if s.investigations.is_empty() || s.investigations.iter().any(|i| !i.is_settled()) {
                     return Ok(
                         json!({"complete":false,"incomplete":s.investigations.iter().filter(|i|!i.is_settled()).map(|i|json!({"id":i.id,"title":i.title,"status":i.status,"section":i.section})).collect::<Vec<_>>(),"review":s.reviews,"guidance":"Verify pending items first; incomplete preflight does not consume a document review."}),
                     );
