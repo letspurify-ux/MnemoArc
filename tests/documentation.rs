@@ -2939,6 +2939,47 @@ fn an_append_after_the_models_own_write_may_omit_the_hash() {
 }
 
 #[test]
+fn an_insertion_that_repeats_its_anchor_is_refused() {
+    let body = "# 사용법\n**전송**: Enter 키 또는 ➤ 전송 단추로 보냅니다 (`App.jsx:1325-1327`).\n";
+    let anchor = "**전송**: Enter 키 또는 ➤ 전송 단추로 보냅니다 (`App.jsx:1325-1327`).";
+    for (batch, action) in [(false, "insert_after_text"), (true, "insert_before_text")] {
+        let (_dir, mut s) = setup();
+        std::fs::write(&s.project.output, body).unwrap();
+        // The live shape: the "inserted" text restates the anchor to reword it.
+        let edit = json!({"action":action,"old_text":anchor,"text":format!("\n{anchor} 빈 입력은 보낼 수 없습니다.")});
+        let error = if batch {
+            tools::execute(
+                &mut s,
+                "document_edit_batch",
+                json!({"expected_hash":tools::hash(body.as_bytes()),"edits":[edit]}),
+            )
+        } else {
+            let mut edit = edit;
+            edit["expected_hash"] = json!(tools::hash(body.as_bytes()));
+            tools::execute(&mut s, "document_edit", edit)
+        }
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("the passage would appear twice"), "{error}");
+        assert!(error.contains("use replace_text"), "{error}");
+        assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), body);
+    }
+    // New text next to the anchor, and a short anchor that recurs, still work.
+    let (_dir, mut s) = setup();
+    std::fs::write(&s.project.output, body).unwrap();
+    let result = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after_text","expected_hash":tools::hash(body.as_bytes()),"old_text":anchor,"text":"\n빈 입력은 보낼 수 없습니다."}),
+    );
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after_text","expected_hash":result["hash"],"old_text":"# 사용법","text":"\n# 사용법 요약"}),
+    );
+}
+
+#[test]
 fn appended_heading_starts_a_new_line() {
     let (_dir, mut s) = setup();
     std::fs::write(&s.project.output, "# A\nFirst section ends here.").unwrap();

@@ -1657,6 +1657,18 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
         }
         "patch" | "replace_text" | "delete_text" | "insert_before_text" | "insert_after_text" => {
             let target = text(args, "old_text")?;
+            // Insertion keeps old_text. A text that repeats it puts the passage
+            // in twice; a live run meant to rewrite and duplicated eight
+            // paragraphs this way. Short anchors may legitimately recur.
+            let anchor = target.trim();
+            if matches!(action, "insert_before_text" | "insert_after_text")
+                && anchor.chars().count() >= 20
+                && new.contains(anchor)
+            {
+                bail!(
+                    "invalid_argument_value: {action} keeps old_text and adds text beside it, but text repeats old_text, so the passage would appear twice. To rewrite that passage, use replace_text with the same old_text and the new wording as text"
+                );
+            }
             let (base, scope) = if let Some(section) = args.get("section").and_then(Value::as_str) {
                 let heading = documentation::resolve_heading(old, section)?;
                 (heading.start, &old[heading.start..heading.end])
