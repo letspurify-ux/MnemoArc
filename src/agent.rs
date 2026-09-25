@@ -1692,11 +1692,24 @@ pub async fn run_session_controlled(
                 s.continuation = Some(completion.discarded_tool_calls);
             }
             length_recoveries += 1;
+            // Rewriting a grown document in one call is the usual way to exceed
+            // the output limit; require section-sized edits. A document small
+            // relative to the limit cannot be the cause, so it stays writable.
+            let document_tokens = tools::output_path(&s.project)
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map_or(0, |doc| context::tokens(&doc, &s.config.model));
+            if s.is_document_work()
+                && s.document_written
+                && document_tokens >= s.config.output_tokens / 4
+            {
+                s.progress_recovery.whole_write_withheld = true;
+            }
             s.activity = json!({"stage":"continuing","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds});
             snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
             if length_recoveries >= LENGTH_RECOVERY_LIMIT {
                 let reason = format!(
-                    "length_recovery_limit: {length_recoveries} consecutive output-limit responses. Split document edits into smaller complete calls and keep final reports concise; discarded tool batches did not execute."
+                    "length_recovery_limit: {length_recoveries} consecutive output-limit responses. Split document edits into smaller complete calls (one section per document_edit action=section or replace_text; whole-document write is withheld) and keep final reports concise; discarded tool batches did not execute."
                 );
                 if !recover_document(&mut s, &reason) {
                     failure = Some(format!(

@@ -554,6 +554,11 @@ impl ToolRegistry {
                         t.parameters["anyOf"] = json!([{"required":["path"]},{"required":["path_glob"]},{"required":["pattern"]},{"required":["cursor"]}]);
                     }
                 }
+                if s.progress_recovery.whole_write_withheld
+                    && matches!(t.name, "document_edit" | "document_edit_batch")
+                {
+                    withhold_write_action(&mut t.parameters);
+                }
                 let fields = t.parameters["properties"].clone();
                 // Keep offset for old clients, but offer the model only opaque continuation.
                 if t.name == "investigation" {
@@ -1275,6 +1280,51 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
     }
 }
 
+/// Remove the whole-document `write` action from an edit tool schema.
+fn withhold_write_action(schema: &mut Value) {
+    fn strip(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                if let Some(Value::Array(actions)) = map.get_mut("enum")
+                    && actions.iter().any(|a| a == "write")
+                    && actions.iter().any(|a| a == "section")
+                {
+                    actions.retain(|a| a != "write");
+                }
+                if let Some(Value::Array(branches)) = map.get_mut("oneOf") {
+                    branches.retain(|b| b["properties"]["action"]["const"] != "write");
+                }
+                for child in map.values_mut() {
+                    strip(child);
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    strip(schema);
+}
+
+/// After an output-limit truncation, a whole-document write is withheld.
+fn check_whole_write(s: &Session, name: &str, args: &Value) -> Result<()> {
+    if !s.progress_recovery.whole_write_withheld {
+        return Ok(());
+    }
+    let writes = match name {
+        "document_edit" => args["action"] == "write",
+        "document_edit_batch" => args["edits"]
+            .as_array()
+            .is_some_and(|edits| edits.iter().any(|edit| edit["action"] == "write")),
+        _ => false,
+    };
+    if writes {
+        bail!(
+            "whole_write_withheld: a previous response exceeded the output limit while the document is large; rewrite one section at a time with document_edit action=section (or replace_text for a passage). Whole-document write is available again after a smaller edit succeeds"
+        );
+    }
+    Ok(())
+}
+
 fn persist_document_edit(
     s: &mut Session,
     path: &Path,
@@ -1316,6 +1366,8 @@ fn persist_document_edit(
         temp.persist_noclobber(path)?;
     }
     s.document_written = true;
+    // A smaller edit succeeded; whole-document writes are allowed again.
+    s.progress_recovery.whole_write_withheld = false;
     if s.document_review.approved_hash.is_some() {
         // A later edit starts a new review cycle. An earlier approval's zero
         // issues must not make the first new finding look like a stalled review.
@@ -2173,6 +2225,7 @@ pub fn execute_cancellable(
         }
     }
     ToolRegistry::validate(s, name, &args)?;
+    check_whole_write(s, name, &args)?;
     if s.checkpoint.is_some() && !ToolRegistry::checkpoint_allowed(name) {
         bail!("checkpoint_pending: only memory/state/history maintenance allowed");
     }

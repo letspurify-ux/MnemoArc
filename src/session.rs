@@ -253,6 +253,9 @@ pub struct ProgressRecovery {
     /// reviewed document stayed unchanged (keyed by that document's hash).
     pub unrepaired_finals: usize,
     pub unrepaired_final_hash: Option<String>,
+    /// Set when a document-work response hit the output limit: a whole
+    /// document rewrite is withheld until a smaller edit succeeds.
+    pub whole_write_withheld: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

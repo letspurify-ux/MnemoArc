@@ -197,6 +197,7 @@ pub fn describe(message: &str) -> Value {
         || code == "ambiguous_file_read_range"
         || code == "conflicting_arguments"
         || code == "item_already_verified"
+        || code == "whole_write_withheld"
     {
         (Class::InvalidInput, "correct_arguments")
     } else {

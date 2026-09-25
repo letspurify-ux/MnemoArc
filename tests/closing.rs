@@ -1105,3 +1105,88 @@ async fn transient_empty_replies_are_retried_before_any_workflow_is_set() {
             .starts_with("empty_completion")
     );
 }
+
+#[tokio::test]
+async fn an_output_limit_truncation_withholds_whole_document_writes() {
+    let truncated_then_final = || {
+        vec![
+            Completion {
+                length_limited: true,
+                discarded_tool_calls: true,
+                ..Default::default()
+            },
+            Completion {
+                text: "Saved out.md".into(),
+                ..Default::default()
+            },
+        ]
+    };
+    // A document small relative to the output limit cannot be the cause:
+    // whole writes stay available.
+    let (_small_dir, small) = verified_fixture();
+    let (result, _) = run_scripted(small, truncated_then_final()).await;
+    assert!(!result.progress_recovery.whole_write_withheld);
+
+    let (dir, mut s) = verified_fixture();
+    let filler: String = (1..=600)
+        .map(|i| format!("Detail line {i} explains one more step of the flow.\n"))
+        .collect();
+    let hash = tools::hash(&std::fs::read(dir.path().join("out.md")).unwrap());
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":hash,"text":format!("\n# Details\n{filler}")}),
+    )
+    .unwrap();
+    let (result, _) = run_scripted(
+        s,
+        vec![
+            Completion {
+                length_limited: true,
+                discarded_tool_calls: true,
+                ..Default::default()
+            },
+            Completion {
+                text: "Saved out.md".into(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await;
+    assert!(result.progress_recovery.whole_write_withheld);
+    let mut s = result;
+    // The schema no longer offers write, and a write call is refused.
+    let edit = ToolRegistry::definitions(&s)
+        .into_iter()
+        .find(|tool| tool["function"]["name"] == "document_edit")
+        .unwrap();
+    let actions = edit["function"]["parameters"]["properties"]["action"]["enum"].clone();
+    assert!(!actions.as_array().unwrap().iter().any(|a| a == "write"), "{actions}");
+    assert!(actions.as_array().unwrap().iter().any(|a| a == "section"));
+    let path = dir.path().join("out.md");
+    let hash = tools::hash(&std::fs::read(&path).unwrap());
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","expected_hash":hash,"text":"# Flow\\nRewritten.\\n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("whole_write_withheld"), "{error}");
+    let error = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":hash,"edits":[{"action":"write","text":"# Flow\\nRewritten.\\n"}]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("whole_write_withheld"), "{error}");
+    // A section-sized edit succeeds and restores whole writes.
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":hash,"old_text":"History is normalized first.","text":"History is normalized before the loop."}),
+    )
+    .unwrap();
+    assert!(!s.progress_recovery.whole_write_withheld);
+}
