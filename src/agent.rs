@@ -37,8 +37,9 @@ fn closing_stall_limit(config: &Config) -> usize {
 }
 
 /// One monotonic measure of document progress: written/verified items, the
-/// best document shape, reduced review findings, met acceptance checks and
-/// distinct source evidence gathered while investigating. Plan bookkeeping is
+/// best document shape, reduced review findings, met acceptance checks,
+/// distinct source evidence gathered while investigating, and fresh
+/// verifications (re-verifying a section after a repair edit counts again). Plan bookkeeping is
 /// excluded; completing and reopening the same to-do is not progress.
 fn progress_score(s: &Session) -> usize {
     let items: usize = s
@@ -58,6 +59,7 @@ fn progress_score(s: &Session) -> usize {
             .map_or(0, |best| 12usize.saturating_sub(best))
         + s.completion_review.best_met * 2
         + s.progress_recovery.evidence_credit
+        + s.progress_recovery.verification_events * 2
 }
 
 fn closing_instruction(s: &Session) -> String {

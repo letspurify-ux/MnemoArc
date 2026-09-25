@@ -1190,3 +1190,37 @@ async fn an_output_limit_truncation_withholds_whole_document_writes() {
     .unwrap();
     assert!(!s.progress_recovery.whole_write_withheld);
 }
+
+#[test]
+fn repair_reverification_counts_as_fresh_progress() {
+    let (_dir, mut s, source) = fixture();
+    let verify = |s: &mut Session, id: &str| {
+        tools::execute(s, "investigation", json!({"action":"verify","id":id,"source_ids":[source],"verification_note":"Compared the cited lines with the section"})).unwrap();
+    };
+    verify(&mut s, "flow");
+    assert_eq!(s.progress_recovery.verification_events, 1);
+    // Re-verifying an unchanged, already verified item is not new work.
+    verify(&mut s, "flow");
+    assert_eq!(s.progress_recovery.verification_events, 1);
+    // A repair edit invalidates the section; verifying it again counts.
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":hash,"old_text":"A for loop runs work five times.","text":"A for loop runs work exactly five times."}),
+    )
+    .unwrap();
+    assert_ne!(s.investigations.iter().find(|i| i.id == "flow").unwrap().status, "verified");
+    verify(&mut s, "flow");
+    assert_eq!(s.progress_recovery.verification_events, 2);
+}
+
+#[test]
+fn paged_rereview_judges_previous_findings_only_on_their_page() {
+    let (_dir, mut s, _) = fixture();
+    let request = document_review::request(&mut s).unwrap();
+    let system = request["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("List ONLY problems that are still present"));
+    assert!(system.contains("skip it otherwise"));
+    assert!(system.contains("cannot be observed on this page"));
+}

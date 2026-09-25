@@ -256,6 +256,10 @@ pub struct ProgressRecovery {
     /// Set when a document-work response hit the output limit: a whole
     /// document rewrite is withheld until a smaller edit succeeds.
     pub whole_write_withheld: bool,
+    /// Successful verifications of items that were not verified before the
+    /// call (a first verification or one after its section changed). Repair
+    /// work re-verifies sections, which the current verified count hides.
+    pub verification_events: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

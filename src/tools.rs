@@ -3066,10 +3066,15 @@ pub fn execute_cancellable(
                     .into());
                 }
                 let item = s.investigations.iter_mut().find(|i| i.id == id).unwrap();
+                let fresh = item.status != "verified";
                 item.document_hash = Some(hash(section.as_bytes()));
                 item.sources = sources;
                 item.note = note.into();
                 item.status = "verified".into();
+                if fresh {
+                    s.progress_recovery.verification_events =
+                        s.progress_recovery.verification_events.saturating_add(1);
+                }
                 if supplemented.is_empty() {
                     Ok(json!({"verified":id}))
                 } else {
