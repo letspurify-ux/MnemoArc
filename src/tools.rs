@@ -906,6 +906,67 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Accept argument names models commonly use for an unambiguous meaning.
+/// A conflicting pair is still rejected so no value is silently dropped.
+fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Result<()> {
+    fn rename(object: &mut serde_json::Map<String, Value>, alias: &str, key: &str, at: &str) -> Result<()> {
+        let Some(value) = object.remove(alias) else {
+            return Ok(());
+        };
+        match object.get(key) {
+            Some(existing) if *existing != value => bail!(
+                "conflicting_arguments: {at}{alias} and {at}{key} differ; pass only {key}"
+            ),
+            Some(_) => {}
+            None => {
+                object.insert(key.into(), value);
+            }
+        }
+        Ok(())
+    }
+    match name {
+        "document_edit" => {
+            if let Some(object) = args.as_object_mut() {
+                rename(object, "new_text", "text", "")?;
+            }
+        }
+        "document_edit_batch" => {
+            // Malformed (non-object) arguments reach normal validation.
+            if let Some(edits) = args.get_mut("edits").and_then(Value::as_array_mut) {
+                for (index, edit) in edits.iter_mut().enumerate() {
+                    if let Some(object) = edit.as_object_mut() {
+                        rename(object, "new_text", "text", &format!("edits[{index}]."))?;
+                    }
+                }
+            }
+        }
+        "document_audit" => {
+            if let Some(object) = args.as_object_mut() {
+                rename(object, "max_issues", "limit", "")?;
+            }
+        }
+        "investigation" if args["action"] == "verify" => {
+            // verify compares the item's registered section; restating that
+            // same section is harmless, a different one is a real mistake.
+            let registered = args["id"]
+                .as_str()
+                .and_then(|id| s.investigations.iter().find(|item| item.id == id))
+                .map(|item| item.section.clone());
+            if let (Some(section), Some(registered)) = (args["section"].as_str(), registered) {
+                let section = section.trim();
+                let same = !section.is_empty()
+                    && (registered.trim() == section
+                        || registered.lines().last().is_some_and(|last| last.trim() == section));
+                if same {
+                    args.as_object_mut().unwrap().remove("section");
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// A batch has one document hash. Models often repeat it inside each edit;
 /// accept that when every copy agrees, and supply a missing top-level value
 /// from them. Differing copies are a real conflict.
@@ -2202,6 +2263,7 @@ pub fn execute_cancellable(
         bail!("cancelled");
     }
     normalize_integer_arguments(name, &mut args);
+    normalize_argument_aliases(s, name, &mut args)?;
     if name == "document_edit_batch" {
         hoist_batch_expected_hash(&mut args)?;
     }

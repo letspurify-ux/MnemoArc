@@ -2224,3 +2224,59 @@ fn batch_target_failures_say_why_old_text_did_not_match() {
         hash
     );
 }
+
+#[test]
+fn common_argument_aliases_are_accepted_and_conflicts_rejected() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.rs"), "let a = 1;\n").unwrap();
+    std::fs::write(&s.project.output, "# A\nOne. a.rs:1\n").unwrap();
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    // new_text is taken as text, alone and inside batch edits.
+    let result = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":hash,"old_text":"One.","new_text":"First."}),
+    );
+    let hash = result["hash"].as_str().unwrap().to_owned();
+    run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":hash,"edits":[{"action":"replace_text","old_text":"First.","new_text":"Value one."}]}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# A\nValue one. a.rs:1\n"
+    );
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":hash,"old_text":"Value one.","text":"x","new_text":"y"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("conflicting_arguments"), "{error}");
+    // max_issues is the audit page size.
+    let audit = run(&mut s, "document_audit", json!({"max_issues":1}));
+    assert!(audit["issues"].as_array().unwrap().len() <= 1);
+    // verify ignores a restated registered section but rejects another one.
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"a","title":"A","section":"# A","status":"written"}),
+    );
+    let source = run(&mut s, "file_read", json!({"path":"a.rs"}))["source"]["id"].clone();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"a","section":"# A","source_ids":[source],"verification_note":"Compared the assignment"}),
+    );
+    let error = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"a","section":"# Other","source_ids":[source],"verification_note":"Compared"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("does not accept section"), "{error}");
+}
