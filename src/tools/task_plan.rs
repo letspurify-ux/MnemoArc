@@ -382,10 +382,19 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
         ));
     }
     if args["expected_revision"].as_u64() != Some(s.task.plan_revision) {
-        return Ok(unchanged(
-            &s.task,
-            "Plan revision changed or expected_revision is missing".into(),
-        ));
+        let revision = s.task.plan_revision;
+        let mut reason = match args["expected_revision"].as_u64() {
+            Some(sent) => format!(
+                "Plan revision changed: expected_revision {sent} but the plan is at revision {revision}; recheck the returned plan, then use {revision}"
+            ),
+            None => format!("expected_revision is missing; the plan is at revision {revision}"),
+        };
+        if args.get("operations").is_none() {
+            reason.push_str(
+                "; operations is also missing: apply needs an array of operation objects",
+            );
+        }
+        return Ok(unchanged(&s.task, reason));
     }
     let (operations, normalized) = match parse_operations(&args["operations"]) {
         Ok(operations) => operations,

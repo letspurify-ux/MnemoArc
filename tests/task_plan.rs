@@ -898,3 +898,30 @@ fn a_failed_operation_in_a_batch_is_named_with_the_current_item() {
     );
     assert_eq!(s.task.current_todo().unwrap().id, "T1");
 }
+
+#[test]
+fn a_bare_apply_names_the_missing_revision_and_operations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(&mut s, json!([{"op":"insert","texts":["a"]}]));
+    // The live shape: {"action":"apply"} with nothing else.
+    let result = tools::execute(&mut s, "task_plan", json!({"action":"apply"})).unwrap();
+    let reason = result["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with("expected_revision is missing; the plan is at revision 1"),
+        "{reason}"
+    );
+    assert!(reason.contains("operations is also missing"), "{reason}");
+    let result = tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["b"]}]}),
+    )
+    .unwrap();
+    let reason = result["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("expected_revision 0 but the plan is at revision 1"),
+        "{reason}"
+    );
+    assert!(!reason.contains("operations is also missing"), "{reason}");
+}

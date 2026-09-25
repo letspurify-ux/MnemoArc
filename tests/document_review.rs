@@ -72,9 +72,17 @@ fn source_workflow_activates_tools_and_schema_prevents_guessing() {
         .iter()
         .find(|t| t["function"]["name"] == "document_edit")
         .unwrap();
-    assert_eq!(
-        edit["function"]["parameters"]["oneOf"][1]["required"],
-        json!(["text", "expected_hash"])
+    // Per-action unions are not offered to the model; execution enforces them.
+    assert!(edit["function"]["parameters"].get("oneOf").is_none());
+    assert!(
+        tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"append","text":"x"})
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("expected_hash")
     );
     let revision = s.task.revision;
     tools::execute(&mut s, "task_state", json!({"action":"update","patch":{}})).unwrap();

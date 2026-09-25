@@ -2725,6 +2725,103 @@ fn a_named_section_falls_back_to_the_unique_numbered_heading() {
 }
 
 #[test]
+fn a_retyped_citation_names_the_exact_document_passage() {
+    let body = "# Manual\n## 1. Setup\nOpen settings (`frontend/src/App.jsx:306-308`). Then save.\nSee `a.rs:1` and `a.rs:1`.\n";
+    for batch in [false, true] {
+        let (_dir, mut s) = setup();
+        std::fs::write(&s.project.output, body).unwrap();
+        let hash = tools::hash(body.as_bytes());
+        let edit = |old_text: &str| {
+            let edit = json!({"action":"replace_text","old_text":old_text,"text":"x","section":"## 1. Setup"});
+            if batch {
+                json!({"expected_hash":hash,"edits":[edit]})
+            } else {
+                let mut edit = edit;
+                edit["expected_hash"] = json!(hash);
+                edit
+            }
+        };
+        let tool = if batch {
+            "document_edit_batch"
+        } else {
+            "document_edit"
+        };
+        // The live shape: backtick moved and an en dash for the hyphen.
+        let error = tools::execute(&mut s, tool, edit("frontend/src/App.jsx`:306–308"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                r#"only in backticks, dashes, quotes or spacing: "frontend/src/App.jsx:306-308""#
+            ),
+            "{error}"
+        );
+        // A repeated target and a missing one are explained on single edits too.
+        let error = tools::execute(&mut s, tool, edit("`a.rs:1`"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("old_text occurs 2 times"), "{error}");
+        let error = tools::execute(&mut s, tool, edit("nothing like this at all"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("old_text is not in the current document"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), body);
+        // The named passage works as old_text.
+        let mut args = edit("frontend/src/App.jsx:306-308");
+        let fix = json!("frontend/src/App.jsx:305-307");
+        if batch {
+            args["edits"][0]["text"] = fix;
+        } else {
+            args["text"] = fix;
+        }
+        run(&mut s, tool, args);
+        assert!(
+            std::fs::read_to_string(&s.project.output)
+                .unwrap()
+                .contains("(`frontend/src/App.jsx:305-307`)")
+        );
+    }
+}
+
+#[test]
+fn a_short_heading_name_resolves_only_when_unique() {
+    let (_dir, mut s) = setup();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Manual\n## 1. 처음 설정: 모델 연결 정보 입력\nBody\n## 2. 채팅: 요청 보내기\nBody\n## 3. 채팅: 작업 제어\nBody\n"}),
+    );
+    // The live shapes: the title before the colon, with or without its number.
+    for section in ["## 1. 처음 설정", "처음 설정", "1. 처음 설정: 다른 설명"] {
+        let page = run(&mut s, "document_inspect", json!({"section":section}));
+        assert_eq!(page["start_line"], 2, "{section}");
+    }
+    let registered = run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"setup","title":"Setup","section":"처음 설정","status":"written"}),
+    );
+    assert_eq!(
+        registered["section"],
+        "# Manual\n## 1. 처음 설정: 모델 연결 정보 입력"
+    );
+    // Two headings share the short title, or the section number disagrees.
+    assert_eq!(
+        run(&mut s, "document_inspect", json!({"section":"## 3. 채팅"}))["start_line"],
+        6
+    );
+    for section in ["채팅", "## 5. 처음 설정"] {
+        let error = tools::execute(&mut s, "document_inspect", json!({"section":section}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("section_not_found"), "{section}: {error}");
+    }
+}
+
+#[test]
 fn appended_heading_starts_a_new_line() {
     let (_dir, mut s) = setup();
     std::fs::write(&s.project.output, "# A\nFirst section ends here.").unwrap();

@@ -175,6 +175,19 @@ fn bare_heading_title(heading: &str) -> &str {
     }
 }
 
+/// A title's section number (if any) and its text before the first colon.
+fn short_title(title: &str) -> (Option<&str>, &str) {
+    let number = super::section_number(title);
+    let rest = match number {
+        Some(label) => title[title.find(label).unwrap() + label.len()..]
+            .trim_start_matches(['.', ')'])
+            .trim_start(),
+        None => title,
+    };
+    let core = rest.split([':', '：']).next().unwrap_or(rest).trim();
+    (number, core)
+}
+
 /// Full headings, unique bare titles, or newline-separated ancestor paths
 /// whose lines may be either form.
 pub(super) fn resolve_heading(doc: &str, requested: &str) -> Result<Heading> {
@@ -201,6 +214,27 @@ pub(super) fn resolve_heading(doc: &str, requested: &str) -> Result<Heading> {
         }
     };
     let mut matching: Vec<_> = headings.iter().enumerate().filter(matches).collect();
+    // A heading named by its short form, e.g. "## 1. 처음 설정" or "처음 설정"
+    // for "## 1. 처음 설정: 모델 연결 정보 입력": compare the title before a
+    // colon without its section number. Section numbers must agree when both
+    // have one, and only a single match counts.
+    if matching.is_empty() && !is_path {
+        let (number, core) = short_title(bare_heading_title(requested));
+        if core.chars().count() >= 2 {
+            let short: Vec<_> = headings
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| {
+                    let (other_number, other_core) = short_title(bare_heading_title(&h.heading));
+                    other_core == core
+                        && (number.is_none() || other_number.is_none() || number == other_number)
+                })
+                .collect();
+            if short.len() == 1 {
+                matching = short;
+            }
+        }
+    }
     // A path may mix full headings and bare titles line by line; compare bare
     // titles only when the exact path found nothing.
     if matching.is_empty() && is_path {

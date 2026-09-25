@@ -57,11 +57,13 @@ async fn registered_source_documentation() {
         config.source_document_review,
         config.completion_review_enabled
     );
+    // MNEMOARC_LIVE_PROJECT picks another registered project (default llm_agent).
+    let project_name = std::env::var("MNEMOARC_LIVE_PROJECT").unwrap_or("llm_agent".into());
     let mut project = config
         .projects
         .iter()
-        .find(|p| p.name == "llm_agent")
-        .expect("registered llm_agent project")
+        .find(|p| p.name == project_name)
+        .unwrap_or_else(|| panic!("registered {project_name} project"))
         .clone();
     let original_output = project.output.clone();
     let original_hash = std::fs::read(&original_output)

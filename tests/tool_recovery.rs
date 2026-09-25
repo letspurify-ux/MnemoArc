@@ -549,20 +549,25 @@ fn tool_contract_exposes_action_fields_and_points_state_fields_to_patch() {
         .into_iter()
         .find(|d| d["function"]["name"] == "investigation")
         .unwrap();
-    let branches = definition["function"]["parameters"]["oneOf"]
-        .as_array()
-        .unwrap();
-    let single = branches
-        .iter()
-        .find(|b| b["properties"]["action"]["const"] == "verify")
-        .unwrap();
-    let batch = branches
-        .iter()
-        .find(|b| b["properties"]["action"]["const"] == "verify_batch")
-        .unwrap();
-    assert!(single["properties"].get("items").is_none());
-    assert!(batch["properties"].get("source_ids").is_none());
-    assert_eq!(batch["required"], json!(["items", "action"]));
+    // Per-action unions are not offered to the model (a provider dropped
+    // arguments under them); execution enforces each action's fields.
+    assert!(definition["function"]["parameters"].get("oneOf").is_none());
+    let error = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"x","items":{},"source_ids":[],"verification_note":"n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("does not accept items"), "{error}");
+    let error = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"verify_batch","source_ids":["S1"],"items":{"x":{"source_ids":[],"verification_note":"n"}}}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("does not accept source_ids"), "{error}");
     let before = s.task.phase.clone();
     let err = tools::execute(
         &mut s,

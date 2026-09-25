@@ -664,6 +664,13 @@ impl ToolRegistry {
                     ]);
                     format!("{} Enabled modes: {}.", t.description, modes.join(", "))
                 } else { t.description.to_string() };
+                // Per-action unions are enforced at execution. Offered to the
+                // model, a top-level oneOf made at least one provider (GLM via
+                // OpenRouter) drop every argument except action, e.g. a bare
+                // {"action":"update"} for task_state, so it is not sent.
+                if let Some(parameters) = t.parameters.as_object_mut() {
+                    parameters.remove("oneOf");
+                }
                 json!({"type":"function","function":{"name":t.name,"description":description,"parameters":t.parameters}})
             })
             .collect()
@@ -811,7 +818,11 @@ fn validate_task_state_arguments(args: &Value) -> Result<()> {
         return Ok(());
     }
     let Some(patch) = args.get("patch") else {
-        bail!("missing_argument: patch for task_state action=update");
+        // A bare {"action":"update"} was repeated in a live run; show the
+        // whole call shape to copy.
+        bail!(
+            r#"missing_argument: patch for task_state action=update. Send the fields to change inside patch in the same call, for example {{"action":"update","patch":{{"workflow":"source_document","completion":["the requested result"]}}}}"#
+        );
     };
     let object = patch.as_object().ok_or_else(|| {
         anyhow::anyhow!("invalid_argument_type: patch for task_state must be an object")
@@ -1273,18 +1284,8 @@ fn batch_target_hint(states: &[String], edit: &Value, error: &str) -> String {
     let Some(target) = edit["old_text"].as_str().filter(|t| !t.is_empty()) else {
         return String::new();
     };
-    // The operation's own error already names the cause.
-    if error.contains("HTML entities") {
-        return String::new();
-    }
-    let current = states.last().map_or("", String::as_str);
-    let count = current.matches(target).count();
-    if count > 1 {
-        return format!(
-            ". old_text occurs {count} times; include more surrounding text so it matches once"
-        );
-    }
-    // Present in the original but removed by an earlier operation here.
+    // Present in the original but removed by an earlier operation here. The
+    // operation's own error explains every other cause.
     if let Some(changed_by) =
         (1..states.len()).find(|&k| states[k - 1].contains(target) && !states[k].contains(target))
     {
@@ -1293,7 +1294,7 @@ fn batch_target_hint(states: &[String], edit: &Value, error: &str) -> String {
             changed_by - 1
         );
     }
-    ". old_text is not in the current document; copy it exactly (including spacing and line breaks) from document_inspect or file_read of the output".into()
+    String::new()
 }
 
 /// A stale hash means the document changed; a malformed one was never issued
@@ -1313,7 +1314,7 @@ fn revision_conflict(args: &Value) -> anyhow::Error {
 
 fn unique_document_text_span(old: &str, target: &str) -> Result<(usize, usize)> {
     if target.is_empty() {
-        bail!("patch_target_must_match_once");
+        bail!("patch_target_must_match_once: old_text is empty");
     }
     let Some(first) = old.find(target) else {
         if let Some(entities) = html_escaped_target(old, target) {
@@ -1321,15 +1322,70 @@ fn unique_document_text_span(old: &str, target: &str) -> Result<(usize, usize)> 
                 "patch_target_must_match_once: old_text contains HTML entities ({entities}) but the document has the literal characters; send old_text and text unescaped (for example => instead of =&gt;)"
             );
         }
-        bail!("patch_target_must_match_once");
+        if let Some(passage) = near_match(old, target) {
+            bail!(
+                "patch_target_must_match_once: old_text is not in the current document (or the given section), but this passage differs from it only in backticks, dashes, quotes or spacing: {passage:?}. Copy that passage exactly as old_text"
+            );
+        }
+        bail!(
+            "patch_target_must_match_once: old_text is not in the current document (or the given section); copy it exactly (including spacing and line breaks) from document_inspect or file_read of the output"
+        );
     };
     // Start one Unicode character after the first match so overlapping
     // occurrences such as `aa` in `aaa` are treated as ambiguous.
     let next_start = first + old[first..].chars().next().unwrap().len_utf8();
     if old[next_start..].contains(target) {
-        bail!("patch_target_must_match_once");
+        bail!(
+            "patch_target_must_match_once: old_text occurs {} times; include more surrounding text so it matches once",
+            old.matches(target).count().max(2)
+        );
     }
     Ok((first, first + target.len()))
+}
+
+/// The one passage that equals `target` once backticks are ignored, dash and
+/// quote variants are unified and whitespace runs are collapsed. Citations
+/// are often retyped with an en dash or a moved backtick; showing the exact
+/// text lets the caller copy it instead of guessing again.
+fn near_match(old: &str, target: &str) -> Option<String> {
+    fn normalize(text: &str) -> (Vec<char>, Vec<(usize, usize)>) {
+        let mut chars = Vec::new();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (at, c) in text.char_indices() {
+            let end = at + c.len_utf8();
+            let c = match c {
+                '`' => continue,
+                '–' | '—' | '‒' | '−' => '-',
+                '‘' | '’' => '\'',
+                '“' | '”' => '"',
+                c if c.is_whitespace() => ' ',
+                c => c,
+            };
+            if c == ' ' && chars.last() == Some(&' ') {
+                if let Some(span) = spans.last_mut() {
+                    span.1 = end;
+                }
+                continue;
+            }
+            chars.push(c);
+            spans.push((at, end));
+        }
+        (chars, spans)
+    }
+    let (doc, spans) = normalize(old);
+    let (wanted, _) = normalize(target.trim());
+    if wanted.len() < 8 || wanted.len() > doc.len() {
+        return None;
+    }
+    let mut found =
+        (0..=doc.len() - wanted.len()).filter(|&i| doc[i..i + wanted.len()] == wanted[..]);
+    let start = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    let (from, _) = spans[start];
+    let (_, to) = spans[start + wanted.len() - 1];
+    Some(old[from..to].to_owned())
 }
 
 /// Entities in a target that only matches once they are decoded.
@@ -2459,6 +2515,10 @@ fn bind_written_sections(s: &mut Session, doc: &str) -> Vec<String> {
             continue;
         }
         if let Some(path) = target {
+            item.section = path;
+        } else if let Some(path) = resolved_section_path(doc, &item.section) {
+            // A short or level-free name that resolves is stored as the
+            // heading's full path, like every other bound section.
             item.section = path;
         }
         if !item.section.trim().is_empty()

@@ -1282,3 +1282,33 @@ fn explicit_null_optional_read_arguments_are_treated_as_omitted() {
         .to_string();
     assert!(error.contains("path"), "{error}");
 }
+
+#[test]
+fn a_bare_task_state_update_shows_the_call_to_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    // The live shape: {"action":"update"} repeated with nothing else.
+    let error = tools::execute(&mut s, "task_state", json!({"action":"update"}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("missing_argument: patch"), "{error}");
+    assert!(
+        error.contains(r#"{"action":"update","patch":{"workflow":"source_document""#),
+        "{error}"
+    );
+}
+
+#[test]
+fn no_tool_definition_offers_a_top_level_one_of() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.active_tools = tools::ToolRegistry::optional_names();
+    // A top-level oneOf made a provider drop every argument but action.
+    for definition in tools::ToolRegistry::definitions(&s) {
+        assert!(
+            definition["function"]["parameters"].get("oneOf").is_none(),
+            "{}",
+            definition["function"]["name"]
+        );
+    }
+}
