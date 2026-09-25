@@ -1056,3 +1056,52 @@ async fn a_fix_made_after_closing_on_an_unrepaired_review_is_reviewed_again() {
         result.completion_gaps
     );
 }
+
+#[tokio::test]
+async fn transient_empty_replies_are_retried_before_any_workflow_is_set() {
+    let plain = || {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            Config {
+                model: "gpt-4o".into(),
+                model_context: Some(128_000),
+                context_tokens: 128_000,
+                output_tokens: 1_024,
+                source_answer_review: false,
+                ..Default::default()
+            },
+        );
+        s.add_user("What does this project do?".into());
+        (dir, s)
+    };
+    let (_dir, s) = plain();
+    let (result, _) = run_scripted(
+        s,
+        vec![
+            Completion::default(),
+            Completion::default(),
+            Completion {
+                text: "It serves an API.".into(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await;
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    // Persistent empty replies still stop the run instead of looping.
+    let (_dir, s) = plain();
+    let (result, _) = run_scripted(s, vec![Completion::default(); 3]).await;
+    assert_eq!(result.status, "blocked");
+    assert!(
+        result
+            .last_error
+            .as_deref()
+            .unwrap()
+            .starts_with("empty_completion")
+    );
+}

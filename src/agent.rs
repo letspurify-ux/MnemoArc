@@ -265,6 +265,9 @@ fn abandon_failing_review(s: &mut Session, failures: usize) -> bool {
     true
 }
 
+/// Consecutive empty replies retried before a non-document run stops.
+const EMPTY_COMPLETION_RETRIES: usize = 2;
+
 /// Unchanged-document final answers rejected by a review before closing.
 const UNREPAIRED_FINAL_LIMIT: usize = 2;
 
@@ -839,6 +842,7 @@ pub async fn run_session_controlled(
     let mut failure = None;
     let mut finalization_attempts = s.progress_recovery.finalization_attempts;
     let mut length_recoveries = 0usize;
+    let mut empty_completions = 0usize;
     let mut review_response_failures = 0usize;
     let mut tool_failures = tools::recovery::FailureTracker::default();
     let mut repetitions = std::collections::BTreeMap::<String, usize>::new();
@@ -1649,6 +1653,16 @@ pub async fn run_session_controlled(
                 s.progress_recovery.action_required = true;
                 continue;
             }
+            // An empty reply is usually transient (the provider stopped before
+            // producing content). Ask again a bounded number of times before
+            // stopping; this also covers work not yet classified as a document.
+            empty_completions += 1;
+            if empty_completions <= EMPTY_COMPLETION_RETRIES {
+                s.last_error = Some(
+                    "empty_completion: the previous response had neither text nor tool calls; continue the task with a tool call or the answer".into(),
+                );
+                continue;
+            }
             // A provider may legally return stop with an empty content field.
             // Treating that as a successful final answer would mark the task
             // complete while persisting an empty assistant message.
@@ -1659,6 +1673,7 @@ pub async fn run_session_controlled(
             break;
         }
 
+        empty_completions = 0;
         if completion.length_limited && buffer_answer && !completion.discarded_tool_calls {
             // A source draft need not be streamed or continued verbatim: the
             // bounded review can produce a complete answer from its evidence.
