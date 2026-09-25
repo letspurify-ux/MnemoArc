@@ -1244,3 +1244,20 @@ fn type_errors_name_the_expected_and_received_type() {
         "invalid_argument_type: patch must be object, got number"
     );
 }
+
+#[test]
+fn an_invented_cursor_explains_how_to_page() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.js"), "button\nonClick\n").unwrap();
+    let mut s = session(dir.path());
+    // The live shape: a cursor made up as JSON text.
+    let error = tools::execute(
+        &mut s,
+        "source_search",
+        json!({"path":"a.js","queries":["button"],"cursor":"{\"action\": \"read\", \"id\": 5}"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("invalid_cursor: "), "{error}");
+    assert!(error.contains("copy next_cursor exactly"), "{error}");
+}

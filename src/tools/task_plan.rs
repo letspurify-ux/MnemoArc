@@ -237,7 +237,17 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
                 return Ok(());
             }
             if task.current_todo().is_none_or(|item| item.id != id) {
-                bail!("Complete the current item first, or insert/move its prerequisite before it");
+                // Name the unfinished items ahead of the target so the caller
+                // can complete or remove them in the same batch, in order.
+                let ahead: Vec<&str> = task.todos[..at]
+                    .iter()
+                    .filter(|item| !item.done)
+                    .map(|item| item.id.as_str())
+                    .collect();
+                bail!(
+                    "Complete the current item first, or insert/move its prerequisite before it; {id} can complete only after {} are completed or removed, in list order",
+                    ahead.join(", ")
+                );
             }
             task.todos[at].done = true;
             task.todos[at].result = result.into();
@@ -390,9 +400,23 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
         }
     };
     let mut next = s.task.clone();
-    for operation in operations {
+    let count = operations.len();
+    for (index, operation) in operations.into_iter().enumerate() {
         if let Err(error) = apply(&mut next, operation) {
-            return Ok(unchanged(&s.task, error.to_string()));
+            // Operations apply in order, so the plan the failing one saw can
+            // differ from the one the caller read. Name the operation and the
+            // item that was current at that point.
+            let current = next
+                .current_todo()
+                .map_or("none".to_owned(), |item| item.id.clone());
+            let reason = if count > 1 {
+                format!(
+                    "operations[{index}] failed: {error} (current item at that point: {current}). No operation in this batch was applied; earlier operations only take effect together with it"
+                )
+            } else {
+                format!("{error} (current item: {current})")
+            };
+            return Ok(unchanged(&s.task, reason));
         }
     }
     if next.todos.iter().filter(|item| !item.done).count() > MAX_PENDING {

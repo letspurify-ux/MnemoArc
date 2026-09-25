@@ -559,7 +559,7 @@ pub(super) fn execute(
     let fingerprint = fingerprint(&path, &digest, &filters);
     let offset = page_cursor(args, &fingerprint)?;
     if offset > symbols.len() {
-        bail!("invalid_cursor");
+        bail!(INVALID_CURSOR);
     }
     let end = offset
         .saturating_add(n(args, "limit", 50).clamp(1, 100))

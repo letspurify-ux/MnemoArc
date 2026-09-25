@@ -362,7 +362,7 @@ impl ToolRegistry {
                 optional: true,
                 read_only: false,
                 parameters: schema(
-                    json!({"action":action(&["list","upsert","verify","verify_batch","final_check","mark_gap"]),"reason":{"type":"string","minLength":10,"maxLength":400,"description":"ONLY for action=mark_gap: why this item cannot be verified with the gathered evidence."},"id":{"type":"string","minLength":1},"title":{"type":"string","minLength":1,"description":"Non-empty title required for a NEW item. Omit when updating an existing id to preserve its title."},"status":action(&["uninvestigated","in_progress","written"]),"memory_ids":strings(),"source_ids":strings(),"section":string(),"verification_note":string(),"items":{"type":"object","description":"ONLY for action=verify_batch. Object keyed by existing investigation IDs; not an array and not used by upsert.","minProperties":1,"maxProperties":20,"additionalProperties":{"type":"object","properties":{"source_ids":strings(),"verification_note":string()},"required":["source_ids","verification_note"],"additionalProperties":false}},"offset":number(),"limit":number()}),
+                    json!({"action":action(&["list","upsert","verify","verify_batch","final_check","mark_gap"]),"reason":{"type":"string","minLength":10,"maxLength":400,"description":"ONLY for action=mark_gap: why this item cannot be verified with the gathered evidence."},"id":{"type":"string","minLength":1},"title":{"type":"string","minLength":1,"description":"Non-empty title required for a NEW item. Omit when updating an existing id to preserve its title."},"status":action(&["uninvestigated","in_progress","written"]),"memory_ids":strings(),"source_ids":strings(),"section":string(),"verification_note":string(),"items":{"type":"object","description":"ONLY for action=verify_batch. Object keyed by existing investigation IDs; not an array and not used by upsert.","minProperties":1,"maxProperties":20,"additionalProperties":{"type":"object","properties":{"source_ids":strings(),"verification_note":string(),"section":string()},"required":["source_ids","verification_note"],"additionalProperties":false}},"offset":number(),"limit":number()}),
                     &["action"],
                 ),
             },
@@ -1724,7 +1724,7 @@ fn investigation_contract(action: &str, updating: bool) -> Option<InvestigationC
             r##"{"action":"upsert","id":"overview","title":"Project overview","section":"# Overview"}"##,
         ),
         "verify" => (
-            &["action", "id", "source_ids", "verification_note"],
+            &["action", "id", "source_ids", "verification_note", "section"],
             &["id", "source_ids", "verification_note"],
             r#"{"action":"verify","id":"existing-id","source_ids":["observed-source-id"],"verification_note":"Actual source/document comparison"}"#,
         ),
@@ -2461,6 +2461,46 @@ fn bind_written_sections(s: &mut Session, doc: &str) -> Vec<String> {
     written
 }
 
+/// Verification may name the section of an item registered without one (or
+/// whose section no longer resolves), saving a separate upsert round. It
+/// never moves an item that already has a section, or takes another item's.
+fn bind_verify_section(s: &mut Session, id: &str, section: &str) -> Result<()> {
+    let doc = read_text(&output_path(&s.project)?)?;
+    let item = s
+        .investigations
+        .iter()
+        .find(|i| i.id == id)
+        .ok_or_else(|| anyhow::anyhow!("item_not_found"))?;
+    let heading = documentation::resolve_heading(&doc, section)?;
+    let path = documentation::heading_path(&doc, heading.start)?;
+    if let Some(current) = resolved_section_path(&doc, &item.section) {
+        if current == path {
+            return Ok(());
+        }
+        bail!(
+            "invalid_argument_value: item {id} is registered to section {current:?}, not {path:?}; verify compares its registered section. Omit section, or move the item with investigation upsert first"
+        );
+    }
+    if let Some(other) = s.investigations.iter().find(|other| {
+        other.id != id && resolved_section_path(&doc, &other.section).as_ref() == Some(&path)
+    }) {
+        bail!(
+            "invalid_argument_value: section {path:?} already belongs to item {}; choose this item's own section",
+            other.id
+        );
+    }
+    let written = doc[heading.start..heading.end]
+        .lines()
+        .skip(1)
+        .any(|line| !line.trim().is_empty());
+    let item = s.investigations.iter_mut().find(|i| i.id == id).unwrap();
+    item.section = path;
+    if written && !item.is_settled() {
+        item.status = "written".into();
+    }
+    Ok(())
+}
+
 fn resolved_section_path(doc: &str, section: &str) -> Option<String> {
     if section.trim().is_empty() {
         return None;
@@ -2542,11 +2582,15 @@ fn bounded_text(s: &Session, content: &str, offset: usize) -> Value {
     let next = offset + body.chars().count();
     json!({"text":body,"truncated":truncated,"next_offset":truncated.then_some(next)})
 }
+/// A cursor that this tool did not issue, or that no longer points into the
+/// result. Models sometimes invent one; say how to get a real one.
+pub(crate) const INVALID_CURSOR: &str = "invalid_cursor: not a cursor this tool issued for these results; copy next_cursor exactly from the previous result, or omit cursor to start from the beginning";
+
 fn page_cursor(args: &Value, fingerprint: &str) -> Result<usize> {
     if let Some(cursor) = args["cursor"].as_str() {
         let (h, index) = cursor
             .split_once(':')
-            .ok_or_else(|| anyhow::anyhow!("invalid_cursor"))?;
+            .ok_or_else(|| anyhow::anyhow!(INVALID_CURSOR))?;
         if h != fingerprint {
             bail!(
                 "cursor_expired: this cursor was issued for different arguments (path_glob, mode, query or filters) or the listing changed; pass the cursor with exactly the original arguments, or restart without a cursor"
@@ -2554,7 +2598,7 @@ fn page_cursor(args: &Value, fingerprint: &str) -> Result<usize> {
         }
         index
             .parse::<usize>()
-            .map_err(|_| anyhow::anyhow!("invalid_cursor"))
+            .map_err(|_| anyhow::anyhow!(INVALID_CURSOR))
     } else {
         Ok(0)
     }
@@ -3089,7 +3133,7 @@ fn execute_repaired(
                 hash(serde_json::to_string(&(mode, path_glob(&args)?, &names))?.as_bytes());
             let offset = page_cursor(&args, &fingerprint)?;
             if offset > names.len() {
-                bail!("invalid_cursor");
+                bail!(INVALID_CURSOR);
             }
             let end = (offset + n(&args, "limit", 100).clamp(1, 500)).min(names.len());
             if end < names.len()
@@ -3339,12 +3383,10 @@ fn execute_repaired(
                         );
                         continue;
                     }
-                    if let Some(key) =
-                        params.as_object().unwrap().keys().find(|key| {
-                            !["source_ids", "verification_note"].contains(&key.as_str())
-                        })
-                    {
-                        results.push(json!({"id":id,"result":envelope(Err(anyhow::anyhow!("invalid_action_arguments: verify_batch item does not accept {key}; allowed: source_ids, verification_note; ID belongs in the items key")))}));
+                    if let Some(key) = params.as_object().unwrap().keys().find(|key| {
+                        !["source_ids", "verification_note", "section"].contains(&key.as_str())
+                    }) {
+                        results.push(json!({"id":id,"result":envelope(Err(anyhow::anyhow!("invalid_action_arguments: verify_batch item does not accept {key}; allowed: source_ids, verification_note, section; ID belongs in the items key")))}));
                         continue;
                     }
                     // Batch entries are not passed through the outer tool
@@ -3406,6 +3448,9 @@ fn execute_repaired(
                 {
                     bind_written_sections(s, &doc);
                 }
+                if let Some(section) = args["section"].as_str() {
+                    bind_verify_section(s, id, section)?;
+                }
                 let item = s
                     .investigations
                     .iter()
@@ -3416,7 +3461,7 @@ fn execute_repaired(
                     || (item.status == "gap" && !item.section.trim().is_empty()))
                 {
                     bail!(
-                        "item_must_be_written_before_verification: id={}, status={}, section={:?}. Inspect the document section first; if its content is written, use investigation upsert with this id, the exact section heading from document_inspect, and status=written together, then verify. Otherwise write the section before verifying.",
+                        "item_must_be_written_before_verification: id={}, status={}, section={:?}. Inspect the document section first; if its content is written and this item has no section yet, pass that exact heading as section in this verify (or verify_batch item), or use investigation upsert with this id, the section and status=written, then verify. Otherwise write the section before verifying.",
                         item.id,
                         item.status,
                         item.section

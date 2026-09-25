@@ -2614,6 +2614,70 @@ fn audit_flags_the_output_path_written_into_the_document() {
 }
 
 #[test]
+fn verify_binds_the_section_of_an_item_registered_without_one() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.rs"), numbered_source(4)).unwrap();
+    // The live shape: items planned without a section, then verified with
+    // verify_batch right after writing.
+    for (id, title) in [
+        ("start", "Start"),
+        ("answers", "Answers"),
+        ("other", "Other"),
+    ] {
+        run(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":id,"title":title,"status":"in_progress"}),
+        );
+    }
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Manual\n## 1. 첫 화면\nBody a.rs:1-2\n## 2. 답변 읽기\nBody a.rs:3-4\n"}),
+    );
+    let source = run(&mut s, "file_read", json!({"path":"a.rs"}))["source"]["id"].clone();
+    let result = run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify_batch","items":{
+            "start":{"source_ids":[source],"verification_note":"Compared a.rs:1-2","section":"## 1. 첫 화면"},
+            "answers":{"source_ids":[source],"verification_note":"Compared a.rs:3-4","section":"## 2. 답변 읽기"}
+        }}),
+    );
+    assert_eq!(
+        result["succeeded_ids"],
+        json!(["answers", "start"]),
+        "{result}"
+    );
+    let item = |s: &Session, id: &str| {
+        s.investigations
+            .iter()
+            .find(|i| i.id == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(item(&s, "start").status, "verified");
+    assert_eq!(item(&s, "start").section, "# Manual\n## 1. 첫 화면");
+
+    // Another item's section is refused, and so is moving a bound item.
+    let verify = |s: &mut Session, id: &str, section: &str| {
+        tools::execute(
+            s,
+            "investigation",
+            json!({"action":"verify","id":id,"source_ids":[source],"verification_note":"Compared","section":section}),
+        )
+        .unwrap_err()
+        .to_string()
+    };
+    let error = verify(&mut s, "other", "## 1. 첫 화면");
+    assert!(error.contains("already belongs to item start"), "{error}");
+    assert!(item(&s, "other").section.is_empty());
+    let error = verify(&mut s, "start", "## 2. 답변 읽기");
+    assert!(error.contains("is registered to section"), "{error}");
+    assert_eq!(item(&s, "start").section, "# Manual\n## 1. 첫 화면");
+}
+
+#[test]
 fn appended_heading_starts_a_new_line() {
     let (_dir, mut s) = setup();
     std::fs::write(&s.project.output, "# A\nFirst section ends here.").unwrap();
@@ -2776,5 +2840,8 @@ fn common_argument_aliases_are_accepted_and_conflicts_rejected() {
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("does not accept section"), "{error}");
+    // A section the item is not registered to is still refused (moving a
+    // registered item is covered by the verify section-binding test).
+    assert!(error.starts_with("section_not_found"), "{error}");
+    assert_eq!(s.investigations[0].section, "# A");
 }

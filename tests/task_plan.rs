@@ -858,3 +858,43 @@ fn a_flattened_operation_is_applied_as_one_operation() {
     .to_string();
     assert!(error.starts_with("unknown_argument: note"), "{error}");
 }
+
+#[test]
+fn a_failed_operation_in_a_batch_is_named_with_the_current_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(
+        &mut s,
+        json!([{"op":"insert","texts":["a","b","c","d","e"]}]),
+    );
+    // The live shape: completing T1 and then a later item that is not
+    // current once T1 is done.
+    let result = tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":1,"operations":[
+            {"op":"complete","id":"T1","result":"done"},
+            {"op":"complete","id":"T5","result":"done"}
+        ]}),
+    )
+    .unwrap();
+    assert_eq!(result["applied"], false);
+    let reason = result["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with("operations[1] failed: Complete the current item first"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("current item at that point: T2"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("T5 can complete only after T2, T3, T4 are completed or removed"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("No operation in this batch was applied"),
+        "{reason}"
+    );
+    assert_eq!(s.task.current_todo().unwrap().id, "T1");
+}

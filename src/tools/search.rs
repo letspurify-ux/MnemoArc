@@ -109,10 +109,10 @@ pub(super) fn execute(
     let requested_offset = if let Some(cursor) = args["cursor"].as_str() {
         cursor
             .split_once(':')
-            .ok_or_else(|| anyhow::anyhow!("invalid_cursor"))?
+            .ok_or_else(|| anyhow::anyhow!(INVALID_CURSOR))?
             .1
             .parse::<usize>()
-            .map_err(|_| anyhow::anyhow!("invalid_cursor"))?
+            .map_err(|_| anyhow::anyhow!(INVALID_CURSOR))?
     } else {
         0
     };
@@ -200,7 +200,7 @@ pub(super) fn execute(
         matching_file_count
     };
     if offset > total {
-        bail!("invalid_cursor");
+        bail!(INVALID_CURSOR);
     }
     let end = offset
         .saturating_add(n(args, "limit", 20).clamp(1, 100))

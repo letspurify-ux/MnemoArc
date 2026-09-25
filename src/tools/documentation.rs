@@ -405,7 +405,7 @@ pub(super) fn execute(
             let fingerprint = format!("{:x}", fingerprint.finalize());
             let offset = page_cursor(args, &fingerprint)?;
             if offset > rows.len() {
-                bail!("invalid_cursor");
+                bail!(INVALID_CURSOR);
             }
             let end = (offset + n(args, "limit", 20).clamp(1, 100)).min(rows.len());
             let results=rows[offset..end].iter().map(|(path,digest,line,name,excerpt,truncated)| {

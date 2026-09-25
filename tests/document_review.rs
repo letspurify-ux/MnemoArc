@@ -1127,6 +1127,10 @@ async fn progressive_document_repairs_reach_final_approval_past_both_intervals()
     s.config.review_limit = 2;
     s.config.document_repair_limit = 2;
     s.config.run_tokens = 5_000_000;
+    // This test counts repair requests, not checkpoint cleanup; the default
+    // budget sits close enough to the cleanup threshold that a slightly
+    // larger tool schema would insert a cleanup request.
+    s.config.context_tokens = 128_000;
     let client = Arc::new(ProgressiveDocumentRepair {
         calls: std::sync::Mutex::new(0),
         path: s.project.output.clone(),
