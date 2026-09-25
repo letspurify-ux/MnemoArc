@@ -810,3 +810,51 @@ async fn invalid_operations_recover_even_before_the_first_plan_exists() {
         "Actual requested result\n"
     );
 }
+
+#[test]
+fn invalid_json_text_shows_where_it_broke() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    // The live shape: operations as hand-written JSON text with Korean
+    // content and the closing bracket of texts missing.
+    let text =
+        r#"[{"op":"insert","texts":["조사: 첫 화면 (App.jsx)"},{"op":"insert","texts":["b"]}]"#;
+    let result = tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":0,"operations":text}),
+    )
+    .unwrap();
+    assert_eq!(result["applied"], false, "{result}");
+    let reason = result["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(r#"[\"조사: 첫 화면 (App.jsx)\"" <here> "},{"#),
+        "{reason}"
+    );
+    assert!(reason.contains("not as quoted text"), "{reason}");
+}
+
+#[test]
+fn a_flattened_operation_is_applied_as_one_operation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(&mut s, json!([{"op":"insert","texts":["첫 화면 확인"]}]));
+    // The live shape: the operation's fields at the top level.
+    let result = tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"complete","expected_revision":1,"id":"T1","result":"App.jsx 확인"}),
+    )
+    .unwrap();
+    assert_eq!(result["applied"], true, "{result}");
+    assert!(s.task.current_todo().is_none());
+    // Unknown fields still reach normal validation.
+    let error = tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"insert","expected_revision":2,"texts":["x"],"note":"y"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("unknown_argument: note"), "{error}");
+}

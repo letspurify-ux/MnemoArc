@@ -431,6 +431,12 @@ pub(super) fn execute(
             if s.investigations.is_empty() {
                 issues.push(json!({"kind":"no_investigation_coverage"}));
             }
+            // The output's own absolute path in its text is a run report
+            // (where it was written), which belongs in the final answer.
+            if let Some(line) = output_path_line(&path, &doc) {
+                issues.push(json!({"kind":"output_path_in_document","line":line,
+                    "guidance":"The document states its own output path, a report of how it was produced. Remove that text; give the path, verification scope and limitations in the final chat answer instead."}));
+            }
             for item in &s.investigations {
                 // A closing-mode gap is reported as unconfirmed by the final
                 // result; it is settled, and it may never have been written.
@@ -493,6 +499,21 @@ pub(super) fn execute(
         }
         _ => bail!("unsupported_tool"),
     }
+}
+
+/// The first document line naming the output's absolute path, in either its
+/// configured or canonical spelling (e.g. /var/... and /private/var/...).
+fn output_path_line(path: &Path, doc: &str) -> Option<usize> {
+    let mut spellings = vec![path.display().to_string()];
+    if let Ok(canonical) = path.canonicalize() {
+        spellings.push(canonical.display().to_string());
+    }
+    if let Some(stripped) = spellings.iter().find_map(|p| p.strip_prefix("/private")) {
+        spellings.push(stripped.to_owned());
+    }
+    doc.lines()
+        .position(|line| spellings.iter().any(|p| line.contains(p.as_str())))
+        .map(|index| index + 1)
 }
 
 /// Sections whose citations no investigation item covers. Verification only

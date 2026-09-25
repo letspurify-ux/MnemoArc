@@ -284,7 +284,31 @@ fn decode_json(text: &str) -> Result<Value> {
     }
     // Strict JSON only: never repair partial JSON, evaluate text, or guess
     // operation ordering from a map. Each string wrapper is decoded once.
-    serde_json::from_str(text).map_err(|error| anyhow::anyhow!("Invalid JSON: {error}"))
+    serde_json::from_str(text).map_err(|error| {
+        anyhow::anyhow!(
+            "Invalid JSON: {error}; near {}. Send operations as a JSON array value, not as quoted text, so no brackets or quotes need hand escaping",
+            json_error_context(text, error.line(), error.column())
+        )
+    })
+}
+
+/// The text around a JSON error with a marker at the reported position, so a
+/// bracket or quote mistake inside hand-written JSON text is visible.
+fn json_error_context(text: &str, line: usize, column: usize) -> String {
+    let line_text = text.lines().nth(line.saturating_sub(1)).unwrap_or("");
+    // serde_json's column is the 1-based byte offset of the offending
+    // character; the marker goes just before it.
+    let mut at = column.saturating_sub(1).min(line_text.len());
+    while !line_text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let (head, tail) = line_text.split_at(at);
+    let before: String = {
+        let chars: Vec<char> = head.chars().collect();
+        chars[chars.len().saturating_sub(40)..].iter().collect()
+    };
+    let after: String = tail.chars().take(40).collect();
+    format!("{before:?} <here> {after:?}")
 }
 
 fn parse_operations(value: &Value) -> Result<(Vec<Operation>, bool)> {

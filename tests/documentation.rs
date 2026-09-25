@@ -2577,6 +2577,43 @@ fn source_changed_names_the_source_and_output_document_reads() {
 }
 
 #[test]
+fn audit_flags_the_output_path_written_into_the_document() {
+    let (_dir, mut s) = setup();
+    let output = s
+        .project
+        .output
+        .canonicalize()
+        .unwrap_or(s.project.output.clone());
+    // The live shape: a closing "document info" line with the output path.
+    for path in [
+        s.project.output.display().to_string(),
+        output.display().to_string(),
+    ] {
+        std::fs::write(
+            &s.project.output,
+            format!("# Guide\nBody.\n\n**문서 정보**: 생성 경로는 {path}.\n"),
+        )
+        .unwrap();
+        let audit = run(&mut s, "document_audit", json!({}));
+        let issue = audit["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|issue| issue["kind"] == "output_path_in_document")
+            .cloned();
+        assert_eq!(issue.unwrap()["line"], 4, "{audit}");
+        assert_eq!(audit["structural_ok"], false);
+    }
+    // Naming the file relatively is ordinary content.
+    std::fs::write(&s.project.output, "# Guide\nSee summary.md for details.\n").unwrap();
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert!(
+        !audit.to_string().contains("output_path_in_document"),
+        "{audit}"
+    );
+}
+
+#[test]
 fn appended_heading_starts_a_new_line() {
     let (_dir, mut s) = setup();
     std::fs::write(&s.project.output, "# A\nFirst section ends here.").unwrap();

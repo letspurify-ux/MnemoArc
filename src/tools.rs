@@ -1026,6 +1026,27 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
                 rename(object, "max_issues", "limit", "")?;
             }
         }
+        // One plan operation flattened into the call, e.g.
+        // {action:"complete",id,result}, means an apply with that operation.
+        "task_plan"
+            if args["action"].as_str().is_some_and(|action| {
+                [
+                    "insert", "update", "split", "move", "remove", "complete", "reopen",
+                ]
+                .contains(&action)
+            }) && args.get("operations").is_none() =>
+        {
+            let object = args.as_object_mut().unwrap();
+            let op = object.remove("action").unwrap();
+            let mut operation = serde_json::Map::from_iter([("op".to_owned(), op)]);
+            for key in ["texts", "before", "id", "text", "result", "reason"] {
+                if let Some(value) = object.remove(key) {
+                    operation.insert(key.into(), value);
+                }
+            }
+            object.insert("action".into(), json!("apply"));
+            object.insert("operations".into(), json!([operation]));
+        }
         "investigation" if args["action"] == "verify" => {
             // verify compares the item's registered section; restating that
             // same section is harmless, a different one is a real mistake.
