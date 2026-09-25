@@ -1020,6 +1020,18 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
         "document_edit" => {
             if let Some(object) = args.as_object_mut() {
                 rename(object, "new_text", "text", "")?;
+                // An append right after the model's own successful write
+                // often omits expected_hash (three live runs in a row). If the
+                // document is still exactly that write, its hash is known to
+                // the model already; any other change keeps the requirement.
+                if object.get("action").and_then(Value::as_str) == Some("append")
+                    && !object.contains_key("expected_hash")
+                    && let Some((written, digest)) = &s.last_document_write
+                    && output_path(&s.project).is_ok_and(|path| path == *written)
+                    && std::fs::read(written).is_ok_and(|bytes| hash(&bytes) == *digest)
+                {
+                    object.insert("expected_hash".into(), json!(digest));
+                }
             }
         }
         "document_edit_batch" => {
@@ -1278,6 +1290,29 @@ fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
 /// Explain a batch operation whose old_text did not match exactly once.
 /// `states[k]` is the document before operation k (states[0] = original).
 fn batch_target_hint(states: &[String], edit: &Value, error: &str) -> String {
+    if error.starts_with("section_revision_conflict") {
+        // The section may have matched the snapshot the caller read and been
+        // changed by an earlier operation of this same batch.
+        let (Some(section), Some(expected)) = (
+            edit["section"].as_str(),
+            edit["expected_section_hash"].as_str(),
+        ) else {
+            return String::new();
+        };
+        let matched = |doc: &String| {
+            documentation::resolve_heading(doc, section)
+                .is_ok_and(|h| hash(&doc.as_bytes()[h.start..h.end]) == expected)
+        };
+        if let Some(changed_by) =
+            (1..states.len()).find(|&k| matched(&states[k - 1]) && !matched(&states[k]))
+        {
+            return format!(
+                ". The section matched when this batch started but edits[{}] in this same batch already changed it; merge the two edits into one section replacement or send them as separate requests",
+                changed_by - 1
+            );
+        }
+        return String::new();
+    }
     if !error.starts_with("patch_target_must_match_once") {
         return String::new();
     }
@@ -1327,6 +1362,11 @@ fn unique_document_text_span(old: &str, target: &str) -> Result<(usize, usize)> 
                 "patch_target_must_match_once: old_text is not in the current document (or the given section), but this passage differs from it only in backticks, dashes, quotes or spacing: {passage:?}. Copy that passage exactly as old_text"
             );
         }
+        if let Some((matched, document_next, target_next)) = divergence(old, target) {
+            bail!(
+                "patch_target_must_match_once: old_text is not in the current document (or the given section). Its beginning matches the document up to {matched:?}; after that the document continues with {document_next:?} but old_text continues with {target_next:?}. Copy old_text from the document text at that point"
+            );
+        }
         bail!(
             "patch_target_must_match_once: old_text is not in the current document (or the given section); copy it exactly (including spacing and line breaks) from document_inspect or file_read of the output"
         );
@@ -1341,6 +1381,41 @@ fn unique_document_text_span(old: &str, target: &str) -> Result<(usize, usize)> 
         );
     }
     Ok((first, first + target.len()))
+}
+
+/// Where an old_text that begins like the document stops matching it. The
+/// longest prefix of `target` found exactly once in `old` (at least 12
+/// characters) marks the point; the text on either side of it is returned
+/// so the caller sees which sentence it misremembered. None when the
+/// prefix is short or occurs more than once.
+fn divergence(old: &str, target: &str) -> Option<(String, String, String)> {
+    let bounds: Vec<usize> = target
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain(std::iter::once(target.len()))
+        .collect();
+    // Presence of a prefix is monotonic in its length, so binary search the
+    // longest one that occurs.
+    let (mut low, mut high) = (0, bounds.len() - 1);
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if old.contains(&target[..bounds[mid]]) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let prefix = &target[..bounds[low]];
+    if low < 12 || old.matches(prefix).count() != 1 {
+        return None;
+    }
+    let at = old.find(prefix)? + prefix.len();
+    let tail = |text: &str| text.chars().take(40).collect::<String>();
+    let matched: String = {
+        let chars: Vec<char> = prefix.chars().collect();
+        chars[chars.len().saturating_sub(30)..].iter().collect()
+    };
+    Some((matched, tail(&old[at..]), tail(&target[prefix.len()..])))
 }
 
 /// The one passage that equals `target` once backticks are ignored, dash and
@@ -1534,7 +1609,17 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             let resolved = documentation::resolve_heading(old, heading)?;
             let target = &old[resolved.start..resolved.end];
             if args["expected_section_hash"].as_str() != Some(hash(target.as_bytes()).as_str()) {
-                bail!("section_revision_conflict");
+                let sent = args["expected_section_hash"].as_str().unwrap_or("");
+                if sent.len() != 64 || !sent.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    bail!(
+                        "section_revision_conflict: expected_section_hash {sent:?} is not a section hash (64 hex characters); copy section_hash from document_inspect of {:?}, not an item ID or document hash",
+                        resolved.heading
+                    );
+                }
+                bail!(
+                    "section_revision_conflict: expected_section_hash is not the current hash of {:?}; read that section again with document_inspect and use its section_hash",
+                    resolved.heading
+                );
             }
             if new.lines().next().map(str::trim) != target.lines().next().map(str::trim) {
                 bail!("invalid_argument_value: section replacement must retain its heading");

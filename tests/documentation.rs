@@ -1914,10 +1914,36 @@ fn batch_failure_after_successful_edit_leaves_file_unchanged() {
     .unwrap_err()
     .to_string();
     assert!(error.contains("index=1") && error.contains("section_revision_conflict"));
+    // The earlier operation of the same batch is named as the cause.
+    assert!(
+        error.contains("edits[0] in this same batch already changed it"),
+        "{error}"
+    );
     assert_eq!(
         std::fs::read_to_string(&s.project.output).unwrap(),
         original
     );
+    // Outside a batch the message says how to get the current section hash.
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":"## Target","expected_hash":inspected["hash"],"expected_section_hash":"0".repeat(64),"text":"## Target\nfinal\n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("read that section again with document_inspect"),
+        "{error}"
+    );
+    // The live shape: an item ID sent as the section hash.
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":"## Target","expected_hash":inspected["hash"],"expected_section_hash":"1eeacd1d-fb48-4d6b-b909-2c3c275cebcc","text":"## Target\nfinal\n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("is not a section hash"), "{error}");
     assert!(!s.document_written);
 }
 
@@ -2819,6 +2845,97 @@ fn a_short_heading_name_resolves_only_when_unique() {
             .to_string();
         assert!(error.starts_with("section_not_found"), "{section}: {error}");
     }
+}
+
+#[test]
+fn a_misremembered_old_text_names_where_it_diverges() {
+    // The live shape: old_text copied correctly, then a sentence that the
+    // document no longer has.
+    let body = "# 설정\n- 전체 범위에서 저장하면 세션이 열려 있을 때 같은 내용이 현재 세션에도 함께 저장됩니다(Settings.jsx:250-260).\n## 다음\n본문\n";
+    for batch in [false, true] {
+        let (_dir, mut s) = setup();
+        std::fs::write(&s.project.output, body).unwrap();
+        let hash = tools::hash(body.as_bytes());
+        let edit = json!({"action":"replace_text","old_text":"전체 범위에서 저장하면 세션이 열려 있을 때 같은 내용이 현재 세션에도 함께 저장됩니다(Settings.jsx:250-260). 해당 옵션의 화면 문구는 미확인입니다.","text":"x"});
+        let error = if batch {
+            tools::execute(
+                &mut s,
+                "document_edit_batch",
+                json!({"expected_hash":hash,"edits":[edit]}),
+            )
+        } else {
+            let mut edit = edit;
+            edit["expected_hash"] = json!(hash);
+            tools::execute(&mut s, "document_edit", edit)
+        }
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(r#"matches the document up to "#), "{error}");
+        assert!(
+            error.contains(r#"the document continues with "\n## 다음\n본문\n""#),
+            "{error}"
+        );
+        assert!(
+            error.contains(r#"old_text continues with " 해당 옵션의 화면 문구는 미확인입니다.""#),
+            "{error}"
+        );
+    }
+    // A short shared beginning gives the plain guidance instead.
+    let (_dir, mut s) = setup();
+    std::fs::write(&s.project.output, body).unwrap();
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":tools::hash(body.as_bytes()),"old_text":"- 전체 이야기는 다릅니다","text":"x"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("copy it exactly"), "{error}");
+}
+
+#[test]
+fn an_append_after_the_models_own_write_may_omit_the_hash() {
+    let (_dir, mut s) = setup();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\nOne.\n"}),
+    );
+    // The live shape: append straight after the model's own write.
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","text":"## Two\nTwo.\n"}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\nOne.\n## Two\nTwo.\n"
+    );
+    // After an outside change the model's last write is stale: still required.
+    std::fs::write(&s.project.output, "# Guide\nChanged elsewhere.\n").unwrap();
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","text":"## Three\n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("expected_hash"), "{error}");
+    // Other actions keep requiring it even right after a write.
+    let hash = tools::hash(b"# Guide\nChanged elsewhere.\n");
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":hash,"text":"## Three\n"}),
+    );
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","old_text":"Three","text":"3"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("expected_hash"), "{error}");
 }
 
 #[test]

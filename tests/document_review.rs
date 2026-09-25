@@ -78,7 +78,7 @@ fn source_workflow_activates_tools_and_schema_prevents_guessing() {
         tools::execute(
             &mut s,
             "document_edit",
-            json!({"action":"append","text":"x"})
+            json!({"action":"replace_text","old_text":"A while loop","text":"x"})
         )
         .unwrap_err()
         .to_string()
@@ -1663,4 +1663,45 @@ fn a_repeated_finding_about_rewritten_text_is_dropped() {
     .unwrap();
     assert!(s.document_review.issues.is_empty());
     assert!(document_review::approved(&s));
+}
+
+#[test]
+fn a_page_cannot_report_a_later_section_as_missing() {
+    let (_dir, mut s) = fixture();
+    let mut doc = String::from("# Intro\n");
+    doc.push_str(&"Intro context. main.js:1-6\n".repeat(59));
+    doc.push_str("## Diagram\n```mermaid\n");
+    doc.push_str(&"A --> B\n".repeat(60));
+    doc.push_str("```\n## 4-3. Binding editor basics\n");
+    doc.push_str(&"Conclusion. main.js:1-6\n".repeat(100));
+    std::fs::write(&s.project.output, doc).unwrap();
+    s.document_review = Default::default();
+    let first = document_review::request(&mut s).unwrap();
+    let first: Value =
+        serde_json::from_str(first["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(first["document_line_end"], 60);
+    // Every page sees the whole outline.
+    assert!(
+        first["document_outline"]
+            .to_string()
+            .contains("## 4-3. Binding editor basics")
+    );
+    // The live shape: a page claims a later section is missing. A finding
+    // about this page's text, and one quoting text not in the document, stay.
+    document_review::finish(
+        &mut s,
+        r#"{"issues":["Doc end: the requested section '4-3. Binding editor basics' does not exist on this page; add it","Intro: 'Intro context. main.js:1-6' repeats without new detail","Intro: add the requested 'loop bound explanation' paragraph"]}"#,
+    )
+    .unwrap();
+    while s.document_review.pending {
+        document_review::request(&mut s).unwrap();
+        document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    }
+    assert_eq!(
+        s.document_review.issues,
+        [
+            "Intro: 'Intro context. main.js:1-6' repeats without new detail",
+            "Intro: add the requested 'loop bound explanation' paragraph"
+        ]
+    );
 }
