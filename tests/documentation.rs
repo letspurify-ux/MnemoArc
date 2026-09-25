@@ -2980,6 +2980,36 @@ fn an_insertion_that_repeats_its_anchor_is_refused() {
 }
 
 #[test]
+fn reading_the_output_before_it_exists_says_to_create_it() {
+    let (_dir, mut s) = setup();
+    // The live shape: reads and an audit of the output before any write.
+    let output = s.project.output.display().to_string();
+    for (tool, args) in [
+        ("file_read", json!({"path":output,"max_lines":10})),
+        ("document_inspect", json!({"path":output})),
+    ] {
+        let error = tools::execute(&mut s, tool, args).unwrap_err().to_string();
+        assert!(error.starts_with("file_not_found"), "{tool}: {error}");
+        assert!(
+            error.contains("The configured output does not exist yet"),
+            "{tool}: {error}"
+        );
+    }
+    let error = tools::execute(&mut s, "document_audit", json!({}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("document_missing"), "{error}");
+    // A missing project file keeps the ordinary guidance.
+    let error = tools::execute(&mut s, "file_read", json!({"path":"nope.rs"}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        !error.contains("configured output does not exist yet"),
+        "{error}"
+    );
+}
+
+#[test]
 fn appended_heading_starts_a_new_line() {
     let (_dir, mut s) = setup();
     std::fs::write(&s.project.output, "# A\nFirst section ends here.").unwrap();

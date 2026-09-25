@@ -2161,7 +2161,12 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
             std::io::ErrorKind::PermissionDenied => "file_permission_denied",
             _ => "file_access_error",
         };
-        let hint = if e.kind() == std::io::ErrorKind::NotFound {
+        // Reading the output before its first write: say so, rather than
+        // suggesting a different project file (a live run asked three times).
+        let is_output = output_path(p).is_ok_and(|output| output == candidate);
+        let hint = if e.kind() == std::io::ErrorKind::NotFound && is_output {
+            " The configured output does not exist yet: nothing has been written to it. Create it with document_edit action=create (or document_edit_batch) before reading or auditing it.".to_owned()
+        } else if e.kind() == std::io::ErrorKind::NotFound {
             match similar_paths(p, &candidate).as_slice() {
                 [] => " No project file has this name; list files with file_list mode=paths and path_glob before reading.".to_owned(),
                 similar => format!(" Existing project files with a similar name: {}. Copy one exactly.", similar.join(", ")),

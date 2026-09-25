@@ -457,6 +457,11 @@ pub(super) fn execute(
         "document_audit" => {
             revalidate(s)?;
             let path = output_path(&s.project)?;
+            if !path.exists() {
+                bail!(
+                    "document_missing: the configured output has not been written yet; create it with document_edit action=create before auditing it"
+                );
+            }
             let doc = read_text(&path)?;
             let (checked, mut issues) = citation_issues(s, &path, &doc)?;
             if checked == 0 {
