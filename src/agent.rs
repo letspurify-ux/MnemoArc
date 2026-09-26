@@ -9,10 +9,10 @@ use anyhow::{Result, bail};
 use futures_util::FutureExt;
 use serde_json::{Value, json};
 use std::{
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 mod question;
@@ -645,49 +645,111 @@ fn assistant(text: &str, calls: &[ToolCall]) -> Value {
     }
     v
 }
-async fn execute_one(
-    mut s: Session,
-    call: ToolCall,
-    cancel: &CancellationToken,
-) -> (Session, Value) {
+async fn execute_one(s: Session, call: ToolCall, cancel: &CancellationToken) -> (Session, Value) {
     if cancel.is_cancelled() {
         return (s, tools::envelope(Err(anyhow::anyhow!("cancelled"))));
     }
     let timeout = s.config.tool_timeout_secs;
     let backup = s.clone();
     let child = cancel.child_token();
-    let tool_cancel = child.clone();
-    let mut job = tokio::task::spawn_blocking(move || {
-        let result = tools::run_call_cancellable(&mut s, &call, &tool_cancel);
-        (s, result)
-    });
-    // Joining a mutating operation is mandatory: cancellation must not hide a completed write.
-    match tokio::time::timeout(Duration::from_secs(timeout), &mut job).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => (
+    let external_write = matches!(
+        call.name.as_str(),
+        "document_edit"
+            | "document_edit_batch"
+            | "file_edit"
+            | "file_write"
+            | "file_patch"
+            | "db_execute"
+    );
+    let receiver = match spawn_tool_worker(s, call, child.clone()) {
+        Ok(receiver) => receiver,
+        Err(error) => return (backup, tools::envelope(Err(error.into()))),
+    };
+    await_tool_worker(
+        backup,
+        receiver,
+        cancel,
+        child,
+        Duration::from_secs(timeout),
+        Duration::from_secs(1),
+        external_write,
+    )
+    .await
+}
+
+type ToolOutcome = (Session, Value);
+
+fn spawn_tool_worker(
+    mut session: Session,
+    call: ToolCall,
+    cancel: CancellationToken,
+) -> std::io::Result<oneshot::Receiver<ToolOutcome>> {
+    let (sender, receiver) = oneshot::channel();
+    // Tokio waits for spawn_blocking tasks at runtime shutdown. A stuck OS
+    // thread must not hold the API or process open after its deadline.
+    std::thread::Builder::new()
+        .name("mnemoarc-tool".into())
+        .spawn(move || {
+            let result = tools::run_call_cancellable(&mut session, &call, &cancel);
+            let _ = sender.send((session, result));
+        })?;
+    Ok(receiver)
+}
+
+async fn await_tool_worker(
+    backup: Session,
+    mut receiver: oneshot::Receiver<ToolOutcome>,
+    cancel: &CancellationToken,
+    child: CancellationToken,
+    timeout: Duration,
+    settle_wait: Duration,
+    external_write: bool,
+) -> ToolOutcome {
+    let stopped = tokio::select! {
+        biased;
+        outcome = &mut receiver => return received_tool_outcome(backup, outcome, external_write),
+        _ = cancel.cancelled() => "cancelled",
+        _ = tokio::time::sleep(timeout) => "tool_timeout",
+    };
+    child.cancel();
+    // A write can finish just after cancellation. Give it a bounded chance
+    // to report the actual result before declaring its outcome unknown.
+    if external_write {
+        if let Ok(outcome) = tokio::time::timeout(settle_wait, &mut receiver).await {
+            return received_tool_outcome(backup, outcome, true);
+        }
+        backup
+            .write_outcome_uncertain
+            .store(true, Ordering::Release);
+        return (
             backup,
             tools::envelope(Err(anyhow::anyhow!(
-                "tool_worker_panic: worker lost; last snapshot retained, write outcomes require review"
+                "tool_worker_unresolved: {stopped}; external write outcome is unknown; review files or database changes and restart before another run"
             ))),
-        ),
+        );
+    }
+    (backup, tools::envelope(Err(anyhow::anyhow!(stopped))))
+}
+
+fn received_tool_outcome(
+    backup: Session,
+    outcome: Result<ToolOutcome, oneshot::error::RecvError>,
+    external_write: bool,
+) -> ToolOutcome {
+    match outcome {
+        Ok(result) => result,
         Err(_) => {
-            child.cancel();
-            let (mut s, result) = match job.await {
-                Ok(result) => result,
-                Err(_) => {
-                    return (
-                        backup,
-                        tools::envelope(Err(anyhow::anyhow!(
-                            "tool_worker_panic: worker lost after deadline; write outcomes require review"
-                        ))),
-                    );
-                }
-            };
-            s.last_error = Some(
-                "Tool exceeded deadline; waited for its final outcome to avoid an untracked write"
-                    .into(),
-            );
-            (s, result)
+            if external_write {
+                backup
+                    .write_outcome_uncertain
+                    .store(true, Ordering::Release);
+            }
+            (
+                backup,
+                tools::envelope(Err(anyhow::anyhow!(
+                    "tool_worker_panic: worker lost; last snapshot retained, write outcomes require review"
+                ))),
+            )
         }
     }
 }
@@ -771,32 +833,20 @@ async fn read_parallel(
         let timeout = config.tool_timeout_secs;
         async move {
             let child = cancel.child_token();
-            let tool_cancel = child.clone();
-            let mut job = tokio::task::spawn_blocking(move || {
-                let result = tools::run_call_cancellable(&mut temporary, &call, &tool_cancel);
-                (temporary, result)
-            });
+            let mut receiver = spawn_tool_worker(temporary, call, child.clone())
+                .map_err(|error| anyhow::anyhow!("tool_worker_start_failed: {error}"))?;
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => {
                     child.cancel();
-                    // Do not detach a blocking worker on cancellation. It only
-                    // owns a temporary session, but the worker still consumes a
-                    // thread and can outlive the run indefinitely otherwise.
-                    let _ = job.await;
                     Err(anyhow::anyhow!("cancelled"))
                 }
-                result = tokio::time::timeout(Duration::from_secs(timeout), &mut job) => {
-                    match result {
-                        Ok(Ok(value)) => Ok(value),
-                        Ok(Err(error)) => Err(anyhow::anyhow!("tool_worker_panic: tool worker failed: {error}")),
-                        Err(_) => {
-                            child.cancel();
-                            // Reads have no owner-session writes, so the final
-                            // outcome can be discarded after the worker joins.
-                            let _ = job.await;
-                            Err(anyhow::anyhow!("tool_timeout"))
-                        }
-                    }
+                result = &mut receiver => {
+                    result.map_err(|error| anyhow::anyhow!("tool_worker_panic: tool worker failed: {error}"))
+                }
+                _ = tokio::time::sleep(Duration::from_secs(timeout)) => {
+                    child.cancel();
+                    Err(anyhow::anyhow!("tool_timeout"))
                 }
             }
         }
@@ -875,6 +925,15 @@ pub async fn run_session_controlled(
     events: mpsc::Sender<AgentEvent>,
     mut commands: mpsc::Receiver<RunCommand>,
 ) -> Session {
+    if s.write_outcome_uncertain.load(Ordering::Acquire) {
+        s.status = "blocked".into();
+        s.last_error = Some(
+            "tool_worker_unresolved: review external write outcomes and restart before another run"
+                .into(),
+        );
+        s.finish_run();
+        return s;
+    }
     if s.question.is_some() {
         return question::run(s, client, cancel, events).await;
     }
@@ -2487,10 +2546,9 @@ pub async fn run_session_controlled(
                         failure = Some(reason);
                     }
                 }
-                if result["error"]
-                    .as_str()
-                    .is_some_and(|e| e.starts_with("tool_worker_panic"))
-                {
+                if result["error"].as_str().is_some_and(|e| {
+                    e.starts_with("tool_worker_panic") || e.starts_with("tool_worker_unresolved")
+                }) {
                     failure = result["error"].as_str().map(str::to_owned);
                 }
                 if rebased_document_call && result["status"] == "ok" {
@@ -2821,7 +2879,10 @@ pub async fn run_session_controlled(
         }
         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
     }
-    if cancel.is_cancelled() {
+    if s.write_outcome_uncertain.load(Ordering::Acquire) {
+        s.status = "blocked".into();
+        s.last_error = Some(failure.filter(|error| error.starts_with("tool_worker_")).unwrap_or_else(|| "tool_worker_unresolved: review external write outcomes and restart before another run".into()));
+    } else if cancel.is_cancelled() {
         s.status = "cancelled".into();
         s.last_error = None;
     } else if let Some(error) = failure {
@@ -2886,4 +2947,100 @@ pub fn apply_config(s: &mut Session, config: Config) -> Result<()> {
     }
     s.config = copy.config;
     Ok(())
+}
+
+#[cfg(test)]
+mod worker_wait_tests {
+    use super::*;
+    use crate::config::Project;
+
+    fn session() -> Session {
+        Session::new(Project::default(), Config::default())
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_does_not_wait_for_a_stuck_worker() {
+        let backup = session();
+        let (_sender, receiver) = oneshot::channel();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (_, result) = tokio::time::timeout(
+            Duration::from_millis(200),
+            await_tool_worker(
+                backup.clone(),
+                receiver,
+                &cancel,
+                cancel.child_token(),
+                Duration::from_secs(5),
+                Duration::from_millis(20),
+                false,
+            ),
+        )
+        .await
+        .expect("cancelled read must not join the worker");
+        assert_eq!(result["error"], "cancelled");
+        assert!(!backup.write_outcome_uncertain.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn unresolved_write_returns_and_quarantines_future_runs() {
+        let backup = session();
+        let (_sender, receiver) = oneshot::channel();
+        let cancel = CancellationToken::new();
+        let (returned, result) = tokio::time::timeout(
+            Duration::from_millis(200),
+            await_tool_worker(
+                backup.clone(),
+                receiver,
+                &cancel,
+                cancel.child_token(),
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                true,
+            ),
+        )
+        .await
+        .expect("external write wait must be bounded");
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("tool_worker_unresolved")
+        );
+        assert!(backup.write_outcome_uncertain.load(Ordering::Acquire));
+        let (events, _receiver) = mpsc::channel(1);
+        let blocked = run_session(returned, Arc::new(OpenAiClient), cancel, events).await;
+        assert_eq!(blocked.status, "blocked");
+        assert!(
+            blocked
+                .last_error
+                .unwrap()
+                .starts_with("tool_worker_unresolved")
+        );
+    }
+
+    #[tokio::test]
+    async fn write_finishing_during_grace_period_keeps_its_result() {
+        let backup = session();
+        let (sender, receiver) = oneshot::channel();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let finished = backup.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = sender.send((finished, json!({"status":"ok","data":{"committed":true}})));
+        });
+        let (_, result) = await_tool_worker(
+            backup.clone(),
+            receiver,
+            &cancel,
+            cancel.child_token(),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            true,
+        )
+        .await;
+        assert_eq!(result["data"]["committed"], true);
+        assert!(!backup.write_outcome_uncertain.load(Ordering::Acquire));
+    }
 }

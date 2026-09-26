@@ -26,7 +26,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     path::{Path as FsPath, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -56,6 +59,7 @@ pub struct WebState {
     events: broadcast::Sender<u64>,
     client: Arc<dyn LlmClient>,
     stopping: CancellationToken,
+    write_outcome_uncertain: Arc<AtomicBool>,
 }
 struct ApiError(StatusCode, String);
 impl IntoResponse for ApiError {
@@ -178,7 +182,9 @@ impl WebState {
         for project in &mut config.projects {
             *project = normalize_project(project.clone())?;
         }
-        let session = Session::new(config.projects[0].clone(), config.clone());
+        let write_outcome_uncertain = Arc::new(AtomicBool::new(false));
+        let mut session = Session::new(config.projects[0].clone(), config.clone());
+        session.write_outcome_uncertain = write_outcome_uncertain.clone();
         let id = session.id.clone();
         let (events, _) = broadcast::channel(128);
         Ok(Self {
@@ -195,6 +201,7 @@ impl WebState {
             events,
             client,
             stopping: CancellationToken::new(),
+            write_outcome_uncertain,
         })
     }
     pub async fn shutdown(&self) {
@@ -506,7 +513,8 @@ struct NewSession {
 async fn create_session(State(s): State<WebState>, Json(input): Json<NewSession>) -> Api {
     let project = normalize_project(input.project)?;
     let mut c = s.core.lock().await;
-    let session = Session::new(project, c.config.clone());
+    let mut session = Session::new(project, c.config.clone());
+    session.write_outcome_uncertain = s.write_outcome_uncertain.clone();
     let id = session.id.clone();
     c.order.push(id.clone());
     c.sessions.insert(id.clone(), session);
@@ -642,6 +650,9 @@ async fn run(
         }
         if c.running.is_some() {
             return Err(busy());
+        }
+        if s.write_outcome_uncertain.load(Ordering::Acquire) {
+            return Err(ApiError(StatusCode::CONFLICT, "도구 쓰기 결과를 확인할 수 없습니다. 파일 또는 데이터베이스 변경을 확인하고 앱을 다시 시작하세요.".into()));
         }
         let session = c.sessions.get_mut(&id).ok_or_else(missing)?;
         session.config.runnable()?;
@@ -1035,4 +1046,37 @@ pub async fn serve_app(
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod worker_wait_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unresolved_write_blocks_new_web_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.projects = vec![Project {
+            root: dir.path().into(),
+            ..Default::default()
+        }];
+        let state = WebState::new(
+            config,
+            dir.path().join("config.toml"),
+            Arc::new(OpenAiClient),
+        )
+        .unwrap();
+        let id = state.core.lock().await.order[0].clone();
+        state.write_outcome_uncertain.store(true, Ordering::Release);
+        let result = run(
+            State(state),
+            Path(id),
+            Json(RunInput {
+                text: "next task".into(),
+                action: "chat".into(),
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(ApiError(StatusCode::CONFLICT, _))));
+    }
 }

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, atomic::AtomicBool};
 
 mod run_history;
 pub use run_history::{RUN_HISTORY_LIMIT, RunRecord};
@@ -360,6 +361,9 @@ pub struct Session {
     pub id: String,
     pub project: Project,
     pub config: Config,
+    /// Shared across web sessions after an external write times out with an
+    /// unknown outcome. Further runs require review and a process restart.
+    pub write_outcome_uncertain: Arc<AtomicBool>,
     pub pending_config: Option<Config>,
     pub task: TaskState,
     /// Workflow the user selected for this session's requests (one of
@@ -504,6 +508,7 @@ impl Session {
             id: id(),
             project,
             config,
+            write_outcome_uncertain: Arc::new(AtomicBool::new(false)),
             pending_config: None,
             task,
             memory: Default::default(),
