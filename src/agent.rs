@@ -1127,6 +1127,10 @@ pub async fn run_session_controlled(
                 }
             }
         }
+        // Progress recovery steers only this request. Persisting its verify
+        // would ratchet the task into verification for good: a live run was
+        // left unable to register its next section after one early stall.
+        let persisted_phase = phase.clone();
         let closing_active = s.progress_recovery.closing.is_some();
         if closing_active {
             phase = "verify".into();
@@ -1170,7 +1174,11 @@ pub async fn run_session_controlled(
         if closing_active {
             phase = "verify".into();
         }
-        s.task.phase = phase.clone();
+        s.task.phase = if closing_active {
+            phase.clone()
+        } else {
+            persisted_phase
+        };
         let focused_instruction = "Focused recovery: choose the first document_review issue, unmet completion check or current to-do and perform one concrete action that changes the requested result or verifies specific missing evidence. Read recovery_reason and the last tool's recovery contract; correct the cause or choose a different action before retrying. A task_plan applied=false or unchanged=true result did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, merely rewrite the plan, or save another summary. After a real edit, advance its to-do or verify the resulting section. If the original result already exists, verify it with the relevant tool, then complete only the actual remaining work. Document retry counts are recovery signals, not permission to stop or weaken requirements: continue to final verification within the remaining tokens and time.";
         s.run_guidance = json!({"task_rounds":s.task_rounds,"finalization_attempts":finalization_attempts,"phase":phase,"remaining_tokens":remaining,"remaining_seconds":seconds_remaining,
             "recovery_reason":s.progress_recovery.recovery_reason,"action_required":s.progress_recovery.action_required,

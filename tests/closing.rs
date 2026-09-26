@@ -1456,3 +1456,22 @@ async fn new_evidence_read_for_open_review_findings_is_progress() {
         );
     }
 }
+
+#[tokio::test]
+async fn progress_recovery_verify_does_not_persist_into_the_task_phase() {
+    let (_dir, s) = verified_fixture();
+    let steps = (0..10)
+        .map(|i| call(&format!("idle-{i}"), "task_state", json!({"action":"read"})))
+        .collect();
+    let (result, guidance) = run_scripted(s, steps).await;
+    // Idle rounds trigger recovery, which steers requests toward verification.
+    assert!(
+        guidance
+            .iter()
+            .any(|step| step["phase"] == "verify" && step["progress_recovery"]["active"] == true),
+        "{guidance:?}"
+    );
+    // The stored task phase keeps the budget phase, so the next request after
+    // recovery can register and investigate a new section again.
+    assert_ne!(result.task.phase, "verify");
+}
