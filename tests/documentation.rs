@@ -3696,3 +3696,31 @@ fn source_documentation_never_writes_project_files_and_append_creates_output() {
         "# Manual\n\nFirst.\n"
     );
 }
+
+#[test]
+fn retyped_old_text_with_a_repeated_opening_shows_the_passage_to_copy() {
+    let (_dir, mut s) = setup();
+    let body = "# Guide\n\n첫 화면에는 환영 문구가 표시됩니다. 추천 질문 칩을 누르면 입력란에 반영됩니다.\n\n첫 화면에는 환영 문구가 표시됩니다. 홈 버튼으로 돌아옵니다.\n";
+    let written = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":body}),
+    );
+    // The opening occurs twice and a middle phrase was dropped, so there is
+    // no single divergence point.
+    let err = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":written["hash"],"edits":[{"action":"replace_text","old_text":"첫 화면에는 환영 문구가 표시됩니다. 칩을 누르면 입력란에 반영됩니다.","text":"바뀜"}]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("its start and end match this passage"),
+        "{err}"
+    );
+    assert!(
+        err.contains("추천 질문 칩을 누르면 입력란에 반영됩니다."),
+        "{err}"
+    );
+}

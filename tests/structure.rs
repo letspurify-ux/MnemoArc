@@ -1166,3 +1166,22 @@ fn long_symbol_names_preserve_exact_matching_and_container_paths() {
         assert_eq!(members["symbols"][0]["container"], container);
     }
 }
+
+#[test]
+fn malformed_symbol_id_is_not_reported_as_a_changed_source() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.rs"), "fn real() {}\n").unwrap();
+    let outline = run(&mut s, "code_outline", json!({"path":"a.rs"}));
+    let observed = outline["symbols"][0]["symbol_id"].as_str().unwrap();
+    // The live shape: a bare hash copy with one character dropped.
+    let bare = &observed.split(':').next().unwrap()[1..];
+    let call = mnemoarc::llm::ToolCall {
+        id: "bare-hash".into(),
+        name: "symbol_read".into(),
+        arguments: json!({"path":"a.rs","symbol_id":bare}).to_string(),
+    };
+    let result = tools::run_call(&mut s, &call);
+    assert_eq!(result["recovery"]["code"], "invalid_symbol_id", "{result}");
+    assert_eq!(result["recovery"]["action"], "copy_observed_symbol_id");
+    assert!(!result["error"].as_str().unwrap().contains("source changed"));
+}

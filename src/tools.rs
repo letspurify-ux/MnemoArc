@@ -1562,6 +1562,11 @@ fn unique_document_text_span(old: &str, target: &str) -> Result<(usize, usize)> 
                 "patch_target_must_match_once: old_text is not in the current document (or the given section), but this passage differs from it only in backticks, dashes, quotes or spacing: {passage:?}. Copy that passage exactly as old_text"
             );
         }
+        if let Some(passage) = anchored_passage(old, target) {
+            bail!(
+                "patch_target_must_match_once: old_text is not in the current document (or the given section); its start and end match this passage, whose middle differs (text dropped, added or retyped). Copy it exactly as old_text: {passage:?}"
+            );
+        }
         if let Some((matched, document_next, target_next)) = divergence(old, target) {
             bail!(
                 "patch_target_must_match_once: old_text is not in the current document (or the given section). Its beginning matches the document up to {matched:?}; after that the document continues with {document_next:?} but old_text continues with {target_next:?}. Copy old_text from the document text at that point"
@@ -1616,6 +1621,68 @@ fn divergence(old: &str, target: &str) -> Option<(String, String, String)> {
         chars[chars.len().saturating_sub(30)..].iter().collect()
     };
     Some((matched, tail(&old[at..]), tail(&target[prefix.len()..])))
+}
+
+/// The one passage that begins with the start of `target` and ends with its
+/// end. A retyped old_text that dropped or changed text in the middle, or
+/// whose opening words occur in several places, has no single divergence
+/// point; its intact ends still identify the text to copy.
+fn anchored_passage(old: &str, target: &str) -> Option<String> {
+    const ANCHOR: usize = 6;
+    // Byte offset of each character boundary of target, including its end.
+    let bounds: Vec<usize> = target
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain(std::iter::once(target.len()))
+        .collect();
+    let count = bounds.len() - 1;
+    if count < ANCHOR * 2 {
+        return None;
+    }
+    // Presence is monotonic in length, so binary search the longest
+    // occurring prefix and suffix, measured in characters.
+    fn longest(old: &str, count: usize, piece: impl Fn(usize) -> String) -> usize {
+        let (mut low, mut high) = (0, count);
+        while low < high {
+            let mid = (low + high).div_ceil(2);
+            if old.contains(piece(mid).as_str()) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        low
+    }
+    let head_len = longest(old, count, |n| target[..bounds[n]].to_owned());
+    let tail_len = longest(old, count, |n| target[bounds[count - n]..].to_owned());
+    if head_len < ANCHOR || tail_len < ANCHOR {
+        return None;
+    }
+    let head = &target[..bounds[head_len]];
+    let tail = &target[bounds[count - tail_len]..];
+    let window = target.len().saturating_mul(2).saturating_add(200);
+    let mut passages = std::collections::BTreeSet::new();
+    for (start, _) in old.match_indices(head).take(8) {
+        let mut limit = (start + window).min(old.len());
+        while !old.is_char_boundary(limit) {
+            limit -= 1;
+        }
+        let rest = &old[start..limit];
+        if let Some(end) = rest
+            .match_indices(tail)
+            .map(|(at, _)| at + tail.len())
+            .find(|end| *end >= head.len())
+        {
+            passages.insert(&old[start..start + end]);
+        }
+    }
+    let mut passages = passages.into_iter();
+    match (passages.next(), passages.next()) {
+        (Some(passage), None) if passage != target && passage.chars().count() <= 1200 => {
+            Some(passage.to_owned())
+        }
+        _ => None,
+    }
 }
 
 /// The one passage that equals `target` once backticks are ignored, dash and
@@ -3610,7 +3677,11 @@ fn execute_repaired(
             let cp = s
                 .checkpoint
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("no_checkpoint"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no_checkpoint: no checkpoint is pending; call checkpoint_complete only in answer to a CHECKPOINT CONTROL REQUEST and continue the task"
+                    )
+                })?;
             // Only one checkpoint is active, so a copied ID that the model cut
             // short still identifies it; a mismatching or tiny prefix does not.
             let supplied = text(&args, "id")?.trim();
@@ -3985,7 +4056,13 @@ fn execute_repaired(
                     );
                 }
                 if item.status == "written" {
-                    let doc = read_text(&output_path(&s.project)?)?;
+                    let output = output_path(&s.project)?;
+                    if !output.exists() {
+                        bail!(
+                            "document_missing: the output document does not exist yet; write this section with document_edit action=create first, then mark the item written; existing item retained"
+                        );
+                    }
+                    let doc = read_text(&output)?;
                     // A planned section kept from before writing is rebound
                     // the same way document edits rebind it.
                     if args.get("section").is_none()

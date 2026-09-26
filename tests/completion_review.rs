@@ -984,3 +984,46 @@ fn saved_output_is_reviewed_whole_and_observed_sources_are_rehashed() {
     assert_eq!(manual["truncated"], false);
     assert!(manual["text"].as_str().unwrap().contains("마지막 문장."));
 }
+
+#[test]
+fn a_rejection_binds_only_the_result_it_reviewed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.project.output = dir.path().join("manual.md");
+    s.active_tools = tools::ToolRegistry::optional_names();
+    std::fs::write(dir.path().join("ui.js"), "export const hint = 'ok';\n").unwrap();
+    let step = |s: &mut Session, id: &str, name: &str, args: Value| {
+        let call = ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args.to_string(),
+        };
+        let result = tools::run_call(s, &call);
+        assert_eq!(result["status"], "ok", "{result}");
+        review::observe(s, &call, &result);
+        result
+    };
+    let created = step(
+        &mut s,
+        "create",
+        "document_edit",
+        json!({"action":"create","text":"# Manual\n\nConclusion: done\n"}),
+    );
+    review::begin(&mut s, "Saved manual.md").unwrap();
+    assert_eq!(finish(&mut s, false), None);
+    assert!(review::rejected_on_current_result(&s));
+    // New evidence alone is a changed basis for the re-review.
+    step(&mut s, "read", "file_read", json!({"path":"ui.js"}));
+    assert!(!review::rejected_on_current_result(&s));
+    review::begin(&mut s, "Saved manual.md").unwrap();
+    assert_eq!(finish(&mut s, false), None);
+    assert!(review::rejected_on_current_result(&s));
+    // So is a repaired document.
+    step(
+        &mut s,
+        "append",
+        "document_edit",
+        json!({"action":"append","expected_hash":created["data"]["hash"],"text":"Example: shown\n"}),
+    );
+    assert!(!review::rejected_on_current_result(&s));
+}

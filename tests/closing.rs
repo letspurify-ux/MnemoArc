@@ -1475,3 +1475,31 @@ async fn progress_recovery_verify_does_not_persist_into_the_task_phase() {
     // recovery can register and investigate a new section again.
     assert_ne!(result.task.phase, "verify");
 }
+
+#[tokio::test]
+async fn closing_on_a_finished_result_asks_for_the_final_answer() {
+    let (_dir, mut s) = verified_fixture();
+    s.config.stall_round_limit = 2;
+    let steps = (0..10)
+        .map(|i| {
+            call(
+                &format!("audit-{i}"),
+                "task_state",
+                json!({"action":"read"}),
+            )
+        })
+        .collect();
+    let (_, guidance) = run_scripted(s, steps).await;
+    let closing = guidance
+        .iter()
+        .find(|step| step["closing"]["active"] == true)
+        .expect("stalled idle rounds enter closing mode");
+    assert_eq!(closing["ready_for_final"], true, "{closing}");
+    assert!(
+        closing["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("this is the time to answer"),
+        "{closing}"
+    );
+}

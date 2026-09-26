@@ -223,10 +223,7 @@ fn ready_except_plan(s: &Session) -> bool {
         && !s.document_review.pending
         && !s.completion_review.pending
         && !tools::document_review::rejected_on_current_result(s)
-        && s.completion_review
-            .checks
-            .iter()
-            .all(|check| check.status == "met")
+        && !tools::completion_review::rejected_on_current_result(s)
         && tools::verify_document_write(s).is_ok()
 }
 
@@ -1241,7 +1238,16 @@ pub async fn run_session_controlled(
             s.run_guidance["closing"] = json!({"active":true,"reason":closing.reason,
                 "rounds":closing.rounds,"round_limit":CLOSING_ROUND_LIMIT,
                 "final_attempts":closing.final_attempts});
-            s.run_guidance["instruction"] = json!(closing_instruction(&s));
+            // Closing mode kept auditing a finished result for its whole
+            // allowance in live runs; once nothing is left, say so.
+            s.run_guidance["instruction"] = json!(if ready_for_final(&s) {
+                s.run_guidance["ready_for_final"] = json!(true);
+                format!(
+                    "{READY_FOR_FINAL_INSTRUCTION} Closing mode is active: this is the time to answer."
+                )
+            } else {
+                closing_instruction(&s)
+            });
         } else if s.document_written
             && stall_rounds >= s.config.stall_round_limit
             && s.investigations.iter().any(|item| !item.is_settled())

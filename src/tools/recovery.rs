@@ -119,7 +119,7 @@ pub fn describe(message: &str) -> Value {
         (Class::InvalidInput, "correct_arguments")
     } else if code == "unknown_source" || code == "source_coverage_missing" {
         (Class::MissingEvidence, "lookup_observed_evidence")
-    } else if code == "unknown_symbol" {
+    } else if code == "unknown_symbol" || code == "invalid_symbol_id" {
         (Class::InvalidInput, "copy_observed_symbol_id")
     } else if matches!(
         code,

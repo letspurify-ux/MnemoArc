@@ -1467,3 +1467,30 @@ fn filled_history_memory_and_state_placeholders_are_normalized() {
         "{err}"
     );
 }
+
+#[test]
+fn written_before_the_output_exists_and_stray_checkpoint_ack_explain_the_next_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.project.output = dir.path().join("manual.md");
+    s.active_tools.insert("investigation".into());
+    let err = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","title":"Setup","section":"## Setup","status":"written"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.starts_with("document_missing:"), "{err}");
+    assert!(err.contains("action=create first"), "{err}");
+    assert!(!err.contains("os error"), "{err}");
+    let err = tools::execute(
+        &mut s,
+        "checkpoint_complete",
+        json!({"id":"S1","progress":"Section 1 written","no_save_reason":"none pending"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.starts_with("no_checkpoint:"), "{err}");
+    assert!(err.contains("CHECKPOINT CONTROL REQUEST"), "{err}");
+}

@@ -58,6 +58,12 @@ pub struct ReviewState {
     /// "originals unchanged" rests on runtime facts rather than model claims.
     #[serde(skip)]
     written_paths: Vec<String>,
+    /// Delivered observations so far and the output hash when the last
+    /// verdict was given: a rejection binds only that exact result.
+    #[serde(skip)]
+    observations: usize,
+    #[serde(skip)]
+    reviewed_state: Option<(Option<String>, usize)>,
     #[serde(skip)]
     repair_todos: BTreeMap<String, String>,
 }
@@ -190,6 +196,7 @@ pub fn observe(s: &mut Session, call: &crate::llm::ToolCall, result: &Value) {
     let receipt = json!({"tool":call.name,"file_versions":bindings,"observed":observed,"truncated":truncated});
     s.completion_review.receipts.retain(|r| r != &receipt);
     s.completion_review.receipts.push(receipt);
+    s.completion_review.observations = s.completion_review.observations.saturating_add(1);
     let overflow = s
         .completion_review
         .receipts
@@ -417,6 +424,28 @@ pub fn mark_unavailable(s: &mut Session, reason: Option<String>) {
     state.approved = false;
     state.offset = 0;
     state.checks.clear();
+}
+
+fn current_output_hash(s: &Session) -> Option<String> {
+    output_path(&s.project)
+        .and_then(|path| read_text(&path))
+        .ok()
+        .map(|doc| hash(doc.as_bytes()))
+}
+
+/// The last verdict rejected this exact result: the output is unchanged and
+/// no new evidence was delivered since. After a repair the old unmet checks
+/// no longer block the final answer that starts the re-review.
+pub fn rejected_on_current_result(s: &Session) -> bool {
+    let state = &s.completion_review;
+    !state.pending
+        && state.checks.iter().any(|check| check.status != "met")
+        && state
+            .reviewed_state
+            .as_ref()
+            .is_none_or(|(output, observations)| {
+                *output == current_output_hash(s) && *observations == state.observations
+            })
 }
 
 pub fn response_format() -> Value {
@@ -681,7 +710,10 @@ pub fn finish(s: &mut Session, response: &str) -> Result<Option<String>> {
         state.best_met = state.checks.len();
     }
     state.reviewed_fingerprint = state.fingerprint.clone();
-    Ok(state.approved.then(|| state.draft.clone()))
+    let observations = state.observations;
+    let approved = state.approved.then(|| state.draft.clone());
+    s.completion_review.reviewed_state = Some((current_output_hash(s), observations));
+    Ok(approved)
 }
 
 /// Use the existing plan mutator, respecting capacity, uniqueness and state

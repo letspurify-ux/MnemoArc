@@ -435,6 +435,26 @@ pub(super) fn execute(
     let mut containers = std::collections::BTreeSet::new();
     let filters = options(args);
     let requested_symbol_id = (tool == "symbol_read").then(|| args["symbol_id"].as_str().unwrap());
+    // An ID is digest:path:start:end. A malformed copy (a live run sent a
+    // bare, truncated hash) is not a changed source; say what is wrong.
+    if let Some(id) = requested_symbol_id {
+        let mut parts = id.splitn(2, ':');
+        let digest = parts.next().unwrap_or("");
+        let mut span = parts.next().unwrap_or("").rsplitn(3, ':');
+        // The path segment is not checked here: an unmatched but well-formed
+        // ID is reported as unknown_symbol after traversal.
+        let well_formed = digest.len() >= 32
+            && digest.bytes().all(|b| b.is_ascii_hexdigit())
+            && span.next().is_some_and(|end| end.parse::<usize>().is_ok())
+            && span
+                .next()
+                .is_some_and(|start| start.parse::<usize>().is_ok());
+        if !well_formed {
+            bail!(
+                "invalid_symbol_id: symbol_id must be copied whole from code_outline (hash:path:start_byte:end_byte); got {id:?}"
+            );
+        }
+    }
     let requested_span = requested_symbol_id.and_then(|id| {
         let mut parts = id.rsplitn(3, ':');
         let end = parts.next()?.parse::<usize>().ok()?;
