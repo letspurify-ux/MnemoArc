@@ -260,6 +260,7 @@ test("session window selects the workflow for the next request", async ({
 }) => {
   await page.goto("/");
   const workflow = page.getByLabel("작업 방식");
+  await page.getByLabel("요청 종류").selectOption("chat");
   await expect(workflow).toHaveValue("answer");
   // No automatic choice: the user picks one of the three workflows.
   await expect(workflow.locator("option")).toHaveText([

@@ -16,6 +16,7 @@ const reasons = {
   context_limit: "컨텍스트 한도 초과",
 };
 const stages = {
+  question: "기존 작업 질문",
   preparing: "요청 준비",
   model: "모델 응답",
   tools: "도구 실행",
@@ -51,7 +52,9 @@ export default function RunHistory({ records = [] }) {
             <dd>{statusLabel[run.status] || run.status}</dd>
             <dt>작업 방식</dt>
             <dd>
-              {workflowOptions.find(([id]) => id === run.workflow)?.[1] ||
+              {(run.workflow === "follow_up"
+                ? "기존 작업 질문"
+                : workflowOptions.find(([id]) => id === run.workflow)?.[1]) ||
                 run.workflow}
             </dd>
             <dt>시작 시각</dt>

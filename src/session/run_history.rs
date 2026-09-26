@@ -58,8 +58,17 @@ impl Session {
         }
         self.active_run = Some(ActiveRun {
             id: crate::memory::id(),
-            request: excerpt(&self.latest_request, 240),
-            workflow: self.task.workflow.clone(),
+            request: excerpt(
+                self.question
+                    .as_ref()
+                    .map_or(self.latest_request.as_str(), |q| q.text.as_str()),
+                240,
+            ),
+            workflow: if self.question.is_some() {
+                "follow_up".into()
+            } else {
+                self.task.workflow.clone()
+            },
             started_at: Utc::now(),
             started: Instant::now(),
             input_tokens: self.input_tokens,
@@ -100,7 +109,9 @@ impl Session {
         } else {
             self.status.clone()
         };
-        let last_stage = if self.checkpoint.is_some() {
+        let last_stage = if self.question.is_some() {
+            "question"
+        } else if self.checkpoint.is_some() {
             "checkpoint"
         } else {
             self.activity["stage"]
@@ -123,7 +134,7 @@ impl Session {
             usage_estimated: run.usage_estimated,
             rounds: self.task_rounds.saturating_sub(run.rounds),
             last_stage: last_stage.into(),
-            checkpoint_pending: self.checkpoint.is_some(),
+            checkpoint_pending: self.question.is_none() && self.checkpoint.is_some(),
             token_limit: self.config.run_tokens,
             timeout_secs: self.config.run_timeout_secs,
         });

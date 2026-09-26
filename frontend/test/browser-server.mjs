@@ -49,6 +49,10 @@ const provider = createServer(async (req, res) => {
     event({ choices: [{ delta: { content: text }, finish_reason: "stop" }] });
     res.end("data: [DONE]\n\n");
   };
+  if (data.messages[0]?.content.startsWith("Answer only the user's follow-up question")) {
+    sendAnswer("기존 작업의 상태와 검토 지적을 유지한 질문 답변입니다.");
+    return;
+  }
   let reviewPayload;
   try { reviewPayload = JSON.parse(data.messages[1]?.content); } catch {}
   if (reviewPayload?.completion_review && reviewPayload.original_request === "완료 조건 검증 테스트") {

@@ -9,6 +9,39 @@ import {
 } from "../src/chat/markdown.js";
 import { parseChartBlock, sliceSafe } from "../src/chat/chart.js";
 
+test("resumed task text never joins a truncated follow-up answer", async () => {
+  const { continuationMessages } = await import("../src/chat/continuation.js");
+  const question = {
+    id: 1,
+    messages: [
+      {
+        role: "assistant",
+        content: "Question answer",
+        partial: true,
+        follow_up: true,
+      },
+    ],
+  };
+  const next = {
+    id: 2,
+    messages: [
+      {
+        role: "assistant",
+        content: "Original task continuation",
+        continues_previous: true,
+      },
+    ],
+  };
+  assert.equal(continuationMessages([question, next]).messages.length, 2);
+  const streamed = continuationMessages(
+    [question],
+    "Original task stream",
+    true,
+  );
+  assert.equal(streamed.messages.length, 1);
+  assert.equal(streamed.streamText, "Original task stream");
+});
+
 test("every public Rust setting has a UI editor", async () => {
   const code = await readFile(
     new URL("../../src/config.rs", import.meta.url),

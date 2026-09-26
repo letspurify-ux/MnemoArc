@@ -15,6 +15,8 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+mod question;
+
 const FINALIZATION_RETRY_LIMIT: usize = 8;
 const COMPLETION_REVIEW_NO_PROGRESS_LIMIT: usize = 3;
 const COMPLETION_REVIEW_EXHAUST_LIMIT: usize = 6;
@@ -873,6 +875,9 @@ pub async fn run_session_controlled(
     events: mpsc::Sender<AgentEvent>,
     mut commands: mpsc::Receiver<RunCommand>,
 ) -> Session {
+    if s.question.is_some() {
+        return question::run(s, client, cancel, events).await;
+    }
     s.begin_run();
     s.task.migrate_legacy_plan();
     s.status = "running".into();

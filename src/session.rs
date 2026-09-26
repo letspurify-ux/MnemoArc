@@ -11,6 +11,16 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 mod run_history;
 pub use run_history::{RUN_HISTORY_LIMIT, RunRecord};
 
+#[derive(Clone, Debug)]
+pub struct FollowUpQuestion {
+    pub text: String,
+    pub(crate) bundle_id: u64,
+    pub(crate) prior_status: String,
+    pub(crate) prior_error: Option<String>,
+    pub(crate) prior_activity: Value,
+    pub(crate) prior_rounds: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TodoItem {
@@ -381,6 +391,7 @@ pub struct Session {
     pub document_written: bool,
     pub last_document_write: Option<(std::path::PathBuf, String)>,
     pub last_error: Option<String>,
+    pub question: Option<FollowUpQuestion>,
     /// Finished executions survive new questions within this session.
     pub run_history: VecDeque<RunRecord>,
     active_run: Option<run_history::ActiveRun>,
@@ -533,6 +544,7 @@ impl Session {
             document_written: false,
             last_document_write: None,
             last_error: None,
+            question: None,
             run_history: VecDeque::new(),
             active_run: None,
             run_guidance: json!({}),
@@ -602,15 +614,75 @@ impl Session {
             })
             .collect()
     }
-    pub fn add_user(&mut self, text: String) {
-        let first_request = self.latest_request.is_empty() && self.history.bundles.is_empty();
-        let continuation = matches!(
+    pub fn queue_question(&mut self, text: String) -> Result<()> {
+        if text.trim().is_empty() {
+            bail!("empty_question: enter a question");
+        }
+        if self.latest_request.is_empty() {
+            bail!("no_current_task: start a task before asking about it");
+        }
+        if self.question.is_some() || self.status == "running" {
+            bail!("session_busy: wait for the current run to finish");
+        }
+        // Reserve room for both messages without pruning the suspended task's history.
+        let message = json!({"role":"user","content":text,"follow_up":true});
+        let reserved = serde_json::to_vec(&message)?
+            .len()
+            .saturating_add(self.config.output_tokens.saturating_mul(32))
+            .saturating_add(4096);
+        if self.history.bytes().saturating_add(reserved) > self.config.history_bytes {
+            bail!(
+                "history_capacity: not enough space for a follow-up answer; clean up history first"
+            );
+        }
+        let bundle_id = self.history.push(vec![message], true);
+        let bundle = self.history.bundles.back_mut().unwrap();
+        bundle.active = false;
+        bundle.reviewed = true;
+        self.question = Some(FollowUpQuestion {
+            text,
+            bundle_id,
+            prior_status: self.status.clone(),
+            prior_error: self.last_error.clone(),
+            prior_activity: self.activity.clone(),
+            prior_rounds: self.task_rounds,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn restore_after_question(&mut self) {
+        if let Some(question) = self.question.take() {
+            self.status = question.prior_status;
+            self.last_error = question.prior_error;
+            self.activity = question.prior_activity;
+            self.task_rounds = question.prior_rounds;
+        }
+    }
+
+    pub fn is_continuation(text: &str) -> bool {
+        matches!(
             text.trim()
                 .trim_end_matches(['.', '!'])
                 .to_lowercase()
                 .as_str(),
             "계속 진행" | "계속" | "이어서 진행" | "continue" | "resume"
-        );
+        )
+    }
+
+    pub fn add_user(&mut self, text: String) {
+        let continuation = Self::is_continuation(&text);
+        self.add_request(text, continuation);
+    }
+
+    pub fn start_new_task(&mut self, text: String) {
+        self.add_request(text, false);
+        // An explicit new task must not acknowledge the old task's unfinished
+        // checkpoint. Its active history remains available for fresh cleanup.
+        self.checkpoint = None;
+    }
+
+    fn add_request(&mut self, text: String, continuation: bool) {
+        let first_request = self.latest_request.is_empty() && self.history.bundles.is_empty();
         if !continuation {
             // Tool-call IDs are scoped to one model request sequence. Retaining
             // successful results across a new user task can replay a stale read

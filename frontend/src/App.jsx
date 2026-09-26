@@ -443,8 +443,8 @@ export default function App() {
                 session={session}
                 busy={Boolean(state.running)}
                 canRun={canRun}
-                onSend={(text) =>
-                  act(() => send(`/sessions/${selected}/run`, { text }))
+                onSend={(text, action) =>
+                  act(() => send(`/sessions/${selected}/run`, { text, action }))
                 }
                 onWorkflow={(workflow) =>
                   act(() =>

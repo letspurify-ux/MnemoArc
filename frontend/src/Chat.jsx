@@ -26,24 +26,29 @@ export default function Chat({
   );
   const stage = session?.activity?.stage;
   const progress =
-    stage === "completion_review"
-      ? "실제 결과와 완료 조건 확인 중"
-      : stage === "document_review"
-      ? "문서와 소스 근거 대조 중"
-      : stage === "answer_review"
-      ? "소스 근거와 답변 대조 중"
-      : stage === "tools"
-      ? `${(session.activity.tools || []).map((name) => toolLabels[name] || name).join(" · ")} 실행 중`
-      : session?.stream
-        ? "답변 생성 중"
-        : stage === "model"
-          ? session?.continuation_pending
-            ? "길이 제한으로 이어서 생성 중"
-            : "모델 응답 대기 중"
-          : stage === "continuing"
-            ? "받은 답변을 보존하고 이어서 생성 중"
-            : "요청 준비 중";
+    stage === "question"
+      ? "기존 작업을 보존하고 질문 답변 중"
+      : stage === "completion_review"
+        ? "실제 결과와 완료 조건 확인 중"
+        : stage === "document_review"
+          ? "문서와 소스 근거 대조 중"
+          : stage === "answer_review"
+            ? "소스 근거와 답변 대조 중"
+            : stage === "tools"
+              ? `${(session.activity.tools || []).map((name) => toolLabels[name] || name).join(" · ")} 실행 중`
+              : session?.stream
+                ? "답변 생성 중"
+                : stage === "model"
+                  ? session?.continuation_pending
+                    ? "길이 제한으로 이어서 생성 중"
+                    : "모델 응답 대기 중"
+                  : stage === "continuing"
+                    ? "받은 답변을 보존하고 이어서 생성 중"
+                    : "요청 준비 중";
   const [input, setInput] = useState("");
+  const [intent, setIntent] = useState(null);
+  const requestKind = intent || (session?.has_task ? "question" : "chat");
+  const lastRun = session?.run_history?.at(-1);
   const [sending, setSending] = useState(false);
   const inputRef = useRef(null),
     lock = useRef(false),
@@ -81,8 +86,9 @@ export default function Chat({
     lock.current = true;
     setSending(true);
     try {
-      await onSend(message);
+      await onSend(message, intent || "auto");
       setInput("");
+      setIntent(null);
       bottom.current = true;
       inputRef.current?.focus();
     } finally {
@@ -186,6 +192,21 @@ export default function Chat({
                 : ""}
             </div>
           )}
+          {session?.status !== "running" &&
+            lastRun?.workflow === "follow_up" && (
+              <div
+                className={lastRun.error ? "inline-error" : "subtle"}
+                role="status"
+              >
+                {lastRun.status === "complete"
+                  ? "질문 답변 완료"
+                  : lastRun.status === "cancelled"
+                    ? "질문 답변 중지"
+                    : "질문 답변을 완료하지 못했습니다"}
+                {" · 기존 작업 상태는 유지됩니다."}
+                {lastRun.error && <p>{lastRun.error}</p>}
+              </div>
+            )}
           {session?.error && (
             <div className="inline-error" role="alert">
               {session.error}
@@ -239,6 +260,20 @@ export default function Chat({
               <i className="small-dot" />
               세션 기억 사용 · Enter 전송 / Shift+Enter 줄바꿈
             </span>
+            <label className="workflow-select">
+              요청 종류
+              <select
+                aria-label="요청 종류"
+                value={requestKind}
+                disabled={busy}
+                onChange={(e) => setIntent(e.target.value)}
+              >
+                <option value="question" disabled={!session?.has_task}>
+                  기존 작업 질문
+                </option>
+                <option value="chat">새 작업</option>
+              </select>
+            </label>
             <label
               className="workflow-select"
               title="이 세션의 요청을 처리할 방식입니다. 다음 요청부터 적용됩니다."
@@ -246,8 +281,10 @@ export default function Chat({
               작업 방식
               <select
                 value={session?.workflow_mode ?? "answer"}
-                disabled={busy}
-                onChange={(e) => void onWorkflow(e.target.value).catch(() => {})}
+                disabled={busy || requestKind === "question"}
+                onChange={(e) =>
+                  void onWorkflow(e.target.value).catch(() => {})
+                }
               >
                 {workflowOptions.map(([value, label]) => (
                   <option key={value} value={value}>
@@ -273,8 +310,9 @@ export default function Chat({
           </div>
         </form>
         <p className="composer-footnote">
-          결과 문서는 프로젝트에 저장됩니다. 기억과 대화는 앱 실행 중에만
-          유지됩니다.
+          {requestKind === "question"
+            ? "질문은 작업 상태를 보존합니다. 수정을 계속하려면 상단의 작업 재개를, 다른 작업을 시작하려면 새 작업을 선택하세요."
+            : "새 작업은 이전 계획과 검토 상태를 초기화합니다. 저장된 문서와 실행 기록은 유지됩니다."}
         </p>
       </div>
     </section>

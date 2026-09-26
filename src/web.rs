@@ -356,7 +356,7 @@ async fn session_get(
         .filter(|b| session.history.bundles.iter().any(|old| old.id < b.id))
         .map(|b| b.id);
     Ok(Json(
-        json!({"revision":c.revision,"id":id,"project":session.project,"config":session.config,"pending_config":session.pending_config,"credential_configured":OpenAiClient::has_key(&session.config),"status":session.status,"error":session.last_error,"run_history":session.run_history,"task":session.task,"workflow_mode":session.workflow_mode,"document_review":session.document_review,"completion_review":session.completion_review,"completion_gaps":session.completion_gaps,"run_guidance":session.run_guidance,"activity":session.activity,"continuation_pending":session.continuation.is_some(),"bundles":bundles,"previous":previous,"pruned_through":session.history.pruned_through,"stream":c.streams.get(&id),"memories":session.memory.recent(session.config.memory_count),"investigations":session.investigations,"active_tools":session.active_tools,"usage":{"input":session.input_tokens,"output":session.output_tokens,"cached":session.cached_tokens,"estimated":session.usage_incomplete,"context_estimated":crate::context::is_estimated(&session.config.model),"memory_bytes":session.memory.bytes(),"history_bytes":session.history.bytes(),"checkpoints":session.checkpoints_completed},"checkpoint":session.checkpoint}),
+        json!({"revision":c.revision,"id":id,"project":session.project,"config":session.config,"pending_config":session.pending_config,"credential_configured":OpenAiClient::has_key(&session.config),"status":session.status,"error":session.last_error,"run_history":session.run_history,"has_task":!session.latest_request.is_empty(),"question_running":session.question.is_some(),"task":session.task,"workflow_mode":session.workflow_mode,"document_review":session.document_review,"completion_review":session.completion_review,"completion_gaps":session.completion_gaps,"run_guidance":session.run_guidance,"activity":session.activity,"continuation_pending":session.continuation.is_some(),"bundles":bundles,"previous":previous,"pruned_through":session.history.pruned_through,"stream":c.streams.get(&id),"memories":session.memory.recent(session.config.memory_count),"investigations":session.investigations,"active_tools":session.active_tools,"usage":{"input":session.input_tokens,"output":session.output_tokens,"cached":session.cached_tokens,"estimated":session.usage_incomplete,"context_estimated":crate::context::is_estimated(&session.config.model),"memory_bytes":session.memory.bytes(),"history_bytes":session.history.bytes(),"checkpoints":session.checkpoints_completed},"checkpoint":session.checkpoint}),
     ))
 }
 #[derive(Deserialize)]
@@ -611,11 +611,11 @@ async fn session_tools(
 struct RunInput {
     #[serde(default)]
     text: String,
-    #[serde(default = "chat")]
+    #[serde(default = "auto_action")]
     action: String,
 }
-fn chat() -> String {
-    "chat".into()
+fn auto_action() -> String {
+    "auto".into()
 }
 async fn run(
     State(s): State<WebState>,
@@ -642,13 +642,27 @@ async fn run(
         }
         let session = c.sessions.get_mut(&id).ok_or_else(missing)?;
         session.config.runnable()?;
-        match input.action.as_str() {
-            "chat" => { if input.text.trim().is_empty(){return Err(ApiError(StatusCode::BAD_REQUEST,"메시지를 입력하세요.".into()));} session.add_user(input.text); },
+        let action = if input.action == "auto" {
+            if Session::is_continuation(&input.text) && !session.latest_request.is_empty() {
+                "resume"
+            } else if !session.latest_request.is_empty() {
+                "question"
+            } else {
+                "chat"
+            }
+        } else {
+            input.action.as_str()
+        };
+        match action {
+            "chat" => { if input.text.trim().is_empty(){return Err(ApiError(StatusCode::BAD_REQUEST,"메시지를 입력하세요.".into()));} session.start_new_task(input.text); },
+            "question" => session.queue_question(input.text)?,
             "resume" => {},
             "cleanup" => session.add_maintenance("Clean up memory and progress to fit the pending settings. Preserve important evidence and user constraints. Do not modify project files.".into()),
             _ => return Err(ApiError(StatusCode::BAD_REQUEST,"지원하지 않는 실행 방식입니다.".into())),
         }
-        if let Some(cp) = &mut session.checkpoint {
+        if session.question.is_none()
+            && let Some(cp) = &mut session.checkpoint
+        {
             cp.attempts = 0;
             cp.acknowledged = false;
             cp.failed_attempts = 0;
@@ -824,6 +838,7 @@ async fn run(
                         session.note_run_estimate();
                         session.finish_run();
                         session.activity = json!({"stage":"idle"});
+                        session.restore_after_question();
                     }
                 }
             }

@@ -7,6 +7,8 @@ export function continuationMessages(bundles, stream, pending) {
       const previous = messages.at(-1);
       if (
         current.continues_previous &&
+        !current.follow_up &&
+        !previous?.follow_up &&
         previous?.partial &&
         current.role === "assistant" &&
         previous.role === "assistant" &&
@@ -25,6 +27,7 @@ export function continuationMessages(bundles, stream, pending) {
   if (
     streamText &&
     pending &&
+    !previous?.follow_up &&
     previous?.partial &&
     previous.role === "assistant"
   ) {
