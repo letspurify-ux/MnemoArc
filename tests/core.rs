@@ -360,6 +360,29 @@ fn config_saved_then_session_override() {
     assert_eq!(loaded.model, "custom-model");
     assert_eq!(loaded.model_context, c.model_context);
 }
+
+#[test]
+fn config_load_uses_saved_credential_for_cli_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let config = config();
+    config.save(&path).unwrap();
+    std::fs::write(
+        path.with_extension("credentials.json"),
+        serde_json::to_vec(&json!({config.api_key_env.clone(): "saved-test-key"})).unwrap(),
+    )
+    .unwrap();
+    let loaded = Config::load(&path, &Default::default()).unwrap();
+    assert_eq!(
+        loaded.api_key.as_ref().map(|key| key.0.as_str()),
+        Some("saved-test-key")
+    );
+    assert!(
+        !std::fs::read_to_string(path)
+            .unwrap()
+            .contains("saved-test-key")
+    );
+}
 #[test]
 fn unicode_truncation_is_safe() {
     let s = "한국어🦀".repeat(500);
@@ -1012,6 +1035,8 @@ fn file_read_limit_alias_preserves_ranges_and_rejects_ambiguity() {
     for args in [
         json!({"path":"read.md","start_line":2,"limit":2}),
         json!({"path":"read.md","start_line":"2","limit":"2","max_lines":2}),
+        json!({"path":"read.md","start_line":2,"limit":0,"max_lines":2}),
+        json!({"path":"read.md","start_line":2,"limit":2,"max_lines":0}),
     ] {
         let result = tools::execute(&mut s, "file_read", args).unwrap();
         assert_eq!(result["content"]["text"], "two\nthree");

@@ -290,7 +290,13 @@ impl Config {
         for (k, v) in overrides {
             value[k] = v.clone();
         }
-        let config: Self = serde_json::from_value(value)?;
+        let mut config: Self = serde_json::from_value(value)?;
+        let credentials = path.with_extension("credentials.json");
+        if credentials.exists() {
+            let keys: BTreeMap<String, String> =
+                serde_json::from_slice(&std::fs::read(credentials)?)?;
+            config.api_key = keys.get(&config.api_key_env).cloned().map(Secret);
+        }
         config.validate()?;
         Ok(config)
     }

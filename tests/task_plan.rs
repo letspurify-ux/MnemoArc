@@ -946,6 +946,26 @@ fn insert_accepts_a_single_text_and_ignores_an_invented_id() {
 }
 
 #[test]
+fn insert_discards_shared_schema_fields_and_non_id_placeholder() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let result = apply(
+        &mut s,
+        json!([{"op":"insert","before":"x","id":"x","reason":"Organize work","result":"pending","text":"unused","texts":["Read settings","Write manual"]}]),
+    );
+    assert_eq!(result["applied"], true, "{result}");
+    assert_eq!(result["input_normalized"], true);
+    assert_eq!(
+        s.task
+            .todos
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>(),
+        ["Read settings", "Write manual"]
+    );
+}
+
+#[test]
 fn complete_accepts_the_shared_schema_reason_without_changing_its_result() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
@@ -956,7 +976,7 @@ fn complete_accepts_the_shared_schema_reason_without_changing_its_result() {
     let id = s.task.todos[0].id.clone();
     let result = apply(
         &mut s,
-        json!([{"op":"complete","id":id,"result":"Section saved","reason":"Already done"}]),
+        json!([{"op":"complete","id":id,"result":"Section saved","reason":"Already done","before":"T1","text":"unused","texts":["unused"]}]),
     );
     assert_eq!(result["applied"], true, "{result}");
     assert_eq!(result["input_normalized"], true);

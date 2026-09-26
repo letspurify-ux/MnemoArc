@@ -369,13 +369,30 @@ fn parse_operations(value: &Value) -> Result<(Vec<Operation>, bool)> {
         let mut item = item.clone();
         if item["op"] == "insert" {
             let object = item.as_object_mut().unwrap();
-            if !object.contains_key("texts")
-                && let Some(text) = object.remove("text").filter(Value::is_string)
-            {
-                object.insert("texts".into(), json!([text]));
+            if let Some(text) = object.remove("text") {
+                if !object.contains_key("texts") && text.is_string() {
+                    object.insert("texts".into(), json!([text]));
+                }
                 normalized = true;
             }
-            if object.remove("id").is_some() {
+            // The public nested schema contains fields for every operation.
+            // Some providers fill all of them even for insert; these fields
+            // have no meaning for a newly allocated plan item.
+            for key in ["id", "reason", "result"] {
+                if object.remove(key).is_some() {
+                    normalized = true;
+                }
+            }
+            if object
+                .get("before")
+                .and_then(Value::as_str)
+                .is_some_and(|id| {
+                    !id.starts_with('T')
+                        || id.len() < 2
+                        || !id[1..].bytes().all(|byte| byte.is_ascii_digit())
+                })
+            {
+                object.remove("before");
                 normalized = true;
             }
         }
@@ -388,6 +405,25 @@ fn parse_operations(value: &Value) -> Result<(Vec<Operation>, bool)> {
                 if !object.contains_key("result") && reason.is_string() {
                     object.insert("result".into(), reason);
                 }
+                normalized = true;
+            }
+        }
+        // The published item schema is shared by all operation variants.
+        // Providers can populate every optional field, so discard fields
+        // belonging to other variants while retaining strict validation for
+        // fields outside that schema.
+        let allowed: &[&str] = match item["op"].as_str() {
+            Some("insert") => &["texts", "before"],
+            Some("update") => &["id", "text"],
+            Some("split") => &["id", "texts"],
+            Some("move") => &["id", "before"],
+            Some("remove" | "reopen") => &["id", "reason"],
+            Some("complete") => &["id", "result"],
+            _ => &[],
+        };
+        let object = item.as_object_mut().unwrap();
+        for key in ["texts", "before", "id", "text", "result", "reason"] {
+            if !allowed.contains(&key) && object.remove(key).is_some() {
                 normalized = true;
             }
         }

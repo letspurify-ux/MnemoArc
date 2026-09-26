@@ -417,8 +417,11 @@ async fn registered_source_documentation() {
         assert!(result.completion_review.attempts > 0);
         assert!(result.completion_review.approved);
     }
+    let min_investigations = std::env::var("MNEMOARC_DOC_MIN_INVESTIGATIONS")
+        .map(|value| value.parse::<usize>().expect("minimum investigation count"))
+        .unwrap_or(4);
     assert!(
-        result.investigations.len() >= 4
+        result.investigations.len() >= min_investigations
             && result.investigations.iter().all(|i| i.status == "verified")
     );
     if let Ok(limit) = std::env::var("MNEMOARC_DOC_MAX_INPUT") {

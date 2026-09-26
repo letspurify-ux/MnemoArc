@@ -3029,7 +3029,9 @@ fn execute_repaired(
             );
         }
         if let Some(max_lines) = fields.get("max_lines") {
-            if max_lines != &limit {
+            if max_lines == &json!(0) && limit != json!(0) {
+                fields.insert("max_lines".into(), limit);
+            } else if limit != json!(0) && max_lines != &limit {
                 bail!(
                     "conflicting_arguments: file_read limit and max_lines differ; supply only max_lines (number of lines)"
                 );
