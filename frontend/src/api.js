@@ -27,6 +27,12 @@ export const statusLabel = {
   blocked: "확인 필요",
   cancelled: "중지됨",
 };
+// How a session's requests are handled; the user selects it per session.
+export const workflowOptions = [
+  ["answer", "질문 답변"],
+  ["source_document", "소스 기반 문서 작성"],
+  ["document_edit", "문서 편집"],
+];
 export const toolLabels = {
   document_inspect: "문서 구조 조회",
   document_audit: "문서 근거 점검",

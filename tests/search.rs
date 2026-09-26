@@ -367,3 +367,25 @@ fn literal_alternatives_preserve_punctuation_and_cursor_identity() {
         1
     );
 }
+
+#[test]
+fn file_list_path_lists_one_directory() {
+    let (dir, mut s) = setup();
+    std::fs::create_dir_all(dir.path().join("frontend/src")).unwrap();
+    std::fs::write(dir.path().join("frontend/src/App.jsx"), "x\n").unwrap();
+    std::fs::write(dir.path().join("frontend/other.js"), "x\n").unwrap();
+    // The live shape: a directory path instead of path_glob.
+    let listed = tools::execute(
+        &mut s,
+        "file_list",
+        json!({"mode":"paths","path":"frontend/src"}),
+    )
+    .unwrap();
+    assert_eq!(listed["paths"], json!(["frontend/src/App.jsx"]));
+    for args in [
+        json!({"path":"frontend/src","path_glob":"**"}),
+        json!({"path":"frontend/src/App.jsx"}),
+    ] {
+        assert!(tools::execute(&mut s, "file_list", args).is_err());
+    }
+}

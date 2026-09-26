@@ -1,13 +1,14 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Message, StreamingMessage } from "./chat/Message.jsx";
 import { continuationMessages } from "./chat/continuation.js";
-import { toolLabels } from "./api.js";
+import { toolLabels, workflowOptions } from "./api.js";
 
 export default function Chat({
   session,
   busy,
   canRun,
   onSend,
+  onWorkflow,
   onCancel,
   onSettings,
   onOlder,
@@ -238,6 +239,23 @@ export default function Chat({
               <i className="small-dot" />
               세션 기억 사용 · Enter 전송 / Shift+Enter 줄바꿈
             </span>
+            <label
+              className="workflow-select"
+              title="이 세션의 요청을 처리할 방식입니다. 다음 요청부터 적용됩니다."
+            >
+              작업 방식
+              <select
+                value={session?.workflow_mode ?? "answer"}
+                disabled={busy}
+                onChange={(e) => void onWorkflow(e.target.value).catch(() => {})}
+              >
+                {workflowOptions.map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </label>
             {session?.status === "running" ? (
               <button type="button" className="stop-button" onClick={onCancel}>
                 ■ 중지

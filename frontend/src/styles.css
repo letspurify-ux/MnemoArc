@@ -586,6 +586,26 @@ button:hover {
   align-items: center;
   gap: 6px;
 }
+.workflow-select {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  white-space: nowrap;
+  gap: 6px;
+  margin-left: auto;
+  margin-right: 10px;
+  font-size: 10px;
+  color: #6f7d66;
+}
+.workflow-select select {
+  width: auto;
+  font-size: 11px;
+  padding: 3px 6px;
+  border: 1px solid #c9d2bf;
+  border-radius: 6px;
+  background: white;
+  color: inherit;
+}
 .small-dot {
   width: 4px;
   height: 4px;
@@ -1451,8 +1471,9 @@ button:hover {
   .composer-wrap {
     padding: 10px 14px;
   }
+  /* Room for the workflow selector; Enter/Shift+Enter still work. */
   .composer-bottom > span {
-    font-size: 8px;
+    display: none;
   }
   .setup-note {
     font-size: 9px;

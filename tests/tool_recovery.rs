@@ -257,11 +257,13 @@ fn observed_state_and_path_errors_have_actionable_recovery() {
     };
     let result = tools::run_call(&mut s, &call);
     assert_eq!(result["recovery"]["code"], "file_not_found");
+    // The bare output file name resolves to the output, not yet written.
     assert!(
         result["error"]
             .as_str()
             .unwrap()
-            .contains(&dir.path().join("external-summary.md").display().to_string())
+            .contains("configured output does not exist yet"),
+        "{result}"
     );
     for (code, class, action) in [
         (

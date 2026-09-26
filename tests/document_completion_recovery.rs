@@ -38,12 +38,7 @@ fn fixture() -> (tempfile::TempDir, Session) {
         },
     );
     s.add_user("Write report.md with the requested document.".into());
-    tools::execute(
-        &mut s,
-        "task_state",
-        json!({"action":"update","patch":{"workflow":"document_edit"}}),
-    )
-    .unwrap();
+    s.select_workflow("document_edit").unwrap();
     tools::execute(
         &mut s,
         "document_edit",
@@ -1245,4 +1240,87 @@ async fn oversized_tool_batch_can_be_split_without_executing_rejected_writes() {
         assert!(s.completion_review.approved);
         assert_eq!(deltas, ["Saved report.md"]);
     }
+}
+
+struct EarlyOversizedBatch {
+    calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl LlmClient for EarlyOversizedBatch {
+    async fn complete(
+        &self,
+        request: Value,
+        _config: &Config,
+        _cancel: CancellationToken,
+        _tx: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let count = {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        if count == 1 {
+            let mut batch = call(1, "file_list", json!({"mode":"paths"}));
+            for i in 2..=3 {
+                batch
+                    .calls
+                    .extend(call(i, "file_list", json!({"mode":"paths"})).calls);
+            }
+            return Ok(batch);
+        }
+        let content = request["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        let state: Value = serde_json::from_str(content.split_once('\n').unwrap().1)?;
+        if count == 2 {
+            assert!(
+                state["run_guidance"]["recovery_reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("none of this batch executed")
+            );
+            return Ok(call(4, "file_list", json!({"mode":"paths"})));
+        }
+        // The reason explained one rejected batch; an executed one clears it.
+        assert!(state["run_guidance"]["recovery_reason"].is_null());
+        Ok(Completion {
+            text: "Answer.".into(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn oversized_batch_before_any_workflow_is_retried_not_fatal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("report.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128_000),
+            context_tokens: 128_000,
+            run_tokens: 1_000_000,
+            output_tokens: 1024,
+            batch_tokens: 400,
+            result_tokens: 400,
+            source_answer_review: false,
+            source_document_review: false,
+            completion_review_enabled: false,
+            ..Default::default()
+        },
+    );
+    s.add_user("List the project files.".into());
+    assert!(!s.is_document_work());
+    let client = Arc::new(EarlyOversizedBatch {
+        calls: Mutex::new(0),
+    });
+    let (s, _) = run(s, client.clone()).await;
+    assert_eq!(s.status, "complete", "{:?}", s.last_error);
+    assert_eq!(*client.calls.lock().unwrap(), 3);
+    assert!(!s.ledger.contains_key("action-1"));
 }

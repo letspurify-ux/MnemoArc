@@ -713,7 +713,7 @@ async fn varied_reads_without_deliverable_progress_focus_on_writing_and_resume()
     std::fs::write(dir.path().join("main.rs"), "one\ntwo\nthree\n").unwrap();
     let mut session = s(dir.path());
     session.config.stall_round_limit = 3;
-    session.task.workflow = "document_edit".into();
+    session.workflow_mode = "document_edit".into();
     session.task.deliverables = vec!["docs/source-summary.md".into()];
     session.active_tools.insert("document_edit".into());
     session.add_user("Save a summary of the source".into());
@@ -738,7 +738,7 @@ async fn resumed_document_work_retains_no_progress_count() {
     std::fs::write(dir.path().join("main.rs"), "one\ntwo\nthree\n").unwrap();
     let mut session = s(dir.path());
     session.config.stall_round_limit = 3;
-    session.task.workflow = "document_edit".into();
+    session.workflow_mode = "document_edit".into();
     session.task.deliverables = vec!["docs/source-summary.md".into()];
     session.active_tools.insert("document_edit".into());
     session.add_user("Save a summary of the source".into());
@@ -1409,16 +1409,9 @@ async fn simple_edit_cannot_complete_if_saved_file_changes_or_disappears() {
 fn evidence_requirement_is_explicit_and_retained_on_resume() {
     let dir = tempfile::tempdir().unwrap();
     let mut session = s(dir.path());
-    session.active_tools.insert("document_edit".into());
-    session.active_tools.insert("investigation".into());
-    mnemoarc::tools::execute(
-        &mut session,
-        "task_state",
-        json!({
-            "action":"update", "patch":{"require_investigation":true}
-        }),
-    )
-    .unwrap();
+    session.workflow_mode = "source_document".into();
+    session.add_user("소스 문서를 작성해줘".into());
+    assert!(session.task.require_investigation);
     let error = mnemoarc::tools::execute(
         &mut session,
         "task_state",
@@ -1428,12 +1421,12 @@ fn evidence_requirement_is_explicit_and_retained_on_resume() {
     )
     .unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("investigation_requirement_locked")
+        error.to_string().contains("workflow_selected_by_user"),
+        "{error}"
     );
     session.add_user("계속 진행".into());
     assert!(session.task.require_investigation);
+    session.workflow_mode = "document_edit".into();
     session.add_user("문서 제목만 바꿔줘".into());
     assert!(!session.task.require_investigation);
     assert!(!session.document_written);

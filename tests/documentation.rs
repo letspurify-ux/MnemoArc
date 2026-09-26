@@ -688,7 +688,7 @@ fn audit_ignores_example_citations_inside_fenced_code() {
 }
 
 #[test]
-fn verify_names_source_ids_that_are_not_file_evidence() {
+fn verify_drops_non_file_ids_beside_file_evidence() {
     let (dir, mut s) = setup();
     std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
     s.add_user("Document main.rs".into());
@@ -710,10 +710,11 @@ fn verify_names_source_ids_that_are_not_file_evidence() {
         "investigation",
         json!({"action":"upsert","id":"entry","title":"entry","status":"written","section":"# Entry"}),
     );
+    // Alone, the request's ID is still named and refused.
     let error = tools::execute(
         &mut s,
         "investigation",
-        json!({"action":"verify","id":"entry","source_ids":[file, user],"verification_note":"Compared main.rs:1."}),
+        json!({"action":"verify","id":"entry","source_ids":[user],"verification_note":"Compared main.rs:1."}),
     )
     .unwrap_err()
     .to_string();
@@ -722,13 +723,76 @@ fn verify_names_source_ids_that_are_not_file_evidence() {
         "{error}"
     );
     assert!(error.contains(&format!("{user} (origin=user)")), "{error}");
-    assert!(!error.contains(file.as_str().unwrap()), "{error}");
+    // Beside file evidence it is dropped and reported (the live shape).
     let verified = run(
         &mut s,
         "investigation",
-        json!({"action":"verify","id":"entry","source_ids":[file],"verification_note":"Compared main.rs:1."}),
+        json!({"action":"verify","id":"entry","source_ids":[file, user],"verification_note":"Compared main.rs:1."}),
     );
     assert_eq!(s.investigations[0].status, "verified", "{verified}");
+    assert_eq!(verified["ignored_source_ids"], json!([user]));
+    assert!(
+        s.investigations[0]
+            .sources
+            .iter()
+            .all(|source| source.origin == "file")
+    );
+}
+
+#[test]
+fn verify_batch_explains_fields_sent_as_items_and_paths_sent_as_ids() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Entry\nmain.rs:1\n"}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"entry","title":"entry","status":"written","section":"# Entry"}),
+    );
+    let error = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"verify_batch","items":{"section":"# Entry","source_ids":["main.rs"],"verification_note":"Compared."}}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("must map each investigation ID"), "{error}");
+    let error = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"entry","source_ids":["src/missing.css"],"verification_note":"Compared."}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("unknown_source: src/missing.css is a path"),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_output_file_name_alone_names_the_output() {
+    let (dir, mut s) = setup();
+    // The live shape: the output lives outside the project root.
+    let outside = tempfile::tempdir().unwrap();
+    s.project.output = outside.path().join("generated.md");
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\nText.\n"}),
+    );
+    let inspected = run(&mut s, "document_inspect", json!({"path":"generated.md"}));
+    assert!(inspected.to_string().contains("Guide"), "{inspected}");
+    let read = run(&mut s, "file_read", json!({"path":"generated.md"}));
+    assert!(read.to_string().contains("Text."), "{read}");
+    // A project file with that name still wins.
+    std::fs::write(dir.path().join("generated.md"), "project copy\n").unwrap();
+    let read = run(&mut s, "file_read", json!({"path":"generated.md"}));
+    assert!(read.to_string().contains("project copy"), "{read}");
 }
 
 #[test]
@@ -3176,4 +3240,212 @@ fn common_argument_aliases_are_accepted_and_conflicts_rejected() {
     // registered item is covered by the verify section-binding test).
     assert!(error.starts_with("section_not_found"), "{error}");
     assert_eq!(s.investigations[0].section, "# A");
+}
+
+#[test]
+fn a_user_selected_workflow_applies_to_each_request_and_is_locked() {
+    let (_dir, mut s) = setup();
+    s.active_tools.clear();
+    s.workflow_mode = "source_document".into();
+    s.add_user("Write the manual.".into());
+    assert_eq!(s.task.workflow, "source_document");
+    assert!(s.task.require_investigation && s.is_document_work());
+    assert!(s.active_tools.contains("investigation") && s.active_tools.contains("document_edit"));
+    // The model may fill in the task but not reclassify the request.
+    let error = tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"workflow":"answer"}}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("workflow_selected_by_user:"), "{error}");
+    run(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"completion":["The manual is saved."]}}),
+    );
+    // A later request resets the task and applies the selection again.
+    s.workflow_mode = "answer".into();
+    s.add_user("What does main do?".into());
+    assert_eq!(s.task.workflow, "answer");
+    assert!(!s.task.require_investigation && !s.is_document_work());
+}
+
+#[test]
+fn an_edit_after_verification_offers_the_reverify_call() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let file = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Entry\nmain.rs:1\n"}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"entry","title":"entry","status":"written","section":"# Entry"}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"entry","source_ids":[file],"verification_note":"Compared main.rs:1."}),
+    );
+    // A later edit to the section returns the item to "written".
+    let doc = std::fs::read(&s.project.output).unwrap();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","expected_hash":tools::hash(&doc),"text":"# Entry\nThe entry point is main (main.rs:1).\n"}),
+    );
+    let check = run(&mut s, "investigation", json!({"action":"final_check"}));
+    assert_eq!(check["complete"], false);
+    assert_eq!(check["incomplete"][0]["previous_source_ids"], json!([file]));
+    let example = check["verify_batch_example"].clone();
+    assert_eq!(example["items"]["entry"]["source_ids"], json!([file]));
+    // The offered call re-verifies the edited section as-is.
+    let verified = run(&mut s, "investigation", example);
+    assert_eq!(s.investigations[0].status, "verified", "{verified}");
+}
+
+#[test]
+fn unwritten_items_get_the_call_that_advances_them() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    // The live shape: items registered before writing, with no section.
+    for title in ["Entry point", "Errors"] {
+        run(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","status":"in_progress","title":title}),
+        );
+    }
+    let file = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n## Entry point\nIt starts in main (main.rs:1).\n"}),
+    );
+    let check = run(&mut s, "investigation", json!({"action":"final_check"}));
+    let steps = check["next_steps"].as_array().unwrap();
+    // Writing the matching heading bound the first item; its next call is
+    // the verification. The other section must be written first.
+    let entry = steps
+        .iter()
+        .find(|step| step["next"]["action"] == "verify")
+        .unwrap_or_else(|| panic!("{check}"));
+    assert!(
+        steps.iter().any(|step| step["next"]
+            .as_str()
+            .is_some_and(|next| next.contains("\"Errors\""))),
+        "{check}"
+    );
+    let id = entry["id"].as_str().unwrap();
+    // The offered call names the section's cited file; it verifies as sent,
+    // using the evidence already delivered by the read.
+    assert_eq!(entry["next"]["source_ids"], json!(["main.rs"]));
+    assert!(file.is_string());
+    run(&mut s, "investigation", entry["next"].clone());
+    assert!(
+        s.investigations
+            .iter()
+            .any(|i| i.id == id && i.status == "verified")
+    );
+    // An in_progress item registered after its section was written gets the
+    // upsert that marks it written.
+    let doc = std::fs::read(&s.project.output).unwrap();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","expected_hash":tools::hash(&doc),"text":"# Guide\n## Entry point\nIt starts in main (main.rs:1).\n## Errors\nNone.\n## Limits\nNone.\n"}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","status":"in_progress","title":"Limits"}),
+    );
+    let steps = run(&mut s, "investigation", json!({"action":"final_check"}))["next_steps"].clone();
+    let limits = steps
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["next"]["action"] == "upsert")
+        .unwrap_or_else(|| panic!("{steps}"));
+    assert_eq!(limits["next"]["status"], "written");
+    assert_eq!(limits["next"]["section"], "# Guide\n## Limits");
+}
+
+#[test]
+fn a_passing_final_check_says_what_finishes_the_task() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let file = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Entry\nmain.rs:1\n"}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"entry","title":"entry","status":"written","section":"# Entry"}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"entry","source_ids":[file],"verification_note":"Compared main.rs:1."}),
+    );
+    let revision = s.task.plan_revision;
+    run(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":revision,"operations":[{"op":"insert","texts":["Write the entry section"]}]}),
+    );
+    // The live shape: passing preflights repeated while a to-do stayed open.
+    let check = run(&mut s, "investigation", json!({"action":"final_check"}));
+    assert_eq!(check["complete"], true, "{check}");
+    let next = check["next"].as_str().unwrap();
+    assert!(
+        next.contains("task_plan apply") && next.contains("final answer"),
+        "{next}"
+    );
+    let id = s.task.todos[0].id.clone();
+    let revision = s.task.plan_revision;
+    run(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":revision,"operations":[{"op":"complete","id":id,"result":"Entry section written and verified"}]}),
+    );
+    let check = run(&mut s, "investigation", json!({"action":"final_check"}));
+    assert!(
+        check["next"]
+            .as_str()
+            .unwrap()
+            .starts_with("Give the final answer now")
+    );
+}
+
+#[test]
+fn a_directory_path_is_a_targeted_listing_while_verifying() {
+    let (dir, mut s) = setup();
+    std::fs::create_dir_all(dir.path().join("frontend/src")).unwrap();
+    std::fs::write(dir.path().join("frontend/src/App.jsx"), "x\n").unwrap();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"entry","title":"entry"}),
+    );
+    s.run_guidance["phase"] = json!("verify");
+    // The live shape: a directory path refused as broad discovery.
+    let listed = run(
+        &mut s,
+        "file_list",
+        json!({"mode":"paths","path":"frontend/src"}),
+    );
+    assert_eq!(listed["paths"], json!(["frontend/src/App.jsx"]));
+    let error = tools::execute(&mut s, "file_list", json!({"mode":"paths","path":"."}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("verification_reserve:"), "{error}");
 }

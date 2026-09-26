@@ -253,3 +253,43 @@ test("app exit can be cancelled and stops reconnecting after confirmation", asyn
   ).toBeVisible();
   await expect(page.getByText("연결 복구 중…")).toHaveCount(0);
 });
+
+test("session window selects the workflow for the next request", async ({
+  page,
+  request,
+}) => {
+  await page.goto("/");
+  const workflow = page.getByLabel("작업 방식");
+  await expect(workflow).toHaveValue("answer");
+  // No automatic choice: the user picks one of the three workflows.
+  await expect(workflow.locator("option")).toHaveText([
+    "질문 답변",
+    "소스 기반 문서 작성",
+    "문서 편집",
+  ]);
+  await workflow.selectOption("source_document");
+  const state = await (await request.get("/api/state")).json();
+  const id = state.sessions[0].id;
+  await expect
+    .poll(async () => {
+      const session = await (await request.get(`/api/sessions/${id}`)).json();
+      return session.workflow_mode;
+    })
+    .toBe("source_document");
+  await page.reload();
+  await expect(page.getByLabel("작업 방식")).toHaveValue("source_document");
+  await page.locator(".composer-wrap").screenshot({
+    path: "test-artifacts/workflow-select-desktop.png",
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByLabel("작업 방식")).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: "test-artifacts/workflow-select.png",
+    fullPage: true,
+  });
+});

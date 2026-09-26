@@ -73,6 +73,11 @@ async fn registered_source_documentation() {
     let dir = tempfile::tempdir().unwrap();
     project.output = dir.path().join("generated.md");
     let mut session = Session::new(project, config);
+    // The workflow a user selects in the session window; MNEMOARC_LIVE_WORKFLOW
+    // overrides the documentation default.
+    let workflow = std::env::var("MNEMOARC_LIVE_WORKFLOW").unwrap_or("source_document".into());
+    session.select_workflow(&workflow).unwrap();
+    eprintln!("[live] workflow_mode={workflow}");
     // MNEMOARC_LIVE_PROMPT_FILE swaps in another request against the same project.
     let request = match std::env::var("MNEMOARC_LIVE_PROMPT_FILE") {
         Ok(path) => std::fs::read_to_string(&path).expect("MNEMOARC_LIVE_PROMPT_FILE"),
@@ -140,6 +145,23 @@ async fn registered_source_documentation() {
                                 data["reason"].as_str().unwrap_or(""),
                                 data["plan"]["pending_count"],
                                 arguments.chars().take(200).collect::<String>()
+                            );
+                        }
+                        // Successful investigation calls hid a 20-round loop;
+                        // log what each one asked for.
+                        if message["role"] == "tool"
+                            && let Some(id) = message["tool_call_id"].as_str()
+                            && !seen_result_ids.contains(id)
+                            && let Some((name, arguments)) = call_signatures.get(id)
+                            && name == "investigation"
+                            && message["content"]
+                                .as_str()
+                                .and_then(|content| serde_json::from_str::<Value>(content).ok())
+                                .is_some_and(|result| result["status"] == "ok")
+                        {
+                            eprintln!(
+                                "[live] investigation ok args={}",
+                                arguments.chars().take(160).collect::<String>()
                             );
                         }
                         if message["role"] == "tool"

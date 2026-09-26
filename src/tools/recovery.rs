@@ -53,7 +53,8 @@ pub fn describe(message: &str) -> Value {
         (Class::MissingEvidence, "restore_memory_evidence")
     } else if code == "verification_sources_required" {
         (Class::MissingEvidence, "lookup_observed_evidence")
-    } else if code == "item_must_be_written_before_verification" {
+    } else if code == "item_must_be_written_before_verification" || code == "review_repair_required"
+    {
         (Class::Prerequisite, "complete_prerequisite")
     } else if code == "file_not_found" || code == "document_missing" {
         (Class::MissingPath, "resolve_path")
@@ -146,7 +147,7 @@ pub fn describe(message: &str) -> Value {
             | "call_id_collision"
             | "malformed_tool_call"
             | "workflow_locked"
-            | "investigation_requirement_locked"
+            | "workflow_selected_by_user"
     ) {
         (Class::InvalidInput, "correct_arguments")
     } else if code == "memory_referenced" {

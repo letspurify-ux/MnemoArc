@@ -33,7 +33,8 @@ fn fixture() -> (tempfile::TempDir, Session) {
     s.add_user(
         "Write a source document covering history normalization and all loop bounds.".into(),
     );
-    tools::execute(&mut s, "task_state", json!({"action":"update","patch":{"workflow":"source_document","completion":["history normalization", "loop type and bounds"]}})).unwrap();
+    s.select_workflow("source_document").unwrap();
+    tools::execute(&mut s, "task_state", json!({"action":"update","patch":{"completion":["history normalization", "loop type and bounds"]}})).unwrap();
     let read = tools::execute(&mut s, "file_read", json!({"path":"main.js"})).unwrap();
     tools::execute(
         &mut s,
@@ -97,8 +98,10 @@ fn source_workflow_activates_tools_and_schema_prevents_guessing() {
     );
     s.add_user("continue".into());
     assert_eq!(s.task.workflow, "source_document");
+    // The user switches the session to answers for the next request.
+    s.workflow_mode = "answer".into();
     s.add_user("Now answer a question only.".into());
-    assert_eq!(s.task.workflow, "");
+    assert_eq!(s.task.workflow, "answer");
     assert!(!s.task.require_investigation);
 }
 
@@ -1583,7 +1586,7 @@ async fn source_document_can_finish_after_stalled_reviews_or_many_rejected_final
         let s = run_repair_test(s, client).await;
         if premature_finals {
             // Final answers that never edit the rejected document are not
-            // repair: after two unchanged rejections the run closes and
+            // repair: after three unchanged rejections the run closes and
             // reports the open finding instead of waiting for a late fix.
             assert_eq!(s.status, "complete_with_gaps", "{:?}", s.last_error);
             assert_eq!(

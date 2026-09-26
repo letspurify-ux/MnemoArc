@@ -99,6 +99,16 @@ pub struct Investigation {
     pub note: String,
 }
 impl Investigation {
+    /// Source IDs this item was last verified with. After a document edit
+    /// the item returns to "written" but keeps them; a checkpoint may have
+    /// dropped them from the model's context (a live run looped 20 rounds).
+    pub fn source_ids(&self) -> Vec<String> {
+        self.sources
+            .iter()
+            .take(30)
+            .map(|source| source.id.clone())
+            .collect()
+    }
     /// Verified items and closing-mode gaps are settled. A gap is reported to
     /// the user as unconfirmed; it never counts as verified evidence.
     pub fn is_settled(&self) -> bool {
@@ -225,6 +235,9 @@ pub struct ReadCoverage {
 pub struct ProgressRecovery {
     /// A rejected document final must return to tools before trying to finish.
     pub action_required: bool,
+    /// The batch being executed answers a forced repair step, so non-repair
+    /// tools are refused while it runs (action_required is already cleared).
+    pub repair_step: bool,
     /// Recovery thresholds change the approach; document work retains its budget.
     pub recovery_reason: Option<String>,
     pub rounds_without_progress: usize,
@@ -253,6 +266,10 @@ pub struct ProgressRecovery {
     /// reviewed document stayed unchanged (keyed by that document's hash).
     pub unrepaired_finals: usize,
     pub unrepaired_final_hash: Option<String>,
+    /// Hash of the rejected document when a checkpoint cleared the context
+    /// during review repair; the next requests restate the findings until
+    /// the document changes.
+    pub review_repair_resume_hash: Option<String>,
     /// Set when a document-work response hit the output limit: a whole
     /// document rewrite is withheld until a smaller edit succeeds.
     pub whole_write_withheld: bool,
@@ -330,6 +347,9 @@ pub struct Session {
     pub config: Config,
     pub pending_config: Option<Config>,
     pub task: TaskState,
+    /// Workflow the user selected for this session's requests (one of
+    /// WORKFLOW_MODES); applied to every new task.
+    pub workflow_mode: String,
     pub memory: MemoryStore,
     pub history: SessionHistory,
     pub sources: BTreeMap<String, Source>,
@@ -381,7 +401,52 @@ pub struct Session {
     // Some(true): truncated tool batch; Some(false): text continuation.
     pub continuation: Option<bool>,
 }
+/// Workflows a user selects for a session in the session window.
+pub const WORKFLOW_MODES: [&str; 3] = ["answer", "source_document", "document_edit"];
+
 impl Session {
+    /// Select how this session's requests are handled and apply it to the
+    /// current task. The model cannot change the selection.
+    pub fn select_workflow(&mut self, mode: &str) -> anyhow::Result<()> {
+        if !WORKFLOW_MODES.contains(&mode) {
+            anyhow::bail!("invalid_workflow: use one of {WORKFLOW_MODES:?}");
+        }
+        self.workflow_mode = mode.into();
+        self.apply_workflow_mode();
+        Ok(())
+    }
+
+    /// Apply the user's workflow selection to the current task and enable its
+    /// tools. A new request resets the task, so this runs for each one.
+    pub fn apply_workflow_mode(&mut self) {
+        let require_investigation = self.workflow_mode == "source_document";
+        if self.task.workflow != self.workflow_mode
+            || self.task.require_investigation != require_investigation
+        {
+            self.task.workflow = self.workflow_mode.clone();
+            self.task.require_investigation = require_investigation;
+            self.task.revision = self.task.revision.saturating_add(1);
+        }
+        self.activate_workflow_tools();
+    }
+
+    /// Document workflows need their edit and verification tools active.
+    pub fn activate_workflow_tools(&mut self) {
+        if self.task.require_investigation || self.task.workflow == "document_edit" {
+            for name in [
+                "investigation",
+                "document_edit",
+                "document_edit_batch",
+                "document_audit",
+            ] {
+                self.active_tools.insert(name.into());
+                if let Some(pending) = &mut self.pending_tools {
+                    pending.insert(name.into());
+                }
+            }
+        }
+    }
+
     pub fn is_document_work(&self) -> bool {
         self.task.require_investigation
             || matches!(
@@ -412,6 +477,8 @@ impl Session {
             scope: project.root.display().to_string(),
             // A configured output is a possible destination, not a requested deliverable.
             deliverables: vec![],
+            // The default selection; see workflow_mode.
+            workflow: "answer".into(),
             ..Default::default()
         };
         Self {
@@ -441,6 +508,7 @@ impl Session {
             .map(str::to_owned)
             .collect(),
             pending_tools: None,
+            workflow_mode: "answer".into(),
             investigations: vec![],
             checkpoint: None,
             ledger: BTreeMap::new(),
@@ -578,6 +646,7 @@ impl Session {
             if self.task.completion.is_empty() {
                 self.task.completion = self.initial_completion(&text);
             }
+            self.apply_workflow_mode();
         }
         self.latest_request = text.clone();
         let source = Source {

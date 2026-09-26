@@ -261,6 +261,7 @@ pub fn app_router(state: WebState, frontend: Option<PathBuf>) -> Router {
         .route("/api/sessions/{id}/settings", put(session_settings))
         .route("/api/sessions/{id}/project", put(session_project))
         .route("/api/sessions/{id}/tools", put(session_tools))
+        .route("/api/sessions/{id}/workflow", put(session_workflow))
         .route("/api/sessions/{id}/memories/{memory}", get(memory_get))
         .route("/api/sessions/{id}/output", get(output));
     let router = match frontend {
@@ -355,7 +356,7 @@ async fn session_get(
         .filter(|b| session.history.bundles.iter().any(|old| old.id < b.id))
         .map(|b| b.id);
     Ok(Json(
-        json!({"revision":c.revision,"id":id,"project":session.project,"config":session.config,"pending_config":session.pending_config,"credential_configured":OpenAiClient::has_key(&session.config),"status":session.status,"error":session.last_error,"task":session.task,"document_review":session.document_review,"completion_review":session.completion_review,"completion_gaps":session.completion_gaps,"run_guidance":session.run_guidance,"activity":session.activity,"continuation_pending":session.continuation.is_some(),"bundles":bundles,"previous":previous,"pruned_through":session.history.pruned_through,"stream":c.streams.get(&id),"memories":session.memory.recent(session.config.memory_count),"investigations":session.investigations,"active_tools":session.active_tools,"usage":{"input":session.input_tokens,"output":session.output_tokens,"cached":session.cached_tokens,"estimated":session.usage_incomplete,"context_estimated":crate::context::is_estimated(&session.config.model),"memory_bytes":session.memory.bytes(),"history_bytes":session.history.bytes(),"checkpoints":session.checkpoints_completed},"checkpoint":session.checkpoint}),
+        json!({"revision":c.revision,"id":id,"project":session.project,"config":session.config,"pending_config":session.pending_config,"credential_configured":OpenAiClient::has_key(&session.config),"status":session.status,"error":session.last_error,"task":session.task,"workflow_mode":session.workflow_mode,"document_review":session.document_review,"completion_review":session.completion_review,"completion_gaps":session.completion_gaps,"run_guidance":session.run_guidance,"activity":session.activity,"continuation_pending":session.continuation.is_some(),"bundles":bundles,"previous":previous,"pruned_through":session.history.pruned_through,"stream":c.streams.get(&id),"memories":session.memory.recent(session.config.memory_count),"investigations":session.investigations,"active_tools":session.active_tools,"usage":{"input":session.input_tokens,"output":session.output_tokens,"cached":session.cached_tokens,"estimated":session.usage_incomplete,"context_estimated":crate::context::is_estimated(&session.config.model),"memory_bytes":session.memory.bytes(),"history_bytes":session.history.bytes(),"checkpoints":session.checkpoints_completed},"checkpoint":session.checkpoint}),
     ))
 }
 #[derive(Deserialize)]
@@ -531,6 +532,32 @@ async fn session_project(
     }
     session.project = project;
     tools::revalidate(session)?;
+    changed(&s, &mut c);
+    Ok(Json(json!({"saved":true})))
+}
+#[derive(Deserialize)]
+struct WorkflowSelection {
+    workflow: String,
+}
+/// The user's choice of how the session's requests are handled. It applies
+/// from the next request; the running one keeps the workflow it started with.
+async fn session_workflow(
+    State(s): State<WebState>,
+    Path(id): Path<String>,
+    Json(input): Json<WorkflowSelection>,
+) -> Api {
+    if !crate::session::WORKFLOW_MODES.contains(&input.workflow.as_str()) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "선택할 수 없는 작업 방식입니다.".into(),
+        ));
+    }
+    let mut c = s.core.lock().await;
+    if c.running.as_ref().is_some_and(|r| r.id == id) {
+        return Err(busy());
+    }
+    let session = c.sessions.get_mut(&id).ok_or_else(missing)?;
+    session.workflow_mode = input.workflow;
     changed(&s, &mut c);
     Ok(Json(json!({"saved":true})))
 }

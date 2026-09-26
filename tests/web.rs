@@ -402,3 +402,48 @@ async fn output_preview_truncates_at_utf8_boundaries() {
     assert_eq!(data["truncated"], true);
     assert_eq!(data["content"], prefix);
 }
+#[tokio::test]
+async fn workflow_selection_is_validated_shown_and_locked_while_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, state, server) = launch(dir.path()).await;
+    let c = reqwest::Client::new();
+    let id = get(&c, &url, "/api/state").await["sessions"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let select = |workflow: &str| {
+        c.put(format!("{url}/api/sessions/{id}/workflow"))
+            .header("x-mnemoarc-client", "web")
+            .json(&json!({"workflow":workflow}))
+            .send()
+    };
+    assert_eq!(
+        get(&c, &url, &format!("/api/sessions/{id}")).await["workflow_mode"],
+        "answer"
+    );
+    for invalid in ["", "unknown"] {
+        assert_eq!(select(invalid).await.unwrap().status(), 400);
+    }
+    assert_eq!(select("source_document").await.unwrap().status(), 200);
+    let started = c
+        .post(format!("{url}/api/sessions/{id}/run"))
+        .header("x-mnemoarc-client", "web")
+        .json(&json!({"text":"write the manual"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), 200);
+    // The request runs under the selection; changing it waits for the end.
+    let running = get(&c, &url, &format!("/api/sessions/{id}")).await;
+    assert_eq!(running["workflow_mode"], "source_document");
+    assert_eq!(running["task"]["workflow"], "source_document");
+    assert_eq!(running["task"]["require_investigation"], true);
+    assert_eq!(select("answer").await.unwrap().status(), 409);
+    c.post(format!("{url}/api/sessions/{id}/cancel"))
+        .header("x-mnemoarc-client", "web")
+        .send()
+        .await
+        .unwrap();
+    state.shutdown().await;
+    server.abort();
+}

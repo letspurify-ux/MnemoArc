@@ -93,11 +93,6 @@ fn task_patch_schema() -> Value {
         properties.insert(field.into(), strings());
     }
     properties.insert("details".into(), json!({"type":"array","items":{}}));
-    properties.insert("require_investigation".into(), json!({"type":"boolean"}));
-    properties.insert(
-        "workflow".into(),
-        action(&["answer", "source_document", "document_edit"]),
-    );
     properties.insert(
         "phase".into(),
         action(&["investigate", "draft", "verify", "answer"]),
@@ -187,7 +182,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "task_state",
-                description: "Read/update goals, constraints and completion criteria. Manage ordered work through task_plan; current/next/done and todos are not patch fields. State fields belong inside patch, e.g. {action:update,patch:{phase:verify}}. A new user task starts with a request-based completion condition; refine it into concrete checks before substantial work. For source documentation START with patch.workflow=source_document and completion criteria matching the user request; this activates investigation/document_edit/document_edit_batch/document_audit. Use investigation upsert for evidence items. Do not send empty patches or completion:[]. Updates preserve omitted fields. Evidence requirements and explicit user constraints remain in force even when a plan item is removed.",
+                description: "Read/update goals, constraints and completion criteria. Manage ordered work through task_plan; current/next/done and todos are not patch fields. State fields belong inside patch, e.g. {action:update,patch:{phase:verify}}. A new user task starts with a request-based completion condition; refine it into concrete checks before substantial work. The user selects task.workflow (answer, source_document or document_edit) and it cannot be patched; for source_document START with completion criteria matching the user request. Use investigation upsert for evidence items. Do not send empty patches or completion:[]. Updates preserve omitted fields. Evidence requirements and explicit user constraints remain in force even when a plan item is removed.",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -228,11 +223,11 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "file_list",
-                description: "List project files. Default mode=text validates UTF-8 text; mode=paths lists regular file paths without reading contents (may include binary/large files). path_glob is a file glob such as backend/**/*.js (pattern is a legacy alias). Paginated; respects project boundaries and exclusions",
+                description: "List project files. Default mode=text validates UTF-8 text; mode=paths lists regular file paths without reading contents (may include binary/large files). path_glob is a file glob such as backend/**/*.js (pattern is a legacy alias); path lists everything below one directory instead. Paginated; respects project boundaries and exclusions",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number(),"mode":action(&["text","paths"])}),
+                    json!({"path":string(),"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number(),"mode":action(&["text","paths"])}),
                     &[],
                 ),
             },
@@ -426,20 +421,26 @@ impl ToolRegistry {
         ]
         .contains(&name)
     }
+    /// Re-verifying the unchanged rejected document is not repair (a live run
+    /// answered three times, re-verifying in between); verification follows
+    /// an edit, which ends repair_only. Closing keeps investigation for mark_gap.
     const REPAIR_TOOLS: &'static [&'static str] = &[
         "document_edit",
         "document_edit_batch",
         "file_read",
         "source_search",
         "symbol_read",
-        "investigation",
     ];
+    fn repair_allows(s: &Session, name: &str) -> bool {
+        Self::REPAIR_TOOLS.contains(&name)
+            || (name == "investigation" && s.progress_recovery.closing.is_some())
+    }
     /// A final answer was rejected by a review whose findings the unchanged
     /// document still carries. The required tool call must be a repair step,
     /// not a plan, outline or audit call that merely satisfies the requirement.
     pub fn repair_only(s: &Session) -> bool {
         s.checkpoint.is_none()
-            && s.progress_recovery.action_required
+            && (s.progress_recovery.action_required || s.progress_recovery.repair_step)
             && s.is_document_work()
             && !s.document_review.issues.is_empty()
             && document_review::rejected_on_current_result(s)
@@ -527,7 +528,7 @@ impl ToolRegistry {
             .filter(|t| s.config.memory_reuse || !["memory_read", "memory_find"].contains(&t.name))
             .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
             .filter(|t| !Self::closing_withholds(s, t.name))
-            .filter(|t| !Self::repair_only(s) || Self::REPAIR_TOOLS.contains(&t.name))
+            .filter(|t| !Self::repair_only(s) || Self::repair_allows(s, t.name))
             // Second stage of the document progress ladder: after twice the
             // stall limit without a better result, stop broad discovery even
             // in the verify phase. Targeted file_read/symbol_read remain.
@@ -698,6 +699,13 @@ impl ToolRegistry {
             }
             .replace("{name}", name));
         }
+        // The offered list alone did not stop a live model from calling
+        // document_audit in a forced repair step.
+        if Self::repair_only(s) && !Self::repair_allows(s, name) {
+            bail!(
+                "review_repair_required: {name} is not a repair step; the reviewed document is unchanged, so edit it for document_review.issues with document_edit or document_edit_batch (read a cited source range first if needed)"
+            );
+        }
         if !s.config.memory_reuse && ["memory_find", "memory_read"].contains(&name) {
             bail!("unsupported: memory reuse disabled for evaluation");
         }
@@ -821,7 +829,7 @@ fn validate_task_state_arguments(args: &Value) -> Result<()> {
         // A bare {"action":"update"} was repeated in a live run; show the
         // whole call shape to copy.
         bail!(
-            r#"missing_argument: patch for task_state action=update. Send the fields to change inside patch in the same call, for example {{"action":"update","patch":{{"workflow":"source_document","completion":["the requested result"]}}}}"#
+            r#"missing_argument: patch for task_state action=update. Send the fields to change inside patch in the same call, for example {{"action":"update","patch":{{"completion":["the requested result"]}}}}"#
         );
     };
     let object = patch.as_object().ok_or_else(|| {
@@ -835,6 +843,11 @@ fn validate_task_state_arguments(args: &Value) -> Result<()> {
         let Some(field) = properties.get(key) else {
             if key == "revision" {
                 bail!("invalid_argument_value: revision is program-owned");
+            }
+            if key == "workflow" || key == "require_investigation" {
+                bail!(
+                    "workflow_selected_by_user: the user selects the workflow for this session (see task.workflow); omit {key} from the patch; state unchanged"
+                );
             }
             bail!(
                 "unknown_argument: {key} belongs inside task_state patch schema; state unchanged"
@@ -1952,22 +1965,6 @@ fn validate_investigation_arguments(s: &Session, args: &Value) -> Result<()> {
     Ok(())
 }
 
-fn activate_workflow_tools(s: &mut Session) {
-    if s.task.require_investigation || s.task.workflow == "document_edit" {
-        for name in [
-            "investigation",
-            "document_edit",
-            "document_edit_batch",
-            "document_audit",
-        ] {
-            s.active_tools.insert(name.into());
-            if let Some(pending) = &mut s.pending_tools {
-                pending.insert(name.into());
-            }
-        }
-    }
-}
-
 fn text<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args[key]
         .as_str()
@@ -2150,11 +2147,21 @@ pub fn output_path(p: &Project) -> Result<PathBuf> {
 }
 pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
     let root = p.root.canonicalize()?;
-    let candidate = if Path::new(path).is_absolute() {
+    let mut candidate = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
         root.join(path)
     };
+    // A bare file name that no project file has but the configured output
+    // does names the output (live runs sent "generated.md" for an output
+    // outside the project root).
+    if !candidate.exists()
+        && Path::new(path).components().count() == 1
+        && let Ok(output) = output_path(p)
+        && output.file_name() == Some(std::ffi::OsStr::new(path))
+    {
+        candidate = output;
+    }
     let canonical = candidate.canonicalize().map_err(|e| {
         let code = match e.kind() {
             std::io::ErrorKind::NotFound => "file_not_found",
@@ -2701,6 +2708,62 @@ fn resolved_section_path(doc: &str, section: &str) -> Option<String> {
     documentation::heading_path(doc, heading.start).ok()
 }
 
+/// The next call for each unsettled investigation item. A live run kept
+/// in_progress items it had already written about and, told only that items
+/// were unverified, listed them for 20 rounds instead of advancing them.
+pub fn investigation_next_steps(s: &Session) -> Vec<Value> {
+    let doc = output_path(&s.project)
+        .ok()
+        .and_then(|path| read_text(&path).ok())
+        .unwrap_or_default();
+    s.investigations
+        .iter()
+        .filter(|item| !item.is_settled())
+        .take(10)
+        .map(|item| {
+            if item.status == "written" {
+                // Never-verified items carry no IDs, and a checkpoint may have
+                // dropped the model's (a live run then looped): offer the
+                // section's cited project files, whose delivered evidence
+                // verify uses directly.
+                let cited = || {
+                    let mut paths: Vec<String> = section_text(&doc, &item.section)
+                        .ok()
+                        .and_then(|section| documentation::citation_spans(section).ok())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|citation| citation.path)
+                        .filter(|path| read_path(&s.project, path).is_ok_and(|p| p.is_file()))
+                        .collect();
+                    paths.sort();
+                    paths.dedup();
+                    paths
+                };
+                let source_ids = if item.sources.is_empty() {
+                    let paths = cited();
+                    if paths.is_empty() {
+                        json!(["<S-IDs from file_read/source_search, or the cited project file paths>"])
+                    } else {
+                        json!(paths)
+                    }
+                } else {
+                    json!(item.source_ids())
+                };
+                return json!({"id":item.id,"next":{"action":"verify","id":item.id,"source_ids":source_ids,"verification_note":"<how the section matches these sources>"}});
+            }
+            match resolved_section_path(&doc, &item.section)
+                .or_else(|| planned_heading(&doc, &item.section, &item.title))
+            {
+                Some(section) => json!({"id":item.id,"status":item.status,
+                    "next":{"action":"upsert","id":item.id,"status":"written","section":section},
+                    "then":"verify it with the S-IDs (or cited project file paths) of its evidence"}),
+                None => json!({"id":item.id,"status":item.status,
+                    "next":format!("write its section (\"{}\") with document_edit, then upsert status=written with that heading as section", item.title)}),
+            }
+        })
+        .collect()
+}
+
 /// The written heading a planned section most likely became: the item title,
 /// the planned title at any heading level, or the same leading section
 /// number such as `2.` in `## 2. Flow`. Each must match a single heading.
@@ -2873,10 +2936,10 @@ fn execute_repaired(
         && !s.investigations.is_empty()
         && ((name == "file_list"
             && args["cursor"].as_str().is_none()
-            && !["path_glob", "pattern"].iter().any(|key| {
-                args[*key]
-                    .as_str()
-                    .is_some_and(|pattern| !matches!(pattern.trim(), "" | "*" | "**" | "**/*"))
+            && !["path", "path_glob", "pattern"].iter().any(|key| {
+                args[*key].as_str().is_some_and(|pattern| {
+                    !matches!(pattern.trim(), "" | "." | "./" | "*" | "**" | "**/*")
+                })
             }))
             || (name == "symbol_search" && args["query"].as_str().unwrap_or("").is_empty())
             || (name == "investigation"
@@ -3112,37 +3175,19 @@ fn execute_repaired(
                         "completion_required: provide non-empty completion criteria, or omit completion to preserve the current criteria"
                     );
                 }
-                if !["", "answer", "source_document", "document_edit"]
-                    .contains(&next.workflow.as_str())
+                // The user selects the workflow in the session window; the
+                // model fills in the task but cannot reclassify the request.
+                if next.workflow != s.task.workflow
+                    || next.require_investigation != s.task.require_investigation
                 {
-                    bail!("invalid_workflow: use answer, source_document or document_edit");
-                }
-                if next.workflow == "source_document" {
-                    if next.completion.is_empty()
-                        || next
-                            .completion
-                            .iter()
-                            .any(|criterion| criterion.trim().is_empty())
-                    {
-                        bail!(
-                            "completion_required: source_document needs non-empty completion criteria before work begins"
-                        );
-                    }
-                    next.require_investigation = true;
-                }
-                if s.task.workflow == "source_document" && next.workflow != "source_document" {
                     bail!(
-                        "workflow_locked: source-document evidence requirements cannot be disabled during this request"
+                        "workflow_selected_by_user: the user selected workflow={} for this session; omit workflow and require_investigation from the patch",
+                        s.task.workflow
                     );
                 }
                 if !["", "investigate", "draft", "verify", "answer"].contains(&next.phase.as_str())
                 {
                     bail!("invalid_task_phase: use investigate, draft, verify or answer");
-                }
-                if s.task.require_investigation && !next.require_investigation {
-                    bail!(
-                        "investigation_requirement_locked: cannot disable required evidence verification during this request"
-                    );
                 }
                 for id in &next.memory_ids {
                     s.memory.get(id)?;
@@ -3169,7 +3214,7 @@ fn execute_repaired(
                     bail!("task_detail_limit");
                 }
                 s.task = next;
-                activate_workflow_tools(s);
+                s.activate_workflow_tools();
                 Ok(json!({"revision":s.task.revision}))
             }
             _ => unreachable!(),
@@ -3292,6 +3337,37 @@ fn execute_repaired(
             Ok(json!({"acknowledged":true,"state_revision":s.task.revision}))
         }
         "file_list" => {
+            // A directory path lists everything below it, as in source_search
+            // (live runs sent path twice and were refused).
+            if let Some(path) = args.get("path").and_then(Value::as_str) {
+                if args.get("path_glob").is_some() || args.get("pattern").is_some() {
+                    bail!(
+                        "conflicting_arguments: use path for one directory OR path_glob/pattern for a file glob"
+                    );
+                }
+                let dir = read_path(&s.project, path)?;
+                if !dir.is_dir() {
+                    bail!(
+                        "invalid_argument_value: path must be a directory for file_list; read a file with file_read"
+                    );
+                }
+                let root = s.project.root.canonicalize()?;
+                let relative = dir
+                    .strip_prefix(&root)
+                    .unwrap_or(&dir)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let args = args.as_object_mut().unwrap();
+                args.remove("path");
+                args.insert(
+                    "path_glob".into(),
+                    json!(if relative.is_empty() {
+                        "**".to_owned()
+                    } else {
+                        format!("{}/**", relative.trim_end_matches('/'))
+                    }),
+                );
+            }
             // A continuation that omits the original mode/path_glob keeps the
             // scope its cursor was issued for.
             if let Some(scope) = args["cursor"]
@@ -3351,9 +3427,10 @@ fn execute_repaired(
             // A cursor continues its original range, so a page size sent with
             // it changes nothing. Ignore it rather than reject a correct
             // continuation; new-range arguments with a cursor still conflict.
+            // read_file still rejects a path naming another file.
             let ignored_page_size = args["cursor"].is_string()
                 && args.get("max_lines").is_some()
-                && !["path", "start_line", "offset"]
+                && !["start_line", "offset"]
                     .iter()
                     .any(|key| args.get(key).is_some());
             if ignored_page_size {
@@ -3560,6 +3637,13 @@ fn execute_repaired(
                 if items.is_empty() || items.len() > 20 {
                     bail!("invalid_argument_value: items requires 1..20 entries");
                 }
+                // One item's fields sent directly as items: explain the shape
+                // once instead of failing each field as an item ID.
+                if items.contains_key("source_ids") || items.contains_key("verification_note") {
+                    bail!(
+                        r#"invalid_argument_type: items must map each investigation ID to its fields, not hold the fields directly; for example {{"action":"verify_batch","items":{{"sec1":{{"source_ids":["S12"],"verification_note":"..."}}}}}}"#
+                    );
+                }
                 revalidate(s)?;
                 let mut reused_ids = vec![];
                 let mut results = vec![];
@@ -3672,7 +3756,29 @@ fn execute_repaired(
                         || read_path(&s.project, id).is_err()
                 });
                 let path_hints = path_hints - ids.len();
+                // A path left here names no readable project file; say so
+                // instead of the generic unknown-ID recovery.
+                if let Some(path) = ids.iter().find(|id| {
+                    id.contains('/') && s.source_refs(std::slice::from_ref(*id)).is_err()
+                }) {
+                    bail!(
+                        "unknown_source: {path} is a path, not a source ID, and no readable project file has it; pass the S-IDs returned by file_read/source_search/symbol_search for the cited files (or an existing project path to use its delivered evidence)"
+                    );
+                }
                 let mut sources = s.source_refs(&ids)?;
+                // The user's request (origin=user) and memories are not file
+                // evidence. When file evidence remains, drop them and report it
+                // (a live run lost four items at once to a stray S1).
+                let mut ignored_source_ids = vec![];
+                if sources.iter().any(|source| source.origin == "file") || path_hints > 0 {
+                    sources.retain(|source| {
+                        let keep = source.origin == "file";
+                        if !keep {
+                            ignored_source_ids.push(source.id.clone());
+                        }
+                        keep
+                    });
+                }
                 // Name each non-file ID so the caller drops only those.
                 let rejected: Vec<String> = sources
                     .iter()
@@ -3768,11 +3874,17 @@ fn execute_repaired(
                     s.progress_recovery.verification_events =
                         s.progress_recovery.verification_events.saturating_add(1);
                 }
-                if supplemented.is_empty() {
-                    Ok(json!({"verified":id}))
-                } else {
-                    Ok(json!({"verified":id,"supplemented_source_ids":supplemented}))
+                let mut result = json!({"verified":id});
+                if !supplemented.is_empty() {
+                    result["supplemented_source_ids"] = json!(supplemented);
                 }
+                if !ignored_source_ids.is_empty() {
+                    result["ignored_source_ids"] = json!(ignored_source_ids);
+                    result["ignored_note"] = json!(
+                        "These IDs are not file evidence (for example the user's request) and were not recorded; pass only file_read/source_search/symbol_search IDs."
+                    );
+                }
+                Ok(result)
             }
             "mark_gap" => {
                 if s.progress_recovery.closing.is_none() {
@@ -3804,12 +3916,27 @@ fn execute_repaired(
                     s.task.require_investigation = true;
                     s.task.revision = s.task.revision.saturating_add(1);
                 }
-                activate_workflow_tools(s);
+                s.activate_workflow_tools();
                 revalidate(s)?;
                 if s.investigations.is_empty() || s.investigations.iter().any(|i| !i.is_settled()) {
-                    return Ok(
-                        json!({"complete":false,"incomplete":s.investigations.iter().filter(|i|!i.is_settled()).map(|i|json!({"id":i.id,"title":i.title,"status":i.status,"section":i.section})).collect::<Vec<_>>(),"review":s.reviews,"guidance":"Verify pending items first; incomplete preflight does not consume a document review."}),
-                    );
+                    let mut result = json!({"complete":false,"incomplete":s.investigations.iter().filter(|i|!i.is_settled()).map(|i|json!({"id":i.id,"title":i.title,"status":i.status,"section":i.section,"previous_source_ids":i.source_ids()})).collect::<Vec<_>>(),"next_steps":investigation_next_steps(s),"review":s.reviews,"guidance":"Verify pending items first; incomplete preflight does not consume a document review. Follow next_steps: an item must be written, with its section, before it can be verified."});
+                    // Written items that lost verification to an edit keep
+                    // their sources: offer the call that re-verifies them.
+                    let items: serde_json::Map<String, Value> = s
+                        .investigations
+                        .iter()
+                        .filter(|i| i.status == "written" && !i.sources.is_empty())
+                        .take(20)
+                        .map(|i| (i.id.clone(), json!({"source_ids":i.source_ids(),"verification_note":"Compared the edited section with these sources"})))
+                        .collect();
+                    if !items.is_empty() {
+                        result["verify_batch_example"] =
+                            json!({"action":"verify_batch","items":items});
+                        result["guidance"] = json!(
+                            "Verify pending items first; incomplete preflight does not consume a document review. Items edited after verification keep their previous_source_ids: send verify_batch_example after checking each section against them (write your own verification_note), adding IDs for any new citation."
+                        );
+                    }
+                    return Ok(result);
                 }
                 let audit = documentation::execute(s, "document_audit", &json!({}), cancel)?;
                 if audit["structural_ok"] != true {
@@ -3827,9 +3954,29 @@ fn execute_repaired(
                     .filter(|i| !i.is_settled())
                     .map(|i| json!({"id":i.id,"title":i.title,"status":i.status}))
                     .collect();
-                Ok(
-                    json!({"complete":!s.investigations.is_empty()&&incomplete.is_empty(),"semantic_verified":false,"completion_scope":"structural preflight; enabled source-document model review runs before task completion","incomplete":incomplete,"review":s.reviews,"output":s.project.output}),
-                )
+                let complete = !s.investigations.is_empty() && incomplete.is_empty();
+                let mut result = json!({"complete":complete,"semantic_verified":false,"completion_scope":"structural preflight; enabled source-document model review runs before task completion","incomplete":incomplete,"review":s.reviews,"output":s.project.output});
+                // A passing preflight is not the finish: say what is. A live
+                // run repeated final_check and list for rounds after passing.
+                if complete {
+                    let pending: Vec<_> = s
+                        .task
+                        .todos
+                        .iter()
+                        .filter(|item| !item.done)
+                        .map(|item| item.id.clone())
+                        .collect();
+                    result["next"] = json!(if pending.is_empty() {
+                        "Give the final answer now; the document review runs after it. Do not re-check or re-list."
+                            .to_owned()
+                    } else {
+                        format!(
+                            "Close the remaining to-dos {pending:?} in ONE task_plan apply with expected_revision={} (complete each with its result, or remove an obsolete one), then give the final answer; the document review runs after it.",
+                            s.task.plan_revision
+                        )
+                    });
+                }
+                Ok(result)
             }
             _ => unreachable!(),
         },
@@ -3844,20 +3991,36 @@ fn read_file(
     _cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value> {
     let cursor = if let Some(id) = args["cursor"].as_str() {
-        if ["path", "start_line", "max_lines", "offset"]
-            .iter()
-            .any(|key| args.get(key).is_some())
+        let cursor = s.file_cursors.get(id).cloned().ok_or_else(|| anyhow::anyhow!("invalid_file_cursor: copy next_cursor.cursor exactly from this session, or start a new read with path/start_line/max_lines"))?;
+        if let Some(path) = args.get("path").and_then(Value::as_str)
+            && read_path(&s.project, path)? != read_path(&s.project, &cursor.path)?
         {
+            bail!(
+                "cursor_arguments_conflict: cursor belongs to {}; for another file omit cursor and use path/start_line/max_lines",
+                cursor.path
+            );
+        }
+        args["path"] = json!(cursor.path);
+        if args.get("start_line").is_some() {
+            // An explicit start line on the cursor's file is a new range: read
+            // it and drop the cursor (a live run was refused twice for this).
+            if args.get("offset").is_some() {
+                bail!(
+                    "cursor_arguments_conflict: pass cursor alone to continue, or start_line/max_lines without cursor or offset for a new range"
+                );
+            }
+            args.as_object_mut().unwrap().remove("cursor");
+            None
+        } else if args.get("offset").is_some() || args.get("max_lines").is_some() {
             bail!(
                 "cursor_arguments_conflict: pass only cursor (and optional force_read); for a new range omit cursor and use path/start_line/max_lines"
             );
+        } else {
+            args["start_line"] = json!(cursor.start_line);
+            args["max_lines"] = json!(cursor.max_lines);
+            args["offset"] = json!(cursor.offset);
+            Some(cursor)
         }
-        let cursor = s.file_cursors.get(id).cloned().ok_or_else(|| anyhow::anyhow!("invalid_file_cursor: copy next_cursor.cursor exactly from this session, or start a new read with path/start_line/max_lines"))?;
-        args["path"] = json!(cursor.path);
-        args["start_line"] = json!(cursor.start_line);
-        args["max_lines"] = json!(cursor.max_lines);
-        args["offset"] = json!(cursor.offset);
-        Some(cursor)
     } else {
         None
     };

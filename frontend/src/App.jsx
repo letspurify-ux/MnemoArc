@@ -445,6 +445,11 @@ export default function App() {
                 onSend={(text) =>
                   act(() => send(`/sessions/${selected}/run`, { text }))
                 }
+                onWorkflow={(workflow) =>
+                  act(() =>
+                    send(`/sessions/${selected}/workflow`, { workflow }, "PUT"),
+                  )
+                }
                 onCancel={safe(() => send(`/sessions/${selected}/cancel`, {}))}
                 onSettings={() => setPage("settings")}
                 onOlder={safe(async () => {

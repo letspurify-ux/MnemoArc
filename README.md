@@ -300,7 +300,7 @@ LLM은 `code_outline`의 `view=compact`, `max_depth=0`으로 최상위 구조를
 
 LLM에는 읽은 본문을 절대 줄 번호와 함께 전달하고, 구조 목록에는 복사 가능한 `location`을 제공합니다. 원문과 커서 오프셋은 유지하며 모델용 줄 번호도 응답 토큰 예산에 반영합니다.
 
-소스 문서는 `task_state.patch.workflow="source_document"`로 시작해 조사·작성 도구를 즉시 활성화합니다. `source_document_review`는 생성 문서와 실제 소스·요구사항을 제한된 별도 요청으로 대조하며 기본값은 `true`입니다. 일반 완료 승인 모델 요청은 `completion_review_enabled`(기본 `true`)로 별도 제어합니다. 이를 끄면 모델 승인 단계는 생략하지만 정적 문서 감사와 출처 검사는 유지됩니다. 비용 상한과 재현 방법은 [소스 문서 작업·검토 설계](docs/source-document-review.md)를 참고하세요.
+작업 방식은 세션 창 입력란 아래의 "작업 방식"에서 고릅니다(질문 답변·소스 기반 문서 작성·문서 편집, 기본값 질문 답변). 소스 기반 문서 작성을 고르면 조사·작성 도구가 즉시 활성화되고, 모델은 이 선택을 바꿀 수 없습니다. `source_document_review`는 생성 문서와 실제 소스·요구사항을 제한된 별도 요청으로 대조하며 기본값은 `true`입니다. 일반 완료 승인 모델 요청은 `completion_review_enabled`(기본 `true`)로 별도 제어합니다. 이를 끄면 모델 승인 단계는 생략하지만 정적 문서 감사와 출처 검사는 유지됩니다. 비용 상한과 재현 방법은 [소스 문서 작업·검토 설계](docs/source-document-review.md)를 참고하세요.
 
 ### 프록시 강제 비활성화
 

@@ -164,6 +164,8 @@ fn collect_gaps(s: &mut Session, extra: &[String]) -> Vec<String> {
 
 const PLAN_CLOSEOUT_INSTRUCTION: &str = "The document is written and every investigation item is settled; only the to-dos in plan_closeout remain, and the final answer is refused while any is open. Close them in ONE task_plan apply using plan_closeout.expected_revision: one operation per item in the listed order, complete with the actual observed result when its work is done, or remove with a reason when it is obsolete. complete must follow list order, because only the current item can complete. Do real work first only for an item whose result is truly missing. Then give the final answer.";
 
+const REVIEW_REPAIR_RESUME_INSTRUCTION: &str = "A checkpoint cleared the context during review repair, and the document is still UNCHANGED: every finding in review_repair.unrepaired_findings is still open. A final answer now is rejected again without a new review. Edit the document for these findings first.";
+
 const READY_FOR_FINAL_INSTRUCTION: &str = "Ready to finish: every investigation item is verified or reported, no to-do remains and no review finding is open for this document version. Give the concise final answer now (output path, verification scope, remaining limitations). The runtime then runs the document review and completion checks and returns any finding as a repair. Do not inspect, audit or re-verify again unless you change the document.";
 
 const REVIEW_REPAIR_INSTRUCTION: &str = "Review repair: fix ALL findings in document_review.issues before the next final answer. Read any source range a finding needs, then apply the corrections with as few document edits as possible: group non-overlapping corrections in one document_edit_batch whose single expected_hash is the top-level argument (never inside edits). Operations apply in order, so never target text that an earlier operation in the same batch replaces; when corrections touch the same passage, merge them into one operation or use a separate request. Then run ONE verify_batch for the returned verification_required_ids and give the final answer to start the re-review. Do not alternate single edits with document_audit or document_inspect. Fix findings in their original sections; do not add a review-notes section.";
@@ -297,15 +299,21 @@ fn abandon_failing_review(s: &mut Session, failures: usize) -> bool {
 const EMPTY_COMPLETION_RETRIES: usize = 2;
 
 /// Unchanged-document final answers rejected by a review before closing.
-const UNREPAIRED_FINAL_LIMIT: usize = 2;
+/// A live run closed after two with most of its budget left.
+const UNREPAIRED_FINAL_LIMIT: usize = 3;
+
+/// The output document's current hash, if it exists.
+fn output_hash(s: &Session) -> Option<String> {
+    tools::output_path(&s.project)
+        .ok()
+        .and_then(|path| std::fs::read(path).ok())
+        .map(|bytes| tools::hash(&bytes))
+}
 
 /// Count a final answer rejected because the reviewed document was not
 /// edited. An edit changes the document hash and restarts the count.
 fn note_unrepaired_final(s: &mut Session) -> usize {
-    let current = tools::output_path(&s.project)
-        .ok()
-        .and_then(|path| std::fs::read(path).ok())
-        .map(|bytes| tools::hash(&bytes));
+    let current = output_hash(s);
     let recovery = &mut s.progress_recovery;
     if current.is_some() && recovery.unrepaired_final_hash == current {
         recovery.unrepaired_finals = recovery.unrepaired_finals.saturating_add(1);
@@ -466,14 +474,20 @@ fn recover_review_setup(s: &mut Session, reason: &str) -> bool {
 
 fn recover_unexecuted_batch(s: &mut Session, reason: &str) -> bool {
     let code = reason.split(':').next().unwrap_or(reason);
+    if !matches!(
+        code,
+        "tool_call_batch_limit"
+            | "invalid_tool_arguments"
+            | "malformed_tool_call"
+            | "response_size_limit"
+    ) {
+        return false;
+    }
+    // Before document work, retry only an oversized batch, once in a row: the
+    // reason clears after the next executed batch (a live run ended here
+    // after 32 rounds), while repeated malformed output still stops the run.
     if !s.is_document_work()
-        || !matches!(
-            code,
-            "tool_call_batch_limit"
-                | "invalid_tool_arguments"
-                | "malformed_tool_call"
-                | "response_size_limit"
-        )
+        && (code != "tool_call_batch_limit" || s.progress_recovery.recovery_reason.is_some())
     {
         return false;
     }
@@ -513,7 +527,9 @@ fn recover_unexecuted_batch(s: &mut Session, reason: &str) -> bool {
     // An oversized text-only final can be fixed by shortening the answer;
     // requiring a tool call here would delay acceptance for a finished file.
     s.progress_recovery.action_required |= code != "response_size_limit";
-    recover_document(s, &guidance)
+    // Nothing ran, so the retry is safe; run_guidance carries the reason.
+    s.progress_recovery.recovery_reason = Some(guidance);
+    true
 }
 
 #[derive(Clone, Debug)]
@@ -1183,6 +1199,19 @@ pub async fn run_session_controlled(
         } else if s.progress_recovery.closing.is_none() && review_repair_pending(&s) {
             s.run_guidance["review_repair"] = json!({"findings":s.document_review.issues.len()});
             s.run_guidance["instruction"] = json!(REVIEW_REPAIR_INSTRUCTION);
+            // After a checkpoint cleared the repair context, restate the
+            // findings until the document changes.
+            let resume = s.progress_recovery.review_repair_resume_hash.clone();
+            if resume.is_some() && resume == output_hash(&s) {
+                s.run_guidance["review_repair"]["resumed_after_checkpoint"] = json!(true);
+                s.run_guidance["review_repair"]["unrepaired_findings"] =
+                    json!(s.document_review.issues);
+                s.run_guidance["instruction"] = json!(format!(
+                    "{REVIEW_REPAIR_RESUME_INSTRUCTION} {REVIEW_REPAIR_INSTRUCTION}"
+                ));
+            } else if resume.is_some() {
+                s.progress_recovery.review_repair_resume_hash = None;
+            }
         }
         if let Some(closing) = &s.progress_recovery.closing {
             s.run_guidance["closing"] = json!({"active":true,"reason":closing.reason,
@@ -1959,8 +1988,10 @@ pub async fn run_session_controlled(
                 let _ = tools::revalidate(&mut s);
                 if s.investigations.iter().any(|i| !i.is_settled()) {
                     s.status = "partial".into();
-                    s.last_error =
-                        Some("Unverified investigation items remain; document is partial".into());
+                    s.last_error = Some(format!(
+                        "Unverified investigation items remain; document is partial. Next step for each: {}",
+                        json!(tools::investigation_next_steps(&s))
+                    ));
                 } else {
                     match tools::audit_document(&mut s) {
                         Ok(audit) if audit["structural_ok"] == true => {
@@ -2193,6 +2224,7 @@ pub async fn run_session_controlled(
             break;
         }
         if s.checkpoint.is_none() {
+            s.progress_recovery.repair_step = tools::ToolRegistry::repair_only(&s);
             s.progress_recovery.action_required = false;
         }
         // Count the batch once and review AFTER it is executed. Rejecting the
@@ -2556,6 +2588,11 @@ pub async fn run_session_controlled(
                 .progress_recovery
                 .artifact_edits_without_milestone
                 .saturating_add(1);
+        }
+        s.progress_recovery.repair_step = false;
+        if !s.is_document_work() {
+            // Outside document work the reason only explains the rejected batch.
+            s.progress_recovery.recovery_reason = None;
         }
         if novel_artifact_change || verified_progress {
             s.progress_recovery.recovery_reason = None;

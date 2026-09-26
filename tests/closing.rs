@@ -35,12 +35,7 @@ fn fixture() -> (tempfile::TempDir, Session, Value) {
         },
     );
     s.add_user("Write a source document covering the loop and history handling.".into());
-    tools::execute(
-        &mut s,
-        "task_state",
-        json!({"action":"update","patch":{"workflow":"source_document"}}),
-    )
-    .unwrap();
+    s.select_workflow("source_document").unwrap();
     let read = tools::execute(&mut s, "file_read", json!({"path":"main.js"})).unwrap();
     tools::execute(
         &mut s,
@@ -320,12 +315,7 @@ async fn closing_reserve_finishes_steady_work_before_the_budget() {
     );
     s.add_user("Write out.md".into());
     s.active_tools = ToolRegistry::optional_names();
-    tools::execute(
-        &mut s,
-        "task_state",
-        json!({"action":"update","patch":{"workflow":"document_edit"}}),
-    )
-    .unwrap();
+    s.select_workflow("document_edit").unwrap();
     tools::execute(
         &mut s,
         "document_edit",
@@ -777,12 +767,7 @@ async fn reading_new_sources_before_the_first_write_is_progress() {
         },
     );
     s.add_user("Document main.js with source evidence".into());
-    tools::execute(
-        &mut s,
-        "task_state",
-        json!({"action":"update","patch":{"workflow":"source_document"}}),
-    )
-    .unwrap();
+    s.select_workflow("source_document").unwrap();
     // Twelve distinct ranges: four times the closing threshold (3 x 2).
     let mut steps: Vec<Completion> = (0..12)
         .map(|i| {
@@ -840,12 +825,7 @@ async fn discovery_tools_stay_available_until_the_document_exists() {
     );
     s.add_user("Document backend/src/agent.js with source evidence".into());
     s.active_tools = ToolRegistry::optional_names();
-    tools::execute(
-        &mut s,
-        "task_state",
-        json!({"action":"update","patch":{"workflow":"source_document"}}),
-    )
-    .unwrap();
+    s.select_workflow("source_document").unwrap();
     // Wrong guesses first (no new evidence), then real distinct reads: both
     // stretches exceed the stall limit before any document is written.
     let mut steps: Vec<Completion> = (0..5)
@@ -1020,8 +1000,10 @@ async fn repeated_final_answers_on_an_unrepaired_review_close_the_run() {
         },
         final_answer(), // rejected, unchanged (1)
         call("read-1", "file_read", json!({"path":"main.js"})), // forced step
-        final_answer(), // rejected, unchanged (2) -> closing
+        final_answer(), // rejected, unchanged (2)
         call("read-2", "file_read", json!({"path":"main.js"})), // forced step
+        final_answer(), // rejected, unchanged (3) -> closing
+        call("read-3", "file_read", json!({"path":"main.js"})), // forced step
         final_answer(), // accepted with reported gaps
     ];
     let (result, guidance, offered) = run_scripted_tools(s, steps).await;
@@ -1043,7 +1025,7 @@ async fn repeated_final_answers_on_an_unrepaired_review_close_the_run() {
         result.completion_gaps
     );
     // The forced step after a rejected final offers repair tools only.
-    for forced in [3, 5] {
+    for forced in [3, 5, 7] {
         let names = &offered[forced];
         assert!(
             names.iter().any(|name| name == "document_edit_batch"),
@@ -1062,7 +1044,7 @@ async fn repeated_final_answers_on_an_unrepaired_review_close_the_run() {
             );
         }
     }
-    assert!(guidance[6]["closing"]["active"] == true);
+    assert!(guidance[8]["closing"]["active"] == true);
 }
 
 #[test]
@@ -1125,7 +1107,9 @@ async fn a_fix_made_after_closing_on_an_unrepaired_review_is_reviewed_again() {
         },
         final_answer(), // rejected, unchanged (1)
         call("read-1", "file_read", json!({"path":"main.js"})),
-        final_answer(), // rejected, unchanged (2) -> closing
+        final_answer(), // rejected, unchanged (2)
+        call("read-2", "file_read", json!({"path":"main.js"})),
+        final_answer(), // rejected, unchanged (3) -> closing
         // The forced step finally edits the document.
         call(
             "fix",
@@ -1332,4 +1316,110 @@ fn paged_rereview_judges_previous_findings_only_on_their_page() {
     assert!(system.contains("List ONLY problems that are still present"));
     assert!(system.contains("skip it otherwise"));
     assert!(system.contains("cannot be observed on this page"));
+}
+
+#[tokio::test]
+async fn a_checkpoint_during_review_repair_restates_the_open_findings() {
+    use mnemoarc::context::ContextManager;
+    let (_dir, mut s) = verified_fixture();
+    s.config.source_document_review = true;
+    let final_answer = || Completion {
+        text: "Saved out.md".into(),
+        ..Default::default()
+    };
+    // The review rejects the document, which then stays unchanged.
+    let (mut s, _, _) = run_scripted_tools(
+        s,
+        vec![
+            final_answer(),
+            Completion {
+                text: r#"{"issues":["Flow: state that the loop runs five times"]}"#.into(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await;
+    assert!(document_review::rejected_on_current_result(&s));
+    // A checkpoint then clears the context that held the findings.
+    for i in 0..6 {
+        s.history.push(
+            vec![json!({"role":"user","content":format!("{i} {}", "context ".repeat(2500))})],
+            true,
+        );
+    }
+    let budget = ContextManager::input_budget(&s.config);
+    assert!(ContextManager::prepare(&mut s, budget).unwrap());
+    let id = s.checkpoint.as_ref().unwrap().id.clone();
+    tools::execute(
+        &mut s,
+        "checkpoint_complete",
+        json!({"id":id,"progress":"Repairing the review findings","no_save_reason":"Nothing new to save"}),
+    )
+    .unwrap();
+    ContextManager::commit(&mut s).unwrap();
+    assert!(s.progress_recovery.review_repair_resume_hash.is_some());
+    let (after, guidance, _) = run_scripted_tools(s, vec![final_answer()]).await;
+    assert!(
+        !guidance.is_empty(),
+        "{} {:?}",
+        after.status,
+        after.last_error
+    );
+    let repair = &guidance[0]["review_repair"];
+    assert_eq!(repair["resumed_after_checkpoint"], true, "{}", guidance[0]);
+    assert!(
+        repair["unrepaired_findings"][0]
+            .as_str()
+            .unwrap()
+            .contains("loop runs five times")
+    );
+    assert!(
+        guidance[0]["instruction"]
+            .as_str()
+            .unwrap()
+            .starts_with("A checkpoint cleared the context")
+    );
+}
+
+#[tokio::test]
+async fn a_forced_repair_step_refuses_non_repair_tools() {
+    let (_dir, mut s) = verified_fixture();
+    s.config.source_document_review = true;
+    let final_answer = || Completion {
+        text: "Saved out.md".into(),
+        ..Default::default()
+    };
+    let steps = vec![
+        final_answer(),
+        Completion {
+            text: r#"{"issues":["Flow: state that the loop runs five times"]}"#.into(),
+            ..Default::default()
+        },
+        final_answer(), // rejected, unchanged
+        // The live shape: an audit instead of an edit in the forced step.
+        call("audit", "document_audit", json!({})),
+        final_answer(),
+        call("read-1", "file_read", json!({"path":"main.js"})),
+        final_answer(), // third unchanged rejection -> closing
+        call("read-2", "file_read", json!({"path":"main.js"})),
+        final_answer(),
+    ];
+    let (result, _, offered) = run_scripted_tools(s, steps).await;
+    let audit = result
+        .history
+        .bundles
+        .iter()
+        .flat_map(|bundle| &bundle.messages)
+        .find(|message| message["tool_call_id"] == "audit")
+        .expect("audit result");
+    assert!(
+        audit["content"]
+            .as_str()
+            .unwrap()
+            .contains("review_repair_required:"),
+        "{audit}"
+    );
+    // Re-verifying the unchanged document is not offered as repair.
+    assert!(!offered[3].iter().any(|name| name == "investigation"));
+    assert!(offered[3].iter().any(|name| name == "document_edit_batch"));
 }

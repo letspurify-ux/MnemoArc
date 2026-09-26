@@ -774,10 +774,11 @@ fn continuation_preserves_progress_but_new_task_resets_it() {
 fn first_prompt_preserves_prepared_completion_and_new_tasks_start_with_criteria() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
+    s.select_workflow("source_document").unwrap();
     tools::execute(
         &mut s,
         "task_state",
-        json!({"action":"update","patch":{"workflow":"source_document","completion":["Check every requested flow"],"deliverables":["Report"]}}),
+        json!({"action":"update","patch":{"completion":["Check every requested flow"],"deliverables":["Report"]}}),
     )
     .unwrap();
     let prepared_revision = s.task.revision;
@@ -792,7 +793,8 @@ fn first_prompt_preserves_prepared_completion_and_new_tasks_start_with_criteria(
     assert_eq!(s.task.completion.len(), 1);
     assert!(s.task.completion[0].contains("Explain a different module"));
     assert!(s.task.deliverables.is_empty());
-    assert_eq!(s.task.workflow, "");
+    // The session's selection carries over to the new task.
+    assert_eq!(s.task.workflow, "source_document");
 }
 
 #[test]
@@ -821,24 +823,25 @@ fn completion_cannot_be_emptied_by_task_state_update() {
 }
 
 #[test]
-fn source_document_workflow_requires_completion_before_start() {
+fn the_model_cannot_change_the_selected_workflow() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
-    let error = tools::execute(
-        &mut s,
-        "task_state",
-        json!({"action":"update","patch":{"workflow":"source_document"}}),
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("completion_required"));
-    assert_eq!(s.task.workflow, "");
-    tools::execute(
-        &mut s,
-        "task_state",
-        json!({"action":"update","patch":{"workflow":"source_document","completion":["Every requested flow is documented and verified"]}}),
-    )
-    .unwrap();
-    assert_eq!(s.task.workflow, "source_document");
+    assert_eq!(s.task.workflow, "answer");
+    for patch in [
+        json!({"workflow":"source_document"}),
+        json!({"require_investigation":true}),
+    ] {
+        let error = tools::execute(
+            &mut s,
+            "task_state",
+            json!({"action":"update","patch":patch}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.starts_with("workflow_selected_by_user:"), "{error}");
+    }
+    assert!(!s.is_document_work());
+    assert!(s.select_workflow("").is_err());
 }
 
 #[test]
@@ -932,11 +935,21 @@ fn file_cursors_reject_mixed_ranges_changed_files_and_other_sessions() {
     let result = tools::run_call(&mut s, &call);
     let cursor = result["next_cursor"]["cursor"].clone();
     assert!(cursor.is_string());
-    // New-range arguments with a cursor are ambiguous and rejected.
+    // An explicit start line on the cursor's file reads that new range.
+    let ranged = tools::execute(
+        &mut s,
+        "file_read",
+        json!({"cursor":cursor,"path":"pages.md","start_line":90,"max_lines":5}),
+    )
+    .unwrap();
+    assert_eq!(ranged["read_start"], 90);
+    assert_eq!(ranged["read_max_lines"], 5);
+    // Other mixes stay ambiguous and are rejected.
+    std::fs::write(dir.path().join("other.md"), "x\n").unwrap();
     for extra in [
-        json!({"start_line":90}),
+        json!({"start_line":90,"offset":0}),
         json!({"offset":0}),
-        json!({"path":"pages.md"}),
+        json!({"path":"other.md"}),
     ] {
         let mut args = extra;
         args["cursor"] = cursor.clone();
@@ -958,6 +971,15 @@ fn file_cursors_reject_mixed_ranges_changed_files_and_other_sessions() {
         result["data"]["read_max_lines"]
     );
     assert!(continued["read_offset"].as_u64().unwrap() > 0);
+    // The same with the cursor's own path, as a live run sent it.
+    let with_path = tools::execute(
+        &mut s,
+        "file_read",
+        json!({"cursor":cursor,"path":"pages.md","max_lines":20}),
+    )
+    .unwrap();
+    assert_eq!(with_path["ignored_arguments"], json!(["max_lines"]));
+    assert_eq!(with_path["read_offset"], continued["read_offset"]);
     let mut other = session(dir.path());
     assert!(
         tools::execute(&mut other, "file_read", json!({"cursor":cursor}))
@@ -1295,7 +1317,7 @@ fn a_bare_task_state_update_shows_the_call_to_send() {
         .to_string();
     assert!(error.starts_with("missing_argument: patch"), "{error}");
     assert!(
-        error.contains(r#"{"action":"update","patch":{"workflow":"source_document""#),
+        error.contains(r#"{"action":"update","patch":{"completion":"#),
         "{error}"
     );
 }
