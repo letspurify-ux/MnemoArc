@@ -539,7 +539,10 @@ impl ToolRegistry {
             // Listing and auditing cannot settle an item. When a document
             // stalls with pending verification, withhold those choices until
             // the model advances an item or makes a substantive edit.
-            .filter(|t| !pending_verification_stall(s) || t.name != "document_audit")
+            .filter(|t| {
+                !pending_verification_stall(s)
+                    || !matches!(t.name, "document_audit" | "task_plan")
+            })
             // Second stage of the document progress ladder: after twice the
             // stall limit without a better result, stop broad discovery even
             // in the verify phase. Targeted file_read/symbol_read remain.
@@ -718,7 +721,7 @@ impl ToolRegistry {
             .replace("{name}", name));
         }
         if pending_verification_stall(s)
-            && (name == "document_audit"
+            && (matches!(name, "document_audit" | "task_plan")
                 || (name == "investigation"
                     && matches!(args["action"].as_str(), Some("list" | "final_check"))))
         {

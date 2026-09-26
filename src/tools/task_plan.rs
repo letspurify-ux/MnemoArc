@@ -379,6 +379,18 @@ fn parse_operations(value: &Value) -> Result<(Vec<Operation>, bool)> {
                 normalized = true;
             }
         }
+        if item["op"] == "complete" {
+            let object = item.as_object_mut().unwrap();
+            // The shared nested schema offers reason for remove/reopen, so a
+            // provider may also send it with complete. The actual completion
+            // result remains the authoritative text.
+            if let Some(reason) = object.remove("reason") {
+                if !object.contains_key("result") && reason.is_string() {
+                    object.insert("result".into(), reason);
+                }
+                normalized = true;
+            }
+        }
         let operation = serde_json::from_value(item).map_err(|error| {
             let detail: String = error.to_string().chars().take(240).collect();
             anyhow::anyhow!("operations[{i}]: {detail}")

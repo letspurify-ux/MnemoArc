@@ -3382,11 +3382,10 @@ fn stalled_pending_verification_withholds_read_only_check_loops() {
         .unwrap();
     assert!(!names.contains(&json!("list")) && !names.contains(&json!("final_check")));
     assert!(names.contains(&json!("verify")));
-    assert!(
-        offered
-            .iter()
-            .all(|tool| tool["function"]["name"] != "document_audit")
-    );
+    assert!(offered.iter().all(|tool| !matches!(
+        tool["function"]["name"].as_str(),
+        Some("document_audit" | "task_plan")
+    )));
     let error = tools::ToolRegistry::validate(&s, "investigation", &json!({"action":"list"}))
         .unwrap_err()
         .to_string();
@@ -3395,6 +3394,13 @@ fn stalled_pending_verification_withholds_read_only_check_loops() {
         "{error}"
     );
     assert!(error.contains("verify"), "{error}");
+    let plan_error = tools::ToolRegistry::validate(&s, "task_plan", &json!({"action":"list"}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        plan_error.starts_with("investigation_progress_required:"),
+        "{plan_error}"
+    );
     tools::ToolRegistry::validate(&s, "investigation", &json!({"action":"verify","id":"entry","source_ids":[file],"verification_note":"Rechecked the edit."})).unwrap();
 }
 

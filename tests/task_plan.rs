@@ -944,3 +944,21 @@ fn insert_accepts_a_single_text_and_ignores_an_invented_id() {
     assert_eq!(texts, ["Read the entry point", "Write the overview"]);
     assert!(s.task.todos.iter().all(|item| item.id != "t1"));
 }
+
+#[test]
+fn complete_accepts_the_shared_schema_reason_without_changing_its_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(
+        &mut s,
+        json!([{"op":"insert","texts":["Write the section"]}]),
+    );
+    let id = s.task.todos[0].id.clone();
+    let result = apply(
+        &mut s,
+        json!([{"op":"complete","id":id,"result":"Section saved","reason":"Already done"}]),
+    );
+    assert_eq!(result["applied"], true, "{result}");
+    assert_eq!(result["input_normalized"], true);
+    assert_eq!(s.task.todos[0].result, "Section saved");
+}
