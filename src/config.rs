@@ -266,7 +266,23 @@ impl Config {
             .flatten()
             .filter_map(Result::ok)
             .collect();
-        env.extend(std::env::vars().filter(|(k, _)| k.starts_with("MNEMOARC_")));
+        // vars() panics if even an unrelated process variable is not UTF-8.
+        // Decode values only for recognized MnemoArc settings.
+        for (key, raw) in std::env::vars_os() {
+            let Some(key) = key.to_str() else {
+                continue;
+            };
+            let Some(field) = key.strip_prefix("MNEMOARC_") else {
+                continue;
+            };
+            if value.get(&field.to_lowercase()).is_none() {
+                continue;
+            }
+            let raw = raw
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("{key} must contain valid UTF-8"))?;
+            env.insert(key.to_owned(), raw);
+        }
         for (key, raw) in env {
             if let Some(field) = key.strip_prefix("MNEMOARC_") {
                 let field = field.to_lowercase();

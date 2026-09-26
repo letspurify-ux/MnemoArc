@@ -505,9 +505,8 @@ impl ContextManager {
             && crate::tools::document_review::rejected_on_current_result(s)
         {
             s.progress_recovery.review_repair_resume_hash = crate::tools::output_path(&s.project)
-                .ok()
-                .and_then(|path| std::fs::read(path).ok())
-                .map(|bytes| crate::tools::hash(&bytes));
+                .and_then(|path| crate::tools::hash_file(&path))
+                .ok();
         }
         Ok(())
     }

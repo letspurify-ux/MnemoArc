@@ -311,9 +311,8 @@ const UNREPAIRED_FINAL_LIMIT: usize = 3;
 /// The output document's current hash, if it exists.
 fn output_hash(s: &Session) -> Option<String> {
     tools::output_path(&s.project)
+        .and_then(|path| tools::hash_file(&path))
         .ok()
-        .and_then(|path| std::fs::read(path).ok())
-        .map(|bytes| tools::hash(&bytes))
 }
 
 /// Count a final answer rejected because the reviewed document was not
@@ -1820,8 +1819,8 @@ pub async fn run_session_controlled(
             // the output limit; require section-sized edits. A document small
             // relative to the limit cannot be the cause, so it stays writable.
             let document_tokens = tools::output_path(&s.project)
+                .and_then(|path| tools::read_text(&path))
                 .ok()
-                .and_then(|path| std::fs::read_to_string(path).ok())
                 .map_or(0, |doc| context::tokens(&doc, &s.config.model));
             if s.is_document_work()
                 && s.document_written

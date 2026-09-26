@@ -48,6 +48,63 @@ async fn server(body: String) -> (String, tokio::task::JoinHandle<()>) {
 fn event(v: serde_json::Value) -> String {
     format!("data: {v}\n\n")
 }
+
+#[tokio::test]
+async fn connection_probe_times_out_despite_stream_keepalives() {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let received = count.clone();
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move || {
+            let received = received.clone();
+            async move {
+                if received.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return axum::Json(json!({"choices":[{"message":{"content":"OK"}}]}))
+                        .into_response();
+                }
+                let stream = futures_util::stream::unfold((), |_| async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Some((Ok::<_, std::convert::Infallible>(": keepalive\n\n"), ()))
+                });
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(stream),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = Config {
+        base_url: format!("http://{}", listener.local_addr().unwrap()),
+        model: "mock".into(),
+        model_context: Some(128000),
+        request_timeout_secs: 1,
+        run_timeout_secs: 1,
+        retries: 0,
+        disable_proxy: true,
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let result = tokio::time::timeout(Duration::from_secs(3), OpenAiClient.probe(&config)).await;
+    server.abort();
+    let error = result
+        .expect("connection probe ignored its overall deadline")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("connection_probe_timeout"),
+        "{error}"
+    );
+    assert!(count.load(Ordering::SeqCst) >= 2);
+}
 #[tokio::test]
 async fn assemble_interleaved_calls_and_usage() {
     let body=[event(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"memory_read","arguments":"{\"id\":"}},{"index":1,"id":"c2","function":{"name":"memory_read","arguments":"{\"id\":"}}]},"finish_reason":null}]})),event(json!({"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"b\"}"}},{"index":0,"function":{"arguments":"\"a\"}"}}]},"finish_reason":"tool_calls"}]})),event(json!({"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":3}}})),"data: [DONE]\n\n".into()].concat();

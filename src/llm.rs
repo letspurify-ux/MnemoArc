@@ -407,6 +407,18 @@ impl OpenAiClient {
     }
     pub async fn probe(&self, c: &Config) -> Result<String> {
         c.runnable()?;
+        // The request timeout measures silence. A server that keeps sending
+        // SSE comments can otherwise keep a connection check alive forever.
+        let timeout_secs = c
+            .run_timeout_secs
+            .min(c.request_timeout_secs.saturating_mul(3));
+        tokio::time::timeout(Duration::from_secs(timeout_secs), self.probe_roundtrip(c))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("connection_probe_timeout: check exceeded {timeout_secs}s")
+            })?
+    }
+    async fn probe_roundtrip(&self, c: &Config) -> Result<String> {
         let mut body = json!({"model":c.model,"messages":[{"role":"user","content":"Reply OK"}],"stream":false});
         body[if c.legacy_max_tokens {
             "max_tokens"

@@ -12,7 +12,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 fn session(root: &std::path::Path) -> Session {
@@ -94,6 +94,76 @@ impl LlmClient for Panicking {
     ) -> anyhow::Result<Completion> {
         panic!("injected model failure")
     }
+}
+struct LengthLimited(Notify);
+#[async_trait]
+impl LlmClient for LengthLimited {
+    async fn complete(
+        &self,
+        _: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> anyhow::Result<Completion> {
+        self.0.notify_one();
+        Ok(Completion {
+            text: "partial answer".into(),
+            length_limited: true,
+            ..Default::default()
+        })
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn length_recovery_rejects_fifo_output_and_can_cancel() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out.md");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut s = session(dir.path());
+    s.project.output = "out.md".into();
+    s.config.run_timeout_secs = 1;
+    s.config.source_answer_review = false;
+    s.config.source_document_review = false;
+    s.config.completion_review_enabled = false;
+    let cancel = CancellationToken::new();
+    let client = Arc::new(LengthLimited(Notify::new()));
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let mut job = tokio::spawn(agent::run_session(s, client.clone(), cancel.clone(), tx));
+    tokio::time::timeout(Duration::from_secs(5), client.0.notified())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_millis(900), &mut job).await;
+    let timely = result.is_ok();
+    let returned = match result {
+        Ok(result) => result.unwrap(),
+        Err(_) => {
+            // Release the FIFO reader if this regresses, so the test can fail
+            // without leaving a blocked runtime thread behind.
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path);
+            tokio::time::timeout(Duration::from_secs(3), job)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    };
+    drain.await.unwrap();
+    assert!(timely, "length recovery blocked on a FIFO output");
+    assert_eq!(returned.status, "cancelled");
 }
 struct RetainedSender(Mutex<Option<mpsc::Sender<String>>>);
 #[async_trait]

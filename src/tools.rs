@@ -1171,7 +1171,7 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
                     && !object.contains_key("expected_hash")
                     && let Some((written, digest)) = &s.last_document_write
                     && output_path(&s.project).is_ok_and(|path| path == *written)
-                    && std::fs::read(written).is_ok_and(|bytes| hash(&bytes) == *digest)
+                    && hash_file(written).is_ok_and(|current| current == *digest)
                 {
                     object.insert("expected_hash".into(), json!(digest));
                 }
@@ -2671,11 +2671,11 @@ fn read_bytes_bounded(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn hash_file(path: &Path) -> Result<String> {
+pub(crate) fn hash_file(path: &Path) -> Result<String> {
     Ok(hash(&read_bytes_bounded(path)?))
 }
 
-fn read_text(path: &Path) -> Result<String> {
+pub(crate) fn read_text(path: &Path) -> Result<String> {
     let bytes = read_bytes_bounded(path)?;
     if bytes.contains(&0) {
         bail!("unsupported_binary_file");
