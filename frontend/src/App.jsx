@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Chat from "./Chat.jsx";
+import RunHistory from "./RunHistory.jsx";
 import Settings, { ProjectForm, cleanProject } from "./Settings.jsx";
 import { Message } from "./chat/Message.jsx";
 import { api, send, statusLabel, toolLabels } from "./api.js";
@@ -903,6 +904,7 @@ function Inspector({
         {tab === "progress" && (
           <>
             <h3>목표와 진행</h3>
+            <RunHistory records={session.run_history} />
             {session.run_guidance?.phase && (
               <p>
                 실행 단계:{" "}

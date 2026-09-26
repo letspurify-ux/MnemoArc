@@ -379,6 +379,7 @@ fn force_finish(s: &mut Session, cause: &str) -> Option<String> {
     if !s.is_document_work() || s.checkpoint.is_some() || !document_saved(s) {
         return None;
     }
+    s.set_run_stop_reason(cause);
     if s.document_review.pending {
         tools::document_review::defer_for_repair(s);
     }
@@ -872,6 +873,7 @@ pub async fn run_session_controlled(
     events: mpsc::Sender<AgentEvent>,
     mut commands: mpsc::Receiver<RunCommand>,
 ) -> Session {
+    s.begin_run();
     s.task.migrate_legacy_plan();
     s.status = "running".into();
     s.last_error = None;
@@ -981,10 +983,17 @@ pub async fn run_session_controlled(
                 .saturating_sub(initial_tokens)
                 >= s.config.run_tokens
         {
+            let reason = if started.elapsed().as_secs() >= s.config.run_timeout_secs {
+                "run_timeout"
+            } else {
+                "run_budget_exhausted"
+            };
             if let Some(text) = force_finish(&mut s, "run_budget_exhausted") {
+                s.set_run_stop_reason(reason);
                 publish_final(&mut s, text, &events, &cancel, started).await;
                 break;
             }
+            s.set_run_stop_reason(reason);
             failure = Some("run_budget_exhausted: partial results and memory retained".into());
             break;
         }
@@ -1455,6 +1464,7 @@ pub async fn run_session_controlled(
         let mut completion = match response {
             Ok(r) => r,
             Err(e) => {
+                s.note_run_estimate();
                 s.usage_incomplete = true;
                 let attempts = e
                     .downcast_ref::<crate::llm::CompletionError>()
@@ -1484,6 +1494,7 @@ pub async fn run_session_controlled(
         if let Err(error) = crate::llm::validate_completion_bounds(&completion) {
             let extra_attempts = completion.attempts.saturating_sub(1);
             if extra_attempts > 0 {
+                s.note_run_estimate();
                 s.usage_incomplete = true;
             }
             s.input_tokens = s
@@ -1496,6 +1507,7 @@ pub async fn run_session_controlled(
                     s.cached_tokens = Some(s.cached_tokens.unwrap_or(0).saturating_add(cached));
                 }
             } else {
+                s.note_run_estimate();
                 s.usage_incomplete = true;
                 s.input_tokens = s.input_tokens.saturating_add(request_tokens);
                 s.output_tokens = s.output_tokens.saturating_add(request_config.output_tokens);
@@ -1513,6 +1525,7 @@ pub async fn run_session_controlled(
             break;
         }
         if completion.attempts > 1 {
+            s.note_run_estimate();
             s.usage_incomplete = true;
             s.input_tokens = s
                 .input_tokens
@@ -1528,6 +1541,7 @@ pub async fn run_session_controlled(
                 s.cached_tokens = Some(s.cached_tokens.unwrap_or(0).saturating_add(c));
             }
         } else {
+            s.note_run_estimate();
             s.usage_incomplete = true;
             s.input_tokens = s.input_tokens.saturating_add(request_tokens);
             s.output_tokens = s
@@ -2809,6 +2823,7 @@ pub async fn run_session_controlled(
         s.status = "blocked".into();
         s.last_error = Some(error);
     }
+    s.finish_run();
     s.activity = json!({"stage":"idle"});
     snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
     s

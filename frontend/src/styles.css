@@ -1520,3 +1520,39 @@ button:hover {
     scroll-behavior: auto !important;
   }
 }
+.run-history {
+  margin: 16px 0;
+}
+.run-record {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  margin: 8px 0;
+}
+.run-record summary {
+  cursor: pointer;
+}
+.run-record time,
+.run-request {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+}
+.run-request,
+.run-record dd {
+  overflow-wrap: anywhere;
+}
+.run-record dl {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px 12px;
+  font-size: 12px;
+}
+.run-record dd {
+  margin: 0;
+}
+.run-error {
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

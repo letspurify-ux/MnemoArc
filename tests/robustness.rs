@@ -280,6 +280,10 @@ async fn model_panics_retained_stream_senders_and_extreme_usage_return_sessions(
         assert_eq!(result.latest_request, "Keep this request after errors");
         if i == 0 {
             assert_eq!(result.status, "blocked");
+            assert_eq!(
+                result.run_history.back().unwrap().reason,
+                "model_worker_panic"
+            );
             assert!(result.last_error.unwrap().contains("model_worker_panic"));
         } else {
             assert_eq!(result.status, "complete");
@@ -343,7 +347,7 @@ async fn model_panic_releases_web_run_slot_and_shutdown_finishes() {
         .await
         .unwrap();
     let id = initial["sessions"][0]["id"].as_str().unwrap();
-    for _ in 0..2 {
+    for attempt in 0..2 {
         let response = client
             .post(format!("{url}/api/sessions/{id}/run"))
             .header("x-mnemoarc-client", "web")
@@ -375,6 +379,21 @@ async fn model_panic_releases_web_run_slot_and_shutdown_finishes() {
         })
         .await
         .unwrap();
+        let session: Value = client
+            .get(format!("{url}/api/sessions/{id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let records = session["run_history"].as_array().unwrap();
+        assert_eq!(records.len(), attempt + 1);
+        assert!(
+            records
+                .iter()
+                .all(|record| record["reason"] == "model_worker_panic")
+        );
     }
     tokio::time::timeout(Duration::from_secs(2), state.shutdown())
         .await

@@ -8,6 +8,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+mod run_history;
+pub use run_history::{RUN_HISTORY_LIMIT, RunRecord};
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TodoItem {
@@ -378,6 +381,9 @@ pub struct Session {
     pub document_written: bool,
     pub last_document_write: Option<(std::path::PathBuf, String)>,
     pub last_error: Option<String>,
+    /// Finished executions survive new questions within this session.
+    pub run_history: VecDeque<RunRecord>,
+    active_run: Option<run_history::ActiveRun>,
     pub run_guidance: Value,
     pub progress_recovery: ProgressRecovery,
     /// Unresolved items reported with a complete_with_gaps result.
@@ -527,6 +533,8 @@ impl Session {
             document_written: false,
             last_document_write: None,
             last_error: None,
+            run_history: VecDeque::new(),
+            active_run: None,
             run_guidance: json!({}),
             progress_recovery: Default::default(),
             completion_gaps: vec![],
