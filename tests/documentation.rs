@@ -3662,3 +3662,37 @@ fn delete_text_ignores_a_filled_text_but_not_a_real_replacement() {
             .contains("Keep.")
     );
 }
+
+#[test]
+fn source_documentation_never_writes_project_files_and_append_creates_output() {
+    let (dir, mut s) = setup();
+    s.select_workflow("source_document").unwrap();
+    let names: Vec<_> = tools::ToolRegistry::definitions(&s)
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned())
+        .collect();
+    for withheld in ["file_edit", "file_write", "file_patch"] {
+        assert!(!names.iter().any(|name| name == withheld), "{names:?}");
+    }
+    let err = tools::execute(
+        &mut s,
+        "file_write",
+        json!({"path":"manual-output.md","content":"# Stray\n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.starts_with("workflow_write_scope:"), "{err}");
+    assert!(!dir.path().join("manual-output.md").exists());
+    // Luna's first write: append with every placeholder filled, before any
+    // output exists.
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":"","expected_section_hash":"","old_text":"","section":"","text":"# Manual\n\nFirst.\n"}),
+    );
+    assert!(created["hash"].is_string(), "{created}");
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Manual\n\nFirst.\n"
+    );
+}

@@ -462,6 +462,13 @@ impl ToolRegistry {
                 || (!s.document_written
                     && matches!(name, "file_read" | "symbol_read" | "source_lookup")))
     }
+    /// Source documentation reads the project and writes only its configured
+    /// output. A live run wrote a stray manual into the source repository with
+    /// file_write after a document_edit error.
+    pub fn project_writes_withheld(s: &Session) -> bool {
+        s.task.workflow == "source_document"
+    }
+
     fn checkpoint_allowed(name: &str) -> bool {
         [
             "memory_write",
@@ -532,6 +539,10 @@ impl ToolRegistry {
             .filter(|t| t.name != "db_query" || s.config.database.active_queries().next().is_some())
             .filter(|t| t.name != "db_execute" || s.config.database.free_execution_enabled())
             .filter(|t| !t.optional || s.active_tools.contains(t.name))
+            .filter(|t| {
+                !Self::project_writes_withheld(s)
+                    || !matches!(t.name, "file_edit" | "file_write" | "file_patch")
+            })
             .filter(|t| s.config.memory_reuse || !["memory_read", "memory_find"].contains(&t.name))
             .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
             .filter(|t| {
@@ -1127,6 +1138,31 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
             if let Some(object) = args.as_object_mut() {
                 rename(object, "new_text", "text", "")?;
                 drop_filled_delete_text(object);
+                // Appending to a document that does not exist yet is creating
+                // it; a live run spent rounds on hashes for a missing output.
+                if object.get("action").and_then(Value::as_str) == Some("append")
+                    && output_path(&s.project).is_ok_and(|path| !path.exists())
+                {
+                    object.insert("action".into(), json!("create"));
+                    object.remove("expected_hash");
+                }
+                // Whole-text actions take no target; filled empty placeholders
+                // for targeted edits carry no meaning there.
+                if matches!(
+                    object.get("action").and_then(Value::as_str),
+                    Some("create" | "write" | "append")
+                ) {
+                    for key in [
+                        "expected_section_hash",
+                        "old_text",
+                        "section",
+                        "expected_hash",
+                    ] {
+                        if object.get(key).is_some_and(|value| value == "") {
+                            object.remove(key);
+                        }
+                    }
+                }
                 // An append right after the model's own successful write
                 // often omits expected_hash (three live runs in a row). If the
                 // document is still exactly that write, its hash is known to
@@ -3728,6 +3764,11 @@ fn execute_repaired(
             }
             Ok(result)
         }
+        "file_edit" | "file_write" | "file_patch" if ToolRegistry::project_writes_withheld(s) => {
+            bail!(
+                "workflow_write_scope: the source_document workflow writes only the configured output; use document_edit or document_edit_batch, and never modify project files"
+            )
+        }
         "file_edit" | "file_write" | "file_patch" => file_edit::execute(s, name, &args, cancel),
         "document_edit" => {
             let path = output_path(&s.project)?;
@@ -3749,7 +3790,9 @@ fn execute_repaired(
                 return Err(revision_conflict(&args, &digest));
             }
             if !exists && action != "create" && action != "write" {
-                bail!("document_missing");
+                bail!(
+                    "document_missing: the output document does not exist yet; create it with document_edit action=create and no expected_hash"
+                );
             }
             let result = apply_document_edit_operation(&old, &args)?;
             persist_document_edit(s, &path, &old, exists, result, cancel)
@@ -3758,7 +3801,9 @@ fn execute_repaired(
             let path = output_path(&s.project)?;
             let exists = path.exists();
             if !exists {
-                bail!("document_missing");
+                bail!(
+                    "document_missing: the output document does not exist yet; create it with document_edit action=create and no expected_hash"
+                );
             }
             let old = read_text(&path)?;
             let digest = hash(old.as_bytes());
