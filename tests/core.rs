@@ -1323,7 +1323,7 @@ fn a_bare_task_state_update_shows_the_call_to_send() {
 }
 
 #[test]
-fn no_tool_definition_offers_a_top_level_one_of() {
+fn no_tool_definition_offers_a_top_level_union() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     s.active_tools = tools::ToolRegistry::optional_names();
@@ -1331,6 +1331,11 @@ fn no_tool_definition_offers_a_top_level_one_of() {
     for definition in tools::ToolRegistry::definitions(&s) {
         assert!(
             definition["function"]["parameters"].get("oneOf").is_none(),
+            "{}",
+            definition["function"]["name"]
+        );
+        assert!(
+            definition["function"]["parameters"].get("anyOf").is_none(),
             "{}",
             definition["function"]["name"]
         );

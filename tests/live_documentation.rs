@@ -2,7 +2,7 @@
 use mnemoarc::{
     agent::{self, AgentEvent},
     config::{Config, Secret},
-    llm::OpenAiClient,
+    llm::{LlmClient, OpenAiClient},
     session::Session,
     tools,
 };
@@ -13,6 +13,7 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 fn env_bool(name: &str, fallback: bool) -> bool {
@@ -26,10 +27,94 @@ fn env_bool(name: &str, fallback: bool) -> bool {
 
 #[tokio::test]
 #[ignore = "paid provider; explicitly set MNEMOARC_LIVE_TEST=1"]
+async fn glm_rejects_missing_required_ui_steps() {
+    assert_eq!(std::env::var("MNEMOARC_LIVE_TEST").as_deref(), Ok("1"));
+    let path = PathBuf::from(std::env::var("MNEMOARC_LIVE_CONFIG").unwrap_or("config.toml".into()));
+    let mut config = Config::load(&path, &BTreeMap::new()).unwrap();
+    assert_eq!(
+        config.model, "z-ai/glm-5.3-flash",
+        "use the existing GLM model"
+    );
+    if path.with_extension("credentials.json").exists() {
+        let keys: BTreeMap<String, String> = serde_json::from_slice(
+            &std::fs::read(path.with_extension("credentials.json")).unwrap(),
+        )
+        .unwrap();
+        config.api_key = keys.get(&config.api_key_env).cloned().map(Secret);
+    }
+    config.output_tokens = config.output_tokens.min(1024);
+    config.request_timeout_secs = config.request_timeout_secs.min(90);
+    config.retries = 0;
+    let mut project = config
+        .projects
+        .iter()
+        .find(|project| project.name == "MnemoArc")
+        .expect("registered MnemoArc project")
+        .clone();
+    let dir = tempfile::tempdir().unwrap();
+    project.output = dir.path().join("incomplete-manual.md");
+    std::fs::write(
+        &project.output,
+        "# MnemoArc 사용자 매뉴얼\n## 처음 설정\n모델 연결 정보는 입력합니다. frontend/src/fields.js:10-34\n연결 확인과 설정 저장 버튼은 미확인입니다. frontend/src/Settings.jsx:239-289 frontend/src/Settings.jsx:483-492\nAPI 키 보관 선택도 미확인입니다. frontend/src/Settings.jsx:374-417\n",
+    )
+    .unwrap();
+    let mut session = Session::new(project, config);
+    session.select_workflow("source_document").unwrap();
+    session.add_user("frontend/src 브라우저 UI를 근거로 처음 설정 절차를 작성해줘. 모델 연결 정보 입력, 연결 확인, 설정 저장, API 키 보관 선택의 실제 버튼과 순서를 모두 설명하고, 확인 가능한 항목을 미확인으로 대체하지 마.".into());
+    let request = tools::document_review::request(&mut session).unwrap();
+    let payload: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["more_document_pages"], false);
+    assert_eq!(payload["more_evidence_pages"], false);
+    let (tx, mut rx) = mpsc::channel(32);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let start = Instant::now();
+    let completion = tokio::time::timeout(
+        std::time::Duration::from_secs(150),
+        OpenAiClient.complete(request, &session.config, CancellationToken::new(), tx),
+    )
+    .await
+    .expect("review timeout")
+    .expect("GLM review request");
+    drain.await.unwrap();
+    tools::document_review::finish(&mut session, &completion.text).unwrap();
+    let report = json!({
+        "model":session.config.model,
+        "elapsed_seconds":start.elapsed().as_secs_f64(),
+        "attempts":completion.attempts,
+        "usage":completion.usage,
+        "review_text":completion.text,
+        "review_issues":session.document_review.issues,
+        "approved":tools::document_review::approved(&session),
+    });
+    if let Ok(path) = std::env::var("MNEMOARC_REVIEW_REPORT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+    eprintln!("[live] targeted GLM review: {}", report);
+    assert!(!tools::document_review::approved(&session));
+    assert!(!session.document_review.issues.is_empty());
+    let issues = session.document_review.issues.join(" ");
+    for required in ["연결 확인", "설정 저장", "API 키"] {
+        assert!(
+            issues.contains(required),
+            "review omitted {required}: {issues}"
+        );
+    }
+    assert!(
+        !issues.contains("프로젝트 폴더"),
+        "unrelated scope: {issues}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "paid provider; explicitly set MNEMOARC_LIVE_TEST=1"]
 async fn registered_source_documentation() {
     assert_eq!(std::env::var("MNEMOARC_LIVE_TEST").as_deref(), Ok("1"));
     let path = PathBuf::from(std::env::var("MNEMOARC_LIVE_CONFIG").unwrap_or("config.toml".into()));
     let mut config = Config::load(&path, &BTreeMap::new()).unwrap();
+    if let Ok(model) = std::env::var("MNEMOARC_LIVE_MODEL") {
+        config.model = model;
+    }
     if path.with_extension("credentials.json").exists() {
         let keys: BTreeMap<String, String> = serde_json::from_slice(
             &std::fs::read(path.with_extension("credentials.json")).unwrap(),

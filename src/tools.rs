@@ -77,6 +77,13 @@ fn action(values: &[&str]) -> Value {
     json!({"type":"string","enum":values})
 }
 pub struct ToolRegistry;
+
+fn pending_verification_stall(s: &Session) -> bool {
+    s.document_written
+        && s.progress_recovery.closing.is_none()
+        && s.progress_recovery.rounds_since_best >= s.config.stall_round_limit
+        && s.investigations.iter().any(|item| !item.is_settled())
+}
 fn task_patch_schema() -> Value {
     let mut properties = serde_json::Map::new();
     for field in ["purpose", "scope"] {
@@ -333,7 +340,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit",
-                description: "Edit ONLY configured Markdown output. Save one investigated section at a time. Inspect the outline and copy section_path when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree, and insertion keeps the anchor and inserts text verbatim. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash. Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and also requires expected_section_hash; its text must retain the original full heading. Simple edits do not require investigation items; source documentation must first set task_state patch.require_investigation=true. Returns measured lines and new hash",
+                description: "Edit ONLY configured Markdown output. Save one investigated section at a time. Inspect the outline and copy section_path when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash. Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and also requires expected_section_hash; its text must retain the original full heading. Simple edits do not require investigation items; source documentation must first set task_state patch.require_investigation=true. Returns measured lines and new hash",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -343,7 +350,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit_batch",
-                description: "Apply 1..32 related edits to the existing configured Markdown output in order using one base expected_hash. Each edit is write, append, insert_before, insert_after, insert_first_child, insert_last_child, patch, replace_text, delete_text, insert_before_text, insert_after_text or section and observes prior edits. Copy section_path from document_inspect for repeated headings. Sibling insertion uses a same-level section anchor; child insertion uses a parent section and a heading one level deeper. Text edits use an exact unique old_text anchor, optionally within section. All edits are prepared in memory and persisted only if every operation succeeds. Use this for related corrections from one snapshot; save newly investigated sections as progress is made. section replaces descendants and requires expected_section_hash.",
+                description: "Apply 1..32 related edits to the existing configured Markdown output in order using one base expected_hash. Each edit is write, append, insert_before, insert_after, insert_first_child, insert_last_child, patch, replace_text, delete_text, insert_before_text, insert_after_text or section and observes prior edits. Copy section_path from document_inspect for repeated headings. Sibling insertion uses a same-level section anchor; child insertion uses a parent section and a heading one level deeper. Text edits use an exact unique old_text anchor, optionally within section. If insertion text contains that exact old_text once, it is treated as a replacement to avoid duplication; prefer replace_text for rewrites. All edits are prepared in memory and persisted only if every operation succeeds. Use this for related corrections from one snapshot; save newly investigated sections as progress is made. section replaces descendants and requires expected_section_hash.",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -529,6 +536,10 @@ impl ToolRegistry {
             .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
             .filter(|t| !Self::closing_withholds(s, t.name))
             .filter(|t| !Self::repair_only(s) || Self::repair_allows(s, t.name))
+            // Listing and auditing cannot settle an item. When a document
+            // stalls with pending verification, withhold those choices until
+            // the model advances an item or makes a substantive edit.
+            .filter(|t| !pending_verification_stall(s) || t.name != "document_audit")
             // Second stage of the document progress ladder: after twice the
             // stall limit without a better result, stop broad discovery even
             // in the verify phase. Targeted file_read/symbol_read remain.
@@ -547,14 +558,9 @@ impl ToolRegistry {
                 && (s.run_guidance["phase"] == "verify" || !matches!(t.name,
                     "file_list" | "source_search" | "symbol_search" | "code_outline")))
             .map(|mut t| {
-                if recovery_focus && s.checkpoint.is_none() {
-                    if t.name == "file_list" {
-                        t.parameters["anyOf"] = json!([{"required":["path_glob"]},{"required":["pattern"]},{"required":["cursor"]}]);
-                    }
-                    if t.name == "source_search" {
-                        t.parameters["anyOf"] = json!([{"required":["path"]},{"required":["path_glob"]},{"required":["pattern"]},{"required":["cursor"]}]);
-                    }
-                }
+                // OpenAI-compatible providers reject a top-level anyOf in a
+                // function parameter schema. Runtime verification-reserve
+                // checks still reject broad discovery in this state.
                 if s.progress_recovery.whole_write_withheld
                     && matches!(t.name, "document_edit" | "document_edit_batch")
                 {
@@ -563,6 +569,17 @@ impl ToolRegistry {
                 let fields = t.parameters["properties"].clone();
                 // Keep offset for old clients, but offer the model only opaque continuation.
                 if t.name == "investigation" {
+                    if pending_verification_stall(s) {
+                        if let Some(actions) = t.parameters["properties"]["action"]["enum"].as_array_mut() {
+                            actions.retain(|action| action != "list" && action != "final_check");
+                        }
+                        if let Some(branches) = t.parameters["oneOf"].as_array_mut() {
+                            branches.retain(|branch| {
+                                branch["properties"]["action"]["const"] != "list"
+                                    && branch["properties"]["action"]["const"] != "final_check"
+                            });
+                        }
+                    }
                     if s.progress_recovery.closing.is_some() {
                         static CLOSING: std::sync::OnceLock<&'static str> =
                             std::sync::OnceLock::new();
@@ -671,6 +688,7 @@ impl ToolRegistry {
                 // {"action":"update"} for task_state, so it is not sent.
                 if let Some(parameters) = t.parameters.as_object_mut() {
                     parameters.remove("oneOf");
+                    parameters.remove("anyOf");
                 }
                 json!({"type":"function","function":{"name":t.name,"description":description,"parameters":t.parameters}})
             })
@@ -698,6 +716,17 @@ impl ToolRegistry {
                 "closing_mode: {name} is withheld until the document is saved; create it now with document_edit action=create from the evidence already gathered"
             }
             .replace("{name}", name));
+        }
+        if pending_verification_stall(s)
+            && (name == "document_audit"
+                || (name == "investigation"
+                    && matches!(args["action"].as_str(), Some("list" | "final_check"))))
+        {
+            let next = investigation_next_steps(s);
+            bail!(
+                "investigation_progress_required: read-only checks cannot settle the pending investigation items; advance the first next step now: {}",
+                next.first().unwrap_or(&Value::Null)["next"]
+            );
         }
         // The offered list alone did not stop a live model from calling
         // document_audit in a forced repair step.
@@ -1670,16 +1699,17 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
         }
         "patch" | "replace_text" | "delete_text" | "insert_before_text" | "insert_after_text" => {
             let target = text(args, "old_text")?;
-            // Insertion keeps old_text. A text that repeats it puts the passage
-            // in twice; a live run meant to rewrite and duplicated eight
-            // paragraphs this way. Short anchors may legitimately recur.
+            // A live model often sends a complete revised passage through an
+            // insertion action. If the payload contains the exact old passage
+            // once, interpret it as a replacement instead of duplicating the
+            // passage. Ambiguous or approximate repeats are still rejected.
             let anchor = target.trim();
-            if matches!(action, "insert_before_text" | "insert_after_text")
-                && anchor.chars().count() >= 20
-                && new.contains(anchor)
-            {
+            let insertion = matches!(action, "insert_before_text" | "insert_after_text");
+            let repeated_anchor = insertion && anchor.chars().count() >= 20 && new.contains(anchor);
+            let replace_instead = repeated_anchor && new.matches(target).count() == 1;
+            if repeated_anchor && !replace_instead {
                 bail!(
-                    "invalid_argument_value: {action} keeps old_text and adds text beside it, but text repeats old_text, so the passage would appear twice. To rewrite that passage, use replace_text with the same old_text and the new wording as text"
+                    "invalid_argument_value: {action} keeps old_text and adds text beside it, but text repeats old_text ambiguously, so the passage would appear twice. Use replace_text with an exact old_text and the full revised passage as text"
                 );
             }
             let (base, scope) = if let Some(section) = args.get("section").and_then(Value::as_str) {
@@ -1691,6 +1721,7 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             let (relative_start, relative_end) = unique_document_text_span(scope, target)?;
             let (start, end) = (base + relative_start, base + relative_end);
             Ok(match action {
+                _ if replace_instead => format!("{}{}{}", &old[..start], new, &old[end..]),
                 "insert_before_text" => format!("{}{}{}", &old[..start], new, &old[start..]),
                 "insert_after_text" => format!("{}{}{}", &old[..end], new, &old[end..]),
                 _ => format!("{}{}{}", &old[..start], new, &old[end..]),
@@ -2011,19 +2042,96 @@ fn n(args: &Value, key: &str, default: usize) -> usize {
 // them once at the execution boundary and again anywhere a raw call is used to
 // rebuild a continuation, so both paths use the same typed arguments.
 fn normalize_integer_arguments(name: &str, args: &mut Value) {
+    fn blank_placeholder(key: &str, value: &Value) -> bool {
+        value.as_str() == Some("")
+            && matches!(
+                key,
+                "id" | "title"
+                    | "path"
+                    | "path_glob"
+                    | "pattern"
+                    | "cursor"
+                    | "query"
+                    | "section"
+                    | "old_text"
+                    | "expected_hash"
+                    | "expected_section_hash"
+                    | "verification_note"
+                    | "reason"
+            )
+    }
+    fn required_document_field(action: &str, key: &str) -> bool {
+        match key {
+            "old_text" => matches!(
+                action,
+                "patch"
+                    | "replace_text"
+                    | "delete_text"
+                    | "insert_before_text"
+                    | "insert_after_text"
+            ),
+            "section" => matches!(
+                action,
+                "insert_before"
+                    | "insert_after"
+                    | "insert_first_child"
+                    | "insert_last_child"
+                    | "section"
+            ),
+            "expected_section_hash" => action == "section",
+            "expected_hash" => !matches!(action, "create" | "write"),
+            _ => false,
+        }
+    }
     if let Some(spec) = ToolRegistry::specs().into_iter().find(|t| t.name == name)
         && let Some(fields) = args.as_object_mut()
     {
-        // For a read-only tool an explicit null optional argument means "not
-        // given"; models often spell every optional field out. Write tools
-        // keep rejecting it, since null there could mean "clear". A required
-        // argument stays and is reported by validation.
+        // For a read-only tool, explicit null means "not given". Some
+        // providers also fill every optional path/filter/cursor string with
+        // "". Keep required arguments and write-tool values unchanged.
         if spec.read_only {
             let required = spec.parameters["required"].as_array();
             fields.retain(|key, value| {
-                !value.is_null()
-                    || required.is_some_and(|required| required.iter().any(|r| r == key.as_str()))
+                let required =
+                    required.is_some_and(|required| required.iter().any(|r| r == key.as_str()));
+                let blank_navigation_option = matches!(
+                    name,
+                    "file_list" | "source_search" | "file_read" | "document_inspect"
+                ) && matches!(
+                    key.as_str(),
+                    "path" | "path_glob" | "pattern" | "cursor" | "query"
+                ) && value.as_str() == Some("");
+                required || !(value.is_null() || blank_navigation_option)
             });
+        }
+        // Function-call providers can fill optional fields with empty strings
+        // even for an action that forbids those fields (notably create). None
+        // of these identifiers, paths or revision tokens has an empty-string
+        // meaning. Keep text/content values, where empty can mean deletion.
+        let action = fields
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        fields.retain(|key, value| {
+            !blank_placeholder(key, value)
+                || (name == "document_edit" && required_document_field(&action, key))
+        });
+        if name == "document_edit_batch"
+            && let Some(edits) = fields.get_mut("edits").and_then(Value::as_array_mut)
+        {
+            for edit in edits {
+                if let Some(fields) = edit.as_object_mut() {
+                    let action = fields
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    fields.retain(|key, value| {
+                        !blank_placeholder(key, value) || required_document_field(&action, key)
+                    });
+                }
+            }
         }
         for (key, value) in &mut *fields {
             let kind = &spec.parameters["properties"][key]["type"];
@@ -3519,9 +3627,17 @@ fn execute_repaired(
                 revalidate(s)?;
                 let offset = n(&args, "offset", 0);
                 let limit = n(&args, "limit", 20).clamp(1, 100);
-                Ok(
-                    json!({"items":s.investigations.iter().skip(offset).take(limit).collect::<Vec<_>>(),"next_offset":(offset.saturating_add(limit)<s.investigations.len()).then_some(offset.saturating_add(limit))}),
-                )
+                let next_steps = investigation_next_steps(s);
+                Ok(json!({
+                    "items":s.investigations.iter().skip(offset).take(limit).collect::<Vec<_>>(),
+                    "next_offset":(offset.saturating_add(limit)<s.investigations.len()).then_some(offset.saturating_add(limit)),
+                    "next_steps":next_steps,
+                    "guidance":if next_steps.is_empty() {
+                        "All investigation items are settled. Continue with document and completion review."
+                    } else {
+                        "Use the concrete next_steps to advance pending items. Repeated listing does not verify them."
+                    }
+                }))
             }
             "upsert" => {
                 if args["id"].as_str().is_some_and(|id| id.trim().is_empty()) {
@@ -3534,6 +3650,49 @@ fn execute_repaired(
                     .map(str::to_string)
                     .unwrap_or_else(crate::memory::id);
                 let previous = s.investigations.iter().find(|item| item.id == id).cloned();
+                // Re-registering a verified item without changing its section,
+                // sources or memories keeps it verified (a live run reset one
+                // to in_progress and had to verify it again).
+                if let Some(prev) = previous.as_ref().filter(|item| item.status == "verified") {
+                    let doc = output_path(&s.project)
+                        .ok()
+                        .and_then(|path| read_text(&path).ok())
+                        .unwrap_or_default();
+                    let same_section = args["section"].as_str().is_none_or(|section| {
+                        section == prev.section
+                            || resolved_section_path(&doc, section).is_some_and(|path| {
+                                resolved_section_path(&doc, &prev.section) == Some(path)
+                            })
+                    });
+                    let same_ids = |key: &str, current: Vec<String>| {
+                        args.get(key).is_none() || {
+                            let mut sent = list(&args, key);
+                            let mut current = current;
+                            sent.sort();
+                            current.sort();
+                            sent == current
+                        }
+                    };
+                    if same_section
+                        && same_ids(
+                            "source_ids",
+                            prev.sources
+                                .iter()
+                                .map(|source| source.id.clone())
+                                .collect(),
+                        )
+                        && same_ids("memory_ids", prev.memory_refs.keys().cloned().collect())
+                    {
+                        if let Some(title) = args["title"].as_str() {
+                            let item = s.investigations.iter_mut().find(|i| i.id == id).unwrap();
+                            item.title = title.to_owned();
+                        }
+                        return Ok(
+                            json!({"id":id,"status":"verified","section":prev.section,"unchanged":true,
+                            "guidance":"Already verified for its current section and sources, so the status is kept. Change the section or its sources to register new work; the next step is the final answer or the next unverified item."}),
+                        );
+                    }
+                }
                 if previous.is_none()
                     && s.investigations
                         .iter()

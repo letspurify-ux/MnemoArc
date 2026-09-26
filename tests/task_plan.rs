@@ -925,3 +925,22 @@ fn a_bare_apply_names_the_missing_revision_and_operations() {
     );
     assert!(!reason.contains("operations is also missing"), "{reason}");
 }
+
+#[test]
+fn insert_accepts_a_single_text_and_ignores_an_invented_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    // The live shapes: {"op":"insert","text":...} with and without an "id".
+    let result = apply(
+        &mut s,
+        json!([
+            {"op":"insert","text":"Read the entry point"},
+            {"op":"insert","text":"Write the overview","id":"t1"},
+        ]),
+    );
+    assert_eq!(result["applied"], true, "{result}");
+    assert_eq!(result["input_normalized"], true);
+    let texts: Vec<_> = s.task.todos.iter().map(|item| item.text.as_str()).collect();
+    assert_eq!(texts, ["Read the entry point", "Write the overview"]);
+    assert!(s.task.todos.iter().all(|item| item.id != "t1"));
+}

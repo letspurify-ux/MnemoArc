@@ -1218,6 +1218,18 @@ pub async fn run_session_controlled(
                 "rounds":closing.rounds,"round_limit":CLOSING_ROUND_LIMIT,
                 "final_attempts":closing.final_attempts});
             s.run_guidance["instruction"] = json!(closing_instruction(&s));
+        } else if s.document_written
+            && stall_rounds >= s.config.stall_round_limit
+            && s.investigations.iter().any(|item| !item.is_settled())
+        {
+            let steps = tools::investigation_next_steps(&s);
+            if let Some(first) = steps.first() {
+                s.run_guidance["pending_investigation_next_steps"] = json!(steps);
+                s.run_guidance["instruction"] = json!(format!(
+                    "The document is written, but investigation items are pending. Advance the first pending item now using this concrete next call: {}. Replace the verification_note placeholder with your actual source/document comparison. Do not call investigation list, document_inspect or document_audit again before this action unless its cited source range is missing. Then advance the other pending items and review the document.",
+                    first["next"]
+                ));
+            }
         }
         let definitions = ToolRegistry::definitions(&s);
         let mut request = match ContextManager::request(&s, definitions.clone()) {

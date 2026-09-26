@@ -364,7 +364,22 @@ fn parse_operations(value: &Value) -> Result<(Vec<Operation>, bool)> {
                 value_type(item)
             );
         }
-        let operation = serde_json::from_value(item.clone()).map_err(|error| {
+        // Live runs sent insert with a single "text" and an invented "id";
+        // the plan assigns IDs, so accept that shape as one new item.
+        let mut item = item.clone();
+        if item["op"] == "insert" {
+            let object = item.as_object_mut().unwrap();
+            if !object.contains_key("texts")
+                && let Some(text) = object.remove("text").filter(Value::is_string)
+            {
+                object.insert("texts".into(), json!([text]));
+                normalized = true;
+            }
+            if object.remove("id").is_some() {
+                normalized = true;
+            }
+        }
+        let operation = serde_json::from_value(item).map_err(|error| {
             let detail: String = error.to_string().chars().take(240).collect();
             anyhow::anyhow!("operations[{i}]: {detail}")
         })?;

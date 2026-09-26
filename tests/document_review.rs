@@ -145,6 +145,21 @@ fn review_reads_declarations_is_bounded_and_invalidates_on_change() {
 }
 
 #[test]
+fn empty_model_verdict_does_not_approve_a_materially_short_document() {
+    let (_dir, mut s) = fixture();
+    s.answer_review_question = "사용자 매뉴얼을 120줄 내외로 작성해줘.".into();
+    document_review::request(&mut s).unwrap();
+    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    assert!(!document_review::approved(&s));
+    assert!(
+        s.document_review
+            .issues
+            .iter()
+            .any(|issue| issue.contains("실제 2줄"))
+    );
+}
+
+#[test]
 fn write_reports_bad_mermaid_citations_without_rejecting_partial_draft() {
     let (_dir, mut s) = fixture();
     let expected = s.last_document_write.as_ref().unwrap().1.clone();
