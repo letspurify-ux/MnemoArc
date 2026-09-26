@@ -1891,13 +1891,27 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             if new.lines().next().map(str::trim) != target.lines().next().map(str::trim) {
                 bail!("invalid_argument_value: section replacement must retain its heading");
             }
-            if documentation::headings(new)
+            if let Some(extra) = documentation::headings(new)
                 .iter()
                 .skip(1)
-                .any(|heading| heading.level <= resolved.level)
+                .find(|heading| heading.level <= resolved.level)
             {
+                let guidance = if resolved.level < 6 {
+                    let child_level = resolved.level + 1;
+                    let hashes = "#".repeat(child_level);
+                    format!(
+                        "Child headings are allowed: if this is a child, change its prefix to {hashes} (level {child_level}) or deeper, up to level 6. Heading depth depends on the number of # characters, not section numbering."
+                    )
+                } else {
+                    "A level-6 section cannot have Markdown child headings; use paragraphs or lists for details within this section.".into()
+                };
                 bail!(
-                    "invalid_argument_value: section replacement cannot add a sibling or ancestor heading"
+                    "invalid_argument_value: section replacement cannot add a sibling or ancestor heading: target {:?} is level {}; line {} of text contains level-{} heading {:?}. {guidance}",
+                    resolved.heading,
+                    resolved.level,
+                    extra.line,
+                    extra.level,
+                    extra.heading
                 );
             }
             let mut replacement = new.to_string();

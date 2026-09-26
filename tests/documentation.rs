@@ -1062,19 +1062,22 @@ fn indented_code_comment_marker_does_not_hide_following_document_content() {
 fn section_replacement_cannot_insert_peer_or_ancestor_headings() {
     for batch in [false, true] {
         let (_dir, mut s) = setup();
-        let original = "# Guide\n## Part\nOriginal.\n## Next\nLater.\n";
+        let original = "# Guide\n## 1.3 Part\nOriginal.\n## Next\nLater.\n";
         let created = run(
             &mut s,
             "document_edit",
             json!({"action":"create","text":original}),
         );
-        let inspected = run(&mut s, "document_inspect", json!({"section":"## Part"}));
-        for heading in ["## Sibling", "# Ancestor"] {
-            let edit = json!({"action":"section","section":"## Part","expected_section_hash":inspected["section_hash"],"text":format!("## Part\nUpdated.\n{heading}\nUnexpected.\n")});
+        let inspected = run(&mut s, "document_inspect", json!({"section":"## 1.3 Part"}));
+        for (heading, level) in [("## 1.3.1 Detail", 2), ("# Ancestor", 1)] {
+            let edit = json!({"action":"section","section":"## 1.3 Part","expected_section_hash":inspected["section_hash"],"text":format!("## 1.3 Part\nUpdated.\n### Valid child\nDetails.\n{heading}\nUnexpected.\n")});
             let (name, args) = if batch {
                 (
                     "document_edit_batch",
-                    json!({"expected_hash":created["hash"],"edits":[edit]}),
+                    json!({"expected_hash":created["hash"],"edits":[
+                        {"action":"replace_text","old_text":"Later.","text":"Changed."},
+                        edit
+                    ]}),
                 )
             } else {
                 let mut edit = edit;
@@ -1082,13 +1085,74 @@ fn section_replacement_cannot_insert_peer_or_ancestor_headings() {
                 ("document_edit", edit)
             };
             let error = tools::execute(&mut s, name, args).unwrap_err().to_string();
-            assert!(error.contains("sibling or ancestor heading"), "{error}");
+            for detail in [
+                "invalid_argument_value: section replacement cannot add a sibling or ancestor heading".to_string(),
+                "target \"## 1.3 Part\" is level 2".to_string(),
+                format!("line 5 of text contains level-{level} heading {heading:?}"),
+                "Child headings are allowed".to_string(),
+                "change its prefix to ### (level 3)".to_string(),
+                "not section numbering".to_string(),
+            ] {
+                assert!(error.contains(&detail), "missing {detail:?}: {error}");
+            }
+            if batch {
+                assert!(error.starts_with("document_batch_operation_failed: index=1;"));
+                assert!(error.contains("no changes persisted"));
+            }
             assert_eq!(
                 std::fs::read_to_string(&s.project.output).unwrap(),
                 original
             );
         }
+
+        // Follow the error's advice with the same hashes after the rollback.
+        let edit = json!({"action":"section","section":"## 1.3 Part","expected_section_hash":inspected["section_hash"],"text":"## 1.3 Part\nUpdated.\n### 1.3.1 Detail\nChild content.\n"});
+        let result = if batch {
+            run(
+                &mut s,
+                "document_edit_batch",
+                json!({"expected_hash":created["hash"],"edits":[edit]}),
+            )
+        } else {
+            let mut edit = edit;
+            edit["expected_hash"] = created["hash"].clone();
+            run(&mut s, "document_edit", edit)
+        };
+        let expected =
+            "# Guide\n## 1.3 Part\nUpdated.\n### 1.3.1 Detail\nChild content.\n## Next\nLater.\n";
+        assert_eq!(
+            std::fs::read_to_string(&s.project.output).unwrap(),
+            expected
+        );
+        assert_eq!(result["hash"], tools::hash(expected.as_bytes()));
     }
+}
+
+#[test]
+fn section_replacement_at_level_six_does_not_suggest_a_level_seven_heading() {
+    let (_dir, mut s) = setup();
+    let original = "# Guide\n###### Detail\nOriginal.\n";
+    std::fs::write(&s.project.output, original).unwrap();
+    let inspected = run(
+        &mut s,
+        "document_inspect",
+        json!({"section":"###### Detail"}),
+    );
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":"###### Detail","expected_hash":inspected["hash"],"expected_section_hash":inspected["section_hash"],"text":"###### Detail\nUpdated.\n###### More\nExtra.\n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("line 3 of text contains level-6 heading \"###### More\""));
+    assert!(error.contains("cannot have Markdown child headings"));
+    assert!(error.contains("use paragraphs or lists"));
+    assert!(!error.contains("#######"));
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        original
+    );
 }
 
 #[test]
