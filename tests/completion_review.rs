@@ -928,7 +928,7 @@ fn runtime_write_log_and_saved_file_precede_newer_observations() {
         request["messages"][0]["content"]
             .as_str()
             .unwrap()
-            .contains("runtime_write_log is a runtime record")
+            .contains("runtime_write_log and runtime_investigations are runtime records")
     );
     let p = payload(&request);
     let evidence = p["evidence"].as_array().unwrap();
@@ -938,8 +938,9 @@ fn runtime_write_log_and_saved_file_precede_newer_observations() {
     assert!(written[0].as_str().unwrap().ends_with("result.txt"));
     // A read is an observation, not a write.
     assert!(!evidence[1].to_string().contains("source.rs"));
-    assert_eq!(evidence[2]["kind"], "current_file", "{p}");
-    assert_eq!(evidence[3]["kind"], "tool_observation", "{p}");
+    assert_eq!(evidence[2]["kind"], "runtime_investigations", "{p}");
+    assert_eq!(evidence[3]["kind"], "current_file", "{p}");
+    assert_eq!(evidence[4]["kind"], "tool_observation", "{p}");
 }
 
 #[test]
@@ -976,7 +977,7 @@ fn saved_output_is_reviewed_whole_and_observed_sources_are_rehashed() {
     let log = &evidence[1];
     assert_eq!(log["observed_sources"]["checked"], 1, "{log}");
     assert_eq!(log["observed_sources"]["unchanged"], 1, "{log}");
-    let manual = &evidence[2];
+    let manual = &evidence[3];
     assert!(
         manual["path"].as_str().unwrap().ends_with("manual.md"),
         "{manual}"
@@ -1012,7 +1013,10 @@ fn a_rejection_binds_only_the_result_it_reviewed() {
     review::begin(&mut s, "Saved manual.md").unwrap();
     assert_eq!(finish(&mut s, false), None);
     assert!(review::rejected_on_current_result(&s));
-    // New evidence alone is a changed basis for the re-review.
+    // Re-inspecting the unchanged output is not new evidence.
+    step(&mut s, "inspect", "document_inspect", json!({}));
+    assert!(review::rejected_on_current_result(&s));
+    // A newly delivered source read is a changed basis for the re-review.
     step(&mut s, "read", "file_read", json!({"path":"ui.js"}));
     assert!(!review::rejected_on_current_result(&s));
     review::begin(&mut s, "Saved manual.md").unwrap();
@@ -1026,4 +1030,24 @@ fn a_rejection_binds_only_the_result_it_reviewed() {
         json!({"action":"append","expected_hash":created["data"]["hash"],"text":"Example: shown\n"}),
     );
     assert!(!review::rejected_on_current_result(&s));
+}
+
+#[test]
+fn investigation_status_is_supplied_as_runtime_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.active_tools.insert("investigation".into());
+    tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"flow","title":"Main flow"}),
+    )
+    .unwrap();
+    write(&mut s, "Conclusion: done\nExample: shown\n");
+    review::begin(&mut s, "Saved result.txt").unwrap();
+    let p = payload(&review::request(&mut s).unwrap());
+    let items = &p["evidence"][2];
+    assert_eq!(items["kind"], "runtime_investigations", "{p}");
+    assert_eq!(items["items"][0]["id"], "flow");
+    assert_eq!(items["items"][0]["status"], s.investigations[0].status);
 }
