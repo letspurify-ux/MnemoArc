@@ -3,7 +3,7 @@ import Chat from "./Chat.jsx";
 import RunHistory from "./RunHistory.jsx";
 import Settings, { ProjectForm, cleanProject } from "./Settings.jsx";
 import { Message } from "./chat/Message.jsx";
-import { api, send, statusLabel, toolLabels } from "./api.js";
+import { api, download, send, statusLabel, toolLabels } from "./api.js";
 
 const DEFAULT_INSPECTOR_WIDTH = 295;
 const MIN_INSPECTOR_WIDTH = 240;
@@ -46,7 +46,11 @@ export default function App() {
     pending = useRef(false),
     timer = useRef(null),
     alive = useRef(true),
-    versions = useRef(new Map());
+    versions = useRef(new Map()),
+    settingsDirty = useRef(false);
+  const onSettingsDirtyChange = useCallback((dirty) => {
+    settingsDirty.current = dirty;
+  }, []);
   const refresh = useCallback(async () => {
     if (fetching.current) {
       pending.current = true;
@@ -136,7 +140,20 @@ export default function App() {
       // resizing the panel for the current page.
     }
   }, [inspectorWidth]);
-  function choose(id) {
+  function canLeaveSettings() {
+    return (
+      page !== "settings" ||
+      !settingsDirty.current ||
+      window.confirm("저장하지 않은 설정을 버리고 이동할까요?")
+    );
+  }
+  function showPage(next) {
+    if (next !== page && !canLeaveSettings()) return;
+    setPage(next);
+    setMobileNav(false);
+  }
+  function choose(id, confirmed = false) {
+    if (!confirmed && !canLeaveSettings()) return;
     selection.current = id;
     window.history.replaceState(null, "", `#${id}`);
     setSelected(id);
@@ -160,18 +177,22 @@ export default function App() {
     void act(fn).catch(() => {});
   };
   async function create(project) {
+    if (!canLeaveSettings()) return;
+    setPage("chat");
+    setMobileNav(false);
     setNavigating(true);
     try {
       const data = await send("/sessions", { project });
-      choose(data.id);
+      choose(data.id, true);
     } finally {
       setNavigating(false);
     }
   }
   async function closeSession(id) {
+    const unsaved = id === selected && page === "settings" && settingsDirty.current;
     if (
       !window.confirm(
-        "이 세션을 닫을까요? 대화와 기억은 사라지고 결과 문서는 유지됩니다.",
+        `이 세션을 닫을까요? 대화와 기억은 사라지고 결과 문서는 유지됩니다.${unsaved ? " 저장하지 않은 설정도 사라집니다." : ""}`,
       )
     )
       return;
@@ -180,7 +201,7 @@ export default function App() {
   async function shutdown() {
     if (
       !window.confirm(
-        "진행 중인 작업을 중지하고 앱을 종료할까요? 저장된 문서는 유지되며 세션과 기억은 사라집니다.",
+        `진행 중인 작업을 중지하고 앱을 종료할까요? 저장된 문서는 유지되며 세션과 기억은 사라집니다.${page === "settings" && settingsDirty.current ? " 저장하지 않은 설정도 사라집니다." : ""}`,
       )
     )
       return;
@@ -209,7 +230,7 @@ export default function App() {
   return (
     <div className="workspace">
       <aside className={`sidebar ${mobileNav ? "mobile-open" : ""}`}>
-        <button className="brand" onClick={() => setPage("chat")}>
+        <button className="brand" onClick={() => showPage("chat")}>
           <span className="brand-symbol">
             m<span>·</span>
           </span>
@@ -232,10 +253,7 @@ export default function App() {
           <button
             aria-label="프로젝트 추가·관리"
             title="프로젝트 관리"
-            onClick={() => {
-              setPage("projects");
-              setMobileNav(false);
-            }}
+            onClick={() => showPage("projects")}
           >
             ＋
           </button>
@@ -290,19 +308,13 @@ export default function App() {
           <button
             className={page === "projects" ? "selected" : ""}
             aria-label="프로젝트 관리"
-            onClick={() => {
-              setPage("projects");
-              setMobileNav(false);
-            }}
+            onClick={() => showPage("projects")}
           >
             <span>▱</span>프로젝트 관리
           </button>
           <button
             className={page === "settings" ? "selected" : ""}
-            onClick={() => {
-              setPage("settings");
-              setMobileNav(false);
-            }}
+            onClick={() => showPage("settings")}
           >
             <span>⚙</span>모든 설정
           </button>
@@ -379,7 +391,8 @@ export default function App() {
             sessionConfig={session?.pending_config || session?.config}
             sessionId={session?.id}
             onSaved={refresh}
-            onClose={() => setPage("chat")}
+            onClose={() => showPage("chat")}
+            onDirtyChange={onSettingsDirtyChange}
           />
         ) : page === "projects" ? (
           <Projects
@@ -452,7 +465,7 @@ export default function App() {
                   )
                 }
                 onCancel={safe(() => send(`/sessions/${selected}/cancel`, {}))}
-                onSettings={() => setPage("settings")}
+                onSettings={() => showPage("settings")}
                 onOlder={safe(async () => {
                   const older = await api(
                     `/sessions/${selected}?before=${session.previous}`,
@@ -495,7 +508,7 @@ export default function App() {
                 ? "세션을 불러오는 중…"
                 : "첫 작업을 시작해 보세요"}
             </h2>
-            <button className="primary" onClick={() => setPage("projects")}>
+            <button className="primary" onClick={() => showPage("projects")}>
               프로젝트 관리
             </button>
           </div>
@@ -756,6 +769,7 @@ function Inspector({
 }) {
   const [toolSelection, setToolSelection] = useState(session.active_tools);
   const [toolsSaving, setToolsSaving] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const activeToolsKey = JSON.stringify(session.active_tools);
   useEffect(() => {
     setToolSelection(JSON.parse(activeToolsKey));
@@ -1154,22 +1168,31 @@ function Inspector({
               <>
                 <button
                   className="text-button"
-                  onClick={() => {
-                    const url = URL.createObjectURL(
-                      new Blob([document.content], {
-                        type: "text/markdown;charset=utf-8",
-                      }),
-                    );
-                    const link = Object.assign(
-                      window.document.createElement("a"),
-                      {
-                        href: url,
-                        download: session.project.output.split("/").pop(),
-                      },
-                    );
-                    link.click();
-                    setTimeout(() => URL.revokeObjectURL(url), 1000);
-                  }}
+                  disabled={downloading}
+                  onClick={doAction(async () => {
+                    setDownloading(true);
+                    try {
+                      const blob = await download(
+                        `/sessions/${encodeURIComponent(session.id)}/output/download`,
+                      );
+                      const url = URL.createObjectURL(blob);
+                      const link = Object.assign(
+                        window.document.createElement("a"),
+                        {
+                          href: url,
+                          download:
+                            session.project.output.split(/[\\/]/).pop() ||
+                            "output.md",
+                        },
+                      );
+                      window.document.body.appendChild(link);
+                      link.click();
+                      link.remove();
+                      setTimeout(() => URL.revokeObjectURL(url), 1000);
+                    } finally {
+                      setDownloading(false);
+                    }
+                  })}
                 >
                   Markdown 내려받기
                 </button>

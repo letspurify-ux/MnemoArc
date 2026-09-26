@@ -207,6 +207,7 @@ export default function Settings({
   sessionId,
   onSaved,
   onClose,
+  onDirtyChange,
 }) {
   const [scope, setScope] = useState("global"),
     [draft, setDraft] = useState(() => structuredClone(config)),
@@ -218,7 +219,12 @@ export default function Settings({
     [busy, setBusy] = useState(false),
     [message, setMessage] = useState(""),
     [error, setError] = useState("");
-  const [dirty, setDirty] = useState(false);
+  const [dirty, setDirtyState] = useState(false);
+  const setDirty = (value) => {
+    setDirtyState(value);
+    onDirtyChange(value);
+  };
+  useEffect(() => () => onDirtyChange(false), [onDirtyChange]);
   const group = groups.find((g) => g.id === tab);
   const change = (name, value) => {
     setDraft((d) => ({ ...d, [name]: value }));
@@ -307,10 +313,7 @@ export default function Settings({
         </div>
         <button
           className="secondary"
-          onClick={() => {
-            if (!dirty || confirm("저장하지 않은 설정을 버리고 돌아갈까요?"))
-              onClose();
-          }}
+          onClick={onClose}
         >
           채팅으로 돌아가기
         </button>

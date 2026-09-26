@@ -9,8 +9,9 @@ use crate::{
 use anyhow::{Result, bail};
 use axum::{
     Json, Router,
+    body::Body,
     extract::{DefaultBodyLimit, Path, Query, Request, State},
-    http::{Method, StatusCode},
+    http::{Method, StatusCode, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response, Sse,
@@ -29,6 +30,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 
@@ -263,7 +265,8 @@ pub fn app_router(state: WebState, frontend: Option<PathBuf>) -> Router {
         .route("/api/sessions/{id}/tools", put(session_tools))
         .route("/api/sessions/{id}/workflow", put(session_workflow))
         .route("/api/sessions/{id}/memories/{memory}", get(memory_get))
-        .route("/api/sessions/{id}/output", get(output));
+        .route("/api/sessions/{id}/output", get(output))
+        .route("/api/sessions/{id}/output/download", get(output_download));
     let router = match frontend {
         Some(path) => {
             router.fallback_service(ServeDir::new(path).append_index_html_on_directories(true))
@@ -903,6 +906,31 @@ async fn output(State(s): State<WebState>, Path(id): Path<String>) -> Api {
     .await
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
     Ok(Json(result))
+}
+async fn output_download(
+    State(s): State<WebState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let project = {
+        let c = s.core.lock().await;
+        c.sessions.get(&id).ok_or_else(missing)?.project.clone()
+    };
+    let file = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+        let path = tools::output_path(&project)?;
+        tools::open_regular_file(&path)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    let body = Body::from_stream(ReaderStream::new(tokio::fs::File::from_std(file)));
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/markdown; charset=utf-8"),
+            (header::CONTENT_DISPOSITION, "attachment"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response())
 }
 #[derive(Deserialize)]
 struct DirectoryQuery {

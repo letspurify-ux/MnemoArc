@@ -1,4 +1,6 @@
 import { test, expect } from "@playwright/test";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join } from "node:path";
 
 test("configure entirely in UI, stream rich chat, switch/cancel sessions and retain RAM on reload", async ({
   page,
@@ -293,4 +295,84 @@ test("session window selects the workflow for the next request", async ({
     path: "test-artifacts/workflow-select.png",
     fullPage: true,
   });
+});
+
+test("typing a new draft while send is pending preserves that draft", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "모든 설정" }).click();
+  await page.getByLabel("모델 이름", { exact: true }).fill("z-ai/glm-5.3-flash");
+  await page.getByLabel("모델 최대 컨텍스트", { exact: true }).fill("128000");
+  await page.getByLabel("API 키", { exact: true }).fill("browser-test-only");
+  await page.getByRole("button", { name: "설정 저장", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("설정을 저장했습니다");
+  await page.getByRole("button", { name: "채팅으로 돌아가기" }).click();
+  await page.getByRole("button", { name: "새 세션", exact: true }).click();
+
+  let release;
+  let intercepted;
+  const requestSeen = new Promise((resolve) => { intercepted = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  await page.route("**/api/sessions/*/run", async (route) => {
+    intercepted();
+    await held;
+    await route.continue();
+  });
+  const input = page.getByRole("textbox", { name: "메시지", exact: true });
+  await input.fill("느린 요청 테스트");
+  await page.getByRole("button", { name: "메시지 보내기" }).click();
+  await requestSeen;
+  await input.fill("다음 요청 초안");
+  release();
+  await expect(page.locator(".thinking")).toBeVisible();
+  await expect(input).toHaveValue("다음 요청 초안");
+  await page.getByRole("button", { name: "■ 중지" }).click();
+  await expect(page.locator(".status-pill")).toHaveText("중지됨");
+});
+
+test("sidebar navigation confirms before discarding unsaved settings", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "모든 설정" }).click();
+  const model = page.getByLabel("모델 이름", { exact: true });
+  await model.fill("unsaved-model");
+  page.once("dialog", (dialog) => dialog.dismiss());
+  await page.locator(".brand").click();
+  await expect(model).toHaveValue("unsaved-model");
+  page.once("dialog", (dialog) => dialog.accept());
+  await page
+    .locator(".sidebar-bottom")
+    .getByRole("button", { name: "프로젝트 관리", exact: true })
+    .click();
+  await expect(page.getByRole("heading", { name: "프로젝트 관리" })).toBeVisible();
+  await page.getByRole("button", { name: "모든 설정" }).click();
+  await expect(model).not.toHaveValue("unsaved-model");
+  await model.fill("another-unsaved-model");
+  let confirmations = 0;
+  page.on("dialog", async (dialog) => {
+    confirmations++;
+    await dialog.accept();
+  });
+  await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  await expect(page.getByRole("textbox", { name: "메시지", exact: true })).toBeVisible();
+  expect(confirmations).toBe(1);
+});
+
+test("Markdown download includes bytes beyond the preview limit", async ({ page, request }) => {
+  const state = await (await request.get("/api/state")).json();
+  const session = state.sessions[0];
+  const output = session.project.output;
+  const path = isAbsolute(output) ? output : join(session.project.root, output);
+  const content = `${"a".repeat(2 * 1024 * 1024)}한글 끝`;
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, content);
+  await page.goto("/");
+  await page.route("**/api/sessions/*/output", (route) =>
+    route.fulfill({ json: { content: "미리보기", truncated: true } }),
+  );
+  await page.getByRole("tab", { name: "문서", exact: true }).click();
+  await page.getByRole("button", { name: "문서 불러오기" }).click();
+  await expect(page.getByText("미리보기 한도로 일부만 표시합니다.")).toBeVisible();
+  const downloadEvent = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Markdown 내려받기" }).click();
+  const downloaded = await downloadEvent;
+  expect(await readFile(await downloaded.path(), "utf8")).toBe(content);
 });

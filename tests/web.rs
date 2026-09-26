@@ -403,6 +403,32 @@ async fn output_preview_truncates_at_utf8_boundaries() {
     assert_eq!(data["content"], prefix);
 }
 #[tokio::test]
+async fn output_download_returns_the_full_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("docs/source-summary.md");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let content = format!("{}한글 끝", "a".repeat(2 * 1024 * 1024));
+    std::fs::write(&path, &content).unwrap();
+    let (url, state, server) = launch(dir.path()).await;
+    let client = reqwest::Client::new();
+    let initial = get(&client, &url, "/api/state").await;
+    let id = initial["sessions"][0]["id"].as_str().unwrap();
+    let response = client
+        .get(format!("{url}/api/sessions/{id}/output/download"))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_DISPOSITION],
+        "attachment"
+    );
+    let bytes = response.bytes().await.unwrap();
+    state.shutdown().await;
+    server.abort();
+    assert_eq!(bytes.as_ref(), content.as_bytes());
+}
+#[tokio::test]
 async fn workflow_selection_is_validated_shown_and_locked_while_running() {
     let dir = tempfile::tempdir().unwrap();
     let (url, state, server) = launch(dir.path()).await;

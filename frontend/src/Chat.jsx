@@ -54,7 +54,8 @@ export default function Chat({
     lock = useRef(false),
     composing = useRef(false),
     chatRef = useRef(null),
-    bottom = useRef(true);
+    bottom = useRef(true),
+    draftVersion = useRef(0);
   const fitInput = () => {
     const el = inputRef.current;
     if (!el) return;
@@ -85,10 +86,13 @@ export default function Chat({
     if (!message || busy || !canRun || lock.current) return;
     lock.current = true;
     setSending(true);
+    const submittedVersion = draftVersion.current;
     try {
       await onSend(message, intent || "auto");
-      setInput("");
-      setIntent(null);
+      if (draftVersion.current === submittedVersion) {
+        setInput("");
+        setIntent(null);
+      }
       bottom.current = true;
       inputRef.current?.focus();
     } finally {
@@ -155,7 +159,13 @@ export default function Chat({
                   "핵심 데이터 구조와 오류 처리를 조사해줘",
                   "지금까지의 발견과 미확인 사항을 알려줘",
                 ].map((text, i) => (
-                  <button key={text} onClick={() => setInput(text)}>
+                  <button
+                    key={text}
+                    onClick={() => {
+                      draftVersion.current++;
+                      setInput(text);
+                    }}
+                  >
                     <span>0{i + 1}</span>
                     {text}
                     <b>↗</b>
@@ -234,7 +244,10 @@ export default function Chat({
             placeholder="프로젝트에 대해 요청해 보세요…"
             rows={1}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => {
+              draftVersion.current++;
+              setInput(e.target.value);
+            }}
             onCompositionStart={() => {
               composing.current = true;
             }}
@@ -266,7 +279,10 @@ export default function Chat({
                 aria-label="요청 종류"
                 value={requestKind}
                 disabled={busy}
-                onChange={(e) => setIntent(e.target.value)}
+                onChange={(e) => {
+                  draftVersion.current++;
+                  setIntent(e.target.value);
+                }}
               >
                 <option value="question" disabled={!session?.has_task}>
                   기존 작업 질문

@@ -24,7 +24,7 @@ sha2 = "0.10"
 tempfile = "3"
 tiktoken-rs = "0.9"
 tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["io"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
 unicode-normalization = "0.1"

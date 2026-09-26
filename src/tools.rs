@@ -2644,7 +2644,7 @@ fn file_access_error(path: &Path, error: std::io::Error) -> anyhow::Error {
     };
     anyhow::anyhow!("{code}: {}: {error}", path.display())
 }
-fn open_regular_file(path: &Path) -> Result<std::fs::File> {
+pub(crate) fn open_regular_file(path: &Path) -> Result<std::fs::File> {
     regular_metadata(
         &path.metadata().map_err(|e| file_access_error(path, e))?,
         path,

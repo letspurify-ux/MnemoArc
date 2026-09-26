@@ -17,6 +17,16 @@ export async function api(path, options = {}) {
 }
 export const send = (path, body, method = "POST") =>
   api(path, { method, body });
+export async function download(path) {
+  const response = await fetch(`/api${path}`, {
+    headers: { "X-MnemoArc-Client": "web" },
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || `요청 실패 (${response.status})`);
+  }
+  return response.blob();
+}
 export const statusLabel = {
   idle: "준비됨",
   running: "작업 중",
