@@ -982,3 +982,84 @@ fn complete_accepts_the_shared_schema_reason_without_changing_its_result() {
     assert_eq!(result["input_normalized"], true);
     assert_eq!(s.task.todos[0].result, "Section saved");
 }
+
+#[test]
+fn document_phase_does_not_advance_to_verify_while_plan_items_are_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.select_workflow("source_document").unwrap();
+    // An empty plan before any document exists is not readiness either.
+    let result = tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"phase":"verify"}}),
+    )
+    .unwrap();
+    assert!(
+        result["phase_deferred"]
+            .as_str()
+            .is_some_and(|note| note.contains("not been written")),
+        "{result}"
+    );
+    assert_ne!(s.task.phase, "verify");
+    s.document_written = true;
+    apply(
+        &mut s,
+        json!([{"op":"insert","texts":["Write section 1","Write section 2"]}]),
+    );
+    let result = tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"phase":"verify","scope":"Four UI flows"}}),
+    )
+    .unwrap();
+    assert!(
+        result["phase_deferred"]
+            .as_str()
+            .is_some_and(|note| note.contains("2 task_plan items are pending")),
+        "{result}"
+    );
+    assert_ne!(s.task.phase, "verify");
+    assert_eq!(s.task.scope, "Four UI flows");
+    tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"phase":"draft"}}),
+    )
+    .unwrap();
+    assert_eq!(s.task.phase, "draft");
+    let ids: Vec<_> = s.task.todos.iter().map(|item| item.id.clone()).collect();
+    apply(
+        &mut s,
+        json!(
+            ids.iter()
+                .map(|id| json!({"op":"complete","id":id,"result":"Written"}))
+                .collect::<Vec<_>>()
+        ),
+    );
+    let result = tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"phase":"verify"}}),
+    )
+    .unwrap();
+    assert!(result.get("phase_deferred").is_none(), "{result}");
+    assert_eq!(s.task.phase, "verify");
+}
+
+#[test]
+fn task_state_read_ignores_filled_details_paging() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let read = tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"read","limit":20,"offset":0}),
+    )
+    .unwrap();
+    assert_eq!(read["revision"], s.task.revision, "{read}");
+    let err = tools::execute(&mut s, "task_state", json!({"action":"read","cursor":"x"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown_argument: cursor"), "{err}");
+}

@@ -186,7 +186,9 @@ impl MemoryStore {
                 bail!("revision_conflict: expected {}", m.revision);
             }
         } else if input.expected_revision.is_some() {
-            bail!("revision_conflict: memory does not exist");
+            bail!(
+                "revision_conflict: no memory has this key yet; omit expected_revision to create it (only updates of an existing memory use its revision)"
+            );
         }
         let status = if input.inferred || (input.kind == MemoryKind::Fact && sources.is_empty()) {
             MemoryStatus::NeedsReview

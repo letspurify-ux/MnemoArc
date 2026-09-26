@@ -303,7 +303,10 @@ pub(super) fn execute(
                     "document_hash_required: offset or coverage_offset > 0 requires expected_hash from the first document_inspect result; copy its hash or the returned next_cursor arguments. If that result is unavailable, call document_inspect with offset 0 and coverage_offset 0 first"
                 );
             }
+            // Offset 0 starts a fresh read that returns the current hash, so a
+            // stale or placeholder expected_hash has nothing to protect there.
             if let Some(expected) = args["expected_hash"].as_str()
+                && (document_offset > 0 || coverage_offset > 0)
                 && expected != digest
             {
                 bail!(

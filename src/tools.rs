@@ -534,6 +534,12 @@ impl ToolRegistry {
             .filter(|t| !t.optional || s.active_tools.contains(t.name))
             .filter(|t| s.config.memory_reuse || !["memory_read", "memory_find"].contains(&t.name))
             .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
+            .filter(|t| {
+                t.name != "source_lookup"
+                    || s.checkpoint.as_ref().is_none_or(|cp| {
+                        cp.source_lookup_calls < crate::context::CHECKPOINT_SOURCE_LOOKUP_LIMIT
+                    })
+            })
             .filter(|t| !Self::closing_withholds(s, t.name))
             .filter(|t| !Self::repair_only(s) || Self::repair_allows(s, t.name))
             // Listing and auditing cannot settle an item. When a document
@@ -882,7 +888,8 @@ fn validate_task_state_arguments(args: &Value) -> Result<()> {
                 );
             }
             bail!(
-                "unknown_argument: {key} belongs inside task_state patch schema; state unchanged"
+                "unknown_argument: {key} is not a task_state patch field; allowed patch fields: {}; state unchanged",
+                properties.keys().cloned().collect::<Vec<_>>().join(", ")
             );
         };
         let valid = match field["type"].as_str() {
@@ -1040,6 +1047,19 @@ fn repair_leaked_argument_markup(args: &mut Value) -> Result<bool> {
 
 /// Accept argument names models commonly use for an unambiguous meaning.
 /// A conflicting pair is still rejected so no value is silently dropped.
+/// delete_text has no replacement text. Providers that fill every field send
+/// an empty text or a copy of old_text; a different text is a real conflict
+/// and still reaches validation.
+fn drop_filled_delete_text(object: &mut serde_json::Map<String, Value>) {
+    if object.get("action").and_then(Value::as_str) == Some("delete_text")
+        && object.get("text").is_some_and(|text| {
+            text.is_null() || text == "" || Some(text) == object.get("old_text")
+        })
+    {
+        object.remove("text");
+    }
+}
+
 fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Result<()> {
     fn rename(
         object: &mut serde_json::Map<String, Value>,
@@ -1062,9 +1082,51 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
         Ok(())
     }
     match name {
+        // The schema shares details paging with every action; providers that
+        // fill every field send it with read/update too. Paging changes no
+        // state, so it is dropped where the action does not page.
+        "task_state" => {
+            if args["action"] != "details"
+                && let Some(object) = args.as_object_mut()
+            {
+                object.remove("offset");
+                object.remove("limit");
+            }
+            // Restating the user's workflow selection changes nothing; only an
+            // attempt to reclassify it is rejected.
+            // The same holds for the program-owned checkpoint summary echoed
+            // back from the task state.
+            let (workflow, require_investigation) =
+                (json!(s.task.workflow), json!(s.task.require_investigation));
+            if let Some(patch) = args.get_mut("patch").and_then(Value::as_object_mut) {
+                for (key, current) in [
+                    ("workflow", workflow),
+                    ("require_investigation", require_investigation),
+                    ("checkpoint_summary", json!(s.task.checkpoint_summary)),
+                ] {
+                    if patch.get(key) == Some(&current) {
+                        patch.remove(key);
+                    }
+                }
+            }
+        }
+        // The investigation schema is shared by every action; providers that
+        // fill every field send verification data with upsert and sources
+        // with mark_gap, neither of which those actions use.
+        "investigation" if args["action"] == "upsert" => {
+            if let Some(object) = args.as_object_mut() {
+                object.remove("verification_note");
+            }
+        }
+        "investigation" if args["action"] == "mark_gap" => {
+            if let Some(object) = args.as_object_mut() {
+                object.remove("source_ids");
+            }
+        }
         "document_edit" => {
             if let Some(object) = args.as_object_mut() {
                 rename(object, "new_text", "text", "")?;
+                drop_filled_delete_text(object);
                 // An append right after the model's own successful write
                 // often omits expected_hash (three live runs in a row). If the
                 // document is still exactly that write, its hash is known to
@@ -1085,6 +1147,7 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
                 for (index, edit) in edits.iter_mut().enumerate() {
                     if let Some(object) = edit.as_object_mut() {
                         rename(object, "new_text", "text", &format!("edits[{index}]."))?;
+                        drop_filled_delete_text(object);
                     }
                 }
             }
@@ -1092,6 +1155,26 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
         "document_audit" => {
             if let Some(object) = args.as_object_mut() {
                 rename(object, "max_issues", "limit", "")?;
+            }
+        }
+        // Shared-schema placeholders: search does not use a history id or
+        // text offset, and read does not search.
+        "history" => {
+            let unused: &[&str] = match args["action"].as_str() {
+                Some("search") => &["id", "offset"],
+                Some("read") => &["query", "after", "limit"],
+                _ => &[],
+            };
+            if let Some(object) = args.as_object_mut() {
+                for key in unused {
+                    object.remove(*key);
+                }
+            }
+        }
+        // A null optional field means the field was not supplied.
+        "memory_write" => {
+            if let Some(object) = args.as_object_mut() {
+                object.retain(|_, value| !value.is_null());
             }
         }
         // One plan operation flattened into the call, e.g.
@@ -1379,9 +1462,21 @@ fn batch_target_hint(states: &[String], edit: &Value, error: &str) -> String {
 
 /// A stale hash means the document changed; a malformed one was never issued
 /// by a tool, so rereading alone would not tell the model what went wrong.
-fn revision_conflict(args: &Value) -> anyhow::Error {
+fn revision_conflict(args: &Value, current: &str) -> anyhow::Error {
     let expected = args["expected_hash"].as_str().unwrap_or("");
     if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        // A copy that lost a span of the current hash keeps failing when the
+        // model reuses it; name the exact loss instead of asking for a reread.
+        if let Some(dropped) = dropped_span(current, expected) {
+            return anyhow::anyhow!(
+                "document_revision_conflict: expected_hash is the current hash with {dropped:?} missing after its first {} characters; use the current hash exactly: {current}",
+                expected
+                    .bytes()
+                    .zip(current.bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            );
+        }
         return anyhow::anyhow!(
             "document_revision_conflict: expected_hash is not a document hash (a SHA-256 hash is 64 hex characters; got {}); copy the hash field exactly from the latest document_inspect or document_edit result instead of retyping it",
             expected.chars().count()
@@ -1390,6 +1485,30 @@ fn revision_conflict(args: &Value) -> anyhow::Error {
     anyhow::anyhow!(
         "document_revision_conflict: the document changed since this expected_hash; read output and retry with its current hash"
     )
+}
+
+/// The contiguous span removed from `current` to produce `copy`, when the
+/// copy keeps a recognizable prefix and suffix of the current hash.
+pub(crate) fn dropped_span<'a>(current: &'a str, copy: &str) -> Option<&'a str> {
+    if copy.len() >= current.len() || copy.len() < 32 {
+        return None;
+    }
+    let prefix = copy
+        .bytes()
+        .zip(current.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let missing = current.len() - copy.len();
+    // The overlap may make several split points valid; any of them proves
+    // the copy is prefix + suffix of the current hash.
+    (prefix.saturating_sub(missing)..=prefix)
+        .find(|&split| {
+            split >= 8
+                && copy.len() - split >= 8
+                && current.ends_with(&copy[split..])
+                && current.starts_with(&copy[..split])
+        })
+        .map(|split| &current[split..split + missing])
 }
 
 fn unique_document_text_span(old: &str, target: &str) -> Result<(usize, usize)> {
@@ -3016,6 +3135,17 @@ fn execute_repaired(
 ) -> Result<Value> {
     normalize_integer_arguments(name, &mut args);
     normalize_argument_aliases(s, name, &mut args)?;
+    if name == "memory_write"
+        && args["expected_revision"] == 0
+        && let Some(key) = args["key"].as_str()
+        && !s
+            .memory
+            .entries
+            .values()
+            .any(|entry| entry.key.as_deref() == Some(key))
+    {
+        args.as_object_mut().unwrap().remove("expected_revision");
+    }
     if name == "document_edit_batch" {
         hoist_batch_expected_hash(&mut args)?;
     }
@@ -3314,6 +3444,25 @@ fn execute_repaired(
                     .collect::<Result<Vec<_>>>()?;
                 next.memory_ids.sort();
                 next.memory_ids.dedup();
+                // A declared phase only ratchets forward. Document work without
+                // a written document or with pending plan items is not ready
+                // for verify/answer; some providers fill every enum in the
+                // patch schema, and accepting that value would pause discovery
+                // before sections exist.
+                let rank = |phase: &str| match phase {
+                    "answer" => 3,
+                    "verify" => 2,
+                    "draft" => 1,
+                    _ => 0,
+                };
+                let pending = next.todos.iter().filter(|item| !item.done).count();
+                let phase_deferred = s.is_document_work()
+                    && (pending > 0 || !s.document_written)
+                    && rank(&next.phase) >= rank("verify")
+                    && rank(&next.phase) > rank(&s.task.phase);
+                if phase_deferred {
+                    next.phase = s.task.phase.clone();
+                }
                 next.revision = s.task.revision + 1;
                 let compact = context::ContextManager::task_snapshot(
                     &next,
@@ -3328,6 +3477,17 @@ fn execute_repaired(
                 }
                 s.task = next;
                 s.activate_workflow_tools();
+                if phase_deferred {
+                    return Ok(json!({"revision":s.task.revision,"phase_deferred":format!(
+                        "phase stays {}: {}; other fields were saved",
+                        if s.task.phase.is_empty() { "investigate" } else { s.task.phase.as_str() },
+                        if s.document_written {
+                            format!("{pending} task_plan items are pending; finish or remove them first")
+                        } else {
+                            "the document has not been written yet".into()
+                        }
+                    )}));
+                }
                 Ok(json!({"revision":s.task.revision}))
             }
             _ => unreachable!(),
@@ -3350,6 +3510,14 @@ fn execute_repaired(
             _ => unreachable!(),
         },
         "source_lookup" => {
+            if let Some(cp) = &mut s.checkpoint {
+                if cp.source_lookup_calls >= crate::context::CHECKPOINT_SOURCE_LOOKUP_LIMIT {
+                    bail!(
+                        "checkpoint_lookup_limit: source IDs already available from earlier lookups; save needed memories and call checkpoint_complete"
+                    );
+                }
+                cp.source_lookup_calls += 1;
+            }
             let mut sources = std::collections::BTreeMap::new();
             for source in s
                 .memory
@@ -3397,7 +3565,9 @@ fn execute_repaired(
                 .collect();
             let next = offset.saturating_add(items.len());
             Ok(
-                json!({"items":items,"total":matches.len(),"next_offset":(next < matches.len()).then_some(next)}),
+                json!({"items":items,"total":matches.len(),"next_offset":(next < matches.len()).then_some(next),
+                    "checkpoint_lookup_remaining":s.checkpoint.as_ref().map(|cp| crate::context::CHECKPOINT_SOURCE_LOOKUP_LIMIT.saturating_sub(cp.source_lookup_calls)),
+                    "checkpoint_next_action":s.checkpoint.as_ref().map(|_| "Use delivered source IDs in memory_write, then call checkpoint_complete; repeated lookup does not preserve findings")}),
             )
         }
         "checkpoint_complete" => {
@@ -3574,8 +3744,9 @@ fn execute_repaired(
             if exists && action != "create" && args["expected_hash"].as_str().is_none() {
                 bail!("document_hash_required: existing document edits require expected_hash");
             }
-            if exists && args["expected_hash"].as_str() != Some(hash(old.as_bytes()).as_str()) {
-                return Err(revision_conflict(&args));
+            let digest = hash(old.as_bytes());
+            if exists && args["expected_hash"].as_str() != Some(digest.as_str()) {
+                return Err(revision_conflict(&args, &digest));
             }
             if !exists && action != "create" && action != "write" {
                 bail!("document_missing");
@@ -3590,8 +3761,9 @@ fn execute_repaired(
                 bail!("document_missing");
             }
             let old = read_text(&path)?;
-            if args["expected_hash"].as_str() != Some(hash(old.as_bytes()).as_str()) {
-                return Err(revision_conflict(&args));
+            let digest = hash(old.as_bytes());
+            if args["expected_hash"].as_str() != Some(digest.as_str()) {
+                return Err(revision_conflict(&args, &digest));
             }
             let edits = args["edits"].as_array().expect("validated edits array");
             let mut current = old.clone();
@@ -4882,6 +5054,7 @@ mod panic_tests {
             attempts: 1,
             failed_attempts: 0,
             last_failure: None,
+            source_lookup_calls: 0,
             starting_state_revision: 0,
             starting_memory_generation: 0,
             failed: false,

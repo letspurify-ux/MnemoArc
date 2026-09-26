@@ -565,12 +565,11 @@ async fn open_todos_on_a_finished_document_are_closed_in_one_batch() {
     assert_eq!(closeout["pending_count"], 3);
     assert_eq!(closeout["items"][0]["id"], "T1");
     assert!(guidance[0]["ready_for_final"].is_null());
-    assert!(
-        guidance[0]["instruction"]
-            .as_str()
-            .unwrap()
-            .contains("Close them in ONE task_plan apply")
-    );
+    let instruction = guidance[0]["instruction"].as_str().unwrap();
+    assert!(instruction.contains("close them in ONE task_plan apply"));
+    // Settled items cover only registered work; an unstarted to-do such as a
+    // missing section must not be removed as obsolete.
+    assert!(instruction.contains("NOT obsolete"), "{instruction}");
     // One batched update was enough: the next request is ready to finish.
     assert_eq!(guidance[1]["ready_for_final"], true);
     assert!(result.task.current_todo().is_none());
@@ -1422,4 +1421,38 @@ async fn a_forced_repair_step_refuses_non_repair_tools() {
     // Re-verifying the unchanged document is not offered as repair.
     assert!(!offered[3].iter().any(|name| name == "investigation"));
     assert!(offered[3].iter().any(|name| name == "document_edit_batch"));
+}
+
+#[tokio::test]
+async fn new_evidence_read_for_open_review_findings_is_progress() {
+    let (dir, mut s) = verified_fixture();
+    for name in ["a.js", "b.js", "c.js"] {
+        std::fs::write(
+            dir.path().join(name),
+            format!("export const {} = 1;\n", &name[..1]),
+        )
+        .unwrap();
+    }
+    s.document_review.issues = vec!["Line 3: cite the helper that normalizes history".into()];
+    let (_, guidance) = run_scripted(
+        s,
+        vec![
+            call("read-a", "file_read", json!({"path":"a.js"})),
+            call("read-b", "file_read", json!({"path":"b.js"})),
+            call("read-c", "file_read", json!({"path":"c.js"})),
+            Completion {
+                text: "Saved out.md".into(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await;
+    // Each read delivered new evidence for the open finding, so the stall
+    // ladder never advanced.
+    for step in &guidance[1..4] {
+        assert_eq!(
+            step["progress_recovery"]["rounds_since_progress"], 0,
+            "{step}"
+        );
+    }
 }

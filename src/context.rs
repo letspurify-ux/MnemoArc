@@ -86,6 +86,7 @@ pub const CHECKPOINT_MAX_FAILURES: usize = 8;
 // while still bounding a stale or missing acknowledgement loop.
 pub const DOCUMENT_CHECKPOINT_MAX_REQUESTS: usize = CHECKPOINT_MAX_REQUESTS * 2;
 pub const DOCUMENT_CHECKPOINT_MAX_FAILURES: usize = CHECKPOINT_MAX_FAILURES * 2;
+pub const CHECKPOINT_SOURCE_LOOKUP_LIMIT: usize = 3;
 pub struct ContextManager;
 
 fn model_message(mut message: Value) -> Value {
@@ -277,7 +278,7 @@ impl ContextManager {
                 cp.attempts.saturating_add(1),
                 cp.failed_attempts
             );
-            instruction.push_str(&format!("\nCheckpoint {}: {allowance}. Preserve concise findings and progress. Include checkpoint_complete after successful saves in the SAME batch; prose does not commit a checkpoint. It runs after all other calls and saves progress. Use source_lookup to recover existing evidence IDs; never invent IDs for compact outlines. If evidence was never read, record that work as unresolved rather than asserting it as fact. Retry counts are bounded for every workflow; correct the reported cause and do not repeat an unchanged failed acknowledgement.{}", cp.id, if cp.attempts.saturating_add(1) >= max_requests { " LAST cleanup request: finish saves and acknowledgement together." } else { "" }));
+            instruction.push_str(&format!("\nCheckpoint {}: {allowance}. Preserve concise findings and progress. Include checkpoint_complete after successful saves in the SAME batch; prose does not commit a checkpoint. It runs after all other calls and saves progress. Use source_lookup only if a source ID needed for the next memory_write is missing; one lookup of an ID is sufficient, and another lookup cannot save a memory or acknowledge the checkpoint. For a NEW memory key omit expected_revision, including zero; only updates use an existing revision. If evidence was never read, record that work as unresolved rather than asserting it as fact. Retry counts are bounded for every workflow; correct the reported cause and do not repeat an unchanged failed acknowledgement.{}", cp.id, if cp.attempts.saturating_add(1) >= max_requests { " LAST cleanup request: finish saves and acknowledgement together." } else { "" }));
         }
         if s.checkpoint.is_none()
             && let Some(discarded_tools) = s.continuation
@@ -298,8 +299,9 @@ impl ContextManager {
             };
             let allowance = format!("{}/{max_requests}", cp.attempts.saturating_add(1));
             format!(
-                "CHECKPOINT CONTROL REQUEST {} (request {allowance}): Pause source investigation NOW. Do NOT call file_read, source_search or investigation. Use source_lookup for existing evidence IDs. Preserve necessary facts using concise memory_write calls, then call checkpoint_complete with a concise progress summary. Preserve the ordered task_plan; cleanup does not complete its items. If facts already exist in memory, provide no_save_reason. A separate task_state call is not required. At most {} tool calls in this batch. Resume the original user task only AFTER checkpoint_complete succeeds. The following JSON is program state.",
+                "CHECKPOINT CONTROL REQUEST {} (request {allowance}): Pause source investigation NOW. Do NOT call file_read, source_search or investigation. Lookup is limited to {} calls total and does not advance cleanup; use already delivered IDs. Preserve necessary facts using concise memory_write calls, then call checkpoint_complete with a concise progress summary. Preserve the ordered task_plan; cleanup does not complete its items. If facts already exist in memory, provide no_save_reason. A separate task_state call is not required. At most {} tool calls in this batch. Resume the original user task only AFTER checkpoint_complete succeeds. The following JSON is program state.",
                 cp.id,
+                CHECKPOINT_SOURCE_LOOKUP_LIMIT,
                 Self::cleanup_result_budget(&s.config) / 200
             )
         } else {
@@ -458,6 +460,7 @@ impl ContextManager {
             attempts: 0,
             failed_attempts: 0,
             last_failure: None,
+            source_lookup_calls: 0,
             starting_state_revision: s.task.revision,
             starting_memory_generation: s.memory.generation,
             failed: false,

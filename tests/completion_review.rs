@@ -139,7 +139,7 @@ fn targeted_read_keeps_evidence_beyond_the_old_receipt_character_cutoff() {
             .unwrap()
             .contains(marker)
     );
-    assert!(mnemoarc::context::count(&review::request(&mut s).unwrap(), &s.config.model) <= 16_000);
+    assert!(mnemoarc::context::count(&review::request(&mut s).unwrap(), &s.config.model) <= 24_000);
     assert_eq!(finish(&mut s, true).as_deref(), Some("Saved result.txt"));
 }
 
@@ -903,4 +903,84 @@ async fn planned_answer_continuation_reviews_whole_answer_and_keeps_join_marker(
     assert_eq!(final_message["continues_previous"], true);
     assert_eq!(final_message["content"], " B\n```");
     assert!(result.completion_review.approved);
+}
+
+#[test]
+fn runtime_write_log_and_saved_file_precede_newer_observations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    std::fs::write(dir.path().join("source.rs"), "fn main() {}\n").unwrap();
+    write(&mut s, "Conclusion: done\nExample: shown\n");
+    for i in 0..3 {
+        let call = ToolCall {
+            id: format!("read-{i}"),
+            name: "file_read".into(),
+            arguments: json!({"path":"source.rs","start_line":1,"max_lines":1,"force_read":true})
+                .to_string(),
+        };
+        let result = tools::run_call(&mut s, &call);
+        assert_eq!(result["status"], "ok", "{result}");
+        review::observe(&mut s, &call, &result);
+    }
+    review::begin(&mut s, "Saved result.txt").unwrap();
+    let request = review::request(&mut s).unwrap();
+    assert!(
+        request["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("runtime_write_log is a runtime record")
+    );
+    let p = payload(&request);
+    let evidence = p["evidence"].as_array().unwrap();
+    assert_eq!(evidence[1]["kind"], "runtime_write_log", "{p}");
+    let written = evidence[1]["written_paths"].as_array().unwrap();
+    assert_eq!(written.len(), 1, "{p}");
+    assert!(written[0].as_str().unwrap().ends_with("result.txt"));
+    // A read is an observation, not a write.
+    assert!(!evidence[1].to_string().contains("source.rs"));
+    assert_eq!(evidence[2]["kind"], "current_file", "{p}");
+    assert_eq!(evidence[3]["kind"], "tool_observation", "{p}");
+}
+
+#[test]
+fn saved_output_is_reviewed_whole_and_observed_sources_are_rehashed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.project.output = dir.path().join("manual.md");
+    std::fs::write(dir.path().join("ui.js"), "export const label = '저장';\n").unwrap();
+    s.active_tools = tools::ToolRegistry::optional_names();
+    let read = ToolCall {
+        id: "read-ui".into(),
+        name: "file_read".into(),
+        arguments: json!({"path":"ui.js"}).to_string(),
+    };
+    let result = tools::run_call(&mut s, &read);
+    assert_eq!(result["status"], "ok", "{result}");
+    review::observe(&mut s, &read, &result);
+    let body = format!(
+        "# 안내\n\n{}\n\n## 끝\n\n마지막 문장.\n",
+        "설명 문장입니다. ".repeat(700)
+    );
+    assert!(body.chars().count() > 6000);
+    let write = ToolCall {
+        id: "write-manual".into(),
+        name: "document_edit".into(),
+        arguments: json!({"action":"create","text":body}).to_string(),
+    };
+    let result = tools::run_call(&mut s, &write);
+    assert_eq!(result["status"], "ok", "{result}");
+    review::observe(&mut s, &write, &result);
+    review::begin(&mut s, "Saved manual.md").unwrap();
+    let p = payload(&review::request(&mut s).unwrap());
+    let evidence = p["evidence"].as_array().unwrap();
+    let log = &evidence[1];
+    assert_eq!(log["observed_sources"]["checked"], 1, "{log}");
+    assert_eq!(log["observed_sources"]["unchanged"], 1, "{log}");
+    let manual = &evidence[2];
+    assert!(
+        manual["path"].as_str().unwrap().ends_with("manual.md"),
+        "{manual}"
+    );
+    assert_eq!(manual["truncated"], false);
+    assert!(manual["text"].as_str().unwrap().contains("마지막 문장."));
 }

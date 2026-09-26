@@ -111,6 +111,19 @@ fn memory_conflicts_paging_and_no_silent_eviction() {
     assert_eq!(store.entries.len(), 3);
     assert!(store.get(&replaced.id).is_ok());
 }
+
+#[test]
+fn new_memory_key_accepts_zero_revision_placeholder_but_existing_key_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let args = json!({"key":"new-key","title":"Finding","summary":"Observed detail","body":"The detail is retained","kind":"fact","expected_revision":0});
+    let created = tools::execute(&mut s, "memory_write", args.clone()).unwrap();
+    assert_eq!(created["revision"], 1);
+    let err = tools::execute(&mut s, "memory_write", args)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("revision_conflict: expected 1"), "{err}");
+}
 #[test]
 fn replacement_failure_is_atomic() {
     let mut store = MemoryStore::default();
@@ -1092,10 +1105,6 @@ fn investigation_action_contracts_explain_invalid_calls_before_mutation() {
         ),
         (json!({"action":"upsert","title":"  "}), "must not be empty"),
         (
-            json!({"action":"upsert","title":"Overview","verification_note":"note"}),
-            "does not accept verification_note",
-        ),
-        (
             json!({"action":"verify","id":"overview"}),
             "missing_argument: source_ids",
         ),
@@ -1160,6 +1169,17 @@ fn checkpoint_source_lookup_returns_only_existing_matching_evidence() {
     assert_eq!(found["total"], 1);
     let missing = tools::execute(&mut s, "source_lookup", json!({"path":"unseen.rs"})).unwrap();
     assert_eq!(missing["total"], 0);
+    let third = tools::execute(&mut s, "source_lookup", json!({"id":id,"path":"a.rs"})).unwrap();
+    assert_eq!(third["checkpoint_lookup_remaining"], 0);
+    assert!(
+        !tools::ToolRegistry::definitions(&s)
+            .iter()
+            .any(|tool| tool["function"]["name"] == "source_lookup")
+    );
+    let err = tools::execute(&mut s, "source_lookup", json!({"id":id}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("checkpoint_lookup_limit"), "{err}");
     assert!(tools::execute(&mut s, "file_read", json!({"path":"a.rs"})).is_err());
     assert!(
         s.source_refs(&["S93-missing".into()])
@@ -1365,4 +1385,85 @@ fn no_tool_definition_offers_a_top_level_union() {
             definition["function"]["name"]
         );
     }
+}
+
+#[test]
+fn filled_shared_schema_fields_are_ignored_but_reclassification_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.active_tools.insert("investigation".into());
+    // upsert does not verify; a filled verification_note is dropped.
+    let item = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"overview","title":"Overview","verification_note":"filled"}),
+    )
+    .unwrap();
+    assert_ne!(item["status"], "verified", "{item}");
+    let id = s.investigations[0].id.clone();
+    let err = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"mark_gap","id":id,"reason":"Not visible in the sources","source_ids":["S1"]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(!err.contains("does not accept source_ids"), "{err}");
+    // Restating the current workflow selection is not a reclassification.
+    let (workflow, require) = (s.task.workflow.clone(), s.task.require_investigation);
+    tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"workflow":workflow,"require_investigation":require,"scope":"UI"}}),
+    )
+    .unwrap();
+    assert_eq!(s.task.scope, "UI");
+    let err = tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"require_investigation":!require}}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.starts_with("workflow_selected_by_user:"), "{err}");
+}
+
+#[test]
+fn filled_history_memory_and_state_placeholders_are_normalized() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    tools::execute(
+        &mut s,
+        "history",
+        json!({"action":"search","after":0,"id":0,"limit":5,"offset":0,"query":"x"}),
+    )
+    .unwrap();
+    let memory = json!({"key":null,"expected_revision":null,"title":"Finding","summary":"Observed","body":"Detail","kind":"fact"});
+    tools::execute(&mut s, "memory_write", memory).unwrap();
+    let err = tools::execute(
+        &mut s,
+        "memory_write",
+        json!({"key":"fresh","expected_revision":1,"title":"T","summary":"S","body":"B","kind":"fact"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("omit expected_revision to create it"), "{err}");
+    let summary = s.task.checkpoint_summary.clone();
+    tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"checkpoint_summary":summary,"scope":"UI"}}),
+    )
+    .unwrap();
+    let err = tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"checkpoint_summary":"invented"}}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("is not a task_state patch field; allowed patch fields:"),
+        "{err}"
+    );
 }

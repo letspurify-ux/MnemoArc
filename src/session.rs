@@ -210,6 +210,8 @@ pub struct Checkpoint {
     pub failed_attempts: usize,
     #[serde(default)]
     pub last_failure: Option<String>,
+    #[serde(default)]
+    pub source_lookup_calls: usize,
     pub starting_state_revision: u64,
     pub starting_memory_generation: u64,
     pub failed: bool,

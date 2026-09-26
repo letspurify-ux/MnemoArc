@@ -162,7 +162,10 @@ fn collect_gaps(s: &mut Session, extra: &[String]) -> Vec<String> {
     gaps
 }
 
-const PLAN_CLOSEOUT_INSTRUCTION: &str = "The document is written and every investigation item is settled; only the to-dos in plan_closeout remain, and the final answer is refused while any is open. Close them in ONE task_plan apply using plan_closeout.expected_revision: one operation per item in the listed order, complete with the actual observed result when its work is done, or remove with a reason when it is obsolete. complete must follow list order, because only the current item can complete. Do real work first only for an item whose result is truly missing. Then give the final answer.";
+// Items are registered one section at a time, so "every registered item is
+// settled" also holds between sections; a live run read the old wording as
+// permission to remove the to-dos for unwritten sections.
+const PLAN_CLOSEOUT_INSTRUCTION: &str = "The document is written and every REGISTERED investigation item is settled, but the to-dos in plan_closeout are open and the final answer is refused while any is open. Settled items cover only work registered so far: a to-do whose work is not done yet, such as a requested section still missing from the document, is NOT obsolete. Do that work first: register its investigation item with its section, read the evidence, write and verify it. When the listed work is done, close them in ONE task_plan apply using plan_closeout.expected_revision: one operation per item in the listed order, complete with the actual observed result, or remove with a reason only when the item is genuinely obsolete, never merely unstarted. complete must follow list order, because only the current item can complete. Then give the final answer.";
 
 const REVIEW_REPAIR_RESUME_INSTRUCTION: &str = "A checkpoint cleared the context during review repair, and the document is still UNCHANGED: every finding in review_repair.unrepaired_findings is still open. A final answer now is rejected again without a new review. Edit the document for these findings first.";
 
@@ -1055,8 +1058,15 @@ pub async fn run_session_controlled(
         if s.checkpoint.is_none() {
             // Reading new sources is progress until the document exists, even
             // after the budget or a required investigation switches the
-            // guidance to drafting; afterwards only result improvements count.
-            if phase == "investigate" || !s.document_written {
+            // guidance to drafting; afterwards only result improvements count,
+            // except while review findings are open: repairing them needs new
+            // evidence, and a live run stalled out reading exactly that.
+            let review_repair_open = !s.document_review.issues.is_empty()
+                || s.completion_review
+                    .checks
+                    .iter()
+                    .any(|check| check.status != "met");
+            if phase == "investigate" || !s.document_written || review_repair_open {
                 s.progress_recovery.evidence_credit =
                     s.progress_recovery.evidence_credit.max(s.sources.len());
             }

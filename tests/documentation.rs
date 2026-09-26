@@ -3587,3 +3587,78 @@ fn an_unchanged_upsert_keeps_a_verified_item_verified() {
     );
     assert_eq!(s.investigations[0].status, "written");
 }
+
+#[test]
+fn hash_copy_with_a_dropped_span_names_the_loss_and_fresh_inspect_ignores_it() {
+    let (_dir, mut s) = setup();
+    let written = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n\nFirst line.\n"}),
+    );
+    let current = written["hash"].as_str().unwrap().to_owned();
+    let corrupted = format!("{}{}", &current[..41], &current[46..]);
+    let err = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":corrupted,"edits":[{"action":"append","text":"More.\n"}]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains(&format!("{:?} missing", &current[41..46])),
+        "{err}"
+    );
+    assert!(err.contains(&current), "{err}");
+    // A fresh read returns the current hash even with a placeholder hash.
+    let page = run(
+        &mut s,
+        "document_inspect",
+        json!({"expected_hash":corrupted,"offset":0,"coverage_offset":0}),
+    );
+    assert_eq!(page["hash"], current);
+    let err = tools::execute(
+        &mut s,
+        "document_inspect",
+        json!({"expected_hash":corrupted,"offset":1}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("document_revision_conflict"), "{err}");
+}
+
+#[test]
+fn delete_text_ignores_a_filled_text_but_not_a_real_replacement() {
+    let (_dir, mut s) = setup();
+    let written = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n\nKeep.\n\nDrop me.\n"}),
+    );
+    let hash = written["hash"].as_str().unwrap().to_owned();
+    let err = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":hash,"edits":[{"action":"delete_text","old_text":"\nDrop me.\n","text":"Other"}]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("not valid for action=delete_text"), "{err}");
+    let deleted = run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":hash,"edits":[{"action":"delete_text","old_text":"\nDrop me.\n","text":"\nDrop me.\n"}]}),
+    );
+    let doc = std::fs::read_to_string(&s.project.output).unwrap();
+    assert!(!doc.contains("Drop me."), "{doc}");
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"delete_text","expected_hash":deleted["hash"],"old_text":"Keep.","text":""}),
+    );
+    assert!(
+        !std::fs::read_to_string(&s.project.output)
+            .unwrap()
+            .contains("Keep.")
+    );
+}

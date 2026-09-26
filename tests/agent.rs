@@ -1690,11 +1690,24 @@ impl LlmClient for RepeatsDocumentCheckpointMaintenanceWithoutAck {
                 .unwrap()
                 .1,
         )?;
-        Ok(call(
-            &format!("repeat-source-lookup-{}", state["checkpoint"]["attempts"]),
-            "source_lookup",
-            json!({"path":"unobserved.rs"}),
-        ))
+        // Lookups are capped per checkpoint; afterwards keep making successful
+        // maintenance calls so only the missing acknowledgement bounds the run.
+        let attempts = state["checkpoint"]["attempts"].as_u64().unwrap_or(0);
+        Ok(
+            if attempts < mnemoarc::context::CHECKPOINT_SOURCE_LOOKUP_LIMIT as u64 {
+                call(
+                    &format!("repeat-source-lookup-{attempts}"),
+                    "source_lookup",
+                    json!({"path":"unobserved.rs"}),
+                )
+            } else {
+                call(
+                    &format!("repeat-task-read-{attempts}"),
+                    "task_state",
+                    json!({"action":"read"}),
+                )
+            },
+        )
     }
 }
 
@@ -1712,6 +1725,7 @@ fn document_checkpoint_session(dir: &std::path::Path) -> Session {
         attempts: 0,
         failed_attempts: 0,
         last_failure: None,
+        source_lookup_calls: 0,
         starting_state_revision: session.task.revision,
         starting_memory_generation: session.memory.generation,
         failed: false,
