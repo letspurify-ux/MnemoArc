@@ -286,8 +286,14 @@ fn abandon_failing_review(s: &mut Session, failures: usize) -> bool {
         return false;
     }
     if s.completion_review.pending {
-        tools::completion_review::mark_unavailable(s);
-        s.last_error = Some("completion_review_unavailable: acceptance review responses were invalid; give the final answer again and the result will be reported as unchecked".into());
+        // last_error holds the rejected response's validation error; keep it
+        // before the notice below replaces it.
+        let reason = s.last_error.clone();
+        tools::completion_review::mark_unavailable(s, reason.clone());
+        s.last_error = Some(format!(
+            "completion_review_unavailable: acceptance review responses were invalid ({}); give the final answer again and the result will be reported as unchecked",
+            reason.as_deref().unwrap_or("no validation error recorded")
+        ));
     } else if s.document_review.pending {
         tools::document_review::mark_unavailable(s);
         s.last_error = Some("document_review_unavailable: document review responses were invalid; give the final answer again and the document will be reported as unreviewed".into());

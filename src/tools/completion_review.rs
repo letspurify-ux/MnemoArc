@@ -26,6 +26,10 @@ pub struct ReviewState {
     /// The current result could not receive a valid verdict; it finishes
     /// without acceptance and is reported as unchecked.
     pub unavailable: bool,
+    /// The validation error of the last rejected review response, so a
+    /// report of an unchecked result says why the review was abandoned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
     #[serde(skip)]
     unavailable_fingerprint: String,
     #[serde(skip)]
@@ -404,10 +408,11 @@ pub enum Gate {
 
 /// Stop retrying a review whose responses keep failing validation. A changed
 /// result or answer produces a new fingerprint and becomes reviewable again.
-pub fn mark_unavailable(s: &mut Session) {
+pub fn mark_unavailable(s: &mut Session, reason: Option<String>) {
     let state = &mut s.completion_review;
     state.unavailable_fingerprint = state.fingerprint.clone();
     state.unavailable = true;
+    state.unavailable_reason = reason;
     state.pending = false;
     state.approved = false;
     state.offset = 0;
@@ -519,6 +524,7 @@ pub fn begin_final(s: &mut Session, draft: &str, continues_previous: bool) -> Re
         return Ok(Gate::Unavailable);
     }
     state.unavailable = false;
+    state.unavailable_reason = None;
     if fingerprint == state.reviewed_fingerprint {
         state.approved = !state.checks.is_empty() && state.checks.iter().all(|c| c.status == "met");
         return Ok(if state.approved {

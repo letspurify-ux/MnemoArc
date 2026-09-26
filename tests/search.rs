@@ -389,3 +389,32 @@ fn file_list_path_lists_one_directory() {
         assert!(tools::execute(&mut s, "file_list", args).is_err());
     }
 }
+
+#[test]
+fn an_empty_filled_alternative_to_query_is_not_a_conflict() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.js"), "const hint = 'Shift+Enter';\n").unwrap();
+    let found = search(
+        &mut s,
+        json!({"path":"a.js","query":"Shift+Enter","queries":[]}),
+    );
+    assert_eq!(
+        found["matches"].as_array().map(Vec::len),
+        Some(1),
+        "{found}"
+    );
+    let found = search(&mut s, json!({"path":"a.js","query":"","queries":["hint"]}));
+    assert_eq!(
+        found["matches"].as_array().map(Vec::len),
+        Some(1),
+        "{found}"
+    );
+    let err = tools::execute(
+        &mut s,
+        "source_search",
+        json!({"path":"a.js","query":"hint","queries":["const"]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.starts_with("conflicting_arguments:"), "{err}");
+}

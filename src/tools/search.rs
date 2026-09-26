@@ -18,6 +18,26 @@ pub(super) fn execute(
     args: &Value,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value> {
+    // Providers that fill every field send an empty queries list or query
+    // string beside the real one; an empty alternative is not a conflict.
+    let mut args = args.clone();
+    if let Some(object) = args.as_object_mut() {
+        if object
+            .get("query")
+            .is_some_and(|q| q.as_str().is_some_and(str::is_empty))
+            && object.contains_key("queries")
+        {
+            object.remove("query");
+        }
+        if object
+            .get("queries")
+            .is_some_and(|q| q.as_array().is_some_and(Vec::is_empty))
+            && object.contains_key("query")
+        {
+            object.remove("queries");
+        }
+    }
+    let args = &args;
     if args.get("query").is_some() == args.get("queries").is_some() {
         bail!(
             "conflicting_arguments: supply exactly one of query (literal by default) or queries (literal OR)"

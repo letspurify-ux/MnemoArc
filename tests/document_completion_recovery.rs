@@ -711,6 +711,15 @@ async fn persistently_invalid_acceptance_is_reported_as_unchecked() {
         assert_eq!(s.status, "complete_with_gaps", "{:?}", s.last_error);
         assert_eq!(*client.reviews.lock().unwrap(), 3);
         assert!(s.completion_review.unavailable);
+        // The report says why the review was abandoned.
+        assert!(
+            s.completion_review
+                .unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("completion_review_invalid:")),
+            "{:?}",
+            s.completion_review.unavailable_reason
+        );
         assert!(!s.completion_review.approved);
         assert!(
             s.completion_gaps
