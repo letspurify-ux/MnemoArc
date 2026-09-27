@@ -214,9 +214,9 @@ test("a stalled refresh times out and allows the next poll to recover", async ({
   session.project.name = "응답 지연 후 복구된 프로젝트";
   try {
     await page.clock.runFor(15200);
-    await expect(page.getByRole("alert")).toContainText("작업 공간 응답이 지연");
-    await page.clock.runFor(3200);
+    await expect.poll(() => calls).toBeGreaterThanOrEqual(2);
     await expect(page.locator(".session-heading h2")).toHaveText(session.project.name);
+    await expect(page.getByRole("alert")).toHaveCount(0);
   } finally {
     pending.release();
   }

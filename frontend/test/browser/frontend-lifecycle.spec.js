@@ -83,6 +83,61 @@ test("unsent drafts protect browser exit even while settings are open", async ({
   expect(prevented).toBe(true);
 });
 
+test("the detail panel starts closed on narrow screens and remains available on demand", async ({ page, request }) => {
+  await page.setViewportSize({ width: 390, height: 740 });
+  await workspace({ page, request });
+  const toggle = page.getByRole("button", { name: "상세 패널 표시" });
+  await expect(toggle).toHaveAttribute("aria-pressed", "false");
+  await expect(page.locator(".inspector")).toHaveCount(0);
+  await toggle.click();
+  await expect(page.locator(".inspector")).toBeVisible();
+  await toggle.click();
+  await expect(page.locator(".inspector")).toHaveCount(0);
+});
+
+test("resizing a desktop chat to a narrow screen reveals the composer", async ({ page, request }) => {
+  await workspace({ page, request });
+  await expect(page.locator(".inspector")).toBeVisible();
+  await page.setViewportSize({ width: 390, height: 740 });
+  await expect(page.getByRole("button", { name: "상세 패널 표시" })).toHaveAttribute("aria-pressed", "false");
+  await expect(page.locator(".inspector")).toHaveCount(0);
+});
+
+test("resizing does not discard an unsaved session project", async ({ page, request }) => {
+  await workspace({ page, request });
+  await page.getByRole("tab", { name: "프로젝트", exact: true }).click();
+  const name = page.getByLabel("프로젝트 이름", { exact: true });
+  await name.fill("보존할 프로젝트 초안");
+  await page.setViewportSize({ width: 390, height: 740 });
+  await expect(page.locator(".inspector")).toBeVisible();
+  await expect(name).toHaveValue("보존할 프로젝트 초안");
+  page.once("dialog", (dialog) => dialog.dismiss());
+  await page.getByRole("button", { name: "상세 패널 표시" }).click();
+  await expect(name).toHaveValue("보존할 프로젝트 초안");
+});
+
+test("a recovered refresh clears its transient error but preserves action failures", async ({ page, request }) => {
+  await page.clock.install();
+  const { state } = await workspace({ page, request });
+  let failRefresh = true;
+  await page.route("**/api/state", (route) => route.fulfill(failRefresh
+    ? { status: 503, json: { error: "일시적인 조회 오류" } }
+    : { json: state }));
+  await page.clock.runFor(3200);
+  await expect(page.getByRole("alert")).toContainText("일시적인 조회 오류");
+  failRefresh = false;
+  await page.clock.runFor(3200);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+
+  await page.route("**/api/sessions/*/workflow", (route) => route.fulfill({
+    status: 409, json: { error: "작업 방식 저장 실패" },
+  }));
+  await page.getByLabel("작업 방식").selectOption("source_document");
+  await expect(page.getByRole("alert")).toContainText("작업 방식 저장 실패");
+  await page.clock.runFor(3200);
+  await expect(page.getByRole("alert")).toContainText("작업 방식 저장 실패");
+});
+
 test("a pending run keeps all run controls locked after navigation", async ({ page, request }) => {
   const { state, session } = await workspace({ page, request }, { has_task: true });
   await addSession(page, state, session);

@@ -38,8 +38,9 @@ export default function App() {
     [selected, setSelected] = useState(() => window.location.hash.slice(1)),
     [page, setPage] = useState("chat"),
     [error, setError] = useState(""),
+    [refreshError, setRefreshError] = useState(""),
     [connected, setConnected] = useState(false),
-    [detail, setDetail] = useState(true),
+    [detail, setDetail] = useState(() => !window.matchMedia("(max-width: 1000px)").matches),
     [mobileNav, setMobileNav] = useState(false),
     [navigating, setNavigating] = useState(false),
     [runPending, setRunPending] = useState(false),
@@ -121,11 +122,12 @@ export default function App() {
               setSession((old) => mergeSession(old, current));
             }
           } else setSession(null);
+          if (isCurrent()) setRefreshError("");
         }
       } catch (e) {
         if (alive.current && fetching.current === request && selectionEpoch.current === epoch) {
-          if (timedOut) setError("작업 공간 응답이 지연되고 있습니다. 다시 연결을 시도합니다.");
-          else if (!controller.signal.aborted) setError(e.message);
+          if (timedOut) setRefreshError("작업 공간 응답이 지연되고 있습니다. 다시 연결을 시도합니다.");
+          else if (!controller.signal.aborted) setRefreshError(e.message);
         }
       } finally {
         clearTimeout(deadline);
@@ -175,6 +177,14 @@ export default function App() {
       timer.current = null;
     };
   }, [refresh, stopped]);
+  useEffect(() => {
+    const narrow = window.matchMedia("(max-width: 1000px)");
+    const closeOnNarrow = (event) => {
+      if (event.matches && !inspectorDirty.current) setDetail(false);
+    };
+    narrow.addEventListener("change", closeOnNarrow);
+    return () => narrow.removeEventListener("change", closeOnNarrow);
+  }, []);
   useEffect(() => {
     try {
       window.localStorage.setItem(INSPECTOR_WIDTH_KEY, String(inspectorWidth));
@@ -465,10 +475,10 @@ export default function App() {
             )}
           </div>
         </header>
-        {error && (
+        {(error || refreshError) && (
           <div className="app-error" role="alert">
-            <span>{error}</span>
-            <button aria-label="오류 닫기" onClick={() => setError("")}>
+            <span>{error || refreshError}</span>
+            <button aria-label="오류 닫기" onClick={() => { setError(""); setRefreshError(""); }}>
               ×
             </button>
           </div>

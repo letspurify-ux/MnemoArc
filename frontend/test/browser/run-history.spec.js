@@ -89,7 +89,6 @@ test("execution history survives another request and reload", async ({
   await page.getByLabel("요청 종류").selectOption("chat");
   await expect(page.getByLabel("작업 방식")).toBeEnabled();
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.getByRole("button", { name: "상세 패널 표시" }).click();
   await expect(page.locator(".inspector")).toHaveCount(0);
   await expect(page.getByLabel("요청 종류")).toBeVisible();
   await expect(page.getByLabel("작업 방식")).toBeVisible();
