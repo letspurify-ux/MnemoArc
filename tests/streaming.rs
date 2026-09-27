@@ -340,6 +340,38 @@ async fn incomplete_stream_never_returns_calls() {
 }
 
 #[tokio::test]
+async fn repeated_identical_finish_reason_accepts_provider_tool_call_stream() {
+    let body = [
+        event(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"ping-1","function":{"name":"ping","arguments":"{}"}}]},"finish_reason":null}]})),
+        event(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})),
+        event(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})),
+        event(json!({"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":4}})),
+        "data: [DONE]\n\n".into(),
+    ]
+    .concat();
+    let (url, server) = server(body).await;
+    let config = Config {
+        base_url: url,
+        retries: 0,
+        ..Default::default()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let completion = OpenAiClient
+        .complete(
+            json!({"messages":[]}),
+            &config,
+            CancellationToken::new(),
+            tx,
+        )
+        .await
+        .unwrap();
+    server.abort();
+    assert_eq!(completion.calls.len(), 1);
+    assert_eq!(completion.calls[0].name, "ping");
+    assert_eq!(completion.usage.unwrap().output, 4);
+}
+
+#[tokio::test]
 async fn contradictory_stream_finish_reasons_never_complete() {
     for (body, expected) in [
         (

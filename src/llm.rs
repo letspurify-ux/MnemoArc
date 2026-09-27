@@ -308,7 +308,8 @@ impl OpenAiClient {
         let mut parser = SseDecoder::default();
         let mut out = Completion::default();
         let mut calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
-        let (mut done, mut finish) = (false, false);
+        let mut done = false;
+        let mut finish_reason: Option<String> = None;
         let mut expects_calls = false;
         loop {
             let next = tokio::select! {
@@ -360,7 +361,7 @@ impl OpenAiClient {
                 let Some(choice) = v["choices"].as_array().and_then(|a| a.first()) else {
                     continue;
                 };
-                if finish
+                if finish_reason.is_some()
                     && (choice["delta"]["content"]
                         .as_str()
                         .is_some_and(|text| !text.is_empty())
@@ -371,18 +372,23 @@ impl OpenAiClient {
                     bail!("incomplete_completion: delta after finish reason");
                 }
                 if let Some(reason) = choice["finish_reason"].as_str() {
-                    if finish {
-                        bail!("incomplete_completion: multiple finish reasons");
-                    }
-                    if !["stop", "tool_calls", "length"].contains(&reason) {
-                        if reason == "error" {
-                            bail!("provider_stream_error: finish_reason=error");
+                    if let Some(previous) = finish_reason.as_deref() {
+                        if previous != reason {
+                            bail!(
+                                "incomplete_completion: multiple finish reasons ({previous}, {reason})"
+                            );
                         }
-                        bail!("incomplete_completion: {reason}");
+                    } else {
+                        if !["stop", "tool_calls", "length"].contains(&reason) {
+                            if reason == "error" {
+                                bail!("provider_stream_error: finish_reason=error");
+                            }
+                            bail!("incomplete_completion: {reason}");
+                        }
+                        out.length_limited = reason == "length";
+                        expects_calls = reason == "tool_calls";
+                        finish_reason = Some(reason.to_owned());
                     }
-                    out.length_limited = reason == "length";
-                    expects_calls = reason == "tool_calls";
-                    finish = true;
                 }
                 if let Some(text) = choice["delta"]["content"].as_str() {
                     out.text.push_str(text);
@@ -437,7 +443,7 @@ impl OpenAiClient {
                 break;
             }
         }
-        if !done || !finish {
+        if !done || finish_reason.is_none() {
             bail!("stream_interrupted: missing completion terminator");
         }
         if out.length_limited {
