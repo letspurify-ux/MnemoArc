@@ -1,10 +1,11 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Message, StreamingMessage } from "./chat/Message.jsx";
 import { continuationMessages } from "./chat/continuation.js";
 import { toolLabels, workflowOptions } from "./api.js";
 
 export default function Chat({
   session,
+  drafts,
   busy,
   navigating,
   canRun,
@@ -46,9 +47,10 @@ export default function Chat({
                   : stage === "continuing"
                     ? "받은 답변을 보존하고 이어서 생성 중"
                     : "요청 준비 중";
-  const [input, setInput] = useState("");
-  const [intent, setIntent] = useState(null);
-  const requestKind = intent || (session?.has_task ? "question" : "chat");
+  const draft = useSyncExternalStore(drafts.subscribe, () => drafts.get(session.id));
+  const input = draft.text;
+  const requestKind = draft.intent || (session?.has_task ? "question" : "chat");
+  const updateDraft = (patch) => drafts.update(session.id, patch);
   const lastRun = session?.run_history?.at(-1);
   const [sending, setSending] = useState(false);
   const [workflowSaving, setWorkflowSaving] = useState(false);
@@ -56,14 +58,13 @@ export default function Chat({
   const [loadingOlder, setLoadingOlder] = useState(false);
   const workflowLock = useRef(false), olderLock = useRef(false);
   useEffect(() => {
-    if (!workflowLock.current) setWorkflow(session?.workflow_mode ?? "answer");
-  }, [session?.workflow_mode]);
+    if (!workflowSaving) setWorkflow(session?.workflow_mode ?? "answer");
+  }, [session?.workflow_mode, workflowSaving]);
   const inputRef = useRef(null),
     lock = useRef(false),
     composing = useRef(false),
     chatRef = useRef(null),
-    bottom = useRef(true),
-    draftVersion = useRef(0);
+    bottom = useRef(true);
   const fitInput = () => {
     const el = inputRef.current;
     if (!el) return;
@@ -94,13 +95,10 @@ export default function Chat({
     if (!message || busy || !canRun || lock.current || workflowLock.current) return;
     lock.current = true;
     setSending(true);
-    const submittedVersion = draftVersion.current;
+    const submitted = drafts.get(session.id);
     try {
       await onSend(message, requestKind);
-      if (draftVersion.current === submittedVersion) {
-        setInput("");
-        setIntent(null);
-      }
+      drafts.clearIfUnchanged(session.id, submitted);
       bottom.current = true;
       inputRef.current?.focus();
     } finally {
@@ -112,12 +110,12 @@ export default function Chat({
     if (workflowLock.current || lock.current || busy) return;
     workflowLock.current = true;
     setWorkflowSaving(true);
-    const previous = workflow;
     setWorkflow(value);
     try {
       await onWorkflow(value);
     } catch {
-      setWorkflow(previous);
+      // On unlock the effect restores the latest server choice. The workspace
+      // reports failures; an older captured choice must not hide newer state.
     } finally {
       workflowLock.current = false;
       setWorkflowSaving(false);
@@ -198,8 +196,7 @@ export default function Chat({
                     key={text}
                     disabled={navigating}
                     onClick={() => {
-                      draftVersion.current++;
-                      setInput(text);
+                      updateDraft({ text });
                     }}
                   >
                     <span>0{i + 1}</span>
@@ -282,8 +279,7 @@ export default function Chat({
             disabled={navigating}
             value={input}
             onChange={(e) => {
-              draftVersion.current++;
-              setInput(e.target.value);
+              updateDraft({ text: e.target.value });
             }}
             onCompositionStart={() => {
               composing.current = true;
@@ -317,8 +313,7 @@ export default function Chat({
                 value={requestKind}
                 disabled={busy}
                 onChange={(e) => {
-                  draftVersion.current++;
-                  setIntent(e.target.value);
+                  updateDraft({ intent: e.target.value });
                 }}
               >
                 <option value="question" disabled={!session?.has_task}>

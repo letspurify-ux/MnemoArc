@@ -6,6 +6,7 @@ import { Message } from "./chat/Message.jsx";
 import { api, download, send, statusLabel, toolLabels } from "./api.js";
 import { mergeSession, mergeOlder } from "./session-history.js";
 import { useServerDraft } from "./use-server-draft.js";
+import { createComposerDrafts } from "./composer-drafts.js";
 
 const DEFAULT_INSPECTOR_WIDTH = 295;
 const MIN_INSPECTOR_WIDTH = 240;
@@ -31,6 +32,7 @@ function loadInspectorWidth() {
 }
 
 export default function App() {
+  const [drafts] = useState(createComposerDrafts);
   const [state, setState] = useState(null),
     [session, setSession] = useState(null),
     [selected, setSelected] = useState(() => window.location.hash.slice(1)),
@@ -40,6 +42,7 @@ export default function App() {
     [detail, setDetail] = useState(true),
     [mobileNav, setMobileNav] = useState(false),
     [navigating, setNavigating] = useState(false),
+    [runPending, setRunPending] = useState(false),
     [workflowPending, setWorkflowPending] = useState(new Set()),
     [stopped, setStopped] = useState(false),
     [stopping, setStopping] = useState(false),
@@ -54,6 +57,7 @@ export default function App() {
     projectsDirty = useRef(false),
     inspectorDirty = useRef(false),
     creating = useRef(false),
+    startingRun = useRef(false),
     navigationEpoch = useRef(0),
     selectionEpoch = useRef(0);
   const onSettingsDirtyChange = useCallback((dirty) => {
@@ -65,74 +69,83 @@ export default function App() {
   const onInspectorDirtyChange = useCallback((dirty) => {
     inspectorDirty.current = dirty;
   }, []);
-  const refresh = useCallback(async (restart = false) => {
+  const refresh = useCallback((restart = false) => {
+    if (!alive.current) return Promise.resolve();
     if (fetching.current) {
       if (!restart) {
         pending.current = true;
-        return;
+        return fetching.current.done;
       }
-      fetching.current.abort();
+      fetching.current.controller.abort();
     }
     const controller = new AbortController();
-    fetching.current = controller;
+    const request = { controller, done: null };
+    fetching.current = request;
     pending.current = false;
     clearTimeout(timer.current);
     timer.current = null;
     const epoch = selectionEpoch.current;
-    const isCurrent = () => alive.current && fetching.current === controller &&
+    const isCurrent = () => alive.current && fetching.current === request &&
       selectionEpoch.current === epoch && !controller.signal.aborted;
     let timedOut = false;
     const deadline = setTimeout(() => {
       timedOut = true;
       controller.abort();
     }, 15000);
-    try {
-      const next = await api("/state", { signal: controller.signal });
-      if (!isCurrent()) return;
-      setState(next);
-      let id = selection.current;
-      if (!next.sessions.some((s) => s.id === id)) {
-        id = next.sessions[0]?.id || "";
-        selection.current = id;
-        setSelected(id);
-        setSession(null);
-        window.history.replaceState(
-          null,
-          "",
-          id ? `#${id}` : window.location.pathname + window.location.search,
-        );
-      }
-      if (id) {
-        const current = await api(`/sessions/${id}`, { signal: controller.signal });
-        if (
-          isCurrent() &&
-          selection.current === id &&
-          current.revision >= (versions.current.get(id) || 0)
-        ) {
-          versions.current.set(id, current.revision);
-          setSession((old) => mergeSession(old, current));
+    request.done = (async () => {
+      try {
+        const next = await api("/state", { signal: controller.signal });
+        if (isCurrent()) {
+          setState(next);
+          drafts.retain(next.sessions.map((session) => session.id));
+          let id = selection.current;
+          if (!next.sessions.some((s) => s.id === id)) {
+            id = next.sessions[0]?.id || "";
+            selection.current = id;
+            setSelected(id);
+            setSession(null);
+            window.history.replaceState(
+              null,
+              "",
+              id ? `#${id}` : window.location.pathname + window.location.search,
+            );
+          }
+          if (id) {
+            const current = await api(`/sessions/${id}`, { signal: controller.signal });
+            if (
+              isCurrent() &&
+              selection.current === id &&
+              current.revision >= (versions.current.get(id) || 0)
+            ) {
+              versions.current.set(id, current.revision);
+              setSession((old) => mergeSession(old, current));
+            }
+          } else setSession(null);
         }
-      } else setSession(null);
-    } catch (e) {
-      if (alive.current && fetching.current === controller && selectionEpoch.current === epoch) {
-        if (timedOut) setError("작업 공간 응답이 지연되고 있습니다. 다시 연결을 시도합니다.");
-        else if (!controller.signal.aborted) setError(e.message);
-      }
-    } finally {
-      clearTimeout(deadline);
-      // A cancelled request must not release the newer request's lock or timer.
-      if (fetching.current === controller) {
-        fetching.current = null;
-        if (pending.current && alive.current) {
-          pending.current = false;
-          timer.current = setTimeout(() => {
-            timer.current = null;
-            void refresh();
-          }, 120);
+      } catch (e) {
+        if (alive.current && fetching.current === request && selectionEpoch.current === epoch) {
+          if (timedOut) setError("작업 공간 응답이 지연되고 있습니다. 다시 연결을 시도합니다.");
+          else if (!controller.signal.aborted) setError(e.message);
+        }
+      } finally {
+        clearTimeout(deadline);
+        if (fetching.current === request) {
+          fetching.current = null;
+          if (pending.current && alive.current) {
+            pending.current = false;
+            timer.current = setTimeout(() => {
+              timer.current = null;
+              void refresh();
+            }, 120);
+          }
         }
       }
-    }
-  }, []);
+      // Cancellation alone is not completion for an action awaiting fresh state.
+      const replacement = fetching.current;
+      if (replacement && replacement !== request) await replacement.done;
+    })();
+    return request.done;
+  }, [drafts]);
   useEffect(() => {
     if (stopped) return;
     alive.current = true;
@@ -153,7 +166,7 @@ export default function App() {
     const poll = setInterval(() => void refresh(), 3000);
     return () => {
       alive.current = false;
-      fetching.current?.abort();
+      fetching.current?.controller.abort();
       fetching.current = null;
       pending.current = false;
       stream.close();
@@ -172,13 +185,13 @@ export default function App() {
   }, [inspectorWidth]);
   useEffect(() => {
     const warnBeforeUnload = (event) => {
-      if (!settingsDirty.current && !projectsDirty.current && !inspectorDirty.current) return;
+      if (!settingsDirty.current && !projectsDirty.current && !inspectorDirty.current && !drafts.hasText()) return;
       event.preventDefault();
       event.returnValue = "";
     };
     window.addEventListener("beforeunload", warnBeforeUnload);
     return () => window.removeEventListener("beforeunload", warnBeforeUnload);
-  }, []);
+  }, [drafts]);
   function canLeavePage() {
     const dirty =
       (page === "settings" && settingsDirty.current) ||
@@ -227,6 +240,17 @@ export default function App() {
   const safe = (fn) => () => {
     void act(fn).catch(() => {});
   };
+  async function runSession(id, text, action) {
+    if (startingRun.current) throw new Error("실행 요청을 처리하고 있습니다.");
+    startingRun.current = true;
+    setRunPending(true);
+    try {
+      return await act(() => send(`/sessions/${id}/run`, { text, action }));
+    } finally {
+      startingRun.current = false;
+      setRunPending(false);
+    }
+  }
   async function changeWorkflow(id, workflow) {
     setWorkflowPending((current) => new Set([...current, id]));
     try {
@@ -253,10 +277,10 @@ export default function App() {
     }
   }
   async function closeSession(id) {
-    const unsaved = id === selected && (settingsDirty.current || inspectorDirty.current);
+    const unsaved = drafts.get(id).text.trim() || (id === selected && (settingsDirty.current || inspectorDirty.current));
     if (
       !window.confirm(
-        `이 세션을 닫을까요? 대화와 기억은 사라지고 결과 문서는 유지됩니다.${unsaved ? " 저장하지 않은 설정도 사라집니다." : ""}`,
+        `이 세션을 닫을까요? 대화와 기억은 사라지고 결과 문서는 유지됩니다.${unsaved ? " 저장하지 않은 변경 사항도 사라집니다." : ""}`,
       )
     )
       return;
@@ -265,13 +289,14 @@ export default function App() {
   async function shutdown() {
     if (
       !window.confirm(
-        `진행 중인 작업을 중지하고 앱을 종료할까요? 저장된 문서는 유지되며 세션과 기억은 사라집니다.${settingsDirty.current || projectsDirty.current || inspectorDirty.current ? " 저장하지 않은 변경 사항도 사라집니다." : ""}`,
+        `진행 중인 작업을 중지하고 앱을 종료할까요? 저장된 문서는 유지되며 세션과 기억은 사라집니다.${settingsDirty.current || projectsDirty.current || inspectorDirty.current || drafts.hasText() ? " 저장하지 않은 변경 사항도 사라집니다." : ""}`,
       )
     )
       return;
     setStopping(true);
     try {
       await send("/shutdown", {});
+      drafts.retain([]);
       setStopped(true);
     } catch (e) {
       setError(e.message);
@@ -488,19 +513,15 @@ export default function App() {
                 <div className="session-actions">
                   <button
                     title="보존된 상태로 재개"
-                    disabled={navigating || workflowPending.has(selected) || Boolean(state.running) || !canRun}
-                    onClick={safe(() =>
-                      send(`/sessions/${selected}/run`, { action: "resume" }),
-                    )}
+                    disabled={navigating || runPending || workflowPending.has(selected) || Boolean(state.running) || !canRun}
+                    onClick={() => void runSession(selected, undefined, "resume").catch(() => {})}
                   >
                     재개
                   </button>
                   <button
                     title="기억과 상태 정리"
-                    disabled={navigating || workflowPending.has(selected) || Boolean(state.running) || !canRun}
-                    onClick={safe(() =>
-                      send(`/sessions/${selected}/run`, { action: "cleanup" }),
-                    )}
+                    disabled={navigating || runPending || workflowPending.has(selected) || Boolean(state.running) || !canRun}
+                    onClick={() => void runSession(selected, undefined, "cleanup").catch(() => {})}
                   >
                     기억 정리
                   </button>
@@ -524,11 +545,12 @@ export default function App() {
               <Chat
                 key={session.id}
                 session={session}
-                busy={navigating || workflowPending.has(session.id) || Boolean(state.running)}
+                drafts={drafts}
+                busy={navigating || runPending || workflowPending.has(session.id) || Boolean(state.running)}
                 navigating={navigating}
                 canRun={canRun}
                 onSend={(text, action) =>
-                  act(() => send(`/sessions/${selected}/run`, { text, action }))
+                  runSession(session.id, text, action)
                 }
                 onWorkflow={(workflow) => changeWorkflow(session.id, workflow)}
                 onCancel={safe(() => send(`/sessions/${selected}/cancel`, {}))}
@@ -863,8 +885,8 @@ function Inspector({
   const projectSavingRef = useRef(false), mounted = useRef(true);
   const activeToolsKey = JSON.stringify(session.active_tools);
   useEffect(() => {
-    setToolSelection(JSON.parse(activeToolsKey));
-  }, [activeToolsKey]);
+    if (!toolsSaving) setToolSelection(JSON.parse(activeToolsKey));
+  }, [activeToolsKey, toolsSaving]);
   const [tab, setTab] = useState("memory"),
     [query, setQuery] = useState(""),
     [memoryId, setMemoryId] = useState(null),
@@ -1263,7 +1285,7 @@ function Inspector({
                         "PUT",
                       ),
                     )
-                      .catch(() => setToolSelection(session.active_tools))
+                      .catch(() => {})
                       .finally(() => setToolsSaving(false));
                   }}
                 />
