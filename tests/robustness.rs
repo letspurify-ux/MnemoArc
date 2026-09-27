@@ -445,7 +445,7 @@ async fn run_deadline_unblocks_initial_snapshot_without_user_cancellation() {
     .await
     .expect("run deadline must also bound snapshot delivery");
     assert_eq!(result.status, "blocked");
-    assert!(result.last_error.unwrap().contains("budget_exhausted"));
+    assert!(result.last_error.unwrap().contains("run_timeout"));
 }
 
 #[tokio::test]

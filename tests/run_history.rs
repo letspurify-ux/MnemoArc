@@ -168,3 +168,35 @@ async fn cancellation_and_timeouts_have_distinct_records() {
         assert_eq!(record.timeout_secs, 1);
     }
 }
+
+#[tokio::test]
+async fn saved_document_timeout_reports_time_as_the_closing_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = fixture(dir.path());
+    s.select_workflow("document_edit").unwrap();
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Result\nSaved draft.\n"}),
+    )
+    .unwrap();
+    s.task.unresolved.push("Missing evidence".into());
+    s.config.run_timeout_secs = 1;
+    let (tx, _rx) = mpsc::channel(1);
+    tx.send(AgentEvent::Notice {
+        session: s.id.clone(),
+        text: "fill event queue".into(),
+    })
+    .await
+    .unwrap();
+    let result = run_session(s, Arc::new(Reply::Wait), CancellationToken::new(), tx).await;
+    assert_eq!(result.status, "complete_with_gaps");
+    assert_eq!(result.run_history.back().unwrap().reason, "run_timeout");
+    let final_text = &result.history.bundles.back().unwrap().messages[0]["content"];
+    assert!(
+        final_text
+            .as_str()
+            .unwrap()
+            .contains("실행 시간이 끝나 마감했습니다.")
+    );
+}

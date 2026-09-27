@@ -1908,3 +1908,95 @@ async fn changing_bad_arguments_and_unrelated_writes_cannot_evade_recovery_limit
     assert_eq!(result.memory.entries.len(), 0);
     assert_eq!(result.task.findings, ["round 2"]); // No later writes after terminal failure.
 }
+
+struct TwoEditsWithOldHash {
+    hash: String,
+    second_has_hash: bool,
+    round: Mutex<usize>,
+}
+
+#[async_trait]
+impl LlmClient for TwoEditsWithOldHash {
+    async fn complete(
+        &self,
+        _: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let mut round = self.round.lock().unwrap();
+        *round += 1;
+        if *round > 1 {
+            anyhow::bail!("stop_after_edit_batch");
+        }
+        Ok(Completion {
+            calls: ["First", "Second"]
+                .iter()
+                .enumerate()
+                .map(|(index, word)| {
+                    let mut args = json!({"action":"append","text":format!("{word}.\n")});
+                    if index == 0 || self.second_has_hash {
+                        args["expected_hash"] = json!(self.hash);
+                    }
+                    ToolCall {
+                        id: format!("append-{word}"),
+                        name: "document_edit".into(),
+                        arguments: args.to_string(),
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn document_edits_preserve_explicit_hash_and_recover_omitted_hash() {
+    for second_has_hash in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = s(dir.path());
+        session.select_workflow("document_edit").unwrap();
+        session.config.source_document_review = false;
+        session.config.completion_review_enabled = false;
+        session.add_user("Append to the document".into());
+        let created = mnemoarc::tools::execute(
+            &mut session,
+            "document_edit",
+            json!({"action":"create","text":"# Result\nOriginal.\n"}),
+        )
+        .unwrap();
+        let model = Arc::new(TwoEditsWithOldHash {
+            hash: created["hash"].as_str().unwrap().into(),
+            second_has_hash,
+            round: Mutex::new(0),
+        });
+        let (tx, mut rx) = mpsc::channel(128);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let result = run_session(session, model, CancellationToken::new(), tx).await;
+        drain.await.unwrap();
+        let document = std::fs::read_to_string(dir.path().join("docs/source-summary.md")).unwrap();
+        assert!(document.contains("First."));
+        assert_eq!(document.contains("Second."), !second_has_hash);
+        let tools: Vec<Value> = result
+            .history
+            .bundles
+            .iter()
+            .flat_map(|bundle| &bundle.messages)
+            .filter(|message| message["role"] == "tool")
+            .map(|message| serde_json::from_str(message["content"].as_str().unwrap()).unwrap())
+            .collect();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["status"], "ok");
+        if second_has_hash {
+            assert!(
+                tools[1]["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("document_revision_conflict")
+            );
+        } else {
+            assert_eq!(tools[1]["status"], "ok");
+            assert_eq!(tools[1]["data"]["batch_rebased"], true);
+        }
+    }
+}

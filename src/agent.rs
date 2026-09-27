@@ -336,6 +336,7 @@ const REVIEW_UNAVAILABLE_NOTICE: &str = "검토 응답이 반복해서 형식에
 fn finish_cause_text(cause: &str) -> &'static str {
     match cause {
         "run_budget_exhausted" => "실행 예산이 소진되어 마감했습니다.",
+        "run_timeout" => "실행 시간이 끝나 마감했습니다.",
         "closing_round_limit" => "마감 단계의 요청 한도에 도달해 마감했습니다.",
         "budget" => "마감 예산에 도달해 마감했습니다.",
         "stall" => "진행이 오래 멈춰 마감했습니다.",
@@ -841,18 +842,19 @@ fn rebase_document_call(call: &ToolCall, hash: Option<&str>) -> (ToolCall, bool)
     // edit in this response, but an explicitly supplied non-string value is
     // malformed input and must still reach normal schema validation. Treating
     // null/numbers as omitted would silently turn a bad call into a write.
-    let expected_hash = match object.get("expected_hash") {
-        None => None,
-        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.as_str()),
-        Some(Value::String(_)) => return (call.clone(), false),
-        Some(_) => return (call.clone(), false),
-    };
+    // An explicit hash is the model's optimistic-lock precondition. Even if
+    // an earlier call in this response changed the document, never replace
+    // that precondition: the second edit may have been planned for the old
+    // version and must get a revision conflict instead of silently applying.
+    if object.contains_key("expected_hash") {
+        return (call.clone(), false);
+    }
     // A create call intentionally has no revision precondition: rebasing it
     // would turn its useful document_exists error into a less meaningful
     // stale-hash error. A first write on a missing file, however, may be
     // followed by another write in the same response, so fill its now
     // required precondition just like append/patch/section calls.
-    if action == "create" || expected_hash == Some(hash) {
+    if action == "create" {
         return (call.clone(), false);
     }
     // Every other edit targets the current document. If the model omitted
@@ -1121,13 +1123,13 @@ pub async fn run_session_controlled(
             } else {
                 "run_budget_exhausted"
             };
-            if let Some(text) = force_finish(&mut s, "run_budget_exhausted") {
+            if let Some(text) = force_finish(&mut s, reason) {
                 s.set_run_stop_reason(reason);
                 publish_final(&mut s, text, &events, &cancel, started).await;
                 break;
             }
             s.set_run_stop_reason(reason);
-            failure = Some("run_budget_exhausted: partial results and memory retained".into());
+            failure = Some(format!("{reason}: partial results and memory retained"));
             break;
         }
         if !s.config.source_document_review {
