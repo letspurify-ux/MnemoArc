@@ -101,8 +101,10 @@ test("stale refresh does not replace a newly created session", async ({ page, re
 
   let releaseState;
   let sawState;
+  let deliveredState;
   const held = new Promise((resolve) => { releaseState = resolve; });
   const stateRequested = new Promise((resolve) => { sawState = resolve; });
+  const stateDelivered = new Promise((resolve) => { deliveredState = resolve; });
   let intercept = true;
   await page.route("**/api/state", async (route) => {
     if (intercept) {
@@ -110,6 +112,7 @@ test("stale refresh does not replace a newly created session", async ({ page, re
       sawState();
       await held;
       await route.fulfill({ json: stale, headers: { "X-Review-Stale": "yes" } });
+      deliveredState();
     } else {
       await route.continue();
     }
@@ -127,12 +130,10 @@ test("stale refresh does not replace a newly created session", async ({ page, re
     return id && id !== initialId && id !== externalId ? id : null;
   }).not.toBeNull();
   const createdId = await page.evaluate(() => location.hash.slice(1));
-  const staleResponse = page.waitForResponse((response) =>
-    response.url().endsWith("/api/state") &&
-    response.headers()["x-review-stale"] === "yes",
-  );
   releaseState();
-  await staleResponse;
+  // Navigation may abort the obsolete fetch, which has no response event.
+  // Wait for the fixture to finish delivering it before checking selection.
+  await stateDelivered;
   await page.evaluate(() => new Promise((resolve) =>
     requestAnimationFrame(() => requestAnimationFrame(resolve)),
   ));

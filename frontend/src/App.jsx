@@ -4,6 +4,8 @@ import RunHistory from "./RunHistory.jsx";
 import Settings, { ProjectForm, cleanProject } from "./Settings.jsx";
 import { Message } from "./chat/Message.jsx";
 import { api, download, send, statusLabel, toolLabels } from "./api.js";
+import { mergeSession, mergeOlder } from "./session-history.js";
+import { useServerDraft } from "./use-server-draft.js";
 
 const DEFAULT_INSPECTOR_WIDTH = 295;
 const MIN_INSPECTOR_WIDTH = 240;
@@ -38,17 +40,21 @@ export default function App() {
     [detail, setDetail] = useState(true),
     [mobileNav, setMobileNav] = useState(false),
     [navigating, setNavigating] = useState(false),
+    [workflowPending, setWorkflowPending] = useState(new Set()),
     [stopped, setStopped] = useState(false),
     [stopping, setStopping] = useState(false),
     [inspectorWidth, setInspectorWidth] = useState(loadInspectorWidth);
   const selection = useRef(selected),
-    fetching = useRef(false),
+    fetching = useRef(null),
     pending = useRef(false),
     timer = useRef(null),
     alive = useRef(true),
     versions = useRef(new Map()),
     settingsDirty = useRef(false),
     projectsDirty = useRef(false),
+    inspectorDirty = useRef(false),
+    creating = useRef(false),
+    navigationEpoch = useRef(0),
     selectionEpoch = useRef(0);
   const onSettingsDirtyChange = useCallback((dirty) => {
     settingsDirty.current = dirty;
@@ -56,26 +62,40 @@ export default function App() {
   const onProjectsDirtyChange = useCallback((dirty) => {
     projectsDirty.current = dirty;
   }, []);
-  const refresh = useCallback(async () => {
+  const onInspectorDirtyChange = useCallback((dirty) => {
+    inspectorDirty.current = dirty;
+  }, []);
+  const refresh = useCallback(async (restart = false) => {
     if (fetching.current) {
-      pending.current = true;
-      return;
-    }
-    fetching.current = true;
-    const epoch = selectionEpoch.current;
-    try {
-      const next = await api("/state");
-      if (!alive.current) return;
-      if (selectionEpoch.current !== epoch) {
+      if (!restart) {
         pending.current = true;
         return;
       }
+      fetching.current.abort();
+    }
+    const controller = new AbortController();
+    fetching.current = controller;
+    pending.current = false;
+    clearTimeout(timer.current);
+    timer.current = null;
+    const epoch = selectionEpoch.current;
+    const isCurrent = () => alive.current && fetching.current === controller &&
+      selectionEpoch.current === epoch && !controller.signal.aborted;
+    let timedOut = false;
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 15000);
+    try {
+      const next = await api("/state", { signal: controller.signal });
+      if (!isCurrent()) return;
       setState(next);
       let id = selection.current;
       if (!next.sessions.some((s) => s.id === id)) {
         id = next.sessions[0]?.id || "";
         selection.current = id;
         setSelected(id);
+        setSession(null);
         window.history.replaceState(
           null,
           "",
@@ -83,42 +103,33 @@ export default function App() {
         );
       }
       if (id) {
-        const current = await api(`/sessions/${id}`);
+        const current = await api(`/sessions/${id}`, { signal: controller.signal });
         if (
-          alive.current &&
+          isCurrent() &&
           selection.current === id &&
           current.revision >= (versions.current.get(id) || 0)
         ) {
           versions.current.set(id, current.revision);
-          setSession((old) => {
-            // Keep explicitly loaded older pages across live refreshes.
-            const before =
-              old?.id === id
-                ? old.bundles.filter(
-                    (b) =>
-                      b.id < (current.bundles[0]?.id || 0) &&
-                      (!current.pruned_through ||
-                        b.id > current.pruned_through),
-                  )
-                : [];
-            return {
-              ...current,
-              bundles: [...before, ...current.bundles],
-              previous: before.length ? old.previous : current.previous,
-            };
-          });
+          setSession((old) => mergeSession(old, current));
         }
       } else setSession(null);
     } catch (e) {
-      if (alive.current) setError(e.message);
+      if (alive.current && fetching.current === controller && selectionEpoch.current === epoch) {
+        if (timedOut) setError("작업 공간 응답이 지연되고 있습니다. 다시 연결을 시도합니다.");
+        else if (!controller.signal.aborted) setError(e.message);
+      }
     } finally {
-      fetching.current = false;
-      if (pending.current && alive.current) {
-        pending.current = false;
-        timer.current = setTimeout(() => {
-          timer.current = null;
-          void refresh();
-        }, 120);
+      clearTimeout(deadline);
+      // A cancelled request must not release the newer request's lock or timer.
+      if (fetching.current === controller) {
+        fetching.current = null;
+        if (pending.current && alive.current) {
+          pending.current = false;
+          timer.current = setTimeout(() => {
+            timer.current = null;
+            void refresh();
+          }, 120);
+        }
       }
     }
   }, []);
@@ -142,9 +153,13 @@ export default function App() {
     const poll = setInterval(() => void refresh(), 3000);
     return () => {
       alive.current = false;
+      fetching.current?.abort();
+      fetching.current = null;
+      pending.current = false;
       stream.close();
       clearInterval(poll);
       clearTimeout(timer.current);
+      timer.current = null;
     };
   }, [refresh, stopped]);
   useEffect(() => {
@@ -155,19 +170,40 @@ export default function App() {
       // resizing the panel for the current page.
     }
   }, [inspectorWidth]);
+  useEffect(() => {
+    const warnBeforeUnload = (event) => {
+      if (!settingsDirty.current && !projectsDirty.current && !inspectorDirty.current) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, []);
   function canLeavePage() {
     const dirty =
       (page === "settings" && settingsDirty.current) ||
-      (page === "projects" && projectsDirty.current);
+      (page === "projects" && projectsDirty.current) ||
+      (page === "chat" && inspectorDirty.current);
     return !dirty || window.confirm("저장하지 않은 변경 사항을 버리고 이동할까요?");
   }
   function showPage(next) {
     if (next !== page && !canLeavePage()) return;
+    if (next !== page) navigationEpoch.current++;
     setPage(next);
     setMobileNav(false);
   }
   function choose(id, confirmed = false) {
+    if (page === "chat" && id === selection.current && session?.id === id) {
+      setMobileNav(false);
+      return;
+    }
     if (!confirmed && !canLeavePage()) return;
+    navigationEpoch.current++;
+    if (id === selection.current && session?.id === id) {
+      setPage("chat");
+      setMobileNav(false);
+      return;
+    }
     selectionEpoch.current++;
     selection.current = id;
     window.history.replaceState(null, "", `#${id}`);
@@ -175,7 +211,7 @@ export default function App() {
     setSession(null);
     setPage("chat");
     setMobileNav(false);
-    void refresh();
+    void refresh(true);
   }
   async function act(fn) {
     setError("");
@@ -185,26 +221,39 @@ export default function App() {
       setError(e.message);
       throw e;
     } finally {
-      void refresh();
+      await refresh(true);
     }
   }
   const safe = (fn) => () => {
     void act(fn).catch(() => {});
   };
+  async function changeWorkflow(id, workflow) {
+    setWorkflowPending((current) => new Set([...current, id]));
+    try {
+      return await act(() => send(`/sessions/${id}/workflow`, { workflow }, "PUT"));
+    } finally {
+      setWorkflowPending((current) => {
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
+    }
+  }
   async function create(project) {
-    if (!canLeavePage()) return;
-    setPage("chat");
-    setMobileNav(false);
+    if (creating.current || !canLeavePage()) return;
+    creating.current = true;
+    const navigation = navigationEpoch.current;
     setNavigating(true);
     try {
       const data = await send("/sessions", { project });
-      choose(data.id, true);
+      if (navigationEpoch.current === navigation) choose(data.id, true);
     } finally {
+      creating.current = false;
       setNavigating(false);
     }
   }
   async function closeSession(id) {
-    const unsaved = id === selected && page === "settings" && settingsDirty.current;
+    const unsaved = id === selected && (settingsDirty.current || inspectorDirty.current);
     if (
       !window.confirm(
         `이 세션을 닫을까요? 대화와 기억은 사라지고 결과 문서는 유지됩니다.${unsaved ? " 저장하지 않은 설정도 사라집니다." : ""}`,
@@ -216,7 +265,7 @@ export default function App() {
   async function shutdown() {
     if (
       !window.confirm(
-        `진행 중인 작업을 중지하고 앱을 종료할까요? 저장된 문서는 유지되며 세션과 기억은 사라집니다.${page === "settings" && settingsDirty.current ? " 저장하지 않은 설정도 사라집니다." : ""}`,
+        `진행 중인 작업을 중지하고 앱을 종료할까요? 저장된 문서는 유지되며 세션과 기억은 사라집니다.${settingsDirty.current || projectsDirty.current || inspectorDirty.current ? " 저장하지 않은 변경 사항도 사라집니다." : ""}`,
       )
     )
       return;
@@ -259,7 +308,7 @@ export default function App() {
           onClick={safe(() =>
             create(current?.project || state.config.projects[0]),
           )}
-          disabled={!state?.config.projects.length}
+          disabled={navigating || !state?.config.projects.length}
         >
           <span>＋</span>새 세션
         </button>
@@ -279,6 +328,7 @@ export default function App() {
               <button
                 className="project-heading"
                 title={project.root}
+                disabled={navigating}
                 onClick={safe(() => create(project))}
               >
                 <span>▱</span>
@@ -379,7 +429,10 @@ export default function App() {
                   title="상세 패널 표시"
                   aria-label="상세 패널 표시"
                   aria-pressed={detail}
-                  onClick={() => setDetail(!detail)}
+                  onClick={() => {
+                    if (detail && inspectorDirty.current && !canLeavePage()) return;
+                    setDetail(!detail);
+                  }}
                 >
                   ☷
                 </button>
@@ -405,18 +458,19 @@ export default function App() {
             sessionCredential={session?.credential_configured}
             sessionConfig={session?.pending_config || session?.config}
             sessionId={session?.id}
-            onSaved={refresh}
+            onSaved={() => refresh(true)}
             onClose={() => showPage("chat")}
             onDirtyChange={onSettingsDirtyChange}
           />
         ) : page === "projects" ? (
           <Projects
             config={state.config}
-            onSaved={refresh}
+            onSaved={() => refresh(true)}
             onDirtyChange={onProjectsDirtyChange}
             onCreate={(project) => act(() => create(project))}
+            creating={navigating}
           />
-        ) : session && !navigating ? (
+        ) : session ? (
           <div
             className={`workarea ${detail ? "with-details" : ""}`}
             style={
@@ -434,7 +488,7 @@ export default function App() {
                 <div className="session-actions">
                   <button
                     title="보존된 상태로 재개"
-                    disabled={Boolean(state.running) || !canRun}
+                    disabled={navigating || workflowPending.has(selected) || Boolean(state.running) || !canRun}
                     onClick={safe(() =>
                       send(`/sessions/${selected}/run`, { action: "resume" }),
                     )}
@@ -443,7 +497,7 @@ export default function App() {
                   </button>
                   <button
                     title="기억과 상태 정리"
-                    disabled={Boolean(state.running) || !canRun}
+                    disabled={navigating || workflowPending.has(selected) || Boolean(state.running) || !canRun}
                     onClick={safe(() =>
                       send(`/sessions/${selected}/run`, { action: "cleanup" }),
                     )}
@@ -470,36 +524,22 @@ export default function App() {
               <Chat
                 key={session.id}
                 session={session}
-                busy={Boolean(state.running)}
+                busy={navigating || workflowPending.has(session.id) || Boolean(state.running)}
+                navigating={navigating}
                 canRun={canRun}
                 onSend={(text, action) =>
                   act(() => send(`/sessions/${selected}/run`, { text, action }))
                 }
-                onWorkflow={(workflow) =>
-                  act(() =>
-                    send(`/sessions/${selected}/workflow`, { workflow }, "PUT"),
-                  )
-                }
+                onWorkflow={(workflow) => changeWorkflow(session.id, workflow)}
                 onCancel={safe(() => send(`/sessions/${selected}/cancel`, {}))}
                 onSettings={() => showPage("settings")}
-                onOlder={safe(async () => {
+                onOlder={() => act(async () => {
+                  const epoch = selectionEpoch.current;
                   const older = await api(
                     `/sessions/${selected}?before=${session.previous}`,
                   );
-                  if (selection.current === older.id)
-                    setSession((old) => {
-                      if (!old || old.id !== older.id) return old;
-                      const byId = new Map();
-                      for (const bundle of older.bundles) byId.set(bundle.id, bundle);
-                      // Prefer the live response for overlapping IDs because it
-                      // carries the newest active/reviewed flags.
-                      for (const bundle of old.bundles) byId.set(bundle.id, bundle);
-                      return {
-                        ...old,
-                        bundles: [...byId.values()].sort((a, b) => a.id - b.id),
-                        previous: older.previous,
-                      };
-                    });
+                  if (selection.current === older.id && selectionEpoch.current === epoch)
+                    setSession((old) => mergeOlder(old, older));
                 })}
               />
             </div>
@@ -510,6 +550,8 @@ export default function App() {
                 tools={state.tools}
                 running={state.running}
                 onAction={act}
+                onProjectDirtyChange={onInspectorDirtyChange}
+                navigating={navigating}
                 width={inspectorWidth}
                 onWidthChange={(next) =>
                   setInspectorWidth(clampInspectorWidth(next))
@@ -566,7 +608,7 @@ function SessionButton({ session, active, onClick, onClose, closing }) {
     </div>
   );
 }
-function Projects({ config, onSaved, onCreate, onDirtyChange }) {
+function Projects({ config, onSaved, onCreate, onDirtyChange, creating }) {
   const empty = {
     name: "새 프로젝트",
     root: "",
@@ -576,18 +618,32 @@ function Projects({ config, onSaved, onCreate, onDirtyChange }) {
     purpose: "프로젝트 구조, 주요 흐름과 오류 처리를 소스 근거와 함께 설명",
     audience: "신규 개발자",
   };
-  const [list, setList] = useState(() => structuredClone(config.projects)),
-    [index, setIndex] = useState(0),
+  const [list, setList, markSaved] = useServerDraft(config.projects);
+  const [index, setIndex] = useState(0),
     [error, setError] = useState(""),
     [message, setMessage] = useState(""),
     [busy, setBusy] = useState(false),
-    [dirty, setDirty] = useState(false);
+    [dirty, setDirtyState] = useState(false);
+  const draftVersion = useRef(0), saving = useRef(false), mounted = useRef(true);
+  if (index >= list.length && index !== 0) setIndex(0);
+  function setDirty(value) {
+    if (!mounted.current) return;
+    if (value) draftVersion.current++;
+    setDirtyState(value);
+    onDirtyChange(value);
+  }
   useEffect(() => {
-    onDirtyChange(dirty);
-    return () => onDirtyChange(false);
-  }, [dirty, onDirtyChange]);
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      onDirtyChange(false);
+    };
+  }, [onDirtyChange]);
   const project = list[index];
   async function save() {
+    if (saving.current) return;
+    saving.current = true;
+    const submittedVersion = draftVersion.current;
     setBusy(true);
     setError("");
     try {
@@ -596,12 +652,16 @@ function Projects({ config, onSaved, onCreate, onDirtyChange }) {
         { config: { ...config, projects: list.map(cleanProject) } },
         "PUT",
       );
-      setMessage("프로젝트를 저장했습니다. 새 세션에 적용됩니다.");
-      setDirty(false);
+      markSaved(list);
+      const unchanged = submittedVersion === draftVersion.current;
+      setMessage("프로젝트를 저장했습니다. 새 세션에 적용됩니다." +
+        (unchanged ? "" : " 이후 변경 사항은 아직 저장하지 않았습니다."));
+      if (unchanged) setDirty(false);
       await onSaved();
     } catch (e) {
       setError(e.message);
     } finally {
+      saving.current = false;
       setBusy(false);
     }
   }
@@ -615,6 +675,7 @@ function Projects({ config, onSaved, onCreate, onDirtyChange }) {
         </div>
         <button
           className="secondary"
+          disabled={creating}
           onClick={() => {
             setList([...list, empty]);
             setIndex(list.length);
@@ -631,6 +692,7 @@ function Projects({ config, onSaved, onCreate, onDirtyChange }) {
               key={i}
               className={i === index ? "active" : ""}
               onClick={() => setIndex(i)}
+              disabled={creating}
             >
               {p.name || "이름 없는 프로젝트"}
             </button>
@@ -640,7 +702,9 @@ function Projects({ config, onSaved, onCreate, onDirtyChange }) {
           {project ? (
             <>
               <ProjectForm
+                key={index}
                 project={project}
+                disabled={creating}
                 onChange={(p) => {
                   setList(list.map((old, i) => (i === index ? p : old)));
                   setDirty(true);
@@ -656,14 +720,14 @@ function Projects({ config, onSaved, onCreate, onDirtyChange }) {
                     setIndex(0);
                     setDirty(true);
                   }}
-                  disabled={list.length <= 1}
+                  disabled={creating || list.length <= 1}
                 >
                   목록에서 삭제
                 </button>
                 <span />
                 <button
                   className="secondary"
-                  disabled={busy}
+                  disabled={busy || creating}
                   onClick={() => {
                     void onCreate(cleanProject(project)).catch((e) =>
                       setError(e.message),
@@ -672,7 +736,7 @@ function Projects({ config, onSaved, onCreate, onDirtyChange }) {
                 >
                   이 프로젝트로 새 세션
                 </button>
-                <button className="primary" disabled={busy} onClick={save}>
+                <button className="primary" disabled={busy || creating} onClick={save}>
                   프로젝트 저장
                 </button>
               </div>
@@ -784,21 +848,98 @@ function Inspector({
   tools,
   running,
   onAction,
+  onProjectDirtyChange,
+  navigating,
   width,
   onWidthChange,
 }) {
   const [toolSelection, setToolSelection] = useState(session.active_tools);
   const [toolsSaving, setToolsSaving] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const [outputLoading, setOutputLoading] = useState(false);
+  const [projectDirty, setProjectDirty] = useState(false);
+  const [projectSaving, setProjectSaving] = useState(false);
+  const [projectMessage, setProjectMessage] = useState("");
+  const projectSavingRef = useRef(false), mounted = useRef(true);
   const activeToolsKey = JSON.stringify(session.active_tools);
   useEffect(() => {
     setToolSelection(JSON.parse(activeToolsKey));
   }, [activeToolsKey]);
   const [tab, setTab] = useState("memory"),
     [query, setQuery] = useState(""),
+    [memoryId, setMemoryId] = useState(null),
     [memory, setMemory] = useState(null),
-    [document, setDocument] = useState(null),
-    [project, setProject] = useState(session.project);
+    [document, setDocument] = useState(null);
+  const [project, setProject, markProjectSaved] = useServerDraft(session.project);
+  const outputKey = JSON.stringify([session.project.root, session.project.output]);
+  const outputRequest = useRef(0), outputIdentity = useRef(outputKey);
+  outputIdentity.current = outputKey;
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      onProjectDirtyChange(false);
+    };
+  }, [onProjectDirtyChange]);
+  useEffect(() => {
+    setDocument(null);
+    setOutputLoading(false);
+    return () => { outputRequest.current++; };
+  }, [outputKey]);
+  async function loadDocument() {
+    const request = ++outputRequest.current;
+    setOutputLoading(true);
+    setDocument(null);
+    try {
+      const next = await api(`/sessions/${session.id}/output`);
+      if (request === outputRequest.current && outputIdentity.current === outputKey)
+        setDocument(next);
+    } catch (error) {
+      if (request === outputRequest.current && outputIdentity.current === outputKey) throw error;
+    } finally {
+      if (request === outputRequest.current) setOutputLoading(false);
+    }
+  }
+  async function saveProject() {
+    if (projectSavingRef.current) return;
+    projectSavingRef.current = true;
+    setProjectSaving(true);
+    setProjectMessage("");
+    try {
+      await send(`/sessions/${session.id}/project`, cleanProject(project), "PUT");
+      markProjectSaved(project);
+      if (mounted.current) {
+        setProjectDirty(false);
+        onProjectDirtyChange(false);
+        setProjectMessage("현재 세션에 적용했습니다.");
+      }
+    } finally {
+      projectSavingRef.current = false;
+      setProjectSaving(false);
+    }
+  }
+  const memoryKey = JSON.stringify(session.memories.find((item) => item.id === memoryId) || null);
+  useEffect(() => {
+    setMemory(null);
+    if (!memoryId) return;
+    if (memoryKey === "null") {
+      setMemoryId(null);
+      return;
+    }
+    let active = true;
+    void onAction(async () => {
+      try {
+        const result = await api(`/sessions/${session.id}/memories/${memoryId}`);
+        if (active) setMemory(result);
+      } catch (error) {
+        if (active) {
+          setMemoryId(null);
+          throw error;
+        }
+      }
+    }).catch(() => {});
+    return () => { active = false; };
+  }, [session.id, memoryId, memoryKey]);
   const doAction = (fn) => () => {
     void onAction(fn).catch(() => {});
   };
@@ -850,7 +991,7 @@ function Inspector({
             />
             {memory ? (
               <article className="memory-detail">
-                <button className="text-button" onClick={() => setMemory(null)}>
+                <button className="text-button" onClick={() => setMemoryId(null)}>
                   ← 목록으로
                 </button>
                 <h3>{memory.title}</h3>
@@ -874,11 +1015,7 @@ function Inspector({
                 <button
                   className="memory-card"
                   key={m.id}
-                  onClick={doAction(async () =>
-                    setMemory(
-                      await api(`/sessions/${session.id}/memories/${m.id}`),
-                    ),
-                  )}
+                  onClick={() => setMemoryId(m.id)}
                 >
                   <div>
                     <strong>{m.title}</strong>
@@ -1178,9 +1315,8 @@ function Inspector({
             <p className="directory-path">{session.project.output}</p>
             <button
               className="secondary"
-              onClick={doAction(async () =>
-                setDocument(await api(`/sessions/${session.id}/output`)),
-              )}
+              disabled={outputLoading}
+              onClick={doAction(loadDocument)}
             >
               문서 불러오기
             </button>
@@ -1233,22 +1369,24 @@ function Inspector({
             </p>
             <ProjectForm
               project={project}
-              onChange={setProject}
-              disabled={running?.id === session.id}
+              onChange={(next) => {
+                if (projectSavingRef.current) return;
+                setProject(next);
+                setProjectDirty(true);
+                onProjectDirtyChange(true);
+                setProjectMessage("");
+              }}
+              disabled={navigating || running?.id === session.id || projectSaving}
             />
             <button
               className="primary"
-              disabled={running?.id === session.id}
-              onClick={doAction(() =>
-                send(
-                  `/sessions/${session.id}/project`,
-                  cleanProject(project),
-                  "PUT",
-                ),
-              )}
+              disabled={navigating || running?.id === session.id || projectSaving}
+              onClick={doAction(saveProject)}
             >
               현재 세션에 적용
             </button>
+            {projectDirty && <p className="subtle">저장하지 않은 변경 사항이 있습니다.</p>}
+            {projectMessage && <p role="status" className="success-message">{projectMessage}</p>}
           </>
         )}
       </div>

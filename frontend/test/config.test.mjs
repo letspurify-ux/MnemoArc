@@ -66,6 +66,12 @@ test("UI units and optional values round trip without silent zeroes", () => {
   assert.equal(parseValue("", "optionalNumber"), null);
   assert.equal(parseValue("", "number"), "");
   assert.equal(parseValue("", "optional"), null);
+  for (const type of ["number", "optionalNumber", "kib", "mib", "percent"])
+    assert.equal(inputValue(parseValue("", type), type), "");
+  assert.equal(parseValue("0.1", "mib"), 104858);
+  assert.equal(parseValue("0.1", "kib"), 102);
+  for (const bytes of [1, 102, 104858, 16777217])
+    assert.equal(parseValue(inputValue(bytes, "mib"), "mib"), bytes);
 });
 test("reused chat preserves unicode and blocks executable links", () => {
   assert.equal(sliceSafe("a😀b", 2), "a");

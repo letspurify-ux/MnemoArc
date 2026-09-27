@@ -13,6 +13,7 @@ import { PreviewPre } from './preview.js';
 // 답변 속 주소를 어떻게 다룰지의 판정은 markdown.js에 있다 (순수 함수라 회귀 테스트가 붙는다).
 import { linkTarget, imageTarget, mdProps, scopeMarkdownIds } from './markdown.js';
 import InlineMath from './InlineMath.jsx';
+import { followInPageLink } from './in-page-link.js';
 
 const NO_REHYPE = [];
 function useMarkdownPlugins(base = NO_REHYPE) {
@@ -197,7 +198,7 @@ function NewTabLink({ node, href, children, ...props }) {
   const { url, attrs } = linkTarget(href);
   const link = url === ''
     ? <a {...props}>{children}</a>
-    : <a href={url} {...props} {...attrs}>{children}</a>;
+    : <a href={url} {...props} {...attrs} onClick={followInPageLink}>{children}</a>;
   return <InLink.Provider value={true}>{link}</InLink.Provider>;
 }
 // 답변 속 그림(![글자](주소))은 자동으로 불러오지 않는다. 그 주소는 모델이 쓴 것이고, 모델이 보는
@@ -219,7 +220,7 @@ function AltImage({ node, src, alt, title }) {
   // 글자가 없으면 주소로 대신하되 여기서도 끝을 줄인다 — 조회 결과가 섞여 들어간 주소는 수천 자가
   // 되기도 하고, 그대로 두면 답변 한 줄이 주소의 벽에 묻힌다(주소 전부는 href에 그대로 남는다).
   return (
-    <a href={url} title={title || undefined} {...attrs}>🖼 {label || clip(url, 60)}</a>
+    <a href={url} title={title || undefined} {...attrs} onClick={followInPageLink}>🖼 {label || clip(url, 60)}</a>
   );
 }
 

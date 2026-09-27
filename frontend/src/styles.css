@@ -1155,17 +1155,16 @@ button:hover {
   color: #5a7b47;
   font-size: 11px;
 }
-.modal-backdrop {
-  position: fixed;
-  inset: 0;
+.modal::backdrop {
   background: #163b3140;
-  z-index: 100;
-  display: grid;
-  place-items: center;
   backdrop-filter: blur(4px);
 }
 .modal {
   width: min(560px, 90vw);
+  max-height: 90dvh;
+  overflow: auto;
+  border: 0;
+  color: inherit;
   background: #fff;
   border-radius: 15px;
   padding: 25px;

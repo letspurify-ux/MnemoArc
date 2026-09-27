@@ -1,12 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { groups, inputValue, parseValue } from "./fields.js";
 import { api, send } from "./api.js";
+import { useServerDraft } from "./use-server-draft.js";
 
 export function DirectoryPicker({ path, onSelect, onClose }) {
   const [data, setData] = useState(null),
     [error, setError] = useState(""),
     [loading, setLoading] = useState(false);
-  const request = useRef(0);
+  const request = useRef(0), dialog = useRef(null);
   const load = async (path) => {
     const current = ++request.current;
     setLoading(true);
@@ -24,16 +25,36 @@ export function DirectoryPicker({ path, onSelect, onClose }) {
     }
   };
   useEffect(() => {
+    setData(null);
     void load(path);
     return () => { request.current++; };
+  }, [path]);
+  useLayoutEffect(() => {
+    const element = dialog.current;
+    const opener = document.activeElement;
+    element.showModal();
+    return () => {
+      element.close();
+      if (opener?.isConnected) opener.focus();
+    };
   }, []);
+  const containFocus = (event) => {
+    if (event.key !== "Tab") return;
+    const buttons = [...event.currentTarget.querySelectorAll("button:not(:disabled)")];
+    const first = buttons[0], last = buttons.at(-1);
+    if ((event.shiftKey && document.activeElement === first) ||
+        (!event.shiftKey && document.activeElement === last)) {
+      event.preventDefault();
+      (event.shiftKey ? last : first)?.focus();
+    }
+  };
   return (
-    <div className="modal-backdrop">
-      <section
+      <dialog
+        ref={dialog}
         className="modal"
-        role="dialog"
-        aria-modal="true"
         aria-label="프로젝트 폴더 선택"
+        onCancel={(event) => { event.preventDefault(); onClose(); }}
+        onKeyDown={containFocus}
       >
         <div className="modal-head">
           <h2>프로젝트 폴더 선택</h2>
@@ -66,12 +87,14 @@ export function DirectoryPicker({ path, onSelect, onClose }) {
         >
           이 폴더 선택
         </button>
-      </section>
-    </div>
+      </dialog>
   );
 }
 export function ProjectForm({ project, onChange, disabled = false }) {
   const [browse, setBrowse] = useState(false);
+  useEffect(() => {
+    if (disabled) setBrowse(false);
+  }, [disabled]);
   const set = (key, value) => onChange({ ...project, [key]: value });
   return (
     <div className="project-fields">
@@ -173,7 +196,7 @@ function DatabaseEditor({ database, onChange }) {
     <small>기본값은 꺼짐입니다. 모델은 이 설정이나 아래 스위치를 변경할 수 없습니다. 전체 스위치와 해당 기능 스위치가 모두 켜져야 도구가 노출됩니다.</small>
     <div className="field-grid">
       {[["host", "호스트", "localhost"], ["port", "포트", "1521"], ["service", "서비스 이름", "FREEPDB1"], ["username", "사용자", "READ_ONLY_USER"], ["password_env", "암호 환경변수 이름", "MNEMOARC_DB_PASSWORD"], ["max_rows", "최대 결과 행", "100"]].map(([key, label, placeholder]) =>
-        <label className="setting-field" key={key}><span>{label}</span><input aria-label={label} type={["port", "max_rows"].includes(key) ? "number" : "text"} value={database[key]} placeholder={placeholder} onChange={e => set(key, ["port", "max_rows"].includes(key) ? Number(e.target.value) : e.target.value)} /></label>
+        <label className="setting-field" key={key}><span>{label}</span><input aria-label={label} type={["port", "max_rows"].includes(key) ? "number" : "text"} value={database[key]} placeholder={placeholder} onChange={e => set(key, ["port", "max_rows"].includes(key) ? parseValue(e.target.value, "number") : e.target.value)} /></label>
       )}
     </div>
     <small>암호 값은 이 화면이나 설정 파일에 저장하지 않습니다. 앱 실행 환경변수 또는 실행 폴더의 .env에 지정하세요. DB 사용자에게 필요한 권한만 부여하세요.</small>
@@ -217,8 +240,8 @@ export default function Settings({
   onDirtyChange,
 }) {
   const [scope, setScope] = useState("global"),
-    [draft, setDraft] = useState(() => structuredClone(config)),
     [tab, setTab] = useState("connection");
+  const [draft, setDraft, markSaved] = useServerDraft(scope === "global" ? config : sessionConfig, scope);
   const [key, setKey] = useState(""),
     [remember, setRemember] = useState(false),
     [clear, setClear] = useState(false),
@@ -227,11 +250,22 @@ export default function Settings({
     [message, setMessage] = useState(""),
     [error, setError] = useState("");
   const [dirty, setDirtyState] = useState(false);
+  const draftVersion = useRef(0), operation = useRef(false), mounted = useRef(true);
+  const draftSnapshot = useRef("");
+  draftSnapshot.current = JSON.stringify(draft);
   const setDirty = (value) => {
+    if (!mounted.current) return;
+    if (value) draftVersion.current++;
     setDirtyState(value);
     onDirtyChange(value);
   };
-  useEffect(() => () => onDirtyChange(false), [onDirtyChange]);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      onDirtyChange(false);
+    };
+  }, [onDirtyChange]);
   const group = groups.find((g) => g.id === tab);
   const change = (name, value) => {
     setDraft((d) => ({ ...d, [name]: value }));
@@ -250,8 +284,13 @@ export default function Settings({
         : "keep",
   });
   async function save() {
+    if (operation.current) return;
+    operation.current = true;
+    const submittedVersion = draftVersion.current;
     setBusy(true);
     setError("");
+    setMessage("");
+    let globalSaved = false;
     try {
       const data = payload();
       const result = await send(
@@ -259,6 +298,8 @@ export default function Settings({
         data,
         "PUT",
       );
+      globalSaved = scope === "global";
+      markSaved(data.config);
       let pending = result.pending;
       if (scope === "global" && apply && sessionId) {
         const res = await send(
@@ -271,22 +312,32 @@ export default function Settings({
         );
         pending = res.pending;
       }
-      setMessage(
-        pending
+      const unchanged = submittedVersion === draftVersion.current;
+      setMessage((pending
           ? "저장했습니다. 현재 요청이 끝나거나 기억 정리가 완료되면 적용됩니다."
-          : "설정을 저장했습니다.",
+          : "설정을 저장했습니다.") +
+        (unchanged ? "" : " 이후 변경 사항은 아직 저장하지 않았습니다."),
       );
-      setDirty(false);
-      setKey("");
-      setClear(false);
-      await onSaved();
+      if (unchanged) {
+        setDirty(false);
+        setKey("");
+        setClear(false);
+      }
     } catch (e) {
+      if (globalSaved)
+        setMessage("전체 기본 설정은 저장했지만 현재 세션에는 적용하지 못했습니다. 다시 적용해 주세요.");
       setError(e.message);
     } finally {
+      await onSaved();
+      operation.current = false;
       setBusy(false);
     }
   }
   async function check() {
+    if (operation.current) return;
+    operation.current = true;
+    const checkedVersion = draftVersion.current;
+    const checkedDraft = draftSnapshot.current;
     setBusy(true);
     setError("");
     setMessage("일반 응답, 스트리밍, 도구 왕복을 확인하고 있습니다…");
@@ -295,18 +346,21 @@ export default function Settings({
         scope === "session" ? `/sessions/${sessionId}/check` : "/check",
         payload(),
       );
-      setMessage("연결 확인 완료 · 응답, 스트리밍, 도구 호출이 정상입니다.");
+      setMessage(checkedVersion === draftVersion.current && checkedDraft === draftSnapshot.current
+        ? "연결 확인 완료 · 응답, 스트리밍, 도구 호출이 정상입니다."
+        : "입력값이 변경되었습니다. 현재 설정으로 다시 연결을 확인하세요.");
     } catch (e) {
       setError(e.message);
       setMessage("");
     } finally {
+      operation.current = false;
       setBusy(false);
     }
   }
   function switchScope(value) {
+    if (operation.current || value === scope) return;
     if (dirty && !confirm("저장하지 않은 설정을 버리고 전환할까요?")) return;
     setScope(value);
-    setDraft(structuredClone(value === "global" ? config : sessionConfig));
     setDirty(false);
     setKey("");
     setClear(false);
@@ -333,6 +387,7 @@ export default function Settings({
           적용 범위
           <select
             aria-label="설정 적용 범위"
+            disabled={busy}
             value={scope}
             onChange={(e) => switchScope(e.target.value)}
           >
@@ -347,6 +402,7 @@ export default function Settings({
             <input
               type="checkbox"
               checked={apply}
+              disabled={busy}
               onChange={(e) => setApply(e.target.checked)}
             />
             현재 세션에도 적용
@@ -405,7 +461,11 @@ export default function Settings({
                     <input
                       type="checkbox"
                       checked={remember}
-                      onChange={(e) => setRemember(e.target.checked)}
+                      disabled={busy}
+                      onChange={(e) => {
+                        setRemember(e.target.checked);
+                        if (key) setDirty(true);
+                      }}
                     />
                     이 기기에 키 저장
                   </label>

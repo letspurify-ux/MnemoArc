@@ -1,6 +1,7 @@
 // ```mermaid 블록 하나를 그림으로. 지식 답변의 절차·흐름을 모델이 흐름도로 쓸 때 쓰인다.
 // App.jsx가 React.lazy로 부른다 — mermaid는 번들이 수 MB라 첫 흐름도가 나올 때까지 내려받지 않는다.
 import { useEffect, useLayoutEffect, useRef, useState, useId } from 'react';
+import { followInPageLink } from './in-page-link.js';
 import mermaid from 'mermaid';
 // 그림 안 링크의 주소 규칙과 그림 노드의 판정은 답변의 링크·그림과 같은 자리에 있다 (markdown.js).
 import { rawLinkTarget, mermaidLoadsImage, mermaidFetchesViaStyle, mermaidMathLabels } from './markdown.js';
@@ -96,7 +97,8 @@ export default function Mermaid({ text }) {
   useLayoutEffect(() => {
     const box = boxRef.current;
     if (!box || svg === null) return;
-    for (const a of box.querySelectorAll('a')) {
+    const links = [...box.querySelectorAll('a')];
+    for (const a of links) {
       const href = a.getAttribute('href') ?? a.getAttribute('xlink:href');
       if (href === null) continue; // mermaid가 이미 걷어낸 것(javascript: 등) — 누를 것이 없는 <a>다
       const { url, attrs } = rawLinkTarget(href);
@@ -104,7 +106,9 @@ export default function Mermaid({ text }) {
       if (url === '') continue;
       a.setAttribute('href', url);
       for (const [k, v] of Object.entries(attrs)) a.setAttribute(k, v);
+      a.addEventListener('click', followInPageLink);
     }
+    return () => links.forEach(a => a.removeEventListener('click', followInPageLink));
   }, [svg]);
   // mermaid의 SVG는 width="100%"라 상자에 맞춰 통째로 줄어든다. 좁은 상자에서는 그 배율이 끝없이
   // 내려가 그림은 다 보이는데 글자를 못 읽는 상태가 된다 — 실측: 폭 238px 상자에서 흐름도 높이 41px,

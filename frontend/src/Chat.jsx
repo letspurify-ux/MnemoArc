@@ -6,6 +6,7 @@ import { toolLabels, workflowOptions } from "./api.js";
 export default function Chat({
   session,
   busy,
+  navigating,
   canRun,
   onSend,
   onWorkflow,
@@ -50,6 +51,13 @@ export default function Chat({
   const requestKind = intent || (session?.has_task ? "question" : "chat");
   const lastRun = session?.run_history?.at(-1);
   const [sending, setSending] = useState(false);
+  const [workflowSaving, setWorkflowSaving] = useState(false);
+  const [workflow, setWorkflow] = useState(session?.workflow_mode ?? "answer");
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const workflowLock = useRef(false), olderLock = useRef(false);
+  useEffect(() => {
+    if (!workflowLock.current) setWorkflow(session?.workflow_mode ?? "answer");
+  }, [session?.workflow_mode]);
   const inputRef = useRef(null),
     lock = useRef(false),
     composing = useRef(false),
@@ -83,12 +91,12 @@ export default function Chat({
   }, [session?.id]);
   async function submit(text = input) {
     const message = text.trim();
-    if (!message || busy || !canRun || lock.current) return;
+    if (!message || busy || !canRun || lock.current || workflowLock.current) return;
     lock.current = true;
     setSending(true);
     const submittedVersion = draftVersion.current;
     try {
-      await onSend(message, intent || "auto");
+      await onSend(message, requestKind);
       if (draftVersion.current === submittedVersion) {
         setInput("");
         setIntent(null);
@@ -98,6 +106,35 @@ export default function Chat({
     } finally {
       lock.current = false;
       setSending(false);
+    }
+  }
+  async function changeWorkflow(value) {
+    if (workflowLock.current || lock.current || busy) return;
+    workflowLock.current = true;
+    setWorkflowSaving(true);
+    const previous = workflow;
+    setWorkflow(value);
+    try {
+      await onWorkflow(value);
+    } catch {
+      setWorkflow(previous);
+    } finally {
+      workflowLock.current = false;
+      setWorkflowSaving(false);
+    }
+  }
+  async function loadOlder() {
+    if (olderLock.current) return;
+    olderLock.current = true;
+    setLoadingOlder(true);
+    bottom.current = false;
+    try {
+      await onOlder();
+    } catch {
+      // The workspace reports API errors and leaves the cursor available to retry.
+    } finally {
+      olderLock.current = false;
+      setLoadingOlder(false);
     }
   }
   const { messages, streamText } = continuationMessages(
@@ -123,10 +160,8 @@ export default function Chat({
           {session?.previous && (
             <button
               className="text-button older"
-              onClick={() => {
-                bottom.current = false;
-                onOlder();
-              }}
+              disabled={loadingOlder}
+              onClick={loadOlder}
             >
               이전 대화 더 보기
             </button>
@@ -161,6 +196,7 @@ export default function Chat({
                 ].map((text, i) => (
                   <button
                     key={text}
+                    disabled={navigating}
                     onClick={() => {
                       draftVersion.current++;
                       setInput(text);
@@ -243,6 +279,7 @@ export default function Chat({
             aria-label="메시지"
             placeholder="프로젝트에 대해 요청해 보세요…"
             rows={1}
+            disabled={navigating}
             value={input}
             onChange={(e) => {
               draftVersion.current++;
@@ -296,11 +333,9 @@ export default function Chat({
             >
               작업 방식
               <select
-                value={session?.workflow_mode ?? "answer"}
-                disabled={busy || requestKind === "question"}
-                onChange={(e) =>
-                  void onWorkflow(e.target.value).catch(() => {})
-                }
+                value={workflow}
+                disabled={busy || sending || workflowSaving || requestKind === "question"}
+                onChange={(e) => void changeWorkflow(e.target.value)}
               >
                 {workflowOptions.map(([value, label]) => (
                   <option key={value} value={value}>
@@ -318,7 +353,7 @@ export default function Chat({
                 className="send-button"
                 type="submit"
                 aria-label="메시지 보내기"
-                disabled={!input.trim() || busy || sending || !canRun}
+                disabled={!input.trim() || busy || sending || workflowSaving || !canRun}
               >
                 ↑
               </button>

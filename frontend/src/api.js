@@ -8,11 +8,13 @@ export async function api(path, options = {}) {
     },
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
   });
-  const data = await response.json().catch(() => ({
-    error: `서버 응답을 읽지 못했습니다 (${response.status}).`,
-  }));
+  const data = await response.json().catch(() => {
+    throw new Error(`서버 응답을 읽지 못했습니다 (${response.status}).`);
+  });
   if (!response.ok)
-    throw new Error(data.error || `요청 실패 (${response.status})`);
+    throw new Error(data?.error || `요청 실패 (${response.status})`);
+  if (!data || typeof data !== "object" || Array.isArray(data))
+    throw new Error(`서버 응답을 읽지 못했습니다 (${response.status}).`);
   return data;
 }
 export const send = (path, body, method = "POST") =>
@@ -23,7 +25,7 @@ export async function download(path) {
   });
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
-    throw new Error(data.error || `요청 실패 (${response.status})`);
+    throw new Error(data?.error || `요청 실패 (${response.status})`);
   }
   return response.blob();
 }

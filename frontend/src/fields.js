@@ -215,7 +215,7 @@ export const unitScale = (type) =>
         ? 0.01
         : 1;
 export function inputValue(value, type) {
-  return value == null
+  return value == null || value === ""
     ? ""
     : ["number", "optionalNumber", "kib", "mib", "percent"].includes(type)
       ? Number((value / unitScale(type)).toFixed(8))
@@ -226,7 +226,10 @@ export function parseValue(value, type) {
   if (type === "optional" || type === "optionalNumber") {
     if (value === "") return null;
   }
-  if (["number", "optionalNumber", "kib", "mib", "percent"].includes(type))
-    return value === "" ? "" : Number(value) * unitScale(type);
+  if (["number", "optionalNumber", "kib", "mib", "percent"].includes(type)) {
+    if (value === "") return "";
+    const scaled = Number(value) * unitScale(type);
+    return type === "kib" || type === "mib" ? Math.round(scaled) : scaled;
+  }
   return value;
 }
