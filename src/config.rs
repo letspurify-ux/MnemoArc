@@ -326,6 +326,13 @@ impl Config {
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
         use std::io::Write;
         temp.write_all(toml::to_string_pretty(self)?.as_bytes())?;
+        // Replacing a file with NamedTempFile otherwise changes an existing
+        // config's access mode to the temporary file's private default.
+        match std::fs::metadata(path) {
+            Ok(metadata) => temp.as_file().set_permissions(metadata.permissions())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         temp.as_file().sync_all()?;
         temp.persist(path)?;
         Ok(())

@@ -3725,7 +3725,12 @@ fn execute_repaired(
             // tiny prefix or an unrelated ID does not.
             let supplied = text(&args, "id")?.trim();
             let typo = supplied.len() == cp.id.len()
-                && supplied.bytes().zip(cp.id.bytes()).filter(|(a, b)| a != b).count() <= 2;
+                && supplied
+                    .bytes()
+                    .zip(cp.id.bytes())
+                    .filter(|(a, b)| a != b)
+                    .count()
+                    <= 2;
             if cp.id != supplied && !typo && !(supplied.len() >= 8 && cp.id.starts_with(supplied)) {
                 bail!("checkpoint_id_mismatch: expected checkpoint ID {}", cp.id);
             }
@@ -3768,9 +3773,28 @@ fn execute_repaired(
             Ok(json!({"acknowledged":true,"state_revision":s.task.revision}))
         }
         "file_list" => {
-            // A directory path lists everything below it, as in source_search
-            // (live runs sent path twice and were refused).
-            if let Some(path) = args.get("path").and_then(Value::as_str) {
+            // A continuation that omits its original mode and file or
+            // directory scope keeps the scope its cursor was issued for.
+            if let Some(scope) = args["cursor"]
+                .as_str()
+                .and_then(|cursor| cursor.split_once(':'))
+                .and_then(|(fingerprint, _)| {
+                    s.list_cursor_scopes
+                        .iter()
+                        .find(|(known, _)| known == fingerprint)
+                        .map(|(_, scope)| scope.clone())
+                })
+            {
+                for key in ["mode", "path_glob", "path"] {
+                    if args.get(key).is_none() && !scope[key].is_null() {
+                        args[key] = scope[key].clone();
+                    }
+                }
+            }
+            // A directory path is literal. Turning it into a glob would make
+            // names such as [route] select a different directory (and reject
+            // a valid directory containing an unmatched '[').
+            let directory = if let Some(path) = args.get("path").and_then(Value::as_str) {
                 if args.get("path_glob").is_some() || args.get("pattern").is_some() {
                     bail!(
                         "conflicting_arguments: use path for one directory OR path_glob/pattern for a file glob"
@@ -3782,54 +3806,35 @@ fn execute_repaired(
                         "invalid_argument_value: path must be a directory for file_list; read a file with file_read"
                     );
                 }
-                let root = s.project.root.canonicalize()?;
-                let relative = dir
-                    .strip_prefix(&root)
-                    .unwrap_or(&dir)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let args = args.as_object_mut().unwrap();
-                args.remove("path");
-                args.insert(
-                    "path_glob".into(),
-                    json!(if relative.is_empty() {
-                        "**".to_owned()
-                    } else {
-                        format!("{}/**", relative.trim_end_matches('/'))
-                    }),
-                );
+                Some(dir)
+            } else {
+                None
+            };
+            let mode = args["mode"].as_str().unwrap_or("text");
+            let mut files = candidate_paths(&s.project, path_glob(&args)?, cancel)?;
+            if let Some(dir) = &directory {
+                files.retain(|path| path.starts_with(dir));
             }
-            // A continuation that omits the original mode/path_glob keeps the
-            // scope its cursor was issued for.
-            if let Some(scope) = args["cursor"]
-                .as_str()
-                .and_then(|cursor| cursor.split_once(':'))
-                .and_then(|(fingerprint, _)| {
-                    s.list_cursor_scopes
-                        .iter()
-                        .find(|(known, _)| known == fingerprint)
-                        .map(|(_, scope)| scope.clone())
-                })
-            {
-                for key in ["mode", "path_glob"] {
-                    if args.get(key).is_none() && !scope[key].is_null() {
-                        args[key] = scope[key].clone();
+            if mode != "paths" {
+                let mut searchable = Vec::new();
+                for path in files {
+                    if cancel.is_cancelled() {
+                        bail!("cancelled");
+                    }
+                    if search_text(&path)?.is_some() {
+                        searchable.push(path);
                     }
                 }
+                files = searchable;
             }
-            let mode = args["mode"].as_str().unwrap_or("text");
-            let files = if mode == "paths" {
-                candidate_paths(&s.project, path_glob(&args)?, cancel)?
-            } else {
-                paths(&s.project, path_glob(&args)?, cancel)?
-            };
             let root = s.project.root.canonicalize()?;
             let names = files
                 .iter()
                 .map(|p| p.strip_prefix(&root).unwrap().display().to_string())
                 .collect::<Vec<_>>();
-            let fingerprint =
-                hash(serde_json::to_string(&(mode, path_glob(&args)?, &names))?.as_bytes());
+            let fingerprint = hash(
+                serde_json::to_string(&(mode, path_glob(&args)?, &directory, &names))?.as_bytes(),
+            );
             let offset = page_cursor(&args, &fingerprint)?;
             if offset > names.len() {
                 bail!(INVALID_CURSOR);
@@ -3838,7 +3843,7 @@ fn execute_repaired(
             if end < names.len() {
                 s.remember_list_scope(
                     fingerprint.clone(),
-                    json!({"mode":mode,"path_glob":path_glob(&args)?}),
+                    json!({"mode":mode,"path_glob":path_glob(&args)?,"path":args.get("path")}),
                 );
             }
             Ok(

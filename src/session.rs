@@ -406,8 +406,8 @@ pub struct Session {
     /// Recent provider input tokens per locally estimated token, for models
     /// without a known tokenizer. See ContextManager::token_ratio.
     pub token_ratios: VecDeque<f64>,
-    /// file_list cursor fingerprint -> the mode and path_glob it was issued
-    /// for, so a continuation that omits them keeps its original scope.
+    /// file_list cursor fingerprint -> its mode and file or directory scope,
+    /// so a continuation that omits them keeps its original scope.
     pub list_cursor_scopes: VecDeque<(String, Value)>,
     pub activity: Value,
     pub task_rounds: usize,

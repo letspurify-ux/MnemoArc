@@ -71,6 +71,22 @@ fn operation_encodings_are_normalized_and_replayed_without_duplicate_items() {
 }
 
 #[test]
+fn an_oversized_result_is_told_its_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(&mut s, json!([{"op":"insert","texts":["문서 감사"]}]));
+    let id = s.task.current_todo().unwrap().id.clone();
+    // Live run: results carrying a full hash and audit dump were refused
+    // four times in a row without saying how long they were.
+    let result = format!("현재 해시 {} 문서 audit 통과", "5".repeat(300));
+    let refused = apply(&mut s, json!([{"op":"complete","id":id,"result":result}]));
+    assert_eq!(refused["applied"], false, "{refused}");
+    let reason = refused["reason"].as_str().unwrap();
+    assert!(reason.contains(&format!("this text has {}", result.chars().count())), "{reason}");
+    assert!(!s.task.todos[0].done);
+}
+
+#[test]
 fn invalid_operation_shapes_preserve_plan_without_poisoning_error_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());

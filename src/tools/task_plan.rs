@@ -100,8 +100,16 @@ pub fn view(task: &TaskState, offset: usize, limit: usize) -> Value {
 
 fn nonempty(value: &str, limit: usize) -> Result<&str> {
     let value = value.trim();
-    if value.is_empty() || value.chars().count() > limit {
+    if value.is_empty() {
         bail!("Use nonempty text of at most {limit} characters");
+    }
+    // Say how far over the limit it is, or the model trims a little and
+    // resends an oversized text again.
+    let count = value.chars().count();
+    if count > limit {
+        bail!(
+            "Use nonempty text of at most {limit} characters; this text has {count}. Keep one short sentence and drop hashes, line lists and audit details"
+        );
     }
     Ok(value)
 }

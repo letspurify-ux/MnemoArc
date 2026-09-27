@@ -119,9 +119,9 @@ fn write_credentials(path: &FsPath, keys: &BTreeMap<String, Secret>) -> Result<(
     file.persist(path)?;
     Ok(())
 }
-fn restore_file(path: &FsPath, original: Option<&[u8]>) -> Result<()> {
+fn restore_file(path: &FsPath, original: Option<&(Vec<u8>, std::fs::Permissions)>) -> Result<()> {
     match original {
-        Some(bytes) => {
+        Some((bytes, permissions)) => {
             let parent = path
                 .parent()
                 .filter(|p| !p.as_os_str().is_empty())
@@ -129,6 +129,7 @@ fn restore_file(path: &FsPath, original: Option<&[u8]>) -> Result<()> {
             let mut file = tempfile::NamedTempFile::new_in(parent)?;
             use std::io::Write;
             file.write_all(bytes)?;
+            file.as_file().set_permissions(permissions.clone())?;
             file.as_file().sync_all()?;
             file.persist(path)?;
         }
@@ -445,7 +446,12 @@ async fn settings(State(s): State<WebState>, Json(input): Json<Settings>) -> Api
     // config so a failed request cannot leave only half of the settings live.
     let previous_config = if updates_credentials {
         match std::fs::read(&c.path) {
-            Ok(bytes) => Some(bytes),
+            Ok(bytes) => Some((
+                bytes,
+                std::fs::metadata(&c.path)
+                    .map_err(anyhow::Error::from)?
+                    .permissions(),
+            )),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(anyhow::Error::from(error).into()),
         }
@@ -456,7 +462,7 @@ async fn settings(State(s): State<WebState>, Json(input): Json<Settings>) -> Api
     if updates_credentials
         && let Err(error) = write_credentials(&credential_path(&c.path), &credentials)
     {
-        if let Err(rollback) = restore_file(&c.path, previous_config.as_deref()) {
+        if let Err(rollback) = restore_file(&c.path, previous_config.as_ref()) {
             return Err(anyhow::anyhow!(
                 "credential save failed: {error}; config rollback failed: {rollback}"
             )
@@ -565,9 +571,10 @@ async fn session_project(
     }
     let session = c.sessions.get_mut(&id).ok_or_else(missing)?;
     let output_changed = tools::output_path(&project)? != tools::output_path(&session.project)?;
-    if (project.root != session.project.root || output_changed)
-        && !session.history.bundles.is_empty()
-    {
+    // Check the durable history counter. A checkpoint can prune every bundle
+    // while the task, memories and source references still belong to the old
+    // project; an empty deque does not make the session new again.
+    if (project.root != session.project.root || output_changed) && session.history.next_id > 0 {
         return Err(ApiError(
             StatusCode::CONFLICT,
             "기록이 있는 세션의 소스 폴더나 결과 문서 경로는 변경할 수 없습니다. 새 세션을 만드세요.".into(),
@@ -1111,6 +1118,93 @@ pub async fn serve_app(
 #[cfg(test)]
 mod worker_wait_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_credential_save_restores_config_content_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            projects: vec![Project {
+                root: dir.path().into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let path = dir.path().join("config.toml");
+        let state = WebState::new(config.clone(), path.clone(), Arc::new(OpenAiClient)).unwrap();
+        let original = b"original settings";
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::create_dir(credential_path(&path)).unwrap();
+
+        let result = settings(
+            State(state.clone()),
+            Json(Settings {
+                config,
+                api_key: Some("test-key".into()),
+                credential_mode: "save".into(),
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(state.core.lock().await.revision, 0);
+    }
+
+    #[tokio::test]
+    async fn project_cannot_change_after_its_history_was_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original");
+        let replacement = dir.path().join("replacement");
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::create_dir_all(&replacement).unwrap();
+        let config = Config {
+            projects: vec![Project {
+                root: original.clone(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let state = WebState::new(
+            config,
+            dir.path().join("config.toml"),
+            Arc::new(OpenAiClient),
+        )
+        .unwrap();
+        let id = state.core.lock().await.order[0].clone();
+        {
+            let mut core = state.core.lock().await;
+            let session = core.sessions.get_mut(&id).unwrap();
+            session.add_user("Investigate the original project".into());
+            for bundle in &mut session.history.bundles {
+                bundle.active = false;
+                bundle.reviewed = true;
+            }
+            session.history.prune(0).unwrap();
+            assert!(session.history.bundles.is_empty());
+            assert_eq!(session.history.pruned_through, Some(1));
+        }
+        let result = session_project(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(Project {
+                root: replacement,
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(ApiError(StatusCode::CONFLICT, _))));
+        assert_eq!(
+            state.core.lock().await.sessions[&id].project.root,
+            original.canonicalize().unwrap()
+        );
+    }
 
     #[tokio::test]
     async fn successive_pending_settings_preserve_the_latest_credential_choice() {

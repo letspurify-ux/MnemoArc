@@ -456,6 +456,49 @@ fn file_list_path_lists_one_directory() {
 }
 
 #[test]
+fn file_list_directory_path_is_literal_and_cursor_keeps_its_scope() {
+    let (dir, mut s) = setup();
+    for folder in ["[route]", "r", "{routes,handlers}", "routes", "[unclosed"] {
+        std::fs::create_dir_all(dir.path().join(folder).join("nested")).unwrap();
+        std::fs::write(dir.path().join(folder).join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join(folder).join("nested/b.rs"), "fn b() {}\n").unwrap();
+    }
+    for folder in ["[route]", "{routes,handlers}", "[unclosed"] {
+        let first = tools::execute(
+            &mut s,
+            "file_list",
+            json!({"mode":"paths","path":folder,"limit":1}),
+        )
+        .unwrap();
+        assert_eq!(first["total_files"], 2, "{folder}: {first}");
+        let second = tools::execute(
+            &mut s,
+            "file_list",
+            json!({"cursor":first["next_cursor"],"limit":1}),
+        )
+        .unwrap();
+        for page in [&first, &second] {
+            assert!(
+                page["paths"][0].as_str().unwrap().starts_with(folder),
+                "{folder}: {page}"
+            );
+        }
+        assert!(second["next_cursor"].is_null());
+        let text_mode =
+            tools::execute(&mut s, "file_list", json!({"mode":"text","path":folder})).unwrap();
+        assert_eq!(text_mode["total_files"], 2, "{folder}: {text_mode}");
+        assert!(
+            tools::execute(
+                &mut s,
+                "file_list",
+                json!({"mode":"paths","path":"r","cursor":first["next_cursor"]}),
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn an_empty_filled_alternative_to_query_is_not_a_conflict() {
     let (dir, mut s) = setup();
     std::fs::write(dir.path().join("a.js"), "const hint = 'Shift+Enter';\n").unwrap();
