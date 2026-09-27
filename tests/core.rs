@@ -581,6 +581,34 @@ fn bounded_file_results_keep_sources_offsets_and_fit_serialized_message_budget()
 }
 
 #[test]
+fn relimited_crlf_read_does_not_certify_a_split_line_ending() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("crlf.txt"), "line body\r\n".repeat(80)).unwrap();
+    let mut s = session(dir.path());
+    let call = mnemoarc::llm::ToolCall {
+        id: "crlf-budget".into(),
+        name: "file_read".into(),
+        arguments: json!({"path":"crlf.txt","max_lines":80}).to_string(),
+    };
+    let full = tools::run_call(&mut s, &call);
+    assert_eq!(full["status"], "ok");
+    let mut found = false;
+    for budget in 300..=450 {
+        let page = tools::limit_result(&mut s, &call, full.clone(), budget);
+        if page["data"]["content"]["text"]
+            .as_str()
+            .is_some_and(|text| text.ends_with('\r'))
+        {
+            found = true;
+            assert_eq!(page["data"]["content"]["last_line_complete"], false);
+            assert_eq!(page["data"]["source"]["line_end_complete"], false);
+            break;
+        }
+    }
+    assert!(found, "expected a budget to split a CRLF line ending");
+}
+
+#[test]
 fn history_continuations_do_not_recursively_archive_previews() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());

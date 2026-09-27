@@ -82,7 +82,10 @@ fn an_oversized_result_is_told_its_length() {
     let refused = apply(&mut s, json!([{"op":"complete","id":id,"result":result}]));
     assert_eq!(refused["applied"], false, "{refused}");
     let reason = refused["reason"].as_str().unwrap();
-    assert!(reason.contains(&format!("this text has {}", result.chars().count())), "{reason}");
+    assert!(
+        reason.contains(&format!("this text has {}", result.chars().count())),
+        "{reason}"
+    );
     assert!(!s.task.todos[0].done);
 }
 

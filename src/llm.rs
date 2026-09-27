@@ -543,6 +543,10 @@ impl OpenAiClient {
         if completion.calls.len() != 1 || completion.calls[0].name != "connection_echo" {
             bail!("tool probe did not return expected call");
         }
+        let arguments: Value = serde_json::from_str(&completion.calls[0].arguments)?;
+        if arguments["text"].as_str() != Some("OK") {
+            bail!("tool probe did not return the requested text argument");
+        }
         request.as_object_mut().unwrap().remove("tool_choice");
         let call = &completion.calls[0];
         request["messages"].as_array_mut().unwrap().extend([json!({"role":"assistant","content":null,"tool_calls":[{"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments}}]}),json!({"role":"tool","tool_call_id":call.id,"content":"OK"})]);

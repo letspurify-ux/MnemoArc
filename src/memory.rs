@@ -131,6 +131,26 @@ pub struct MemoryStore {
     pub generation: u64,
 }
 impl MemoryStore {
+    fn key_owner(&self, key: &str) -> Result<Option<&Memory>> {
+        let mut owners = self
+            .entries
+            .values()
+            .filter(|memory| memory.key.as_deref() == Some(key));
+        let owner = owners.next();
+        // IDs and user keys share get()'s lookup namespace. A key equal to a
+        // different memory's ID would make reads ambiguous and previously
+        // caused save() to update that memory instead of creating a new one.
+        if owners.next().is_some()
+            || self
+                .entries
+                .get(key)
+                .is_some_and(|by_id| owner.is_none_or(|memory| memory.id != by_id.id))
+        {
+            bail!("memory_key_conflict: key collides with a memory ID or another key");
+        }
+        Ok(owner)
+    }
+
     fn page_fingerprint(&self, query: &str, tags: &[String]) -> String {
         let input = serde_json::to_vec(&(self.generation, query, tags))
             .expect("memory page cursor input is always serializable");
@@ -171,7 +191,13 @@ impl MemoryStore {
         if input.key.as_ref().is_some_and(|k| k.trim().is_empty()) {
             bail!("invalid_argument_value: key must not be empty");
         }
-        let old = input.key.as_deref().and_then(|k| self.get(k).ok()).cloned();
+        let old = input
+            .key
+            .as_deref()
+            .map(|key| self.key_owner(key))
+            .transpose()?
+            .flatten()
+            .cloned();
         if let Some(m) = &old {
             if input.kind == MemoryKind::Fact
                 && !input.inferred
@@ -269,20 +295,21 @@ impl MemoryStore {
             .iter()
             .filter_map(|ident| self.get(ident).ok().map(|memory| memory.id.clone()))
             .collect();
-        if let Some(existing) = input.key.as_deref().and_then(|key| self.get(key).ok())
+        let key_owner = input
+            .key
+            .as_deref()
+            .map(|key| self.key_owner(key))
+            .transpose()?
+            .flatten()
+            .cloned();
+        if let Some(existing) = &key_owner
             && !target_ids.contains(&existing.id)
         {
             bail!(
                 "memory_key_conflict: replacement key belongs to a memory outside the replacement IDs"
             );
         }
-        if let Some(old) = input
-            .key
-            .as_deref()
-            .and_then(|key| self.get(key).ok())
-            .filter(|memory| target_ids.contains(&memory.id))
-            .cloned()
-        {
+        if let Some(old) = key_owner.filter(|memory| target_ids.contains(&memory.id)) {
             if input.kind == MemoryKind::Fact
                 && !input.inferred
                 && !old.sources.is_empty()
@@ -398,5 +425,70 @@ impl MemoryStore {
     }
     pub fn candidates(&self, protected: &BTreeSet<String>) -> Vec<serde_json::Value> {
         self.entries.values().filter(|m|!protected.contains(&m.id)).map(|m|serde_json::json!({"id":m.id,"reason":if m.status==MemoryStatus::Superseded{"superseded"}else{"not_referenced"}})).take(20).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(key: String, body: &str, expected_revision: Option<u64>) -> MemoryInput {
+        MemoryInput {
+            key: Some(key),
+            title: "Test".into(),
+            summary: "Test summary".into(),
+            body: body.into(),
+            tags: vec![],
+            kind: MemoryKind::Decision,
+            inferred: false,
+            source_ids: vec![],
+            metadata: serde_json::Value::Null,
+            expected_revision,
+        }
+    }
+
+    #[test]
+    fn a_memory_key_cannot_alias_another_memory_id() {
+        let mut store = MemoryStore::default();
+        let config = Config::default();
+        let original = store
+            .save(
+                input("original".into(), "original body", None),
+                vec![],
+                &config,
+            )
+            .unwrap();
+        let generation = store.generation;
+
+        let error = store
+            .save(
+                input(
+                    original.id.clone(),
+                    "replacement body",
+                    Some(original.revision),
+                ),
+                vec![],
+                &config,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("memory_key_conflict"));
+        assert_eq!(store.generation, generation);
+        assert_eq!(store.get(&original.id).unwrap().body, "original body");
+
+        let error = store
+            .replace(
+                std::slice::from_ref(&original.id),
+                input(
+                    original.id.clone(),
+                    "replacement body",
+                    Some(original.revision),
+                ),
+                vec![],
+                &config,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("memory_key_conflict"));
+        assert_eq!(store.generation, generation);
+        assert_eq!(store.get("original").unwrap().body, "original body");
     }
 }

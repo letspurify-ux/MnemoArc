@@ -147,6 +147,36 @@ async fn connection_probe_requires_valid_plain_and_final_answers() {
         }
     }
 }
+
+#[tokio::test]
+async fn connection_probe_rejects_a_tool_call_with_the_wrong_arguments() {
+    let plain =
+        json!({"choices":[{"message":{"content":"OK"},"finish_reason":"stop"}]}).to_string();
+    let final_text = format!(
+        "{}data: [DONE]\n\n",
+        event(json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}))
+    );
+    for arguments in ["{}", "{\"text\":\"NOT OK\"}", "{\"text\":7}"] {
+        let tool = format!(
+            "{}data: [DONE]\n\n",
+            event(
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"echo","function":{"name":"connection_echo","arguments":arguments}}]},"finish_reason":"tool_calls"}]})
+            )
+        );
+        let (url, server, _) =
+            sequenced_server(vec![plain.clone(), tool, final_text.clone()]).await;
+        let config = Config {
+            base_url: url,
+            model: "probe-arguments-test-model".into(),
+            model_context: Some(128_000),
+            retries: 0,
+            ..Default::default()
+        };
+        let result = OpenAiClient.probe(&config).await;
+        server.abort();
+        assert!(result.unwrap_err().to_string().contains("tool probe"));
+    }
+}
 #[tokio::test]
 async fn completion_terminator_ignores_invalid_utf8_after_the_final_event() {
     let mut body = format!(

@@ -4859,7 +4859,7 @@ pub fn limit_result(
                     let end = v["data"]["content"]["line_start"].as_u64().unwrap_or(line)
                         + shown.lines().count().saturating_sub(1) as u64;
                     let complete = if length < chars.len() {
-                        shown.ends_with('\n') || chars[length] == '\n'
+                        shown.ends_with('\n') || (chars[length] == '\n' && !shown.ends_with('\r'))
                     } else {
                         template["data"]["content"]["last_line_complete"]
                             .as_bool()
