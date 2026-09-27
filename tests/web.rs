@@ -60,6 +60,41 @@ async fn get(client: &reqwest::Client, url: &str, path: &str) -> Value {
         .await
         .unwrap()
 }
+
+#[tokio::test]
+async fn resume_and_cleanup_reject_missing_task_or_discarded_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, state, server) = launch(dir.path()).await;
+    let client = reqwest::Client::new();
+    let initial = get(&client, &url, "/api/state").await;
+    let id = initial["sessions"][0]["id"].as_str().unwrap();
+    for (action, text, expected) in [
+        ("resume", "", "재개하거나 정리할 작업이 없습니다"),
+        ("cleanup", "", "재개하거나 정리할 작업이 없습니다"),
+        ("resume", "새 요구사항", "메시지를 받지 않습니다"),
+        ("cleanup", "새 요구사항", "메시지를 받지 않습니다"),
+    ] {
+        let response = client
+            .post(format!("{url}/api/sessions/{id}/run"))
+            .header("x-mnemoarc-client", "web")
+            .json(&json!({"action":action,"text":text}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "{action}: {text}");
+        let body: Value = response.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains(expected), "{body}");
+    }
+    let after = get(&client, &url, "/api/state").await;
+    assert_eq!(after["revision"], initial["revision"]);
+    assert!(after["running"].is_null());
+    assert_eq!(
+        get(&client, &url, &format!("/api/sessions/{id}")).await["bundles"],
+        json!([])
+    );
+    state.shutdown().await;
+    server.abort();
+}
 #[tokio::test]
 async fn unavailable_saved_projects_do_not_prevent_startup_or_repair() {
     for available in [true, false] {

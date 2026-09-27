@@ -309,6 +309,7 @@ impl OpenAiClient {
         let mut out = Completion::default();
         let mut calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
         let (mut done, mut finish) = (false, false);
+        let mut expects_calls = false;
         loop {
             let next = tokio::select! {
                 _ = cancel.cancelled() => bail!("cancelled"),
@@ -359,7 +360,20 @@ impl OpenAiClient {
                 let Some(choice) = v["choices"].as_array().and_then(|a| a.first()) else {
                     continue;
                 };
+                if finish
+                    && (choice["delta"]["content"]
+                        .as_str()
+                        .is_some_and(|text| !text.is_empty())
+                        || choice["delta"]["tool_calls"]
+                            .as_array()
+                            .is_some_and(|calls| !calls.is_empty()))
+                {
+                    bail!("incomplete_completion: delta after finish reason");
+                }
                 if let Some(reason) = choice["finish_reason"].as_str() {
+                    if finish {
+                        bail!("incomplete_completion: multiple finish reasons");
+                    }
                     if !["stop", "tool_calls", "length"].contains(&reason) {
                         if reason == "error" {
                             bail!("provider_stream_error: finish_reason=error");
@@ -367,6 +381,7 @@ impl OpenAiClient {
                         bail!("incomplete_completion: {reason}");
                     }
                     out.length_limited = reason == "length";
+                    expects_calls = reason == "tool_calls";
                     finish = true;
                 }
                 if let Some(text) = choice["delta"]["content"].as_str() {
@@ -430,6 +445,12 @@ impl OpenAiClient {
             // instructions. Never expose any of its calls for execution.
             out.discarded_tool_calls = !calls.is_empty();
             return Ok(out);
+        }
+        if expects_calls && calls.is_empty() {
+            bail!("incomplete_completion: tool_calls finish without a call");
+        }
+        if !expects_calls && !calls.is_empty() {
+            bail!("incomplete_completion: stop finish with tool calls");
         }
         let mut ids = std::collections::BTreeSet::new();
         for call in calls.values() {
@@ -502,9 +523,7 @@ impl OpenAiClient {
             || choice["message"]["tool_calls"]
                 .as_array()
                 .is_some_and(|calls| !calls.is_empty())
-            || choice["finish_reason"]
-                .as_str()
-                .is_some_and(|reason| reason != "stop")
+            || choice["finish_reason"].as_str() != Some("stop")
         {
             bail!("plain response probe failed: expected a complete text response");
         }

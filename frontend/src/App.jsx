@@ -523,14 +523,14 @@ export default function App() {
                 <div className="session-actions">
                   <button
                     title="보존된 상태로 재개"
-                    disabled={navigating || runPending || workflowPending.has(selected) || Boolean(state.running) || !canRun}
+                    disabled={navigating || runPending || workflowPending.has(selected) || Boolean(state.running) || !canRun || !session.has_task}
                     onClick={() => void runSession(selected, undefined, "resume").catch(() => {})}
                   >
                     재개
                   </button>
                   <button
                     title="기억과 상태 정리"
-                    disabled={navigating || runPending || workflowPending.has(selected) || Boolean(state.running) || !canRun}
+                    disabled={navigating || runPending || workflowPending.has(selected) || Boolean(state.running) || !canRun || !session.has_task}
                     onClick={() => void runSession(selected, undefined, "cleanup").catch(() => {})}
                   >
                     기억 정리

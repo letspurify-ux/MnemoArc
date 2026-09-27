@@ -815,6 +815,7 @@ fn uncertain_write_error(error: &str) -> bool {
             "tool_worker_panic"
                 | "tool_worker_unresolved"
                 | "database_commit_uncertain"
+                | "database_rollback_uncertain"
                 | "file_patch_rollback_failed"
         )
     )
@@ -3065,6 +3066,7 @@ mod worker_wait_tests {
     async fn reported_uncertain_writes_quarantine_following_calls_and_runs() {
         for cause in [
             "database_commit_uncertain: connection lost during commit",
+            "database_rollback_uncertain: connection lost during rollback",
             "file_patch_rollback_failed: one changed file could not be restored",
             "tool_worker_panic: interrupted after a file write",
         ] {

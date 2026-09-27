@@ -117,6 +117,11 @@ async fn connection_probe_requires_valid_plain_and_final_answers() {
             Some("plain response probe failed"),
         ),
         (
+            json!({"choices":[{"message":{"content":"OK"}}]}).to_string(),
+            text.clone(),
+            Some("plain response probe failed"),
+        ),
+        (
             plain.clone(),
             tool.clone(),
             Some("tool round-trip probe failed"),
@@ -206,8 +211,10 @@ async fn connection_probe_times_out_despite_stream_keepalives() {
             let received = received.clone();
             async move {
                 if received.fetch_add(1, Ordering::SeqCst) == 0 {
-                    return axum::Json(json!({"choices":[{"message":{"content":"OK"}}]}))
-                        .into_response();
+                    return axum::Json(
+                        json!({"choices":[{"message":{"content":"OK"},"finish_reason":"stop"}]}),
+                    )
+                    .into_response();
                 }
                 let stream = futures_util::stream::unfold((), |_| async {
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -330,6 +337,64 @@ async fn incomplete_stream_never_returns_calls() {
             .is_err()
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn contradictory_stream_finish_reasons_never_complete() {
+    for (body, expected) in [
+        (
+            format!(
+                "{}data: [DONE]\n\n",
+                event(json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"tool_calls"}]}))
+            ),
+            "tool_calls finish without a call",
+        ),
+        (
+            format!(
+                "{}data: [DONE]\n\n",
+                event(
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"write","function":{"name":"file_write","arguments":"{}"}}]},"finish_reason":"stop"}]})
+                )
+            ),
+            "stop finish with tool calls",
+        ),
+        (
+            format!(
+                "{}{}data: [DONE]\n\n",
+                event(
+                    json!({"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}]})
+                ),
+                event(json!({"choices":[{"delta":{"content":"final"},"finish_reason":"stop"}]}))
+            ),
+            "delta after finish reason",
+        ),
+        (
+            format!(
+                "{}{}data: [DONE]\n\n",
+                event(json!({"choices":[{"delta":{},"finish_reason":"length"}]})),
+                event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]}))
+            ),
+            "multiple finish reasons",
+        ),
+    ] {
+        let (url, server) = server(body).await;
+        let config = Config {
+            base_url: url,
+            retries: 0,
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = OpenAiClient
+            .complete(
+                json!({"messages":[]}),
+                &config,
+                CancellationToken::new(),
+                tx,
+            )
+            .await;
+        server.abort();
+        assert!(result.unwrap_err().to_string().contains(expected));
+    }
 }
 #[tokio::test]
 async fn missing_usage_is_not_zero() {

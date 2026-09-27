@@ -299,6 +299,15 @@ fn read_output(
     }
 }
 
+fn rollback_failure(cause: anyhow::Error, rollback: Result<()>) -> anyhow::Error {
+    match rollback {
+        Ok(()) => cause,
+        Err(error) => anyhow::anyhow!(
+            "database_rollback_uncertain: operation failed: {cause}; rollback failed: {error}"
+        ),
+    }
+}
+
 fn finish_mutation(
     conn: &Connection,
     operation: Result<Value>,
@@ -308,19 +317,19 @@ fn finish_mutation(
     let mut result = match operation {
         Ok(result) => result,
         Err(error) => {
-            let _ = conn.rollback();
-            return Err(error);
+            return Err(rollback_failure(error, conn.rollback().map_err(Into::into)));
         }
     };
     if cancel.is_cancelled() {
-        let _ = conn.rollback();
-        bail!("cancelled");
+        return Err(rollback_failure(
+            anyhow::anyhow!("cancelled"),
+            conn.rollback().map_err(Into::into),
+        ));
     }
     if let Err(error) =
         remaining(deadline).and_then(|left| conn.set_call_timeout(Some(left)).map_err(Into::into))
     {
-        let _ = conn.rollback();
-        return Err(error);
+        return Err(rollback_failure(error, conn.rollback().map_err(Into::into)));
     }
     conn.commit()
         .map_err(|error| anyhow::anyhow!("database_commit_uncertain: {error}"))?;
@@ -530,5 +539,17 @@ mod tests {
     fn sql_bind_names_must_be_unique_ignoring_case() {
         assert!(sql_binds(&json!({"params":{"item_id":1,"ITEM_ID":2}})).is_err());
         assert!(sql_binds(&json!({"params":{"item_id":1,"other_id":2}})).is_ok());
+    }
+
+    #[test]
+    fn failed_rollback_preserves_both_causes_and_marks_outcome_uncertain() {
+        let cause = anyhow::anyhow!("cancelled");
+        let error = rollback_failure(cause, Err(anyhow::anyhow!("connection lost")));
+        assert_eq!(
+            error.to_string(),
+            "database_rollback_uncertain: operation failed: cancelled; rollback failed: connection lost"
+        );
+        let error = rollback_failure(anyhow::anyhow!("statement failed"), Ok(()));
+        assert_eq!(error.to_string(), "statement failed");
     }
 }

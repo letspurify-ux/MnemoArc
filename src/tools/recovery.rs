@@ -138,7 +138,10 @@ pub fn describe(message: &str) -> Value {
         "invalid_database_query_arguments" | "invalid_database_execution_arguments"
     ) {
         (Class::InvalidInput, "correct_arguments")
-    } else if code == "database_commit_uncertain" {
+    } else if matches!(
+        code,
+        "database_commit_uncertain" | "database_rollback_uncertain"
+    ) {
         (Class::OutcomeUnknown, "inspect_outcome_before_retry")
     } else if code == "database_result_too_wide" {
         (Class::Capacity, "reduce_request_or_cleanup")

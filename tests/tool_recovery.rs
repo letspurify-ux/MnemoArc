@@ -25,6 +25,15 @@ fn uncertain_nested_write_is_not_treated_as_a_correctable_document_error() {
     assert!(!tools::recovery::correctable_document_error(&mixed));
 }
 
+#[test]
+fn failed_database_rollback_requires_outcome_inspection() {
+    let result = tools::envelope(Err(anyhow::anyhow!(
+        "database_rollback_uncertain: operation failed; rollback failed"
+    )));
+    assert_eq!(result["recovery"]["class"], "outcome_unknown");
+    assert_eq!(result["recovery"]["action"], "inspect_outcome_before_retry");
+}
+
 fn session(root: &std::path::Path) -> Session {
     let mut s = Session::new(
         Project {

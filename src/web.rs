@@ -700,11 +700,38 @@ async fn run(
             input.action.as_str()
         };
         match action {
-            "chat" => { if input.text.trim().is_empty(){return Err(ApiError(StatusCode::BAD_REQUEST,"메시지를 입력하세요.".into()));} session.start_new_task(input.text); },
+            "chat" => {
+                if input.text.trim().is_empty() {
+                    return Err(ApiError(
+                        StatusCode::BAD_REQUEST,
+                        "메시지를 입력하세요.".into(),
+                    ));
+                }
+                session.start_new_task(input.text);
+            }
             "question" => session.queue_question(input.text)?,
-            "resume" => {},
-            "cleanup" => session.add_maintenance("Clean up memory and progress to fit the pending settings. Preserve important evidence and user constraints. Do not modify project files.".into()),
-            _ => return Err(ApiError(StatusCode::BAD_REQUEST,"지원하지 않는 실행 방식입니다.".into())),
+            "resume" | "cleanup" => {
+                let accepted_text = input.text.is_empty()
+                    || (action == "resume" && Session::is_continuation(&input.text));
+                if !accepted_text {
+                    return Err(ApiError(StatusCode::BAD_REQUEST,"재개와 기억 정리는 메시지를 받지 않습니다. 새 요청은 새 작업으로 보내세요.".into()));
+                }
+                if session.latest_request.is_empty() {
+                    return Err(ApiError(
+                        StatusCode::BAD_REQUEST,
+                        "재개하거나 정리할 작업이 없습니다.".into(),
+                    ));
+                }
+                if action == "cleanup" {
+                    session.add_maintenance("Clean up memory and progress to fit the pending settings. Preserve important evidence and user constraints. Do not modify project files.".into());
+                }
+            }
+            _ => {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "지원하지 않는 실행 방식입니다.".into(),
+                ));
+            }
         }
         if session.question.is_none()
             && let Some(cp) = &mut session.checkpoint
