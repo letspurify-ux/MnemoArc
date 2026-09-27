@@ -99,6 +99,7 @@ fn model_message(mut message: Value) -> Value {
     if let Some(fields) = message.as_object_mut() {
         fields.remove("partial");
         fields.remove("continues_previous");
+        fields.remove("maintenance");
     }
     message
 }

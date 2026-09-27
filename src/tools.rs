@@ -3808,19 +3808,11 @@ fn execute_repaired(
                 bail!(INVALID_CURSOR);
             }
             let end = (offset + n(&args, "limit", 100).clamp(1, 500)).min(names.len());
-            if end < names.len()
-                && !s
-                    .list_cursor_scopes
-                    .iter()
-                    .any(|(known, _)| *known == fingerprint)
-            {
-                s.list_cursor_scopes.push_back((
+            if end < names.len() {
+                s.remember_list_scope(
                     fingerprint.clone(),
                     json!({"mode":mode,"path_glob":path_glob(&args)?}),
-                ));
-                while s.list_cursor_scopes.len() > 32 {
-                    s.list_cursor_scopes.pop_front();
-                }
+                );
             }
             Ok(
                 json!({"hash":fingerprint,"mode":mode,"total_files":names.len(),"paths":names[offset..end],"next_cursor":(end<names.len()).then(||format!("{fingerprint}:{end}"))}),

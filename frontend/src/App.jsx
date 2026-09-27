@@ -47,9 +47,14 @@ export default function App() {
     timer = useRef(null),
     alive = useRef(true),
     versions = useRef(new Map()),
-    settingsDirty = useRef(false);
+    settingsDirty = useRef(false),
+    projectsDirty = useRef(false),
+    selectionEpoch = useRef(0);
   const onSettingsDirtyChange = useCallback((dirty) => {
     settingsDirty.current = dirty;
+  }, []);
+  const onProjectsDirtyChange = useCallback((dirty) => {
+    projectsDirty.current = dirty;
   }, []);
   const refresh = useCallback(async () => {
     if (fetching.current) {
@@ -57,15 +62,25 @@ export default function App() {
       return;
     }
     fetching.current = true;
+    const epoch = selectionEpoch.current;
     try {
       const next = await api("/state");
       if (!alive.current) return;
+      if (selectionEpoch.current !== epoch) {
+        pending.current = true;
+        return;
+      }
       setState(next);
       let id = selection.current;
       if (!next.sessions.some((s) => s.id === id)) {
         id = next.sessions[0]?.id || "";
         selection.current = id;
         setSelected(id);
+        window.history.replaceState(
+          null,
+          "",
+          id ? `#${id}` : window.location.pathname + window.location.search,
+        );
       }
       if (id) {
         const current = await api(`/sessions/${id}`);
@@ -140,20 +155,20 @@ export default function App() {
       // resizing the panel for the current page.
     }
   }, [inspectorWidth]);
-  function canLeaveSettings() {
-    return (
-      page !== "settings" ||
-      !settingsDirty.current ||
-      window.confirm("저장하지 않은 설정을 버리고 이동할까요?")
-    );
+  function canLeavePage() {
+    const dirty =
+      (page === "settings" && settingsDirty.current) ||
+      (page === "projects" && projectsDirty.current);
+    return !dirty || window.confirm("저장하지 않은 변경 사항을 버리고 이동할까요?");
   }
   function showPage(next) {
-    if (next !== page && !canLeaveSettings()) return;
+    if (next !== page && !canLeavePage()) return;
     setPage(next);
     setMobileNav(false);
   }
   function choose(id, confirmed = false) {
-    if (!confirmed && !canLeaveSettings()) return;
+    if (!confirmed && !canLeavePage()) return;
+    selectionEpoch.current++;
     selection.current = id;
     window.history.replaceState(null, "", `#${id}`);
     setSelected(id);
@@ -177,7 +192,7 @@ export default function App() {
     void act(fn).catch(() => {});
   };
   async function create(project) {
-    if (!canLeaveSettings()) return;
+    if (!canLeavePage()) return;
     setPage("chat");
     setMobileNav(false);
     setNavigating(true);
@@ -398,6 +413,7 @@ export default function App() {
           <Projects
             config={state.config}
             onSaved={refresh}
+            onDirtyChange={onProjectsDirtyChange}
             onCreate={(project) => act(() => create(project))}
           />
         ) : session && !navigating ? (
@@ -550,7 +566,7 @@ function SessionButton({ session, active, onClick, onClose, closing }) {
     </div>
   );
 }
-function Projects({ config, onSaved, onCreate }) {
+function Projects({ config, onSaved, onCreate, onDirtyChange }) {
   const empty = {
     name: "새 프로젝트",
     root: "",
@@ -566,6 +582,10 @@ function Projects({ config, onSaved, onCreate }) {
     [message, setMessage] = useState(""),
     [busy, setBusy] = useState(false),
     [dirty, setDirty] = useState(false);
+  useEffect(() => {
+    onDirtyChange(dirty);
+    return () => onDirtyChange(false);
+  }, [dirty, onDirtyChange]);
   const project = list[index];
   async function save() {
     setBusy(true);

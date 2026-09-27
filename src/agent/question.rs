@@ -76,6 +76,7 @@ pub(super) async fn run(
     cancel: CancellationToken,
     events: mpsc::Sender<AgentEvent>,
 ) -> Session {
+    let settings = apply_pending_config(&mut s, false);
     s.begin_run();
     s.status = "running".into();
     s.last_error = None;
@@ -85,6 +86,7 @@ pub(super) async fn run(
     snapshot(&s, &events, &cancel, deadline).await;
     let mut answer = None;
     let result: Result<()> = async {
+        settings.map_err(|error| anyhow::anyhow!("settings_pending_cleanup: {error}; task preserved"))?;
         s.config.runnable()?;
         let mut request = request(&s);
         let tokens = context::count(&request, &s.config.model);

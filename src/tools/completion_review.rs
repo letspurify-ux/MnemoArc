@@ -101,6 +101,21 @@ pub fn required(s: &Session) -> bool {
             || !s.task.unresolved.is_empty())
 }
 
+/// Called only with paths validated and changed by the filesystem tool.
+pub(super) fn record_file_writes(s: &mut Session, paths: &[PathBuf]) {
+    for path in paths {
+        let path = path.display().to_string();
+        if !s.completion_review.written_paths.contains(&path) {
+            s.completion_review.written_paths.push(path.clone());
+        }
+        s.completion_review.files.retain(|saved| saved != &path);
+        s.completion_review.files.push(path);
+    }
+    let overflow = s.completion_review.files.len().saturating_sub(MAX_FILES);
+    s.completion_review.retention_omitted |= overflow > 0;
+    s.completion_review.files.drain(..overflow);
+}
+
 /// Persist bounded, delivered observations across checkpoints. Bookkeeping and
 /// model-authored verification notes are deliberately not acceptance evidence.
 pub fn observe(s: &mut Session, call: &crate::llm::ToolCall, result: &Value) {
@@ -129,20 +144,10 @@ pub fn observe(s: &mut Session, call: &crate::llm::ToolCall, result: &Value) {
     if result["status"] != "ok" {
         return;
     }
-    if mutation && call.name != "db_execute" {
-        let written = if matches!(call.name.as_str(), "document_edit" | "document_edit_batch") {
-            output_path(&s.project).ok()
-        } else {
-            serde_json::from_str::<Value>(&call.arguments)
-                .ok()
-                .and_then(|args| args["path"].as_str().map(str::to_owned))
-                .and_then(|path| read_path(&s.project, &path).ok())
-        };
-        if let Some(path) = written.map(|p| p.display().to_string())
-            && !s.completion_review.written_paths.contains(&path)
-        {
-            s.completion_review.written_paths.push(path);
-        }
+    if matches!(call.name.as_str(), "document_edit" | "document_edit_batch")
+        && let Some((path, _)) = s.last_document_write.clone()
+    {
+        record_file_writes(s, &[path]);
     }
     // A suppressed repeat contains no new evidence. Retain the real read
     // instead of consuming a receipt slot with another navigation reminder.

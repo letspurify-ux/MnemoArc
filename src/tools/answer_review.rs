@@ -45,15 +45,56 @@ pub fn request(s: &Session) -> Result<Value> {
         {"role":"user","content":""}
     ]});
     let mut payload = json!({"source_answer_review":true,"request":s.answer_review_question,
-        "constraints":s.task.constraints,"draft":s.answer_draft,"evidence":[],"evidence_omitted":false,
+        "constraints":s.task.constraints,"draft":s.answer_draft,"draft_truncated":false,"evidence":[],"evidence_omitted":false,
         "previous_response_error":s.last_error.as_deref().filter(|e| e.starts_with("answer_review_incomplete:")),
         "citation_issues":citation_issues(s, s.answer_draft.as_deref().unwrap_or(""))});
     request["messages"][1]["content"] = json!(payload.to_string());
-    let ceiling = 8000.min(context::ContextManager::input_budget(&s.config));
-    if context::count(&request, &s.config.model) > ceiling {
-        bail!(
-            "answer_review_budget: draft and constraints exceed bounded review input; shorten the answer before resuming"
+    let count = |request: &Value| {
+        context::ContextManager::calibrated(s, context::count(request, &s.config.model))
+    };
+    // This tool-free revision needs room for its answer, but no future tool
+    // batches or cleanup requests. Grow the usual allowance with the draft.
+    let available = s
+        .config
+        .context_tokens
+        .saturating_sub(s.config.output_tokens.saturating_add(512));
+    let base_tokens = count(&request);
+    let ceiling = 8000.max(base_tokens.saturating_add(4096)).min(available);
+    if base_tokens > ceiling {
+        // A pending draft may outlive a reduction of the context setting.
+        // Preserve its full text in the session and label the review preview
+        // explicitly; requirements are never shortened to fit a stale draft.
+        let draft = s.answer_draft.as_deref().unwrap_or("");
+        let boundaries: Vec<_> = draft
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(draft.len()))
+            .collect();
+        payload["draft_truncated"] = json!(true);
+        payload["draft_note"] = json!(
+            "Only a prefix of the draft fits this context. Return a complete concise answer to the original request using the evidence; do not treat this preview as a complete answer."
         );
+        payload["draft"] = json!("");
+        request["messages"][1]["content"] = json!(payload.to_string());
+        let draft_ceiling = ceiling.saturating_sub(4096.min(ceiling / 4));
+        if count(&request) > draft_ceiling {
+            bail!(
+                "answer_review_budget: request and constraints exceed the review context; increase the context budget or disable source answer review"
+            );
+        }
+        let (mut low, mut high) = (0, boundaries.len() - 1);
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            payload["draft"] = json!(&draft[..boundaries[mid]]);
+            request["messages"][1]["content"] = json!(payload.to_string());
+            if count(&request) <= draft_ceiling {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        payload["draft"] = json!(&draft[..boundaries[low]]);
+        request["messages"][1]["content"] = json!(payload.to_string());
     }
     let mut items = Vec::new();
     // Hash each file once while constructing this request, not once per hit.
@@ -114,7 +155,7 @@ pub fn request(s: &Session) -> Result<Value> {
         evidence.push(item);
         payload["evidence"] = json!(&evidence);
         request["messages"][1]["content"] = json!(payload.to_string());
-        if context::count(&request, &s.config.model) > ceiling.saturating_sub(128) {
+        if count(&request) > ceiling.saturating_sub(128) {
             evidence.pop();
             omitted = true;
         }

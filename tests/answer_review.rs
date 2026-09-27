@@ -191,17 +191,146 @@ fn review_is_bounded_and_new_requests_reset_but_resume_preserves_pending_draft()
     s.add_user("resume".into());
     assert_eq!(s.answer_draft.as_deref(), Some("draft"));
     assert_eq!(s.answer_review_question, original);
-    s.answer_draft = Some("many words ".repeat(20_000));
+    s.answer_draft = Some("many words 한글 ".repeat(30_000));
+    let full_draft = s.answer_draft.clone();
+    let request = tools::answer_review::request(&s).unwrap();
+    let payload: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["draft_truncated"], true);
+    assert!(!payload["evidence"].as_array().unwrap().is_empty());
     assert!(
-        tools::answer_review::request(&s)
-            .unwrap_err()
-            .to_string()
-            .contains("answer_review_budget")
+        full_draft
+            .as_ref()
+            .unwrap()
+            .starts_with(payload["draft"].as_str().unwrap())
+    );
+    assert_eq!(s.answer_draft, full_draft);
+    assert!(
+        mnemoarc::context::count(&request, &s.config.model) + s.config.output_tokens + 512
+            <= s.config.context_tokens
     );
     s.add_user("A new task".into());
     assert!(s.answer_draft.is_none());
     assert!(!s.answer_reviewed);
     assert!(!tools::answer_review::eligible(&s));
+}
+
+struct LongAnswer {
+    step: Mutex<usize>,
+    draft: String,
+}
+#[async_trait]
+impl LlmClient for LongAnswer {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        if let Some(review) = support::acceptance(&request) {
+            return Ok(review);
+        }
+        let mut step = self.step.lock().unwrap();
+        let result = match *step {
+            0 => Completion {
+                calls: vec![ToolCall {
+                    id: "read-long".into(),
+                    name: "file_read".into(),
+                    arguments: json!({"path":"a.rs"}).to_string(),
+                }],
+                ..Default::default()
+            },
+            1 => Completion {
+                text: self.draft.clone(),
+                ..Default::default()
+            },
+            2 => {
+                let payload: Value =
+                    serde_json::from_str(request["messages"][1]["content"].as_str().unwrap())?;
+                assert_eq!(payload["source_answer_review"], true);
+                assert_eq!(payload["draft"], self.draft);
+                assert_eq!(payload["draft_truncated"], false);
+                assert!(!payload["evidence"].as_array().unwrap().is_empty());
+                Completion {
+                    text: "The function returns true when flag is true, otherwise false.".into(),
+                    ..Default::default()
+                }
+            }
+            _ => panic!("unexpected extra model request"),
+        };
+        *step += 1;
+        Ok(result)
+    }
+}
+
+#[tokio::test]
+async fn long_source_answer_completes_its_review_without_an_eight_thousand_token_stop() {
+    let (_dir, mut s) = setup();
+    s.config.context_tokens = 128000;
+    s.config.output_tokens = 10000;
+    let client = Arc::new(LongAnswer {
+        step: Mutex::new(0),
+        draft: "word ".repeat(8200),
+    });
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = agent::run_session(s, client.clone(), CancellationToken::new(), tx).await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert!(result.answer_reviewed);
+    assert!(result.answer_draft.is_none());
+    assert_eq!(result.answer_review_original.as_ref(), Some(&client.draft));
+    assert_eq!(*client.step.lock().unwrap(), 3);
+}
+
+struct ReviewDisabled;
+#[async_trait]
+impl LlmClient for ReviewDisabled {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        assert!(!config.source_answer_review);
+        assert!(
+            !request
+                .to_string()
+                .contains("\"source_answer_review\":true")
+        );
+        Ok(Completion {
+            text: "The function returns the flag value.".into(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn disabling_review_releases_a_pending_draft_at_the_request_boundary() {
+    let (_dir, mut s) = setup();
+    delivered(&mut s);
+    s.answer_draft = Some("saved draft".into());
+    s.status = "blocked".into();
+    s.last_error = Some("answer_review_budget: old review limit".into());
+    let mut next = s.config.clone();
+    next.source_answer_review = false;
+    s.pending_config = Some(next);
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result =
+        agent::run_session(s, Arc::new(ReviewDisabled), CancellationToken::new(), tx).await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert!(result.answer_draft.is_none());
+    assert!(result.pending_config.is_none());
+    assert!(!result.answer_reviewed);
+    assert_eq!(
+        result.answer_review_original.as_deref(),
+        Some("saved draft")
+    );
+    assert_eq!(result.run_history.back().unwrap().rounds, 1);
 }
 
 struct ForbiddenReviewer;

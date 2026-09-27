@@ -376,7 +376,7 @@ fn write_path(
 }
 
 fn commit(
-    s: &Session,
+    s: &mut Session,
     state: BTreeMap<PathBuf, Option<String>>,
     originals: BTreeMap<PathBuf, Option<String>>,
     permissions: BTreeMap<PathBuf, Option<Permissions>>,
@@ -444,6 +444,7 @@ fn commit(
             if failures.is_empty() {
                 bail!("cancelled: completed file changes were rolled back");
             }
+            super::completion_review::record_file_writes(s, &completed);
             bail!(
                 "file_patch_rollback_failed: cancellation left uncertain file changes; rollback_errors={failures:?}"
             );
@@ -462,12 +463,16 @@ fn commit(
             if rollback_errors.is_empty() {
                 bail!("file_patch_write_failed: {error}; completed file changes were rolled back");
             }
+            super::completion_review::record_file_writes(s, &completed);
             bail!(
                 "file_patch_rollback_failed: write error={error}; rollback_errors={rollback_errors:?}"
             );
         }
         completed.push(path.clone());
     }
+    // Capture actual committed paths before the response can be truncated.
+    // This also includes deleted files and both ends of a move.
+    super::completion_review::record_file_writes(s, &completed);
     let mut result = json!({"files":files,"changed_files":changed.len()});
     if files.len() == 1 {
         result["hash"] = files[0]["hash"].clone();

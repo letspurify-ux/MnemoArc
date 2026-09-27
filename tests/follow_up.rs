@@ -156,6 +156,105 @@ async fn run(s: Session, client: Arc<dyn LlmClient>) -> Session {
     result
 }
 
+struct UpdatedConfig;
+#[async_trait]
+impl LlmClient for UpdatedConfig {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &Config,
+        cancel: CancellationToken,
+        delta: mpsc::Sender<String>,
+    ) -> anyhow::Result<Completion> {
+        assert_eq!(config.model, "gpt-4.1");
+        assert_eq!(request["model"], "gpt-4.1");
+        assert_eq!(config.request_timeout_secs, 37);
+        assert_eq!(
+            config.api_key.as_ref().map(|key| key.0.as_str()),
+            Some("updated-follow-up-key")
+        );
+        Reply::Answer.complete(request, config, cancel, delta).await
+    }
+}
+
+#[tokio::test]
+async fn follow_up_applies_pending_and_queued_settings_without_changing_the_suspended_task() {
+    use mnemoarc::agent::{RunCommand, run_session_controlled};
+    for queued in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = fixture(dir.path());
+        let before = preserved(&s);
+        let mut next = s.config.clone();
+        next.model = "gpt-4.1".into();
+        next.request_timeout_secs = 37;
+        next.api_key = Some(mnemoarc::config::Secret("updated-follow-up-key".into()));
+        s.queue_question("Why did it stop?".into()).unwrap();
+        let (commands, rx_commands) = mpsc::channel(1);
+        if queued {
+            commands
+                .send(RunCommand::Configure(Box::new(next)))
+                .await
+                .unwrap();
+        } else {
+            s.pending_config = Some(next);
+        }
+        let (tx, mut rx) = mpsc::channel(128);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let result = run_session_controlled(
+            s,
+            Arc::new(UpdatedConfig),
+            CancellationToken::new(),
+            tx,
+            rx_commands,
+        )
+        .await;
+        drain.await.unwrap();
+        assert_eq!(preserved(&result), before);
+        assert_eq!(result.config.model, "gpt-4.1");
+        assert!(result.pending_config.is_none());
+        assert_eq!(result.run_history.back().unwrap().reason, "complete");
+    }
+}
+
+struct NoQuestionRequest;
+#[async_trait]
+impl LlmClient for NoQuestionRequest {
+    async fn complete(
+        &self,
+        _: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> anyhow::Result<Completion> {
+        panic!("incompatible pending settings must not use the previous model");
+    }
+}
+
+#[tokio::test]
+async fn follow_up_rejects_incompatible_settings_without_pruning_the_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = fixture(dir.path());
+    let before = preserved(&s);
+    s.queue_question("Why did it stop?".into()).unwrap();
+    let history = serde_json::to_value(&s.history.bundles).unwrap();
+    let mut next = s.config.clone();
+    next.history_bytes = 1;
+    s.pending_config = Some(next);
+    let result = run(s, Arc::new(NoQuestionRequest)).await;
+    assert_eq!(preserved(&result), before);
+    assert_eq!(
+        serde_json::to_value(&result.history.bundles).unwrap(),
+        history
+    );
+    assert!(result.pending_config.is_some());
+    assert_eq!(result.config.model, "gpt-4o");
+    assert_eq!(
+        result.run_history.back().unwrap().reason,
+        "settings_pending_cleanup"
+    );
+    assert_eq!(result.run_history.back().unwrap().rounds, 0);
+}
+
 #[tokio::test]
 async fn questions_preserve_unfinished_work_even_on_failure_or_cancellation() {
     for (reply, expected) in [

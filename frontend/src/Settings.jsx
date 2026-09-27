@@ -1,24 +1,31 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { groups, inputValue, parseValue } from "./fields.js";
 import { api, send } from "./api.js";
 
 export function DirectoryPicker({ path, onSelect, onClose }) {
   const [data, setData] = useState(null),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [loading, setLoading] = useState(false);
+  const request = useRef(0);
   const load = async (path) => {
+    const current = ++request.current;
+    setLoading(true);
     try {
-      setData(
-        await api(
-          `/directories${path ? `?path=${encodeURIComponent(path)}` : ""}`,
-        ),
+      const next = await api(
+        `/directories${path ? `?path=${encodeURIComponent(path)}` : ""}`,
       );
+      if (request.current !== current) return;
+      setData(next);
       setError("");
     } catch (e) {
-      setError(e.message);
+      if (request.current === current) setError(e.message);
+    } finally {
+      if (request.current === current) setLoading(false);
     }
   };
   useEffect(() => {
     void load(path);
+    return () => { request.current++; };
   }, []);
   return (
     <div className="modal-backdrop">
@@ -40,7 +47,7 @@ export function DirectoryPicker({ path, onSelect, onClose }) {
             {error}
           </p>
         )}
-        <div className="directory-list">
+        <div className="directory-list" aria-busy={loading}>
           {data?.parent && (
             <button onClick={() => load(data.parent)}>↑ 상위 폴더</button>
           )}
@@ -54,7 +61,7 @@ export function DirectoryPicker({ path, onSelect, onClose }) {
         </div>
         <button
           className="primary"
-          disabled={!data}
+          disabled={!data || loading}
           onClick={() => onSelect(data.path)}
         >
           이 폴더 선택
@@ -284,7 +291,10 @@ export default function Settings({
     setError("");
     setMessage("일반 응답, 스트리밍, 도구 왕복을 확인하고 있습니다…");
     try {
-      await send("/check", payload());
+      await send(
+        scope === "session" ? `/sessions/${sessionId}/check` : "/check",
+        payload(),
+      );
       setMessage("연결 확인 완료 · 응답, 스트리밍, 도구 호출이 정상입니다.");
     } catch (e) {
       setError(e.message);

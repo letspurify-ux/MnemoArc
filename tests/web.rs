@@ -33,7 +33,13 @@ async fn launch(path: &std::path::Path) -> (String, WebState, tokio::task::JoinH
         }],
         ..Default::default()
     };
-    let state = WebState::new(c, path.join("config.toml"), Arc::new(Waiting)).unwrap();
+    launch_config(path, c).await
+}
+async fn launch_config(
+    path: &std::path::Path,
+    config: Config,
+) -> (String, WebState, tokio::task::JoinHandle<()>) {
+    let state = WebState::new(config, path.join("config.toml"), Arc::new(Waiting)).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let app = web::router(state.clone(), path.into());
@@ -53,6 +59,89 @@ async fn get(client: &reqwest::Client, url: &str, path: &str) -> Value {
         .json()
         .await
         .unwrap()
+}
+#[tokio::test]
+async fn unavailable_saved_projects_do_not_prevent_startup_or_repair() {
+    for available in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = Project {
+            name: "Moved project".into(),
+            root: dir.path().join("missing"),
+            ..Default::default()
+        };
+        let valid = Project {
+            name: "Available project".into(),
+            root: dir.path().into(),
+            ..Default::default()
+        };
+        let mut projects = vec![missing.clone()];
+        if available {
+            projects.push(valid.clone());
+        }
+        let config = Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128000),
+            projects,
+            ..Default::default()
+        };
+        let (url, state, server) = launch_config(dir.path(), config).await;
+        let client = reqwest::Client::new();
+        let initial = get(&client, &url, "/api/state").await;
+        assert_eq!(initial["config"]["projects"][0]["name"], "Moved project");
+        assert_eq!(
+            initial["sessions"].as_array().unwrap().len(),
+            usize::from(available)
+        );
+        if available {
+            assert_eq!(
+                initial["sessions"][0]["project"]["name"],
+                "Available project"
+            );
+        }
+        let rejected = client
+            .post(format!("{url}/api/sessions"))
+            .header("x-mnemoarc-client", "web")
+            .json(&json!({"project":missing}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), 400);
+        let mut repaired = initial["config"].clone();
+        repaired["projects"] = json!([valid]);
+        let saved = client
+            .put(format!("{url}/api/settings"))
+            .header("x-mnemoarc-client", "web")
+            .json(&json!({"config":repaired}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            saved.status().is_success(),
+            "{}",
+            saved.text().await.unwrap()
+        );
+        let created = client
+            .post(format!("{url}/api/sessions"))
+            .header("x-mnemoarc-client", "web")
+            .json(&json!({"project":valid}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            created.status().is_success(),
+            "{}",
+            created.text().await.unwrap()
+        );
+        assert_eq!(
+            get(&client, &url, "/api/state").await["sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            usize::from(available) + 1
+        );
+        state.shutdown().await;
+        server.abort();
+    }
 }
 #[tokio::test]
 async fn settings_are_complete_validated_persisted_and_credentials_never_returned() {
@@ -105,6 +194,90 @@ async fn settings_are_complete_validated_persisted_and_credentials_never_returne
     );
     state.shutdown().await;
     server.abort();
+}
+#[tokio::test]
+async fn session_connection_check_uses_the_sessions_credential() {
+    use axum::{Router, http::HeaderMap, http::StatusCode, routing::post};
+
+    let (auth_tx, mut auth_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mock = Router::new().route(
+        "/chat/completions",
+        post(move |headers: HeaderMap| {
+            let auth_tx = auth_tx.clone();
+            async move {
+                let authorization = headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let _ = auth_tx.send(authorization);
+                (StatusCode::UNAUTHORIZED, "probe stopped")
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+    let dir = tempfile::tempdir().unwrap();
+    let (url, state, server) = launch(dir.path()).await;
+    let client = reqwest::Client::new();
+    let initial = get(&client, &url, "/api/state").await;
+    let id = initial["sessions"][0]["id"].as_str().unwrap();
+    let mut config = initial["config"].clone();
+    config["base_url"] = json!(upstream);
+    let global = client
+        .put(format!("{url}/api/settings"))
+        .header("x-mnemoarc-client", "web")
+        .json(&json!({"config":config,"api_key":"global-test-key","credential_mode":"session"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(global.status().is_success());
+    let session = client
+        .put(format!("{url}/api/sessions/{id}/settings"))
+        .header("x-mnemoarc-client", "web")
+        .json(&json!({"config":config,"api_key":"session-test-key","credential_mode":"session"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(session.status().is_success());
+
+    let session_check = client
+        .post(format!("{url}/api/sessions/{id}/check"))
+        .header("x-mnemoarc-client", "web")
+        .json(&json!({"config":config,"credential_mode":"keep"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(session_check.status(), 400);
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), auth_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        "Bearer session-test-key"
+    );
+
+    let global_check = client
+        .post(format!("{url}/api/check"))
+        .header("x-mnemoarc-client", "web")
+        .json(&json!({"config":config,"credential_mode":"keep"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(global_check.status(), 400);
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), auth_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        "Bearer global-test-key"
+    );
+
+    state.shutdown().await;
+    server.abort();
+    mock_server.abort();
 }
 #[tokio::test]
 async fn session_switch_reconnect_busy_cancel_and_close_preserve_owner() {

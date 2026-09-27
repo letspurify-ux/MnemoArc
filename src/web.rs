@@ -179,20 +179,32 @@ impl WebState {
                 ..Default::default()
             });
         }
+        // Saved folders may have been moved or temporarily unmounted. Keep
+        // those entries editable in settings, and start with an available
+        // project instead of preventing the settings UI from opening.
+        let mut initial_project = None;
         for project in &mut config.projects {
-            *project = normalize_project(project.clone())?;
+            if let Ok(normalized) = normalize_project(project.clone()) {
+                *project = normalized;
+                initial_project.get_or_insert_with(|| project.clone());
+            }
         }
         let write_outcome_uncertain = Arc::new(AtomicBool::new(false));
-        let mut session = Session::new(config.projects[0].clone(), config.clone());
-        session.write_outcome_uncertain = write_outcome_uncertain.clone();
-        let id = session.id.clone();
+        let mut sessions = BTreeMap::new();
+        let mut order = Vec::new();
+        if let Some(project) = initial_project {
+            let mut session = Session::new(project, config.clone());
+            session.write_outcome_uncertain = write_outcome_uncertain.clone();
+            order.push(session.id.clone());
+            sessions.insert(session.id.clone(), session);
+        }
         let (events, _) = broadcast::channel(128);
         Ok(Self {
             core: Arc::new(Mutex::new(Core {
                 config,
                 path,
-                sessions: BTreeMap::from([(id.clone(), session)]),
-                order: vec![id],
+                sessions,
+                order,
                 streams: BTreeMap::new(),
                 running: None,
                 revision: 0,
@@ -268,6 +280,7 @@ pub fn app_router(state: WebState, frontend: Option<PathBuf>) -> Router {
         .route("/api/sessions/{id}/run", post(run))
         .route("/api/sessions/{id}/cancel", post(cancel))
         .route("/api/sessions/{id}/settings", put(session_settings))
+        .route("/api/sessions/{id}/check", post(session_check))
         .route("/api/sessions/{id}/project", put(session_project))
         .route("/api/sessions/{id}/tools", put(session_tools))
         .route("/api/sessions/{id}/workflow", put(session_workflow))
@@ -499,6 +512,22 @@ async fn check(State(s): State<WebState>, Json(input): Json<Settings>) -> Api {
         let c = s.core.lock().await;
         prepare_settings(&input, &c.config, &c.credentials)?
     };
+    check_config(s, config).await
+}
+async fn session_check(
+    State(s): State<WebState>,
+    Path(id): Path<String>,
+    Json(input): Json<Settings>,
+) -> Api {
+    let config = {
+        let c = s.core.lock().await;
+        let session = c.sessions.get(&id).ok_or_else(missing)?;
+        let current = session.pending_config.as_ref().unwrap_or(&session.config);
+        prepare_settings(&input, current, &c.credentials)?
+    };
+    check_config(s, config).await
+}
+async fn check_config(s: WebState, config: Config) -> Api {
     let message = tokio::select! {
         biased;
         _ = s.stopping.cancelled() => return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "앱을 종료하고 있습니다.".into())),
@@ -850,6 +879,7 @@ async fn run(
                         session.status = "blocked".into();
                         session.last_error = Some("agent_worker_panic: last snapshot retained; write outcomes require review".into());
                         session.note_run_estimate();
+                        session.finish_maintenance();
                         session.finish_run();
                         session.activity = json!({"stage":"idle"});
                         session.restore_after_question();

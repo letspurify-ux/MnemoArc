@@ -684,6 +684,7 @@ impl Session {
         // An explicit new task must not acknowledge the old task's unfinished
         // checkpoint. Its active history remains available for fresh cleanup.
         self.checkpoint = None;
+        self.finish_maintenance();
     }
 
     fn add_request(&mut self, text: String, continuation: bool) {
@@ -757,10 +758,44 @@ impl Session {
     /// must keep the current workflow, evidence requirements and review state
     /// so a pending settings change cannot silently weaken completion checks.
     pub fn add_maintenance(&mut self, text: String) {
-        self.ledger.clear();
-        self.latest_request = text.clone();
-        self.history
-            .push(vec![json!({"role":"user","content":text})], true);
+        self.finish_maintenance();
+        self.history.push(
+            vec![json!({"role":"user","content":text,"maintenance":true})],
+            true,
+        );
+    }
+
+    /// Cleanup instructions belong to one run, not to the resumed user task.
+    pub(crate) fn finish_maintenance(&mut self) {
+        for bundle in &mut self.history.bundles {
+            if bundle
+                .messages
+                .iter()
+                .any(|message| message["maintenance"] == true)
+            {
+                bundle.active = false;
+                // A cancelled cleanup may still have a checkpoint referring
+                // to this bundle. Hide the instruction, but retain the record
+                // until that checkpoint commits and releases its history.
+                bundle.reviewed = !self.checkpoint.as_ref().is_some_and(|checkpoint| {
+                    checkpoint.bundle_ids.contains(&bundle.id)
+                        || checkpoint.maintenance_bundle_ids.contains(&bundle.id)
+                });
+            }
+        }
+    }
+
+    pub(crate) fn remember_list_scope(&mut self, fingerprint: String, scope: Value) {
+        if !self
+            .list_cursor_scopes
+            .iter()
+            .any(|(known, _)| *known == fingerprint)
+        {
+            self.list_cursor_scopes.push_back((fingerprint, scope));
+            while self.list_cursor_scopes.len() > 32 {
+                self.list_cursor_scopes.pop_front();
+            }
+        }
     }
     /// Return the serialized size of session metadata that is retained outside
     /// the memory and history stores. Runtime turns use the same bound to

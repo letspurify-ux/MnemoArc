@@ -645,11 +645,47 @@ fn assistant(text: &str, calls: &[ToolCall]) -> Value {
     }
     v
 }
-async fn execute_one(s: Session, call: ToolCall, cancel: &CancellationToken) -> (Session, Value) {
+#[derive(Clone, Copy)]
+struct ToolDeadline {
+    at: tokio::time::Instant,
+    reason: &'static str,
+}
+
+impl ToolDeadline {
+    fn new(timeout: Duration, run_deadline: tokio::time::Instant) -> Self {
+        let tool_deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or(run_deadline);
+        if run_deadline <= tool_deadline {
+            Self {
+                at: run_deadline,
+                reason: "run_timeout",
+            }
+        } else {
+            Self {
+                at: tool_deadline,
+                reason: "tool_timeout",
+            }
+        }
+    }
+}
+
+async fn execute_one(
+    s: Session,
+    call: ToolCall,
+    cancel: &CancellationToken,
+    run_deadline: tokio::time::Instant,
+) -> (Session, Value) {
     if cancel.is_cancelled() {
         return (s, tools::envelope(Err(anyhow::anyhow!("cancelled"))));
     }
-    let timeout = s.config.tool_timeout_secs;
+    if tokio::time::Instant::now() >= run_deadline {
+        return (s, tools::envelope(Err(anyhow::anyhow!("run_timeout"))));
+    }
+    let deadline = ToolDeadline::new(
+        Duration::from_secs(s.config.tool_timeout_secs),
+        run_deadline,
+    );
     let backup = s.clone();
     let child = cancel.child_token();
     let external_write = matches!(
@@ -670,7 +706,7 @@ async fn execute_one(s: Session, call: ToolCall, cancel: &CancellationToken) -> 
         receiver,
         cancel,
         child,
-        Duration::from_secs(timeout),
+        deadline,
         Duration::from_secs(1),
         external_write,
     )
@@ -701,7 +737,7 @@ async fn await_tool_worker(
     mut receiver: oneshot::Receiver<ToolOutcome>,
     cancel: &CancellationToken,
     child: CancellationToken,
-    timeout: Duration,
+    deadline: ToolDeadline,
     settle_wait: Duration,
     external_write: bool,
 ) -> ToolOutcome {
@@ -709,7 +745,7 @@ async fn await_tool_worker(
         biased;
         outcome = &mut receiver => return received_tool_outcome(backup, outcome, external_write),
         _ = cancel.cancelled() => "cancelled",
-        _ = tokio::time::sleep(timeout) => "tool_timeout",
+        _ = tokio::time::sleep_until(deadline.at) => deadline.reason,
     };
     child.cancel();
     // A write can finish just after cancellation. Give it a bounded chance
@@ -804,6 +840,7 @@ async fn read_parallel(
     s: &mut Session,
     calls: &[ToolCall],
     cancel: &CancellationToken,
+    run_deadline: tokio::time::Instant,
 ) -> Vec<Value> {
     use futures_util::{StreamExt, stream};
     let project = s.project.clone();
@@ -822,6 +859,7 @@ async fn read_parallel(
     };
     let guidance = s.run_guidance.clone();
     let file_cursors = s.file_cursors.clone();
+    let list_cursor_scopes = s.list_cursor_scopes.clone();
     let owned_calls = calls.to_vec();
     let futures = owned_calls.into_iter().map(|call| {
         let mut temporary = Session::new(project.clone(), config.clone());
@@ -829,9 +867,19 @@ async fn read_parallel(
         temporary.history = history.clone();
         temporary.run_guidance = guidance.clone();
         temporary.file_cursors = file_cursors.clone();
+        temporary.list_cursor_scopes = list_cursor_scopes.clone();
         let cancel = cancel.clone();
         let timeout = config.tool_timeout_secs;
         async move {
+            // Buffered calls may start well after their batch was admitted.
+            // Check the shared deadline before creating each worker.
+            if cancel.is_cancelled() {
+                bail!("cancelled");
+            }
+            if tokio::time::Instant::now() >= run_deadline {
+                bail!("run_timeout");
+            }
+            let deadline = ToolDeadline::new(Duration::from_secs(timeout), run_deadline);
             let child = cancel.child_token();
             let mut receiver = spawn_tool_worker(temporary, call, child.clone())
                 .map_err(|error| anyhow::anyhow!("tool_worker_start_failed: {error}"))?;
@@ -844,9 +892,9 @@ async fn read_parallel(
                 result = &mut receiver => {
                     result.map_err(|error| anyhow::anyhow!("tool_worker_panic: tool worker failed: {error}"))
                 }
-                _ = tokio::time::sleep(Duration::from_secs(timeout)) => {
+                _ = tokio::time::sleep_until(deadline.at) => {
                     child.cancel();
-                    Err(anyhow::anyhow!("tool_timeout"))
+                    Err(anyhow::anyhow!(deadline.reason))
                 }
             }
         }
@@ -857,6 +905,14 @@ async fn read_parallel(
         match result {
             Ok((temp, mut result)) => {
                 s.file_cursors.extend(temp.file_cursors);
+                for (fingerprint, scope) in temp.list_cursor_scopes {
+                    if !list_cursor_scopes
+                        .iter()
+                        .any(|(known, _)| *known == fingerprint)
+                    {
+                        s.remember_list_scope(fingerprint, scope);
+                    }
+                }
                 let mut source_ids = std::collections::BTreeMap::new();
                 for source in temp.sources.into_values() {
                     let source_id = source.id.clone();
@@ -931,10 +987,12 @@ pub async fn run_session_controlled(
             "tool_worker_unresolved: review external write outcomes and restart before another run"
                 .into(),
         );
+        s.finish_maintenance();
         s.finish_run();
         return s;
     }
     if s.question.is_some() {
+        consume_commands(&mut s, &mut commands);
         return question::run(s, client, cancel, events).await;
     }
     s.begin_run();
@@ -988,58 +1046,38 @@ pub async fn run_session_controlled(
     }
     snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
     while failure.is_none() && !cancel.is_cancelled() {
-        while let Ok(command) = commands.try_recv() {
-            match command {
-                RunCommand::Configure(config) => s.pending_config = Some(*config),
-                RunCommand::Tools(names) => {
-                    // The web layer validates against its owner snapshot, but
-                    // this private session may have advanced before the
-                    // command is consumed. Preserve any workflow tools that
-                    // became mandatory in that interval.
-                    s.active_tools = ToolRegistry::normalize_tool_selection(&s, &names);
-                    // An explicit web selection supersedes a model's older
-                    // tool_select request that was waiting for the next batch.
-                    s.pending_tools = None;
-                }
+        consume_commands(&mut s, &mut commands);
+        match apply_pending_config(&mut s, true) {
+            Ok(true) => {
+                emit(
+                    &events,
+                    AgentEvent::Notice {
+                        session: s.id.clone(),
+                        text: "Settings applied at request boundary".into(),
+                    },
+                    &cancel,
+                    run_deadline(started, &s.config),
+                )
+                .await;
             }
+            Err(error) => {
+                emit(
+                    &events,
+                    AgentEvent::Notice {
+                        session: s.id.clone(),
+                        text: format!("Settings pending cleanup: {error}"),
+                    },
+                    &cancel,
+                    run_deadline(started, &s.config),
+                )
+                .await;
+            }
+            Ok(false) => {}
         }
-        if let Some(config) = s.pending_config.clone() {
-            // Try history cleanup and the new limits on a private candidate.
-            // A rejected setting must not leave an irreversible history prune
-            // behind while the old configuration remains active.
-            let mut candidate = s.clone();
-            let result = candidate
-                .history
-                .prune(config.history_bytes)
-                .and_then(|_| apply_config(&mut candidate, config));
-            match result {
-                Ok(()) => {
-                    candidate.pending_config = None;
-                    s = candidate;
-                    emit(
-                        &events,
-                        AgentEvent::Notice {
-                            session: s.id.clone(),
-                            text: "Settings applied at request boundary".into(),
-                        },
-                        &cancel,
-                        run_deadline(started, &s.config),
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    emit(
-                        &events,
-                        AgentEvent::Notice {
-                            session: s.id.clone(),
-                            text: format!("Settings pending cleanup: {error}"),
-                        },
-                        &cancel,
-                        run_deadline(started, &s.config),
-                    )
-                    .await;
-                }
-            }
+        if !s.config.source_answer_review && s.answer_draft.is_some() {
+            // Release a paused review when the user disables it. Keep the
+            // draft for inspection and return to the normal completion gates.
+            s.answer_review_original = s.answer_draft.take();
         }
         if started.elapsed().as_secs() >= s.config.run_timeout_secs
             || s.input_tokens
@@ -2481,9 +2519,11 @@ pub async fn run_session_controlled(
                     .map(|_| tools::envelope(Err(anyhow::anyhow!(reason))))
                     .collect()
             } else if parallel {
-                read_parallel(&mut s, &execution_calls[i..i + group], &cancel).await
+                let deadline = run_deadline(started, &s.config);
+                read_parallel(&mut s, &execution_calls[i..i + group], &cancel, deadline).await
             } else {
-                let (next, result) = execute_one(s, effective_call, &cancel).await;
+                let deadline = run_deadline(started, &s.config);
+                let (next, result) = execute_one(s, effective_call, &cancel, deadline).await;
                 s = next;
                 // The tool ran with a rebased execution argument, but the
                 // provider's call ID identifies the original assistant call.
@@ -2547,7 +2587,9 @@ pub async fn run_session_controlled(
                     }
                 }
                 if result["error"].as_str().is_some_and(|e| {
-                    e.starts_with("tool_worker_panic") || e.starts_with("tool_worker_unresolved")
+                    e.starts_with("tool_worker_panic")
+                        || e.starts_with("tool_worker_unresolved")
+                        || e.starts_with("run_timeout")
                 }) {
                     failure = result["error"].as_str().map(str::to_owned);
                 }
@@ -2889,6 +2931,7 @@ pub async fn run_session_controlled(
         s.status = "blocked".into();
         s.last_error = Some(error);
     }
+    s.finish_maintenance();
     s.finish_run();
     s.activity = json!({"stage":"idle"});
     snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
@@ -2930,6 +2973,37 @@ pub async fn headless(mut s: Session, prompt: String) -> Result<Session> {
     }
     Ok(result)
 }
+fn consume_commands(s: &mut Session, commands: &mut mpsc::Receiver<RunCommand>) {
+    while let Ok(command) = commands.try_recv() {
+        match command {
+            RunCommand::Configure(config) => s.pending_config = Some(*config),
+            RunCommand::Tools(names) => {
+                // Revalidate against the latest workflow, and supersede an
+                // older model selection waiting for the next batch.
+                s.active_tools = ToolRegistry::normalize_tool_selection(s, &names);
+                s.pending_tools = None;
+            }
+        }
+    }
+}
+
+fn apply_pending_config(s: &mut Session, prune_history: bool) -> Result<bool> {
+    let Some(config) = s.pending_config.clone() else {
+        return Ok(false);
+    };
+    // Validate on a private candidate. A rejected setting must not leave an
+    // irreversible history prune behind. Follow-up questions cannot prune the
+    // suspended task's history even if cleanup would make the settings fit.
+    let mut candidate = s.clone();
+    if prune_history {
+        candidate.history.prune(config.history_bytes)?;
+    }
+    apply_config(&mut candidate, config)?;
+    candidate.pending_config = None;
+    *s = candidate;
+    Ok(true)
+}
+
 pub fn apply_config(s: &mut Session, config: Config) -> Result<()> {
     s.check_limits(&config)?;
     let mut copy = s.clone();
@@ -2959,6 +3033,67 @@ mod worker_wait_tests {
     }
 
     #[tokio::test]
+    async fn run_deadline_cancels_a_read_before_its_tool_timeout() {
+        let (_sender, receiver) = oneshot::channel();
+        let cancel = CancellationToken::new();
+        let child = cancel.child_token();
+        let deadline = ToolDeadline::new(
+            Duration::from_secs(5),
+            tokio::time::Instant::now() + Duration::from_millis(10),
+        );
+        let (_, result) = tokio::time::timeout(
+            Duration::from_millis(300),
+            await_tool_worker(
+                session(),
+                receiver,
+                &cancel,
+                child.clone(),
+                deadline,
+                Duration::from_millis(20),
+                false,
+            ),
+        )
+        .await
+        .expect("run deadline must bound a stuck read");
+        assert_eq!(result["error"], "run_timeout");
+        assert!(child.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn expired_run_does_not_start_queued_reads_or_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("source.rs"), "fn source() {}\n").unwrap();
+        let mut s = session();
+        s.project.root = dir.path().into();
+        s.config.read_parallelism = 1;
+        let calls: Vec<_> = (0..4)
+            .map(|i| ToolCall {
+                id: format!("read-{i}"),
+                name: "file_read".into(),
+                arguments: json!({"path":"source.rs"}).to_string(),
+            })
+            .collect();
+        let cancel = CancellationToken::new();
+        let expired = tokio::time::Instant::now();
+        let results = read_parallel(&mut s, &calls, &cancel, expired).await;
+        assert_eq!(results.len(), 4);
+        assert!(
+            results
+                .iter()
+                .all(|result| result["error"] == "run_timeout")
+        );
+        assert!(s.sources.is_empty());
+        let write = ToolCall {
+            id: "write".into(),
+            name: "file_write".into(),
+            arguments: json!({"path":"late.rs","content":"late"}).to_string(),
+        };
+        let (_, result) = execute_one(s, write, &cancel, expired).await;
+        assert_eq!(result["error"], "run_timeout");
+        assert!(!dir.path().join("late.rs").exists());
+    }
+
+    #[tokio::test]
     async fn cancelled_read_does_not_wait_for_a_stuck_worker() {
         let backup = session();
         let (_sender, receiver) = oneshot::channel();
@@ -2971,7 +3106,10 @@ mod worker_wait_tests {
                 receiver,
                 &cancel,
                 cancel.child_token(),
-                Duration::from_secs(5),
+                ToolDeadline::new(
+                    Duration::from_secs(5),
+                    tokio::time::Instant::now() + Duration::from_secs(60),
+                ),
                 Duration::from_millis(20),
                 false,
             ),
@@ -2994,7 +3132,10 @@ mod worker_wait_tests {
                 receiver,
                 &cancel,
                 cancel.child_token(),
-                Duration::from_millis(10),
+                ToolDeadline::new(
+                    Duration::from_millis(10),
+                    tokio::time::Instant::now() + Duration::from_secs(60),
+                ),
                 Duration::from_millis(20),
                 true,
             ),
@@ -3035,7 +3176,10 @@ mod worker_wait_tests {
             receiver,
             &cancel,
             cancel.child_token(),
-            Duration::from_secs(5),
+            ToolDeadline::new(
+                Duration::from_secs(5),
+                tokio::time::Instant::now() + Duration::from_secs(60),
+            ),
             Duration::from_millis(100),
             true,
         )

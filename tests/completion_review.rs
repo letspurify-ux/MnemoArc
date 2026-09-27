@@ -67,6 +67,86 @@ fn write(s: &mut Session, content: &str) {
     review::observe(s, &call, &result);
 }
 
+#[test]
+fn patch_write_log_tracks_committed_paths_before_result_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.active_tools = tools::ToolRegistry::optional_names();
+    for path in ["update.rs", "move.rs", "delete.rs", "unchanged.rs"] {
+        std::fs::write(dir.path().join(path), "original\n").unwrap();
+    }
+    let digest = tools::hash(b"original\n");
+    let mut operations = vec![
+        json!({"action":"update","path":"update.rs","expected_hash":digest,"old_text":"original","new_text":"changed"}),
+        json!({"action":"move","path":"move.rs","to_path":"moved.rs","expected_hash":digest}),
+        json!({"action":"delete","path":"delete.rs","expected_hash":digest}),
+        json!({"action":"replace","path":"unchanged.rs","expected_hash":digest,"content":"original\n"}),
+    ];
+    let mut expected: std::collections::BTreeSet<String> =
+        ["update.rs", "move.rs", "moved.rs", "delete.rs"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+    for i in 0..16 {
+        let path = format!("added-{i}-{}.rs", "long-name-".repeat(6));
+        operations.push(json!({"action":"add","path":path,"content":"new\n"}));
+        expected.insert(path);
+    }
+    let call = ToolCall {
+        id: "patch".into(),
+        name: "file_patch".into(),
+        arguments: json!({"operations":operations}).to_string(),
+    };
+    let result = tools::run_call(&mut s, &call);
+    assert_eq!(result["status"], "ok", "{result}");
+    let limited = tools::limit_result(&mut s, &call, result, 200);
+    assert_eq!(limited["truncated"], true, "{limited}");
+    review::observe(&mut s, &call, &limited);
+    assert!(!dir.path().join("move.rs").exists());
+    assert!(!dir.path().join("delete.rs").exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("moved.rs")).unwrap(),
+        "original\n"
+    );
+
+    let failed = ToolCall {
+        id: "failed-patch".into(),
+        name: "file_patch".into(),
+        arguments: json!({"operations":[
+            {"action":"add","path":"uncommitted.rs","content":"not committed"},
+            {"action":"delete","path":"unchanged.rs","expected_hash":"wrong"}
+        ]})
+        .to_string(),
+    };
+    let result = tools::run_call(&mut s, &failed);
+    assert_eq!(result["status"], "error");
+    review::observe(&mut s, &failed, &result);
+    assert!(!dir.path().join("uncommitted.rs").exists());
+
+    review::begin(&mut s, "Applied the patch").unwrap();
+    let data = payload(&review::request(&mut s).unwrap());
+    let log = data["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "runtime_write_log")
+        .unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let actual: std::collections::BTreeSet<String> = log["written_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|path| {
+            std::path::Path::new(path.as_str().unwrap())
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}
+
 fn plan(s: &mut Session, operations: Value) {
     let result = tools::execute(
         s,
