@@ -482,7 +482,10 @@ async fn session_settings(
     }
     let mut c = s.core.lock().await;
     let old = c.sessions.get(&id).ok_or_else(missing)?;
-    let config = prepare_settings(&input, &old.config, &c.credentials)?;
+    // Secrets are omitted from API responses. A later `keep` request must
+    // inherit the latest queued choice, including a queued key deletion.
+    let current = old.pending_config.as_ref().unwrap_or(&old.config);
+    let config = prepare_settings(&input, current, &c.credentials)?;
     let pending = if let Some(r) = &c.running
         && r.id == id
     {
@@ -1083,13 +1086,83 @@ mod worker_wait_tests {
     use super::*;
 
     #[tokio::test]
+    async fn successive_pending_settings_preserve_the_latest_credential_choice() {
+        for mode in ["session", "clear"] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = Config {
+                api_key: Some(Secret("old-test-key".into())),
+                projects: vec![Project {
+                    root: dir.path().into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let state = WebState::new(
+                config.clone(),
+                dir.path().join("config.toml"),
+                Arc::new(OpenAiClient),
+            )
+            .unwrap();
+            let id = state.core.lock().await.order[0].clone();
+            let (commands, mut receiver) = mpsc::channel(16);
+            state.core.lock().await.running = Some(Running {
+                id: id.clone(),
+                cancel: CancellationToken::new(),
+                commands,
+                closing: false,
+            });
+            let first = session_settings(
+                State(state.clone()),
+                Path(id.clone()),
+                Json(Settings {
+                    config: config.clone(),
+                    api_key: Some("new-test-key".into()),
+                    credential_mode: mode.into(),
+                }),
+            )
+            .await;
+            assert!(first.is_ok());
+            let mut next = config.clone();
+            next.request_timeout_secs = 37;
+            let second = session_settings(
+                State(state.clone()),
+                Path(id.clone()),
+                Json(Settings {
+                    config: next,
+                    api_key: None,
+                    credential_mode: "keep".into(),
+                }),
+            )
+            .await;
+            assert!(second.is_ok());
+            let expected = (mode == "session").then_some("new-test-key");
+            let core = state.core.lock().await;
+            let session = &core.sessions[&id];
+            assert_eq!(
+                session.config.api_key.as_ref().map(|key| key.0.as_str()),
+                Some("old-test-key")
+            );
+            let pending = session.pending_config.as_ref().unwrap();
+            assert_eq!(pending.request_timeout_secs, 37);
+            assert_eq!(pending.api_key.as_ref().map(|key| key.0.as_str()), expected);
+            receiver.try_recv().unwrap();
+            let RunCommand::Configure(queued) = receiver.try_recv().unwrap() else {
+                panic!("expected config")
+            };
+            assert_eq!(queued.api_key.as_ref().map(|key| key.0.as_str()), expected);
+        }
+    }
+
+    #[tokio::test]
     async fn unresolved_write_blocks_new_web_runs() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.projects = vec![Project {
-            root: dir.path().into(),
+        let config = Config {
+            projects: vec![Project {
+                root: dir.path().into(),
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
+        };
         let state = WebState::new(
             config,
             dir.path().join("config.toml"),

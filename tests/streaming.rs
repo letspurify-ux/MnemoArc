@@ -32,6 +32,116 @@ fn oversized_sse_event_reports_a_recoverable_response_size_code() {
     let error = parser.feed(&vec![b'x'; 8 * 1024 * 1024 + 1]).unwrap_err();
     assert!(error.to_string().starts_with("response_size_limit:"));
 }
+
+#[test]
+fn sse_accepts_mixed_line_endings_and_a_split_utf8_bom() {
+    for raw in [
+        "\u{feff}data: 한글🦀\r\rdata: [DONE]\r\r",
+        "data: 한글🦀\r\n\ndata: [DONE]\n\r\n",
+        "data: first\r\ndata:  second\rdata:\tthird\n\n",
+    ] {
+        let expected = if raw.contains("first") {
+            vec!["first\n second\n\tthird"]
+        } else {
+            vec!["한글🦀", "[DONE]"]
+        };
+        for split in 0..=raw.len() {
+            let mut parser = SseDecoder::default();
+            let mut events = parser.feed(&raw.as_bytes()[..split]).unwrap();
+            events.extend(parser.feed(&raw.as_bytes()[split..]).unwrap());
+            assert_eq!(events, expected, "split {split}: {raw:?}");
+        }
+        let mut parser = SseDecoder::default();
+        let mut events = vec![];
+        for byte in raw.bytes() {
+            events.extend(parser.feed(&[byte]).unwrap());
+        }
+        assert_eq!(events, expected);
+    }
+}
+
+#[tokio::test]
+async fn completion_terminator_ignores_later_events_in_the_same_chunk() {
+    let body = format!(
+        "{}data: [DONE]\n\n{}",
+        event(json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]})),
+        event(json!({"error":{"code":500,"message":"after completion"}}))
+    );
+    let (url, server) = server(body).await;
+    let config = Config {
+        base_url: url,
+        retries: 0,
+        ..Default::default()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let result = OpenAiClient
+        .complete(
+            json!({"messages":[]}),
+            &config,
+            CancellationToken::new(),
+            tx,
+        )
+        .await;
+    server.abort();
+    let completion = result.unwrap();
+    assert_eq!(completion.text, "OK");
+}
+
+#[tokio::test]
+async fn connection_probe_requires_valid_plain_and_final_answers() {
+    let tool = format!(
+        "{}data: [DONE]\n\n",
+        event(
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"echo","function":{"name":"connection_echo","arguments":"{\"text\":\"OK\"}"}}]},"finish_reason":"tool_calls"}]})
+        )
+    );
+    let text = format!(
+        "{}data: [DONE]\n\n",
+        event(json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}))
+    );
+    let empty = format!(
+        "{}data: [DONE]\n\n",
+        event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]}))
+    );
+    let plain =
+        json!({"choices":[{"message":{"content":"OK"},"finish_reason":"stop"}]}).to_string();
+    for (first, last, expected_error) in [
+        (
+            "<html>upstream unavailable</html>".into(),
+            text.clone(),
+            Some("plain response probe failed"),
+        ),
+        (
+            json!({"error":{"message":"upstream unavailable"}}).to_string(),
+            text.clone(),
+            Some("plain response probe failed"),
+        ),
+        (
+            plain.clone(),
+            tool.clone(),
+            Some("tool round-trip probe failed"),
+        ),
+        (plain.clone(), empty, Some("tool round-trip probe failed")),
+        (plain, text, None),
+    ] {
+        let (url, server, _) = sequenced_server(vec![first, tool.clone(), last]).await;
+        let config = Config {
+            base_url: url,
+            model: "probe-model".into(),
+            model_context: Some(128_000),
+            retries: 0,
+            ..Default::default()
+        };
+        let result = OpenAiClient.probe(&config).await;
+        server.abort();
+        if let Some(expected) = expected_error {
+            assert!(result.is_err(), "probe accepted an invalid response");
+            assert!(result.unwrap_err().to_string().contains(expected));
+        } else {
+            assert!(result.is_ok(), "{result:?}");
+        }
+    }
+}
 async fn server(body: String) -> (String, tokio::task::JoinHandle<()>) {
     let app = Router::new().route(
         "/chat/completions",

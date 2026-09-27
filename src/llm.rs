@@ -150,40 +150,63 @@ fn downgrade_json_schema(request: &mut Value) -> bool {
 
 #[derive(Default)]
 pub struct SseDecoder {
-    buffer: Vec<u8>,
+    line: Vec<u8>,
+    data: String,
+    event_bytes: usize,
+    skip_lf: bool,
+    started: bool,
+    has_data: bool,
 }
 impl SseDecoder {
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>> {
-        self.buffer.extend_from_slice(bytes);
-        if self.buffer.len() > 8 * 1024 * 1024 {
-            bail!("response_size_limit: SSE event too large");
-        }
         let mut result = vec![];
-        loop {
-            let lf = self
-                .buffer
-                .windows(2)
-                .position(|x| x == b"\n\n")
-                .map(|p| (p, 2));
-            let crlf = self
-                .buffer
-                .windows(4)
-                .position(|x| x == b"\r\n\r\n")
-                .map(|p| (p, 4));
-            let Some((pos, size)) = lf.into_iter().chain(crlf).min_by_key(|(p, _)| *p) else {
-                break;
-            };
-            let event = String::from_utf8(self.buffer.drain(..pos + size).collect())?;
-            let data = event
-                .lines()
-                .filter_map(|l| l.strip_prefix("data:").map(str::trim_start))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !data.is_empty() {
-                result.push(data)
+        for &byte in bytes {
+            // SSE permits CR, LF and CRLF, including a CRLF split across
+            // transport chunks. Process each byte once instead of repeatedly
+            // rescanning an unfinished event on every incoming chunk.
+            if self.skip_lf {
+                self.skip_lf = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            self.event_bytes += 1;
+            if self.event_bytes > MAX_COMPLETION_BYTES {
+                bail!("response_size_limit: SSE event too large");
+            }
+            if matches!(byte, b'\r' | b'\n') {
+                self.finish_line(&mut result)?;
+                self.skip_lf = byte == b'\r';
+            } else {
+                self.line.push(byte);
             }
         }
         Ok(result)
+    }
+
+    fn finish_line(&mut self, events: &mut Vec<String>) -> Result<()> {
+        let mut line = std::str::from_utf8(&self.line)?;
+        if !self.started {
+            line = line.strip_prefix('\u{feff}').unwrap_or(line);
+            self.started = true;
+        }
+        if line.is_empty() {
+            if self.has_data {
+                self.data.pop(); // Remove only the final data-line delimiter.
+                events.push(std::mem::take(&mut self.data));
+                self.has_data = false;
+            }
+            self.event_bytes = 0;
+        } else {
+            let (field, value) = line.split_once(':').unwrap_or((line, ""));
+            if field == "data" {
+                self.data.push_str(value.strip_prefix(' ').unwrap_or(value));
+                self.data.push('\n');
+                self.has_data = true;
+            }
+        }
+        self.line.clear();
+        Ok(())
     }
 }
 impl OpenAiClient {
@@ -287,9 +310,12 @@ impl OpenAiClient {
             let Some(chunk) = next else { break };
             let chunk = chunk.map_err(|e| anyhow::anyhow!("stream_interrupted: {e}"))?;
             for event in parser.feed(&chunk)? {
+                if event.is_empty() {
+                    continue;
+                }
                 if event == "[DONE]" {
                     done = true;
-                    continue;
+                    break;
                 }
                 let v: Value = serde_json::from_str(&event)
                     .map_err(|e| anyhow::anyhow!("invalid_stream_event: {e}"))?;
@@ -435,6 +461,41 @@ impl OpenAiClient {
         if !plain.status().is_success() {
             bail!("plain response probe failed: {}", plain.status());
         }
+        // HTTP 200 alone can be an HTML proxy page or a provider error. Read
+        // and validate the plain answer before testing streaming/tool support.
+        let mut stream = plain.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) =
+            tokio::time::timeout(Duration::from_secs(c.request_timeout_secs), stream.next())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("plain response probe failed: response body timeout")
+                })?
+        {
+            let chunk =
+                chunk.map_err(|error| anyhow::anyhow!("plain response probe failed: {error}"))?;
+            if bytes.len().saturating_add(chunk.len()) > MAX_COMPLETION_BYTES {
+                bail!("plain response probe failed: response_size_limit");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let plain: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            anyhow::anyhow!("plain response probe failed: invalid JSON: {error}")
+        })?;
+        let choice = &plain["choices"][0];
+        if !plain["error"].is_null()
+            || choice["message"]["content"]
+                .as_str()
+                .is_none_or(|text| text.trim().is_empty())
+            || choice["message"]["tool_calls"]
+                .as_array()
+                .is_some_and(|calls| !calls.is_empty())
+            || choice["finish_reason"]
+                .as_str()
+                .is_some_and(|reason| reason != "stop")
+        {
+            bail!("plain response probe failed: expected a complete text response");
+        }
         let (tx, mut rx) = mpsc::channel(32);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let tool = json!({"type":"function","function":{"name":"connection_echo","description":"Return the supplied text","parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}});
@@ -453,6 +514,9 @@ impl OpenAiClient {
             .await?;
         if final_response.length_limited {
             bail!("incomplete_completion: length during connection probe");
+        }
+        if !final_response.calls.is_empty() || final_response.text.trim().is_empty() {
+            bail!("tool round-trip probe failed: expected a complete text response without tools");
         }
         Ok("Plain response, SSE streaming and tool round-trip succeeded".into())
     }

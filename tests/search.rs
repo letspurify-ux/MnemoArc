@@ -23,6 +23,71 @@ fn search(s: &mut Session, args: Value) -> Value {
 }
 
 #[test]
+fn exact_directory_scope_treats_glob_characters_as_literal_path_names() {
+    let (dir, mut s) = setup();
+    for folder in ["[route]", "r", "{routes,handlers}", "routes", "[unclosed"] {
+        std::fs::create_dir_all(dir.path().join(folder).join("nested")).unwrap();
+        std::fs::write(dir.path().join(folder).join("a.rs"), "fn marker() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join(folder).join("nested/b.rs"),
+            "fn marker() {}\n",
+        )
+        .unwrap();
+    }
+    for folder in ["[route]", "{routes,handlers}", "[unclosed"] {
+        let first = search(&mut s, json!({"path":folder,"query":"marker","limit":1}));
+        assert_eq!(first["matched_files"], 2, "{folder}: {first}");
+        assert_eq!(first["total_matching_lines"], 2);
+        let second = search(
+            &mut s,
+            json!({"path":folder,"query":"marker","limit":1,"cursor":first["next_cursor"]}),
+        );
+        for page in [&first, &second] {
+            let found = std::path::Path::new(page["matches"][0]["path"].as_str().unwrap());
+            assert!(found.starts_with(dir.path().join(folder).canonicalize().unwrap()));
+        }
+        assert!(second["next_cursor"].is_null());
+        let changed_scope = tools::execute(
+            &mut s,
+            "source_search",
+            json!({"path":"r","query":"marker","limit":1,"cursor":first["next_cursor"]}),
+        );
+        assert!(changed_scope.is_err());
+    }
+}
+
+#[test]
+fn directory_search_applies_include_patterns_to_files_inside_the_scope() {
+    let (dir, mut s) = setup();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/main.rs"), "marker\n").unwrap();
+    std::fs::write(dir.path().join("src/notes.txt"), "marker\n").unwrap();
+    std::fs::write(dir.path().join("src/private.rs"), "marker\n").unwrap();
+    s.project.include = vec!["**/*.rs".into()];
+    s.project.exclude = vec!["**/private.rs".into()];
+    for path in ["src", "."] {
+        let result = search(&mut s, json!({"path":path,"query":"marker"}));
+        assert_eq!(result["matched_files"], 1);
+        assert!(
+            result["matches"][0]["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("src/main.rs")
+        );
+    }
+    for path in ["src/notes.txt", "src/private.rs"] {
+        assert!(
+            tools::execute(
+                &mut s,
+                "source_search",
+                json!({"path":path,"query":"marker"})
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn casefolded_exclusions_apply_to_direct_reads_and_searches() {
     let (dir, mut s) = setup();
     std::fs::create_dir_all(dir.path().join("Secrets")).unwrap();

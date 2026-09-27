@@ -676,6 +676,14 @@ async fn execute_one(
     cancel: &CancellationToken,
     run_deadline: tokio::time::Instant,
 ) -> (Session, Value) {
+    if s.write_outcome_uncertain.load(Ordering::Acquire) {
+        return (
+            s,
+            tools::envelope(Err(anyhow::anyhow!(
+                "tool_worker_unresolved: previous external write outcome is unknown; inspect changes and restart before another run"
+            ))),
+        );
+    }
     if cancel.is_cancelled() {
         return (s, tools::envelope(Err(anyhow::anyhow!("cancelled"))));
     }
@@ -773,7 +781,17 @@ fn received_tool_outcome(
     external_write: bool,
 ) -> ToolOutcome {
     match outcome {
-        Ok(result) => result,
+        Ok((session, result)) => {
+            // A worker can return normally while reporting an uncertain commit,
+            // failed rollback or a caught panic. Returning an error does not
+            // establish that its external writes were undone.
+            if external_write && result["error"].as_str().is_some_and(uncertain_write_error) {
+                session
+                    .write_outcome_uncertain
+                    .store(true, Ordering::Release);
+            }
+            (session, result)
+        }
         Err(_) => {
             if external_write {
                 backup
@@ -788,6 +806,18 @@ fn received_tool_outcome(
             )
         }
     }
+}
+
+fn uncertain_write_error(error: &str) -> bool {
+    matches!(
+        error.split(':').next(),
+        Some(
+            "tool_worker_panic"
+                | "tool_worker_unresolved"
+                | "database_commit_uncertain"
+                | "file_patch_rollback_failed"
+        )
+    )
 }
 
 fn rebase_document_call(call: &ToolCall, hash: Option<&str>) -> (ToolCall, bool) {
@@ -2586,11 +2616,10 @@ pub async fn run_session_controlled(
                         failure = Some(reason);
                     }
                 }
-                if result["error"].as_str().is_some_and(|e| {
-                    e.starts_with("tool_worker_panic")
-                        || e.starts_with("tool_worker_unresolved")
-                        || e.starts_with("run_timeout")
-                }) {
+                if result["error"]
+                    .as_str()
+                    .is_some_and(|e| uncertain_write_error(e) || e.starts_with("run_timeout"))
+                {
                     failure = result["error"].as_str().map(str::to_owned);
                 }
                 if rebased_document_call && result["status"] == "ok" {
@@ -2923,7 +2952,7 @@ pub async fn run_session_controlled(
     }
     if s.write_outcome_uncertain.load(Ordering::Acquire) {
         s.status = "blocked".into();
-        s.last_error = Some(failure.filter(|error| error.starts_with("tool_worker_")).unwrap_or_else(|| "tool_worker_unresolved: review external write outcomes and restart before another run".into()));
+        s.last_error = Some(failure.filter(|error| uncertain_write_error(error)).unwrap_or_else(|| "tool_worker_unresolved: review external write outcomes and restart before another run".into()));
     } else if cancel.is_cancelled() {
         s.status = "cancelled".into();
         s.last_error = None;
@@ -3030,6 +3059,59 @@ mod worker_wait_tests {
 
     fn session() -> Session {
         Session::new(Project::default(), Config::default())
+    }
+
+    #[tokio::test]
+    async fn reported_uncertain_writes_quarantine_following_calls_and_runs() {
+        for cause in [
+            "database_commit_uncertain: connection lost during commit",
+            "file_patch_rollback_failed: one changed file could not be restored",
+            "tool_worker_panic: interrupted after a file write",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut s = session();
+            s.project.root = dir.path().into();
+            let shared = s.write_outcome_uncertain.clone();
+            let outcome = tools::envelope(Err(anyhow::anyhow!(cause)));
+            let (s, result) = received_tool_outcome(s.clone(), Ok((s, outcome)), true);
+            assert_eq!(result["error"], cause);
+            assert!(shared.load(Ordering::Acquire), "{cause}");
+            let call = ToolCall {
+                id: "following-write".into(),
+                name: "file_write".into(),
+                arguments: json!({"path":"must-not-exist.txt","content":"follow-up mutation"})
+                    .to_string(),
+            };
+            let cancel = CancellationToken::new();
+            let (s, result) = execute_one(
+                s,
+                call,
+                &cancel,
+                tokio::time::Instant::now() + Duration::from_secs(60),
+            )
+            .await;
+            assert_eq!(result["status"], "error");
+            assert!(!dir.path().join("must-not-exist.txt").exists());
+            let (events, _receiver) = mpsc::channel(1);
+            let blocked = run_session(s, Arc::new(OpenAiClient), cancel, events).await;
+            assert_eq!(blocked.status, "blocked");
+        }
+        // A confirmed rollback or a read failure has no unresolved write.
+        for (cause, external_write) in [
+            (
+                "file_patch_write_failed: completed file changes were rolled back",
+                true,
+            ),
+            ("tool_worker_panic: read interrupted", false),
+        ] {
+            let s = session();
+            let (s, _) = received_tool_outcome(
+                s.clone(),
+                Ok((s, tools::envelope(Err(anyhow::anyhow!(cause))))),
+                external_write,
+            );
+            assert!(!s.write_outcome_uncertain.load(Ordering::Acquire));
+        }
     }
 
     #[tokio::test]

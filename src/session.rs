@@ -736,7 +736,11 @@ impl Session {
             }
             self.apply_workflow_mode();
         }
-        self.latest_request = text.clone();
+        // A resume message belongs in history, but must not replace the task
+        // requirements used after checkpointing and by completion reviews.
+        if !continuation || self.latest_request.is_empty() {
+            self.latest_request = text.clone();
+        }
         let source = Source {
             id: crate::memory::source_id(),
             observed_at: chrono::Utc::now(),

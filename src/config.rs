@@ -275,7 +275,7 @@ impl Config {
             let Some(field) = key.strip_prefix("MNEMOARC_") else {
                 continue;
             };
-            if value.get(&field.to_lowercase()).is_none() {
+            if value.get(field.to_lowercase()).is_none() {
                 continue;
             }
             let raw = raw

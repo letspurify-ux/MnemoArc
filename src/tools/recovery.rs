@@ -34,7 +34,10 @@ pub fn describe(message: &str) -> Value {
     };
     let (class, action) = if code == "cancelled" {
         (Class::Cancelled, "stop")
-    } else if matches!(code, "tool_worker_panic" | "tool_batch_aborted") {
+    } else if matches!(
+        code,
+        "tool_worker_panic" | "tool_worker_unresolved" | "tool_batch_aborted"
+    ) {
         (Class::OutcomeUnknown, "inspect_outcome_before_retry")
     } else if code == "batch_partial_failure" {
         (Class::PartialFailure, "repair_failed_items_only")

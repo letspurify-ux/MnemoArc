@@ -2537,7 +2537,20 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
     if !canonical.starts_with(&root) {
         bail!("path_outside_project");
     }
-    if excluded(p, canonical.strip_prefix(&root)?)? {
+    // Include patterns select files. A directory scope need not itself match
+    // `**/*.rs`; its children are still filtered when enumerated. Exclusion
+    // rules continue to apply to the directory itself.
+    let directory_rules;
+    let rules = if canonical.is_dir() {
+        directory_rules = Project {
+            include: vec![],
+            ..p.clone()
+        };
+        &directory_rules
+    } else {
+        p
+    };
+    if excluded(rules, canonical.strip_prefix(&root)?)? {
         bail!("path_excluded");
     }
     Ok(canonical)

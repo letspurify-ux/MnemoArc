@@ -807,6 +807,39 @@ fn continuation_preserves_progress_but_new_task_resets_it() {
 }
 
 #[test]
+fn continuation_keeps_the_original_request_for_checkpointed_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let original =
+        "Document the routes, preserving the authentication and error-handling requirements";
+    s.add_user(original.into());
+    let criteria = s.task.completion.clone();
+    // The original prompt can leave the active context after a checkpoint.
+    for bundle in &mut s.history.bundles {
+        bundle.active = false;
+        bundle.reviewed = true;
+    }
+    for continuation in ["계속 진행", "continue!", "resume"] {
+        s.add_user(continuation.into());
+        assert_eq!(s.latest_request, original);
+        assert_eq!(s.task.completion, criteria);
+        assert_eq!(
+            s.history.bundles.back().unwrap().messages[0]["content"],
+            continuation
+        );
+        assert!(
+            ContextManager::state(&s)
+                .unwrap()
+                .to_string()
+                .contains(original)
+        );
+    }
+    s.start_new_task("continue".into());
+    assert_eq!(s.latest_request, "continue");
+    assert_ne!(s.task.completion, criteria);
+}
+
+#[test]
 fn first_prompt_preserves_prepared_completion_and_new_tasks_start_with_criteria() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
