@@ -1,9 +1,9 @@
 //! Explicit paid evaluation; normal cargo test never calls a provider.
 use mnemoarc::{
     agent::{self, AgentEvent},
-    config::{Config, Secret},
+    config::{Config, Project, Secret},
     llm::{LlmClient, OpenAiClient},
-    session::Session,
+    session::{RunRecord, Session},
     tools,
 };
 use serde_json::{Value, json};
@@ -23,6 +23,107 @@ fn env_bool(name: &str, fallback: bool) -> bool {
         Some(value) => panic!("{name} must be a boolean, got {value:?}"),
         None => fallback,
     }
+}
+
+fn report_diagnostics(result: &Session, audit: &Value) -> Value {
+    let final_document_hash = audit["hash"].as_str().map(str::to_owned).or_else(|| {
+        std::fs::read(&result.project.output)
+            .ok()
+            .map(|bytes| tools::hash(&bytes))
+    });
+    let review_verdict = match tools::document_review::current_verdict(result) {
+        tools::document_review::CurrentVerdict::Approved => "approved",
+        tools::document_review::CurrentVerdict::Rejected(_) => "rejected_current",
+        tools::document_review::CurrentVerdict::Unavailable => "unavailable_current",
+        tools::document_review::CurrentVerdict::Unreviewed => "unreviewed",
+    };
+    json!({
+        "completion_gaps":result.completion_gaps,
+        "run_stop_reason":result.run_history.back().map(|run| run.reason.as_str()),
+        "last_run":result.run_history.back(),
+        "final_document_hash":final_document_hash,
+        "review_target_hash":tools::document_review::review_target_hash(result),
+        "review_verdict":review_verdict,
+    })
+}
+
+#[test]
+fn live_report_records_completion_gaps_and_stop_reason() {
+    let mut result = Session::new(Project::default(), Config::default());
+    result.status = "complete_with_gaps".into();
+    result.completion_gaps = vec!["문서 검토 — 현재 문서를 마감 전에 검토하지 못했습니다.".into()];
+    let now = chrono::Utc::now();
+    result.run_history.push_back(RunRecord {
+        id: "run".into(),
+        request: "화면 사용자 매뉴얼 만들어줘".into(),
+        workflow: "source_document".into(),
+        started_at: now,
+        ended_at: now,
+        elapsed_ms: 100,
+        status: result.status.clone(),
+        reason: "closing_round_limit".into(),
+        error: None,
+        input_tokens: 10,
+        output_tokens: 5,
+        usage_estimated: false,
+        rounds: 1,
+        last_stage: "review".into(),
+        checkpoint_pending: false,
+        token_limit: 100,
+        timeout_secs: 60,
+    });
+    let diagnostics = report_diagnostics(&result, &json!({"hash":"current-hash"}));
+    assert_eq!(
+        diagnostics["completion_gaps"],
+        json!(result.completion_gaps)
+    );
+    assert_eq!(diagnostics["run_stop_reason"], "closing_round_limit");
+    assert_eq!(diagnostics["final_document_hash"], "current-hash");
+    assert_eq!(diagnostics["review_target_hash"], Value::Null);
+    assert_eq!(diagnostics["review_verdict"], "unreviewed");
+}
+
+#[test]
+fn live_report_distinguishes_the_edited_document_from_its_last_review_target() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("source.rs"),
+        "fn run() { for _ in 0..5 {} }\n",
+    )
+    .unwrap();
+    let mut result = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("manual.md"),
+            ..Default::default()
+        },
+        Config::default(),
+    );
+    result.add_user("Document the loop.".into());
+    result.select_workflow("source_document").unwrap();
+    tools::execute(
+        &mut result,
+        "document_edit",
+        json!({"action":"create","text":"# Flow\nA while loop runs five times. source.rs:1\n"}),
+    )
+    .unwrap();
+    tools::document_review::request(&mut result).unwrap();
+    tools::document_review::finish(&mut result, r#"{"issues":["Flow: wrong loop type"]}"#).unwrap();
+    let reviewed_hash = tools::document_review::review_target_hash(&result)
+        .unwrap()
+        .to_owned();
+    let expected = result.last_document_write.as_ref().unwrap().1.clone();
+    tools::execute(
+        &mut result,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":expected,"old_text":"A while loop","text":"A for loop"}),
+    )
+    .unwrap();
+    let audit = tools::audit_document(&mut result).unwrap();
+    let diagnostics = report_diagnostics(&result, &audit);
+    assert_eq!(diagnostics["review_target_hash"], reviewed_hash);
+    assert_ne!(diagnostics["final_document_hash"], reviewed_hash);
+    assert_eq!(diagnostics["review_verdict"], "unreviewed");
 }
 
 #[tokio::test]
@@ -380,7 +481,7 @@ async fn registered_source_documentation() {
             errors.push(value);
         }
     }
-    let report = json!({"status":result.status,"error":result.last_error,"model":result.config.model,
+    let mut report = json!({"status":result.status,"error":result.last_error,"model":result.config.model,
         "budget_tokens":result.config.run_tokens,"budget_seconds":result.config.run_timeout_secs,
         "source_document_review_enabled":result.config.source_document_review,
         "completion_review_enabled":result.config.completion_review_enabled,
@@ -390,6 +491,12 @@ async fn registered_source_documentation() {
         "tool_calls":calls,"tool_errors":errors,"document_review":result.document_review,"audit":audit,
         "investigations":result.investigations,"source_unchanged":source_unchanged,"configured_output_unchanged":original_unchanged,
         "document_lines":document.lines().count(),"document":document});
+    report.as_object_mut().unwrap().extend(
+        report_diagnostics(&result, &audit)
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
     if let Ok(path) = std::env::var("MNEMOARC_DOC_REPORT") {
         std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
@@ -406,7 +513,16 @@ async fn registered_source_documentation() {
         source_unchanged && original_unchanged,
         "source or original output changed"
     );
-    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert_eq!(
+        result.status,
+        "complete",
+        "error={:?}; stop_reason={:?}; gaps={:?}; final_hash={:?}; review_target_hash={:?}",
+        result.last_error,
+        result.run_history.back().map(|run| run.reason.as_str()),
+        result.completion_gaps,
+        report["final_document_hash"],
+        report["review_target_hash"]
+    );
     assert_eq!(audit["structural_ok"], true);
     if result.config.source_document_review {
         assert!(tools::document_review::approved(&result));

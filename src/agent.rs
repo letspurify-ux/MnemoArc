@@ -73,7 +73,7 @@ fn closing_instruction(s: &Session) -> String {
         );
     }
     format!(
-        "Closing mode: finish the requested document now from the evidence already gathered; discovery tools are withheld. 1) Write any missing requested section from gathered evidence, stating in the text when a fact is unconfirmed. 2) Verify written items whose evidence was already delivered (verify_batch). 3) For an item that cannot be verified with available evidence, call investigation action=mark_gap with its id and a specific reason, and qualify the related claim in its section. 4) Fix remaining document_review findings or completion checks with targeted edits when possible; otherwise leave them, the runtime reports them as unresolved. 5) Complete or remove remaining to-dos with actual results, then give a concise final answer. At most {remaining} requests remain; afterwards the runtime finishes the document and lists every unresolved item. Do not invent evidence or describe gaps as verified."
+        "Closing mode: finish the requested document now from the evidence already gathered; discovery tools are withheld. 1) Write any missing requested section from gathered evidence, stating in the text when a fact is unconfirmed. 2) Verify written items whose evidence was already delivered (verify_batch). 3) For an item that cannot be verified with available evidence, call investigation action=mark_gap with its id and a specific reason, and qualify the related claim in its section. 4) Fix review findings confirmed for the current document or completion checks with targeted edits when possible; otherwise leave them, the runtime reports them as unresolved. 5) Complete or remove remaining to-dos with actual results, then give a concise final answer. At most {remaining} requests remain; afterwards the runtime finishes the document and lists every unresolved item. Do not invent evidence or describe gaps as verified."
     )
 }
 
@@ -111,18 +111,20 @@ fn collect_gaps(s: &mut Session, extra: &[String]) -> Vec<String> {
                 audit["issue_count"]
             ));
         }
-        if s.document_written
-            && s.config.source_document_review
-            && !tools::document_review::approved(s)
-        {
-            if !s.document_review.issues.is_empty() {
-                for issue in s.document_review.issues.iter().take(12) {
-                    gaps.push(format!("문서 검토 지적 — {issue}"));
+        if s.document_written && s.config.source_document_review {
+            match tools::document_review::current_verdict(s) {
+                tools::document_review::CurrentVerdict::Approved => {}
+                tools::document_review::CurrentVerdict::Rejected(issues) => {
+                    for issue in issues.iter().take(12) {
+                        gaps.push(format!("문서 검토 지적 — {issue}"));
+                    }
                 }
-            } else if tools::document_review::unavailable_on_current(s) {
-                gaps.push("문서 검토 — 검토 응답 오류로 검토를 마치지 못했습니다.".into());
-            } else {
-                gaps.push("문서 검토 — 마감 전에 검토하지 못했습니다.".into());
+                tools::document_review::CurrentVerdict::Unavailable => {
+                    gaps.push("문서 검토 — 검토 응답 오류로 검토를 마치지 못했습니다.".into());
+                }
+                tools::document_review::CurrentVerdict::Unreviewed => {
+                    gaps.push("문서 검토 — 현재 문서를 마감 전에 검토하지 못했습니다.".into());
+                }
             }
         }
     }
@@ -181,9 +183,11 @@ fn review_repair_pending(s: &Session) -> bool {
     s.checkpoint.is_none()
         && s.is_document_work()
         && s.document_written
-        && !s.document_review.pending
-        && !s.document_review.issues.is_empty()
-        && !tools::document_review::approved(s)
+        && s.config.source_document_review
+        && matches!(
+            tools::document_review::current_verdict(s),
+            tools::document_review::CurrentVerdict::Rejected(_)
+        )
 }
 
 /// During review repair an audit between edits needs only its verdict and a
@@ -1185,7 +1189,8 @@ pub async fn run_session_controlled(
             phase = "draft".into();
         }
         if finalization_attempts > 0
-            || !s.document_review.issues.is_empty()
+            || (s.config.source_document_review
+                && tools::document_review::rejected_on_current_result(&s))
             || s.completion_review.checks.iter().any(|c| c.status != "met")
         {
             // A rejected document completion always returns to verification,
@@ -1207,7 +1212,8 @@ pub async fn run_session_controlled(
             // guidance to drafting; afterwards only result improvements count,
             // except while review findings are open: repairing them needs new
             // evidence, and a live run stalled out reading exactly that.
-            let review_repair_open = !s.document_review.issues.is_empty()
+            let review_repair_open = (s.config.source_document_review
+                && tools::document_review::rejected_on_current_result(&s))
                 || s.completion_review
                     .checks
                     .iter()
@@ -1346,10 +1352,14 @@ pub async fn run_session_controlled(
             json!(closing_stall_limit(&s.config));
         if s.progress_recovery.closing.is_none() && ready_for_final(&s) {
             s.run_guidance["ready_for_final"] = json!(true);
-            let open = s.document_review.issues.len();
-            s.run_guidance["instruction"] = json!(if open > 0 {
+            let previous = if s.config.source_document_review {
+                s.document_review.issues.len()
+            } else {
+                0
+            };
+            s.run_guidance["instruction"] = json!(if previous > 0 {
                 format!(
-                    "{READY_FOR_FINAL_INSTRUCTION} Before answering, confirm that all {open} findings in document_review.issues are fixed in the document: the re-review rechecks every one, and an unaddressed finding costs another full review."
+                    "{READY_FOR_FINAL_INSTRUCTION} document_review.issues contains {previous} findings from a previous document version. They are repair context, not confirmed defects in the current version. The next review will check the current document after your final answer."
                 )
             } else {
                 READY_FOR_FINAL_INSTRUCTION.to_owned()
@@ -3053,6 +3063,236 @@ pub fn apply_config(s: &mut Session, config: Config) -> Result<()> {
     }
     s.config = copy.config;
     Ok(())
+}
+
+#[cfg(test)]
+mod review_gap_tests {
+    use super::*;
+    use crate::config::{Project, Secret};
+
+    #[test]
+    fn closing_reports_only_findings_reviewed_for_the_current_document() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("source.rs"),
+            "fn run() { for _ in 0..5 {} }\n",
+        )
+        .unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            Config {
+                completion_review_enabled: false,
+                ..Default::default()
+            },
+        );
+        s.add_user("Document the loop.".into());
+        s.select_workflow("source_document").unwrap();
+        let read = tools::execute(&mut s, "file_read", json!({"path":"source.rs"})).unwrap();
+        tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"create","text":"# Flow\nA while loop runs five times. source.rs:1\n"}),
+        )
+        .unwrap();
+        tools::execute(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":"flow","title":"Flow","section":"# Flow","status":"written"}),
+        )
+        .unwrap();
+        tools::execute(
+            &mut s,
+            "investigation",
+            json!({"action":"verify","id":"flow","source_ids":[read["source"]["id"]],"verification_note":"Compared the loop"}),
+        )
+        .unwrap();
+
+        tools::document_review::request(&mut s).unwrap();
+        tools::document_review::finish(
+            &mut s,
+            r#"{"issues":["Flow: the loop is for, not while"]}"#,
+        )
+        .unwrap();
+        let gaps = collect_gaps(&mut s, &[]);
+        assert!(gaps.iter().any(|gap| gap.contains("the loop is for")));
+
+        let expected = s.last_document_write.as_ref().unwrap().1.clone();
+        tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"replace_text","expected_hash":expected,"old_text":"A while loop","text":"A for loop"}),
+        )
+        .unwrap();
+        let gaps = collect_gaps(&mut s, &[]);
+        assert!(
+            gaps.iter()
+                .any(|gap| gap == "문서 검토 — 현재 문서를 마감 전에 검토하지 못했습니다.")
+        );
+        assert!(!gaps.iter().any(|gap| gap.contains("the loop is for")));
+
+        s.config.source_document_review = false;
+        let gaps = collect_gaps(&mut s, &[]);
+        assert!(!gaps.iter().any(|gap| gap.starts_with("문서 검토")));
+
+        s.config.source_document_review = true;
+        tools::document_review::request(&mut s).unwrap();
+        tools::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+        let gaps = collect_gaps(&mut s, &[]);
+        assert!(!gaps.iter().any(|gap| gap.starts_with("문서 검토")));
+    }
+
+    #[tokio::test]
+    #[ignore = "paid provider; explicitly set MNEMOARC_LIVE_TEST=1"]
+    async fn focused_live_review_does_not_report_previous_findings_after_an_edit() {
+        assert_eq!(std::env::var("MNEMOARC_LIVE_TEST").as_deref(), Ok("1"));
+        let config_path = std::path::PathBuf::from(
+            std::env::var("MNEMOARC_LIVE_CONFIG").unwrap_or("config.toml".into()),
+        );
+        let mut config = Config::load(&config_path, &std::collections::BTreeMap::new()).unwrap();
+        if config_path.with_extension("credentials.json").exists() {
+            let keys: std::collections::BTreeMap<String, String> = serde_json::from_slice(
+                &std::fs::read(config_path.with_extension("credentials.json")).unwrap(),
+            )
+            .unwrap();
+            config.api_key = keys.get(&config.api_key_env).cloned().map(Secret);
+        }
+        config.model = "stealth/space-bunny-alpha".into();
+        config.source_document_review = true;
+        config.completion_review_enabled = false;
+        config.output_tokens = 2048;
+        config.request_timeout_secs = 90;
+        config.retries = 0;
+        let mut project = config
+            .projects
+            .iter()
+            .find(|project| project.name == "MnemoArc")
+            .expect("registered MnemoArc project")
+            .clone();
+        let dir = tempfile::tempdir().unwrap();
+        project.root = dir.path().into();
+        project.output = dir.path().join("focused-live-manual.md");
+        std::fs::write(
+            dir.path().join("source.rs"),
+            "fn run() {\n    for _ in 0..5 {\n        work();\n    }\n}\n",
+        )
+        .unwrap();
+        let mut s = Session::new(project, config);
+        s.select_workflow("source_document").unwrap();
+        s.add_user(
+            "source.rs의 run 함수에서 반복문 종류와 work 호출 횟수를 정확히 설명해줘.".into(),
+        );
+        let read = tools::execute(&mut s, "file_read", json!({"path":"source.rs"})).unwrap();
+        tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"create","text":"# 실행 흐름\nrun은 while 반복문으로 work를 열 번 실행합니다. source.rs:1-5\n"}),
+        )
+        .unwrap();
+        tools::execute(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":"flow","title":"실행 흐름","section":"# 실행 흐름","status":"written"}),
+        )
+        .unwrap();
+        tools::execute(
+            &mut s,
+            "investigation",
+            json!({"action":"verify","id":"flow","source_ids":[read["source"]["id"]],"verification_note":"Compared the loop and its bound"}),
+        )
+        .unwrap();
+
+        let request = tools::document_review::request(&mut s).unwrap();
+        let request_tokens = context::count(&request, &s.config.model);
+        assert!(
+            request_tokens <= 6_000,
+            "review input grew to {request_tokens} tokens"
+        );
+        let payload: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["more_document_pages"], false);
+        assert_eq!(payload["more_evidence_pages"], false);
+        let (tx, mut rx) = mpsc::channel(32);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let started = Instant::now();
+        let completion = tokio::time::timeout(
+            Duration::from_secs(120),
+            OpenAiClient.complete(request, &s.config, CancellationToken::new(), tx),
+        )
+        .await
+        .expect("focused review timeout")
+        .expect("focused review request");
+        drain.await.unwrap();
+        let review_text = completion.text.clone();
+        eprintln!(
+            "[live] focused review: seconds={:.1} input_bound={} output_bound={} usage={:?} text={review_text}",
+            started.elapsed().as_secs_f64(),
+            request_tokens,
+            s.config.output_tokens,
+            completion.usage
+        );
+        tools::document_review::finish(&mut s, &review_text).unwrap();
+        assert!(
+            tools::document_review::rejected_on_current_result(&s),
+            "the live reviewer did not reject the deliberately false loop claim: {review_text}"
+        );
+        let previous_issues = s.document_review.issues.clone();
+        let review_target_hash = tools::document_review::review_target_hash(&s)
+            .unwrap()
+            .to_owned();
+        let expected = s.last_document_write.as_ref().unwrap().1.clone();
+        tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"replace_text","expected_hash":expected,"old_text":"while 반복문으로 work를 열 번","text":"for 반복문으로 work를 다섯 번"}),
+        )
+        .unwrap();
+        tools::execute(
+            &mut s,
+            "investigation",
+            json!({"action":"verify","id":"flow","source_ids":[read["source"]["id"]],"verification_note":"Confirmed the corrected for loop and five calls"}),
+        )
+        .unwrap();
+        let final_document_hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+        let final_message = force_finish(&mut s, "focused_live_test").expect("saved document");
+        let expected_gap = "문서 검토 — 현재 문서를 마감 전에 검토하지 못했습니다.";
+        let report = json!({
+            "model":s.config.model,
+            "project":s.project.name,
+            "source_document_review_enabled":s.config.source_document_review,
+            "completion_review_enabled":s.config.completion_review_enabled,
+            "request_tokens_upper_bound":request_tokens,
+            "output_tokens_upper_bound":s.config.output_tokens,
+            "review_usage":completion.usage,
+            "review_seconds":started.elapsed().as_secs_f64(),
+            "review_text":review_text,
+            "review_issues":previous_issues,
+            "review_target_hash":review_target_hash,
+            "final_document_hash":final_document_hash,
+            "status":s.status,
+            "completion_gaps":s.completion_gaps,
+            "document_review_attempts":s.document_review.attempts,
+            "completion_review_attempts":s.completion_review.attempts,
+        });
+        if let Ok(path) = std::env::var("MNEMOARC_DOC_REPORT") {
+            std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        }
+        eprintln!("[live] focused close: {}", report);
+        assert_ne!(final_document_hash, review_target_hash);
+        assert_eq!(s.status, "complete_with_gaps");
+        assert_eq!(s.document_review.attempts, 1);
+        assert_eq!(s.completion_review.attempts, 0);
+        assert_eq!(s.completion_gaps, [expected_gap]);
+        assert!(final_message.contains(expected_gap));
+        assert!(
+            previous_issues
+                .iter()
+                .all(|issue| { !s.completion_gaps.iter().any(|gap| gap.contains(issue)) })
+        );
+    }
 }
 
 #[cfg(test)]

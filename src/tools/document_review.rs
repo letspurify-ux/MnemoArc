@@ -43,11 +43,62 @@ pub struct ReviewState {
     /// result is finished without approval and reported as unreviewed.
     #[serde(skip)]
     unavailable_hash: Option<String>,
+    #[serde(skip)]
+    unavailable_requirements: Option<String>,
+    #[serde(skip)]
+    unavailable_source_hashes: BTreeMap<String, String>,
     /// Document passages each current finding quoted, as they appeared in the
     /// reviewed document. A later finding that quotes only passages which
     /// have since disappeared is about text that was already changed.
     #[serde(skip)]
     issue_quotes: Vec<Vec<String>>,
+}
+
+/// Only a verdict for the current document, requirements and source versions
+/// can decide completion. `issues` may still contain earlier repair context.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CurrentVerdict<'a> {
+    Approved,
+    Rejected(&'a [String]),
+    Unavailable,
+    Unreviewed,
+}
+
+pub fn current_verdict(s: &Session) -> CurrentVerdict<'_> {
+    let Some(document_hash) = output_path(&s.project)
+        .and_then(|p| read_text(&p))
+        .ok()
+        .map(|doc| hash(doc.as_bytes()))
+    else {
+        return CurrentVerdict::Unreviewed;
+    };
+    let requirement_hash = requirements(s);
+    let state = &s.document_review;
+    if state.approved_hash.as_deref() == Some(document_hash.as_str())
+        && state.reviewed_requirements.as_deref() == Some(requirement_hash.as_str())
+        && fresh(s)
+    {
+        CurrentVerdict::Approved
+    } else if !state.pending
+        && !state.issues.is_empty()
+        && state.target_hash.as_deref() == Some(document_hash.as_str())
+        && state.reviewed_requirements.as_deref() == Some(requirement_hash.as_str())
+        && fresh(s)
+    {
+        CurrentVerdict::Rejected(&state.issues)
+    } else if !state.pending
+        && state.unavailable_hash.as_deref() == Some(document_hash.as_str())
+        && state.unavailable_requirements.as_deref() == Some(requirement_hash.as_str())
+        && hashes_fresh(s, &state.unavailable_source_hashes)
+    {
+        CurrentVerdict::Unavailable
+    } else {
+        CurrentVerdict::Unreviewed
+    }
+}
+
+pub fn review_target_hash(s: &Session) -> Option<&str> {
+    s.document_review.target_hash.as_deref()
 }
 
 /// Quoted passages in a finding: text in '…', "…", ‘…’, “…”, `…` or 「…」,
@@ -113,52 +164,38 @@ fn approximate_line_issue(request: &str, measured: usize) -> Option<String> {
 }
 
 pub fn approved(s: &Session) -> bool {
-    let state = &s.document_review;
-    state.approved_hash.is_some()
-        && state.reviewed_requirements.as_deref() == Some(requirements(s).as_str())
-        && output_path(&s.project)
-            .and_then(|p| read_text(&p))
-            .ok()
-            .is_some_and(|doc| {
-                state.approved_hash.as_deref() == Some(hash(doc.as_bytes()).as_str())
-            })
-        && fresh(s)
+    matches!(current_verdict(s), CurrentVerdict::Approved)
 }
 
 /// Reuse a complete rejection only for exactly the same document, sources and
 /// requirements. Another final claim is not a reason to pay for another review.
 pub fn rejected_on_current_result(s: &Session) -> bool {
-    let state = &s.document_review;
-    !state.pending
-        && !state.issues.is_empty()
-        && state.reviewed_requirements.as_deref() == Some(requirements(s).as_str())
-        && output_path(&s.project)
-            .and_then(|p| read_text(&p))
-            .ok()
-            .is_some_and(|doc| state.target_hash.as_deref() == Some(hash(doc.as_bytes()).as_str()))
-        && fresh(s)
+    matches!(current_verdict(s), CurrentVerdict::Rejected(_))
 }
 
 /// Stop retrying a review whose responses keep failing validation. Only this
 /// exact document is affected; a later edit makes it reviewable again.
 pub fn mark_unavailable(s: &mut Session) {
+    let requirement_hash = s
+        .document_review
+        .target_requirements
+        .clone()
+        .unwrap_or_else(|| requirements(s));
+    let target_hash = s.document_review.target_hash.clone().or_else(|| {
+        output_path(&s.project)
+            .and_then(|p| read_text(&p))
+            .ok()
+            .map(|doc| hash(doc.as_bytes()))
+    });
+    let source_hashes = s.document_review.source_hashes.clone();
     defer_for_repair(s);
-    s.document_review.unavailable_hash = output_path(&s.project)
-        .and_then(|p| read_text(&p))
-        .ok()
-        .map(|doc| hash(doc.as_bytes()));
+    s.document_review.unavailable_hash = target_hash;
+    s.document_review.unavailable_requirements = Some(requirement_hash);
+    s.document_review.unavailable_source_hashes = source_hashes;
 }
 
 pub fn unavailable_on_current(s: &Session) -> bool {
-    s.document_review
-        .unavailable_hash
-        .as_deref()
-        .is_some_and(|target| {
-            output_path(&s.project)
-                .and_then(|p| read_text(&p))
-                .ok()
-                .is_some_and(|doc| hash(doc.as_bytes()) == target)
-        })
+    matches!(current_verdict(s), CurrentVerdict::Unavailable)
 }
 
 /// Hash each heading's own body (up to the next heading of any level), keyed
@@ -193,15 +230,16 @@ pub fn stalled_on_current_result(s: &Session) -> bool {
 }
 
 fn fresh(s: &Session) -> bool {
-    s.document_review
-        .source_hashes
-        .iter()
-        .all(|(path, digest)| {
-            read_path(&s.project, path)
-                .and_then(|p| read_text(&p))
-                .ok()
-                .is_some_and(|doc| hash(doc.as_bytes()) == *digest)
-        })
+    hashes_fresh(s, &s.document_review.source_hashes)
+}
+
+fn hashes_fresh(s: &Session, hashes: &BTreeMap<String, String>) -> bool {
+    hashes.iter().all(|(path, digest)| {
+        read_path(&s.project, path)
+            .and_then(|p| read_text(&p))
+            .ok()
+            .is_some_and(|doc| hash(doc.as_bytes()) == *digest)
+    })
 }
 
 struct EvidenceFile {
@@ -743,6 +781,8 @@ pub fn finish(s: &mut Session, text: &str) -> Result<()> {
     state.issues = next_issues;
     state.reviewed_sections = section_hashes(&doc);
     state.unavailable_hash = None;
+    state.unavailable_requirements = None;
+    state.unavailable_source_hashes.clear();
     state.reviewed_requirements = state.target_requirements.clone();
     reset_pages(state);
     state.approved_hash = state.issues.is_empty().then_some(digest);

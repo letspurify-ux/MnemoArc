@@ -1272,6 +1272,70 @@ fn rejected_review_cache_and_approval_follow_requirements_and_source_versions() 
 }
 
 #[test]
+fn current_verdict_does_not_promote_findings_from_an_earlier_document() {
+    let (dir, mut s) = fixture();
+    assert_eq!(
+        document_review::current_verdict(&s),
+        document_review::CurrentVerdict::Unreviewed
+    );
+    document_review::request(&mut s).unwrap();
+    document_review::finish(&mut s, r#"{"issues":["Correct the loop"]}"#).unwrap();
+    assert!(matches!(
+        document_review::current_verdict(&s),
+        document_review::CurrentVerdict::Rejected(issues) if issues == ["Correct the loop"]
+    ));
+
+    let expected = s.last_document_write.as_ref().unwrap().1.clone();
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":expected,"old_text":"A while loop","text":"A for loop"}),
+    )
+    .unwrap();
+    assert_eq!(s.document_review.issues, ["Correct the loop"]);
+    assert_eq!(
+        document_review::current_verdict(&s),
+        document_review::CurrentVerdict::Unreviewed
+    );
+
+    document_review::request(&mut s).unwrap();
+    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    assert_eq!(
+        document_review::current_verdict(&s),
+        document_review::CurrentVerdict::Approved
+    );
+    std::fs::write(dir.path().join("main.js"), "function changed() {}\n").unwrap();
+    assert_eq!(
+        document_review::current_verdict(&s),
+        document_review::CurrentVerdict::Unreviewed
+    );
+}
+
+#[test]
+fn unavailable_verdict_stays_bound_to_the_failed_request_snapshot() {
+    let (dir, mut s) = fixture();
+    document_review::request(&mut s).unwrap();
+    let original = std::fs::read(dir.path().join("out.md")).unwrap();
+    std::fs::write(
+        dir.path().join("out.md"),
+        "# Changed\nDifferent document.\n",
+    )
+    .unwrap();
+    s.task.constraints.push("New requirement".into());
+    document_review::mark_unavailable(&mut s);
+    assert_eq!(
+        document_review::current_verdict(&s),
+        document_review::CurrentVerdict::Unreviewed
+    );
+    std::fs::write(dir.path().join("out.md"), original).unwrap();
+    s.task.constraints.pop();
+    assert_eq!(
+        document_review::current_verdict(&s),
+        document_review::CurrentVerdict::Unavailable
+    );
+}
+
+#[test]
 fn rewording_review_findings_does_not_count_as_progress() {
     let (_dir, mut s) = fixture();
     for issue in [

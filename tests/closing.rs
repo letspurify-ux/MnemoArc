@@ -213,6 +213,25 @@ fn unavailable_review_applies_only_to_the_unchanged_document() {
     document_review::mark_unavailable(&mut s);
     assert!(!s.document_review.pending);
     assert!(document_review::unavailable_on_current(&s));
+    assert_eq!(
+        document_review::current_verdict(&s),
+        document_review::CurrentVerdict::Unavailable
+    );
+    s.task.constraints.push("Use Korean".into());
+    assert_eq!(
+        document_review::current_verdict(&s),
+        document_review::CurrentVerdict::Unreviewed
+    );
+    s.task.constraints.pop();
+    let source_path = s.project.root.join("main.js");
+    let source = std::fs::read(&source_path).unwrap();
+    std::fs::write(&source_path, "function changed() {}\n").unwrap();
+    assert_eq!(
+        document_review::current_verdict(&s),
+        document_review::CurrentVerdict::Unreviewed
+    );
+    std::fs::write(&source_path, source).unwrap();
+    assert!(document_review::unavailable_on_current(&s));
     let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
     tools::execute(
         &mut s,
@@ -626,10 +645,12 @@ fn provider_usage_calibrates_estimated_token_counts() {
 async fn rejected_review_asks_for_one_batched_repair() {
     let (_dir, mut s, _) = fixture();
     s.config.completion_review_enabled = false;
-    s.document_review.issues = vec![
-        "Flow: state the loop bound".into(),
-        "History: name the helper".into(),
-    ];
+    document_review::request(&mut s).unwrap();
+    document_review::finish(
+        &mut s,
+        r#"{"issues":["Flow: state the loop bound","History: name the helper"]}"#,
+    )
+    .unwrap();
     let (_, guidance) = run_scripted(
         s,
         vec![Completion {
@@ -646,16 +667,22 @@ async fn rejected_review_asks_for_one_batched_repair() {
             .starts_with("Review repair: fix ALL findings")
     );
 
-    // Once repairs are verified, the final-answer guidance names the open
-    // findings so each one is confirmed before a costly re-review.
+    // Findings without a matching review target belong to an earlier version.
     let (_dir, mut s) = verified_fixture();
+    s.config.source_document_review = true;
     s.document_review.issues = vec!["Flow: state the loop bound".into()];
     let (_, guidance) = run_scripted(
         s,
-        vec![Completion {
-            text: "Saved out.md".into(),
-            ..Default::default()
-        }],
+        vec![
+            Completion {
+                text: "Saved out.md".into(),
+                ..Default::default()
+            },
+            Completion {
+                text: r#"{"issues":[]}"#.into(),
+                ..Default::default()
+            },
+        ],
     )
     .await;
     assert_eq!(guidance[0]["ready_for_final"], true);
@@ -663,27 +690,25 @@ async fn rejected_review_asks_for_one_batched_repair() {
         guidance[0]["instruction"]
             .as_str()
             .unwrap()
-            .contains("all 1 findings in document_review.issues")
+            .contains("1 findings from a previous document version")
     );
 }
 
 #[tokio::test]
 async fn audits_during_review_repair_return_a_short_page() {
-    let (dir, mut s, _) = fixture();
+    let (_dir, mut s, _) = fixture();
     s.config.completion_review_enabled = false;
-    s.config.source_document_review = false;
-    s.document_review.issues = vec!["Flow: fix citations".into()];
-    // Seven citations to a file that does not exist: seven audit issues.
-    let hash = tools::hash(&std::fs::read(dir.path().join("out.md")).unwrap());
-    let broken: String = (1..=7)
-        .map(|i| format!("Claim {i}. missing.js:{i}-{i}\n"))
-        .collect();
-    tools::execute(
-        &mut s,
-        "document_edit",
-        json!({"action":"append","expected_hash":hash,"text":format!("\n# Extra\n{broken}")}),
-    )
-    .unwrap();
+    // Pending investigations yield enough audit issues to exercise paging,
+    // while the document and cited source remain reviewable.
+    for i in 0..7 {
+        let mut item = s.investigations[0].clone();
+        item.id = format!("pending-{i}");
+        item.status = "written".into();
+        item.sources.clear();
+        s.investigations.push(item);
+    }
+    document_review::request(&mut s).unwrap();
+    document_review::finish(&mut s, r#"{"issues":["Flow: fix citations"]}"#).unwrap();
     let (result, _) = run_scripted(s, vec![call("audit", "document_audit", json!({}))]).await;
     let output: Value = result
         .history
