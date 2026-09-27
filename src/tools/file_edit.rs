@@ -356,11 +356,24 @@ fn write_path(
     text: &str,
     existed: bool,
     permissions: Option<&Permissions>,
+    created_dirs: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid_file_path"))?;
-    std::fs::create_dir_all(parent)?;
+    let missing: Vec<_> = parent
+        .ancestors()
+        .take_while(|ancestor| !ancestor.exists())
+        .collect();
+    for directory in missing.into_iter().rev() {
+        match std::fs::create_dir(directory) {
+            Ok(()) => created_dirs.push(directory.to_path_buf()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    && std::fs::symlink_metadata(directory)?.file_type().is_dir() => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     temp.write_all(text.as_bytes())?;
     if let Some(permissions) = permissions {
@@ -435,12 +448,18 @@ fn commit(
         }
     }
     let mut completed: Vec<PathBuf> = Vec::new();
+    let mut created_dirs = Vec::new();
     for (path, after) in &changed {
         if cancel.is_cancelled() && completed.is_empty() {
             bail!("cancelled");
         }
         if cancel.is_cancelled() {
-            let failures = rollback(&completed, &originals, &original_permissions);
+            let failures = rollback(
+                &completed,
+                &originals,
+                &original_permissions,
+                &mut created_dirs,
+            );
             if failures.is_empty() {
                 bail!("cancelled: completed file changes were rolled back");
             }
@@ -455,11 +474,17 @@ fn commit(
                 text,
                 originals[path].is_some(),
                 permissions[path].as_ref(),
+                &mut created_dirs,
             ),
             None => std::fs::remove_file(path).map_err(Into::into),
         };
         if let Err(error) = result {
-            let rollback_errors = rollback(&completed, &originals, &original_permissions);
+            let rollback_errors = rollback(
+                &completed,
+                &originals,
+                &original_permissions,
+                &mut created_dirs,
+            );
             if rollback_errors.is_empty() {
                 bail!("file_patch_write_failed: {error}; completed file changes were rolled back");
             }
@@ -484,6 +509,7 @@ fn rollback(
     completed: &[PathBuf],
     originals: &BTreeMap<PathBuf, Option<String>>,
     original_permissions: &BTreeMap<PathBuf, Option<Permissions>>,
+    created_dirs: &mut Vec<PathBuf>,
 ) -> Vec<String> {
     let mut errors = Vec::new();
     for restored in completed.iter().rev() {
@@ -493,6 +519,7 @@ fn rollback(
                 text,
                 restored.exists(),
                 original_permissions[restored].as_ref(),
+                created_dirs,
             ),
             None => {
                 if restored.exists() {
@@ -504,6 +531,13 @@ fn rollback(
         };
         if let Err(cause) = result {
             errors.push(format!("{}: {cause}", restored.display()));
+        }
+    }
+    for directory in created_dirs.iter().rev() {
+        if let Err(cause) = std::fs::remove_dir(directory)
+            && cause.kind() != std::io::ErrorKind::NotFound
+        {
+            errors.push(format!("{}: {cause}", directory.display()));
         }
     }
     errors

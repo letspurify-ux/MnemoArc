@@ -126,6 +126,29 @@ fn invalid_later_patch_operation_does_not_save_earlier_ones() {
 }
 
 #[test]
+fn failed_patch_removes_directories_created_for_earlier_files() {
+    let (dir, mut session) = setup();
+    std::fs::create_dir(dir.path().join("existing")).unwrap();
+    // All paths are valid against the initial tree. During commit, "z" becomes
+    // a file, so writing "z/child.txt" fails after earlier writes.
+    let result = tools::execute(
+        &mut session,
+        "file_patch",
+        json!({"operations":[
+            {"action":"add","path":"a/nested/child.txt","content":"first"},
+            {"action":"add","path":"existing/nested/child.txt","content":"kept parent"},
+            {"action":"add","path":"z","content":"second"},
+            {"action":"add","path":"z/child.txt","content":"third"}
+        ]}),
+    );
+    assert!(result.is_err());
+    assert!(!dir.path().join("a").exists());
+    assert!(dir.path().join("existing").is_dir());
+    assert!(!dir.path().join("existing/nested").exists());
+    assert!(!dir.path().join("z").exists());
+}
+
+#[test]
 fn patch_reuses_first_hash_for_later_edits_but_requires_one_initially() {
     let (dir, mut session) = setup();
     std::fs::write(dir.path().join("part.md"), "one two").unwrap();
