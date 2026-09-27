@@ -78,6 +78,17 @@ fn action(values: &[&str]) -> Value {
 }
 pub struct ToolRegistry;
 
+const WORKFLOW_WRITE_SCOPE_ERROR: &str = "workflow_write_scope: the source_document workflow writes only the configured output; use document_edit or document_edit_batch, and never modify project files";
+
+fn reject_project_write_in_source_document(s: &Session, name: &str) -> Result<()> {
+    if matches!(name, "file_edit" | "file_write" | "file_patch")
+        && ToolRegistry::project_writes_withheld(s)
+    {
+        bail!(WORKFLOW_WRITE_SCOPE_ERROR);
+    }
+    Ok(())
+}
+
 fn pending_verification_stall(s: &Session) -> bool {
     s.document_written
         && s.progress_recovery.closing.is_none()
@@ -726,6 +737,7 @@ impl ToolRegistry {
             .into_iter()
             .find(|t| t.name == name)
             .ok_or_else(|| anyhow::anyhow!("unsupported_tool: {name}"))?;
+        reject_project_write_in_source_document(s, name)?;
         if spec.optional && !s.active_tools.contains(name) {
             bail!("tool_not_active: {name}");
         }
@@ -3237,6 +3249,7 @@ pub fn execute_cancellable(
     if cancel.is_cancelled() {
         bail!("cancelled");
     }
+    reject_project_write_in_source_document(s, name)?;
     if !repair_leaked_argument_markup(&mut args)? {
         return execute_repaired(s, name, args, cancel);
     }
@@ -3874,9 +3887,7 @@ fn execute_repaired(
             Ok(result)
         }
         "file_edit" | "file_write" | "file_patch" if ToolRegistry::project_writes_withheld(s) => {
-            bail!(
-                "workflow_write_scope: the source_document workflow writes only the configured output; use document_edit or document_edit_batch, and never modify project files"
-            )
+            bail!(WORKFLOW_WRITE_SCOPE_ERROR)
         }
         "file_edit" | "file_write" | "file_patch" => file_edit::execute(s, name, &args, cancel),
         "document_edit" => {

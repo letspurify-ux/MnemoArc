@@ -191,7 +191,11 @@ pub fn describe(message: &str) -> Value {
         (Class::Capacity, "reduce_request_or_cleanup")
     } else if matches!(
         code,
-        "checkpoint_pending" | "tool_not_active" | "closing_mode" | "gap_requires_closing"
+        "checkpoint_pending"
+            | "tool_not_active"
+            | "closing_mode"
+            | "gap_requires_closing"
+            | "workflow_write_scope"
     ) || code.starts_with("unsupported")
     {
         (Class::Unavailable, "use_available_tools")
@@ -276,6 +280,9 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             "code_outline",
         ],
         "inspect_outcome_before_retry" => &["history", "document_inspect", "file_read"],
+        "use_available_tools" if result["recovery"]["code"] == "workflow_write_scope" => {
+            &["document_inspect", "document_edit", "document_edit_batch"]
+        }
         "use_available_tools" if result["recovery"]["code"] == "unsupported_language" => {
             &["source_search", "file_read", "tool_catalog", "tool_select"]
         }

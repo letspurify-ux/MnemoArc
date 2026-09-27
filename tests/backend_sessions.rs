@@ -29,6 +29,33 @@ fn session(root: &std::path::Path) -> Session {
     )
 }
 
+#[test]
+fn source_document_review_instruction_follows_session_setting() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.select_workflow("source_document").unwrap();
+
+    for enabled in [false, true] {
+        s.config.source_document_review = enabled;
+        let request = ContextManager::request(&s, vec![]).unwrap();
+        let instruction = request["messages"][0]["content"].as_str().unwrap();
+        assert_eq!(
+            instruction
+                .contains("The separate source-document review is enabled for this session."),
+            enabled
+        );
+        assert_eq!(
+            instruction
+                .contains("The separate source-document review is disabled for this session."),
+            !enabled
+        );
+        assert!(
+            !instruction
+                .contains("Source-document work also requires the separate document review.")
+        );
+    }
+}
+
 async fn run(s: Session, client: Arc<dyn LlmClient>) -> Session {
     let (tx, mut rx) = mpsc::channel(128);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });

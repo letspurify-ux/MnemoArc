@@ -49,6 +49,55 @@ fn session(root: &std::path::Path) -> Session {
     s.active_tools = ToolRegistry::optional_names();
     s
 }
+
+#[test]
+fn source_document_write_scope_precedes_argument_errors_and_points_to_document_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.select_workflow("source_document").unwrap();
+
+    for (name, arguments) in [
+        (
+            "file_write",
+            json!({"path":"manual.md","text":"# Wrong field"}),
+        ),
+        (
+            "file_edit",
+            json!({"path":"manual.md","old_text":"before","text":"after"}),
+        ),
+        (
+            "file_patch",
+            json!({"operations":{"item":{"action":"add","path":"manual.md","content":"# Wrong shape"}}}),
+        ),
+    ] {
+        let error = ToolRegistry::validate(&s, name, &arguments)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("workflow_write_scope:"),
+            "{name}: {error}"
+        );
+
+        let call = ToolCall {
+            id: format!("withheld-{name}"),
+            name: name.into(),
+            arguments: arguments.to_string(),
+        };
+        let result = tools::run_call(&mut s, &call);
+        assert_eq!(
+            result["recovery"]["code"], "workflow_write_scope",
+            "{name}: {result}"
+        );
+        assert_eq!(result["recovery"]["class"], "unavailable");
+        assert_eq!(result["recovery"]["action"], "use_available_tools");
+        assert_eq!(
+            result["recovery"]["tools"],
+            json!(["document_inspect", "document_edit", "document_edit_batch"])
+        );
+    }
+    assert!(!dir.path().join("manual.md").exists());
+}
+
 #[test]
 fn every_registered_tool_uses_common_failure_contract_without_mutation() {
     let dir = tempfile::tempdir().unwrap();
