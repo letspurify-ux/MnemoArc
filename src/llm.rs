@@ -161,39 +161,48 @@ impl SseDecoder {
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>> {
         let mut result = vec![];
         for &byte in bytes {
-            // SSE permits CR, LF and CRLF, including a CRLF split across
-            // transport chunks. Process each byte once instead of repeatedly
-            // rescanning an unfinished event on every incoming chunk.
-            if self.skip_lf {
-                self.skip_lf = false;
-                if byte == b'\n' {
-                    continue;
-                }
-            }
-            self.event_bytes += 1;
-            if self.event_bytes > MAX_COMPLETION_BYTES {
-                bail!("response_size_limit: SSE event too large");
-            }
-            if matches!(byte, b'\r' | b'\n') {
-                self.finish_line(&mut result)?;
-                self.skip_lf = byte == b'\r';
-            } else {
-                self.line.push(byte);
+            if let Some(event) = self.feed_byte(byte)? {
+                result.push(event);
             }
         }
         Ok(result)
     }
 
-    fn finish_line(&mut self, events: &mut Vec<String>) -> Result<()> {
+    // Deliver each event before decoding later bytes so a consumer can stop
+    // at its terminator, even when the rest of that HTTP chunk is malformed.
+    fn feed_byte(&mut self, byte: u8) -> Result<Option<String>> {
+        // SSE permits CR, LF and CRLF, including a split CRLF.
+        if self.skip_lf {
+            self.skip_lf = false;
+            if byte == b'\n' {
+                return Ok(None);
+            }
+        }
+        self.event_bytes += 1;
+        if self.event_bytes > MAX_COMPLETION_BYTES {
+            bail!("response_size_limit: SSE event too large");
+        }
+        if matches!(byte, b'\r' | b'\n') {
+            let event = self.finish_line()?;
+            self.skip_lf = byte == b'\r';
+            Ok(event)
+        } else {
+            self.line.push(byte);
+            Ok(None)
+        }
+    }
+
+    fn finish_line(&mut self) -> Result<Option<String>> {
         let mut line = std::str::from_utf8(&self.line)?;
         if !self.started {
             line = line.strip_prefix('\u{feff}').unwrap_or(line);
             self.started = true;
         }
+        let mut event = None;
         if line.is_empty() {
             if self.has_data {
                 self.data.pop(); // Remove only the final data-line delimiter.
-                events.push(std::mem::take(&mut self.data));
+                event = Some(std::mem::take(&mut self.data));
                 self.has_data = false;
             }
             self.event_bytes = 0;
@@ -206,7 +215,7 @@ impl SseDecoder {
             }
         }
         self.line.clear();
-        Ok(())
+        Ok(event)
     }
 }
 impl OpenAiClient {
@@ -309,7 +318,10 @@ impl OpenAiClient {
             };
             let Some(chunk) = next else { break };
             let chunk = chunk.map_err(|e| anyhow::anyhow!("stream_interrupted: {e}"))?;
-            for event in parser.feed(&chunk)? {
+            for &byte in chunk.iter() {
+                let Some(event) = parser.feed_byte(byte)? else {
+                    continue;
+                };
                 if event.is_empty() {
                     continue;
                 }

@@ -142,7 +142,36 @@ async fn connection_probe_requires_valid_plain_and_final_answers() {
         }
     }
 }
-async fn server(body: String) -> (String, tokio::task::JoinHandle<()>) {
+#[tokio::test]
+async fn completion_terminator_ignores_invalid_utf8_after_the_final_event() {
+    let mut body = format!(
+        "{}data: [DONE]\n\n",
+        event(json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}))
+    )
+    .into_bytes();
+    body.extend_from_slice(b"data: \xff\n\n");
+    let (url, server) = server(body).await;
+    let config = Config {
+        base_url: url,
+        retries: 0,
+        disable_proxy: true,
+        ..Default::default()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let result = OpenAiClient
+        .complete(
+            json!({"messages":[]}),
+            &config,
+            CancellationToken::new(),
+            tx,
+        )
+        .await;
+    server.abort();
+    assert_eq!(result.unwrap().text, "OK");
+}
+
+async fn server(body: impl Into<axum::body::Bytes>) -> (String, tokio::task::JoinHandle<()>) {
+    let body = body.into();
     let app = Router::new().route(
         "/chat/completions",
         post(move || {

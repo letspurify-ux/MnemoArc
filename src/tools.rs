@@ -2041,6 +2041,12 @@ fn persist_document_edit(
     }
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     temp.write_all(result.as_bytes())?;
+    if exists {
+        // Atomic replacement must retain the existing document's access mode;
+        // NamedTempFile otherwise replaces it with its private default mode.
+        temp.as_file()
+            .set_permissions(std::fs::metadata(path)?.permissions())?;
+    }
     temp.as_file().sync_all()?;
     if cancel.is_cancelled() {
         bail!("cancelled");

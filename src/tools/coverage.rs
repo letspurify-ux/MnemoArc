@@ -39,7 +39,12 @@ pub fn record_delivered_read(s: &mut Session, call: &crate::llm::ToolCall, resul
             .sum::<usize>()
             + data["read_offset"].as_u64().unwrap_or(0) as usize
     } else {
-        let Some(section) = data["section"].as_str() else {
+        // Leaf headings can repeat under different parents. Reuse the full
+        // path that identified this section, including on continuation pages.
+        let Some(section) = data["section_path"]
+            .as_str()
+            .or_else(|| data["section"].as_str())
+        else {
             return;
         };
         let Ok(heading) = documentation::resolve_heading(&doc, section) else {

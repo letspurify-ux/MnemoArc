@@ -132,10 +132,23 @@ fn input(value: &Value, kind: &str) -> Result<Input> {
                 Value::Null => None,
                 Value::Number(value) => Some(value.to_string()),
                 Value::String(value) => {
-                    let number = value
-                        .parse::<serde_json::Number>()
-                        .map_err(|_| bad("number bind value must be a valid decimal or null"))?;
-                    Some(number.to_string())
+                    if value.len() > 8192 {
+                        return Err(bad("bind value exceeds 8192 bytes"));
+                    }
+                    // Validate decimal syntax without passing through f64.
+                    // Oracle NUMBER accepts more significant digits than a
+                    // JSON floating-point number can retain.
+                    static DECIMAL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+                    let decimal = DECIMAL.get_or_init(|| {
+                        regex::Regex::new(
+                            r"\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\z",
+                        )
+                        .expect("decimal bind syntax")
+                    });
+                    if !decimal.is_match(value) {
+                        return Err(bad("number bind value must be a valid decimal or null"));
+                    }
+                    Some(value.clone())
                 }
                 _ => return Err(bad("number bind value must be a number or null")),
             };
@@ -158,8 +171,12 @@ fn sql_binds(args: &Value) -> Result<Vec<(String, Input)>> {
     if params.len() > 32 {
         return Err(bad("at most 32 bind parameters are supported"));
     }
+    let mut names = BTreeSet::new();
     params.iter().map(|(name, value)| {
         if !identifier(name) { return Err(bad("bind names must begin with a letter and contain only letters, numbers or underscores")); }
+        if !names.insert(name.to_ascii_lowercase()) {
+            return Err(bad("bind names must be unique ignoring case"));
+        }
         let kind = match value {
             Value::Bool(_) => "boolean",
             Value::Number(_) => "number",
@@ -219,17 +236,21 @@ fn call_args(args: &Value) -> Result<Vec<CallArg>> {
                     "argument names must be unique valid bind names and cannot be mnemoarc_result",
                 ));
             }
-            let direction = entry
-                .get("direction")
-                .and_then(Value::as_str)
-                .unwrap_or("in");
+            let direction = match entry.get("direction") {
+                None => "in",
+                Some(value) => value
+                    .as_str()
+                    .ok_or_else(|| bad("direction must be a string: in, out or inout"))?,
+            };
             if !["in", "out", "inout"].contains(&direction) {
                 return Err(bad("direction must be in, out or inout"));
             }
-            let kind = entry
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("string");
+            let kind = match entry.get("type") {
+                None => "string",
+                Some(value) => value.as_str().ok_or_else(|| {
+                    bad("type must be a string: string, number, boolean or cursor")
+                })?,
+            };
             output_type(kind)?;
             if kind == "cursor" && direction != "out" {
                 return Err(bad("cursor is supported only as an OUT argument"));
@@ -466,5 +487,48 @@ pub fn execute_free(
             finish_mutation(&conn, operation, cancel, deadline)
         }
         _ => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decimal_string_binds_preserve_all_digits() {
+        for value in [
+            "12345678901234567890.123456789012345678",
+            "12345678901234567890123456789012345678",
+            "-0.12345678901234567890123456789012345678",
+            "1.2345678901234567890123456789012345678e-10",
+        ] {
+            let Input::Number(Some(bound)) = input(&json!(value), "number").unwrap() else {
+                panic!("expected a numeric bind");
+            };
+            assert_eq!(bound, value);
+        }
+        for value in ["NaN", "inf", "1; DELETE", "1 2", "", "+1", "01", "1."] {
+            assert!(input(&json!(value), "number").is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn explicit_invalid_argument_types_do_not_select_defaults() {
+        for field in ["direction", "type"] {
+            for invalid in [json!(null), json!(false), json!(42), json!([]), json!({})] {
+                let mut arg = json!({"name":"p_value","value":"text"});
+                arg[field] = invalid;
+                assert!(call_args(&json!({"args":[arg]})).is_err(), "{field}");
+            }
+        }
+        let defaulted = call_args(&json!({"args":[{"name":"p_value","value":"text"}]})).unwrap();
+        assert_eq!(defaulted[0].direction, "in");
+        assert_eq!(defaulted[0].kind, "string");
+    }
+
+    #[test]
+    fn sql_bind_names_must_be_unique_ignoring_case() {
+        assert!(sql_binds(&json!({"params":{"item_id":1,"ITEM_ID":2}})).is_err());
+        assert!(sql_binds(&json!({"params":{"item_id":1,"other_id":2}})).is_ok());
     }
 }

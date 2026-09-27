@@ -121,6 +121,46 @@ fn free_execution_requires_manual_mode_switches() {
 }
 
 #[test]
+fn invalid_database_bind_arguments_are_rejected_before_connecting() {
+    let mut session = Session::new(Default::default(), Config::default());
+    session.config.database = configured();
+    for field in ["direction", "type"] {
+        for value in [json!(null), json!(true), json!(1), json!([]), json!({})] {
+            let mut arg = json!({"name":"p_value","value":"text"});
+            arg[field] = value;
+            let error = tools::execute(
+                &mut session,
+                "db_execute",
+                json!({
+                    "mode":"procedure","name":"TEST_PROC","args":[arg]
+                }),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.starts_with("invalid_database_execution_arguments:"),
+                "{error}"
+            );
+            assert!(error.contains(field), "{error}");
+        }
+    }
+    let error = tools::execute(
+        &mut session,
+        "db_execute",
+        json!({
+            "mode":"statement","sql":"UPDATE items SET value = :value",
+            "params":{"value":1,"VALUE":2}
+        }),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("bind names must be unique ignoring case"),
+        "{error}"
+    );
+}
+
+#[test]
 fn oracle_free_execution_round_trips_sql_procedure_function_and_cursor() -> Result<()> {
     let Ok(password) = std::env::var("MNEMOARC_TEST_DB_PASSWORD") else {
         return Ok(());

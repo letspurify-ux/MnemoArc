@@ -1200,6 +1200,104 @@ fn deliver(s: &mut Session, name: &str, args: Value, budget: usize) -> Value {
 }
 
 #[test]
+fn delivered_nested_sections_with_repeated_titles_keep_their_coverage() {
+    let (_dir, mut s) = setup();
+    let body = "# Guide\r\n## Alpha\r\n### Shared\r\nFirst body.\r\n## Beta\r\n### Shared\r\nSecond body.\r\n";
+    std::fs::write(&s.project.output, body).unwrap();
+    let section = "# Guide\n## Beta\n### Shared";
+    let delivered = deliver(&mut s, "document_inspect", json!({"section":section}), 4000);
+    assert_eq!(delivered["status"], "ok", "{delivered}");
+    assert_eq!(delivered["data"]["section_path"], section);
+    assert_eq!(delivered["data"]["content"]["truncated"], false);
+    let outline = run(&mut s, "document_inspect", json!({}));
+    assert_eq!(outline["coverage"]["fully_read_lines"], 2, "{outline}");
+    assert_eq!(
+        outline["coverage"]["missing_ranges"],
+        json!([{"start_line":1,"end_line":5}])
+    );
+    assert_eq!(outline["outline"][2]["fully_read"], false);
+    assert_eq!(outline["outline"][4]["fully_read"], true);
+}
+
+#[test]
+fn repeated_section_title_coverage_survives_limited_continuation_pages() {
+    for newline in ["\n", "\r\n"] {
+        let (dir, mut s) = setup();
+        let section = "# Guide\n## Beta\n### Shared";
+        let expected = format!("### Shared\n{}", "읽은 내용🙂\n".repeat(60)).replace('\n', newline);
+        let body = format!(
+            "{}{}",
+            "# Guide\n## Alpha\n### Shared\nUnread.\n## Beta\n".replace('\n', newline),
+            expected
+        );
+        std::fs::write(dir.path().join("input.md"), body).unwrap();
+        let mut args = json!({"path":"input.md","section":section});
+        let mut reconstructed = String::new();
+        let mut pages = 0;
+        for _ in 0..100 {
+            let page = deliver(&mut s, "document_inspect", args, 500);
+            assert_eq!(page["status"], "ok", "{page}");
+            reconstructed.push_str(page["data"]["content"]["text"].as_str().unwrap());
+            pages += 1;
+            if page["data"]["content"]["truncated"] != true {
+                break;
+            }
+            args = page["next_cursor"].clone();
+            assert_eq!(args["section"], section);
+            args.as_object_mut().unwrap().remove("tool");
+        }
+        assert!(pages > 1);
+        assert_eq!(reconstructed, expected);
+        let outline = run(&mut s, "document_inspect", json!({"path":"input.md"}));
+        assert_eq!(outline["coverage"]["fully_read_lines"], 61, "{outline}");
+        assert_eq!(
+            outline["coverage"]["missing_ranges"],
+            json!([{"start_line":1,"end_line":5}])
+        );
+        assert_eq!(outline["outline"][2]["fully_read"], false);
+        assert_eq!(outline["outline"][4]["fully_read"], true);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn document_edits_preserve_existing_file_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    for batch in [false, true] {
+        let (_dir, mut s) = setup();
+        let original = "# Guide\nOriginal body.\n";
+        std::fs::write(&s.project.output, original).unwrap();
+        std::fs::set_permissions(&s.project.output, std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+        let edit =
+            json!({"action":"replace_text","old_text":"Original body.","text":"Updated body."});
+        if batch {
+            run(
+                &mut s,
+                "document_edit_batch",
+                json!({"expected_hash":tools::hash(original.as_bytes()),"edits":[edit]}),
+            );
+        } else {
+            let mut edit = edit;
+            edit["expected_hash"] = json!(tools::hash(original.as_bytes()));
+            run(&mut s, "document_edit", edit);
+        }
+        assert_eq!(
+            std::fs::read_to_string(&s.project.output).unwrap(),
+            "# Guide\nUpdated body.\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&s.project.output)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+}
+
+#[test]
 fn nested_outline_stays_pageable_when_result_budget_is_small() {
     let (_dir, mut s) = setup();
     let mut doc = String::from("# Guide\n");
