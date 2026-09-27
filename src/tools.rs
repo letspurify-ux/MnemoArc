@@ -3330,8 +3330,13 @@ fn execute_repaired(
                     .as_str()
                     .is_none_or(|id| !s.investigations.iter().any(|item| item.id == id))))
     {
+        if name == "investigation" {
+            bail!(
+                "verification_reserve: a new investigation item needs a nonempty section naming the document heading it covers (for example \"## Settings\"); broad discovery is paused"
+            );
+        }
         bail!(
-            "verification_reserve: use a targeted path_glob or nonempty symbol query for missing evidence; register missing original requirements with a concrete document section; broad discovery is paused"
+            "verification_reserve: use a targeted path_glob or nonempty symbol query for missing evidence; broad discovery is paused"
         );
     }
     match name {
@@ -3716,9 +3721,12 @@ fn execute_repaired(
                     )
                 })?;
             // Only one checkpoint is active, so a copied ID that the model cut
-            // short still identifies it; a mismatching or tiny prefix does not.
+            // short or mistyped in a character or two still identifies it; a
+            // tiny prefix or an unrelated ID does not.
             let supplied = text(&args, "id")?.trim();
-            if cp.id != supplied && !(supplied.len() >= 8 && cp.id.starts_with(supplied)) {
+            let typo = supplied.len() == cp.id.len()
+                && supplied.bytes().zip(cp.id.bytes()).filter(|(a, b)| a != b).count() <= 2;
+            if cp.id != supplied && !typo && !(supplied.len() >= 8 && cp.id.starts_with(supplied)) {
                 bail!("checkpoint_id_mismatch: expected checkpoint ID {}", cp.id);
             }
             if cp.failed {

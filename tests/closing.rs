@@ -1085,6 +1085,55 @@ fn a_truncated_checkpoint_id_still_acknowledges_the_checkpoint() {
     assert_eq!(result["acknowledged"], true, "{result}");
 }
 
+#[test]
+fn a_checkpoint_id_with_a_one_character_typo_still_acknowledges_the_checkpoint() {
+    use mnemoarc::context::ContextManager;
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(64_000),
+            context_tokens: 64_000,
+            output_tokens: 4_000,
+            ..Default::default()
+        },
+    );
+    s.add_user("Work".into());
+    for i in 0..6 {
+        s.history.push(
+            vec![json!({"role":"user","content":format!("{i} {}", "context ".repeat(2500))})],
+            true,
+        );
+    }
+    let budget = ContextManager::input_budget(&s.config);
+    assert!(ContextManager::prepare(&mut s, budget).unwrap());
+    let id = s.checkpoint.as_ref().unwrap().id.clone();
+    let ack = |id: &str| json!({"id":id,"progress":"Continue the work","no_save_reason":"Nothing new to save"});
+    let flip = |id: &str, at: &[usize]| -> String {
+        id.char_indices()
+            .map(|(i, c)| match (at.contains(&i), c) {
+                (false, c) => c,
+                (true, '0') => '1',
+                (true, '-') => '-',
+                (true, _) => '0',
+            })
+            .collect()
+    };
+    // Three differing characters is another ID, not a typo.
+    let error = tools::execute(&mut s, "checkpoint_complete", ack(&flip(&id, &[0, 1, 2])))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("checkpoint_id_mismatch"), "{error}");
+    // Live run: the model kept copying ...-482f-... for ...-482c-....
+    let result = tools::execute(&mut s, "checkpoint_complete", ack(&flip(&id, &[15]))).unwrap();
+    assert_eq!(result["acknowledged"], true, "{result}");
+}
+
 #[tokio::test]
 async fn a_fix_made_after_closing_on_an_unrepaired_review_is_reviewed_again() {
     let (dir, mut s) = verified_fixture();

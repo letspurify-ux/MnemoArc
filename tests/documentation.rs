@@ -3708,6 +3708,27 @@ fn a_directory_path_is_a_targeted_listing_while_verifying() {
 }
 
 #[test]
+fn a_new_investigation_while_verifying_is_told_to_name_its_section() {
+    let (_dir, mut s) = setup();
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"entry","title":"entry"}),
+    );
+    s.run_guidance["phase"] = json!("verify");
+    // Live run: the model retried without section after the generic message.
+    let error = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"sec-docedit","status":"in_progress","title":"문서 편집 화면 사용법"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("verification_reserve:"), "{error}");
+    assert!(error.contains("nonempty section"), "{error}");
+}
+
+#[test]
 fn an_unchanged_upsert_keeps_a_verified_item_verified() {
     let (dir, mut s) = setup();
     std::fs::write(dir.path().join("main.rs"), "fn main() {}\nfn other() {}\n").unwrap();
