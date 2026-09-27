@@ -51,6 +51,49 @@ fn disabled_completion_review_does_not_gate_artifact_completion() {
     assert!(!s.completion_review.approved);
 }
 
+#[test]
+fn disabled_completion_review_is_not_shown_as_required_after_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.config.completion_review_enabled = false;
+    let call = ToolCall {
+        id: "write-with-review-disabled".into(),
+        name: "document_edit".into(),
+        arguments: json!({"action":"create","text":"# Manual"}).to_string(),
+    };
+    review::observe(&mut s, &call, &json!({"status":"ok","data":{}}));
+    assert!(s.completion_review.artifact_work);
+    assert!(!s.completion_review.required);
+
+    let task_call = ToolCall {
+        id: "completion-with-review-disabled".into(),
+        name: "task_state".into(),
+        arguments: json!({"action":"update","patch":{"completion":["Manual saved"]}}).to_string(),
+    };
+    review::observe(&mut s, &task_call, &json!({"status":"ok","data":{}}));
+    assert!(!s.completion_review.required);
+}
+
+#[test]
+fn disabled_completion_review_is_not_required_by_first_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128000),
+            completion_review_enabled: false,
+            ..Default::default()
+        },
+    );
+    s.task.completion = vec!["Manual saved".into()];
+    s.add_user("Write a manual".into());
+    assert!(!s.completion_review.required);
+}
+
 fn write(s: &mut Session, content: &str) {
     let path = s.project.root.join("result.txt");
     let mut args = json!({"path":"result.txt","content":content});

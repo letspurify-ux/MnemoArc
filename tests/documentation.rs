@@ -1025,6 +1025,45 @@ fn document_edit_ignores_citation_examples_inside_html_comments() {
 }
 
 #[test]
+fn document_audit_detects_list_item_fences_that_swallow_prose_and_citations() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("source.rs"), "fn source() {}\n").unwrap();
+    let result = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n1. ```chart code block instructions\n   [not a link](missing.rs#L999)\n2. ```mermaid code block instructions\n   [not a link](missing.rs#L999)\n3. See [source](source.rs#L1).\n"}),
+    );
+    let check = &result["citation_check"];
+    assert_eq!(check["citations_checked"], 1, "{check}");
+    let fence_lines = check["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| issue["kind"] == "unclosed_code_fence")
+        .map(|issue| issue["line"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(fence_lines, [2, 4], "{check}");
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert_eq!(audit["structural_ok"], false, "{audit}");
+    assert_eq!(audit["citations_checked"], 1, "{audit}");
+    assert_eq!(audit["issues"][0]["kind"], "unclosed_code_fence");
+}
+
+#[test]
+fn closed_list_item_fences_keep_example_citations_out_of_the_audit() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("source.rs"), "fn source() {}\n").unwrap();
+    let result = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n1. ```js\n   missing.rs:999\n   ```\n2. ```mermaid\n   A[source.rs:1]\n   ```\n3. See source.rs:1.\n"}),
+    );
+    let check = &result["citation_check"];
+    assert_eq!(check["citations_checked"], 2, "{check}");
+    assert_eq!(check["issue_count"], 0, "{check}");
+}
+
+#[test]
 fn inline_code_comment_marker_does_not_hide_following_citation() {
     let (dir, mut s) = setup();
     std::fs::write(dir.path().join("source.rs"), "fn source() {}\n").unwrap();

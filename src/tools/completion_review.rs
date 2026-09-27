@@ -132,7 +132,9 @@ pub fn observe(s: &mut Session, call: &crate::llm::ToolCall, result: &Value) {
     if call.name == "task_state" {
         s.completion_review.approved = false;
     }
-    if mutation || (call.name == "task_state" && call.arguments.contains("\"completion\"")) {
+    if s.config.completion_review_enabled
+        && (mutation || (call.name == "task_state" && call.arguments.contains("\"completion\"")))
+    {
         s.completion_review.required = true;
     }
     if mutation {

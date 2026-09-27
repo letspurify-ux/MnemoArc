@@ -298,6 +298,28 @@ fn observed_state_and_path_errors_have_actionable_recovery() {
 }
 
 #[test]
+fn missing_document_edit_hash_points_to_document_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let call = ToolCall {
+        id: "missing-document-hash".into(),
+        name: "document_edit".into(),
+        arguments: json!({
+            "action": "insert_after_text",
+            "old_text": "existing passage",
+            "text": "new passage"
+        })
+        .to_string(),
+    };
+    let result = tools::run_call(&mut s, &call);
+    assert_eq!(result["recovery"]["code"], "missing_argument");
+    assert_eq!(
+        result["recovery"]["tools"],
+        json!(["document_inspect", "document_edit"])
+    );
+}
+
+#[test]
 fn directory_read_identifies_path_and_available_navigation_tools() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());

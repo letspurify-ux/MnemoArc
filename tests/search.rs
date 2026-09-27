@@ -23,6 +23,25 @@ fn search(s: &mut Session, args: Value) -> Value {
 }
 
 #[test]
+fn empty_search_query_is_missing_not_conflicting() {
+    let (_dir, mut s) = setup();
+    for args in [json!({}), json!({"query":"","regex":true})] {
+        let error = tools::execute(&mut s, "source_search", args)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "missing_argument: query or queries");
+    }
+    let error = tools::execute(
+        &mut s,
+        "source_search",
+        json!({"query":"one","queries":["two"]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("conflicting_arguments:"), "{error}");
+}
+
+#[test]
 fn exact_directory_scope_treats_glob_characters_as_literal_path_names() {
     let (dir, mut s) = setup();
     for folder in ["[route]", "r", "{routes,handlers}", "routes", "[unclosed"] {

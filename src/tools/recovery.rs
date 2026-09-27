@@ -283,6 +283,9 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             &["document_inspect", "file_read"]
         }
         "correct_arguments" if call.name == "document_audit" => &["document_audit"],
+        "correct_arguments" if call.name == "document_edit" => {
+            &["document_inspect", "document_edit"]
+        }
         "correct_arguments" if call.name == "document_edit_batch" => {
             &["document_inspect", "document_edit_batch"]
         }

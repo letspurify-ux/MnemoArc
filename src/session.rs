@@ -695,7 +695,9 @@ impl Session {
             // or suppress a new mutation if a provider reuses an ID.
             self.ledger.clear();
             self.completion_review = Default::default();
-            self.completion_review.required = first_request && !self.task.completion.is_empty();
+            self.completion_review.required = self.config.completion_review_enabled
+                && first_request
+                && !self.task.completion.is_empty();
             self.answer_draft = None;
             self.answer_reviewed = false;
             self.answer_review_original = None;

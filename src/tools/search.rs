@@ -38,10 +38,12 @@ pub(super) fn execute(
         }
     }
     let args = &args;
-    if args.get("query").is_some() == args.get("queries").is_some() {
-        bail!(
+    match (args.get("query").is_some(), args.get("queries").is_some()) {
+        (false, false) => bail!("missing_argument: query or queries"),
+        (true, true) => bail!(
             "conflicting_arguments: supply exactly one of query (literal by default) or queries (literal OR)"
-        );
+        ),
+        _ => {}
     }
     let query = args["query"].as_str().unwrap_or("");
     let terms = args["queries"].as_array();

@@ -733,42 +733,126 @@ pub(super) fn missing_citation_ranges(
     Ok(result)
 }
 
-pub(super) fn citation_spans(doc: &str) -> Result<Vec<Citation>> {
+struct CitationFence {
+    marker: char,
+    width: usize,
+    mermaid: bool,
+    start_line: usize,
+    list_content_indent: Option<usize>,
+}
+
+fn fence_run(text: &str) -> Option<(char, usize, &str)> {
+    let marker = text.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+    let width = text.chars().take_while(|ch| *ch == marker).count();
+    (width >= 3).then_some((marker, width, &text[width..]))
+}
+
+fn fence_opener(text: &str) -> Option<(char, usize, &str)> {
+    fence_run(text).filter(|(marker, _, info)| *marker != '`' || !info.contains('`'))
+}
+
+// A fence can begin immediately after a list marker, as in `1. ```chart`.
+// Its continuation lines are indented by the list item's content width.
+fn list_fence_content(line: &str) -> Option<(usize, &str)> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let content = &line[indent..];
+    let marker_width = match content.as_bytes().first()? {
+        b'-' | b'+' | b'*' => 1,
+        byte if byte.is_ascii_digit() => {
+            let digits = content
+                .bytes()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            if !(1..=9).contains(&digits)
+                || !matches!(content.as_bytes().get(digits), Some(b'.' | b')'))
+            {
+                return None;
+            }
+            digits + 1
+        }
+        _ => return None,
+    };
+    let after_marker = &content[marker_width..];
+    let spaces = after_marker
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    if !(1..=4).contains(&spaces) {
+        return None;
+    }
+    let content_indent = indent + marker_width + spaces;
+    Some((content_indent, &line[content_indent..]))
+}
+
+fn unclosed_fence_issue(fence: &CitationFence) -> Value {
+    json!({"kind":"unclosed_code_fence","line":fence.start_line,
+        "guidance":"Close the fenced code block before the next section or list item. To name a code-block language in prose, use inline code around the language name."})
+}
+
+fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
     let pattern = regex::Regex::new(
         r"([\p{L}\p{N}_./@-]+\.[A-Za-z][A-Za-z0-9]*)(:|#L)([0-9]+)(?:[-–]L?([0-9]+))?",
     )?;
     let continuation = regex::Regex::new(r"^\s*,\s*([0-9]+)(?:[-–]L?([0-9]+))?")?;
     let mut spans = vec![];
-    let mut fence: Option<(char, usize, bool)> = None;
+    let mut issues = vec![];
+    let mut fence: Option<CitationFence> = None;
     let mut in_comment = false;
     for (document_line, line) in doc.lines().enumerate() {
         let trimmed = line.trim_start_matches(' ');
         let indent = line.len() - trimmed.len();
-        let marker = trimmed.chars().next().unwrap_or(' ');
-        let width = trimmed.chars().take_while(|c| *c == marker).count();
-        if indent <= 3 {
-            if let Some((open, size, _)) = fence {
-                if marker == open && width >= size && trimmed[width..].trim().is_empty() {
-                    fence = None;
-                    continue;
-                }
-            } else if !in_comment && (marker == '`' || marker == '~') && width >= 3 {
-                fence = Some((
-                    marker,
-                    width,
-                    trimmed[width..].trim().eq_ignore_ascii_case("mermaid"),
-                ));
+        if let Some(open) = &fence {
+            let base_indent = open.list_content_indent.unwrap_or(0);
+            // An outdented sibling item or heading ends a list item even if
+            // its code fence has no explicit closer.
+            if open.list_content_indent.is_some() && !line.trim().is_empty() && indent < base_indent
+            {
+                issues.push(unclosed_fence_issue(open));
+                fence = None;
+            } else if indent >= base_indent
+                && indent <= base_indent + 3
+                && fence_run(trimmed).is_some_and(|(marker, width, tail)| {
+                    marker == open.marker && width >= open.width && tail.trim().is_empty()
+                })
+            {
+                fence = None;
                 continue;
             }
         }
-        if fence.is_some_and(|(_, _, mermaid)| !mermaid) {
+        if fence.as_ref().is_some_and(|open| !open.mermaid) {
             continue;
         }
-        if fence.is_none() && indent >= 4 {
-            if in_comment {
-                let _ = visible_without_html_comments(line, &mut in_comment);
+        if fence.is_none() {
+            let opening = (indent <= 3)
+                .then(|| fence_opener(trimmed).map(|run| (run, None)))
+                .flatten()
+                .or_else(|| {
+                    list_fence_content(line).and_then(|(content_indent, content)| {
+                        fence_opener(content).map(|run| (run, Some(content_indent)))
+                    })
+                });
+            if !in_comment && let Some(((marker, width, info), list_content_indent)) = opening {
+                fence = Some(CitationFence {
+                    marker,
+                    width,
+                    mermaid: info.trim().eq_ignore_ascii_case("mermaid"),
+                    start_line: document_line + 1,
+                    list_content_indent,
+                });
+                continue;
             }
-            continue;
+            if indent >= 4 {
+                if in_comment {
+                    let _ = visible_without_html_comments(line, &mut in_comment);
+                }
+                continue;
+            }
         }
         let visible = if fence.is_some() {
             line.to_owned()
@@ -817,12 +901,18 @@ pub(super) fn citation_spans(doc: &str) -> Result<Vec<Citation>> {
             }
         }
     }
-    Ok(spans)
+    if let Some(open) = fence {
+        issues.push(unclosed_fence_issue(&open));
+    }
+    Ok((spans, issues))
+}
+
+pub(super) fn citation_spans(doc: &str) -> Result<Vec<Citation>> {
+    Ok(scan_citations(doc)?.0)
 }
 
 fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<Value>)> {
-    let spans = citation_spans(doc)?;
-    let mut issues = vec![];
+    let (spans, mut issues) = scan_citations(doc)?;
     let mut versions = std::collections::BTreeMap::new();
     for Citation {
         raw,
@@ -861,6 +951,6 @@ fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<
 pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Value> {
     let (checked, issues) = citation_issues(s, output, doc)?;
     Ok(
-        json!({"citations_checked":checked,"issue_count":issues.len(),"issues":issues.iter().take(8).collect::<Vec<_>>(),"semantic_verified":false,"guidance":"Fix citation issues in the next section edit. Partial drafts may still lack investigation coverage."}),
+        json!({"citations_checked":checked,"issue_count":issues.len(),"issues":issues.iter().take(8).collect::<Vec<_>>(),"semantic_verified":false,"guidance":"Fix citation or code-fence issues in the next section edit. Partial drafts may still lack investigation coverage."}),
     )
 }
