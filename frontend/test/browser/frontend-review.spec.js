@@ -163,6 +163,29 @@ test("session settings follow their own server snapshot when the scope changes",
   await expect(page.getByLabel("모델 이름", { exact: true })).toHaveValue(state.config.model);
 });
 
+test("API key storage guidance follows the selected settings scope", async ({ page, request }) => {
+  await workspace({ page, request });
+  await page.getByRole("button", { name: "모든 설정" }).click();
+  await page.getByLabel("이 기기에 키 저장").check();
+  const guidance = page.locator(".credential-card small");
+  await expect(guidance).toContainText("별도 설정 파일에 저장");
+
+  await page.getByLabel("설정 적용 범위").selectOption("session");
+  await expect(page.getByLabel("이 기기에 키 저장")).toHaveCount(0);
+  await expect(guidance).toContainText("기기에 저장되지 않으며");
+  await page.getByLabel("API 키", { exact: true }).fill("temporary-review-key");
+  let submitted;
+  await page.route("**/api/sessions/*/settings", (route) => {
+    submitted = route.request().postDataJSON();
+    return route.fulfill({ json: { pending: false } });
+  });
+  await page.getByRole("button", { name: "설정 저장", exact: true }).click();
+  await expect.poll(() => submitted?.credential_mode).toBe("session");
+
+  await page.getByLabel("설정 적용 범위").selectOption("global");
+  await expect(page.getByLabel("이 기기에 키 저장")).not.toBeChecked();
+});
+
 test("an open folder picker follows a refreshed project root", async ({ page, request }) => {
   const { session } = await workspace({ page, request });
   await page.route("**/api/directories*", (route) => route.fulfill({ json: {
@@ -394,6 +417,39 @@ test("a failed session creation retains the project draft", async ({ page, reque
   await page.getByRole("button", { name: "이 프로젝트로 새 세션" }).click();
   await expect(page.getByLabel("프로젝트 이름", { exact: true })).toHaveValue("보존해야 할 프로젝트");
   await expect(page.getByRole("alert").first()).toContainText("프로젝트 폴더를 확인하세요.");
+});
+
+test("a new session uses the unsaved project draft only after an accurate confirmation", async ({ page, request }) => {
+  const { state, session } = await workspace({ page, request });
+  await page.locator(".sidebar-bottom").getByRole("button", { name: "프로젝트 관리" }).click();
+  await page.getByLabel("프로젝트 이름", { exact: true }).fill("초안 프로젝트");
+  await page.getByLabel(/^결과 문서 경로/).fill("docs/draft-output.md");
+
+  let submitted;
+  const created = { ...session, id: "project-draft-session" };
+  await page.route("**/api/sessions/project-draft-session", (route) => route.fulfill({ json: created }));
+  await page.route("**/api/sessions", (route) => {
+    submitted = route.request().postDataJSON().project;
+    created.project = submitted;
+    state.sessions.push({ ...state.sessions[0], id: created.id, project: submitted });
+    return route.fulfill({ json: { id: created.id } });
+  });
+
+  let confirmation;
+  page.once("dialog", async (dialog) => {
+    confirmation = dialog.message();
+    await dialog.dismiss();
+  });
+  await page.getByRole("button", { name: "이 프로젝트로 새 세션" }).click();
+  expect(confirmation).toContain("새 세션에만 적용");
+  expect(confirmation).toContain("프로젝트 목록 변경 사항은 저장되지 않습니다");
+  expect(submitted).toBeUndefined();
+
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "이 프로젝트로 새 세션" }).click();
+  await expect.poll(() => submitted?.output).toBe("docs/draft-output.md");
+  await expect(page.locator(".session-heading h2")).toHaveText("초안 프로젝트");
+  expect(state.config.projects[0].name).not.toBe("초안 프로젝트");
 });
 
 test("a malformed successful API response does not discard a message", async ({ page, request }) => {

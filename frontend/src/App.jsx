@@ -202,12 +202,15 @@ export default function App() {
     window.addEventListener("beforeunload", warnBeforeUnload);
     return () => window.removeEventListener("beforeunload", warnBeforeUnload);
   }, [drafts]);
-  function canLeavePage() {
+  function canLeavePage({ projectDraftForNewSession = false } = {}) {
     const dirty =
       (page === "settings" && settingsDirty.current) ||
       (page === "projects" && projectsDirty.current) ||
       (page === "chat" && inspectorDirty.current);
-    return !dirty || window.confirm("저장하지 않은 변경 사항을 버리고 이동할까요?");
+    if (!dirty) return true;
+    return window.confirm(projectDraftForNewSession && page === "projects"
+      ? "현재 입력한 프로젝트 정보를 새 세션에만 적용하고 이동할까요? 저장하지 않은 프로젝트 목록 변경 사항은 저장되지 않습니다."
+      : "저장하지 않은 변경 사항을 버리고 이동할까요?");
   }
   function showPage(next) {
     if (next !== page && !canLeavePage()) return;
@@ -273,8 +276,8 @@ export default function App() {
       });
     }
   }
-  async function create(project) {
-    if (creating.current || !canLeavePage()) return;
+  async function create(project, { projectDraft = false } = {}) {
+    if (creating.current || !canLeavePage({ projectDraftForNewSession: projectDraft })) return;
     creating.current = true;
     const navigation = navigationEpoch.current;
     setNavigating(true);
@@ -517,7 +520,7 @@ export default function App() {
             config={state.config}
             onSaved={() => refresh(true)}
             onDirtyChange={onProjectsDirtyChange}
-            onCreate={(project) => act(() => create(project))}
+            onCreate={(project) => act(() => create(project, { projectDraft: true }))}
             creating={navigating}
           />
         ) : session ? (

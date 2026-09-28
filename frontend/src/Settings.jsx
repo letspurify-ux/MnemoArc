@@ -363,6 +363,7 @@ export default function Settings({
     setScope(value);
     setDirty(false);
     setKey("");
+    setRemember(false);
     setClear(false);
     setMessage("");
     setError("");
@@ -485,9 +486,11 @@ export default function Settings({
               <small>
                 {clear
                   ? "저장하면 앱에 등록한 키를 지웁니다. 환경변수의 키는 계속 사용할 수 있습니다."
-                  : remember
-                    ? "키는 접근을 제한한 별도 설정 파일에 저장되며 화면에 다시 표시하지 않습니다."
-                    : "직접 입력한 키는 앱 종료 시 폐기합니다. 환경변수 이름은 아래에서 설정할 수 있습니다."}
+                  : scope === "session"
+                    ? "현재 세션에 직접 입력한 키는 기기에 저장되지 않으며 세션을 닫거나 앱을 종료하면 폐기됩니다."
+                    : remember
+                      ? "키는 접근을 제한한 별도 설정 파일에 저장되며 화면에 다시 표시하지 않습니다."
+                      : "직접 입력한 키는 앱 종료 시 폐기합니다. 환경변수 이름은 아래에서 설정할 수 있습니다."}
               </small>
             </div>
           )}
