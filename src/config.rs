@@ -47,6 +47,8 @@ pub struct Config {
     pub high_water: f64,
     pub low_water: f64,
     pub read_parallelism: usize,
+    /// App-wide admission limit; existing runs continue when it is lowered.
+    pub max_concurrent_sessions: usize,
     pub request_timeout_secs: u64,
     pub tool_timeout_secs: u64,
     pub retries: usize,
@@ -116,6 +118,7 @@ impl Default for Config {
             high_water: 0.8,
             low_water: 0.6,
             read_parallelism: 4,
+            max_concurrent_sessions: 4,
             request_timeout_secs: 180,
             tool_timeout_secs: 30,
             retries: 2,
@@ -157,6 +160,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if !(1..=32).contains(&self.max_concurrent_sessions) {
+            bail!("max_concurrent_sessions must be between 1 and 32");
+        }
         if !(0.0 < self.low_water && self.low_water < self.high_water && self.high_water < 1.0) {
             bail!("Require 0 < low_water < high_water < 1");
         }

@@ -14,7 +14,7 @@ const provider = createServer(async (req, res) => {
   const data = JSON.parse(body);
   if (data.stream === false) {
     res.setHeader("Content-Type", "application/json");
-    res.end(JSON.stringify({ choices: [{ message: { content: "OK" } }] }));
+    res.end(JSON.stringify({ choices: [{ message: { content: "OK" }, finish_reason: "stop" }] }));
     return;
   }
   res.writeHead(200, {
@@ -80,6 +80,12 @@ const provider = createServer(async (req, res) => {
     return;
   }
   const isRequest = (text) => retainedState?.latest_request === text || data.messages.some((m) => m.role === "user" && m.content === text);
+  if (retainedState?.latest_request.startsWith("동시 실행 테스트 ")) {
+    event({ choices: [{ delta: { content: `${retainedState.latest_request} 응답 중` }, finish_reason: null }] });
+    const keep = setInterval(() => res.write(": keepalive\n\n"), 1000);
+    res.on("close", () => clearInterval(keep));
+    return;
+  }
   const acceptanceTest = isRequest("완료 조건 검증 테스트");
   if (acceptanceTest) {
     const message = data.messages.at(-1).content;

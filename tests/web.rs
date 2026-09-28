@@ -87,7 +87,7 @@ async fn resume_and_cleanup_reject_missing_task_or_discarded_message() {
     }
     let after = get(&client, &url, "/api/state").await;
     assert_eq!(after["revision"], initial["revision"]);
-    assert!(after["running"].is_null());
+    assert!(after["running"].as_array().unwrap().is_empty());
     assert_eq!(
         get(&client, &url, &format!("/api/sessions/{id}")).await["bundles"],
         json!([])
@@ -315,7 +315,7 @@ async fn session_connection_check_uses_the_sessions_credential() {
     mock_server.abort();
 }
 #[tokio::test]
-async fn session_switch_reconnect_busy_cancel_and_close_preserve_owner() {
+async fn session_switch_reconnect_cancel_and_close_preserve_owner() {
     let dir = tempfile::tempdir().unwrap();
     let (url, state, server) = launch(dir.path()).await;
     let c = reqwest::Client::new();
@@ -340,14 +340,14 @@ async fn session_switch_reconnect_busy_cancel_and_close_preserve_owner() {
         .await
         .unwrap();
     let other = created["id"].as_str().unwrap();
-    let rejected = c
+    let parallel = c
         .post(format!("{url}/api/sessions/{other}/run"))
         .header("x-mnemoarc-client", "web")
         .json(&json!({"text":"second"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(rejected.status(), 409);
+    assert_eq!(parallel.status(), 200);
     for _ in 0..100 {
         let s = get(&c, &url, &format!("/api/sessions/{id}")).await;
         if s["stream"] == "진행 중인 응답" {
@@ -362,8 +362,8 @@ async fn session_switch_reconnect_busy_cancel_and_close_preserve_owner() {
         "retain my constraint"
     );
     assert_eq!(
-        get(&c, &url, &format!("/api/sessions/{other}")).await["bundles"],
-        json!([])
+        get(&c, &url, &format!("/api/sessions/{other}")).await["bundles"][0]["messages"][0]["content"],
+        json!("second")
     );
     let sse = c.get(format!("{url}/api/events")).send().await.unwrap();
     assert_eq!(sse.headers()["content-type"], "text/event-stream");

@@ -30,11 +30,13 @@ test("each session retains its own unsent chat draft", async ({ page, request })
 
 for (const edited of [false, true]) {
   test(`a late successful send after remount ${edited ? "preserves later edits" : "clears the submitted draft"}`, async ({ page, request }) => {
-    await workspace({ page, request });
+    const { session } = await workspace({ page, request });
     const pending = gate();
     await page.route("**/api/sessions/*/run", async (route) => {
       pending.seen();
       await pending.held;
+      session.has_task = true;
+      session.revision++;
       await route.fulfill({ json: { started: true } });
     });
     const input = page.getByRole("textbox", { name: "메시지", exact: true });
@@ -138,13 +140,14 @@ test("a recovered refresh clears its transient error but preserves action failur
   await expect(page.getByRole("alert")).toContainText("작업 방식 저장 실패");
 });
 
-test("a pending run keeps all run controls locked after navigation", async ({ page, request }) => {
+test("a pending run locks its own session and leaves other sessions available", async ({ page, request }) => {
   const { state, session } = await workspace({ page, request }, { has_task: true });
   await addSession(page, state, session);
-  const pending = gate();
+  const pending = gate(), otherPending = gate();
   await page.route("**/api/sessions/*/run", async (route) => {
-    pending.seen();
-    await pending.held;
+    const requestGate = route.request().url().includes(session.id) ? pending : otherPending;
+    requestGate.seen();
+    await requestGate.held;
     await route.fulfill({ json: { started: true } });
   });
   const input = page.getByRole("textbox", { name: "메시지", exact: true });
@@ -160,11 +163,20 @@ test("a pending run keeps all run controls locked after navigation", async ({ pa
     await expect(page.getByRole("button", { name: "기억 정리", exact: true })).toBeDisabled();
     await page.locator(".session-button").filter({ hasText: "다른 세션" }).click();
     await input.fill("다른 세션의 초안");
+    await expect(page.getByRole("button", { name: "메시지 보내기" })).toBeEnabled();
+    await page.getByRole("button", { name: "메시지 보내기" }).click();
+    await otherPending.requested;
+    pending.release();
     await expect(page.getByRole("button", { name: "메시지 보내기" })).toBeDisabled();
+    await page.locator(".session-button").filter({ hasText: "리뷰 세션" }).click();
+    await expect(page.getByRole("button", { name: "메시지 보내기" })).toBeEnabled();
+    await page.locator(".session-button").filter({ hasText: "다른 세션" }).click();
+    await expect(page.getByRole("button", { name: "재개", exact: true })).toBeDisabled();
   } finally {
     pending.release();
+    otherPending.release();
   }
-  await expect(page.getByRole("button", { name: "메시지 보내기" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "재개", exact: true })).toBeEnabled();
 });
 
 test("resume and cleanup cannot start overlapping requests before acknowledgement", async ({ page, request }) => {
@@ -186,6 +198,61 @@ test("resume and cleanup cannot start overlapping requests before acknowledgemen
   } finally {
     pending.release();
   }
+});
+
+test("capacity counts each pending session once and releases only the completed owner", async ({ page, request }) => {
+  const { state, session } = await workspace({ page, request }, { has_task: true });
+  state.config.max_concurrent_sessions = 2;
+  const other = await addSession(page, state, session);
+  const third = { ...structuredClone(session), id: "third-review-session" };
+  state.sessions.push({ ...state.sessions[0], id: third.id, title: "셋째 세션" });
+  await page.route(`**/api/sessions/${third.id}`, (route) => route.fulfill({ json: third }));
+  const firstPending = gate(), secondPending = gate();
+  await page.route("**/api/sessions/*/run", async (route) => {
+    const first = route.request().url().includes(session.id);
+    const pending = first ? firstPending : secondPending;
+    if (first) {
+      // The server has accepted this run, but its HTTP response is delayed.
+      state.running = [{ id: session.id, closing: false }];
+      session.status = "running";
+      session.revision++;
+    }
+    pending.seen();
+    await pending.held;
+    await route.fulfill({ json: { started: true } });
+  });
+  const input = page.getByRole("textbox", { name: "메시지", exact: true });
+  const send = page.getByRole("button", { name: "메시지 보내기" });
+  await input.fill("첫 실행");
+  await send.click();
+  await firstPending.requested;
+  try {
+    await page.locator(".session-button").filter({ hasText: "다른 세션" }).click();
+    await input.fill("둘째 실행");
+    await expect(send).toBeEnabled();
+    await send.click();
+    await secondPending.requested;
+    await page.locator(".session-button").filter({ hasText: "셋째 세션" }).click();
+    await input.fill("한도 대기 초안");
+    await expect(send).toBeDisabled();
+
+    // The first run finishes before its acknowledgement arrives. Only its
+    // pending reservation can be released; the second remains in flight.
+    state.running = [];
+    session.status = "complete";
+    session.revision++;
+    firstPending.release();
+    await expect(send).toBeEnabled();
+    await expect(input).toHaveValue("한도 대기 초안");
+    await page.locator(".session-button").filter({ hasText: "다른 세션" }).click();
+    await expect(input).toHaveValue("둘째 실행");
+    await expect(send).toBeDisabled();
+    expect(other.status).toBe("idle");
+  } finally {
+    firstPending.release();
+    secondPending.release();
+  }
+  await expect(page.getByRole("button", { name: "재개", exact: true })).toBeEnabled();
 });
 
 test("replacing an acknowledgement refresh does not release the send lock early", async ({ page, request }) => {

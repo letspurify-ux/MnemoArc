@@ -71,7 +71,11 @@ async fn execute(c: &reqwest::Client, url: &str, id: &str, body: Value) -> Value
         .error_for_status()
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !get(c, &format!("{url}/api/state")).await["running"].is_null() {
+        while !get(c, &format!("{url}/api/state")).await["running"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+        {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })

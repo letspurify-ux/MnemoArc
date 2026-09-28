@@ -38,7 +38,6 @@ use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 
 struct Running {
-    id: String,
     cancel: CancellationToken,
     commands: mpsc::Sender<RunCommand>,
     closing: bool,
@@ -49,7 +48,7 @@ struct Core {
     sessions: BTreeMap<String, Session>,
     order: Vec<String>,
     streams: BTreeMap<String, String>,
-    running: Option<Running>,
+    running: BTreeMap<String, Running>,
     revision: u64,
     credentials: BTreeMap<String, Secret>,
 }
@@ -79,7 +78,7 @@ fn missing() -> ApiError {
 fn busy() -> ApiError {
     ApiError(
         StatusCode::CONFLICT,
-        "다른 작업이 실행 중입니다. 작업을 중지한 뒤 다시 시도하세요.".into(),
+        "이 세션의 작업이 실행 중입니다. 완료되거나 중지된 뒤 다시 시도하세요.".into(),
     )
 }
 fn changed(s: &WebState, c: &mut Core) {
@@ -207,7 +206,7 @@ impl WebState {
                 sessions,
                 order,
                 streams: BTreeMap::new(),
-                running: None,
+                running: BTreeMap::new(),
                 revision: 0,
                 credentials,
             })),
@@ -219,18 +218,19 @@ impl WebState {
     }
     pub async fn shutdown(&self) {
         self.stopping.cancel();
-        let cancel = self
+        let cancellations: Vec<_> = self
             .core
             .lock()
             .await
             .running
-            .as_ref()
-            .map(|r| r.cancel.clone());
-        if let Some(cancel) = cancel {
+            .values()
+            .map(|r| r.cancel.clone())
+            .collect();
+        for cancel in cancellations {
             cancel.cancel();
         }
         loop {
-            if self.core.lock().await.running.is_none() {
+            if self.core.lock().await.running.is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -331,7 +331,7 @@ async fn events(
 async fn state_get(State(s): State<WebState>) -> Json<Value> {
     let c = s.core.lock().await;
     Json(
-        json!({"revision":c.revision,"config":c.config,"defaults":Config::default(),"credential":{"configured":OpenAiClient::has_key(&c.config),"saved":c.credentials.contains_key(&c.config.api_key_env)},"running":c.running.as_ref().map(|r|json!({"id":r.id,"closing":r.closing})),"sessions":c.order.iter().filter_map(|id|c.sessions.get(id)).map(|v|json!({"id":v.id,"project":v.project,"status":v.status,"title":v.latest_request.chars().take(60).collect::<String>(),"memory_count":v.memory.entries.len()})).collect::<Vec<_>>(),"tools":ToolRegistry::specs().iter().filter(|t|t.name != "db_query" && t.name != "db_execute").map(|t|json!({"name":t.name,"description":t.description,"optional":t.optional})).collect::<Vec<_>>()}),
+        json!({"revision":c.revision,"config":c.config,"defaults":Config::default(),"credential":{"configured":OpenAiClient::has_key(&c.config),"saved":c.credentials.contains_key(&c.config.api_key_env)},"running":c.order.iter().filter_map(|id| c.running.get(id).map(|r| json!({"id":id,"closing":r.closing}))).collect::<Vec<_>>(),"sessions":c.order.iter().filter_map(|id|c.sessions.get(id)).map(|v|json!({"id":v.id,"project":v.project,"status":v.status,"title":v.latest_request.chars().take(60).collect::<String>(),"memory_count":v.memory.entries.len()})).collect::<Vec<_>>(),"tools":ToolRegistry::specs().iter().filter(|t|t.name != "db_query" && t.name != "db_execute").map(|t|json!({"name":t.name,"description":t.description,"optional":t.optional})).collect::<Vec<_>>()}),
     )
 }
 #[derive(Default, Deserialize)]
@@ -491,10 +491,9 @@ async fn session_settings(
     // Secrets are omitted from API responses. A later `keep` request must
     // inherit the latest queued choice, including a queued key deletion.
     let current = old.pending_config.as_ref().unwrap_or(&old.config);
-    let config = prepare_settings(&input, current, &c.credentials)?;
-    let pending = if let Some(r) = &c.running
-        && r.id == id
-    {
+    let mut config = prepare_settings(&input, current, &c.credentials)?;
+    config.max_concurrent_sessions = c.config.max_concurrent_sessions;
+    let pending = if let Some(r) = c.running.get(&id) {
         r.commands
             .try_send(RunCommand::Configure(Box::new(config.clone())))
             .map_err(|_| busy())?;
@@ -566,7 +565,7 @@ async fn session_project(
 ) -> Api {
     let project = normalize_project(project)?;
     let mut c = s.core.lock().await;
-    if c.running.as_ref().is_some_and(|r| r.id == id) {
+    if c.running.contains_key(&id) {
         return Err(busy());
     }
     let session = c.sessions.get_mut(&id).ok_or_else(missing)?;
@@ -603,7 +602,7 @@ async fn session_workflow(
         ));
     }
     let mut c = s.core.lock().await;
-    if c.running.as_ref().is_some_and(|r| r.id == id) {
+    if c.running.contains_key(&id) {
         return Err(busy());
     }
     let session = c.sessions.get_mut(&id).ok_or_else(missing)?;
@@ -637,9 +636,7 @@ async fn session_tools(
     }
     let session = c.sessions.get(&id).ok_or_else(missing)?;
     ToolRegistry::validate_tool_selection(session, &input.names)?;
-    if let Some(r) = &c.running
-        && r.id == id
-    {
+    if let Some(r) = c.running.get(&id) {
         r.commands
             .try_send(RunCommand::Tools(input.names.clone()))
             .map_err(|_| busy())?;
@@ -687,8 +684,20 @@ async fn run(
                 "앱을 종료하고 있습니다.".into(),
             ));
         }
-        if c.running.is_some() {
+        if !c.sessions.contains_key(&id) {
+            return Err(missing());
+        }
+        if c.running.contains_key(&id) {
             return Err(busy());
+        }
+        if c.running.len() >= c.config.max_concurrent_sessions {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                format!(
+                    "동시에 실행할 수 있는 세션 수({}개)에 도달했습니다. 작업이 끝난 뒤 다시 보내거나 전체 설정에서 한도를 조절하세요.",
+                    c.config.max_concurrent_sessions
+                ),
+            ));
         }
         if s.write_outcome_uncertain.load(Ordering::Acquire) {
             return Err(ApiError(StatusCode::CONFLICT, "도구 쓰기 결과를 확인할 수 없습니다. 파일 또는 데이터베이스 변경을 확인하고 앱을 다시 시작하세요.".into()));
@@ -757,12 +766,14 @@ async fn run(
         let copy = session.clone();
         let cancel = CancellationToken::new();
         let (tx, rx) = mpsc::channel(16);
-        c.running = Some(Running {
-            id: id.clone(),
-            cancel: cancel.clone(),
-            commands: tx,
-            closing: false,
-        });
+        c.running.insert(
+            id.clone(),
+            Running {
+                cancel: cancel.clone(),
+                commands: tx,
+                closing: false,
+            },
+        );
         changed(&s, &mut c);
         (copy, cancel, rx)
     };
@@ -777,8 +788,8 @@ async fn run(
                     AgentEvent::Delta { session, text } => {
                         let closing = c
                             .running
-                            .as_ref()
-                            .is_some_and(|running| running.id == session && running.closing);
+                            .get(&session)
+                            .is_none_or(|running| running.closing);
                         if !closing {
                             c.streams.entry(session).or_default().push_str(&text);
                         }
@@ -787,8 +798,8 @@ async fn run(
                         let mut snapshot = *snapshot;
                         let closing = c
                             .running
-                            .as_ref()
-                            .is_some_and(|running| running.id == snapshot.id && running.closing);
+                            .get(&snapshot.id)
+                            .is_none_or(|running| running.closing);
                         if closing {
                             c.streams.remove(&snapshot.id);
                             continue;
@@ -841,8 +852,8 @@ async fn run(
                     AgentEvent::Notice { session, text } => {
                         let closing = c
                             .running
-                            .as_ref()
-                            .is_some_and(|running| running.id == session && running.closing);
+                            .get(&session)
+                            .is_none_or(|running| running.closing);
                         if !closing && let Some(v) = c.sessions.get_mut(&session) {
                             v.last_error = Some(text);
                         }
@@ -856,7 +867,7 @@ async fn run(
         let _ = pump.await;
         let mut c = state.core.lock().await;
         c.streams.remove(&id);
-        if c.running.as_ref().is_some_and(|r| r.closing) {
+        if c.running.get(&id).is_some_and(|r| r.closing) {
             c.sessions.remove(&id);
             c.order.retain(|old| old != &id);
         } else {
@@ -924,7 +935,7 @@ async fn run(
                 }
             }
         }
-        c.running = None;
+        c.running.remove(&id);
         changed(&state, &mut c);
     });
     Ok(Json(json!({"started":true})))
@@ -934,9 +945,7 @@ async fn cancel(State(s): State<WebState>, Path(id): Path<String>) -> Api {
     if !c.sessions.contains_key(&id) {
         return Err(missing());
     }
-    if let Some(r) = &c.running
-        && r.id == id
-    {
+    if let Some(r) = c.running.get(&id) {
         r.cancel.cancel();
     }
     Ok(Json(json!({"cancelled":true})))
@@ -946,9 +955,7 @@ async fn close_session(State(s): State<WebState>, Path(id): Path<String>) -> Api
     if !c.sessions.contains_key(&id) {
         return Err(missing());
     }
-    if let Some(r) = &mut c.running
-        && r.id == id
-    {
+    if let Some(r) = c.running.get_mut(&id) {
         r.closing = true;
         r.cancel.cancel();
         c.streams.remove(&id);
@@ -1226,12 +1233,14 @@ mod worker_wait_tests {
             .unwrap();
             let id = state.core.lock().await.order[0].clone();
             let (commands, mut receiver) = mpsc::channel(16);
-            state.core.lock().await.running = Some(Running {
-                id: id.clone(),
-                cancel: CancellationToken::new(),
-                commands,
-                closing: false,
-            });
+            state.core.lock().await.running.insert(
+                id.clone(),
+                Running {
+                    cancel: CancellationToken::new(),
+                    commands,
+                    closing: false,
+                },
+            );
             let first = session_settings(
                 State(state.clone()),
                 Path(id.clone()),

@@ -147,8 +147,9 @@ export const groups = [
   {
     id: "execution",
     label: "실행과 예산",
-    description: "작업 시간, 동시 읽기와 전체 사용량을 제한합니다.",
+    description: "동시 실행 수, 작업 시간과 사용량을 정합니다.",
     fields: [
+      ["max_concurrent_sessions", "동시 실행 세션 수", "number", "앱 전체에 적용합니다 (1~32, 기본 4). 전체 기본 설정에서 변경할 수 있으며, 한도를 줄여도 실행 중인 작업은 계속됩니다."],
       [
         "read_parallelism",
         "동시 읽기 개수",

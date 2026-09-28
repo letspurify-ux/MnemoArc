@@ -30,7 +30,7 @@ async function workspace({ page, request }, patch = {}) {
     config: { ...original.config, model: "review-fixture", model_context: 128000 },
   };
   state.config = structuredClone(session.config);
-  state.running = null;
+  state.running = [];
   state.sessions = [{ ...state.sessions[0], status: "idle", title: "리뷰 세션" }];
   await page.route("**/api/state", (route) => route.fulfill({ json: state }));
   await page.route(`**/api/sessions/${session.id}`, (route) => route.fulfill({ json: session }));
@@ -274,7 +274,7 @@ test("run acknowledgement waits for refreshed state before another send is enabl
   try {
     await expect(submit).toBeDisabled();
   } finally {
-    state.running = { id: session.id, closing: false };
+    state.running = [{ id: session.id, closing: false }];
     session.status = "running";
     refresh.release();
   }

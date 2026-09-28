@@ -7,6 +7,8 @@ mod file_edit;
 pub mod recovery;
 mod search;
 mod structure;
+mod writes;
+pub(crate) use writes::{external_write, uncertain_write_error};
 pub mod task_plan;
 use crate::{
     config::Project,
@@ -3241,6 +3243,28 @@ pub fn execute(s: &mut Session, name: &str, args: Value) -> Result<Value> {
     execute_cancellable(s, name, args, &tokio_util::sync::CancellationToken::new())
 }
 pub fn execute_cancellable(
+    s: &mut Session,
+    name: &str,
+    args: Value,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Value> {
+    let _write = writes::acquire(name, cancel, &s.write_outcome_uncertain)?;
+    let result = execute_arguments(s, name, args, cancel);
+    // Publish an uncertain commit before releasing the gate; another session
+    // must not start writing in the gap before the agent receives this result.
+    if external_write(name)
+        && result
+            .as_ref()
+            .err()
+            .is_some_and(|error| uncertain_write_error(&error.to_string()))
+    {
+        s.write_outcome_uncertain
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    result
+}
+
+fn execute_arguments(
     s: &mut Session,
     name: &str,
     mut args: Value,

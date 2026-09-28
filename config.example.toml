@@ -28,6 +28,8 @@ checkpoint_tokens = 4000
 high_water = 0.8
 low_water = 0.6
 read_parallelism = 4
+# App-wide limit (1..32). Lowering it does not cancel existing runs.
+max_concurrent_sessions = 4
 # Seconds to wait for response headers and for each silent gap in the stream;
 # a long answer that keeps streaming is not cut off. Timeouts are retried.
 request_timeout_secs = 180

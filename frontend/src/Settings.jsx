@@ -524,13 +524,15 @@ export default function Settings({
                           ? "url"
                           : "text"
                     }
-                    min="0"
+                    min={name === "max_concurrent_sessions" ? "1" : "0"}
+                    max={name === "max_concurrent_sessions" ? "32" : undefined}
+                    disabled={name === "max_concurrent_sessions" && scope === "session"}
                     step={
                       type === "percent" || type === "mib" || type === "kib"
                         ? "any"
                         : "1"
                     }
-                    value={inputValue(draft[name], type)}
+                    value={inputValue(name === "max_concurrent_sessions" && scope === "session" ? config[name] : draft[name], type)}
                     placeholder={
                       type.startsWith("optional") ? "사용 안 함" : ""
                     }

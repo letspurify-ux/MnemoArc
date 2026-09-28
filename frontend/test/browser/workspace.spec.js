@@ -29,6 +29,7 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
   await page.getByRole("button", { name: "기억과 보관" }).click();
   await page.getByLabel("전체 기억 보관량", { exact: true }).fill("20");
   await page.getByRole("button", { name: "실행과 예산" }).click();
+  await page.getByLabel("동시 실행 세션 수", { exact: true }).fill("3");
   await page.getByLabel("동시 읽기 개수", { exact: true }).fill("2");
   await page.getByLabel("작성·검증 예산 비율", { exact: true }).fill("60");
   await page.getByLabel("검증 예산 비율", { exact: true }).fill("30");
@@ -43,6 +44,7 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
   const state = await (await request.get("/api/state")).json();
   expect(state.config.memory_bytes).toBe(20 * 1024 * 1024);
   expect(state.config.read_parallelism).toBe(2);
+  expect(state.config.max_concurrent_sessions).toBe(3);
   expect(state.config.writing_reserve_ratio).toBe(0.6);
   expect(state.config.verification_reserve_ratio).toBe(0.3);
   expect(state.config.repeated_read_limit).toBe(3);
@@ -74,9 +76,10 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
   await expect(page.locator(".thinking")).toContainText("답변 생성 중");
   await page.getByRole("button", { name: /프로젝트를 조사해줘/ }).click();
   await expect(
-    page.getByRole("button", { name: "● 다른 세션 작업 중" }),
+    page.locator("summary.running-link"),
   ).toBeVisible();
-  await page.getByRole("button", { name: "● 다른 세션 작업 중" }).click();
+  await page.locator("summary.running-link").click();
+  await page.locator(".running-list button").filter({ hasText: "느린 요청 테스트" }).click();
   await page.getByRole("button", { name: "■ 중지" }).click();
   await expect(page.locator(".status-pill")).toHaveText("중지됨");
   await expect(page.locator(".thinking")).toHaveCount(0);
@@ -133,7 +136,7 @@ test("ordered to-do list follows prerequisites and preserves running work on rel
   await page.getByRole("tab", { name: "진행", exact: true }).click();
   await expect(plan.locator("[aria-current=step]")).toContainText("본문 초안 작성");
   await expect(
-    page.getByRole("button", { name: "● 다른 세션 작업 중" }),
+    page.locator("summary.running-link"),
   ).toHaveCount(0);
   await page.screenshot({
     path: "test-artifacts/task-plan.png",

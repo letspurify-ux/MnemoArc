@@ -395,6 +395,40 @@ button:hover {
 .running-link {
   font-size: 11px;
   color: #3f7e64;
+  cursor: pointer;
+}
+.running-menu {
+  position: relative;
+}
+.running-list {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 30;
+  width: min(320px, 80vw);
+  max-height: 300px;
+  overflow: auto;
+  background: #fff;
+  border: 1px solid #dbe5dd;
+  border-radius: 8px;
+  box-shadow: 0 6px 20px #173b2020;
+  padding: 6px;
+}
+.running-list button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  overflow-wrap: anywhere;
+  padding: 10px;
+  border-radius: 5px;
+}
+.running-list button:hover {
+  background: #eef5ef;
+}
+.capacity-note {
+  font-size: 12px;
+  color: #526759;
+  margin: 0 0 8px;
 }
 .workarea {
   display: grid;

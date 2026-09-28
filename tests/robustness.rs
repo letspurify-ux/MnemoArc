@@ -370,7 +370,7 @@ async fn model_panic_releases_web_run_slot_and_shutdown_finishes() {
                     .json()
                     .await
                     .unwrap();
-                if status["running"].is_null() {
+                if status["running"].as_array().unwrap().is_empty() {
                     assert_eq!(status["sessions"][0]["status"], "blocked");
                     break;
                 }

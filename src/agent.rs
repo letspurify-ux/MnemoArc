@@ -701,15 +701,7 @@ async fn execute_one(
     );
     let backup = s.clone();
     let child = cancel.child_token();
-    let external_write = matches!(
-        call.name.as_str(),
-        "document_edit"
-            | "document_edit_batch"
-            | "file_edit"
-            | "file_write"
-            | "file_patch"
-            | "db_execute"
-    );
+    let external_write = tools::external_write(&call.name);
     let receiver = match spawn_tool_worker(s, call, child.clone()) {
         Ok(receiver) => receiver,
         Err(error) => return (backup, tools::envelope(Err(error.into()))),
@@ -765,7 +757,23 @@ async fn await_tool_worker(
     // to report the actual result before declaring its outcome unknown.
     if external_write {
         if let Ok(outcome) = tokio::time::timeout(settle_wait, &mut receiver).await {
-            return received_tool_outcome(backup, outcome, true);
+            let (session, mut result) = received_tool_outcome(backup, outcome, true);
+            // A queued writer sees a cancelled child token for both user
+            // cancellation and deadlines. Preserve the agent's stop reason
+            // when the worker confirms it stopped (or rolled back). Otherwise
+            // a timeout is reported as user cancellation with recovery=stop,
+            // and bypasses timeout/failure handling. Keep actual commits and
+            // uncertain outcomes exactly as reported by the worker.
+            if stopped != "cancelled" && result["status"] == "cancelled" {
+                let message = format!(
+                    "{stopped}: {}",
+                    result["error"].as_str().unwrap_or("cancelled")
+                );
+                result["status"] = json!("error");
+                result["error"] = json!(message);
+                result["recovery"] = tools::recovery::describe(&message);
+            }
+            return (session, result);
         }
         backup
             .write_outcome_uncertain
@@ -790,7 +798,11 @@ fn received_tool_outcome(
             // A worker can return normally while reporting an uncertain commit,
             // failed rollback or a caught panic. Returning an error does not
             // establish that its external writes were undone.
-            if external_write && result["error"].as_str().is_some_and(uncertain_write_error) {
+            if external_write
+                && result["error"]
+                    .as_str()
+                    .is_some_and(tools::uncertain_write_error)
+            {
                 session
                     .write_outcome_uncertain
                     .store(true, Ordering::Release);
@@ -811,19 +823,6 @@ fn received_tool_outcome(
             )
         }
     }
-}
-
-fn uncertain_write_error(error: &str) -> bool {
-    matches!(
-        error.split(':').next(),
-        Some(
-            "tool_worker_panic"
-                | "tool_worker_unresolved"
-                | "database_commit_uncertain"
-                | "database_rollback_uncertain"
-                | "file_patch_rollback_failed"
-        )
-    )
 }
 
 fn rebase_document_call(call: &ToolCall, hash: Option<&str>) -> (ToolCall, bool) {
@@ -2629,10 +2628,9 @@ pub async fn run_session_controlled(
                         failure = Some(reason);
                     }
                 }
-                if result["error"]
-                    .as_str()
-                    .is_some_and(|e| uncertain_write_error(e) || e.starts_with("run_timeout"))
-                {
+                if result["error"].as_str().is_some_and(|e| {
+                    tools::uncertain_write_error(e) || e.starts_with("run_timeout")
+                }) {
                     failure = result["error"].as_str().map(str::to_owned);
                 }
                 if rebased_document_call && result["status"] == "ok" {
@@ -2965,7 +2963,7 @@ pub async fn run_session_controlled(
     }
     if s.write_outcome_uncertain.load(Ordering::Acquire) {
         s.status = "blocked".into();
-        s.last_error = Some(failure.filter(|error| uncertain_write_error(error)).unwrap_or_else(|| "tool_worker_unresolved: review external write outcomes and restart before another run".into()));
+        s.last_error = Some(failure.filter(|error| tools::uncertain_write_error(error)).unwrap_or_else(|| "tool_worker_unresolved: review external write outcomes and restart before another run".into()));
     } else if cancel.is_cancelled() {
         s.status = "cancelled".into();
         s.last_error = None;
@@ -3512,5 +3510,64 @@ mod worker_wait_tests {
         .await;
         assert_eq!(result["data"]["committed"], true);
         assert!(!backup.write_outcome_uncertain.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn stopped_writes_that_confirm_cancellation_keep_the_stop_reason() {
+        for reason in ["tool_timeout", "run_timeout", "cancelled"] {
+            for message in [
+                "cancelled",
+                "cancelled: completed file changes were rolled back",
+            ] {
+                let backup = session();
+                let finished = backup.clone();
+                let (sender, receiver) = oneshot::channel();
+                let cancel = CancellationToken::new();
+                if reason == "cancelled" {
+                    cancel.cancel();
+                }
+                let child = cancel.child_token();
+                let worker_cancel = child.clone();
+                tokio::spawn(async move {
+                    // A write waiting at the shared gate observes only its
+                    // cancellation token, not why the agent stopped it.
+                    worker_cancel.cancelled().await;
+                    let _ = sender.send((finished, tools::envelope(Err(anyhow::anyhow!(message)))));
+                });
+                let (_, result) = await_tool_worker(
+                    backup.clone(),
+                    receiver,
+                    &cancel,
+                    child,
+                    ToolDeadline {
+                        at: tokio::time::Instant::now(),
+                        reason,
+                    },
+                    Duration::from_secs(1),
+                    true,
+                )
+                .await;
+                assert_eq!(
+                    result["status"],
+                    if reason == "cancelled" {
+                        "cancelled"
+                    } else {
+                        "error"
+                    },
+                    "{result}"
+                );
+                assert!(
+                    result["error"].as_str().unwrap().starts_with(reason),
+                    "{result}"
+                );
+                assert_eq!(result["recovery"]["code"], reason);
+                assert_eq!(
+                    result["recovery"]["action"] == "stop",
+                    reason == "cancelled"
+                );
+                assert_eq!(cancel.is_cancelled(), reason == "cancelled");
+                assert!(!backup.write_outcome_uncertain.load(Ordering::Acquire));
+            }
+        }
     }
 }

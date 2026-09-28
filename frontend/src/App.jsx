@@ -43,7 +43,7 @@ export default function App() {
     [detail, setDetail] = useState(() => !window.matchMedia("(max-width: 1000px)").matches),
     [mobileNav, setMobileNav] = useState(false),
     [navigating, setNavigating] = useState(false),
-    [runPending, setRunPending] = useState(false),
+    [runPending, setRunPending] = useState(new Set()),
     [workflowPending, setWorkflowPending] = useState(new Set()),
     [stopped, setStopped] = useState(false),
     [stopping, setStopping] = useState(false),
@@ -58,7 +58,7 @@ export default function App() {
     projectsDirty = useRef(false),
     inspectorDirty = useRef(false),
     creating = useRef(false),
-    startingRun = useRef(false),
+    startingRun = useRef(new Set()),
     navigationEpoch = useRef(0),
     selectionEpoch = useRef(0);
   const onSettingsDirtyChange = useCallback((dirty) => {
@@ -251,14 +251,14 @@ export default function App() {
     void act(fn).catch(() => {});
   };
   async function runSession(id, text, action) {
-    if (startingRun.current) throw new Error("실행 요청을 처리하고 있습니다.");
-    startingRun.current = true;
-    setRunPending(true);
+    if (startingRun.current.has(id)) throw new Error("이 세션의 실행 요청을 처리하고 있습니다.");
+    startingRun.current.add(id);
+    setRunPending(new Set(startingRun.current));
     try {
       return await act(() => send(`/sessions/${id}/run`, { text, action }));
     } finally {
-      startingRun.current = false;
-      setRunPending(false);
+      startingRun.current.delete(id);
+      setRunPending(new Set(startingRun.current));
     }
   }
   async function changeWorkflow(id, workflow) {
@@ -315,6 +315,13 @@ export default function App() {
     }
   }
   const current = state?.sessions.find((s) => s.id === selected);
+  const running = state?.running || [];
+  const runningById = new Map(running.map((run) => [run.id, run]));
+  const activeCount = new Set([...runningById.keys(), ...runPending]).size;
+  const capacityFull = activeCount >= (state?.config.max_concurrent_sessions ?? 4);
+  const selectedBusy = runPending.has(selected) || runningById.has(selected) ||
+    (session?.id === selected && session.status === "running");
+  const otherRunning = running.filter((run) => run.id !== selected);
   const canRun = Boolean(
     session?.config.model && session?.config.model_context,
   );
@@ -379,7 +386,7 @@ export default function App() {
                     active={s.id === selected && page === "chat"}
                     onClick={() => choose(s.id)}
                     onClose={safe(() => closeSession(s.id))}
-                    closing={state.running?.id === s.id && state.running.closing}
+                    closing={runningById.get(s.id)?.closing}
                   />
                 ))}
             </div>
@@ -396,7 +403,7 @@ export default function App() {
                 active={s.id === selected}
                 onClick={() => choose(s.id)}
                 onClose={safe(() => closeSession(s.id))}
-                closing={state.running?.id === s.id && state.running.closing}
+                closing={runningById.get(s.id)?.closing}
               />
             ))}
         </div>
@@ -446,13 +453,21 @@ export default function App() {
             </strong>
           </div>
           <div className="topbar-actions">
-            {state?.running && state.running.id !== selected && (
-              <button
-                className="running-link"
-                onClick={() => choose(state.running.id)}
-              >
-                ● 다른 세션 작업 중
-              </button>
+            {otherRunning.length > 0 && (
+              <details className="running-menu" key={selected}>
+                <summary className="running-link">● 다른 세션 {otherRunning.length}개 작업 중</summary>
+                <div className="running-list">
+                  {otherRunning.map((run) => {
+                    const item = state.sessions.find((s) => s.id === run.id);
+                    return (
+                      <button key={run.id} onClick={() => choose(run.id)}>
+                        {item?.title || item?.project.name || "새 대화"}
+                        {run.closing ? " · 종료 중" : " · 작업 중"}
+                      </button>
+                    );
+                  })}
+                </div>
+              </details>
             )}
             {page === "chat" && session && (
               <>
@@ -523,14 +538,14 @@ export default function App() {
                 <div className="session-actions">
                   <button
                     title="보존된 상태로 재개"
-                    disabled={navigating || runPending || workflowPending.has(selected) || Boolean(state.running) || !canRun || !session.has_task}
+                    disabled={navigating || selectedBusy || capacityFull || workflowPending.has(selected) || !canRun || !session.has_task}
                     onClick={() => void runSession(selected, undefined, "resume").catch(() => {})}
                   >
                     재개
                   </button>
                   <button
                     title="기억과 상태 정리"
-                    disabled={navigating || runPending || workflowPending.has(selected) || Boolean(state.running) || !canRun || !session.has_task}
+                    disabled={navigating || selectedBusy || capacityFull || workflowPending.has(selected) || !canRun || !session.has_task}
                     onClick={() => void runSession(selected, undefined, "cleanup").catch(() => {})}
                   >
                     기억 정리
@@ -538,7 +553,7 @@ export default function App() {
                   <button
                     className="danger-text"
                     disabled={
-                      state.running?.id === selected && state.running.closing
+                      runningById.get(selected)?.closing
                     }
                     onClick={safe(() => closeSession(selected))}
                   >
@@ -556,7 +571,8 @@ export default function App() {
                 key={session.id}
                 session={session}
                 drafts={drafts}
-                busy={navigating || runPending || workflowPending.has(session.id) || Boolean(state.running)}
+                busy={navigating || selectedBusy || workflowPending.has(session.id)}
+                capacityFull={capacityFull}
                 navigating={navigating}
                 canRun={canRun}
                 onSend={(text, action) =>
@@ -580,7 +596,7 @@ export default function App() {
                 key={session.id}
                 session={session}
                 tools={state.tools}
-                running={state.running}
+                running={runningById.get(session.id) || null}
                 onAction={act}
                 onProjectDirtyChange={onInspectorDirtyChange}
                 navigating={navigating}

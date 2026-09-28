@@ -47,7 +47,7 @@ MnemoArc는 세션 안에서 기억을 저장·검색·재사용하며, 소스 �
 - `POST /api/sessions/{id}/run`, `POST /api/sessions/{id}/cancel`
 - `PUT /api/sessions/{id}/settings|project|tools`, `GET .../memories/{memory}`, `GET .../output`
 
-동시 실행 규칙: `Core.running`이 이미 있으면 `busy()`(409, "다른 작업이 실행 중입니다")를 반환합니다 (src/web.rs:69-76). 세션 종료 시에는 진행 중인 쓰기의 결과를 회수한 뒤(`closing` 처리) RAM 상태를 폐기합니다. API 키 파일은 임시 파일에 쓰고 `0o600` 권한으로 persist합니다 (src/web.rs:88-107).
+동시 실행 규칙: `Core.running`은 세션 ID별 실행 맵입니다. 다른 세션은 `max_concurrent_sessions` 한도(기본 4) 안에서 함께 실행하고, 같은 세션의 중복 실행이나 한도 초과 요청은 409로 거부합니다. 세션 종료 시에는 해당 실행의 쓰기 결과를 회수한 뒤(`closing` 처리) RAM 상태를 폐기합니다. 자세한 변경은 [동시 세션 실행](concurrent-sessions.md)을 참고하세요. API 키 파일은 임시 파일에 쓰고 `0o600` 권한으로 persist합니다 (src/web.rs:88-107).
 
 ### 에이전트 실행 루프 (src/agent.rs)
 
@@ -133,7 +133,7 @@ sequenceDiagram
 
 ## 오류 처리 요약
 
-- **동시 실행 충돌**: 두 번째 실행 요청은 409 CONFLICT (src/web.rs:69-76).
+- **동시 실행 제한**: 같은 세션의 중복 실행과 앱 전체 동시 실행 한도 초과 요청은 409 CONFLICT입니다. 다른 세션은 한도 내에서 함께 실행합니다.
 - **예산 초과**: 실행 시간/토큰 예산 초과 시 `run_budget_exhausted`, 부분 결과와 기억은 보존 (src/agent.rs:194-200).
 - **컨텍스트 한도**: 입력 추정 + 출력 + 512 마진이 한도를 넘으면 원본 컨텍스트 유지 후 실패 (src/agent.rs:289-309).
 - **길이 초과 응답**: 문서 외 작업은 8회 연속 발생 시 `length_recovery_limit`. 문서 작업은 실제 문맥·실행 토큰·시간 안에서 호출 분할과 응답 축약으로 복구합니다 ([최신 점검](document-completion-loop-audit-2026-09-24.md)).

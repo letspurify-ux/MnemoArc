@@ -7,6 +7,7 @@ export default function Chat({
   session,
   drafts,
   busy,
+  capacityFull,
   navigating,
   canRun,
   onSend,
@@ -92,7 +93,7 @@ export default function Chat({
   }, [session?.id]);
   async function submit(text = input) {
     const message = text.trim();
-    if (!message || busy || !canRun || lock.current || workflowLock.current) return;
+    if (!message || busy || capacityFull || !canRun || lock.current || workflowLock.current) return;
     lock.current = true;
     setSending(true);
     const submitted = drafts.get(session.id);
@@ -271,6 +272,9 @@ export default function Chat({
             if (!composing.current) void submit().catch(() => {});
           }}
         >
+          {capacityFull && !busy && (
+            <p className="capacity-note">동시 실행 한도에 도달했습니다. 작업이 끝나면 보낼 수 있습니다.</p>
+          )}
           <textarea
             ref={inputRef}
             aria-label="메시지"
@@ -348,7 +352,8 @@ export default function Chat({
                 className="send-button"
                 type="submit"
                 aria-label="메시지 보내기"
-                disabled={!input.trim() || busy || sending || workflowSaving || !canRun}
+                disabled={!input.trim() || busy || capacityFull || sending || workflowSaving || !canRun}
+                title={capacityFull ? "동시 실행 한도에 도달했습니다. 작업이 끝나면 보낼 수 있습니다." : "메시지 보내기"}
               >
                 ↑
               </button>
