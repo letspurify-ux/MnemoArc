@@ -66,6 +66,7 @@ enum Pattern {
     InvalidPlan,
     AlternatingWrite,
     RepeatedOutline,
+    RepeatedLargeRead,
 }
 
 struct Stubborn {
@@ -120,6 +121,19 @@ impl LlmClient for Stubborn {
                     name: "code_outline".into(),
                     arguments: json!({"path":"source.rs","view":"compact"}).to_string(),
                 }],
+                ..Default::default()
+            },
+            // Several reads share the batch budget, so each result is narrowed.
+            Pattern::RepeatedLargeRead => Completion {
+                calls: (0..3)
+                    .map(|file| ToolCall {
+                        id: format!("read-{calls}-{file}"),
+                        name: "file_read".into(),
+                        arguments:
+                            json!({"path":format!("big{file}.txt"),"start_line":1,"max_lines":2000})
+                                .to_string(),
+                    })
+                    .collect(),
                 ..Default::default()
             },
             Pattern::AlternatingWrite if *calls == 1 => Completion {
@@ -224,6 +238,52 @@ async fn unchanged_navigation_result_is_bounded() {
             .starts_with("progress_recovery_exhausted")
     );
     assert_eq!(result.progress_recovery.seen_navigation_results.len(), 1);
+    assert!(*client.calls.lock().unwrap() < 30);
+}
+
+#[tokio::test]
+async fn repeated_truncated_read_is_not_new_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let body: String = (0..3000)
+        .map(|i| format!("line {i} with enough text to exceed one result budget\n"))
+        .collect();
+    for file in 0..3 {
+        std::fs::write(dir.path().join(format!("big{file}.txt")), &body).unwrap();
+    }
+    let s = session(dir.path());
+    let client = Arc::new(Stubborn {
+        pattern: Pattern::RepeatedLargeRead,
+        calls: Mutex::new(0),
+        reviews: Mutex::new(0),
+        file: dir.path().join("result.txt"),
+    });
+    let result = run(s, client.clone()).await;
+    assert_eq!(result.status, "partial", "{:?}", result.last_error);
+    assert!(
+        result
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("progress_recovery_exhausted"),
+        "{:?}",
+        result.last_error
+    );
+    // Each distinct view is observed once; repeating it adds no source.
+    let views: std::collections::BTreeSet<_> = result
+        .sources
+        .values()
+        .map(|source| {
+            (
+                source.path.clone(),
+                source.start_line,
+                source.end_line,
+                source.hash.clone(),
+                source.evidence_truncated,
+                source.excerpt.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(views.len(), result.sources.len());
     assert!(*client.calls.lock().unwrap() < 30);
 }
 

@@ -2870,6 +2870,19 @@ fn observe_hashed_quality(
     s.sources.insert(source.id.clone(), source.clone());
     source
 }
+/// Observations of the same content view, regardless of when they were made.
+pub(crate) fn same_source(a: &crate::memory::Source, b: &crate::memory::Source) -> bool {
+    a.origin == b.origin
+        && a.path == b.path
+        && a.start_line == b.start_line
+        && a.end_line == b.end_line
+        && a.line_start_complete == b.line_start_complete
+        && a.line_end_complete == b.line_end_complete
+        && a.evidence_truncated == b.evidence_truncated
+        && a.hash == b.hash
+        && a.excerpt == b.excerpt
+}
+
 pub fn revalidate(s: &mut Session) -> Result<()> {
     let paths: BTreeSet<String> = s
         .memory
@@ -4965,7 +4978,17 @@ pub fn limit_result(
                         .as_bool()
                         .unwrap_or(false);
                     source.evidence_truncated = false;
-                    s.sources.insert(source.id.clone(), source);
+                    // Re-reading the same oversized range yields the same view.
+                    // Reuse its observation so a repeated read is not new evidence.
+                    if let Some(existing) = s
+                        .sources
+                        .values()
+                        .find(|existing| same_source(existing, &source))
+                    {
+                        output["data"]["source"]["id"] = json!(existing.id);
+                    } else {
+                        s.sources.insert(source.id.clone(), source);
+                    }
                 }
                 return output;
             }

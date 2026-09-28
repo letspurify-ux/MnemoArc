@@ -445,9 +445,25 @@ fn artifact_exhaust_limit(config: &Config) -> usize {
     config.stall_round_limit.saturating_mul(8).max(32)
 }
 
-const REPEATED_OUTCOME_ERROR: &str = "progress_recovery_exhausted: repeated responses or tool results produced no new output, source evidence or verified result; current work is retained for a changed approach";
-const NAVIGATION_STALL_ERROR: &str = "progress_recovery_exhausted: navigation and bookkeeping did not produce source evidence, a changed artifact or a verified result; current work is retained for a changed approach";
-const ARTIFACT_CHURN_ERROR: &str = "artifact_progress_exhausted: many distinct edits produced no completed task item, verified section or improved completion check; current files and requirements are retained for a changed approach";
+// Resuming keeps the no-progress counters (see ProgressRecovery), so the
+// message must not suggest that an unchanged "continue" can proceed.
+macro_rules! exhausted_next_step {
+    () => {
+        "; resuming continues the same no-progress count and stops again unless its first step yields a new result, so start a new task that changes the approach or narrows the scope"
+    };
+}
+const REPEATED_OUTCOME_ERROR: &str = concat!(
+    "progress_recovery_exhausted: repeated responses or tool results produced no new output, source evidence or verified result; current work is retained",
+    exhausted_next_step!()
+);
+const NAVIGATION_STALL_ERROR: &str = concat!(
+    "progress_recovery_exhausted: navigation and bookkeeping did not produce source evidence, a changed artifact or a verified result; current work is retained",
+    exhausted_next_step!()
+);
+const ARTIFACT_CHURN_ERROR: &str = concat!(
+    "artifact_progress_exhausted: many distinct edits produced no completed task item, verified section or improved completion check; current files and requirements are retained",
+    exhausted_next_step!()
+);
 
 /// Document recovery is bounded by the run budget, not an independent retry
 /// quota. Keep the cause visible so the next request must change its approach.
@@ -579,18 +595,6 @@ fn run_deadline(started: Instant, config: &Config) -> tokio::time::Instant {
     tokio::time::Instant::from_std(started)
         .checked_add(Duration::from_secs(config.run_timeout_secs))
         .unwrap_or_else(tokio::time::Instant::now)
-}
-
-fn same_source(a: &crate::memory::Source, b: &crate::memory::Source) -> bool {
-    a.origin == b.origin
-        && a.path == b.path
-        && a.start_line == b.start_line
-        && a.end_line == b.end_line
-        && a.line_start_complete == b.line_start_complete
-        && a.line_end_complete == b.line_end_complete
-        && a.evidence_truncated == b.evidence_truncated
-        && a.hash == b.hash
-        && a.excerpt == b.excerpt
 }
 
 fn remap_source_ids(value: &mut Value, ids: &std::collections::BTreeMap<String, String>) {
@@ -955,7 +959,7 @@ async fn read_parallel(
                     let canonical = s
                         .sources
                         .values()
-                        .find(|existing| same_source(existing, &source))
+                        .find(|existing| tools::same_source(existing, &source))
                         .map(|existing| existing.id.clone());
                     let id = if let Some(id) = canonical {
                         id
