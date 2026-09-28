@@ -775,6 +775,125 @@ fn verify_batch_explains_fields_sent_as_items_and_paths_sent_as_ids() {
 }
 
 #[test]
+fn verify_accepts_a_citation_passed_as_a_source_id() {
+    let (dir, mut s) = setup();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/app.js"),
+        "let a = 1;\nlet b = 2;\nlet c = 3;\n",
+    )
+    .unwrap();
+    run(&mut s, "file_read", json!({"path":"src/app.js"}));
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Entry\nTwo values. src/app.js:1-2\n"}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"entry","title":"entry","status":"written","section":"# Entry"}),
+    );
+    // The live shape: the document's own citations sent as source_ids.
+    let error = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"entry","source_ids":["src/missing.js:3"],"verification_note":"Compared."}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("unknown_source: src/missing.js:3 is a citation, not a source ID, and src/missing.js is not a readable project file"),
+        "{error}"
+    );
+    let verified = run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"entry","source_ids":["src/app.js:1-2"],"verification_note":"Compared both lines."}),
+    );
+    assert_eq!(s.investigations[0].status, "verified", "{verified}");
+}
+
+#[test]
+fn a_title_item_attests_only_the_opening_not_sections_other_items_own() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+    let body: String = (1..=200).map(|n| format!("let v{n} = {n};\n")).collect();
+    std::fs::write(dir.path().join("b.rs"), body).unwrap();
+    let first = run(&mut s, "file_read", json!({"path":"a.rs"}));
+    let again = run(&mut s, "file_read", json!({"path":"a.rs"}));
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\nThe entry is a. a.rs:1\n## Values\nTwo hundred values. b.rs:1-200\n"}),
+    );
+    for (id, section) in [("intro", "# Guide"), ("values", "# Guide\n## Values")] {
+        run(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":id,"title":id,"status":"written","section":section}),
+        );
+    }
+    // The live shape: b.rs was never read, but its citation belongs to the
+    // Values item, so the opening verifies from a.rs alone.
+    let verified = run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"intro","source_ids":[first["source"]["id"], again["source"]["id"]],"verification_note":"Compared the entry."}),
+    );
+    assert_eq!(s.investigations[0].status, "verified", "{verified}");
+    assert_eq!(
+        s.investigations[0].sources.len(),
+        1,
+        "rereads are kept once"
+    );
+    // The Values item still owes its whole range, and the error offers
+    // narrowing a pointer-like citation instead of reading 200 lines.
+    let error = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"values","source_ids":[first["source"]["id"]],"verification_note":"Compared."}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("source_coverage_missing:"), "{error}");
+    assert!(
+        error.contains("The widest range spans 200 lines"),
+        "{error}"
+    );
+    // Editing the Values section leaves the opening's verification intact.
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","old_text":"Two hundred values.","text":"Many values.","expected_hash":created["hash"]}),
+    );
+    run(&mut s, "investigation", json!({"action":"list"}));
+    assert_eq!(s.investigations[0].status, "verified");
+    let current = run(&mut s, "document_inspect", json!({}));
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","old_text":"The entry is a.","text":"The entry is fn a.","expected_hash":current["hash"]}),
+    );
+    run(&mut s, "investigation", json!({"action":"list"}));
+    assert_eq!(
+        s.investigations[0].status, "written",
+        "the opening itself changed"
+    );
+    // Without an item of its own, a subsection stays in the opening's scope.
+    s.investigations.retain(|item| item.id == "intro");
+    s.investigations[0].status = "written".into();
+    let error = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"intro","source_ids":[first["source"]["id"]],"verification_note":"Compared."}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("b.rs"), "{error}");
+}
+
+#[test]
 fn the_output_file_name_alone_names_the_output() {
     let (dir, mut s) = setup();
     // The live shape: the output lives outside the project root.

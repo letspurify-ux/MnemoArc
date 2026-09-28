@@ -2903,7 +2903,16 @@ pub fn revalidate(s: &mut Session) -> Result<()> {
     let doc = output_path(&s.project)
         .ok()
         .and_then(|p| read_text(&p).ok());
-    for item in &mut s.investigations {
+    let scopes: Vec<Option<String>> = s
+        .investigations
+        .iter()
+        .map(|item| {
+            doc.as_ref()
+                .and_then(|d| item_scope_text(d, &s.investigations, item).ok())
+                .map(|t| hash(t.as_bytes()))
+        })
+        .collect();
+    for (item, scope_hash) in s.investigations.iter_mut().zip(scopes) {
         let changed = item.sources.iter().any(|r| {
             r.path.as_ref().is_some_and(|p| {
                 hashes
@@ -2915,11 +2924,7 @@ pub fn revalidate(s: &mut Session) -> Result<()> {
                 m.revision != *rev || m.status != crate::memory::MemoryStatus::Active
             })
         });
-        let doc_changed = doc
-            .as_ref()
-            .and_then(|d| section_text(d, &item.section).ok())
-            .map(|t| hash(t.as_bytes()))
-            != item.document_hash;
+        let doc_changed = scope_hash != item.document_hash;
         if item.status == "verified" && (changed || doc_changed) {
             item.status = "written".into();
             item.note = "Source, memory or document changed; verification required".into();
@@ -3120,9 +3125,9 @@ pub fn investigation_next_steps(s: &Session) -> Vec<Value> {
                 // section's cited project files, whose delivered evidence
                 // verify uses directly.
                 let cited = || {
-                    let mut paths: Vec<String> = section_text(&doc, &item.section)
+                    let mut paths: Vec<String> = item_scope_text(&doc, &s.investigations, item)
                         .ok()
-                        .and_then(|section| documentation::citation_spans(section).ok())
+                        .and_then(|section| documentation::citation_spans(&section).ok())
                         .unwrap_or_default()
                         .into_iter()
                         .map(|citation| citation.path)
@@ -3212,6 +3217,48 @@ fn section_number(title: &str) -> Option<&str> {
     .then_some(label)
 }
 
+/// The part of the document an investigation item attests: its section minus
+/// descendant sections bound to other items, which verify their own claims.
+/// Without this an item on the title heading (the only handle for an opening)
+/// had to cover and re-verify every citation in the document; a live run
+/// spent 20 rounds reading whole files for it.
+fn item_scope_text(doc: &str, items: &[Investigation], item: &Investigation) -> Result<String> {
+    let own = documentation::resolve_heading(doc, &item.section)?;
+    let mut cuts: Vec<(usize, usize)> = items
+        .iter()
+        .filter(|other| other.id != item.id && !other.section.trim().is_empty())
+        .filter_map(|other| documentation::resolve_heading(doc, &other.section).ok())
+        .filter(|other| other.start > own.start && other.end <= own.end)
+        .map(|other| (other.start, other.end))
+        .collect();
+    cuts.sort_unstable();
+    let mut text = String::new();
+    let mut next = own.start;
+    for (start, end) in cuts {
+        if start > next {
+            text.push_str(&doc[next..start]);
+        }
+        next = next.max(end);
+    }
+    if next < own.end {
+        text.push_str(&doc[next..own.end]);
+    }
+    Ok(text)
+}
+/// `path:10` or `path:10-20` without its line range; anything else unchanged.
+fn strip_line_suffix(id: &str) -> &str {
+    let Some((path, lines)) = id.rsplit_once(':') else {
+        return id;
+    };
+    let mut bounds = lines.split('-');
+    let numeric = |bound: Option<&str>| {
+        bound.is_some_and(|b| !b.is_empty() && b.bytes().all(|c| c.is_ascii_digit()))
+    };
+    let valid = numeric(bounds.next())
+        && bounds.next().is_none_or(|b| numeric(Some(b)))
+        && bounds.next().is_none();
+    if valid && !path.is_empty() { path } else { id }
+}
 fn section_text<'a>(doc: &'a str, heading: &str) -> Result<&'a str> {
     let h = documentation::resolve_heading(doc, heading)?;
     Ok(&doc[h.start..h.end])
@@ -4292,19 +4339,27 @@ fn execute_repaired(
                 }
                 // A project path in place of an ID names the file whose
                 // delivered evidence should be used; coverage supplements it.
+                // A document citation such as `path:10-20` names its file the
+                // same way (a live run passed citations as source_ids).
                 let mut ids = list(&args, "source_ids");
                 let path_hints = ids.len();
                 ids.retain(|id| {
                     s.source_refs(std::slice::from_ref(id)).is_ok()
                         || !(id.contains('/') || id.contains('.'))
-                        || read_path(&s.project, id).is_err()
+                        || read_path(&s.project, strip_line_suffix(id)).is_err()
                 });
                 let path_hints = path_hints - ids.len();
                 // A path left here names no readable project file; say so
                 // instead of the generic unknown-ID recovery.
-                if let Some(path) = ids.iter().find(|id| {
+                if let Some(id) = ids.iter().find(|id| {
                     id.contains('/') && s.source_refs(std::slice::from_ref(*id)).is_err()
                 }) {
+                    let path = strip_line_suffix(id);
+                    if path != id {
+                        bail!(
+                            "unknown_source: {id} is a citation, not a source ID, and {path} is not a readable project file; pass the S-IDs returned by file_read/source_search/symbol_search for the cited files (or an existing project path to use its delivered evidence)"
+                        );
+                    }
                     bail!(
                         "unknown_source: {path} is a path, not a source ID, and no readable project file has it; pass the S-IDs returned by file_read/source_search/symbol_search for the cited files (or an existing project path to use its delivered evidence)"
                     );
@@ -4381,7 +4436,8 @@ fn execute_repaired(
                         bail!("memory_changed: refresh the memory and investigation references");
                     }
                 }
-                let section = section_text(&doc, &item.section)?;
+                let scope = item_scope_text(&doc, &s.investigations, item)?;
+                let section = scope.as_str();
                 let mut missing = documentation::missing_citation_ranges(s, section, &sources)?;
                 // Evidence already delivered in this session at the current
                 // file version is not re-read just because its ID was lost to
@@ -4408,6 +4464,19 @@ fn execute_repaired(
                     }
                     .into());
                 }
+                // Rereads and supplements repeat ranges; keep one of each.
+                let mut seen = std::collections::BTreeSet::new();
+                sources.retain(|source| {
+                    seen.insert((
+                        source.path.clone(),
+                        source.start_line,
+                        source.end_line,
+                        source.hash.clone(),
+                        source.line_start_complete,
+                        source.line_end_complete,
+                        source.evidence_truncated,
+                    ))
+                });
                 let item = s.investigations.iter_mut().find(|i| i.id == id).unwrap();
                 let fresh = item.status != "verified";
                 item.document_hash = Some(hash(section.as_bytes()));

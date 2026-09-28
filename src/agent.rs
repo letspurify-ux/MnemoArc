@@ -591,6 +591,10 @@ impl Drop for AbortOnDrop {
         self.0.abort();
     }
 }
+/// Waits before resending a request whose provider stayed unavailable through
+/// the client's quick retries; the run deadline still bounds them.
+const PROVIDER_OUTAGE_WAITS: [u64; 4] = [10, 30, 60, 120];
+
 fn run_deadline(started: Instant, config: &Config) -> tokio::time::Instant {
     tokio::time::Instant::from_std(started)
         .checked_add(Duration::from_secs(config.run_timeout_secs))
@@ -1056,6 +1060,9 @@ pub async fn run_session_controlled(
     let mut length_recoveries = 0usize;
     let mut empty_completions = 0usize;
     let mut review_response_failures = 0usize;
+    // Consecutive provider outages and the requests they consumed.
+    let mut provider_outages = 0usize;
+    let mut provider_requests = 0usize;
     let mut tool_failures = tools::recovery::FailureTracker::default();
     let mut repetitions = std::collections::BTreeMap::<String, usize>::new();
     let mut rounds_without_progress = s.progress_recovery.rounds_without_progress.max(
@@ -1635,10 +1642,58 @@ pub async fn run_session_controlled(
                     }
                     continue;
                 }
+                // The client's quick retries cover a blip, not an outage of a
+                // few minutes; a live run lost 3M tokens of work to one 502.
+                // Wait longer and resend the same request, which the session
+                // has not changed, before giving up on the run.
+                if e.downcast_ref::<crate::llm::CompletionError>()
+                    .is_some_and(crate::llm::CompletionError::provider_unavailable)
+                {
+                    provider_requests = provider_requests.saturating_add(attempts);
+                    let wait = PROVIDER_OUTAGE_WAITS
+                        .get(provider_outages)
+                        .map(|&secs| Duration::from_secs(secs));
+                    if let Some(wait) = wait
+                        && tokio::time::Instant::now() + wait < deadline
+                    {
+                        provider_outages += 1;
+                        // A request that never answered is not a checkpoint attempt.
+                        if let Some(cp) = &mut s.checkpoint {
+                            cp.attempts = cp.attempts.saturating_sub(1);
+                        }
+                        emit(
+                            &events,
+                            AgentEvent::Notice {
+                                session: s.id.clone(),
+                                text: format!(
+                                    "Model provider unavailable; retrying in {}s ({}/{})",
+                                    wait.as_secs(),
+                                    provider_outages,
+                                    PROVIDER_OUTAGE_WAITS.len()
+                                ),
+                            },
+                            &cancel,
+                            deadline,
+                        )
+                        .await;
+                        tokio::select! {
+                            _ = cancel.cancelled() => {}
+                            _ = tokio::time::sleep(wait) => {}
+                        }
+                        continue;
+                    }
+                    failure = Some(format!(
+                        "{e}; provider unavailable after {provider_requests} requests over {} waits",
+                        provider_outages
+                    ));
+                    break;
+                }
                 failure = Some(e.to_string());
                 break;
             }
         };
+        provider_outages = 0;
+        provider_requests = 0;
         if let Err(error) = crate::llm::validate_completion_bounds(&completion) {
             let extra_attempts = completion.attempts.saturating_sub(1);
             if extra_attempts > 0 {
@@ -3573,5 +3628,119 @@ mod worker_wait_tests {
                 assert!(!backup.write_outcome_uncertain.load(Ordering::Acquire));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_outage_tests {
+    use super::*;
+    use crate::config::Project;
+    use crate::llm::{Completion, CompletionError, LlmClient, Usage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Fails the first `outages` requests as an unavailable provider.
+    struct Outage {
+        outages: usize,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for Outage {
+        async fn complete(
+            &self,
+            _: Value,
+            _: &Config,
+            _: CancellationToken,
+            _: mpsc::Sender<String>,
+        ) -> Result<Completion> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) < self.outages {
+                return Err(CompletionError::new(
+                    anyhow::anyhow!(
+                        "provider_stream_error: {}",
+                        r#"{"code":502,"message":"Provider returned an empty response"}"#
+                    ),
+                    3,
+                    true,
+                )
+                .into());
+            }
+            Ok(Completion {
+                text: "Saved answer".into(),
+                usage: Some(Usage {
+                    input: 100,
+                    output: 7,
+                    cached: None,
+                }),
+                ..Default::default()
+            })
+        }
+    }
+
+    async fn run(outages: usize) -> (Session, usize, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            Config {
+                model: "gpt-4o".into(),
+                model_context: Some(128_000),
+                source_answer_review: false,
+                source_document_review: false,
+                completion_review_enabled: false,
+                run_timeout_secs: 3600,
+                ..Default::default()
+            },
+        );
+        s.add_user("First request".into());
+        let client = Arc::new(Outage {
+            outages,
+            calls: AtomicUsize::new(0),
+        });
+        let (tx, mut rx) = mpsc::channel(128);
+        let drain = tokio::spawn(async move {
+            let mut notices = Vec::new();
+            while let Some(event) = rx.recv().await {
+                if let AgentEvent::Notice { text, .. } = event {
+                    notices.push(text);
+                }
+            }
+            notices
+        });
+        let s = run_session(s, client.clone(), CancellationToken::new(), tx).await;
+        let notices = drain.await.unwrap();
+        (s, client.calls.load(Ordering::SeqCst), notices)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waits_out_a_provider_outage_and_resends_the_request() {
+        let (s, calls, notices) = run(2).await;
+        assert_eq!(s.status, "complete", "{:?}", s.last_error);
+        assert_eq!(calls, 3);
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("retrying in 10s (1/4)")),
+            "{notices:?}"
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("retrying in 30s (2/4)"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lasting_outage_stops_with_the_request_count() {
+        let (s, calls, _) = run(usize::MAX).await;
+        assert_eq!(calls, PROVIDER_OUTAGE_WAITS.len() + 1);
+        let error = s.last_error.unwrap();
+        assert!(error.starts_with("provider_stream_error:"), "{error}");
+        assert!(
+            error.ends_with("provider unavailable after 15 requests over 4 waits"),
+            "{error}"
+        );
     }
 }

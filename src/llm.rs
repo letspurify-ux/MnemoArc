@@ -70,15 +70,37 @@ pub struct Completion {
 pub(crate) struct CompletionError {
     source: anyhow::Error,
     attempts: usize,
+    provider_unavailable: bool,
 }
 impl CompletionError {
-    fn new(source: anyhow::Error, attempts: usize) -> Self {
-        Self { source, attempts }
+    pub(crate) fn new(source: anyhow::Error, attempts: usize, provider_unavailable: bool) -> Self {
+        Self {
+            source,
+            attempts,
+            provider_unavailable,
+        }
     }
 
     pub(crate) fn attempts(&self) -> usize {
         self.attempts.max(1)
     }
+
+    /// The provider stayed unavailable (overload, 5xx, dropped stream) through
+    /// every quick retry and no text reached the user, so the same request
+    /// may be sent again after a longer wait.
+    pub(crate) fn provider_unavailable(&self) -> bool {
+        self.provider_unavailable
+    }
+}
+
+/// Failures of the provider or the connection, not of the request itself.
+fn transient_error(text: &str) -> bool {
+    text.starts_with("provider_stream_error:")
+        || text.starts_with("stream_interrupted:")
+        || text.starts_with("request_timeout")
+        || text.starts_with("http_429")
+        || text.starts_with("http_5")
+        || text.contains("error sending request")
 }
 impl Display for CompletionError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -652,17 +674,19 @@ impl LlmClient for OpenAiClient {
                     // A dropped connection or missing terminator is transient
                     // too. Retrying is safe only before any text reached the
                     // user; the partial response is discarded, never merged.
-                    let retry = !emitted_text.load(Ordering::Relaxed)
-                        && (text.starts_with("provider_stream_error:")
-                            || text.starts_with("stream_interrupted:")
+                    let silent = !emitted_text.load(Ordering::Relaxed);
+                    let transient = transient_error(&text);
+                    let retry = silent
+                        && (transient
                             || (attempt == 0 && text.starts_with("invalid_tool_arguments:"))
-                            || (attempt == 0 && text.starts_with("invalid_stream_event:"))
-                            || text.starts_with("request_timeout")
-                            || text.starts_with("http_429")
-                            || text.starts_with("http_5")
-                            || text.contains("error sending request"));
+                            || (attempt == 0 && text.starts_with("invalid_stream_event:")));
                     if !retry || transient_retries >= c.retries {
-                        return Err(CompletionError::new(e, attempt.saturating_add(1)).into());
+                        return Err(CompletionError::new(
+                            e,
+                            attempt.saturating_add(1),
+                            silent && transient,
+                        )
+                        .into());
                     }
                     transient_retries = transient_retries.saturating_add(1);
                     attempt = attempt.saturating_add(1);

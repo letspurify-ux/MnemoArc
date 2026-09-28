@@ -625,9 +625,28 @@ impl std::fmt::Display for CoverageMissing {
             self.item_id,
             self.missing_ranges.len(),
             json!(self.missing_ranges)
-        )
+        )?;
+        // A live run read 900 lines in pages because an opening cited a
+        // whole screen component as a pointer; offer the cheaper repair.
+        let widest = self
+            .missing_ranges
+            .iter()
+            .filter_map(|range| {
+                Some(range["end_line"].as_u64()? + 1 - range["start_line"].as_u64()?)
+            })
+            .max()
+            .unwrap_or(0);
+        if widest >= BROAD_CITATION_LINES {
+            write!(
+                f,
+                ". The widest range spans {widest} lines: if its citation only points at where a screen, component or feature lives rather than supporting every line, narrow that citation in the document to the lines that support the claim with a scoped text edit, then verify again instead of reading the whole range"
+            )?;
+        }
+        Ok(())
     }
 }
+/// A missing cited range this long is more likely a pointer than evidence.
+const BROAD_CITATION_LINES: u64 = 120;
 impl std::error::Error for CoverageMissing {}
 
 /// Subtract the union of supplied evidence from every cited interval. Merge
