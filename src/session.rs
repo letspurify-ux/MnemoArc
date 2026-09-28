@@ -62,6 +62,17 @@ pub struct TaskState {
     pub details: Vec<Value>,
     pub revision: u64,
 }
+
+/// Criteria supplied before a user request starts. The agent may refine
+/// TaskState while working, but those working checks must not become new
+/// requirements for the user's document.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RequestReviewCriteria {
+    pub completion: Vec<String>,
+    pub constraints: Vec<String>,
+    pub deliverables: Vec<String>,
+}
 impl TaskState {
     pub fn current_todo(&self) -> Option<&TodoItem> {
         self.todos.iter().find(|item| !item.done)
@@ -366,6 +377,7 @@ pub struct Session {
     pub write_outcome_uncertain: Arc<AtomicBool>,
     pub pending_config: Option<Config>,
     pub task: TaskState,
+    pub request_review_criteria: RequestReviewCriteria,
     /// Workflow the user selected for this session's requests (one of
     /// WORKFLOW_MODES); applied to every new task.
     pub workflow_mode: String,
@@ -511,6 +523,7 @@ impl Session {
             write_outcome_uncertain: Arc::new(AtomicBool::new(false)),
             pending_config: None,
             task,
+            request_review_criteria: Default::default(),
             memory: Default::default(),
             history: Default::default(),
             sources: BTreeMap::new(),
@@ -733,6 +746,20 @@ impl Session {
                 self.progress_recovery = Default::default();
                 self.completion_gaps.clear();
             }
+            // Capture caller-provided criteria before initial_completion and
+            // later model task_state updates add working acceptance checks.
+            // On later requests, task.constraints can contain checks the agent
+            // added during the previous task; retain only the earlier caller
+            // constraints for document review.
+            self.request_review_criteria = RequestReviewCriteria {
+                completion: self.task.completion.clone(),
+                constraints: if first_request {
+                    self.task.constraints.clone()
+                } else {
+                    self.request_review_criteria.constraints.clone()
+                },
+                deliverables: self.task.deliverables.clone(),
+            };
             if self.task.completion.is_empty() {
                 self.task.completion = self.initial_completion(&text);
             }

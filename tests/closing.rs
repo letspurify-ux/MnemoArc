@@ -217,12 +217,14 @@ fn unavailable_review_applies_only_to_the_unchanged_document() {
         document_review::current_verdict(&s),
         document_review::CurrentVerdict::Unavailable
     );
-    s.task.constraints.push("Use Korean".into());
+    s.request_review_criteria
+        .constraints
+        .push("Use Korean".into());
     assert_eq!(
         document_review::current_verdict(&s),
         document_review::CurrentVerdict::Unreviewed
     );
-    s.task.constraints.pop();
+    s.request_review_criteria.constraints.pop();
     let source_path = s.project.root.join("main.js");
     let source = std::fs::read(&source_path).unwrap();
     std::fs::write(&source_path, "function changed() {}\n").unwrap();

@@ -134,8 +134,10 @@ fn quoted_passages(issue: &str) -> Vec<String> {
 
 fn requirements(s: &Session) -> String {
     hash(
-        json!({"request":s.answer_review_question,"completion":s.task.completion,
-        "constraints":s.task.constraints,"deliverables":s.task.deliverables})
+        json!({"request":s.answer_review_question,
+        "completion":s.request_review_criteria.completion,
+        "constraints":s.request_review_criteria.constraints,
+        "deliverables":s.request_review_criteria.deliverables})
         .to_string()
         .as_bytes(),
     )
@@ -323,8 +325,13 @@ fn request_with_restarts(s: &mut Session, restarts: usize) -> Result<Value> {
     // refers to the old range, potentially skipping citations or repeating work.
     let doc_lines: Vec<_> = doc.lines().collect();
     let start_line = s.document_review.document_offset.min(doc_lines.len());
+    // Agent-authored task_state criteria include workflow checks (for example
+    // investigation bookkeeping). Only the original request and criteria that
+    // the caller supplied before it started belong in a review of the document.
     let mut payload = json!({"source_document_review":true,"request":s.answer_review_question,
-        "requirements":s.task.completion,"constraints":s.task.constraints,"deliverables":s.task.deliverables,"document":"",
+        "requirements":s.request_review_criteria.completion,
+        "constraints":s.request_review_criteria.constraints,
+        "deliverables":s.request_review_criteria.deliverables,"document":"",
         "previous_response_error":null,
         "measured_lines":doc_lines.len(),"document_line_start":start_line + 1,
         "document_line_end":start_line,"more_document_pages":false,

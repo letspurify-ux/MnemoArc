@@ -53,6 +53,73 @@ fn fixture() -> (tempfile::TempDir, Session) {
 }
 
 #[test]
+fn review_uses_caller_criteria_without_promoting_agent_workflow_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("manual.md");
+    std::fs::write(dir.path().join("main.js"), "function openChat() {}\n").unwrap();
+    std::fs::write(
+        &output,
+        "# Screen manual\nOpen the chat screen. main.js:1\n",
+    )
+    .unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output,
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            ..Default::default()
+        },
+    );
+    s.task.completion = vec!["Include the named controls in the manual".into()];
+    s.task.constraints = vec!["Use Korean".into()];
+    s.task.deliverables = vec!["A Markdown manual".into()];
+    s.add_user("Write a screen manual".into());
+    s.select_workflow("source_document").unwrap();
+    s.task
+        .completion
+        .push("Register and verify each investigation item".into());
+    s.task
+        .deliverables
+        .push("Internal investigation ledger".into());
+
+    let request = document_review::request(&mut s).unwrap();
+    let payload: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["request"], "Write a screen manual");
+    assert_eq!(
+        payload["requirements"],
+        json!(["Include the named controls in the manual"])
+    );
+    assert_eq!(payload["constraints"], json!(["Use Korean"]));
+    assert_eq!(payload["deliverables"], json!(["A Markdown manual"]));
+    assert!(!payload.to_string().contains("investigation"));
+
+    s.add_user("continue".into());
+    assert_eq!(
+        s.request_review_criteria.completion,
+        ["Include the named controls in the manual"]
+    );
+}
+
+#[test]
+fn review_of_an_unprepared_request_does_not_use_agent_completion_checks() {
+    let (_dir, mut s) = fixture();
+    let request = document_review::request(&mut s).unwrap();
+    let payload: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        payload["request"],
+        "Write a source document covering history normalization and all loop bounds."
+    );
+    assert_eq!(payload["requirements"], json!([]));
+    assert_eq!(payload["constraints"], json!([]));
+    assert_eq!(payload["deliverables"], json!([]));
+}
+
+#[test]
 fn source_workflow_activates_tools_and_schema_prevents_guessing() {
     let (_dir, mut s) = fixture();
     assert!(s.task.require_investigation);
@@ -453,7 +520,8 @@ fn wide_source_lines_are_split_across_review_pages_without_narrowing_citations()
 #[test]
 fn oversized_requirements_are_reported_before_document_paging() {
     let (_dir, mut s) = fixture();
-    s.task.completion = vec!["review every branch and condition ".repeat(10_000)];
+    s.request_review_criteria.completion =
+        vec!["review every branch and condition ".repeat(10_000)];
     let error = document_review::request(&mut s).unwrap_err().to_string();
     assert!(
         error.contains("requirements and review instructions"),
@@ -1250,10 +1318,19 @@ fn rejected_review_cache_and_approval_follow_requirements_and_source_versions() 
     document_review::request(&mut s).unwrap();
     document_review::finish(&mut s, r#"{"issues":["Correct the loop"]}"#).unwrap();
     assert!(document_review::rejected_on_current_result(&s));
-    s.task.completion.push("Also document cancellation".into());
+    // Agent-authored working checks do not change what the user requested.
+    s.task
+        .completion
+        .push("Verify investigation bookkeeping".into());
+    assert!(document_review::rejected_on_current_result(&s));
+    s.request_review_criteria
+        .completion
+        .push("Also document cancellation".into());
     assert!(!document_review::rejected_on_current_result(&s));
     document_review::request(&mut s).unwrap();
-    s.task.constraints.push("Use Korean".into());
+    s.request_review_criteria
+        .constraints
+        .push("Use Korean".into());
     assert!(
         document_review::finish(&mut s, r#"{"issues":[]}"#)
             .unwrap_err()
@@ -1263,7 +1340,9 @@ fn rejected_review_cache_and_approval_follow_requirements_and_source_versions() 
     document_review::request(&mut s).unwrap();
     document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
     assert!(document_review::approved(&s));
-    s.task.deliverables.push("API appendix".into());
+    s.request_review_criteria
+        .deliverables
+        .push("API appendix".into());
     assert!(!document_review::approved(&s));
     document_review::request(&mut s).unwrap();
     document_review::finish(&mut s, r#"{"issues":["Add the appendix"]}"#).unwrap();

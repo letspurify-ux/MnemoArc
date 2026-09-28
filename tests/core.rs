@@ -872,6 +872,7 @@ fn first_prompt_preserves_prepared_completion_and_new_tasks_start_with_criteria(
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     s.select_workflow("source_document").unwrap();
+    s.task.constraints.push("Use Korean".into());
     tools::execute(
         &mut s,
         "task_state",
@@ -882,14 +883,26 @@ fn first_prompt_preserves_prepared_completion_and_new_tasks_start_with_criteria(
     s.add_user("Document the routes".into());
     assert_eq!(s.task.completion, ["Check every requested flow"]);
     assert_eq!(s.task.deliverables, ["Report"]);
+    assert_eq!(
+        s.request_review_criteria.completion,
+        ["Check every requested flow"]
+    );
+    assert_eq!(s.request_review_criteria.constraints, ["Use Korean"]);
+    assert_eq!(s.request_review_criteria.deliverables, ["Report"]);
     assert_eq!(s.task.workflow, "source_document");
     assert!(s.task.revision > prepared_revision);
     s.add_user("계속 진행".into());
     assert_eq!(s.task.completion, ["Check every requested flow"]);
+    s.task
+        .constraints
+        .push("Record every investigation ID in the document".into());
     s.add_user("Explain a different module".into());
     assert_eq!(s.task.completion.len(), 1);
     assert!(s.task.completion[0].contains("Explain a different module"));
     assert!(s.task.deliverables.is_empty());
+    assert!(s.request_review_criteria.completion.is_empty());
+    assert_eq!(s.request_review_criteria.constraints, ["Use Korean"]);
+    assert!(s.request_review_criteria.deliverables.is_empty());
     // The session's selection carries over to the new task.
     assert_eq!(s.task.workflow, "source_document");
 }
