@@ -726,6 +726,73 @@ async fn repeated_provider_finish_error_stops_at_retry_limit() {
 }
 
 #[tokio::test]
+async fn interrupted_stream_is_retried_until_the_retry_limit() {
+    use std::sync::atomic::Ordering;
+    let interrupted = event(
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"discard","function":{"name":"memory_write","arguments":"{\"body\":\"x\"}"}}]},"finish_reason":"tool_calls"}]}),
+    );
+    let valid = format!(
+        "{}data: [DONE]\n\n",
+        event(json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}))
+    );
+    let (url, server, calls) = sequenced_server(vec![interrupted.clone(), valid]).await;
+    let c = Config {
+        base_url: url,
+        retries: 1,
+        ..Default::default()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let out = OpenAiClient
+        .complete(json!({"messages":[]}), &c, CancellationToken::new(), tx)
+        .await
+        .unwrap();
+    assert_eq!(out.attempts, 2);
+    assert_eq!(out.text, "OK");
+    assert!(
+        out.calls.is_empty(),
+        "the interrupted batch must be discarded"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+
+    let (url, server, calls) = sequenced_server(vec![interrupted]).await;
+    let c = Config {
+        base_url: url,
+        retries: 1,
+        ..Default::default()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let error = OpenAiClient
+        .complete(json!({"messages":[]}), &c, CancellationToken::new(), tx)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().starts_with("stream_interrupted:"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn interrupted_stream_after_visible_text_is_not_retried() {
+    use std::sync::atomic::Ordering;
+    let partial = event(json!({"choices":[{"delta":{"content":"visible"}}]}));
+    let (url, server, calls) = sequenced_server(vec![partial]).await;
+    let c = Config {
+        base_url: url,
+        retries: 2,
+        ..Default::default()
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let error = OpenAiClient
+        .complete(json!({"messages":[]}), &c, CancellationToken::new(), tx)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().starts_with("stream_interrupted:"));
+    assert_eq!(rx.recv().await.as_deref(), Some("visible"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
 async fn malformed_sse_event_is_labeled_and_retried_once() {
     use std::sync::atomic::Ordering;
     let invalid = "data: {\"choices\":\"unterminated\n\ndata: [DONE]\n\n".to_string();
@@ -796,6 +863,7 @@ async fn length_without_done_remains_a_stream_error() {
     .await;
     let config = Config {
         base_url: url,
+        retries: 0,
         ..Default::default()
     };
     let (tx, _) = tokio::sync::mpsc::channel(8);

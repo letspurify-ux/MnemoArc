@@ -649,8 +649,12 @@ impl LlmClient for OpenAiClient {
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
+                    // A dropped connection or missing terminator is transient
+                    // too. Retrying is safe only before any text reached the
+                    // user; the partial response is discarded, never merged.
                     let retry = !emitted_text.load(Ordering::Relaxed)
                         && (text.starts_with("provider_stream_error:")
+                            || text.starts_with("stream_interrupted:")
                             || (attempt == 0 && text.starts_with("invalid_tool_arguments:"))
                             || (attempt == 0 && text.starts_with("invalid_stream_event:"))
                             || text.starts_with("request_timeout")
