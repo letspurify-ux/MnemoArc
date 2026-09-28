@@ -95,6 +95,12 @@ async fn connection_probe_requires_valid_plain_and_final_answers() {
             json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"echo","function":{"name":"connection_echo","arguments":"{\"text\":\"OK\"}"}}]},"finish_reason":"tool_calls"}]})
         )
     );
+    let tool_with_stop = format!(
+        "{}data: [DONE]\n\n",
+        event(
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"echo","function":{"name":"connection_echo","arguments":"{\"text\":\"OK\"}"}}]},"finish_reason":"stop"}]})
+        )
+    );
     let text = format!(
         "{}data: [DONE]\n\n",
         event(json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}))
@@ -105,31 +111,41 @@ async fn connection_probe_requires_valid_plain_and_final_answers() {
     );
     let plain =
         json!({"choices":[{"message":{"content":"OK"},"finish_reason":"stop"}]}).to_string();
-    for (first, last, expected_error) in [
+    for (first, tool_response, last, expected_error) in [
         (
             "<html>upstream unavailable</html>".into(),
+            tool.clone(),
             text.clone(),
             Some("plain response probe failed"),
         ),
         (
             json!({"error":{"message":"upstream unavailable"}}).to_string(),
+            tool.clone(),
             text.clone(),
             Some("plain response probe failed"),
         ),
         (
             json!({"choices":[{"message":{"content":"OK"}}]}).to_string(),
+            tool.clone(),
             text.clone(),
             Some("plain response probe failed"),
         ),
         (
             plain.clone(),
             tool.clone(),
+            tool.clone(),
             Some("tool round-trip probe failed"),
         ),
-        (plain.clone(), empty, Some("tool round-trip probe failed")),
-        (plain, text, None),
+        (
+            plain.clone(),
+            tool.clone(),
+            empty,
+            Some("tool round-trip probe failed"),
+        ),
+        (plain.clone(), tool, text.clone(), None),
+        (plain, tool_with_stop, text, None),
     ] {
-        let (url, server, _) = sequenced_server(vec![first, tool.clone(), last]).await;
+        let (url, server, _) = sequenced_server(vec![first, tool_response, last]).await;
         let config = Config {
             base_url: url,
             model: "probe-model".into(),
@@ -370,6 +386,37 @@ async fn incomplete_stream_never_returns_calls() {
 }
 
 #[tokio::test]
+async fn stop_finish_never_exposes_an_incomplete_tool_call() {
+    let body = format!(
+        "{}data: [DONE]\n\n",
+        event(
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"echo","function":{"name":"connection_echo","arguments":"{\"text\":"}}]},"finish_reason":"stop"}]})
+        )
+    );
+    let (url, server) = server(body).await;
+    let config = Config {
+        base_url: url,
+        retries: 0,
+        ..Default::default()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let error = OpenAiClient
+        .complete(
+            json!({"messages":[]}),
+            &config,
+            CancellationToken::new(),
+            tx,
+        )
+        .await
+        .unwrap_err();
+    server.abort();
+    assert!(
+        error.to_string().contains("invalid_tool_arguments"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn repeated_identical_finish_reason_accepts_provider_tool_call_stream() {
     let body = [
         event(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"ping-1","function":{"name":"ping","arguments":"{}"}}]},"finish_reason":null}]})),
@@ -410,15 +457,6 @@ async fn contradictory_stream_finish_reasons_never_complete() {
                 event(json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"tool_calls"}]}))
             ),
             "tool_calls finish without a call",
-        ),
-        (
-            format!(
-                "{}data: [DONE]\n\n",
-                event(
-                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"write","function":{"name":"file_write","arguments":"{}"}}]},"finish_reason":"stop"}]})
-                )
-            ),
-            "stop finish with tool calls",
         ),
         (
             format!(

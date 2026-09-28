@@ -455,9 +455,10 @@ impl OpenAiClient {
         if expects_calls && calls.is_empty() {
             bail!("incomplete_completion: tool_calls finish without a call");
         }
-        if !expects_calls && !calls.is_empty() {
-            bail!("incomplete_completion: stop finish with tool calls");
-        }
+        // Some OpenAI-compatible providers finish a complete tool-call
+        // response with `stop` instead of `tool_calls`. The calls are still
+        // checked for IDs, names and complete JSON objects below before the
+        // agent can use them.
         let mut ids = std::collections::BTreeSet::new();
         for call in calls.values() {
             if call.id.is_empty() || call.name.is_empty() || !ids.insert(call.id.clone()) {
