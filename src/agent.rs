@@ -1040,6 +1040,7 @@ pub async fn run_session_controlled(
         return question::run(s, client, cancel, events).await;
     }
     s.begin_run();
+    tools::document_review::refresh_policy(&mut s);
     s.task.migrate_legacy_plan();
     s.status = "running".into();
     s.last_error = None;

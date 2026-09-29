@@ -1886,6 +1886,64 @@ fn reviewer_judges_detail_for_the_project_audience() {
 }
 
 #[test]
+fn user_manual_citations_retain_source_evidence_and_validation() {
+    let (_dir, mut s) = fixture();
+    s.project.audience = "일반 유저".into();
+    let source_path = s.project.root.join("main.js").canonicalize().unwrap();
+    let request = document_review::request(&mut s).unwrap();
+    let payload: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert!(
+        payload["document"]
+            .as_str()
+            .unwrap()
+            .contains("main.js:4-5")
+    );
+    assert!(payload["evidence"].as_array().unwrap().iter().any(|chunk| {
+        s.project
+            .root
+            .join(chunk["path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap()
+            == source_path
+            && chunk["numbered_text"]
+                .as_str()
+                .unwrap()
+                .contains("for (let i = 0; i < 5; i++)")
+    }));
+    assert_eq!(
+        tools::audit_document(&mut s).unwrap()["citations_checked"],
+        1
+    );
+
+    std::fs::write(&s.project.output, "# Flow\nWork runs. main.js:999\n").unwrap();
+    let audit = tools::audit_document(&mut s).unwrap();
+    assert!(
+        audit["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| { issue["kind"] == "citation_range" })
+    );
+
+    std::fs::write(&s.project.output, "# Flow\nWork runs.\n").unwrap();
+    let audit = tools::audit_document(&mut s).unwrap();
+    assert!(
+        audit["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| { issue["kind"] == "no_machine_readable_citations" })
+    );
+    assert!(
+        document_review::request(&mut s)
+            .unwrap_err()
+            .to_string()
+            .contains("no source citations")
+    );
+}
+
+#[test]
 fn longer_repairs_do_not_reset_a_stalled_review_without_a_length_finding() {
     let (_dir, mut s) = fixture();
     s.config.review_limit = 2;

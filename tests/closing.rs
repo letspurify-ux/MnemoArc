@@ -669,31 +669,42 @@ async fn rejected_review_asks_for_one_batched_repair() {
             .starts_with("Review repair: fix ALL findings")
     );
 
-    // Findings without a matching review target belong to an earlier version.
-    let (_dir, mut s) = verified_fixture();
-    s.config.source_document_review = true;
-    s.document_review.issues = vec!["Flow: state the loop bound".into()];
-    let (_, guidance) = run_scripted(
-        s,
-        vec![
-            Completion {
-                text: "Saved out.md".into(),
-                ..Default::default()
-            },
-            Completion {
-                text: r#"{"issues":[]}"#.into(),
-                ..Default::default()
-            },
-        ],
-    )
-    .await;
-    assert_eq!(guidance[0]["ready_for_final"], true);
-    assert!(
-        guidance[0]["instruction"]
-            .as_str()
-            .unwrap()
-            .contains("1 findings from a previous document version")
-    );
+    for legacy_policy in [false, true] {
+        let (_dir, mut s) = verified_fixture();
+        s.config.source_document_review = true;
+        if legacy_policy {
+            // Older state has findings but no review policy fingerprint.
+            s.document_review.issues = vec!["Flow: remove source citations".into()];
+        } else {
+            // Current-policy findings survive a lost review target as repair context.
+            document_review::request(&mut s).unwrap();
+            document_review::finish(&mut s, r#"{"issues":["Flow: state the loop bound"]}"#)
+                .unwrap();
+            document_review::defer_for_repair(&mut s);
+        }
+        let (_, guidance) = run_scripted(
+            s,
+            vec![
+                Completion {
+                    text: "Saved out.md".into(),
+                    ..Default::default()
+                },
+                Completion {
+                    text: r#"{"issues":[]}"#.into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(guidance[0]["ready_for_final"], true);
+        assert_eq!(
+            guidance[0]["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("1 findings from a previous document version"),
+            !legacy_policy
+        );
+    }
 }
 
 #[tokio::test]
@@ -1509,7 +1520,12 @@ async fn new_evidence_read_for_open_review_findings_is_progress() {
         )
         .unwrap();
     }
-    s.document_review.issues = vec!["Line 3: cite the helper that normalizes history".into()];
+    document_review::request(&mut s).unwrap();
+    document_review::finish(
+        &mut s,
+        r#"{"issues":["Line 3: cite the helper that normalizes history"]}"#,
+    )
+    .unwrap();
     let (_, guidance) = run_scripted(
         s,
         vec![

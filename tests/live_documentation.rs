@@ -209,6 +209,138 @@ async fn glm_rejects_missing_required_ui_steps() {
 
 #[tokio::test]
 #[ignore = "paid provider; explicitly set MNEMOARC_LIVE_TEST=1"]
+async fn registered_user_manual_review_preserves_citations() {
+    assert_eq!(std::env::var("MNEMOARC_LIVE_TEST").as_deref(), Ok("1"));
+    let path = PathBuf::from(std::env::var("MNEMOARC_LIVE_CONFIG").unwrap_or("config.toml".into()));
+    let mut config = Config::load(&path, &BTreeMap::new()).unwrap();
+    if let Ok(model) = std::env::var("MNEMOARC_LIVE_MODEL") {
+        config.model = model;
+    }
+    config.output_tokens = config.output_tokens.min(8192);
+    config.request_timeout_secs = config.request_timeout_secs.min(180);
+    config.retries = 0;
+    let project_name = std::env::var("MNEMOARC_LIVE_PROJECT").unwrap_or("MnemoArc".into());
+    let mut project = config
+        .projects
+        .iter()
+        .find(|project| project.name == project_name)
+        .expect("registered MnemoArc project")
+        .clone();
+    project.audience = "일반 유저".into();
+    project.purpose = "화면 사용법 안내".into();
+    let original_output = project.output.clone();
+    let original_hash = std::fs::read(&original_output)
+        .ok()
+        .map(|bytes| tools::hash(&bytes));
+    let source_path = project.root.join("frontend/src/App.jsx");
+    let source = std::fs::read_to_string(&source_path).unwrap();
+    let source_lines: Vec<_> = source.lines().collect();
+    let button = source_lines
+        .iter()
+        .position(|line| line.contains("className=\"new-session\""))
+        .expect("new-session button");
+    let button_end = button
+        + source_lines[button..]
+            .iter()
+            .position(|line| line.contains("</button>"))
+            .unwrap();
+    assert!(
+        source_lines[button..=button_end]
+            .iter()
+            .any(|line| line.contains("!state?.config.projects.length"))
+    );
+    let citation = format!("frontend/src/App.jsx:{}-{}", button, button_end + 1);
+    let source_hash = tools::hash(source.as_bytes());
+    let dir = tempfile::tempdir().unwrap();
+    let mut reports = vec![];
+    for (case, claim, citation, expected_approved) in [
+        (
+            "valid_citation",
+            "등록된 프로젝트가 없으면 사이드바의 **새 세션** 버튼을 사용할 수 없습니다.",
+            citation.as_str(),
+            true,
+        ),
+        (
+            "false_claim",
+            "등록된 프로젝트가 없어도 사이드바의 **새 세션** 버튼을 사용할 수 있습니다.",
+            citation.as_str(),
+            false,
+        ),
+        (
+            "unrelated_citation",
+            "등록된 프로젝트가 없으면 사이드바의 **새 세션** 버튼을 사용할 수 없습니다.",
+            "frontend/src/App.jsx:1-4",
+            false,
+        ),
+    ] {
+        project.output = dir.path().join(format!("{case}.md"));
+        let document =
+            format!("# MnemoArc UI 사용자 매뉴얼\n## 새 세션 버튼\n{claim} {citation}\n");
+        std::fs::write(&project.output, &document).unwrap();
+        let mut session = Session::new(project.clone(), config.clone());
+        session.select_workflow("source_document").unwrap();
+        session.add_user("UI 사용자 매뉴얼의 '새 세션 버튼' 절만 작성해줘. 프로젝트가 하나도 등록되지 않았을 때 버튼을 사용할 수 있는지만 설명해줘. 다른 동작은 범위에 포함하지 마.".into());
+        let request = tools::document_review::request(&mut session).unwrap();
+        let payload: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["more_document_pages"], false);
+        assert_eq!(payload["more_evidence_pages"], false);
+        let (tx, mut rx) = mpsc::channel(32);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let started = Instant::now();
+        let completion = tokio::time::timeout(
+            std::time::Duration::from_secs(210),
+            OpenAiClient.complete(
+                request.clone(),
+                &session.config,
+                CancellationToken::new(),
+                tx,
+            ),
+        )
+        .await
+        .expect("review timeout")
+        .expect("manual review request");
+        drain.await.unwrap();
+        assert!(completion.calls.is_empty(), "review must not call tools");
+        let verdict = tools::document_review::finish(&mut session, &completion.text);
+        let approved = tools::document_review::approved(&session);
+        reports.push(json!({
+            "case":case,"document":document,"request":request,
+            "expected_approved":expected_approved,"approved":approved,
+            "elapsed_seconds":started.elapsed().as_secs_f64(),
+            "usage":completion.usage,"provider_attempts":completion.attempts,
+            "review_text":completion.text,"review_issues":session.document_review.issues,
+            "review_state":session.document_review,
+            "error":verdict.as_ref().err().map(ToString::to_string),
+        }));
+        if let Ok(path) = std::env::var("MNEMOARC_REVIEW_REPORT") {
+            let report = json!({"model":config.model,"source_hash":source_hash,"cases":reports});
+            std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        }
+        eprintln!(
+            "[live] {case}: approved={approved} expected={expected_approved} usage={:?} issues={:?}",
+            completion.usage, session.document_review.issues
+        );
+        verdict.unwrap();
+    }
+    assert_eq!(std::fs::read_to_string(&source_path).unwrap(), source);
+    assert_eq!(
+        std::fs::read(original_output)
+            .ok()
+            .map(|bytes| tools::hash(&bytes)),
+        original_hash
+    );
+    for report in reports {
+        assert_eq!(
+            report["approved"], report["expected_approved"],
+            "{}: {}",
+            report["case"], report["review_text"]
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "paid provider; explicitly set MNEMOARC_LIVE_TEST=1"]
 async fn registered_source_documentation() {
     assert_eq!(std::env::var("MNEMOARC_LIVE_TEST").as_deref(), Ok("1"));
     let path = PathBuf::from(std::env::var("MNEMOARC_LIVE_CONFIG").unwrap_or("config.toml".into()));
