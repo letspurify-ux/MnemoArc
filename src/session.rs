@@ -65,7 +65,7 @@ pub struct TaskState {
 
 /// Criteria supplied before a user request starts. The agent may refine
 /// TaskState while working, but those working checks must not become new
-/// requirements for the user's document.
+/// requirements for document or completion review.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RequestReviewCriteria {
@@ -752,7 +752,7 @@ impl Session {
             // later model task_state updates add working acceptance checks.
             // On later requests, task.constraints can contain checks the agent
             // added during the previous task; retain only the earlier caller
-            // constraints for document review.
+            // constraints for document and completion reviews.
             self.request_review_criteria = RequestReviewCriteria {
                 completion: self.task.completion.clone(),
                 constraints: if first_request {

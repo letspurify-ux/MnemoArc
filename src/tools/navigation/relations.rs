@@ -40,6 +40,7 @@ struct Import {
     // `import pkg.mod` binds `pkg`, but only `pkg.mod.member` addresses mod.
     module_receiver: Option<String>,
     scope: Span,
+    at: usize,
     type_only: bool,
 }
 
@@ -59,6 +60,8 @@ struct Site {
     name_lookup: Option<NameLookup>,
     attribute_type_name: bool,
     verbatim_name: bool,
+    verbatim_receiver: bool,
+    scoped_path: bool,
     owner: Option<Key>,
     callable: Option<(usize, usize)>,
 }
@@ -111,6 +114,15 @@ fn text_of<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     &source[node.byte_range()]
 }
 
+fn unquote(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    if bytes.len() >= 2 && matches!(bytes[0], b'\'' | b'"') && bytes.last() == Some(&bytes[0]) {
+        &name[1..name.len() - 1]
+    } else {
+        name
+    }
+}
+
 fn csharp_identifier(name: &str) -> &str {
     name.strip_prefix('@').unwrap_or(name)
 }
@@ -128,6 +140,39 @@ fn rust_path(path: &str) -> String {
         .map(|part| identifier("rust", part))
         .collect::<Vec<_>>()
         .join("::")
+}
+
+fn csharp_path(path: &str) -> String {
+    path.strip_prefix("global::")
+        .unwrap_or(path)
+        .split('.')
+        .map(|part| csharp_identifier(part.trim()))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+// Paths are token sequences. Whitespace and comments between their segments
+// do not change the name, while the original expression remains source text.
+fn path_text(node: Node<'_>, source: &str) -> String {
+    let mut result = String::new();
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "comment" | "line_comment" | "block_comment") {
+            continue;
+        }
+        if node.child_count() == 0 {
+            result.push_str(text_of(node, source));
+        } else {
+            let mut cursor = node.walk();
+            stack.extend(
+                node.children(&mut cursor)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
+        }
+    }
+    result
 }
 
 fn named(node: Node<'_>) -> Vec<Node<'_>> {
@@ -155,12 +200,19 @@ fn is_function(node: Node<'_>) -> bool {
             | "method_declaration"
             | "constructor_declaration"
             | "compact_constructor_declaration"
+            | "accessor_declaration"
+            | "operator_declaration"
+            | "conversion_operator_declaration"
+            | "destructor_declaration"
             | "local_function_statement"
             | "lambda"
             | "lambda_expression"
             | "closure_expression"
             | "anonymous_method_expression"
-    )
+    ) || (matches!(node.kind(), "property_declaration" | "indexer_declaration")
+        && node
+            .child_by_field_name("value")
+            .is_some_and(|value| value.kind() == "arrow_expression_clause"))
 }
 
 fn scope(node: Node<'_>, parameter: bool, language: &str) -> Span {
@@ -169,6 +221,7 @@ fn scope(node: Node<'_>, parameter: bool, language: &str) -> Span {
     while let Some(parent) = current {
         root = parent;
         if is_function(parent)
+            || (parameter && parent.kind() == "indexer_declaration")
             || (parameter && parent.kind() == "class_definition")
             || (!parameter
                 && matches!(
@@ -377,10 +430,10 @@ fn rust_import(
         "scoped_use_list" => {
             let path = node
                 .child_by_field_name("path")
-                .map(|p| text_of(p, source))
-                .unwrap_or("");
+                .map(|p| path_text(p, source))
+                .unwrap_or_default();
             if let Some(list) = node.child_by_field_name("list") {
-                rust_import(list, source, &join(path), span, imports, wildcard);
+                rust_import(list, source, &join(&path), span, imports, wildcard);
             }
         }
         "use_list" => {
@@ -394,7 +447,7 @@ fn rust_import(
             let full = if text_of(path, source) == "self" && !prefix.is_empty() {
                 prefix.to_owned()
             } else {
-                join(text_of(path, source))
+                join(&path_text(path, source))
             };
             let alias = node
                 .child_by_field_name("alias")
@@ -406,6 +459,7 @@ fn rust_import(
                 member: None,
                 module_receiver: None,
                 scope: span.clone(),
+                at: node.start_byte(),
                 type_only: false,
             });
         }
@@ -419,7 +473,7 @@ fn imports(node: Node<'_>, source: &str, facts: &mut FileFacts, language: &str) 
             let Some(module) = node.child_by_field_name("source") else {
                 return true;
             };
-            let module = text_of(module, source).trim_matches(['\'', '"']);
+            let module = unquote(text_of(module, source));
             let type_only_statement =
                 matches!(language, "typescript" | "typescriptreact") && has_type_modifier(node);
             let mut stack = named(node);
@@ -431,11 +485,10 @@ fn imports(node: Node<'_>, source: &str, facts: &mut FileFacts, language: &str) 
                             facts.imports.push(Import {
                                 alias: text_of(alias, source).into(),
                                 module: module.into(),
-                                member: Some(
-                                    text_of(name, source).trim_matches(['\'', '"']).into(),
-                                ),
+                                member: Some(unquote(text_of(name, source)).into()),
                                 module_receiver: None,
                                 scope: span.clone(),
+                                at: node.start_byte(),
                                 type_only: type_only_statement || has_type_modifier(child),
                             });
                         }
@@ -448,6 +501,7 @@ fn imports(node: Node<'_>, source: &str, facts: &mut FileFacts, language: &str) 
                                 member: None,
                                 module_receiver: None,
                                 scope: span.clone(),
+                                at: node.start_byte(),
                                 type_only: type_only_statement,
                             });
                         }
@@ -459,6 +513,7 @@ fn imports(node: Node<'_>, source: &str, facts: &mut FileFacts, language: &str) 
                             member: Some("default".into()),
                             module_receiver: None,
                             scope: span.clone(),
+                            at: node.start_byte(),
                             type_only: type_only_statement,
                         });
                     }
@@ -493,6 +548,7 @@ fn imports(node: Node<'_>, source: &str, facts: &mut FileFacts, language: &str) 
                     member: from.map(|_| original.into()),
                     module_receiver: from.is_none().then(|| alias.unwrap_or(original).into()),
                     scope: span.clone(),
+                    at: node.start_byte(),
                     type_only: false,
                 });
             }
@@ -537,6 +593,7 @@ fn imports(node: Node<'_>, source: &str, facts: &mut FileFacts, language: &str) 
                     member,
                     module_receiver: None,
                     scope: span,
+                    at: node.start_byte(),
                     type_only: false,
                 });
             }
@@ -557,6 +614,7 @@ fn imports(node: Node<'_>, source: &str, facts: &mut FileFacts, language: &str) 
                     member: None,
                     module_receiver: None,
                     scope: span,
+                    at: node.start_byte(),
                     type_only: false,
                 });
             } else {
@@ -569,6 +627,7 @@ fn imports(node: Node<'_>, source: &str, facts: &mut FileFacts, language: &str) 
                     member: None,
                     module_receiver: None,
                     scope: span,
+                    at: node.start_byte(),
                     type_only: false,
                 });
             }
@@ -606,7 +665,7 @@ fn expression<'a>(node: Node<'a>, source: &str) -> Option<(Node<'a>, Option<Stri
             Some((
                 name,
                 node.child_by_field_name("path")
-                    .map(|p| text_of(p, source).into()),
+                    .map(|p| path_text(p, source)),
             ))
         }
         "dotted_name" => {
@@ -639,7 +698,7 @@ fn expression<'a>(node: Node<'a>, source: &str) -> Option<(Node<'a>, Option<Stri
                 .or_else(|| node.child_by_field_name("expression"))
                 .or_else(|| node.child_by_field_name("module"))
                 .or_else(|| node.child_by_field_name("qualifier"));
-            Some((name, object.map(|p| text_of(p, source).into())))
+            Some((name, object.map(|p| path_text(p, source))))
         }
         _ => None,
     }
@@ -653,7 +712,7 @@ fn call_expression<'a>(node: Node<'a>, source: &str) -> Option<(Node<'a>, Option
         "method_invocation" => Some((
             node.child_by_field_name("name")?,
             node.child_by_field_name("object")
-                .map(|n| text_of(n, source).into()),
+                .map(|n| path_text(n, source)),
         )),
         "new_expression" => expression(node.child_by_field_name("constructor")?, source),
         "object_creation_expression" => expression(node.child_by_field_name("type")?, source),
@@ -680,6 +739,9 @@ fn is_nonreference_identifier(node: Node<'_>, language: &str) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
+    if language == "rust" && matches!(parent.kind(), "lifetime" | "label") {
+        return true;
+    }
     if parent.kind() == "namespace_export" {
         return true;
     }
@@ -757,6 +819,20 @@ fn annotation_type_name(node: Node<'_>, language: &str) -> bool {
 }
 
 fn add_binding(node: Node<'_>, facts: &mut FileFacts, source: &str, language: &str) {
+    if language == "csharp"
+        && node.kind() == "accessor_declaration"
+        && node
+            .child_by_field_name("name")
+            .is_some_and(|name| matches!(text_of(name, source), "set" | "init" | "add" | "remove"))
+    {
+        // C# supplies this parameter without a parameter node in the AST.
+        facts.bindings.push(Binding {
+            name: "value".into(),
+            span: node.start_byte()..node.start_byte(),
+            scope: node.byte_range(),
+            write: false,
+        });
+    }
     let javascript = matches!(language, "javascript" | "typescript" | "typescriptreact");
     let mut cursor = node.walk();
     let loop_kind = (javascript && node.kind() == "for_in_statement")
@@ -809,6 +885,7 @@ fn add_binding(node: Node<'_>, facts: &mut FileFacts, source: &str, language: &s
             .child_by_field_name("pattern")
             .or_else(|| node.child_by_field_name("name")),
         "variable_declarator"
+        | "const_parameter"
         | "formal_parameter"
         | "spread_parameter"
         | "default_parameter"
@@ -844,7 +921,11 @@ fn add_binding(node: Node<'_>, facts: &mut FileFacts, source: &str, language: &s
                     .parent()
                     .is_some_and(|p| p.kind() == "variable_declaration"));
         let mut binding_scope = scope(node, function_scoped, language);
-        if matches!(
+        if node.kind() == "const_parameter" {
+            if let Some(owner) = node.parent().and_then(|list| list.parent()) {
+                binding_scope = owner.byte_range();
+            }
+        } else if matches!(
             node.kind(),
             "function_expression" | "generator_function" | "match_arm"
         ) || (node.kind() == "for_in_statement" && !function_scoped && !write)
@@ -1138,7 +1219,12 @@ fn collect(
                     let mut parent = node.parent();
                     let mut callable = None;
                     while let Some(ancestor) = parent {
-                        if is_function(ancestor) {
+                        if is_function(ancestor)
+                            && (file.syntax.language != "python"
+                                || ancestor.child_by_field_name("body").is_some_and(|body| {
+                                    body.byte_range().contains(&node.start_byte())
+                                }))
+                        {
                             callable = Some(ancestor);
                             break;
                         }
@@ -1154,12 +1240,23 @@ fn collect(
                     let spelling = text_of(name, source);
                     let verbatim_name =
                         file.syntax.language == "csharp" && spelling.starts_with('@');
+                    let verbatim_receiver = file.syntax.language == "csharp"
+                        && qualifier.as_deref().is_some_and(|q| q.starts_with('@'));
+                    let scoped_path = file.syntax.language == "rust"
+                        && name.parent().is_some_and(|parent| {
+                            matches!(
+                                parent.kind(),
+                                "scoped_identifier" | "scoped_type_identifier"
+                            )
+                        });
                     sites.push(Site {
                         file: file_index,
                         name: identifier(file.syntax.language, spelling).into(),
                         qualifier: qualifier.map(|value| {
                             if file.syntax.language == "rust" {
                                 rust_path(&value)
+                            } else if file.syntax.language == "csharp" {
+                                csharp_path(&value)
                             } else {
                                 value
                             }
@@ -1175,6 +1272,8 @@ fn collect(
                         dynamic_callee,
                         attribute_type_name: annotation_type_name(node, file.syntax.language),
                         verbatim_name,
+                        verbatim_receiver,
+                        scoped_path,
                         name_lookup: match (file.syntax.language, node.kind()) {
                             ("java" | "csharp", _)
                                 if annotation_type_name(node, file.syntax.language) =>
@@ -1190,6 +1289,8 @@ fn collect(
                             ("typescript" | "typescriptreact", "nested_type_identifier") => {
                                 Some(NameLookup::Type)
                             }
+                            ("rust" | "java", "scoped_type_identifier")
+                            | ("csharp", "qualified_name") => Some(NameLookup::Type),
                             ("java" | "csharp", "object_creation_expression") => {
                                 Some(NameLookup::Type)
                             }
@@ -1232,6 +1333,8 @@ fn collect(
                 import.alias = identifier(file.syntax.language, &import.alias).to_owned();
                 if file.syntax.language == "rust" {
                     import.module = rust_path(&import.module);
+                } else {
+                    import.module = csharp_path(&import.module);
                 }
             }
         }
@@ -1476,7 +1579,7 @@ fn exported(
                 if let Some(name) = node.child_by_field_name("name") {
                     let alias = node.child_by_field_name("alias").unwrap_or(name);
                     if text_of(name, &file.syntax.source) == declaration.name
-                        && text_of(alias, &file.syntax.source) == wanted
+                        && unquote(text_of(alias, &file.syntax.source)) == wanted
                         && (!(statement_type_only || has_type_modifier(node))
                             || type_position && NameLookup::Type.accepts(&declaration.kind))
                     {
@@ -1545,9 +1648,9 @@ impl LinkIndex {
                 let qualified = workspace.files[file].symbols[d.key.1]["qualified_name"]
                     .as_str()
                     .unwrap();
-                if language == "rust" && d.kind != "macro" {
-                    // Macro invocations are not value calls, and token trees
-                    // are not analyzed as expanded Rust expressions.
+                if language == "rust" && !matches!(d.kind.as_str(), "macro" | "impl") {
+                    // Impl blocks are containers, not type/value bindings.
+                    // Macro invocations are not analyzed as expanded calls.
                     let name = rust_path(
                         &prefix
                             .iter()
@@ -1563,11 +1666,7 @@ impl LinkIndex {
                         .push(d.key);
                 } else if matches!(language, "java" | "csharp") {
                     let name = if language == "csharp" {
-                        qualified
-                            .split("::")
-                            .map(csharp_identifier)
-                            .collect::<Vec<_>>()
-                            .join(".")
+                        csharp_path(&qualified.replace("::", "."))
                     } else {
                         qualified.replace("::", ".")
                     };
@@ -1590,30 +1689,98 @@ impl LinkIndex {
 }
 
 fn rust_targets(index: &LinkIndex, facts: &[FileFacts], site: &Site, path: &str) -> Vec<Key> {
-    let (root, mut module) = index.rust_modules[site.file].clone();
-    // Inline modules are part of the lexical module path too.
-    for d in &facts[site.file].declarations {
-        if d.kind == "module" && d.span.contains(&site.span.start) {
-            module.push(d.name.clone());
+    let (root, prefix) = &index.rust_modules[site.file];
+    let mut inline_modules: Vec<_> = facts[site.file]
+        .declarations
+        .iter()
+        .filter(|d| d.kind == "module" && d.span.contains(&site.span.start))
+        .collect();
+    inline_modules.sort_by_key(|d| std::cmp::Reverse(d.span.len()));
+    let mut parents = vec![(prefix.clone(), None)];
+    for declaration in inline_modules {
+        let mut module = prefix.clone();
+        if !declaration.container.is_empty() {
+            module.extend(
+                rust_path(&declaration.container)
+                    .split("::")
+                    .map(str::to_owned),
+            );
         }
+        module.push(declaration.name.clone());
+        parents.push((module, Some(declaration)));
     }
+    let (mut module, mut owner) = parents.pop().unwrap();
     let mut parts: Vec<String> = path.split("::").map(str::to_owned).collect();
     if parts.first().is_some_and(|p| p == "crate") {
         module.clear();
+        parents.clear();
+        owner = None;
         parts.remove(0);
     } else if parts.first().is_some_and(|p| p == "self") {
         parts.remove(0);
     }
     while parts.first().is_some_and(|p| p == "super") {
-        module.pop();
+        // A local module's display path includes its enclosing function.
+        // `super` crosses one actual module, not one display-path component.
+        if let Some(parent) = parents.pop() {
+            (module, owner) = parent;
+        } else if module.pop().is_none() {
+            return Vec::new();
+        }
         parts.remove(0);
     }
     module.extend(parts);
     index
         .rust
-        .get(&(root, module.join("::")))
-        .cloned()
-        .unwrap_or_default()
+        .get(&(root.clone(), rust_path(&module.join("::"))))
+        .into_iter()
+        .flatten()
+        .filter(|&&key| {
+            key.0 != site.file
+                || owner.is_none_or(|module| {
+                    facts[site.file]
+                        .declarations
+                        .iter()
+                        .find(|d| d.key == key)
+                        .is_some_and(|target| module.span.contains(&target.span.start))
+                })
+        })
+        .copied()
+        .collect()
+}
+
+fn container_contains(facts: &FileFacts, container: &Declaration, member: &Declaration) -> bool {
+    if container.span.contains(&member.span.start) {
+        return true;
+    }
+    // Rust impls can be separate from their type declaration. A display path
+    // alone cannot distinguish same-named local types in sibling blocks.
+    facts.declarations.iter().any(|implementation| {
+        implementation.kind == "impl"
+            && implementation.name == container.name
+            && implementation.container == container.container
+            && implementation.scope == container.scope
+            && implementation.span.contains(&member.span.start)
+    })
+}
+
+fn container_members(
+    workspace: &Workspace,
+    facts: &FileFacts,
+    container: &Declaration,
+    name: &str,
+) -> Vec<Key> {
+    let qualified = &workspace.files[container.key.0].symbols[container.key.1]["qualified_name"];
+    facts
+        .declarations
+        .iter()
+        .filter(|member| {
+            member.name == name
+                && *qualified == member.container
+                && container_contains(facts, container, member)
+        })
+        .map(|member| member.key)
+        .collect()
 }
 
 fn rust_lexical_targets(
@@ -1657,6 +1824,18 @@ fn rust_lexical_targets(
                 .get(&(root.clone(), name))
                 .into_iter()
                 .flatten()
+                .filter(|&&key| {
+                    if key.0 != site.file {
+                        // Inline modules may themselves contain external
+                        // submodules, whose file paths supply the same prefix.
+                        return declaration.kind == "module";
+                    }
+                    facts
+                        .declarations
+                        .iter()
+                        .find(|d| d.key == key)
+                        .is_some_and(|member| container_contains(facts, declaration, member))
+                })
                 .copied(),
         );
     }
@@ -1668,22 +1847,30 @@ fn receiver_container<'a>(
     workspace: &Workspace,
     facts: &'a FileFacts,
     site: &Site,
-) -> Option<&'a str> {
+) -> Option<&'a Declaration> {
     let qualifier = site.qualifier.as_deref()?;
     let owner = facts
         .declarations
         .iter()
         .find(|d| Some(d.key) == site.owner)?;
-    if !facts.declarations.iter().any(|d| {
-        matches!(
-            d.kind.as_str(),
-            "class" | "struct" | "record" | "impl" | "trait" | "interface"
-        ) && workspace.files[site.file].symbols[d.key.1]["qualified_name"] == owner.container
-    }) {
-        return None;
-    }
+    let container = facts
+        .declarations
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.kind.as_str(),
+                "class" | "struct" | "record" | "impl" | "trait" | "interface"
+            ) && d.span.contains(&owner.span.start)
+                && (workspace.files[site.file].symbols[d.key.1]["qualified_name"]
+                    == owner.container
+                    || owner.kind == "accessor")
+        })
+        .min_by_key(|d| d.span.len())?;
     let file = &workspace.files[site.file];
     let language = file.syntax.language;
+    if site.verbatim_receiver || (language == "rust" && qualifier == "self" && site.scoped_path) {
+        return None;
+    }
     if (qualifier == "this"
         && matches!(
             language,
@@ -1691,7 +1878,7 @@ fn receiver_container<'a>(
         ))
         || (qualifier == "Self" && language == "rust")
     {
-        return Some(&owner.container);
+        return Some(container);
     }
     let node = declaration_node(file.syntax.tree.root_node(), &file.symbols[owner.key.1])?;
     let parameter = node.child_by_field_name("parameters")?.named_child(0)?;
@@ -1753,7 +1940,7 @@ fn receiver_container<'a>(
     {
         return None;
     }
-    Some(&owner.container)
+    Some(container)
 }
 
 fn type_targets(
@@ -1781,7 +1968,7 @@ fn csharp_namespace(facts: &FileFacts, at: usize) -> String {
                 && matches!(d.kind.as_str(), "class" | "struct" | "record" | "interface")
         })
         .max_by_key(|d| d.span.len())
-        .map(|d| d.container.replace("::", "."))
+        .map(|d| csharp_path(&d.container.replace("::", ".")))
         .unwrap_or_default()
 }
 
@@ -1803,7 +1990,10 @@ fn import_targets(
             || import.module.clone(),
             |m| format!("{}::{m}", import.module),
         );
-        return rust_targets(index, facts, site, &path);
+        let mut origin = site.clone();
+        origin.span = import.at..import.at;
+        return rust_lexical_targets(workspace, index, &facts[site.file], &origin, &path)
+            .unwrap_or_else(|| rust_targets(index, facts, &origin, &path));
     }
     if matches!(language, "java" | "csharp") {
         if member.is_some() && import.member.is_some() {
@@ -1960,6 +2150,13 @@ fn resolve_exact(
     }) {
         return Resolution::unresolved("global_or_nonlocal_binding_not_resolved");
     }
+    // A validated method receiver is a closer binding than a module import.
+    if let Some(container) = receiver_container(workspace, facts, site) {
+        return Resolution::candidates(
+            container_members(workspace, facts, container, &site.name),
+            "receiver_dispatch_not_resolved",
+        );
+    }
     let mut imports: Vec<_> = facts
         .imports
         .iter()
@@ -2016,11 +2213,7 @@ fn resolve_exact(
         );
     }
     if let Some(qualifier) = &site.qualifier {
-        if language == "rust"
-            && qualifier != "Self"
-            && workspace.files[site.file].syntax.source[site.span.start..site.name_span.start]
-                .contains("::")
-        {
+        if language == "rust" && qualifier != "Self" && site.scoped_path {
             return Resolution::candidates(
                 rust_lexical_targets(
                     workspace,
@@ -2033,17 +2226,6 @@ fn resolve_exact(
                     rust_targets(index, all, site, &format!("{qualifier}::{}", site.name))
                 }),
                 "explicit_module_path_without_compiler_resolution",
-            );
-        }
-        if let Some(container) = receiver_container(workspace, facts, site) {
-            return Resolution::candidates(
-                facts
-                    .declarations
-                    .iter()
-                    .filter(|d| d.container == container && d.name == site.name)
-                    .map(|d| d.key)
-                    .collect(),
-                "receiver_dispatch_not_resolved",
             );
         }
         // A named class/module in lexical scope is useful as a candidate. Never
@@ -2067,16 +2249,7 @@ fn resolve_exact(
         let targets = types
             .iter()
             .filter(|d| Some(&d.scope) == closest_scope)
-            .flat_map(|parent| {
-                let container = workspace.files[site.file].symbols[parent.key.1]["qualified_name"]
-                    .as_str()
-                    .unwrap();
-                facts
-                    .declarations
-                    .iter()
-                    .filter(move |d| d.container == container && d.name == site.name)
-                    .map(|d| d.key)
-            })
+            .flat_map(|parent| container_members(workspace, facts, parent, &site.name))
             .collect::<Vec<_>>();
         if !types.is_empty() {
             return Resolution::candidates(targets, "named_container_without_type_resolution");
@@ -2127,7 +2300,7 @@ fn resolve_exact(
             d.name == site.name
                 && visible(facts, &d.scope, at)
                 && lookup.is_none_or(|lookup| lookup.accepts(&d.kind))
-                && !(language == "rust" && d.kind == "macro")
+                && !(language == "rust" && matches!(d.kind.as_str(), "macro" | "impl"))
         })
         .filter(|d| {
             !matches!(
@@ -2255,6 +2428,10 @@ pub(super) fn execute(s: &Session, args: &Value, cancel: &CancellationToken) -> 
         // Its members are following AST siblings, all within this namespace.
         span.end = workspace.files[file].syntax.source.len();
     }
+    let callable = declaration_node(workspace.files[file].syntax.tree.root_node(), symbol)
+        .is_some_and(|node| {
+            is_function(node) || node.child_by_field_name("value").is_some_and(is_function)
+        });
     let relation = args["relation"].as_str().unwrap_or("calls");
     let (facts, sites, unsupported_calls) = collect(&workspace, cancel, deadline)?;
     let index = LinkIndex::new(&workspace, &facts, cancel, deadline)?;
@@ -2269,13 +2446,7 @@ pub(super) fn execute(s: &Session, args: &Value, cancel: &CancellationToken) -> 
         }
         // A nested function has its own outgoing calls; they are not executions
         // of the selected function. Class/module queries intentionally include descendants.
-        if relation == "calls"
-            && matches!(
-                symbol["symbol_kind"].as_str(),
-                Some("function" | "method" | "constructor")
-            )
-            && site.owner != Some(key)
-        {
+        if relation == "calls" && callable && site.owner != Some(key) {
             continue;
         }
         if relation == "callers" && !site.call {

@@ -28,8 +28,8 @@ fn session(root: &std::path::Path) -> Session {
             ..Default::default()
         },
     );
-    s.add_user("Save result.txt with a conclusion and an example".into());
     s.task.completion = vec!["Conclusion is saved".into(), "An example is saved".into()];
+    s.add_user("Save result.txt with a conclusion and an example".into());
     s
 }
 
@@ -221,6 +221,267 @@ fn finish(s: &mut Session, met: bool) -> Option<String> {
 }
 
 #[test]
+fn working_checks_cannot_add_requirements_or_weaken_caller_requirements() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            ..Default::default()
+        },
+    );
+    s.task.completion = vec!["Include a conclusion and an example".into()];
+    s.task.constraints = vec!["Use Korean".into()];
+    s.task.deliverables = vec!["result.txt".into()];
+    s.add_user("Save result.txt with a conclusion and an example".into());
+    write(&mut s, "결론과 예시\n");
+    s.task.completion = vec!["Every investigation must be exactly written".into()];
+    s.task.constraints.clear();
+    s.task
+        .deliverables
+        .push("Internal investigation ledger".into());
+
+    assert_eq!(
+        review::begin(&mut s, "Saved result.txt").unwrap(),
+        Gate::Review
+    );
+    let p = payload(&review::request(&mut s).unwrap());
+    assert_eq!(p["original_request"], s.answer_review_question);
+    assert_eq!(p["criteria"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        p["criteria"][1]["text"],
+        "Include a conclusion and an example"
+    );
+    assert_eq!(p["constraints"], json!(["Use Korean"]));
+    assert_eq!(p["deliverables"], json!(["result.txt"]));
+    assert!(!p.to_string().contains("exactly written"));
+    assert!(!p.to_string().contains("Internal investigation ledger"));
+
+    // Refining a working checklist during a review neither weakens the
+    // caller's requirements nor makes an otherwise current verdict stale.
+    s.task.completion = vec!["Conclusion only is enough".into()];
+    assert_eq!(
+        review::finish(&mut s, &verdict(&p, true))
+            .unwrap()
+            .as_deref(),
+        Some("Saved result.txt")
+    );
+    assert_eq!(
+        review::current_verdict(&s),
+        review::CurrentVerdict::Approved
+    );
+    assert_eq!(
+        review::begin(&mut s, "Saved result.txt").unwrap(),
+        Gate::Accepted
+    );
+    s.add_user("continue".into());
+    assert_eq!(
+        s.request_review_criteria.completion,
+        ["Include a conclusion and an example"]
+    );
+}
+
+#[test]
+fn changed_requirements_invalidate_rejection_without_reopening_stale_repairs() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Conclusion only\n");
+    review::begin(&mut s, "Saved result.txt").unwrap();
+    assert!(finish(&mut s, false).is_none());
+    review::schedule_repairs(&mut s);
+    let id = s.task.current_todo().unwrap().id.clone();
+    plan(
+        &mut s,
+        json!([{"op":"complete","id":id,"result":"Only marked done"}]),
+    );
+    assert!(review::rejected_on_current_result(&s));
+
+    s.request_review_criteria
+        .constraints
+        .push("Use Korean".into());
+    assert_eq!(
+        review::current_verdict(&s),
+        review::CurrentVerdict::Unreviewed
+    );
+    assert!(!review::rejected_on_current_result(&s));
+    assert_eq!(review::guidance(&s)["needs_review"], true);
+    assert_eq!(review::guidance(&s)["remaining"], 0);
+    assert_eq!(review::view(&s)["checks"], json!([]));
+    review::schedule_repairs(&mut s);
+    assert!(s.task.current_todo().is_none());
+    assert!(
+        !s.completion_review.checks.is_empty(),
+        "Keep the historical verdict for diagnostics"
+    );
+    assert_eq!(
+        review::begin(&mut s, "Saved result.txt").unwrap(),
+        Gate::Review
+    );
+    assert!(finish(&mut s, false).is_none());
+    assert!(review::rejected_on_current_result(&s));
+}
+
+#[test]
+fn unavailable_review_binds_only_the_result_it_could_not_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Conclusion only\n");
+    review::begin(&mut s, "Saved result.txt").unwrap();
+    review::request(&mut s).unwrap();
+    review::mark_unavailable(&mut s, Some("Invalid reviewer response".into()));
+    assert_eq!(
+        review::current_verdict(&s),
+        review::CurrentVerdict::Unavailable
+    );
+    assert_eq!(
+        review::begin(&mut s, "Saved result.txt").unwrap(),
+        Gate::Unavailable
+    );
+    assert_eq!(review::view(&s)["unavailable"], true);
+
+    write(&mut s, "Conclusion\nExample: saved\n");
+    assert_eq!(
+        review::current_verdict(&s),
+        review::CurrentVerdict::Unreviewed
+    );
+    assert_eq!(review::view(&s)["unavailable"], false);
+    assert_eq!(review::view(&s)["unavailable_reason"], Value::Null);
+    assert_eq!(review::view(&s)["needs_review"], true);
+    assert_eq!(
+        review::begin(&mut s, "Saved result.txt").unwrap(),
+        Gate::Review
+    );
+    assert!(finish(&mut s, true).is_some());
+}
+
+#[test]
+fn verified_manual_gets_a_fresh_review_without_a_document_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("ui.js"), "export function openChat() {}\n").unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("manual.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            ..Default::default()
+        },
+    );
+    s.add_user("ui 사용자 매뉴얼 만들어줘".into());
+    s.select_workflow("source_document").unwrap();
+    tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{
+            "completion":["모든 조사 항목이 written 상태이며 감사로 구조/인용 오류가 없다"]
+        }}),
+    )
+    .unwrap();
+    let read = tools::execute(&mut s, "file_read", json!({"path":"ui.js"})).unwrap();
+    let body = (1..=7)
+        .map(|i| format!("# Screen {i}\nOpen the chat screen. ui.js:1\n\n"))
+        .collect::<String>();
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":body}),
+    )
+    .unwrap();
+    for i in 1..=7 {
+        tools::execute(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":format!("T{i}"),
+            "title":format!("Screen {i}"),"section":format!("# Screen {i}"),"status":"written"}),
+        )
+        .unwrap();
+        if i > 1 {
+            tools::execute(&mut s, "investigation", json!({"action":"verify","id":format!("T{i}"),
+                "source_ids":[read["source"]["id"]],"verification_note":"Compared the chat function"})).unwrap();
+        }
+    }
+    let saved_hash = s.last_document_write.as_ref().unwrap().1.clone();
+    // Match the live run: both review options are on, and document review has
+    // already approved the unchanged manual before completion is retried.
+    assert!(s.config.source_document_review && s.config.completion_review_enabled);
+    tools::document_review::request(&mut s).unwrap();
+    tools::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    assert!(tools::document_review::approved(&s));
+    assert_eq!(
+        review::begin(&mut s, "매뉴얼을 저장했습니다.").unwrap(),
+        Gate::Review
+    );
+    let p = payload(&review::request(&mut s).unwrap());
+    assert_eq!(
+        p["criteria"].as_array().unwrap().len(),
+        1,
+        "Only the actual user request is a requirement"
+    );
+    assert_eq!(p["criteria"][0]["id"], "R0");
+    assert_eq!(p["evidence"][2]["items"][0]["status"], "written");
+    assert_eq!(p["evidence"][2]["items"][1]["status"], "verified");
+    let mut response: Value = serde_json::from_str(&verdict(&p, false)).unwrap();
+    response["checks"][0]["reason"] = json!("T1 is still written; six other items are verified");
+    response["checks"][0]["next_action"] = json!("Verify T1 against the delivered source");
+    assert!(
+        review::finish(&mut s, &response.to_string())
+            .unwrap()
+            .is_none()
+    );
+    assert!(review::rejected_on_current_result(&s));
+
+    tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"T1",
+        "source_ids":[read["source"]["id"]],"verification_note":"Compared the chat function"}),
+    )
+    .unwrap();
+    assert_eq!(s.last_document_write.as_ref().unwrap().1, saved_hash);
+    assert!(
+        s.investigations
+            .iter()
+            .all(|item| item.status == "verified")
+    );
+    assert_eq!(
+        review::current_verdict(&s),
+        review::CurrentVerdict::Unreviewed
+    );
+    assert_eq!(review::guidance(&s)["checks"], json!([]));
+    assert_eq!(review::view(&s)["approved"], false);
+    assert_eq!(review::view(&s)["needs_review"], true);
+    assert_eq!(
+        review::begin(&mut s, "매뉴얼을 저장했습니다.").unwrap(),
+        Gate::Review
+    );
+    let p = payload(&review::request(&mut s).unwrap());
+    assert!(
+        p["evidence"][2]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["status"] == "verified")
+    );
+    assert_eq!(
+        review::finish(&mut s, &verdict(&p, true))
+            .unwrap()
+            .as_deref(),
+        Some("매뉴얼을 저장했습니다.")
+    );
+    assert_eq!(
+        review::current_verdict(&s),
+        review::CurrentVerdict::Approved
+    );
+    assert_eq!(review::view(&s)["approved"], true);
+    assert_eq!(review::view(&s)["needs_review"], false);
+}
+
+#[test]
 fn targeted_read_keeps_evidence_beyond_the_old_receipt_character_cutoff() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
@@ -406,7 +667,7 @@ fn approval_requires_every_page_and_is_invalidated_by_files_or_requirements() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     write(&mut s, "Conclusion and Example\n");
-    s.task.completion = (0..20).map(|i| format!("Condition {i}")).collect();
+    s.request_review_criteria.completion = (0..20).map(|i| format!("Condition {i}")).collect();
     assert_eq!(review::begin(&mut s, "Done").unwrap(), Gate::Review);
     assert!(finish(&mut s, true).is_none());
     assert!(s.completion_review.pending);
@@ -416,9 +677,15 @@ fn approval_requires_every_page_and_is_invalidated_by_files_or_requirements() {
     assert_eq!(s.completion_review.checks.len(), 21);
     assert_eq!(review::begin(&mut s, "Done").unwrap(), Gate::Accepted);
     std::fs::write(dir.path().join("result.txt"), "Changed outside agent").unwrap();
+    assert_eq!(
+        review::current_verdict(&s),
+        review::CurrentVerdict::Unreviewed
+    );
+    assert_eq!(review::guidance(&s)["approved"], false);
+    assert_eq!(review::view(&s)["checks"], json!([]));
     assert_eq!(review::begin(&mut s, "Done").unwrap(), Gate::Review);
     let p = payload(&review::request(&mut s).unwrap());
-    s.task.completion = vec!["Weakened requirement".into()];
+    s.request_review_criteria.completion = vec!["Changed caller requirement".into()];
     assert!(review::finish(&mut s, &verdict(&p, true)).is_err());
     let p = payload(&review::request(&mut s).unwrap());
     assert_eq!(
@@ -830,7 +1097,11 @@ async fn rejected_review_bounds_tool_only_repair_loop_and_keeps_work_for_resume(
     );
     assert_eq!(*client.reviews.lock().unwrap(), 1);
     assert!(*client.calls.lock().unwrap() <= 42);
-    assert!(result.task.current_todo().is_some());
+    assert!(
+        result.task.current_todo().is_none(),
+        "A new read invalidated the review; do not reopen its completed repair from a stale verdict"
+    );
+    assert_eq!(review::guidance(&result)["needs_review"], true);
     assert!(!result.completion_review.checks.is_empty());
     assert!(
         !events
@@ -1139,6 +1410,23 @@ fn a_rejection_binds_only_the_result_it_reviewed() {
     // Re-inspecting the unchanged output is not new evidence.
     step(&mut s, "inspect", "document_inspect", json!({}));
     assert!(review::rejected_on_current_result(&s));
+    assert_eq!(
+        review::begin(&mut s, "Saved manual.md").unwrap(),
+        Gate::Repair
+    );
+    // A section read, unlike an outline-only query, delivers actual content.
+    step(
+        &mut s,
+        "read-section",
+        "document_inspect",
+        json!({"section":"# Manual"}),
+    );
+    assert!(!review::rejected_on_current_result(&s));
+    assert_eq!(
+        review::begin(&mut s, "Saved manual.md").unwrap(),
+        Gate::Review
+    );
+    assert_eq!(finish(&mut s, false), None);
     // A newly delivered source read is a changed basis for the re-review.
     step(&mut s, "read", "file_read", json!({"path":"ui.js"}));
     assert!(!review::rejected_on_current_result(&s));

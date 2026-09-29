@@ -37,6 +37,12 @@ fn report_diagnostics(result: &Session, audit: &Value) -> Value {
         tools::document_review::CurrentVerdict::Unavailable => "unavailable_current",
         tools::document_review::CurrentVerdict::Unreviewed => "unreviewed",
     };
+    let completion_verdict = match tools::completion_review::current_verdict(result) {
+        tools::completion_review::CurrentVerdict::Approved => "approved",
+        tools::completion_review::CurrentVerdict::Rejected(_) => "rejected_current",
+        tools::completion_review::CurrentVerdict::Unavailable => "unavailable_current",
+        tools::completion_review::CurrentVerdict::Unreviewed => "unreviewed",
+    };
     json!({
         "completion_gaps":result.completion_gaps,
         "run_stop_reason":result.run_history.back().map(|run| run.reason.as_str()),
@@ -44,6 +50,7 @@ fn report_diagnostics(result: &Session, audit: &Value) -> Value {
         "final_document_hash":final_document_hash,
         "review_target_hash":tools::document_review::review_target_hash(result),
         "review_verdict":review_verdict,
+        "completion_verdict":completion_verdict,
     })
 }
 
@@ -78,6 +85,7 @@ fn live_report_records_completion_gaps_and_stop_reason() {
         json!(result.completion_gaps)
     );
     assert_eq!(diagnostics["run_stop_reason"], "closing_round_limit");
+    assert_eq!(diagnostics["completion_verdict"], "unreviewed");
     assert_eq!(diagnostics["final_document_hash"], "current-hash");
     assert_eq!(diagnostics["review_target_hash"], Value::Null);
     assert_eq!(diagnostics["review_verdict"], "unreviewed");
@@ -663,7 +671,10 @@ async fn registered_source_documentation() {
     }
     if result.config.completion_review_enabled {
         assert!(result.completion_review.attempts > 0);
-        assert!(result.completion_review.approved);
+        assert_eq!(
+            tools::completion_review::current_verdict(&result),
+            tools::completion_review::CurrentVerdict::Approved
+        );
     }
     let min_investigations = std::env::var("MNEMOARC_DOC_MIN_INVESTIGATIONS")
         .map(|value| value.parse::<usize>().expect("minimum investigation count"))

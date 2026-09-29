@@ -128,29 +128,29 @@ fn collect_gaps(s: &mut Session, extra: &[String]) -> Vec<String> {
             }
         }
     }
-    if tools::completion_review::required(s) && !s.completion_review.approved {
-        let unmet: Vec<_> = s
-            .completion_review
-            .checks
-            .iter()
-            .filter(|check| check.status != "met")
-            .collect();
-        if !unmet.is_empty() {
-            for check in unmet.iter().take(12) {
-                let status = if check.status == "unmet" {
-                    "미충족"
-                } else {
-                    "확인 불가"
-                };
-                gaps.push(format!(
-                    "완료 조건 {} ({status}) — {}",
-                    check.id, check.reason
-                ));
+    if tools::completion_review::required(s) {
+        use tools::completion_review::CurrentVerdict;
+        match tools::completion_review::current_verdict(s) {
+            CurrentVerdict::Approved => {}
+            CurrentVerdict::Rejected(checks) => {
+                for check in checks.iter().filter(|check| check.status != "met").take(12) {
+                    let status = if check.status == "unmet" {
+                        "미충족"
+                    } else {
+                        "확인 불가"
+                    };
+                    gaps.push(format!(
+                        "완료 조건 {} ({status}) — {}",
+                        check.id, check.reason
+                    ));
+                }
             }
-        } else if s.completion_review.unavailable {
-            gaps.push("완료 조건 검증 — 검토 응답 오류로 검증을 마치지 못했습니다.".into());
-        } else {
-            gaps.push("완료 조건 검증 — 마감 전에 수행하지 못했습니다.".into());
+            CurrentVerdict::Unavailable => {
+                gaps.push("완료 조건 검증 — 검토 응답 오류로 검증을 마치지 못했습니다.".into());
+            }
+            CurrentVerdict::Unreviewed => {
+                gaps.push("완료 조건 검증 — 현재 결과를 마감 전에 검토하지 못했습니다.".into());
+            }
         }
     }
     for item in &s.task.unresolved {
@@ -1199,10 +1199,18 @@ pub async fn run_session_controlled(
         {
             phase = "draft".into();
         }
+        let completion_rejected = tools::completion_review::rejected_on_current_result(&s);
+        if !completion_rejected
+            && s.last_error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("completion_review_unmet:"))
+        {
+            s.last_error = None;
+        }
         if finalization_attempts > 0
             || (s.config.source_document_review
                 && tools::document_review::rejected_on_current_result(&s))
-            || s.completion_review.checks.iter().any(|c| c.status != "met")
+            || completion_rejected
         {
             // A rejected document completion always returns to verification,
             // even if the model previously declared itself ready to answer.
@@ -1225,10 +1233,7 @@ pub async fn run_session_controlled(
             // evidence, and a live run stalled out reading exactly that.
             let review_repair_open = (s.config.source_document_review
                 && tools::document_review::rejected_on_current_result(&s))
-                || s.completion_review
-                    .checks
-                    .iter()
-                    .any(|check| check.status != "met");
+                || completion_rejected;
             if phase == "investigate" || !s.document_written || review_repair_open {
                 s.progress_recovery.evidence_credit =
                     s.progress_recovery.evidence_credit.max(s.sources.len());
@@ -2952,6 +2957,9 @@ pub async fn run_session_controlled(
             );
             break;
         }
+        // Count the work since the last confirmed review improvement even when
+        // new evidence has made that verdict stale. Changing results alone
+        // must not reset this budget; stale checks cannot reopen repair to-dos.
         if !checkpoint_batch
             && s.completion_review
                 .checks
@@ -2962,12 +2970,12 @@ pub async fn run_session_controlled(
             if s.completion_review.repair_rounds >= COMPLETION_REPAIR_EXHAUST_LIMIT
                 && !recover_document(
                     &mut s,
-                    "Repair rounds have not satisfied a completion check. Resolve the first check through a targeted edit or missing evidence, then request acceptance.",
+                    "Repair rounds have not produced a new accepted result. Finish the concrete correction or targeted verification, then give the final answer to request a review of the current result.",
                 )
             {
                 tools::completion_review::schedule_repairs(&mut s);
                 s.status = "partial".into();
-                s.last_error = Some("completion_review_no_progress: focused repair rounds did not satisfy another criterion; repair tasks and unmet checks retained for a changed approach".into());
+                s.last_error = Some("completion_review_no_progress: repair rounds exhausted without a new approval; result and review history retained for re-evaluation".into());
                 break;
             }
         }
@@ -3129,6 +3137,97 @@ pub fn apply_config(s: &mut Session, config: Config) -> Result<()> {
 mod review_gap_tests {
     use super::*;
     use crate::config::{Project, Secret};
+
+    #[test]
+    fn completion_readiness_and_final_gaps_use_the_current_investigation_state() {
+        use tools::completion_review::{self as review, Gate};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ui.js"), "function openChat() {}\n").unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("manual.md"),
+                ..Default::default()
+            },
+            Config {
+                model: "gpt-4o".into(),
+                source_document_review: false,
+                ..Default::default()
+            },
+        );
+        s.add_user("ui 사용자 매뉴얼 만들어줘".into());
+        s.select_workflow("source_document").unwrap();
+        let read = tools::execute(&mut s, "file_read", json!({"path":"ui.js"})).unwrap();
+        tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"create",
+            "text":"# Chat\nOpen the chat screen. ui.js:1\n"}),
+        )
+        .unwrap();
+        tools::execute(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":"T1",
+            "title":"Chat","section":"# Chat","status":"written"}),
+        )
+        .unwrap();
+        assert_eq!(
+            review::begin(&mut s, "매뉴얼을 저장했습니다.").unwrap(),
+            Gate::Review
+        );
+        review::request(&mut s).unwrap();
+        review::finish(
+            &mut s,
+            &json!({"checks":[{"id":"R0","status":"unverified",
+            "reason":"T1 is still written","evidence":["E2"],"next_action":"Verify T1"}]})
+            .to_string(),
+        )
+        .unwrap();
+        assert!(!ready_for_final(&s));
+        assert!(
+            collect_gaps(&mut s, &[])
+                .iter()
+                .any(|gap| gap.contains("T1 is still written"))
+        );
+
+        tools::execute(
+            &mut s,
+            "investigation",
+            json!({"action":"verify","id":"T1",
+            "source_ids":[read["source"]["id"]],"verification_note":"Compared the chat function"}),
+        )
+        .unwrap();
+        assert!(
+            ready_for_final(&s),
+            "Verification must unblock the final answer that starts a new review"
+        );
+        let gaps = collect_gaps(&mut s, &[]);
+        assert!(!gaps.iter().any(|gap| gap.contains("T1 is still written")));
+        assert!(
+            gaps.iter()
+                .any(|gap| gap == "완료 조건 검증 — 현재 결과를 마감 전에 검토하지 못했습니다.")
+        );
+
+        assert_eq!(
+            review::begin(&mut s, "매뉴얼을 저장했습니다.").unwrap(),
+            Gate::Review
+        );
+        let request = review::request(&mut s).unwrap();
+        let payload: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        let file = payload["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "current_file")
+            .unwrap();
+        review::finish(&mut s, &json!({"checks":[{"id":"R0","status":"met",
+            "reason":"Saved manual covers the chat screen","evidence":[file["id"]],"next_action":""}]}).to_string()).unwrap();
+        assert!(collect_gaps(&mut s, &[]).is_empty());
+        assert!(ready_for_final(&s));
+    }
 
     #[test]
     fn closing_reports_only_findings_reviewed_for_the_current_document() {

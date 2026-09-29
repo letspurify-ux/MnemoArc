@@ -1233,7 +1233,9 @@ function Inspector({
                     ? "실제 결과를 검증하고 있습니다."
                     : session.completion_review.approved
                       ? "모든 완료 조건의 검증을 통과했습니다."
-                      : "할 일 완료 후에도 조건이 충족될 때까지 보완합니다."}
+                      : session.completion_review.needs_review
+                        ? "현재 결과의 완료 조건을 다시 확인해야 합니다."
+                        : "할 일 완료 후에도 조건이 충족될 때까지 보완합니다."}
                 </p>
                 <ul>
                   {(session.completion_review.checks || []).map((check) => (

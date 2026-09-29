@@ -27,6 +27,8 @@
 
 익명 콜백 안에서 발견한 참조는 `enclosing_callable`에 위치와 `anonymous: true`를 표시한다. 선언으로 이름 붙은 호출 범위에는 `enclosing_symbol`도 제공한다.
 
+C# 접근자·연산자·변환 연산자·소멸자와 식 본문 프로퍼티·인덱서도 이름 있는 호출 범위다. 그 안의 중첩 콜백 호출은 별도로 분리한다. Python 함수·람다의 기본 인자 표현식은 정의할 때 평가되므로 바깥 실행 범위의 호출로 기록한다. JavaScript 기본 인자는 해당 함수의 호출 범위에 남는다.
+
 JS/TS 객체 축약 값(`{save}`)도 일반 참조에 포함한다. Rust 구조체 초기화·분해 패턴의 필드 이름은 같은 이름의 함수 참조로 세지 않는다. C#의 익명 `delegate` 본문은 별도 호출 범위로 다룬다.
 
 Rust 매크로 호출과 매크로·어트리뷰트 토큰은 확장된 호출로 해석하지 않는다. 같은 이름의 매크로와 함수가 있으면 일반 함수 호출은 함수 후보만 반환한다. Java 어노테이션과 C# 어트리뷰트의 이름은 타입 참조로 분류한다. C#의 `[Save]`는 [언어 명세의 접미사 생략 규칙](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/attributes)에 따라 `SaveAttribute`도 후보로 찾으며, 둘 다 선언되어 있으면 후보를 함께 표시한다. `[@Save]`는 접미사를 붙이지 않고 정확한 타입 이름만 찾는다. 상속 관계는 검증하지 않는다.
@@ -58,14 +60,18 @@ Java·C#의 문장 레이블과 이동 대상, Python·C#의 이름 지정 인�
 
 Python 함수 매개변수는 본문에서 사용하며 기본값 표현식은 바깥 범위에서 찾는다. 클래스 이름 공간은 클래스 본문과 메서드 기본값에서 사용하고, 메서드·중첩 클래스·comprehension 본문에서는 건너뛴다. comprehension의 첫 iterable 표현식은 바깥 범위를 사용한다. Rust `let`의 초기값과 `for`의 iterable, Java/C# foreach의 iterable에서도 새 반복·지역 변수가 바깥 이름을 가리지 않는다.
 
+같은 `qualified_name`을 가진 지역 타입·모듈도 실제 선언 범위로 구분한다. 서로 다른 블록의 동명 멤버를 합치지 않는다. Rust 수명과 루프 레이블은 값 참조에서 제외하고, const 제네릭 매개변수는 자신의 선언 범위에서 바깥 값을 가린다. C# 인덱서 매개변수와 set/init/add/remove의 암시적 `value`도 해당 범위에만 적용한다.
+
 언어별 연결은 다음 범위에서 후보를 제공한다.
 
-- JS/TS: 상대 경로의 명시적 ESM import, 이름 별칭, namespace import, 직접 export와 같은 파일의 export 목록. 직접 export한 선언에 추가한 별칭도 조회한다. `export default name`과 default 키워드 뒤의 줄바꿈·주석도 처리한다. 로컬 수출 목록의 원래 이름은 참조로 남기고 공개 별칭과 원격 재수출 이름은 지역 참조로 세지 않는다. import한 클래스의 멤버는 그 클래스 내부에서 찾는다. TypeScript의 `Types.Foo`는 한정자를 유지하며, `import type`, `export type`과 개별 `type` 표기는 타입 참조 후보에만 사용하고 런타임 호출 후보에는 사용하지 않는다. [TypeScript 모듈 문서](https://www.typescriptlang.org/docs/handbook/esm-node.html)를 따른다.
+- JS/TS: 상대 경로의 명시적 ESM import, 이름 별칭, namespace import, 직접 export와 같은 파일의 export 목록. 직접 export한 선언에 추가한 별칭과 문자열로 표기한 export 이름도 조회한다. `export default name`과 default 키워드 뒤의 줄바꿈·주석도 처리한다. 로컬 수출 목록의 원래 이름은 참조로 남기고 공개 별칭과 원격 재수출 이름은 지역 참조로 세지 않는다. import한 클래스의 멤버는 그 클래스 내부에서 찾는다. TypeScript의 `Types.Foo`는 한정자를 유지하며, `import type`, `export type`과 개별 `type` 표기는 타입 참조 후보에만 사용하고 런타임 호출 후보에는 사용하지 않는다. [TypeScript 모듈 문서](https://www.typescriptlang.org/docs/handbook/esm-node.html)를 따른다.
 - Python: 프로젝트 루트 또는 상대 경로의 `import`/`from ... import ...`, 별칭과 클래스 멤버 후보. `import pkg.mod`의 `pkg.mod.member`, `from . import mod`의 하위 모듈 경로를 구분한다.
 - Rust: `use`의 별칭·중첩 목록, `crate`/`self`/`super`와 명시적 모듈 경로, 현재 impl/trait의 `Self` 멤버. 상대 경로는 가까운 지역 타입·모듈이 바깥 선언을 가리는지 확인한다. `r#`가 붙은 식별자는 이름 비교에서 일반 표기와 같게 처리하며 원문 위치와 표현식은 유지한다. 타입 참조는 같은 이름의 값 바인딩과 구분한다. 중첩 모듈에 부모 모듈의 이름을 자동 상속하지 않는다. 파일 이름과 `lib.rs`/`main.rs`/`mod.rs` 배치에 따른 후보이므로 모듈 속성·Cargo 설정까지 확인한 결과는 아니다.
 - Java: 명시적 타입·static 멤버 import, 같은 패키지 타입 후보. 같은 패키지의 다른 파일에 선언된 타입도 `new Store()` 후보에 포함한다. 단순 메서드 호출과 생성자의 타입 이름은 값 변수와 구분한다. 같은 이름의 매개변수나 필드가 `save()`를 가리지 않으며 `receiver.save()`의 수신 객체는 별도로 확인한다. [JLS 이름 가림 규칙](https://docs.oracle.com/javase/specs/jls/se25/html/jls-6.html#jls-6.4.1)을 따른다.
 - C#: 타입 별칭, namespace `using`, `using static`, 같은 namespace 타입 후보. `new Store()`의 타입 이름은 같은 이름의 지역 값과 구분하며, `using` 또는 현재 namespace의 다른 파일에 선언된 타입도 후보에 포함한다. 중첩 클래스에서도 바깥 namespace를 사용한다. [C# 이름 공간 규칙](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/basic-concepts)을 따른다. `global using`의 다른 파일 전파는 분석하지 않는다.
 - 현재 클래스의 수신자 멤버도 후보로 표시한다. `this`는 해당 언어에서만 적용한다. Python 메서드의 첫 매개변수와 Rust의 `self`는 재할당·가림을 확인하고, Python의 명시적 `staticmethod` 매개변수는 수신자로 취급하지 않는다. 상속·인터페이스·런타임 디스패치를 확정하지 않는다.
+
+Rust 경로의 공백·주석은 이름 비교에서 제외한다. 함수 내부 모듈에서도 `self::`·`super::`는 실제 모듈 범위를 사용하고, `use`의 대상은 import 선언 위치에서 찾는다. `self::target()`과 `self.target()`은 구문 종류로 구분한다. C#의 `@` 식별자는 일반 이름과 비교하되 `@this`는 일반 변수로 남긴다. Python의 실제 수신자 매개변수는 같은 이름의 바깥 import보다 우선한다. 결과의 원문 표현식과 위치는 유지한다.
 
 타입 추론, 패키지·경로 별칭 설정, wildcard import, 재수출 연쇄, Rust 매크로 확장, 리플렉션, 의존성 주입은 해결하지 않는다. Python 모듈 탐색 경로와 Rust 크레이트 구성 등 실행 환경에 따라 후보가 실제 대상과 다를 수 있다. 복합 수신 표현식과 함수값의 호출도 미해결로 남을 수 있다.
 
@@ -87,6 +93,8 @@ Python 함수 매개변수는 본문에서 사용하며 기본값 표현식은 �
 
 `tests/symbol_regressions.rs`는 2026-09-30에 수정한 9개 결함과 인접한 경계 조건을 검사한다. 한정된 TypeScript 타입의 오연결, 언어별 수신자·재할당, 가까운 Rust 타입·모듈, 초기값 없는 선언과 enum 참조, 복수 선언의 읽기 범위, 추가 export 별칭, Java compact constructor의 호출 소유자, C# 파일 범위 namespace의 하위 호출, Rust raw identifier를 포함한다. 선언과 이름 노드의 바이트 범위가 같아도 선언 종류를 함께 확인해 참조가 누락되지 않도록 한다.
 
+`tests/symbol_review_followup.rs`는 후속 검토의 회귀·경계 테스트 33개다. 기본 인자의 호출 소유자, 동명 컨테이너의 실제 범위, Rust 수명·레이블·const 매개변수·지역 모듈·import 위치, C# 호출 범위·인덱서·암시적 매개변수·`@` 식별자, 문자열 export 이름을 검사한다. 한정된 타입 참조를 값 바인딩과 구분하고 Rust `impl` 블록을 타입·값 참조 대상으로 삼지 않는지도 확인한다. 검색 결과에서 같은 표시 경로의 ID가 구분되는지, 읽기가 다른 심볼 범위를 거부하는지, 6개 언어의 불완전한 소스에서도 검색·읽기 범위를 유지하는지도 확인한다.
+
 정밀 검토에서 추가한 회귀 검사는 다음 오류를 재현하고 수정 여부를 확인한다.
 
 - 구조 분해·반복문·catch·람다·패턴 바인딩과 중첩 블록의 재할당을 놓쳐 바깥 함수를 잘못 연결하는 경우.
@@ -106,8 +114,8 @@ Python 함수 매개변수는 본문에서 사용하며 기본값 표현식은 �
 
 ### 2026-09-30 수정 검증
 
-- macOS에서 전체 `cargo test` 통과: 666개 성공, 실패 0개. 기본 제외 테스트 8개는 유료 모델 연동 7개와 별도 부모 테스트가 실행하는 자식 테스트 1개다.
-- 새 회귀 테스트 32개, 기존 탐색 테스트 77개와 구조 테스트 22개를 포함한다. Linux 전용 파일명 검사는 이번 macOS 실행 대상에 포함되지 않는다.
-- `cargo clippy --all-targets -- -D warnings` 통과.
-- `cargo fmt --check`, `git diff --check` 통과.
+- macOS에서 전체 `cargo test` 통과: 699개 성공, 실패 0개. 기본 제외 테스트 8개는 유료 모델 연동 7개와 별도 부모 테스트가 실행하는 자식 테스트 1개다.
+- 후속 회귀·경계 테스트 33개, 앞선 회귀 테스트 32개, 탐색 테스트 77개와 구조 테스트 22개를 포함한다. Linux 전용 파일명 검사는 이번 macOS 실행 대상에 포함되지 않는다.
+- 동시 편집 중인 다른 파일과 분리해 `85e713a`에 이번 변경만 적용한 별도 체크아웃에서도 심볼 관련 164개와 `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`를 검증했다.
+- 이번 변경의 `git diff --check` 통과. Rust 모듈·import 경로, JavaScript 문자열 export 별칭, Python 기본 인자 평가 시점은 각 언어의 실제 실행으로도 확인했다.
 - 앞선 검토에서는 임시 실행 예제를 포함한 이 저장소의 지원 파일 127개에서 `read_text` 선언 검색과 호출자 조회를 실제 실행했다. 디버그 빌드의 단일 측정에서 검색 약 1.3초, 호출자 조회 약 13.1초였고 관련 위치 18개를 반환했다. 구문 오류는 없었다. 이 시간은 다른 프로젝트나 배포 빌드의 성능 보장이 아니다.
