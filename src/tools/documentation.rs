@@ -280,7 +280,7 @@ pub(super) fn execute(
     s: &mut Session,
     name: &str,
     args: &Value,
-    cancel: &tokio_util::sync::CancellationToken,
+    _cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value> {
     match name {
         "document_inspect" => {
@@ -388,74 +388,6 @@ pub(super) fn execute(
                 result["next_offset"] = json!((end < headings.len()).then_some(end));
             }
             Ok(result)
-        }
-        "symbol_search" => {
-            let declaration = regex::Regex::new(
-                r"^\s*(?:(?:export|default|pub(?:\([^)]*\))?|async|abstract|declare|static)\s+)*(?:(?:function\*?|class|interface|type|enum|struct|trait|fn|def|const|let|var)\s+([\p{L}_$][\p{L}\p{N}_$]*))",
-            )?;
-            let query = args["query"].as_str().unwrap_or("").to_lowercase();
-            let files = candidate_paths(&s.project, path_glob(args)?, cancel)?;
-            let mut matched_files = 0;
-            let mut scanned_files = 0usize;
-            let mut rows = vec![];
-            let mut fingerprint = Sha256::new();
-            fingerprint.update(query.as_bytes());
-            for path in files {
-                if cancel.is_cancelled() {
-                    bail!("cancelled");
-                }
-                let Some(contents) = search_text(&path)? else {
-                    continue;
-                };
-                matched_files += 1;
-                if !matches!(
-                    path.extension().and_then(|x| x.to_str()),
-                    Some("rs" | "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "py")
-                ) {
-                    continue;
-                }
-                scanned_files += 1;
-                let digest = hash(contents.as_bytes());
-                fingerprint.update(path.to_string_lossy().as_bytes());
-                fingerprint.update(digest.as_bytes());
-                for (i, line) in contents.lines().enumerate() {
-                    if i % 256 == 0 && cancel.is_cancelled() {
-                        bail!("cancelled");
-                    }
-                    if let Some(c) = declaration.captures(line)
-                        && c[1].to_lowercase().contains(&query)
-                    {
-                        rows.push((
-                            path.clone(),
-                            digest.clone(),
-                            i + 1,
-                            c[1].to_string(),
-                            line.chars().take(500).collect::<String>(),
-                            line.chars().count() > 500,
-                        ));
-                        if rows.len() > 100000 {
-                            bail!("search_too_broad: narrow pattern/query");
-                        }
-                    }
-                }
-            }
-            let fingerprint = format!("{:x}", fingerprint.finalize());
-            let offset = page_cursor(args, &fingerprint)?;
-            if offset > rows.len() {
-                bail!(INVALID_CURSOR);
-            }
-            let end = (offset + n(args, "limit", 20).clamp(1, 100)).min(rows.len());
-            let results=rows[offset..end].iter().map(|(path,digest,line,name,excerpt,truncated)| {
-                let source=super::observe_hashed_quality(s,path,digest.clone(),*line,*line,excerpt,super::EvidenceQuality {
-                    line_start_complete: true,
-                    line_end_complete: true,
-                    evidence_truncated: *truncated,
-                });
-                json!({"name":name,"path":path,"line":line,"declaration":excerpt,"source":source})
-            }).collect::<Vec<_>>();
-            Ok(
-                json!({"hash":fingerprint,"symbols":results,"matched_files":matched_files,"scanned_files":scanned_files,"heuristic":true,"limitations":"Declarations only; may include constants/comments and miss multiline or method declarations. Not semantic references.","next_cursor":(end<rows.len()).then(||format!("{fingerprint}:{end}"))}),
-            )
         }
         "document_audit" => {
             revalidate(s)?;

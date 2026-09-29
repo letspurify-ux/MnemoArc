@@ -372,177 +372,243 @@ fn describe(
     })
 }
 
+/// One immutable syntax snapshot shared by outline, workspace search and relations.
+pub(super) struct SyntaxFile {
+    pub path: PathBuf,
+    pub source: String,
+    pub digest: String,
+    pub language: &'static str,
+    pub tree: Tree,
+}
+
+pub(super) fn check_budget(
+    cancel: &tokio_util::sync::CancellationToken,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    if cancel.is_cancelled() {
+        bail!("cancelled");
+    }
+    if std::time::Instant::now() >= deadline {
+        bail!("cancelled_or_timeout: syntax analysis timed out; narrow path_glob");
+    }
+    Ok(())
+}
+
+impl SyntaxFile {
+    pub fn parse(
+        path: PathBuf,
+        source: String,
+        cancel: &tokio_util::sync::CancellationToken,
+        deadline: std::time::Instant,
+    ) -> Result<Self> {
+        check_budget(cancel, deadline)?;
+        let digest = hash(source.as_bytes());
+        let language = language(&path)?;
+        let grammar = match language {
+            "rust" => tree_sitter_rust::LANGUAGE.into(),
+            "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+            "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "typescriptreact" => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            "python" => tree_sitter_python::LANGUAGE.into(),
+            "java" => tree_sitter_java::LANGUAGE.into(),
+            "csharp" => tree_sitter_c_sharp::LANGUAGE.into(),
+            _ => unreachable!(),
+        };
+        if cancel.is_cancelled() {
+            bail!("cancelled");
+        }
+        let cached = syntax_cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(language, &digest);
+        let tree = match cached {
+            Some(tree) => tree,
+            None => {
+                let mut parser = Parser::new();
+                parser.set_language(&grammar)?;
+                let mut stop = |_: &tree_sitter::ParseState| {
+                    if cancel.is_cancelled() || std::time::Instant::now() >= deadline {
+                        std::ops::ControlFlow::Break(())
+                    } else {
+                        std::ops::ControlFlow::Continue(())
+                    }
+                };
+                let tree = parser
+                    .parse_with_options(
+                        &mut |offset, _| &source.as_bytes()[offset..],
+                        None,
+                        Some(tree_sitter::ParseOptions::new().progress_callback(&mut stop)),
+                    )
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("cancelled_or_timeout: structure parsing interrupted")
+                    })?;
+                syntax_cache()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(language, digest.clone(), source.len(), tree.clone());
+                tree
+            }
+        };
+
+        Ok(Self {
+            path,
+            source,
+            digest,
+            language,
+            tree,
+        })
+    }
+
+    pub fn symbols(
+        &self,
+        args: &Value,
+        requested_symbol_id: Option<&str>,
+        cancel: &tokio_util::sync::CancellationToken,
+        deadline: std::time::Instant,
+    ) -> Result<(Vec<Value>, BTreeSet<String>)> {
+        let tree = &self.tree;
+        let source = &self.source;
+        let digest = &self.digest;
+        let language = self.language;
+        let path_identity = hash(self.path.to_string_lossy().as_bytes());
+        let mut stack = vec![(tree.root_node(), String::new(), "", 0u64)];
+        let mut symbols = Vec::new();
+        let mut containers = std::collections::BTreeSet::new();
+        let filters = options(args);
+        // An ID is digest:path:start:end. A malformed copy (a live run sent a
+        // bare, truncated hash) is not a changed source; say what is wrong.
+        if let Some(id) = requested_symbol_id {
+            let mut parts = id.splitn(2, ':');
+            let digest = parts.next().unwrap_or("");
+            let mut span = parts.next().unwrap_or("").rsplitn(3, ':');
+            // The path segment is not checked here: an unmatched but well-formed
+            // ID is reported as unknown_symbol after traversal.
+            let well_formed = digest.len() >= 32
+                && digest.bytes().all(|b| b.is_ascii_hexdigit())
+                && span.next().is_some_and(|end| end.parse::<usize>().is_ok())
+                && span
+                    .next()
+                    .is_some_and(|start| start.parse::<usize>().is_ok());
+            if !well_formed {
+                bail!(
+                    "invalid_symbol_id: symbol_id must be copied whole from code_outline (hash:path:start_byte:end_byte); got {id:?}"
+                );
+            }
+        }
+        let requested_span = requested_symbol_id.and_then(|id| {
+            let mut parts = id.rsplitn(3, ':');
+            let end = parts.next()?.parse::<usize>().ok()?;
+            let start = parts.next()?.parse::<usize>().ok()?;
+            Some((start, end))
+        });
+        while let Some((node, mut container, mut parent_kind, mut depth)) = stack.pop() {
+            if cancel.is_cancelled() || std::time::Instant::now() >= deadline {
+                bail!("cancelled_or_timeout: structure traversal interrupted");
+            }
+            if let Some((start, end)) = requested_span
+                && (node.end_byte() <= start || node.start_byte() >= end)
+            {
+                continue;
+            }
+            if let Some(name) = symbol_name(node) {
+                let mut symbol = describe(node, name, &container, source, digest, &path_identity);
+                let kind = category(node, parent_kind, source);
+                symbol["symbol_kind"] = json!(kind);
+                symbol["depth"] = json!(depth);
+                let name = symbol_label(node, name, source);
+                let next_container = if container.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{container}::{name}")
+                };
+                symbol["qualified_name"] = json!(next_container);
+                if containers.len() < 20_000 {
+                    containers.insert(container.clone());
+                }
+                let comparable = if filters["case_sensitive"] == true {
+                    name.to_owned()
+                } else {
+                    name.to_lowercase()
+                };
+                let query = filters["query"].as_str().unwrap();
+                let matches_name = if filters["match"] == "exact" {
+                    comparable == query
+                } else {
+                    comparable.contains(query)
+                };
+                let selected = requested_symbol_id.is_some_and(|id| symbol["symbol_id"] == id)
+                    || (requested_symbol_id.is_none()
+                        && matches_name
+                        && filters["kind"].as_str().is_none_or(|wanted| wanted == kind)
+                        && filters["container"]
+                            .as_str()
+                            .is_none_or(|wanted| wanted == container)
+                        && filters["max_depth"].as_u64().is_none_or(|max| depth <= max));
+                if selected {
+                    symbols.push(symbol);
+                    if requested_symbol_id.is_some() {
+                        // symbol_read has an exact ID and needs only that symbol.
+                        // Stop traversal immediately so a valid ID in a very large
+                        // file is not rejected as an overly broad outline.
+                        break;
+                    }
+                    if symbols.len() > 20_000 {
+                        bail!("outline_too_broad: narrow query or use a smaller file");
+                    }
+                }
+                container = next_container;
+                parent_kind = kind;
+                depth += 1;
+            }
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.named_children(&mut cursor).collect();
+            let mut scheduled = Vec::with_capacity(children.len());
+            for child in children {
+                scheduled.push((child, container.clone(), parent_kind, depth));
+                // A file-scoped C# namespace owns following siblings, not AST
+                // children. Carry its scope into subsequent declarations.
+                if language == "csharp"
+                    && child.kind() == "file_scoped_namespace_declaration"
+                    && let Some(name) = child.child_by_field_name("name")
+                {
+                    let name = symbol_label(child, name, source);
+                    container = if container.is_empty() {
+                        name
+                    } else {
+                        format!("{container}::{name}")
+                    };
+                    parent_kind = "module";
+                    depth += 1;
+                }
+            }
+            stack.extend(scheduled.into_iter().rev());
+        }
+
+        Ok((symbols, containers))
+    }
+}
+
 pub(super) fn execute(
     s: &mut Session,
     tool: &str,
     args: &Value,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value> {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(s.config.tool_timeout_secs);
     let path = read_path(&s.project, text(args, "path")?)?;
     let source = read_text(&path)?;
-    let digest = hash(source.as_bytes());
-    let path_identity = hash(path.to_string_lossy().as_bytes());
-    let language = language(&path)?;
-    let grammar = match language {
-        "rust" => tree_sitter_rust::LANGUAGE.into(),
-        "javascript" => tree_sitter_javascript::LANGUAGE.into(),
-        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        "typescriptreact" => tree_sitter_typescript::LANGUAGE_TSX.into(),
-        "python" => tree_sitter_python::LANGUAGE.into(),
-        "java" => tree_sitter_java::LANGUAGE.into(),
-        "csharp" => tree_sitter_c_sharp::LANGUAGE.into(),
-        _ => unreachable!(),
-    };
-    let started = std::time::Instant::now();
-    let deadline = std::time::Duration::from_secs(s.config.tool_timeout_secs);
-    if cancel.is_cancelled() {
-        bail!("cancelled");
-    }
-    let cached = syntax_cache()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(language, &digest);
-    let tree = match cached {
-        Some(tree) => tree,
-        None => {
-            let mut parser = Parser::new();
-            parser.set_language(&grammar)?;
-            let mut stop = |_: &tree_sitter::ParseState| {
-                if cancel.is_cancelled() || started.elapsed() >= deadline {
-                    std::ops::ControlFlow::Break(())
-                } else {
-                    std::ops::ControlFlow::Continue(())
-                }
-            };
-            let tree = parser
-                .parse_with_options(
-                    &mut |offset, _| &source.as_bytes()[offset..],
-                    None,
-                    Some(tree_sitter::ParseOptions::new().progress_callback(&mut stop)),
-                )
-                .ok_or_else(|| {
-                    anyhow::anyhow!("cancelled_or_timeout: structure parsing interrupted")
-                })?;
-            syntax_cache()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(language, digest.clone(), source.len(), tree.clone());
-            tree
-        }
-    };
-    let mut stack = vec![(tree.root_node(), String::new(), "", 0u64)];
-    let mut symbols = Vec::new();
-    let mut containers = std::collections::BTreeSet::new();
+    let file = SyntaxFile::parse(path, source, cancel, deadline)?;
+    let requested = (tool == "symbol_read").then(|| args["symbol_id"].as_str().unwrap());
+    let (symbols, containers) = file.symbols(args, requested, cancel, deadline)?;
+    let SyntaxFile {
+        path,
+        source,
+        digest,
+        language,
+        tree,
+    } = file;
     let filters = options(args);
-    let requested_symbol_id = (tool == "symbol_read").then(|| args["symbol_id"].as_str().unwrap());
-    // An ID is digest:path:start:end. A malformed copy (a live run sent a
-    // bare, truncated hash) is not a changed source; say what is wrong.
-    if let Some(id) = requested_symbol_id {
-        let mut parts = id.splitn(2, ':');
-        let digest = parts.next().unwrap_or("");
-        let mut span = parts.next().unwrap_or("").rsplitn(3, ':');
-        // The path segment is not checked here: an unmatched but well-formed
-        // ID is reported as unknown_symbol after traversal.
-        let well_formed = digest.len() >= 32
-            && digest.bytes().all(|b| b.is_ascii_hexdigit())
-            && span.next().is_some_and(|end| end.parse::<usize>().is_ok())
-            && span
-                .next()
-                .is_some_and(|start| start.parse::<usize>().is_ok());
-        if !well_formed {
-            bail!(
-                "invalid_symbol_id: symbol_id must be copied whole from code_outline (hash:path:start_byte:end_byte); got {id:?}"
-            );
-        }
-    }
-    let requested_span = requested_symbol_id.and_then(|id| {
-        let mut parts = id.rsplitn(3, ':');
-        let end = parts.next()?.parse::<usize>().ok()?;
-        let start = parts.next()?.parse::<usize>().ok()?;
-        Some((start, end))
-    });
-    while let Some((node, mut container, mut parent_kind, mut depth)) = stack.pop() {
-        if cancel.is_cancelled() || started.elapsed() >= deadline {
-            bail!("cancelled_or_timeout: structure traversal interrupted");
-        }
-        if let Some((start, end)) = requested_span
-            && (node.end_byte() <= start || node.start_byte() >= end)
-        {
-            continue;
-        }
-        if let Some(name) = symbol_name(node) {
-            let mut symbol = describe(node, name, &container, &source, &digest, &path_identity);
-            let kind = category(node, parent_kind, &source);
-            symbol["symbol_kind"] = json!(kind);
-            symbol["depth"] = json!(depth);
-            let name = symbol_label(node, name, &source);
-            let next_container = if container.is_empty() {
-                name.to_string()
-            } else {
-                format!("{container}::{name}")
-            };
-            symbol["qualified_name"] = json!(next_container);
-            if containers.len() < 20_000 {
-                containers.insert(container.clone());
-            }
-            let comparable = if filters["case_sensitive"] == true {
-                name.to_owned()
-            } else {
-                name.to_lowercase()
-            };
-            let query = filters["query"].as_str().unwrap();
-            let matches_name = if filters["match"] == "exact" {
-                comparable == query
-            } else {
-                comparable.contains(query)
-            };
-            let selected = requested_symbol_id.is_some_and(|id| symbol["symbol_id"] == id)
-                || (requested_symbol_id.is_none()
-                    && matches_name
-                    && filters["kind"].as_str().is_none_or(|wanted| wanted == kind)
-                    && filters["container"]
-                        .as_str()
-                        .is_none_or(|wanted| wanted == container)
-                    && filters["max_depth"].as_u64().is_none_or(|max| depth <= max));
-            if selected {
-                symbols.push(symbol);
-                if requested_symbol_id.is_some() {
-                    // symbol_read has an exact ID and needs only that symbol.
-                    // Stop traversal immediately so a valid ID in a very large
-                    // file is not rejected as an overly broad outline.
-                    break;
-                }
-                if symbols.len() > 20_000 {
-                    bail!("outline_too_broad: narrow query or use a smaller file");
-                }
-            }
-            container = next_container;
-            parent_kind = kind;
-            depth += 1;
-        }
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        let mut scheduled = Vec::with_capacity(children.len());
-        for child in children {
-            scheduled.push((child, container.clone(), parent_kind, depth));
-            // A file-scoped C# namespace owns following siblings, not AST
-            // children. Carry its scope into subsequent declarations.
-            if language == "csharp"
-                && child.kind() == "file_scoped_namespace_declaration"
-                && let Some(name) = child.child_by_field_name("name")
-            {
-                let name = symbol_label(child, name, &source);
-                container = if container.is_empty() {
-                    name
-                } else {
-                    format!("{container}::{name}")
-                };
-                parent_kind = "module";
-                depth += 1;
-            }
-        }
-        stack.extend(scheduled.into_iter().rev());
-    }
     if tool == "symbol_read" {
         let id = text(args, "symbol_id")?;
         if !id.starts_with(&format!("{digest}:")) {
@@ -602,6 +668,23 @@ pub(super) fn execute(
         }
         let line = symbol["name_line"].as_u64().unwrap() as usize;
         let excerpt: String = lines[line - 1].chars().take(500).collect();
+        let signature = symbol["signature"].as_str().unwrap().to_owned();
+        let signature_start_line = symbol["signature_start_line"].as_u64().unwrap() as usize;
+        let signature_end_line = symbol["signature_end_line"].as_u64().unwrap() as usize;
+        let signature_line_start_complete =
+            lines.get(signature_start_line - 1).is_some_and(|line| {
+                signature
+                    .lines()
+                    .next()
+                    .is_some_and(|first| line.starts_with(first))
+            });
+        let signature_line_end_complete = symbol["signature_truncated"] == false
+            && lines.get(signature_end_line - 1).is_some_and(|line| {
+                signature
+                    .lines()
+                    .last()
+                    .is_some_and(|last| last.trim() == line.trim())
+            });
         symbol["declaration"] = json!(excerpt);
         symbol["source"] = json!(super::observe_hashed_quality(
             s,
@@ -612,7 +695,7 @@ pub(super) fn execute(
             &excerpt,
             super::EvidenceQuality {
                 line_start_complete: true,
-                line_end_complete: true,
+                line_end_complete: excerpt.len() == lines[line - 1].len(),
                 evidence_truncated: true,
             },
         ));
@@ -620,12 +703,12 @@ pub(super) fn execute(
             s,
             &path,
             digest.clone(),
-            symbol["signature_start_line"].as_u64().unwrap() as usize,
-            symbol["signature_end_line"].as_u64().unwrap() as usize,
-            symbol["signature"].as_str().unwrap(),
+            signature_start_line,
+            signature_end_line,
+            &signature,
             super::EvidenceQuality {
-                line_start_complete: true,
-                line_end_complete: true,
+                line_start_complete: signature_line_start_complete,
+                line_end_complete: signature_line_end_complete,
                 evidence_truncated: true,
             },
         ));

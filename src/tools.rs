@@ -4,6 +4,7 @@ mod coverage;
 pub mod document_review;
 mod documentation;
 mod file_edit;
+mod navigation;
 pub mod recovery;
 mod search;
 mod structure;
@@ -273,12 +274,22 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "symbol_search",
-                description: "Heuristic declaration search for JS/TS, Rust and Python. query is a symbol-name substring, e.g. handleQuestion; path_glob is a file glob, e.g. backend/src/agent.js (pattern is a legacy alias). For declaration regex use source_search instead. Returns matched_files/scanned_files to distinguish no files from no symbols. Cursor expires on source changes.",
+                description: "Search Tree-sitter declarations across Rust, JS/JSX, TS/TSX, Python, Java and C# files. query matches symbol names (case-insensitive substring by default); use match=exact for an exact name. path scopes one file/directory; path_glob filters files (pattern is a legacy alias); do not combine them. kind, container and max_depth follow code_outline. Returns path, hash, exact symbol_id and location; copy path/symbol_id into symbol_read or symbol_relations. Declarations/excerpts are navigation, not implementation evidence. Unsupported files and parse errors are reported. Follow next_cursor with unchanged filters; file changes expire cursors/IDs.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
                     json!({"query":string(),"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number()}),
                     &[],
+                ),
+            },
+            ToolSpec {
+                name: "symbol_relations",
+                description: "Trace syntax calls/references without external language servers. Copy path and symbol_id from symbol_search/code_outline. relation=calls lists outgoing call sites in the symbol (nested functions have their own calls); callers finds incoming calls; references includes call and non-call uses. Optional path_glob limits scanned files; the target file is always included. resolved means a unique local syntax binding, NOT guaranteed runtime execution. Explicit imports/module paths and member access return candidate/ambiguous targets; unknown receivers or shadowed bindings remain unresolved. Never infer links from matching names alone. Results include source locations, hashes, candidate IDs, reasons and scan limitations, but no source evidence IDs. Read sites with file_read and bodies with symbol_read before describing behavior. Inbound results omit unresolved targets: an empty page is not proof of no callers. Follow next_cursor with all original arguments; source changes expire cursors/IDs.",
+                optional: true,
+                read_only: true,
+                parameters: schema(
+                    json!({"path":string(),"symbol_id":string(),"relation":action(&["calls","callers","references"]),"path_glob":string(),"cursor":string(),"limit":number()}),
+                    &["path", "symbol_id"],
                 ),
             },
             ToolSpec {
@@ -293,7 +304,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "symbol_read",
-                description: "Read implementation only when the requested fact is missing from code_outline's detailed signature. Use {path,symbol_id,max_lines:30} for the start of a function; do not read a whole long function just to list arguments. start_line is an optional ABSOLUTE file line within the symbol (default symbol.start_line), max_lines is a count from 1 to 2000, capped at the symbol end. Omit both to read the whole symbol subject to file_read limits. Copy exact symbol_id from code_outline; stale IDs are rejected. If text is truncated, finish that requested range with file_read cursor before starting another range at next_line, at most symbol.end_line. Sources and coverage attest only delivered text. Shared declaration lines can include neighboring declarations.",
+                description: "Read implementation only when the requested fact is missing from code_outline's detailed signature. Use {path,symbol_id,max_lines:30} for the start of a function; do not read a whole long function just to list arguments. start_line is an optional ABSOLUTE file line within the symbol (default symbol.start_line), max_lines is a count from 1 to 2000, capped at the symbol end. Omit both to read the whole symbol subject to file_read limits. Copy exact symbol_id from code_outline or symbol_search; stale IDs are rejected. If text is truncated, finish that requested range with file_read cursor before starting another range at next_line, at most symbol.end_line. Sources and coverage attest only delivered text. Shared declaration lines can include neighboring declarations.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -353,7 +364,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit",
-                description: "Edit ONLY configured Markdown output. Save one investigated section at a time. Inspect the outline and copy section_path when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash. Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and also requires expected_section_hash; its text must retain the original full heading. Simple edits do not require investigation items; source documentation must first set task_state patch.require_investigation=true. Returns measured lines and new hash",
+                description: "Edit ONLY configured Markdown output. Save one investigated section at a time. Inspect the outline and copy section_path when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash. Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and also requires expected_section_hash; its text must retain the original full heading. Simple edits do not require investigation items; the source_document workflow enables investigation automatically from the user's selection; do not patch workflow or require_investigation. Returns measured lines and new hash",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -421,6 +432,29 @@ impl ToolRegistry {
                 branch
             }).collect();
         spec.parameters["oneOf"] = json!(branches);
+        let outline_fields = specs
+            .iter()
+            .find(|spec| spec.name == "code_outline")
+            .unwrap()
+            .parameters["properties"]
+            .clone();
+        let search_fields = specs
+            .iter_mut()
+            .find(|spec| spec.name == "symbol_search")
+            .unwrap()
+            .parameters["properties"]
+            .as_object_mut()
+            .unwrap();
+        for field in [
+            "path",
+            "match",
+            "case_sensitive",
+            "kind",
+            "container",
+            "max_depth",
+        ] {
+            search_fields.insert(field.into(), outline_fields[field].clone());
+        }
         specs
     }
     /// Closing mode finishes from gathered evidence. Broad discovery and
@@ -430,6 +464,7 @@ impl ToolRegistry {
             "file_list",
             "source_search",
             "symbol_search",
+            "symbol_relations",
             "code_outline",
             "memory_write",
             "memory_read",
@@ -582,14 +617,14 @@ impl ToolRegistry {
                     || !s.document_written
                     || s.progress_recovery.rounds_since_best
                         < s.config.stall_round_limit.saturating_mul(2)
-                    || !matches!(t.name, "file_list" | "source_search" | "symbol_search" | "code_outline")
+                    || !matches!(t.name, "file_list" | "source_search" | "symbol_search" | "symbol_relations" | "code_outline")
             })
             // Draft recovery discourages rediscovery. Verification must still
             // be able to locate a missing helper/path and finish source coverage.
             .filter(|t| !recovery_focus || s.checkpoint.is_some() || !matches!(t.name,
                 "memory_write" | "memory_find" | "history")
                 && (s.run_guidance["phase"] == "verify" || !matches!(t.name,
-                    "file_list" | "source_search" | "symbol_search" | "code_outline")))
+                    "file_list" | "source_search" | "symbol_search" | "symbol_relations" | "code_outline")))
             .map(|mut t| {
                 // OpenAI-compatible providers reject a top-level anyOf in a
                 // function parameter schema. Runtime verification-reserve
@@ -2800,7 +2835,31 @@ fn candidate_paths(
     pattern: Option<&str>,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Vec<PathBuf>> {
+    candidate_paths_scoped(p, pattern, cancel, None, None)
+}
+
+fn candidate_paths_scoped(
+    p: &Project,
+    pattern: Option<&str>,
+    cancel: &tokio_util::sync::CancellationToken,
+    directory: Option<&Path>,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<PathBuf>> {
+    let check = || -> Result<()> {
+        if let Some(deadline) = deadline {
+            structure::check_budget(cancel, deadline)
+        } else if cancel.is_cancelled() {
+            bail!("cancelled")
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
     let root = p.root.canonicalize()?;
+    if directory.is_some_and(|scope| !scope.starts_with(&root)) {
+        bail!("path_outside_project");
+    }
+    let scope = directory.map(Path::to_path_buf);
     let mut entries = vec![];
     let filter = pattern
         .map(globset::Glob::new)
@@ -2809,9 +2868,9 @@ fn candidate_paths(
     for entry in ignore::WalkBuilder::new(&root)
         .hidden(false)
         .follow_links(false)
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
             !entry.file_type().is_some_and(|t| t.is_dir())
-                || ![
+                || (![
                     ".git",
                     ".hg",
                     ".svn",
@@ -2824,23 +2883,28 @@ fn candidate_paths(
                     "__pycache__",
                 ]
                 .contains(&entry.file_name().to_string_lossy().as_ref())
+                    && scope.as_ref().is_none_or(|scope| {
+                        entry.path().starts_with(scope) || scope.starts_with(entry.path())
+                    }))
         })
         .build()
     {
-        if cancel.is_cancelled() {
-            bail!("cancelled");
-        }
+        check()?;
         let entry = entry?;
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let rel = entry.path().strip_prefix(&root)?;
-        if excluded(p, rel)? || filter.as_ref().is_some_and(|f| !f.is_match(rel)) {
+        if directory.is_some_and(|scope| !entry.path().starts_with(scope))
+            || excluded(p, rel)?
+            || filter.as_ref().is_some_and(|f| !f.is_match(rel))
+        {
             continue;
         }
         entries.push(entry.path().to_path_buf());
     }
     entries.sort();
+    check()?;
     Ok(entries)
 }
 // Keep the existing text-only listing contract. Searches use candidates directly
@@ -3493,7 +3557,13 @@ fn execute_repaired(
                     !matches!(pattern.trim(), "" | "." | "./" | "*" | "**" | "**/*")
                 })
             }))
-            || (name == "symbol_search" && args["query"].as_str().unwrap_or("").is_empty())
+            || (name == "symbol_search"
+                && args["query"].as_str().unwrap_or("").is_empty()
+                && !["path", "path_glob", "pattern"].iter().any(|key| {
+                    args[*key].as_str().is_some_and(|path| {
+                        !matches!(path.trim(), "" | "." | "./" | "*" | "**" | "**/*")
+                    })
+                }))
             || (name == "investigation"
                 && args["action"] == "upsert"
                 && args["section"]
@@ -3526,9 +3596,9 @@ fn execute_repaired(
             s.config.tool_timeout_secs,
         ),
         "code_outline" | "symbol_read" => structure::execute(s, name, &args, cancel),
-        "document_inspect" | "document_audit" | "symbol_search" => {
-            documentation::execute(s, name, &args, cancel)
-        }
+        "symbol_search" => navigation::search(s, &args, cancel),
+        "symbol_relations" => navigation::relations(s, &args, cancel),
+        "document_inspect" | "document_audit" => documentation::execute(s, name, &args, cancel),
         "tool_catalog" => {
             let q = args["query"].as_str().unwrap_or("").to_lowercase();
             let terms: Vec<_> = q
@@ -4433,11 +4503,11 @@ fn execute_repaired(
                     let path = strip_line_suffix(id);
                     if path != id {
                         bail!(
-                            "unknown_source: {id} is a citation, not a source ID, and {path} is not a readable project file; pass the S-IDs returned by file_read/source_search/symbol_search for the cited files (or an existing project path to use its delivered evidence)"
+                            "unknown_source: {id} is a citation, not a source ID, and {path} is not a readable project file; pass the S-IDs returned by file_read/source_search/symbol_read for the cited files (or an existing project path to use its delivered evidence)"
                         );
                     }
                     bail!(
-                        "unknown_source: {path} is a path, not a source ID, and no readable project file has it; pass the S-IDs returned by file_read/source_search/symbol_search for the cited files (or an existing project path to use its delivered evidence)"
+                        "unknown_source: {path} is a path, not a source ID, and no readable project file has it; pass the S-IDs returned by file_read/source_search/symbol_read for the cited files (or an existing project path to use its delivered evidence)"
                     );
                 }
                 let mut sources = s.source_refs(&ids)?;
@@ -4472,13 +4542,13 @@ fn execute_repaired(
                     .collect();
                 if !rejected.is_empty() {
                     bail!(
-                        "verification_sources_required: these source_ids are not file evidence: {}; remove them and keep the file source_ids returned by file_read/source_search/symbol_search",
+                        "verification_sources_required: these source_ids are not file evidence: {}; remove them and keep the file source_ids returned by file_read/source_search/symbol_read",
                         rejected.join(", ")
                     );
                 }
                 if sources.is_empty() && path_hints == 0 {
                     bail!(
-                        "verification_sources_required: pass non-empty observed file source_ids returned by file_read/source_search/symbol_search"
+                        "verification_sources_required: pass non-empty observed file source_ids returned by file_read/source_search/symbol_read"
                     );
                 }
                 let output = output_path(&s.project)
@@ -4530,7 +4600,7 @@ fn execute_repaired(
                 }
                 if sources.is_empty() {
                     bail!(
-                        "verification_sources_required: pass non-empty observed file source_ids returned by file_read/source_search/symbol_search"
+                        "verification_sources_required: pass non-empty observed file source_ids returned by file_read/source_search/symbol_read"
                     );
                 }
                 if !missing.is_empty() {
@@ -4570,7 +4640,7 @@ fn execute_repaired(
                 if !ignored_source_ids.is_empty() {
                     result["ignored_source_ids"] = json!(ignored_source_ids);
                     result["ignored_note"] = json!(
-                        "These IDs are not file evidence (for example the user's request) and were not recorded; pass only file_read/source_search/symbol_search IDs."
+                        "These IDs are not file evidence (for example the user's request) and were not recorded; pass only file_read/source_search/symbol_read IDs."
                     );
                 }
                 Ok(result)
@@ -4931,6 +5001,13 @@ pub fn limit_result(
         normalize_integer_arguments(call.name.as_str(), &mut args);
         result["next_cursor"] = structure::continuation(&args, path, cursor);
     }
+    if matches!(call.name.as_str(), "symbol_search" | "symbol_relations")
+        && result["status"] == "ok"
+        && let Some(cursor) = result["data"]["next_cursor"].as_str()
+        && let Ok(args) = serde_json::from_str::<Value>(&call.arguments)
+    {
+        result["next_cursor"] = navigation::continuation(&call.name, &args, cursor);
+    }
     if matches!(call.name.as_str(), "file_read" | "symbol_read")
         && result["status"] == "ok"
         && result["data"]["content"]["truncated"] == true
@@ -4979,6 +5056,12 @@ pub fn limit_result(
     }
     if call.name == "code_outline"
         && let Some(page) = structure::limit_outline(call, &output, limit, &s.config.model)
+    {
+        return page;
+    }
+    if matches!(call.name.as_str(), "symbol_search" | "symbol_relations")
+        && result["status"] == "ok"
+        && let Some(page) = navigation::limit_page(call, &output, limit, &s.config.model)
     {
         return page;
     }

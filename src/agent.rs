@@ -2723,6 +2723,7 @@ pub async fn run_session_controlled(
                     "file_list",
                     "source_search",
                     "symbol_search",
+                    "symbol_relations",
                     "document_inspect",
                 ]
                 .contains(&call.name.as_str())
@@ -2773,6 +2774,7 @@ pub async fn run_session_controlled(
                         "file_list",
                         "source_search",
                         "symbol_search",
+                        "symbol_relations",
                         "code_outline",
                         "document_inspect",
                         "db_query",

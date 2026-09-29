@@ -710,6 +710,7 @@ fn multiline_signatures_have_their_own_evidence_and_mark_truncation() {
     assert_eq!(method["signature_truncated"], false);
     assert_eq!(method["signature_source"]["start_line"], 2);
     assert_eq!(method["signature_source"]["end_line"], 5);
+    assert_eq!(method["signature_source"]["line_start_complete"], false);
     assert_eq!(method["source"]["end_line"], 2);
     let source_id = method["signature_source"]["id"].as_str().unwrap();
     assert!(s.sources[source_id].excerpt.contains("String name"));
@@ -741,6 +742,11 @@ fn multiline_signatures_have_their_own_evidence_and_mark_truncation() {
             .chars()
             .count(),
         500
+    );
+    assert_eq!(outline["symbols"][0]["source"]["line_end_complete"], false);
+    assert_eq!(
+        outline["symbols"][0]["signature_source"]["line_end_complete"],
+        false
     );
 }
 

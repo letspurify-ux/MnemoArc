@@ -150,7 +150,9 @@ cargo run -- run --project /path/to/project --output docs/source-summary.md \
 
 부분 완료·복구 가능한 중단은 종료 코드 2로 표시합니다. 취소하거나 프로그램을 종료해도 이미 작성한 결과 파일은 남습니다.
 
-기존 문서의 요약·설명·Mermaid 요청은 관련 구간을 읽고 채팅으로 답하도록 안내합니다. 새 세션은 `file_list`, `file_read`, `document_inspect`, `source_search`, `code_outline`, `symbol_read`를 바로 제공하며, 프로젝트의 출력 경로를 자동으로 작성해야 할 산출물로 지정하지 않습니다. 소스 조사·문서 수정·검증은 해당 작업을 요청했을 때 수행하도록 지시합니다. 여러 읽기 결과는 남은 결과 예산을 균등하게 나누고, 잘린 본문은 파일/섹션 커서로 이어 읽습니다.
+기존 문서의 요약·설명·Mermaid 요청은 관련 구간을 읽고 채팅으로 답하도록 안내합니다. 새 세션은 `file_list`, `file_read`, `document_inspect`, `source_search`, `code_outline`, `symbol_search`, `symbol_relations`, `symbol_read`를 바로 제공하며, 프로젝트의 출력 경로를 자동으로 작성해야 할 산출물로 지정하지 않습니다. 소스 조사·문서 수정·검증은 해당 작업을 요청했을 때 수행하도록 지시합니다. 여러 읽기 결과는 남은 결과 예산을 균등하게 나누고, 잘린 본문은 파일/섹션 커서로 이어 읽습니다.
+
+호출·참조 탐색은 내장 Tree-sitter로 동작하며 별도 언어 서버가 필요하지 않습니다. 명시적 import와 지역 선언을 따라 관련 위치를 찾고, 확정할 수 없는 관계는 후보·미해결 상태로 표시합니다. [사용법과 분석 범위](docs/syntax-navigation.md)를 참고하세요.
 
 ## 기억과 컨텍스트
 
@@ -243,7 +245,7 @@ OpenCode 비교는 동일 소스 지문, 같은 모델·요청, 비슷한 시간
 
 `source-docs`에 문서 목차·섹션 조회(`document_inspect`), 섹션 단위 수정,
 출처 일괄 점검(`document_audit`), 조사 항목 일괄 검증(`verify_batch`),
-선언 검색(`symbol_search`)이 포함된다. 파일 읽기는 실제 줄 수와 줄 위치를 제공한다.
+선언 검색(`symbol_search`), 호출·참조 추적(`symbol_relations`)이 포함된다. 파일 읽기는 실제 줄 수와 줄 위치를 제공한다.
 일반 프로젝트 텍스트 파일에는 `file_edit`(정확한 문자열 교체), `file_write`(생성·전체 교체),
 `file_patch`(여러 파일의 추가·수정·교체·이동·삭제)를 사용할 수 있다.
 기존 파일의 수정에는 현재 파일 해시가 필요하며 설정된 Markdown 출력은 `document_edit`로 편집한다.

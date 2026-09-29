@@ -539,6 +539,8 @@ impl Session {
                 "file_list",
                 "source_search",
                 "code_outline",
+                "symbol_search",
+                "symbol_relations",
                 "symbol_read",
             ]
             .into_iter()

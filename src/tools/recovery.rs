@@ -162,7 +162,10 @@ pub fn describe(message: &str) -> Value {
         (Class::MissingEvidence, "lookup_observed_evidence")
     } else if code == "file_access_error" {
         (Class::Unavailable, "check_file_permissions")
-    } else if matches!(code, "search_too_broad" | "outline_too_broad") {
+    } else if matches!(
+        code,
+        "search_too_broad" | "outline_too_broad" | "navigation_too_broad"
+    ) {
         (Class::Capacity, "reduce_request_or_cleanup")
     } else if code == "document_write_verification_failed" {
         (Class::OutcomeUnknown, "inspect_outcome_before_retry")
@@ -312,6 +315,9 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "correct_arguments" if call.name == "file_list" => &["file_list"],
         "correct_arguments" if call.name == "source_search" => &["source_search"],
         "correct_arguments" if call.name == "symbol_search" => &["symbol_search"],
+        "correct_arguments" if call.name == "symbol_relations" => {
+            &["symbol_relations", "symbol_search", "code_outline"]
+        }
         "correct_arguments" if call.name == "code_outline" => &["code_outline"],
         "correct_arguments" if call.name == "symbol_read" => &["symbol_read", "code_outline"],
         // Memory-specific stale errors need the broader recovery set below:
@@ -358,10 +364,18 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             &["file_read", "file_list"]
         }
         "refresh_matching_state" if call.name == "symbol_search" => &["symbol_search", "file_read"],
+        "refresh_matching_state" if call.name == "symbol_relations" => {
+            &["symbol_search", "code_outline", "symbol_relations"]
+        }
         "refresh_matching_state" => &["code_outline", "file_read", "source_lookup", "history"],
         "reduce_request_or_cleanup" if call.name == "source_search" => &["source_search"],
         "reduce_request_or_cleanup" if call.name == "file_patch" => &["file_patch", "file_read"],
         "reduce_request_or_cleanup" if call.name == "code_outline" => &["code_outline"],
+        "reduce_request_or_cleanup"
+            if matches!(call.name.as_str(), "symbol_search" | "symbol_relations") =>
+        {
+            &["symbol_search", "symbol_relations", "file_list"]
+        }
         "reduce_request_or_cleanup" => &[
             "memory_manage",
             "task_state",
