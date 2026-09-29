@@ -4065,3 +4065,92 @@ fn retyped_old_text_with_a_repeated_opening_shows_the_passage_to_copy() {
         "{err}"
     );
 }
+
+#[test]
+fn inserted_sections_follow_blank_line_heading_spacing() {
+    let (_dir, mut s) = setup();
+    std::fs::write(s.project.root.join("main.js"), "function run() {}\n").unwrap();
+    let read = run(&mut s, "file_read", json!({"path":"main.js"}));
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n\n## Overview\n\nStart. main.js:1\n\n## Errors\n\nFailures.\n"}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"overview","title":"Overview","section":"## Overview","status":"written"}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"overview","source_ids":[read["source"]["id"]],"verification_note":"Compared the overview"}),
+    );
+    let inserted = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after","section":"## Errors","expected_hash":created["hash"],"text":"## Flow\n\nSteps."}),
+    );
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after","section":"## Overview","expected_hash":inserted["hash"],"text":"## Setup\n\nInstall."}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\n\n## Overview\n\nStart. main.js:1\n\n## Setup\n\nInstall.\n\n## Errors\n\nFailures.\n\n## Flow\n\nSteps.\n"
+    );
+    // The blank line added after the verified section is layout only.
+    let listed = run(&mut s, "investigation", json!({"action":"list"}));
+    assert_eq!(listed["items"][0]["status"], "verified");
+}
+
+#[test]
+fn replace_text_ignores_whitespace_around_old_text() {
+    let (_dir, mut s) = setup();
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n- First part. Loading fails\n  quietly here.\n"}),
+    );
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":created["hash"],"old_text":"  Loading fails\n  quietly here.\n","text":"  Loading errors\n  appear at the top.\n"}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\n- First part. Loading errors\n  appear at the top.\n"
+    );
+}
+
+#[test]
+fn unknown_investigation_id_lists_existing_ids() {
+    let (_dir, mut s) = setup();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n## Chat\nText.\n"}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"181f4537","title":"Chat screen","section":"## Chat","status":"written"}),
+    );
+    let error = tools::execute(&mut s, "investigation", json!({"action":"verify","id":"chat","source_ids":["S1"],"verification_note":"Compared the chat screen"}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("item_not_found:"), "{error}");
+    assert!(
+        error.contains("181f4537") && error.contains("Chat screen"),
+        "{error}"
+    );
+    let mut result = tools::envelope(Err(anyhow::anyhow!(error)));
+    let call = mnemoarc::llm::ToolCall {
+        id: "1".into(),
+        name: "investigation".into(),
+        arguments: "{}".into(),
+    };
+    tools::recovery::attach(&s, &call, &mut result);
+    assert_eq!(result["recovery"]["tools"], json!(["investigation"]));
+}

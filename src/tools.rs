@@ -1866,9 +1866,34 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             if !prefix.is_empty() && !prefix.ends_with('\n') {
                 prefix.push_str(delimiter);
             }
+            // Follow the document's heading spacing: when its headings are
+            // set off by a blank line, keep one on both sides of the inserted
+            // section instead of gluing it to the previous paragraph.
+            let blank_line_end = |text: &str| {
+                text.lines()
+                    .last()
+                    .is_some_and(|line| line.trim().is_empty())
+            };
+            let spaced = documentation::headings(old)
+                .iter()
+                .any(|heading| heading.start > 0 && blank_line_end(&old[..heading.start]));
+            if spaced && !prefix.is_empty() && !blank_line_end(&prefix) {
+                prefix.push_str(delimiter);
+            }
             let inserted_start = prefix.len();
             let mut inserted = new.to_string();
             if !inserted.ends_with('\n') {
+                inserted.push_str(delimiter);
+            }
+            let rest = &old[position..];
+            if spaced
+                && !rest.is_empty()
+                && !blank_line_end(&inserted)
+                && !rest
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.trim().is_empty())
+            {
                 inserted.push_str(delimiter);
             }
             let candidate = format!("{}{}{}", prefix, inserted, &old[position..]);
@@ -1971,6 +1996,25 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             } else {
                 (0, old)
             };
+            // Surrounding whitespace in old_text is copying noise (for example
+            // a line's indentation kept when the passage starts mid-line).
+            // When only it differs, match the trimmed passage and drop the
+            // same whitespace from a replacement that repeats it.
+            let trimmed = target.trim();
+            let (target, new) =
+                if !scope.contains(target) && !trimmed.is_empty() && scope.contains(trimmed) {
+                    let lead = &target[..target.len() - target.trim_start().len()];
+                    let trail = &target[target.trim_end().len()..];
+                    let new = if insertion {
+                        new
+                    } else {
+                        let new = new.strip_prefix(lead).unwrap_or(new);
+                        new.strip_suffix(trail).unwrap_or(new)
+                    };
+                    (trimmed, new)
+                } else {
+                    (target, new)
+                };
             let (relative_start, relative_end) = unique_document_text_span(scope, target)?;
             let (start, end) = (base + relative_start, base + relative_end);
             Ok(match action {
@@ -2909,10 +2953,9 @@ pub fn revalidate(s: &mut Session) -> Result<()> {
         .map(|item| {
             doc.as_ref()
                 .and_then(|d| item_scope_text(d, &s.investigations, item).ok())
-                .map(|t| hash(t.as_bytes()))
         })
         .collect();
-    for (item, scope_hash) in s.investigations.iter_mut().zip(scopes) {
+    for (item, scope) in s.investigations.iter_mut().zip(scopes) {
         let changed = item.sources.iter().any(|r| {
             r.path.as_ref().is_some_and(|p| {
                 hashes
@@ -2924,7 +2967,13 @@ pub fn revalidate(s: &mut Session) -> Result<()> {
                 m.revision != *rev || m.status != crate::memory::MemoryStatus::Active
             })
         });
-        let doc_changed = scope_hash != item.document_hash;
+        // Sessions saved before scope_hash hashed the untrimmed scope.
+        let doc_changed = match (scope.as_deref(), item.document_hash.as_deref()) {
+            (Some(scope), Some(recorded)) => {
+                recorded != scope_hash(scope) && recorded != hash(scope.as_bytes())
+            }
+            (scope, recorded) => scope.is_some() || recorded.is_some(),
+        };
         if item.status == "verified" && (changed || doc_changed) {
             item.status = "written".into();
             item.note = "Source, memory or document changed; verification required".into();
@@ -3067,7 +3116,7 @@ fn bind_verify_section(s: &mut Session, id: &str, section: &str) -> Result<()> {
         .investigations
         .iter()
         .find(|i| i.id == id)
-        .ok_or_else(|| anyhow::anyhow!("item_not_found"))?;
+        .ok_or_else(|| investigation_not_found(&s.investigations, id))?;
     let path = resolve_named_section(s, &doc, section, id)?;
     let heading = documentation::resolve_heading(&doc, &path)?;
     if let Some(current) = resolved_section_path(&doc, &item.section) {
@@ -3215,6 +3264,33 @@ fn section_number(title: &str) -> Option<&str> {
         && (paren || raw.ends_with('.') || label.contains('.'))
         && rest.starts_with(char::is_whitespace))
     .then_some(label)
+}
+
+/// An unknown investigation ID names the IDs that do exist, so the model can
+/// copy one instead of guessing again (for example a section nickname).
+fn investigation_not_found(items: &[Investigation], id: &str) -> anyhow::Error {
+    const SHOWN: usize = 20;
+    let known: Vec<_> = items
+        .iter()
+        .take(SHOWN)
+        .map(|item| json!({"id":item.id,"title":item.title.chars().take(60).collect::<String>()}))
+        .collect();
+    let more = items.len().saturating_sub(SHOWN);
+    let rest = if more > 0 {
+        format!(" ({more} more; use investigation list with offset {SHOWN})")
+    } else {
+        String::new()
+    };
+    anyhow::anyhow!(
+        "item_not_found: investigation id {id:?} does not exist. Copy an existing id exactly: {}{rest}. To track new work, register it with investigation upsert and a title first",
+        json!(known)
+    )
+}
+
+/// Trailing blank lines are layout, not content: inserting the next section
+/// separates it with a blank line that must not invalidate a verified scope.
+fn scope_hash(scope: &str) -> String {
+    hash(scope.trim_end().as_bytes())
 }
 
 /// The part of the document an investigation item attests: its section minus
@@ -4321,7 +4397,7 @@ fn execute_repaired(
                     .investigations
                     .iter()
                     .find(|i| i.id == id)
-                    .ok_or_else(|| anyhow::anyhow!("item_not_found"))?;
+                    .ok_or_else(|| investigation_not_found(&s.investigations, id))?;
                 if !(item.status == "written"
                     || item.status == "verified"
                     || (item.status == "gap" && !item.section.trim().is_empty()))
@@ -4479,7 +4555,7 @@ fn execute_repaired(
                 });
                 let item = s.investigations.iter_mut().find(|i| i.id == id).unwrap();
                 let fresh = item.status != "verified";
-                item.document_hash = Some(hash(section.as_bytes()));
+                item.document_hash = Some(scope_hash(section));
                 item.sources = sources;
                 item.note = note.into();
                 item.status = "verified".into();
@@ -4510,11 +4586,14 @@ fn execute_repaired(
                 if !(10..=400).contains(&reason.chars().count()) {
                     bail!("invalid_argument_value: reason requires 10..400 characters");
                 }
+                if !s.investigations.iter().any(|i| i.id == id) {
+                    return Err(investigation_not_found(&s.investigations, id));
+                }
                 let item = s
                     .investigations
                     .iter_mut()
                     .find(|i| i.id == id)
-                    .ok_or_else(|| anyhow::anyhow!("item_not_found"))?;
+                    .expect("investigation checked above");
                 if item.status == "verified" {
                     bail!("item_already_verified: {id} needs no gap");
                 }

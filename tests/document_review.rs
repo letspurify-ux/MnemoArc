@@ -1866,3 +1866,60 @@ fn a_page_cannot_report_a_later_section_as_missing() {
         ]
     );
 }
+
+#[test]
+fn reviewer_judges_detail_for_the_project_audience() {
+    let (_dir, mut s) = fixture();
+    s.project.audience = "일반 유저".into();
+    s.project.purpose = "화면 사용법 안내".into();
+    let request = document_review::request(&mut s).unwrap();
+    let payload: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["audience"], "일반 유저");
+    assert_eq!(payload["purpose"], "화면 사용법 안내");
+    assert!(
+        request["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("non-developer audience")
+    );
+}
+
+#[test]
+fn longer_repairs_do_not_reset_a_stalled_review_without_a_length_finding() {
+    let (_dir, mut s) = fixture();
+    s.config.review_limit = 2;
+    let issues =
+        r#"{"issues":["Flow: name the loop bound","Flow: describe history normalization"]}"#;
+    document_review::request(&mut s).unwrap();
+    document_review::finish(&mut s, issues).unwrap();
+    for n in 1..=2 {
+        // Each repair adds lines to the same section but resolves nothing.
+        let expected = s.last_document_write.as_ref().unwrap().1.clone();
+        tools::execute(&mut s, "document_edit", json!({"action":"append","expected_hash":expected,"text":format!("More detail {n}.\nAnd more {n}.\n")})).unwrap();
+        document_review::request(&mut s).unwrap();
+        document_review::finish(&mut s, issues).unwrap();
+        assert_eq!(s.document_review.stalled_attempts, n);
+    }
+    assert!(document_review::stalled_on_current_result(&s));
+}
+
+#[test]
+fn longer_repairs_count_as_progress_after_a_length_finding() {
+    let (_dir, mut s) = fixture();
+    s.config.review_limit = 1;
+    s.answer_review_question = "history normalization 문서를 40줄 내외로 작성해줘.".into();
+    document_review::request(&mut s).unwrap();
+    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    assert!(s.document_review.issues[0].starts_with("문서 길이:"));
+    let expected = s.last_document_write.as_ref().unwrap().1.clone();
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":expected,"text":"More detail.\nAnd more.\n"}),
+    )
+    .unwrap();
+    document_review::request(&mut s).unwrap();
+    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    assert_eq!(s.document_review.stalled_attempts, 0);
+}
