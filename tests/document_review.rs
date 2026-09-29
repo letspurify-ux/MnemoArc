@@ -2,7 +2,7 @@ mod support;
 use anyhow::Result;
 use async_trait::async_trait;
 use mnemoarc::{
-    agent::{AgentEvent, run_session},
+    agent::AgentEvent,
     config::{Config, Project},
     context::ContextManager,
     llm::{Completion, LlmClient},
@@ -11,6 +11,7 @@ use mnemoarc::{
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
+use support::document_review::run_session;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -191,20 +192,20 @@ fn review_reads_declarations_is_bounded_and_invalidates_on_change() {
     );
     assert!(mnemoarc::context::count(&request, &s.config.model) <= 24000);
     assert!(!document_review::approved(&s));
-    assert!(document_review::finish(&mut s, "not json").is_err());
-    document_review::finish(
+    assert!(support::document_review::finish(&mut s, "not json").is_err());
+    support::document_review::finish(
         &mut s,
         r#"{"issues":["Flow: for loop, not while; history omitted"]}"#,
     )
     .unwrap();
     assert!(!document_review::approved(&s));
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, "```json\n{\"issues\":[]}\n```").unwrap();
+    support::document_review::finish(&mut s, "```json\n{\"issues\":[]}\n```").unwrap();
     assert!(document_review::approved(&s));
     std::fs::write(dir.path().join("main.js"), "changed\n").unwrap();
     assert!(!document_review::approved(&s));
     assert!(
-        document_review::finish(&mut s, r#"{"issues":[]}"#)
+        support::document_review::finish(&mut s, r#"{"issues":[]}"#)
             .unwrap_err()
             .to_string()
             .contains("stale")
@@ -216,7 +217,7 @@ fn empty_model_verdict_does_not_approve_a_materially_short_document() {
     let (_dir, mut s) = fixture();
     s.answer_review_question = "사용자 매뉴얼을 120줄 내외로 작성해줘.".into();
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
     assert!(!document_review::approved(&s));
     assert!(
         s.document_review
@@ -456,7 +457,7 @@ fn broad_explicit_citations_preserve_comment_evidence() {
             "missing cited comment at line {line}"
         );
     }
-    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
     assert!(document_review::approved(&s));
 }
 
@@ -491,7 +492,7 @@ fn wide_source_lines_are_split_across_review_pages_without_narrowing_citations()
             }
         }
         pages += 1;
-        document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+        support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
         if !s.document_review.pending {
             break;
         }
@@ -561,7 +562,7 @@ fn oversized_multiline_document_is_reviewed_in_complete_bounded_ranges() {
         assert!(!payload["evidence"].as_array().unwrap().is_empty());
         expected_start = end + 1;
         pages += 1;
-        document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+        support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
         if !s.document_review.pending {
             break;
         }
@@ -625,7 +626,7 @@ fn review_keeps_citations_on_the_first_line_of_each_document_page() {
             .to_string()
             .contains("1|const LINE_1")
     );
-    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
 
     let second = document_review::request(&mut s).unwrap();
     let second_payload: Value =
@@ -669,7 +670,7 @@ fn editing_document_between_ranges_restarts_review_and_discards_old_findings() {
     std::fs::write(&s.project.output, &doc).unwrap();
     s.document_review = Default::default();
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":["Old revision issue"]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":["Old revision issue"]}"#).unwrap();
     assert!(s.document_review.pending);
     std::fs::write(&s.project.output, format!("{doc}New line: main.js:1-6\n")).unwrap();
     let request = document_review::request(&mut s).unwrap();
@@ -679,7 +680,7 @@ fn editing_document_between_ranges_restarts_review_and_discards_old_findings() {
     assert_eq!(payload["evidence_page"], 0);
     assert_eq!(s.document_review.attempts, 0);
     while s.document_review.pending {
-        document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+        support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
         if s.document_review.pending {
             document_review::request(&mut s).unwrap();
         }
@@ -703,7 +704,7 @@ fn document_ranges_keep_a_mermaid_section_together_when_it_fits() {
     let first: Value =
         serde_json::from_str(first["messages"][1]["content"].as_str().unwrap()).unwrap();
     assert_eq!(first["document_line_end"], 60);
-    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
     let second = document_review::request(&mut s).unwrap();
     let second: Value =
         serde_json::from_str(second["messages"][1]["content"].as_str().unwrap()).unwrap();
@@ -818,7 +819,7 @@ fn grouped_citation_ranges_are_all_audited_and_supplied_to_reviewer() {
 async fn checkpoint_maintenance_does_not_consume_document_repair_requests() {
     let (_dir, mut s) = fixture();
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":["Correct the loop type"]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":["Correct the loop type"]}"#).unwrap();
     s.task_rounds = 20; // Time spent in other control requests is not document repair.
     s.document_review.repair_requests = 0;
     ContextManager::prepare(&mut s, 60000).unwrap();
@@ -976,7 +977,7 @@ fn review_pages_cover_all_evidence_before_approval_and_accumulate_findings() {
             }
         }
         pages += 1;
-        document_review::finish(
+        support::document_review::finish(
             &mut s,
             if pages == 1 {
                 r#"{"issues":["Flow: preserve numeric cap"]}"#
@@ -1010,7 +1011,7 @@ fn changing_evidence_between_pages_restarts_review_without_old_findings() {
     std::fs::write(&s.project.output, "# Flow\nmain.js:1-1800\n").unwrap();
     s.document_review = Default::default();
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":["Old revision issue"]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":["Old revision issue"]}"#).unwrap();
     assert!(s.document_review.pending);
     assert_eq!(s.document_review.evidence_page, 1);
     std::fs::write(
@@ -1104,11 +1105,11 @@ fn resolving_review_issues_allows_more_than_the_total_review_count() {
         vec!["bounds"],
     ] {
         document_review::request(&mut s).unwrap();
-        document_review::finish(&mut s, &json!({"issues":issues}).to_string()).unwrap();
+        support::document_review::finish(&mut s, &json!({"issues":issues}).to_string()).unwrap();
         assert_eq!(s.document_review.stalled_attempts, 0);
     }
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
     assert_eq!(s.document_review.attempts, 4);
     assert!(document_review::approved(&s));
 }
@@ -1119,7 +1120,8 @@ fn additive_sections_keep_document_review_open_for_remaining_work() {
     s.config.review_limit = 2;
     for n in 1..=3 {
         document_review::request(&mut s).unwrap();
-        document_review::finish(&mut s, r#"{"issues":["Finish the requested overview"]}"#).unwrap();
+        support::document_review::finish(&mut s, r#"{"issues":["Finish the requested overview"]}"#)
+            .unwrap();
         assert_eq!(s.document_review.stalled_attempts, 0);
         if n < 3 {
             let expected = s.last_document_write.as_ref().unwrap().1.clone();
@@ -1135,12 +1137,13 @@ fn first_issue_after_an_approved_document_gets_a_repair_chance() {
     let (_dir, mut s) = fixture();
     s.config.review_limit = 1;
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
     assert!(document_review::approved(&s));
     let expected = s.last_document_write.as_ref().unwrap().1.clone();
     tools::execute(&mut s, "document_edit", json!({"action":"replace_text","expected_hash":expected,"old_text":"A while loop","text":"A for loop"})).unwrap();
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":["Finish history normalization"]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":["Finish history normalization"]}"#)
+        .unwrap();
     assert_eq!(s.document_review.stalled_attempts, 0);
     assert!(!document_review::stalled_on_current_result(&s));
 }
@@ -1292,7 +1295,8 @@ async fn reads_and_verification_can_finish_even_at_the_edit_limit() {
     }
     let (_dir, mut s) = fixture();
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":["Check the existing section"]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":["Check the existing section"]}"#)
+        .unwrap();
     // A real correction creates a new target. Merely asking again must not
     // replace the rejected verdict for unchanged content with a random pass.
     // It cites nothing, so no investigation item has to cover it.
@@ -1316,7 +1320,7 @@ async fn reads_and_verification_can_finish_even_at_the_edit_limit() {
 fn rejected_review_cache_and_approval_follow_requirements_and_source_versions() {
     let (dir, mut s) = fixture();
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":["Correct the loop"]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":["Correct the loop"]}"#).unwrap();
     assert!(document_review::rejected_on_current_result(&s));
     // Agent-authored working checks do not change what the user requested.
     s.task
@@ -1332,20 +1336,20 @@ fn rejected_review_cache_and_approval_follow_requirements_and_source_versions() 
         .constraints
         .push("Use Korean".into());
     assert!(
-        document_review::finish(&mut s, r#"{"issues":[]}"#)
+        support::document_review::finish(&mut s, r#"{"issues":[]}"#)
             .unwrap_err()
             .to_string()
             .starts_with("document_review_stale")
     );
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
     assert!(document_review::approved(&s));
     s.request_review_criteria
         .deliverables
         .push("API appendix".into());
     assert!(!document_review::approved(&s));
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":["Add the appendix"]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":["Add the appendix"]}"#).unwrap();
     std::fs::write(dir.path().join("main.js"), "function changed() {}\n").unwrap();
     assert!(!document_review::rejected_on_current_result(&s));
 }
@@ -1358,7 +1362,7 @@ fn current_verdict_does_not_promote_findings_from_an_earlier_document() {
         document_review::CurrentVerdict::Unreviewed
     );
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":["Correct the loop"]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":["Correct the loop"]}"#).unwrap();
     assert!(matches!(
         document_review::current_verdict(&s),
         document_review::CurrentVerdict::Rejected(issues) if issues == ["Correct the loop"]
@@ -1378,7 +1382,7 @@ fn current_verdict_does_not_promote_findings_from_an_earlier_document() {
     );
 
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
     assert_eq!(
         document_review::current_verdict(&s),
         document_review::CurrentVerdict::Approved
@@ -1423,7 +1427,7 @@ fn rewording_review_findings_does_not_count_as_progress() {
         "Fix the loop description",
     ] {
         document_review::request(&mut s).unwrap();
-        document_review::finish(&mut s, &json!({"issues":[issue]}).to_string()).unwrap();
+        support::document_review::finish(&mut s, &json!({"issues":[issue]}).to_string()).unwrap();
     }
     assert_eq!(s.document_review.stalled_attempts, 2);
 }
@@ -1445,7 +1449,7 @@ fn long_document_review_advances_past_thirty_two_pages() {
         assert_eq!(payload["document_line_start"], next_line);
         next_line = payload["document_line_end"].as_u64().unwrap() + 1;
         assert!(mnemoarc::context::count(&request, &s.config.model) <= 24_000);
-        document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+        support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
         pages += 1;
         assert!(pages < 40, "page offsets stopped advancing");
         if !s.document_review.pending {
@@ -1508,7 +1512,7 @@ fn review_retry_preserves_document_range_and_evidence_continuation() {
             .unwrap()
             .contains("document_review_invalid")
     );
-    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
     let next = payload(document_review::request(&mut s).unwrap());
     assert_eq!(next["document"], first["document"]);
     assert_eq!(
@@ -1768,61 +1772,30 @@ async fn source_document_can_finish_after_stalled_reviews_or_many_rejected_final
 }
 
 #[test]
-fn a_repeated_finding_about_rewritten_text_is_dropped() {
+fn a_repeated_finding_about_rewritten_text_is_invalid_not_an_approval() {
     let (_dir, mut s) = fixture();
     document_review::request(&mut s).unwrap();
-    // First review quotes a document passage and a source passage.
-    document_review::finish(
-        &mut s,
-        r#"{"issues":["Flow: 'A while loop runs work…' is wrong; the source uses 'for (let i = 0; i < 5'","Flow: add the history step 'A while loop runs work' with normalization"]}"#,
-    )
-    .unwrap();
-    assert_eq!(s.document_review.issues.len(), 2);
-    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    support::document_review::finish(&mut s, r#"{"issues":["Flow: correct the loop"]}"#).unwrap();
+    let expected = tools::hash(&std::fs::read(&s.project.output).unwrap());
     tools::execute(
         &mut s,
         "document_edit",
-        json!({"action":"replace_text","expected_hash":hash,"old_text":"A while loop runs work.","text":"A bounded for loop runs work."}),
+        json!({"action":"replace_text","expected_hash":expected,
+        "old_text":"A while loop runs work.","text":"A bounded for loop runs work."}),
     )
     .unwrap();
-    // The live shape: the re-review repeats the finding with the old quote.
-    // A finding that also quotes source text, or one without a quote, stays.
     document_review::request(&mut s).unwrap();
-    document_review::finish(
-        &mut s,
-        r#"{"issues":["F2: Flow: add the history step 'A while loop runs work' with normalization","F1: Flow: 'A while loop runs work…' is wrong; the source uses 'for (let i = 0; i < 5'","Flow: normalization of history is not described"]}"#,
-    )
-    .unwrap();
-    assert_eq!(
-        s.document_review.issues,
-        [
-            "F1: Flow: 'A while loop runs work…' is wrong; the source uses 'for (let i = 0; i < 5'",
-            "Flow: normalization of history is not described"
-        ]
+    let stale = json!({"issues":[{"previous_id":null,"kind":"scope","document":{"start_line":2,"end_line":2,"quote":"A while loop runs work."},
+        "requirement_id":"R0","sources":[],"problem":"Old loop finding","correction":"Fix the old passage","ui_labels":[]}]});
+    assert!(
+        document_review::finish(&mut s, &stale.to_string())
+            .unwrap_err()
+            .to_string()
+            .starts_with("document_review_invalid:")
     );
-    // A finding whose quoted passage is still in the document is kept.
-    document_review::request(&mut s).unwrap();
-    document_review::finish(
-        &mut s,
-        r#"{"issues":["F1: Flow: 'A bounded for loop runs work' omits the bound"]}"#,
-    )
-    .unwrap();
-    assert_eq!(s.document_review.issues.len(), 1);
-    // Once only the rewritten passage was flagged, dropping it approves.
-    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
-    tools::execute(
-        &mut s,
-        "document_edit",
-        json!({"action":"replace_text","expected_hash":hash,"old_text":"A bounded for loop runs work.","text":"A for loop runs work five times."}),
-    )
-    .unwrap();
-    document_review::request(&mut s).unwrap();
-    document_review::finish(
-        &mut s,
-        r#"{"issues":["F1: Flow: 'A bounded for loop runs work' omits the bound"]}"#,
-    )
-    .unwrap();
-    assert!(s.document_review.issues.is_empty());
+    assert!(!document_review::approved(&s));
+    assert_eq!(s.document_review.attempts, 1);
+    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
     assert!(document_review::approved(&s));
 }
 
@@ -1847,24 +1820,25 @@ fn a_page_cannot_report_a_later_section_as_missing() {
             .to_string()
             .contains("## 4-3. Binding editor basics")
     );
-    // The live shape: a page claims a later section is missing. A finding
-    // about this page's text, and one quoting text not in the document, stay.
-    document_review::finish(
-        &mut s,
-        r#"{"issues":["Doc end: the requested section '4-3. Binding editor basics' does not exist on this page; add it","Intro: 'Intro context. main.js:1-6' repeats without new detail","Intro: add the requested 'loop bound explanation' paragraph"]}"#,
-    )
-    .unwrap();
-    while s.document_review.pending {
-        document_review::request(&mut s).unwrap();
-        document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
-    }
-    assert_eq!(
-        s.document_review.issues,
-        [
-            "Intro: 'Intro context. main.js:1-6' repeats without new detail",
-            "Intro: add the requested 'loop bound explanation' paragraph"
-        ]
+    let outside = json!({"issues":[{"previous_id":null,"kind":"scope","document":{"start_line":124,"end_line":124,"quote":"## 4-3. Binding editor basics"},
+        "requirement_id":"R0","sources":[],"problem":"Section is missing","correction":"Add the section","ui_labels":[]}]});
+    assert!(
+        document_review::finish(&mut s, &outside.to_string())
+            .unwrap_err()
+            .to_string()
+            .contains("outside this document page")
     );
+    assert!(!document_review::approved(&s));
+    assert_eq!(s.document_review.attempts, 0);
+    loop {
+        document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+        if !s.document_review.pending {
+            break;
+        }
+        document_review::request(&mut s).unwrap();
+    }
+    assert!(s.document_review.issues.is_empty());
+    assert!(document_review::approved(&s));
 }
 
 #[test]
@@ -1950,13 +1924,13 @@ fn longer_repairs_do_not_reset_a_stalled_review_without_a_length_finding() {
     let issues =
         r#"{"issues":["Flow: name the loop bound","Flow: describe history normalization"]}"#;
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, issues).unwrap();
+    support::document_review::finish(&mut s, issues).unwrap();
     for n in 1..=2 {
         // Each repair adds lines to the same section but resolves nothing.
         let expected = s.last_document_write.as_ref().unwrap().1.clone();
         tools::execute(&mut s, "document_edit", json!({"action":"append","expected_hash":expected,"text":format!("More detail {n}.\nAnd more {n}.\n")})).unwrap();
         document_review::request(&mut s).unwrap();
-        document_review::finish(&mut s, issues).unwrap();
+        support::document_review::finish(&mut s, issues).unwrap();
         assert_eq!(s.document_review.stalled_attempts, n);
     }
     assert!(document_review::stalled_on_current_result(&s));
@@ -1968,7 +1942,7 @@ fn longer_repairs_count_as_progress_after_a_length_finding() {
     s.config.review_limit = 1;
     s.answer_review_question = "history normalization 문서를 40줄 내외로 작성해줘.".into();
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
     assert!(s.document_review.issues[0].starts_with("문서 길이:"));
     let expected = s.last_document_write.as_ref().unwrap().1.clone();
     tools::execute(
@@ -1978,6 +1952,6 @@ fn longer_repairs_count_as_progress_after_a_length_finding() {
     )
     .unwrap();
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
     assert_eq!(s.document_review.stalled_attempts, 0);
 }

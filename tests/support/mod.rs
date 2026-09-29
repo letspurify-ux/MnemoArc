@@ -1,9 +1,12 @@
+#[allow(dead_code)]
+pub mod document_review;
 use mnemoarc::llm::Completion;
 use serde_json::{Value, json};
 
 /// Existing workflow fixtures test structural gates. Supply an explicit model
 /// acceptance verdict for the additional independent review; semantic rejection
 /// and recovery are covered by completion_review.rs.
+#[allow(dead_code)]
 pub fn acceptance(request: &Value) -> Option<Completion> {
     let payload: Value = serde_json::from_str(request["messages"][1]["content"].as_str()?).ok()?;
     if payload["completion_review"] != true {

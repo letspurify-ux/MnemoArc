@@ -2,7 +2,7 @@
 use mnemoarc::{
     agent::{self, AgentEvent},
     config::{Config, Project, Secret},
-    llm::{LlmClient, OpenAiClient},
+    llm::{Completion, LlmClient, OpenAiClient},
     session::{RunRecord, Session},
     tools,
 };
@@ -10,11 +10,78 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+/// Keep review inputs, protocol retries and validation decisions observable in
+/// the paid run report, including calls that never produced a complete verdict.
+struct ReviewTrace(Arc<Mutex<Vec<Value>>>);
+
+async fn finish_live_review(
+    session: &mut Session,
+    first: &str,
+    started: Instant,
+    limit: std::time::Duration,
+) -> anyhow::Result<Vec<Value>> {
+    tools::document_review::finish(session, first)?;
+    let mut followups = Vec::new();
+    while session.document_review.pending {
+        let remaining = limit
+            .checked_sub(started.elapsed())
+            .ok_or_else(|| anyhow::anyhow!("live review deadline exhausted"))?;
+        let request = tools::document_review::request(session)?;
+        let (tx, mut rx) = mpsc::channel(32);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let response = tokio::time::timeout(
+            remaining,
+            OpenAiClient.complete(
+                request.clone(),
+                &session.config,
+                CancellationToken::new(),
+                tx,
+            ),
+        )
+        .await??;
+        drain.await?;
+        tools::document_review::finish(session, &response.text)?;
+        followups.push(json!({"request":request,"response":response.text,"usage":response.usage}));
+    }
+    Ok(followups)
+}
+
+#[async_trait::async_trait]
+impl LlmClient for ReviewTrace {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &Config,
+        cancel: CancellationToken,
+        delta: mpsc::Sender<String>,
+    ) -> anyhow::Result<Completion> {
+        let payload = request["messages"][1]["content"]
+            .as_str()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok());
+        let review = payload
+            .as_ref()
+            .is_some_and(|p| p["source_document_review"] == true);
+        let started = Instant::now();
+        let result = OpenAiClient.complete(request, config, cancel, delta).await;
+        if review {
+            let record = match &result {
+                Ok(response) => json!({"input":payload,"response":response.text,
+                    "usage":response.usage,"provider_attempts":response.attempts,
+                    "elapsed_seconds":started.elapsed().as_secs_f64()}),
+                Err(error) => json!({"input":payload,"error":error.to_string(),
+                    "elapsed_seconds":started.elapsed().as_secs_f64()}),
+            };
+            self.0.lock().unwrap().push(record);
+        }
+        result
+    }
+}
 
 fn env_bool(name: &str, fallback: bool) -> bool {
     match std::env::var(name).ok().as_deref() {
@@ -116,7 +183,19 @@ fn live_report_distinguishes_the_edited_document_from_its_last_review_target() {
     )
     .unwrap();
     tools::document_review::request(&mut result).unwrap();
-    tools::document_review::finish(&mut result, r#"{"issues":["Flow: wrong loop type"]}"#).unwrap();
+    tools::document_review::finish(&mut result, &json!({"issues":[{
+        "previous_id":null,"kind":"factual","document":{"start_line":2,"end_line":2,"quote":"A while loop runs five times."},
+        "requirement_id":null,"sources":[{"path":"source.rs","start_line":1,"end_line":1,"quote":"fn run() { for _ in 0..5 {} }"}],
+        "problem":"Flow: wrong loop type","correction":"Describe the for loop.","ui_labels":[]
+    }]}).to_string()).unwrap();
+    tools::document_review::request(&mut result).unwrap();
+    tools::document_review::finish(
+        &mut result,
+        &json!({"decisions":[{"id":"F1","status":"confirmed",
+        "reason":"The document says while; the source declares for.","duplicate_of":null}]})
+        .to_string(),
+    )
+    .unwrap();
     let reviewed_hash = tools::document_review::review_target_hash(&result)
         .unwrap()
         .to_owned();
@@ -186,9 +265,16 @@ async fn glm_rejects_missing_required_ui_steps() {
     .expect("review timeout")
     .expect("GLM review request");
     drain.await.unwrap();
-    tools::document_review::finish(&mut session, &completion.text).unwrap();
+    let followups = finish_live_review(
+        &mut session,
+        &completion.text,
+        start,
+        std::time::Duration::from_secs(150),
+    )
+    .await
+    .unwrap();
     let report = json!({
-        "model":session.config.model,
+        "model":session.config.model,"followup_reviews":followups,
         "elapsed_seconds":start.elapsed().as_secs_f64(),
         "attempts":completion.attempts,
         "usage":completion.usage,
@@ -310,14 +396,20 @@ async fn registered_user_manual_review_preserves_citations() {
         .expect("manual review request");
         drain.await.unwrap();
         assert!(completion.calls.is_empty(), "review must not call tools");
-        let verdict = tools::document_review::finish(&mut session, &completion.text);
+        let verdict = finish_live_review(
+            &mut session,
+            &completion.text,
+            started,
+            std::time::Duration::from_secs(210),
+        )
+        .await;
         let approved = tools::document_review::approved(&session);
         reports.push(json!({
             "case":case,"document":document,"request":request,
             "expected_approved":expected_approved,"approved":approved,
             "elapsed_seconds":started.elapsed().as_secs_f64(),
             "usage":completion.usage,"provider_attempts":completion.attempts,
-            "review_text":completion.text,"review_issues":session.document_review.issues,
+            "review_text":completion.text,"followup_reviews":verdict.as_ref().ok(),"review_issues":session.document_review.issues,
             "review_state":session.document_review,
             "error":verdict.as_ref().err().map(ToString::to_string),
         }));
@@ -555,7 +647,7 @@ async fn registered_source_documentation() {
                             .filter(|item| item.status == "verified")
                             .count();
                         eprintln!(
-                            "[live] round={} input={} output={} document_written={} investigations={}/{} document_reviews={} completion_reviews={} checkpoint={} ladder={}/{} best={} closing={} unrepaired_finals={}",
+                            "[live] round={} input={} output={} document_written={} investigations={}/{} document_reviews={} finding_validations={} dismissed={} merged={} completion_reviews={} checkpoint={} ladder={}/{} best={} closing={} unrepaired_finals={}",
                             s.task_rounds,
                             s.input_tokens,
                             s.output_tokens,
@@ -563,6 +655,9 @@ async fn registered_source_documentation() {
                             verified,
                             s.investigations.len(),
                             s.document_review.attempts,
+                            s.document_review.validation_rounds,
+                            s.document_review.dismissed_findings,
+                            s.document_review.merged_findings,
                             s.completion_review.attempts,
                             s.checkpoint
                                 .as_ref()
@@ -585,10 +680,11 @@ async fn registered_source_documentation() {
         }
         (first_write, reviews)
     });
+    let review_calls = Arc::new(Mutex::new(Vec::new()));
     let start = Instant::now();
     let mut result = agent::run_session(
         session,
-        Arc::new(OpenAiClient),
+        Arc::new(ReviewTrace(review_calls.clone())),
         CancellationToken::new(),
         tx,
     )
@@ -630,7 +726,7 @@ async fn registered_source_documentation() {
         "usage_incomplete":result.usage_incomplete,"model_rounds":result.task_rounds,"first_write":first_write,"review_attempts":reviews,
         "tool_calls":calls,"tool_errors":errors,"document_review":result.document_review,"audit":audit,
         "investigations":result.investigations,"source_unchanged":source_unchanged,"configured_output_unchanged":original_unchanged,
-        "document_lines":document.lines().count(),"document":document});
+        "document_lines":document.lines().count(),"document":document,"review_calls":*review_calls.lock().unwrap()});
     report.as_object_mut().unwrap().extend(
         report_diagnostics(&result, &audit)
             .as_object()

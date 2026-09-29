@@ -1,9 +1,10 @@
 //! Closing mode: document work converges on a finished result, reporting
 //! unresolved items instead of repeating until the run budget is spent.
+mod support;
 use anyhow::Result;
 use async_trait::async_trait;
 use mnemoarc::{
-    agent::{AgentEvent, run_session},
+    agent::AgentEvent,
     config::{Config, Project},
     llm::{Completion, LlmClient, ToolCall, Usage},
     session::{Closing, Session},
@@ -11,6 +12,7 @@ use mnemoarc::{
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
+use support::document_review::run_session;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -179,7 +181,7 @@ fn rereview_lists_previous_findings_and_changed_sections() {
         serde_json::from_str(first["messages"][1]["content"].as_str().unwrap()).unwrap();
     assert_eq!(payload["previous_findings"], json!([]));
     assert!(payload["changed_sections"].is_null());
-    document_review::finish(&mut s, r#"{"issues":["History: name the helper"]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":["History: name the helper"]}"#).unwrap();
     assert!(!s.document_review.pending);
 
     let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
@@ -192,10 +194,12 @@ fn rereview_lists_previous_findings_and_changed_sections() {
     let second = document_review::request(&mut s).unwrap();
     let payload: Value =
         serde_json::from_str(second["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["previous_findings"][0]["id"], "F1");
     assert_eq!(
-        payload["previous_findings"],
-        json!([{"id":"F1","text":"History: name the helper"}])
+        payload["previous_findings"][0]["text"],
+        "History: name the helper"
     );
+    assert!(payload["previous_findings"][0]["document"].is_object());
     assert_eq!(payload["changed_sections"], json!(["# History"]));
     assert!(
         second["messages"][0]["content"]
@@ -648,7 +652,7 @@ async fn rejected_review_asks_for_one_batched_repair() {
     let (_dir, mut s, _) = fixture();
     s.config.completion_review_enabled = false;
     document_review::request(&mut s).unwrap();
-    document_review::finish(
+    support::document_review::finish(
         &mut s,
         r#"{"issues":["Flow: state the loop bound","History: name the helper"]}"#,
     )
@@ -678,8 +682,11 @@ async fn rejected_review_asks_for_one_batched_repair() {
         } else {
             // Current-policy findings survive a lost review target as repair context.
             document_review::request(&mut s).unwrap();
-            document_review::finish(&mut s, r#"{"issues":["Flow: state the loop bound"]}"#)
-                .unwrap();
+            support::document_review::finish(
+                &mut s,
+                r#"{"issues":["Flow: state the loop bound"]}"#,
+            )
+            .unwrap();
             document_review::defer_for_repair(&mut s);
         }
         let (_, guidance) = run_scripted(
@@ -721,7 +728,7 @@ async fn audits_during_review_repair_return_a_short_page() {
         s.investigations.push(item);
     }
     document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":["Flow: fix citations"]}"#).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":["Flow: fix citations"]}"#).unwrap();
     let (result, _) = run_scripted(s, vec![call("audit", "document_audit", json!({}))]).await;
     let output: Value = result
         .history
@@ -1521,7 +1528,7 @@ async fn new_evidence_read_for_open_review_findings_is_progress() {
         .unwrap();
     }
     document_review::request(&mut s).unwrap();
-    document_review::finish(
+    support::document_review::finish(
         &mut s,
         r#"{"issues":["Line 3: cite the helper that normalizes history"]}"#,
     )

@@ -158,6 +158,12 @@ fn response_format_rejected(error: &str) -> bool {
 static JSON_SCHEMA_REJECTED: std::sync::Mutex<std::collections::BTreeSet<String>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
+/// Some providers fail a particular strict grammar inside an otherwise valid
+/// SSE response. Remember only a successful JSON-mode recovery, per schema;
+/// a provider outage alone must not disable all structured output.
+static JSON_SCHEMA_STREAM_RECOVERED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
 fn schema_endpoint(c: &Config) -> String {
     format!("{}\0{}", c.base_url, c.model)
 }
@@ -606,9 +612,16 @@ impl LlmClient for OpenAiClient {
         if let Some(fields) = request.as_object_mut() {
             fields.remove(STREAM_DELTAS_MARKER);
         }
+        let schema_key = (request["response_format"]["type"] == "json_schema")
+            .then(|| format!("{}\0{}", schema_endpoint(c), request["response_format"]));
         if JSON_SCHEMA_REJECTED
             .lock()
             .is_ok_and(|rejected| rejected.contains(&schema_endpoint(c)))
+            || schema_key.as_ref().is_some_and(|key| {
+                JSON_SCHEMA_STREAM_RECOVERED
+                    .lock()
+                    .is_ok_and(|recovered| recovered.contains(key))
+            })
         {
             downgrade_json_schema(&mut request);
         }
@@ -621,6 +634,7 @@ impl LlmClient for OpenAiClient {
         // forever after a subsequent 429/5xx response.
         let mut transient_retries = 0usize;
         let mut response_format_fallback = false;
+        let mut schema_stream_fallback = false;
         loop {
             // Cancellation must cover every await inside an attempt, including
             // response-body reads and backpressure on the delta channel.
@@ -638,6 +652,13 @@ impl LlmClient for OpenAiClient {
             };
             match result {
                 Ok(mut r) => {
+                    if schema_stream_fallback
+                        && request["response_format"]["type"] == "json_object"
+                        && let Some(key) = &schema_key
+                        && let Ok(mut recovered) = JSON_SCHEMA_STREAM_RECOVERED.lock()
+                    {
+                        recovered.insert(key.clone());
+                    }
                     r.attempts = attempt.saturating_add(1);
                     return Ok(r);
                 }
@@ -676,6 +697,19 @@ impl LlmClient for OpenAiClient {
                     // user; the partial response is discarded, never merged.
                     let silent = !emitted_text.load(Ordering::Relaxed);
                     let transient = transient_error(&text);
+                    // Exhaust ordinary transient retries first, then make one
+                    // compatibility attempt for an SSE grammar failure. The
+                    // caller still validates the complete response schema.
+                    if silent
+                        && !schema_stream_fallback
+                        && text.starts_with("provider_stream_error:")
+                        && transient_retries >= c.retries
+                        && downgrade_json_schema(&mut request)
+                    {
+                        schema_stream_fallback = true;
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
                     let retry = silent
                         && (transient
                             || (attempt == 0 && text.starts_with("invalid_tool_arguments:"))

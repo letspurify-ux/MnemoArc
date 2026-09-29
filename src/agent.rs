@@ -3271,7 +3271,7 @@ mod review_gap_tests {
         .unwrap();
 
         tools::document_review::request(&mut s).unwrap();
-        tools::document_review::finish(
+        tools::document_review::test_finish(
             &mut s,
             r#"{"issues":["Flow: the loop is for, not while"]}"#,
         )
@@ -3299,7 +3299,7 @@ mod review_gap_tests {
 
         s.config.source_document_review = true;
         tools::document_review::request(&mut s).unwrap();
-        tools::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+        tools::document_review::test_finish(&mut s, r#"{"issues":[]}"#).unwrap();
         let gaps = collect_gaps(&mut s, &[]);
         assert!(!gaps.iter().any(|gap| gap.starts_with("문서 검토")));
     }
@@ -3394,6 +3394,23 @@ mod review_gap_tests {
             completion.usage
         );
         tools::document_review::finish(&mut s, &review_text).unwrap();
+        while s.document_review.pending {
+            let request = tools::document_review::request(&mut s).unwrap();
+            let (tx, mut rx) = mpsc::channel(32);
+            let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            let remaining = Duration::from_secs(120)
+                .checked_sub(started.elapsed())
+                .expect("focused review deadline");
+            let response = tokio::time::timeout(
+                remaining,
+                OpenAiClient.complete(request, &s.config, CancellationToken::new(), tx),
+            )
+            .await
+            .expect("focused review validation timeout")
+            .unwrap();
+            drain.await.unwrap();
+            tools::document_review::finish(&mut s, &response.text).unwrap();
+        }
         assert!(
             tools::document_review::rejected_on_current_result(&s),
             "the live reviewer did not reject the deliberately false loop claim: {review_text}"

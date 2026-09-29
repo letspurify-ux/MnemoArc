@@ -1019,6 +1019,105 @@ async fn rejected_json_schema_degrades_to_json_mode_and_is_remembered() {
 }
 
 #[tokio::test]
+async fn sse_schema_failure_recovers_once_and_caches_only_that_schema() {
+    use std::sync::{Arc, Mutex};
+    let formats = Arc::new(Mutex::new(Vec::new()));
+    let seen = formats.clone();
+    let app=Router::new().route("/chat/completions",post(move |axum::Json(body):axum::Json<serde_json::Value>| {
+        let seen=seen.clone();
+        async move {
+            let format=body["response_format"]["type"].as_str().unwrap_or("none").to_owned();
+            let failing=format=="json_schema" && body["response_format"]["json_schema"]["name"]=="document_review";
+            seen.lock().unwrap().push(format);
+            let content=if failing { event(json!({"error":{"code":502,"message":"JSON error injected into SSE stream"}})) }
+                else { format!("{}data: [DONE]\n\n",event(json!({"choices":[{"delta":{"content":"{\"issues\":[]}"},"finish_reason":"stop"}]}))) };
+            ([(header::CONTENT_TYPE,"text/event-stream")],content)
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = Config {
+        base_url: format!("http://{}", listener.local_addr().unwrap()),
+        model: "schema-stream-recovery".into(),
+        retries: 0,
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
+    for attempts in [2, 1] {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = OpenAiClient
+            .complete(request.clone(), &config, CancellationToken::new(), tx)
+            .await
+            .unwrap();
+        assert_eq!(result.attempts, attempts);
+    }
+    request["response_format"]["json_schema"]["name"] = json!("different_schema");
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    assert_eq!(
+        OpenAiClient
+            .complete(request, &config, CancellationToken::new(), tx)
+            .await
+            .unwrap()
+            .attempts,
+        1
+    );
+    assert_eq!(
+        *formats.lock().unwrap(),
+        ["json_schema", "json_object", "json_object", "json_schema"]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn an_outage_in_both_formats_is_bounded_and_does_not_poison_schema_cache() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let available = Arc::new(AtomicBool::new(false));
+    let state = available.clone();
+    let app=Router::new().route("/chat/completions",post(move |axum::Json(body):axum::Json<serde_json::Value>| {
+        let state=state.clone();
+        async move {
+            let content=if !state.load(Ordering::SeqCst) || body["response_format"]["type"]=="json_schema" {
+                event(json!({"error":{"code":502,"message":"provider unavailable"}}))
+            } else {format!("{}data: [DONE]\n\n",event(json!({"choices":[{"delta":{"content":"{\"issues\":[]}"},"finish_reason":"stop"}]})))};
+            ([(header::CONTENT_TYPE,"text/event-stream")],content)
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = Config {
+        base_url: format!("http://{}", listener.local_addr().unwrap()),
+        model: "schema-outage-recovery".into(),
+        retries: 0,
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        OpenAiClient.complete(request.clone(), &config, CancellationToken::new(), tx),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.to_string().starts_with("provider_stream_error:"));
+    available.store(true, Ordering::SeqCst);
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    assert_eq!(
+        OpenAiClient
+            .complete(request, &config, CancellationToken::new(), tx)
+            .await
+            .unwrap()
+            .attempts,
+        2,
+        "a failed comparison must not cache the schema as unsupported"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn request_timeout_bounds_silence_not_a_long_streaming_answer() {
     use futures_util::stream;
     let app = Router::new().route(
