@@ -60,12 +60,12 @@ Python 함수 매개변수는 본문에서 사용하며 기본값 표현식은 �
 
 언어별 연결은 다음 범위에서 후보를 제공한다.
 
-- JS/TS: 상대 경로의 명시적 ESM import, 이름 별칭, namespace import, 직접 export와 같은 파일의 export 목록. `export default name`과 default 키워드 뒤의 줄바꿈·주석도 처리한다. 로컬 수출 목록의 원래 이름은 참조로 남기고 공개 별칭과 원격 재수출 이름은 지역 참조로 세지 않는다. import한 클래스의 멤버는 그 클래스 내부에서 찾는다. TypeScript의 `import type`, `export type`과 개별 `type` 표기는 타입 참조 후보에만 사용하고 런타임 호출 후보에는 사용하지 않는다. [TypeScript 모듈 문서](https://www.typescriptlang.org/docs/handbook/esm-node.html)를 따른다.
+- JS/TS: 상대 경로의 명시적 ESM import, 이름 별칭, namespace import, 직접 export와 같은 파일의 export 목록. 직접 export한 선언에 추가한 별칭도 조회한다. `export default name`과 default 키워드 뒤의 줄바꿈·주석도 처리한다. 로컬 수출 목록의 원래 이름은 참조로 남기고 공개 별칭과 원격 재수출 이름은 지역 참조로 세지 않는다. import한 클래스의 멤버는 그 클래스 내부에서 찾는다. TypeScript의 `Types.Foo`는 한정자를 유지하며, `import type`, `export type`과 개별 `type` 표기는 타입 참조 후보에만 사용하고 런타임 호출 후보에는 사용하지 않는다. [TypeScript 모듈 문서](https://www.typescriptlang.org/docs/handbook/esm-node.html)를 따른다.
 - Python: 프로젝트 루트 또는 상대 경로의 `import`/`from ... import ...`, 별칭과 클래스 멤버 후보. `import pkg.mod`의 `pkg.mod.member`, `from . import mod`의 하위 모듈 경로를 구분한다.
-- Rust: `use`의 별칭·중첩 목록, `crate`/`self`/`super`와 명시적 모듈 경로, 현재 impl/trait의 `Self` 멤버. 타입 참조는 같은 이름의 값 바인딩과 구분한다. 중첩 모듈에 부모 모듈의 이름을 자동 상속하지 않는다. 파일 이름과 `lib.rs`/`main.rs`/`mod.rs` 배치에 따른 후보이므로 모듈 속성·Cargo 설정까지 확인한 결과는 아니다.
+- Rust: `use`의 별칭·중첩 목록, `crate`/`self`/`super`와 명시적 모듈 경로, 현재 impl/trait의 `Self` 멤버. 상대 경로는 가까운 지역 타입·모듈이 바깥 선언을 가리는지 확인한다. `r#`가 붙은 식별자는 이름 비교에서 일반 표기와 같게 처리하며 원문 위치와 표현식은 유지한다. 타입 참조는 같은 이름의 값 바인딩과 구분한다. 중첩 모듈에 부모 모듈의 이름을 자동 상속하지 않는다. 파일 이름과 `lib.rs`/`main.rs`/`mod.rs` 배치에 따른 후보이므로 모듈 속성·Cargo 설정까지 확인한 결과는 아니다.
 - Java: 명시적 타입·static 멤버 import, 같은 패키지 타입 후보. 같은 패키지의 다른 파일에 선언된 타입도 `new Store()` 후보에 포함한다. 단순 메서드 호출과 생성자의 타입 이름은 값 변수와 구분한다. 같은 이름의 매개변수나 필드가 `save()`를 가리지 않으며 `receiver.save()`의 수신 객체는 별도로 확인한다. [JLS 이름 가림 규칙](https://docs.oracle.com/javase/specs/jls/se25/html/jls-6.html#jls-6.4.1)을 따른다.
 - C#: 타입 별칭, namespace `using`, `using static`, 같은 namespace 타입 후보. `new Store()`의 타입 이름은 같은 이름의 지역 값과 구분하며, `using` 또는 현재 namespace의 다른 파일에 선언된 타입도 후보에 포함한다. 중첩 클래스에서도 바깥 namespace를 사용한다. [C# 이름 공간 규칙](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/basic-concepts)을 따른다. `global using`의 다른 파일 전파는 분석하지 않는다.
-- 현재 클래스의 `this`/`self` 멤버도 후보로 표시한다. 상속·인터페이스·런타임 디스패치를 확정하지 않는다.
+- 현재 클래스의 수신자 멤버도 후보로 표시한다. `this`는 해당 언어에서만 적용한다. Python 메서드의 첫 매개변수와 Rust의 `self`는 재할당·가림을 확인하고, Python의 명시적 `staticmethod` 매개변수는 수신자로 취급하지 않는다. 상속·인터페이스·런타임 디스패치를 확정하지 않는다.
 
 타입 추론, 패키지·경로 별칭 설정, wildcard import, 재수출 연쇄, Rust 매크로 확장, 리플렉션, 의존성 주입은 해결하지 않는다. Python 모듈 탐색 경로와 Rust 크레이트 구성 등 실행 환경에 따라 후보가 실제 대상과 다를 수 있다. 복합 수신 표현식과 함수값의 호출도 미해결로 남을 수 있다.
 
@@ -85,6 +85,8 @@ Python 함수 매개변수는 본문에서 사용하며 기본값 표현식은 �
 
 `tests/navigation.rs`는 실제 구문 분석기와 임시 프로젝트로 다국어 선언, 별칭, 가림, 중첩 콜백, 오버로드, 미해결 대상, 인바운드 참조, 변경 감지, 경로 제한, 구문 오류, Unicode 위치와 결과 예산의 이어 읽기를 검사한다. 기존 구조·문서 도구 테스트도 함께 실행한다.
 
+`tests/symbol_regressions.rs`는 2026-09-30에 수정한 9개 결함과 인접한 경계 조건을 검사한다. 한정된 TypeScript 타입의 오연결, 언어별 수신자·재할당, 가까운 Rust 타입·모듈, 초기값 없는 선언과 enum 참조, 복수 선언의 읽기 범위, 추가 export 별칭, Java compact constructor의 호출 소유자, C# 파일 범위 namespace의 하위 호출, Rust raw identifier를 포함한다. 선언과 이름 노드의 바이트 범위가 같아도 선언 종류를 함께 확인해 참조가 누락되지 않도록 한다.
+
 정밀 검토에서 추가한 회귀 검사는 다음 오류를 재현하고 수정 여부를 확인한다.
 
 - 구조 분해·반복문·catch·람다·패턴 바인딩과 중첩 블록의 재할당을 놓쳐 바깥 함수를 잘못 연결하는 경우.
@@ -102,10 +104,10 @@ Python 함수 매개변수는 본문에서 사용하며 기본값 표현식은 �
 
 실제 모델의 문서 정확도나 토큰 절감률은 별도 전후 평가가 필요하다. 이 구현은 LLM이 실행 흐름을 올바르게 해석했다는 보증을 추가하지 않는다.
 
-### 이번 변경의 확인 결과
+### 2026-09-30 수정 검증
 
-- 최종 코드의 전체 `npm test` 통과: Rust 631개, JavaScript 27개. 명시적 실행 대상 Rust 테스트 7개는 기존 설정대로 제외했다.
-- macOS에서 탐색 회귀 테스트 77개와 파일 탐색 시간 제한 단위 검사를 통과했다. Linux 전용 파일명 회귀 테스트 1개도 추가했다.
+- macOS에서 전체 `cargo test` 통과: 666개 성공, 실패 0개. 기본 제외 테스트 8개는 유료 모델 연동 7개와 별도 부모 테스트가 실행하는 자식 테스트 1개다.
+- 새 회귀 테스트 32개, 기존 탐색 테스트 77개와 구조 테스트 22개를 포함한다. Linux 전용 파일명 검사는 이번 macOS 실행 대상에 포함되지 않는다.
 - `cargo clippy --all-targets -- -D warnings` 통과.
-- `cargo fmt --check`, `git diff --check`, `npm run build` 통과. 배포 실행 파일에 프런트엔드를 포함했다.
+- `cargo fmt --check`, `git diff --check` 통과.
 - 앞선 검토에서는 임시 실행 예제를 포함한 이 저장소의 지원 파일 127개에서 `read_text` 선언 검색과 호출자 조회를 실제 실행했다. 디버그 빌드의 단일 측정에서 검색 약 1.3초, 호출자 조회 약 13.1초였고 관련 위치 18개를 반환했다. 구문 오류는 없었다. 이 시간은 다른 프로젝트나 배포 빌드의 성능 보장이 아니다.

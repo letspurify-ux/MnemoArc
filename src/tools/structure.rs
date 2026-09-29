@@ -59,7 +59,7 @@ pub(super) fn language(path: &Path) -> Result<&'static str> {
     }
 }
 
-fn symbol_name<'a>(node: Node<'a>) -> Option<Node<'a>> {
+pub(super) fn symbol_name<'a>(node: Node<'a>) -> Option<Node<'a>> {
     match node.kind() {
         "function_item"
         | "function_signature_item"
@@ -339,7 +339,48 @@ fn describe(
             outer = export;
         }
     }
-    let end = outer.end_position();
+    // Declarators share modifiers but not implementations. Keep the common
+    // prefix for the first declarator (and shared source lines), without
+    // allowing a later sibling's body into this symbol's read range.
+    let mut start = outer.start_position();
+    let mut start_byte = outer.start_byte();
+    let mut end = outer.end_position();
+    let mut signature_limit = outer.end_byte();
+    let mut prefix_omitted = false;
+    if node.kind() == "variable_declarator" {
+        // Stop at the adjacent declarator instead of rescanning every sibling
+        // for each symbol in a large multi-declarator statement.
+        let has_sibling = |previous| {
+            let mut sibling = if previous {
+                node.prev_named_sibling()
+            } else {
+                node.next_named_sibling()
+            };
+            while let Some(child) = sibling {
+                if child.kind() == "variable_declarator" {
+                    return true;
+                }
+                sibling = if previous {
+                    child.prev_named_sibling()
+                } else {
+                    child.next_named_sibling()
+                };
+            }
+            false
+        };
+        let previous = has_sibling(true);
+        if previous || has_sibling(false) {
+            end = node.end_position();
+            if outer.start_position().row != outer.end_position().row {
+                signature_limit = node.end_byte();
+            }
+            if previous && node.start_position().row > start.row {
+                start = node.start_position();
+                start_byte = node.start_byte();
+                prefix_omitted = true;
+            }
+        }
+    }
     let end_line = end.row + usize::from(end.column != 0);
     let signature_end = function_value(node)
         .unwrap_or(node)
@@ -350,26 +391,30 @@ fn describe(
                 .filter(|v| v.kind() == "arrow_expression_clause")
         })
         .map(|n| n.start_byte())
-        .unwrap_or(outer.end_byte());
-    let full_signature = source[outer.start_byte()..signature_end].trim();
+        .unwrap_or(signature_limit);
+    let full_signature = source[start_byte..signature_end].trim();
     let signature: String = full_signature.chars().take(500).collect();
-    let signature_start_line = outer.start_position().row + 1;
+    let signature_start_line = start.row + 1;
     let signature_end_line = signature_start_line + signature.lines().count().saturating_sub(1);
     let name_pos = name.start_position();
     let line_start = name.start_byte() - name_pos.column;
     let name_column = source[line_start..name.start_byte()].chars().count() + 1;
-    json!({
+    let mut result = json!({
         // The content digest alone is insufficient: two files can contain
         // identical source and byte ranges. Bind IDs to the canonical path so
         // a copied ID cannot silently read a symbol from the wrong file.
         "symbol_id":format!("{digest}:{path_identity}:{}:{}", node.start_byte(), node.end_byte()),
         "name":symbol_label(node,name,source).chars().take(500).collect::<String>(),"kind":node.kind(),"container":container,
-        "start_line":outer.start_position().row+1,"end_line":end_line,
+        "start_line":start.row+1,"end_line":end_line,
         "name_line":name_pos.row+1,"name_column":name_column,
-        "signature":signature,"signature_truncated":full_signature.chars().count()>500,
+        "signature":signature,"signature_truncated":prefix_omitted || full_signature.chars().count()>500,
         "signature_start_line":signature_start_line,"signature_end_line":signature_end_line,
         "has_parse_errors":node.has_error()
-    })
+    });
+    if prefix_omitted {
+        result["signature_context_start_line"] = json!(outer.start_position().row + 1);
+    }
+    result
 }
 
 /// One immutable syntax snapshot shared by outline, workspace search and relations.

@@ -115,6 +115,21 @@ fn csharp_identifier(name: &str) -> &str {
     name.strip_prefix('@').unwrap_or(name)
 }
 
+fn identifier<'a>(language: &str, name: &'a str) -> &'a str {
+    match language {
+        "csharp" => csharp_identifier(name),
+        "rust" => name.strip_prefix("r#").unwrap_or(name),
+        _ => name,
+    }
+}
+
+fn rust_path(path: &str) -> String {
+    path.split("::")
+        .map(|part| identifier("rust", part))
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
 fn named(node: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).collect()
@@ -139,6 +154,7 @@ fn is_function(node: Node<'_>) -> bool {
             | "method_definition"
             | "method_declaration"
             | "constructor_declaration"
+            | "compact_constructor_declaration"
             | "local_function_statement"
             | "lambda"
             | "lambda_expression"
@@ -203,9 +219,18 @@ fn exact_node(root: Node<'_>, span: Span) -> Option<Node<'_>> {
     }
 }
 
-fn node_name(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("name")
-        .or_else(|| node.child_by_field_name("type"))
+fn declaration_node<'a>(root: Node<'a>, symbol: &Value) -> Option<Node<'a>> {
+    let span = symbol_span(symbol);
+    let mut node = exact_node(root, span.clone())?;
+    // An uninitialized declarator or unit enum variant can share its entire
+    // span with its name. Recover the declaration, not the smaller identifier.
+    while node.byte_range() == span {
+        if Some(node.kind()) == symbol["kind"].as_str() {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+    None
 }
 
 fn identifiers(node: Node<'_>) -> Vec<Node<'_>> {
@@ -215,6 +240,7 @@ fn identifiers(node: Node<'_>) -> Vec<Node<'_>> {
         if matches!(
             node.kind(),
             "identifier"
+                | "self"
                 | "shorthand_property_identifier_pattern"
                 | "shorthand_field_identifier"
                 | "implicit_parameter"
@@ -599,6 +625,7 @@ fn expression<'a>(node: Node<'a>, source: &str) -> Option<(Node<'a>, Option<Stri
         | "field_expression"
         | "attribute"
         | "member_access_expression"
+        | "nested_type_identifier"
         | "qualified_name" => {
             let name = node
                 .child_by_field_name("property")
@@ -610,6 +637,7 @@ fn expression<'a>(node: Node<'a>, source: &str) -> Option<(Node<'a>, Option<Stri
                 .child_by_field_name("object")
                 .or_else(|| node.child_by_field_name("value"))
                 .or_else(|| node.child_by_field_name("expression"))
+                .or_else(|| node.child_by_field_name("module"))
                 .or_else(|| node.child_by_field_name("qualifier"));
             Some((name, object.map(|p| text_of(p, source).into())))
         }
@@ -776,6 +804,7 @@ fn add_binding(node: Node<'_>, facts: &mut FileFacts, source: &str, language: &s
             | "typed_default_parameter"
     ) || direct_parameter;
     let binding = match node.kind() {
+        "self_parameter" => Some(node),
         "let_declaration" | "parameter" => node
             .child_by_field_name("pattern")
             .or_else(|| node.child_by_field_name("name")),
@@ -948,10 +977,10 @@ fn collect(
         };
         for (index, symbol) in file.symbols.iter().enumerate() {
             let span = symbol_span(symbol);
-            let Some(node) = exact_node(root, span.clone()) else {
+            let Some(node) = declaration_node(root, symbol) else {
                 continue;
             };
-            let Some(name) = node_name(node) else {
+            let Some(name) = structure::symbol_name(node) else {
                 continue;
             };
             facts.declarations.push(Declaration {
@@ -979,7 +1008,7 @@ fn collect(
             .declarations
             .iter()
             .filter_map(|d| {
-                let node = exact_node(root, d.span.clone())?;
+                let node = declaration_node(root, &file.symbols[d.key.1])?;
                 let callable = if is_function(node) {
                     Some(node)
                 } else {
@@ -1127,13 +1156,14 @@ fn collect(
                         file.syntax.language == "csharp" && spelling.starts_with('@');
                     sites.push(Site {
                         file: file_index,
-                        name: if file.syntax.language == "csharp" {
-                            csharp_identifier(spelling)
-                        } else {
-                            spelling
-                        }
-                        .into(),
-                        qualifier,
+                        name: identifier(file.syntax.language, spelling).into(),
+                        qualifier: qualifier.map(|value| {
+                            if file.syntax.language == "rust" {
+                                rust_path(&value)
+                            } else {
+                                value
+                            }
+                        }),
                         span: node.byte_range(),
                         name_span: name.byte_range(),
                         line: node.start_position().row + 1,
@@ -1157,6 +1187,9 @@ fn collect(
                                 Some(NameLookup::Type)
                             }
                             ("java", "method_invocation") => Some(NameLookup::Method),
+                            ("typescript" | "typescriptreact", "nested_type_identifier") => {
+                                Some(NameLookup::Type)
+                            }
                             ("java" | "csharp", "object_creation_expression") => {
                                 Some(NameLookup::Type)
                             }
@@ -1188,15 +1221,18 @@ fn collect(
             }
             stack.extend(named(node).into_iter().rev());
         }
-        if file.syntax.language == "csharp" {
+        if matches!(file.syntax.language, "csharp" | "rust") {
             for declaration in &mut facts.declarations {
-                declaration.name = csharp_identifier(&declaration.name).to_owned();
+                declaration.name = identifier(file.syntax.language, &declaration.name).to_owned();
             }
             for binding in facts.bindings.iter_mut().chain(&mut facts.type_parameters) {
-                binding.name = csharp_identifier(&binding.name).to_owned();
+                binding.name = identifier(file.syntax.language, &binding.name).to_owned();
             }
             for import in &mut facts.imports {
-                import.alias = csharp_identifier(&import.alias).to_owned();
+                import.alias = identifier(file.syntax.language, &import.alias).to_owned();
+                if file.syntax.language == "rust" {
+                    import.module = rust_path(&import.module);
+                }
             }
         }
         assign_write_scopes(&mut facts, cancel, deadline)?;
@@ -1394,7 +1430,7 @@ fn exported(
         return false;
     }
     let root = file.syntax.tree.root_node();
-    let Some(node) = exact_node(root, declaration.span.clone()) else {
+    let Some(node) = declaration_node(root, &file.symbols[declaration.key.1]) else {
         return false;
     };
     let mut parent = Some(node);
@@ -1409,11 +1445,16 @@ fn exported(
             let default = node
                 .children(&mut cursor)
                 .any(|child| child.kind() == "default");
-            return if wanted == "default" {
+            let matches = if wanted == "default" {
                 default
             } else {
                 declaration.name == wanted && !default
             };
+            if matches {
+                return true;
+            }
+            // The same declaration may have additional named/default exports.
+            break;
         }
         parent = node.parent();
     }
@@ -1507,12 +1548,14 @@ impl LinkIndex {
                 if language == "rust" && d.kind != "macro" {
                     // Macro invocations are not value calls, and token trees
                     // are not analyzed as expanded Rust expressions.
-                    let name = prefix
-                        .iter()
-                        .map(String::as_str)
-                        .chain(std::iter::once(qualified))
-                        .collect::<Vec<_>>()
-                        .join("::");
+                    let name = rust_path(
+                        &prefix
+                            .iter()
+                            .map(String::as_str)
+                            .chain(std::iter::once(qualified))
+                            .collect::<Vec<_>>()
+                            .join("::"),
+                    );
                     result
                         .rust
                         .entry((root.clone(), name))
@@ -1573,6 +1616,146 @@ fn rust_targets(index: &LinkIndex, facts: &[FileFacts], site: &Site, path: &str)
         .unwrap_or_default()
 }
 
+fn rust_lexical_targets(
+    workspace: &Workspace,
+    index: &LinkIndex,
+    facts: &FileFacts,
+    site: &Site,
+    path: &str,
+) -> Option<Vec<Key>> {
+    let (first, rest) = path.split_once("::")?;
+    if matches!(first, "" | "crate" | "self" | "super") {
+        return None;
+    }
+    let declarations: Vec<_> = facts
+        .declarations
+        .iter()
+        .filter(|d| {
+            d.name == first
+                && visible(facts, &d.scope, site.span.start)
+                && (NameLookup::Type.accepts(&d.kind) || d.kind == "module")
+        })
+        .collect();
+    let closest = declarations.iter().min_by_key(|d| d.scope.len())?;
+    let (root, prefix) = &index.rust_modules[site.file];
+    let mut targets = Vec::new();
+    for declaration in declarations.iter().filter(|d| d.scope == closest.scope) {
+        let qualified = workspace.files[site.file].symbols[declaration.key.1]["qualified_name"]
+            .as_str()
+            .unwrap();
+        let name = rust_path(
+            &prefix
+                .iter()
+                .map(String::as_str)
+                .chain([qualified, rest])
+                .collect::<Vec<_>>()
+                .join("::"),
+        );
+        targets.extend(
+            index
+                .rust
+                .get(&(root.clone(), name))
+                .into_iter()
+                .flatten()
+                .copied(),
+        );
+    }
+    // Even an unresolved local type shadows an outer type with the same name.
+    Some(targets)
+}
+
+fn receiver_container<'a>(
+    workspace: &Workspace,
+    facts: &'a FileFacts,
+    site: &Site,
+) -> Option<&'a str> {
+    let qualifier = site.qualifier.as_deref()?;
+    let owner = facts
+        .declarations
+        .iter()
+        .find(|d| Some(d.key) == site.owner)?;
+    if !facts.declarations.iter().any(|d| {
+        matches!(
+            d.kind.as_str(),
+            "class" | "struct" | "record" | "impl" | "trait" | "interface"
+        ) && workspace.files[site.file].symbols[d.key.1]["qualified_name"] == owner.container
+    }) {
+        return None;
+    }
+    let file = &workspace.files[site.file];
+    let language = file.syntax.language;
+    if (qualifier == "this"
+        && matches!(
+            language,
+            "javascript" | "typescript" | "typescriptreact" | "java" | "csharp"
+        ))
+        || (qualifier == "Self" && language == "rust")
+    {
+        return Some(&owner.container);
+    }
+    let node = declaration_node(file.syntax.tree.root_node(), &file.symbols[owner.key.1])?;
+    let parameter = node.child_by_field_name("parameters")?.named_child(0)?;
+    let receiver = match language {
+        "python" => {
+            if node.parent().is_some_and(|parent| {
+                parent.kind() == "decorated_definition"
+                    && named(parent).iter().any(|decorator| {
+                        decorator.kind() == "decorator"
+                            && matches!(
+                                text_of(*decorator, &file.syntax.source).trim(),
+                                "@staticmethod" | "@builtins.staticmethod"
+                            )
+                    })
+            }) {
+                return None;
+            }
+            match parameter.kind() {
+                "identifier" => parameter,
+                "default_parameter" | "typed_default_parameter" => {
+                    parameter.child_by_field_name("name")?
+                }
+                "typed_parameter" => named(parameter)
+                    .into_iter()
+                    .find(|n| n.kind() == "identifier")?,
+                _ => return None,
+            }
+        }
+        "rust" if qualifier == "self" => identifiers(parameter)
+            .into_iter()
+            .find(|n| n.kind() == "self")?,
+        _ => return None,
+    };
+    if identifier(language, text_of(receiver, &file.syntax.source)) != qualifier {
+        return None;
+    }
+    let binding = facts
+        .bindings
+        .iter()
+        .find(|b| b.span == receiver.byte_range())?;
+    let at = site.span.start;
+    if !visible(facts, &binding.scope, at)
+        || facts.bindings.iter().any(|other| {
+            other.name == qualifier
+                && other.span != binding.span
+                && other.scope.len() <= binding.scope.len()
+                && visible(facts, &other.scope, at)
+        })
+        || facts.declarations.iter().any(|d| {
+            d.name == qualifier
+                && d.scope.len() <= binding.scope.len()
+                && visible(facts, &d.scope, at)
+        })
+        || facts.imports.iter().any(|i| {
+            i.alias == qualifier
+                && i.scope.len() <= binding.scope.len()
+                && visible(facts, &i.scope, at)
+        })
+    {
+        return None;
+    }
+    Some(&owner.container)
+}
+
 fn type_targets(
     index: &LinkIndex,
     language: &str,
@@ -1611,8 +1794,7 @@ fn import_targets(
     member: Option<&str>,
 ) -> Vec<Key> {
     let language = workspace.files[site.file].syntax.language;
-    let type_position =
-        matches!(site.name_lookup, Some(NameLookup::Type)) && site.qualifier.is_none();
+    let type_position = matches!(site.name_lookup, Some(NameLookup::Type));
     if import.type_only && !type_position {
         return Vec::new();
     }
@@ -1736,11 +1918,9 @@ fn resolve_exact(
     let at = site.span.start;
     // JLS 6.4.1/6.5 separates simple method/type names from value names.
     // A receiver such as `Store.save()` still requires value shadow checks.
-    let lookup = if site.qualifier.is_none() {
-        site.name_lookup
-    } else {
-        None
-    };
+    let lookup = site
+        .name_lookup
+        .filter(|lookup| matches!(lookup, NameLookup::Type) || site.qualifier.is_none());
     let binding_name = site
         .qualifier
         .as_deref()
@@ -1842,27 +2022,25 @@ fn resolve_exact(
                 .contains("::")
         {
             return Resolution::candidates(
-                rust_targets(index, all, site, &format!("{qualifier}::{}", site.name)),
+                rust_lexical_targets(
+                    workspace,
+                    index,
+                    facts,
+                    site,
+                    &format!("{qualifier}::{}", site.name),
+                )
+                .unwrap_or_else(|| {
+                    rust_targets(index, all, site, &format!("{qualifier}::{}", site.name))
+                }),
                 "explicit_module_path_without_compiler_resolution",
             );
         }
-        if matches!(qualifier.as_str(), "this" | "self" | "Self")
-            && let Some(owner) = site
-                .owner
-                .and_then(|key| facts.declarations.iter().find(|d| d.key == key))
-            && facts.declarations.iter().any(|d| {
-                matches!(
-                    d.kind.as_str(),
-                    "class" | "struct" | "record" | "impl" | "trait" | "interface"
-                ) && workspace.files[site.file].symbols[d.key.1]["qualified_name"]
-                    == owner.container
-            })
-        {
+        if let Some(container) = receiver_container(workspace, facts, site) {
             return Resolution::candidates(
                 facts
                     .declarations
                     .iter()
-                    .filter(|d| d.container == owner.container && d.name == site.name)
+                    .filter(|d| d.container == container && d.name == site.name)
                     .map(|d| d.key)
                     .collect(),
                 "receiver_dispatch_not_resolved",
@@ -1870,7 +2048,7 @@ fn resolve_exact(
         }
         // A named class/module in lexical scope is useful as a candidate. Never
         // infer a receiver type merely from the spelling of a local variable.
-        if shadowed(facts, qualifier, at, None) {
+        if lookup.is_none() && shadowed(facts, qualifier, at, None) {
             return Resolution::unresolved("receiver_type_unknown");
         }
         let types: Vec<_> = facts
@@ -1885,8 +2063,10 @@ fn resolve_exact(
                     )
             })
             .collect();
+        let closest_scope = types.iter().min_by_key(|d| d.scope.len()).map(|d| &d.scope);
         let targets = types
             .iter()
+            .filter(|d| Some(&d.scope) == closest_scope)
             .flat_map(|parent| {
                 let container = workspace.files[site.file].symbols[parent.key.1]["qualified_name"]
                     .as_str()
@@ -1898,7 +2078,7 @@ fn resolve_exact(
                     .map(|d| d.key)
             })
             .collect::<Vec<_>>();
-        if !targets.is_empty() {
+        if !types.is_empty() {
             return Resolution::candidates(targets, "named_container_without_type_resolution");
         }
         if language == "java" {
@@ -2070,7 +2250,11 @@ pub(super) fn execute(s: &Session, args: &Value, cancel: &CancellationToken) -> 
             .position(|v| v["symbol_id"] == id)
             .unwrap(),
     );
-    let span = symbol_span(symbol);
+    let mut span = symbol_span(symbol);
+    if symbol["kind"] == "file_scoped_namespace_declaration" {
+        // Its members are following AST siblings, all within this namespace.
+        span.end = workspace.files[file].syntax.source.len();
+    }
     let relation = args["relation"].as_str().unwrap_or("calls");
     let (facts, sites, unsupported_calls) = collect(&workspace, cancel, deadline)?;
     let index = LinkIndex::new(&workspace, &facts, cancel, deadline)?;
