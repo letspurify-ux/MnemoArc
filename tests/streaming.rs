@@ -2,8 +2,8 @@ use axum::{Router, http::header, response::IntoResponse, routing::post};
 use mnemoarc::{
     config::Config,
     llm::{
-        LlmClient, MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_CALLS, MAX_TOOL_NAME_BYTES, OpenAiClient,
-        SseDecoder,
+        AttemptAction, CompletionError, LlmClient, MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_CALLS,
+        MAX_TOOL_NAME_BYTES, OpenAiClient, SseDecoder,
     },
 };
 use serde_json::json;
@@ -599,6 +599,10 @@ async fn retries_transient_http_error_before_accepting_a_complete_stream() {
         .unwrap();
     assert_eq!(result.text, "OK");
     assert_eq!(result.attempts, 2);
+    assert_eq!(
+        json!(result.attempt_diagnostics),
+        json!([{"attempt":1,"code":"http_429","reason":"http_429: retry","action":"retry"}])
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(
         result.usage.is_none(),
@@ -720,6 +724,16 @@ async fn repeated_provider_finish_error_stops_at_retry_limit() {
     assert_eq!(
         error.to_string(),
         "provider_stream_error: finish_reason=error"
+    );
+    let provider = error.downcast_ref::<CompletionError>().unwrap();
+    assert_eq!(provider.attempts(), 3);
+    assert_eq!(
+        json!(provider.attempt_diagnostics()),
+        json!([
+            {"attempt":1,"code":"provider_stream_error","reason":"provider_stream_error: finish_reason=error","action":"retry"},
+            {"attempt":2,"code":"provider_stream_error","reason":"provider_stream_error: finish_reason=error","action":"retry"},
+            {"attempt":3,"code":"provider_stream_error","reason":"provider_stream_error: finish_reason=error","action":"stop"}
+        ])
     );
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     server.abort();
@@ -1005,15 +1019,63 @@ async fn rejected_json_schema_degrades_to_json_mode_and_is_remembered() {
         .unwrap();
     assert_eq!(first.text, "{\"issues\":[]}");
     assert_eq!(first.attempts, 2);
+    assert_eq!(
+        json!(first.attempt_diagnostics),
+        json!([{"attempt":1,"code":"http_400","reason":"http_400: response_format json_schema is not supported","action":"json_mode_fallback"}])
+    );
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let second = OpenAiClient
         .complete(request, &c, CancellationToken::new(), tx)
         .await
         .unwrap();
     assert_eq!(second.attempts, 1);
+    assert!(second.attempt_diagnostics.is_empty());
     assert_eq!(
         *formats.lock().unwrap(),
         ["json_schema", "json_object", "json_object"]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn rejected_json_mode_records_fallback_without_response_format() {
+    let app = Router::new().route(
+        "/chat/completions",
+        post(|axum::Json(body): axum::Json<serde_json::Value>| async move {
+            if body.get("response_format").is_some() {
+                (axum::http::StatusCode::BAD_REQUEST, "json mode is not supported").into_response()
+            } else {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    format!("{}data: [DONE]\n\n", event(json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}))),
+                ).into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = Config {
+        base_url: format!("http://{}", listener.local_addr().unwrap()),
+        retries: 0,
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let result = OpenAiClient
+        .complete(
+            json!({"messages":[],"response_format":{"type":"json_object"}}),
+            &config,
+            CancellationToken::new(),
+            tx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.text, "OK");
+    assert_eq!(result.attempts, 2);
+    assert_eq!(
+        json!(result.attempt_diagnostics),
+        json!([
+            {"attempt":1,"code":"http_400","reason":"http_400: json mode is not supported","action":"unstructured_fallback"}
+        ])
     );
     server.abort();
 }
@@ -1050,6 +1112,17 @@ async fn sse_schema_failure_recovers_once_and_caches_only_that_schema() {
             .await
             .unwrap();
         assert_eq!(result.attempts, attempts);
+        if attempts == 2 {
+            assert_eq!(result.attempt_diagnostics.len(), 1);
+            assert_eq!(result.attempt_diagnostics[0].attempt, 1);
+            assert_eq!(result.attempt_diagnostics[0].code, "provider_stream_error");
+            assert_eq!(
+                result.attempt_diagnostics[0].action,
+                AttemptAction::JsonModeFallback
+            );
+        } else {
+            assert!(result.attempt_diagnostics.is_empty());
+        }
     }
     request["response_format"]["json_schema"]["name"] = json!("different_schema");
     let (tx, _rx) = tokio::sync::mpsc::channel(8);

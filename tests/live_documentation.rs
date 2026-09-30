@@ -2,7 +2,7 @@
 use mnemoarc::{
     agent::{self, AgentEvent},
     config::{Config, Project, Secret},
-    llm::{Completion, LlmClient, OpenAiClient},
+    llm::{Completion, CompletionError, LlmClient, OpenAiClient},
     session::{RunRecord, Session},
     tools,
 };
@@ -47,7 +47,8 @@ async fn finish_live_review(
         .await??;
         drain.await?;
         tools::document_review::finish(session, &response.text)?;
-        followups.push(json!({"request":request,"response":response.text,"usage":response.usage}));
+        followups.push(json!({"request":request,"response":response.text,"usage":response.usage,
+            "provider_attempts":response.attempts,"attempt_diagnostics":response.attempt_diagnostics}));
     }
     Ok(followups)
 }
@@ -73,14 +74,90 @@ impl LlmClient for ReviewTrace {
             let record = match &result {
                 Ok(response) => json!({"input":payload,"response":response.text,
                     "usage":response.usage,"provider_attempts":response.attempts,
+                    "attempt_diagnostics":response.attempt_diagnostics,
                     "elapsed_seconds":started.elapsed().as_secs_f64()}),
-                Err(error) => json!({"input":payload,"error":error.to_string(),
-                    "elapsed_seconds":started.elapsed().as_secs_f64()}),
+                Err(error) => {
+                    let provider = error.downcast_ref::<CompletionError>();
+                    json!({"input":payload,"error":error.to_string(),
+                        "provider_attempts":provider.map(CompletionError::attempts),
+                        "attempt_diagnostics":provider.map(CompletionError::attempt_diagnostics).unwrap_or_default(),
+                        "elapsed_seconds":started.elapsed().as_secs_f64()})
+                }
             };
             self.0.lock().unwrap().push(record);
         }
         result
     }
+}
+
+#[tokio::test]
+async fn live_review_trace_preserves_retries_after_success_and_failure() {
+    use axum::{Router, http::header, response::IntoResponse, routing::post};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move || {
+            let call = counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call == 1 {
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{"content":"{\"issues\":[]}"},"finish_reason":"stop"}]})),
+                    ).into_response()
+                } else {
+                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable").into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = Config {
+        base_url: format!("http://{}", listener.local_addr().unwrap()),
+        retries: 1,
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let client = ReviewTrace(records.clone());
+    let request = json!({"messages":[
+        {"role":"system","content":"Test review"},
+        {"role":"user","content":json!({"source_document_review":true}).to_string()}
+    ]});
+    let (tx, _rx) = mpsc::channel(8);
+    let result = client
+        .complete(request.clone(), &config, CancellationToken::new(), tx)
+        .await
+        .unwrap();
+    assert_eq!(result.text, "{\"issues\":[]}");
+    let (tx, _rx) = mpsc::channel(8);
+    assert!(
+        client
+            .complete(request, &config, CancellationToken::new(), tx)
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    let records = records.lock().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["provider_attempts"], 2);
+    assert_eq!(records[1]["provider_attempts"], 2);
+    assert_eq!(
+        records[0]["attempt_diagnostics"],
+        json!([
+            {"attempt":1,"code":"http_503","reason":"http_503: temporarily unavailable","action":"retry"}
+        ])
+    );
+    assert_eq!(
+        records[1]["attempt_diagnostics"],
+        json!([
+            {"attempt":1,"code":"http_503","reason":"http_503: temporarily unavailable","action":"retry"},
+            {"attempt":2,"code":"http_503","reason":"http_503: temporarily unavailable","action":"stop"}
+        ])
+    );
+    server.abort();
 }
 
 fn env_bool(name: &str, fallback: bool) -> bool {

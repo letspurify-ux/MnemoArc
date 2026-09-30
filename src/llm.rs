@@ -53,24 +53,45 @@ pub struct Usage {
     pub output: usize,
     pub cached: Option<usize>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptAction {
+    Retry,
+    JsonModeFallback,
+    UnstructuredFallback,
+    Stop,
+}
+
+/// A failed provider attempt, retained even when a later attempt succeeds.
+#[derive(Clone, Debug, Serialize)]
+pub struct AttemptDiagnostic {
+    pub attempt: usize,
+    pub code: String,
+    pub reason: String,
+    pub action: AttemptAction,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Completion {
     pub text: String,
     pub calls: Vec<ToolCall>,
     pub usage: Option<Usage>,
     pub attempts: usize,
+    pub attempt_diagnostics: Vec<AttemptDiagnostic>,
     pub length_limited: bool,
     pub discarded_tool_calls: bool,
 }
 
 /// The provider may retry a request several times before returning an error.
-/// Keep that count attached to the error so the agent can account for every
-/// attempted request in its run budget instead of charging only the final one.
+/// Keep the attempt count for budgeting and diagnostics for successful retries
+/// as well as terminal failures. Display remains the terminal error message.
 #[derive(Debug)]
-pub(crate) struct CompletionError {
+pub struct CompletionError {
     source: anyhow::Error,
     attempts: usize,
     provider_unavailable: bool,
+    attempt_diagnostics: Vec<AttemptDiagnostic>,
 }
 impl CompletionError {
     pub(crate) fn new(source: anyhow::Error, attempts: usize, provider_unavailable: bool) -> Self {
@@ -78,11 +99,21 @@ impl CompletionError {
             source,
             attempts,
             provider_unavailable,
+            attempt_diagnostics: Vec::new(),
         }
     }
 
-    pub(crate) fn attempts(&self) -> usize {
+    pub fn attempts(&self) -> usize {
         self.attempts.max(1)
+    }
+
+    pub fn attempt_diagnostics(&self) -> &[AttemptDiagnostic] {
+        &self.attempt_diagnostics
+    }
+
+    fn with_diagnostics(mut self, diagnostics: Vec<AttemptDiagnostic>) -> Self {
+        self.attempt_diagnostics = diagnostics;
+        self
     }
 
     /// The provider stayed unavailable (overload, 5xx, dropped stream) through
@@ -126,6 +157,51 @@ pub trait LlmClient: Send + Sync {
 pub struct OpenAiClient;
 pub(crate) const STREAM_DELTAS_MARKER: &str = "__mnemoarc_stream_deltas";
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_DIAGNOSTIC_CHARS: usize = 512;
+
+fn record_attempt_failure(
+    diagnostics: &mut Vec<AttemptDiagnostic>,
+    request_id: &str,
+    attempt: usize,
+    error: &str,
+    action: AttemptAction,
+    c: &Config,
+) {
+    // Providers sometimes echo credentials in an error body. Redact before
+    // clipping so a prefix of a long key cannot leak through truncation.
+    let redacted = if let Some(key) = OpenAiClient::key(c) {
+        error.replace(&key, "[redacted]")
+    } else {
+        error.to_owned()
+    };
+    let prefix = redacted.split(':').next().unwrap_or("");
+    let code = if !prefix.is_empty()
+        && prefix.len() <= 64
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        prefix.to_owned()
+    } else {
+        "request_error".into()
+    };
+    let reason = redacted.chars().take(MAX_DIAGNOSTIC_CHARS).collect();
+    let diagnostic = AttemptDiagnostic {
+        attempt,
+        code,
+        reason,
+        action,
+    };
+    // Group interleaved attempts from concurrent requests without logging the
+    // request payload. JSON also keeps provider newlines on one log line.
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
+        "[llm] {}",
+        json!({"request_id":request_id,"attempt_failure":diagnostic})
+    );
+    diagnostics.push(diagnostic);
+}
 
 fn apply_thinking_settings(request: &mut Value, c: &Config) {
     if c.enable_thinking {
@@ -635,6 +711,8 @@ impl LlmClient for OpenAiClient {
         let mut transient_retries = 0usize;
         let mut response_format_fallback = false;
         let mut schema_stream_fallback = false;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let mut attempt_diagnostics = Vec::new();
         loop {
             // Cancellation must cover every await inside an attempt, including
             // response-body reads and backpressure on the delta channel.
@@ -660,6 +738,7 @@ impl LlmClient for OpenAiClient {
                         recovered.insert(key.clone());
                     }
                     r.attempts = attempt.saturating_add(1);
+                    r.attempt_diagnostics = attempt_diagnostics;
                     return Ok(r);
                 }
                 Err(e) => {
@@ -677,6 +756,14 @@ impl LlmClient for OpenAiClient {
                         if let Ok(mut rejected) = JSON_SCHEMA_REJECTED.lock() {
                             rejected.insert(schema_endpoint(c));
                         }
+                        record_attempt_failure(
+                            &mut attempt_diagnostics,
+                            &request_id,
+                            attempt.saturating_add(1),
+                            &text,
+                            AttemptAction::JsonModeFallback,
+                            c,
+                        );
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
@@ -689,6 +776,14 @@ impl LlmClient for OpenAiClient {
                             .expect("request was validated as an object")
                             .remove("response_format");
                         response_format_fallback = true;
+                        record_attempt_failure(
+                            &mut attempt_diagnostics,
+                            &request_id,
+                            attempt.saturating_add(1),
+                            &text,
+                            AttemptAction::UnstructuredFallback,
+                            c,
+                        );
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
@@ -707,6 +802,14 @@ impl LlmClient for OpenAiClient {
                         && downgrade_json_schema(&mut request)
                     {
                         schema_stream_fallback = true;
+                        record_attempt_failure(
+                            &mut attempt_diagnostics,
+                            &request_id,
+                            attempt.saturating_add(1),
+                            &text,
+                            AttemptAction::JsonModeFallback,
+                            c,
+                        );
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
@@ -715,18 +818,73 @@ impl LlmClient for OpenAiClient {
                             || (attempt == 0 && text.starts_with("invalid_tool_arguments:"))
                             || (attempt == 0 && text.starts_with("invalid_stream_event:")));
                     if !retry || transient_retries >= c.retries {
+                        record_attempt_failure(
+                            &mut attempt_diagnostics,
+                            &request_id,
+                            attempt.saturating_add(1),
+                            &text,
+                            AttemptAction::Stop,
+                            c,
+                        );
                         return Err(CompletionError::new(
                             e,
                             attempt.saturating_add(1),
                             silent && transient,
                         )
+                        .with_diagnostics(attempt_diagnostics)
                         .into());
                     }
+                    record_attempt_failure(
+                        &mut attempt_diagnostics,
+                        &request_id,
+                        attempt.saturating_add(1),
+                        &text,
+                        AttemptAction::Retry,
+                        c,
+                    );
                     transient_retries = transient_retries.saturating_add(1);
                     attempt = attempt.saturating_add(1);
                     tokio::select! {_=cancel.cancelled()=>bail!("cancelled"),_=tokio::time::sleep(Duration::from_millis(500*(1<<attempt.min(5))))=>{}}
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    use crate::config::Secret;
+
+    #[test]
+    fn provider_diagnostics_redact_credentials_before_clipping() {
+        let key = "test_api_key";
+        let config = Config {
+            api_key: Some(Secret(key.into())),
+            ..Default::default()
+        };
+        let mut diagnostics = Vec::new();
+        for error in [
+            format!("http_503: rejected {key}\n{}", "긴 오류 메시지".repeat(150)),
+            key.into(),
+        ] {
+            record_attempt_failure(
+                &mut diagnostics,
+                "redaction-test",
+                1,
+                &error,
+                AttemptAction::Retry,
+                &config,
+            );
+        }
+        assert!(!json!(diagnostics).to_string().contains(key));
+        assert!(
+            diagnostics[0]
+                .reason
+                .starts_with("http_503: rejected [redacted]")
+        );
+        assert_eq!(diagnostics[0].reason.chars().count(), MAX_DIAGNOSTIC_CHARS);
+        assert_eq!(diagnostics[1].code, "request_error");
+        assert_eq!(diagnostics[1].reason, "[redacted]");
     }
 }
