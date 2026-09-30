@@ -185,6 +185,22 @@ fn a_label_quoted_for_removal_is_not_a_proposed_ui_label() {
 }
 
 #[test]
+fn validator_confirms_removing_exposed_internals_for_end_users() {
+    // A live run dismissed 7 of 11 findings asking to remove CSS classes, API
+    // routes and storage keys from an end-user manual as "implementation
+    // detail" demands, although the reviewer is told to report them.
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    submit(&mut s, vec![proposal("문서가 내부 식별자를 노출합니다.")]);
+    let verify = review::request(&mut s).unwrap();
+    let instruction = verify["messages"][0]["content"].as_str().unwrap();
+    assert!(instruction.contains("or audience mismatch"));
+    assert!(instruction.contains("internal detail the document itself exposes"));
+    assert!(instruction.contains("asks for less implementation detail, not more"));
+    assert!(instruction.contains("never an audience mismatch"));
+}
+
+#[test]
 fn same_id_reworded_findings_merge_without_resetting_stall_count() {
     let (_dir, mut s) = fixture();
     review::request(&mut s).unwrap();
