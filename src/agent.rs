@@ -920,16 +920,14 @@ async fn read_parallel(
     let project = s.project.clone();
     let config = s.config.clone();
     let active = s.active_tools.clone();
-    let history = crate::session::SessionHistory {
-        bundles: s
-            .history
-            .bundles
-            .iter()
-            .filter(|b| b.active)
-            .cloned()
-            .collect(),
-        next_id: s.history.next_id,
-        pruned_through: s.history.pruned_through,
+    let history = if calls.iter().any(|call| call.name == "file_read") {
+        tools::parallel_read_history(&s.history)
+    } else {
+        crate::session::SessionHistory {
+            next_id: s.history.next_id,
+            pruned_through: s.history.pruned_through,
+            ..Default::default()
+        }
     };
     let guidance = s.run_guidance.clone();
     let file_cursors = s.file_cursors.clone();
@@ -3525,6 +3523,115 @@ mod review_gap_tests {
 mod worker_wait_tests {
     use super::*;
     use crate::config::Project;
+
+    #[tokio::test]
+    async fn parallel_reads_keep_only_read_metadata_and_preserve_suppression() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("read.rs"),
+            "fn observed() {}\n// nearby context\n",
+        )
+        .unwrap();
+        let mut s = session();
+        s.project.root = dir.path().canonicalize().unwrap();
+        s.config.model = "gpt-4o".into();
+        s.active_tools = ToolRegistry::optional_names();
+        context::tokens("Warm the shared tokenizer.", &s.config.model);
+        for _ in 0..8 {
+            s.history.push(
+                vec![json!({"role":"assistant","content":"x".repeat(2 * 1024 * 1024)})],
+                true,
+            );
+        }
+        let read = tools::execute(
+            &mut s,
+            "file_read",
+            json!({"path":"read.rs","start_line":1,"max_lines":1}),
+        )
+        .unwrap();
+        for _ in 0..s.config.repeated_read_limit {
+            s.history.push(
+                vec![
+                    json!({"role":"tool","content":json!({"status":"ok","data":read}).to_string()}),
+                ],
+                true,
+            );
+        }
+        let worker_history = tools::parallel_read_history(&s.history);
+        let worker_bytes = worker_history.bytes();
+        assert_eq!(worker_history.next_id, s.history.next_id);
+        drop(worker_history);
+        let history_bytes = s.history.bytes();
+        let history_next_id = s.history.next_id;
+        let calls: Vec<_> = [
+            (
+                "file_read",
+                json!({"path":"read.rs","start_line":1,"max_lines":1}),
+            ),
+            (
+                "file_read",
+                json!({"path":"read.rs","start_line":1,"max_lines":1,"force_read":true}),
+            ),
+            (
+                "source_search",
+                json!({"path":"read.rs","query":"observed"}),
+            ),
+            ("file_list", json!({"mode":"paths"})),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, args))| ToolCall {
+            id: format!("bounded-read-{index}"),
+            name: name.into(),
+            arguments: args.to_string(),
+        })
+        .collect();
+        let results = read_parallel(
+            &mut s,
+            &calls,
+            &CancellationToken::new(),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await;
+        assert!(results.iter().all(|result| result["status"] == "ok"));
+        assert_eq!(results[0]["data"]["suppressed"], true);
+        assert_eq!(results[1]["data"]["content"]["text"], "fn observed() {}");
+        assert_eq!(s.history.bytes(), history_bytes);
+        assert_eq!(s.history.next_id, history_next_id);
+        eprintln!("parallel worker read history: {worker_bytes} bytes");
+        assert!(
+            worker_bytes < 8 * 1024,
+            "read workers retained conversation payloads: {worker_bytes} bytes"
+        );
+
+        // Retired observations and hashes from a previous file version must
+        // not suppress a fresh read when rebuilding the worker's metadata.
+        for bundle in s.history.bundles.iter_mut().skip(8) {
+            bundle.active = false;
+        }
+        let results = read_parallel(
+            &mut s,
+            &calls[..1],
+            &CancellationToken::new(),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(results[0]["data"]["content"]["text"], "fn observed() {}");
+        for bundle in s.history.bundles.iter_mut().skip(8) {
+            bundle.active = true;
+        }
+        std::fs::write(dir.path().join("read.rs"), "fn changed() {}\n").unwrap();
+        let results = read_parallel(
+            &mut s,
+            &calls[..1],
+            &CancellationToken::new(),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(results[0]["data"]["content"]["text"], "fn changed() {}");
+        assert_eq!(s.history.bytes(), history_bytes);
+        assert_eq!(s.history.next_id, history_next_id);
+    }
 
     #[tokio::test]
     async fn queued_snapshot_does_not_clone_a_session_before_queue_space_exists() {

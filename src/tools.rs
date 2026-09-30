@@ -4823,6 +4823,68 @@ fn execute_repaired(
     }
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct FileReadMetadata {
+    path: String,
+    source: FileReadHash,
+    read_start: usize,
+    read_offset: usize,
+    read_max_lines: usize,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct FileReadHash {
+    hash: String,
+}
+
+fn file_read_metadata(message: &Value) -> Option<FileReadMetadata> {
+    if message["role"] != "tool" {
+        return None;
+    }
+    #[derive(serde::Deserialize)]
+    struct ReadResult {
+        data: FileReadMetadata,
+    }
+    // Ignore message bodies during deserialization rather than allocating a
+    // complete Value for every previous tool result just to inspect its range.
+    serde_json::from_str::<ReadResult>(message["content"].as_str()?)
+        .ok()
+        .map(|result| result.data)
+}
+
+/// Isolated read workers need only active read identities for suppression,
+/// and the owner's history sequence for any new result archives they create.
+pub(crate) fn parallel_read_history(
+    history: &crate::session::SessionHistory,
+) -> crate::session::SessionHistory {
+    crate::session::SessionHistory {
+        bundles: history
+            .bundles
+            .iter()
+            .filter(|bundle| bundle.active)
+            .filter_map(|bundle| {
+                let messages: Vec<_> = bundle
+                    .messages
+                    .iter()
+                    .filter_map(file_read_metadata)
+                    .map(|metadata| {
+                        json!({"role":"tool","content":json!({"data":metadata}).to_string()})
+                    })
+                    .collect();
+                (!messages.is_empty()).then_some(crate::session::Bundle {
+                    id: bundle.id,
+                    messages,
+                    active: true,
+                    reviewed: bundle.reviewed,
+                    complete: bundle.complete,
+                })
+            })
+            .collect(),
+        next_id: history.next_id,
+        pruned_through: history.pruned_through,
+    }
+}
+
 /// Shared line reader for explicit file reads and Tree-sitter symbol bodies.
 fn read_file(
     s: &mut Session,
@@ -4865,10 +4927,8 @@ fn read_file(
     };
     let path = read_path(&s.project, text(args, "path")?)?;
     let contents = read_text(&path)?;
-    if cursor
-        .as_ref()
-        .is_some_and(|c| c.hash != hash(contents.as_bytes()))
-    {
+    let digest = hash(contents.as_bytes());
+    if cursor.as_ref().is_some_and(|c| c.hash != digest) {
         bail!(
             "file_cursor_expired: file changed; start a new read with path/start_line/max_lines and no cursor"
         );
@@ -4884,7 +4944,7 @@ fn read_file(
             );
         }
         return Ok(
-            json!({"path":path,"hash":hash(contents.as_bytes()),"total_lines":total_lines,"content":{"text":"","truncated":false,"next_offset":null},"source":null,"eof":true,"next_line":null,"next_offset":0}),
+            json!({"path":path,"hash":digest,"total_lines":total_lines,"content":{"text":"","truncated":false,"next_offset":null},"source":null,"eof":true,"next_line":null,"next_offset":0}),
         );
     }
     let selected = contents
@@ -4911,23 +4971,19 @@ fn read_file(
         .iter()
         .filter(|b| b.active)
         .flat_map(|b| &b.messages)
-        .filter(|m| {
-            m["role"] == "tool"
-                && m["content"]
-                    .as_str()
-                    .and_then(|v| serde_json::from_str::<Value>(v).ok())
-                    .is_some_and(|v| {
-                        v["data"]["path"] == json!(path)
-                            && v["data"]["source"]["hash"] == hash(contents.as_bytes())
-                            && v["data"]["read_start"] == start
-                            && v["data"]["read_offset"] == offset
-                            && v["data"]["read_max_lines"] == lines
-                    })
+        .filter_map(file_read_metadata)
+        .filter(|metadata| {
+            metadata.path == path.to_string_lossy()
+                && metadata.source.hash == digest
+                && metadata.read_start == start
+                && metadata.read_offset == offset
+                && metadata.read_max_lines == lines
         })
+        .take(s.config.repeated_read_limit)
         .count();
     if prior >= s.config.repeated_read_limit && !args["force_read"].as_bool().unwrap_or(false) {
         return Ok(
-            json!({"path":path,"hash":hash(contents.as_bytes()),"total_lines":contents.lines().count(),"repeated_read":true,"suppressed":true,"guidance":"Unchanged range already present repeatedly in active context. Reuse it, read another range, use document_inspect for output metadata, or force_read=true for deliberate verification."}),
+            json!({"path":path,"hash":digest,"total_lines":contents.lines().count(),"repeated_read":true,"suppressed":true,"guidance":"Unchanged range already present repeatedly in active context. Reuse it, read another range, use document_inspect for output metadata, or force_read=true for deliberate verification."}),
         );
     }
     let mut content = bounded_text(s, selected, offset);
@@ -4947,7 +5003,7 @@ fn read_file(
     let source = observe_hashed_quality(
         s,
         &path,
-        hash(contents.as_bytes()),
+        digest.clone(),
         observed_start,
         observed_start + shown.lines().count().saturating_sub(1),
         shown,
@@ -4978,7 +5034,7 @@ fn read_file(
         (start - 1 + lines < contents.lines().count()).then_some(start + lines)
     };
     Ok(
-        json!({"path":path,"total_lines":contents.lines().count(),"hash":hash(contents.as_bytes()),"read_start":start,"read_offset":offset,"read_max_lines":lines,"content":content,"source":source,"next_line":next_line,"next_offset":if truncated{content["next_offset"].clone()}else{json!(0)}}),
+        json!({"path":path,"total_lines":contents.lines().count(),"hash":digest,"read_start":start,"read_offset":offset,"read_max_lines":lines,"content":content,"source":source,"next_line":next_line,"next_offset":if truncated{content["next_offset"].clone()}else{json!(0)}}),
     )
 }
 
