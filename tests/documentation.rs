@@ -2256,6 +2256,18 @@ fn section_edit_preserves_replacement_whitespace_and_line_endings() {
                 "## Target\r\nNew",
                 "# Doc\r\n## Target\r\nNew\r\n## Next\r\nRest\r\n",
             ),
+            // Live shape: a replacement without its trailing blank line must
+            // not glue the next heading under a list.
+            (
+                "# Doc\n\n## Target\n\n- old\n\n## Next\n\nRest\n",
+                "## Target\n\n- new",
+                "# Doc\n\n## Target\n\n- new\n\n## Next\n\nRest\n",
+            ),
+            (
+                "# Doc\r\n\r\n## Target\r\n- old\r\n\r\n## Next\r\n",
+                "## Target\r\n- new\r\n",
+                "# Doc\r\n\r\n## Target\r\n- new\r\n\r\n## Next\r\n",
+            ),
         ] {
             let (_dir, mut s) = setup();
             std::fs::write(&s.project.output, original).unwrap();
@@ -3368,6 +3380,58 @@ fn a_full_rewrite_sent_as_an_insertion_replaces_the_anchor_once() {
         &mut s,
         "document_edit",
         json!({"action":"insert_after_text","expected_hash":result["hash"],"old_text":"# 사용법","text":"\n# 사용법 요약"}),
+    );
+}
+
+#[test]
+fn block_insertion_beside_a_mid_line_anchor_is_rejected() {
+    let body = "# 실행\n- Oracle에 관해서는 두 가지 경우가 다릅니다. docker가 없으면 건너뜁니다.\n";
+    // Live shape: a list item inserted after a sentence that ends mid-line.
+    for (action, old_text, text) in [
+        (
+            "insert_after_text",
+            "- Oracle에 관해서는 두 가지 경우가 다릅니다.",
+            "- MariaDB는 필수입니다.\n",
+        ),
+        (
+            "insert_after_text",
+            "두 가지 경우가 다릅니다.",
+            "- MariaDB는 필수입니다.",
+        ),
+        (
+            "insert_before_text",
+            "docker가 없으면",
+            "\n- 컨테이너가 없으면 건너뜁니다.",
+        ),
+    ] {
+        let (_dir, mut s) = setup();
+        std::fs::write(&s.project.output, body).unwrap();
+        let error = tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":action,"expected_hash":tools::hash(body.as_bytes()),"old_text":old_text,"text":text}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("in the middle of a line"), "{error}");
+        assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), body);
+    }
+    // Inline text mid-line and a line after a whole-line anchor still work.
+    let (_dir, mut s) = setup();
+    std::fs::write(&s.project.output, body).unwrap();
+    let result = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after_text","expected_hash":tools::hash(body.as_bytes()),"old_text":"다릅니다.","text":" 아래를 보십시오."}),
+    );
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after_text","expected_hash":result["hash"],"old_text":"docker가 없으면 건너뜁니다.","text":"\n- MariaDB는 필수입니다."}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# 실행\n- Oracle에 관해서는 두 가지 경우가 다릅니다. 아래를 보십시오. docker가 없으면 건너뜁니다.\n- MariaDB는 필수입니다.\n"
     );
 }
 

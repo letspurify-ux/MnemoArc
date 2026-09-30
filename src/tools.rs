@@ -1813,6 +1813,20 @@ fn line_delimiter_at(text: &str, position: usize) -> &str {
     }
 }
 
+/// Whether insertion text forms its own line or Markdown block rather than
+/// inline words.
+fn inserts_block(text: &str) -> bool {
+    let first = text.trim_start();
+    let ordered = first.split_once(". ").is_some_and(|(number, _)| {
+        !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+    });
+    text.contains('\n')
+        || ordered
+        || ["- ", "* ", "+ ", "#", "|", "> ", "```"]
+            .iter()
+            .any(|marker| first.starts_with(marker))
+}
+
 fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
     let action = text(args, "action")?;
     let new = if action == "delete_text" {
@@ -1989,16 +2003,28 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                 );
             }
             let mut replacement = new.to_string();
-            if resolved.end < old.len() && !replacement.ends_with('\n') {
-                // A following heading must remain on its own line. Use the
+            if resolved.end < old.len() {
+                // A following heading must remain on its own line, and keep
+                // the blank line that set it off from this section. Use the
                 // original section's delimiter only when the replacement
                 // has not supplied one; otherwise preserve text verbatim.
+                let delimiter = if target.ends_with("\r\n") {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
                 if replacement.ends_with('\r') {
                     replacement.push('\n');
-                } else if target.ends_with("\r\n") {
-                    replacement.push_str("\r\n");
-                } else {
-                    replacement.push('\n');
+                } else if !replacement.ends_with('\n') {
+                    replacement.push_str(delimiter);
+                }
+                let blank_line_end = |text: &str| {
+                    text.lines()
+                        .last()
+                        .is_some_and(|line| line.trim().is_empty())
+                };
+                if blank_line_end(target) && !blank_line_end(&replacement) {
+                    replacement.push_str(delimiter);
                 }
             }
             let candidate = format!(
@@ -2052,6 +2078,31 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                 };
             let (relative_start, relative_end) = unique_document_text_span(scope, target)?;
             let (start, end) = (base + relative_start, base + relative_end);
+            // A line or block inserted beside an anchor that stops mid-line
+            // is glued into that line ("...다릅니다.- MariaDB는 ..."), which
+            // leaves a broken list. Only inline text may go mid-line.
+            if insertion && !replace_instead && inserts_block(new) {
+                let at = if action == "insert_after_text" {
+                    end
+                } else {
+                    start
+                };
+                let line_boundary = at == 0
+                    || at == old.len()
+                    || old[..at].ends_with('\n')
+                    || old[at..].starts_with('\n')
+                    || old[at..].starts_with("\r\n");
+                if !line_boundary {
+                    let (edge, extend) = if action == "insert_after_text" {
+                        ("ends", "to the end of its line")
+                    } else {
+                        ("starts", "back to the start of its line")
+                    };
+                    bail!(
+                        "invalid_argument_value: {action} old_text {edge} in the middle of a line, but text is a separate line or block (it contains a line break or starts with a list, heading, table or quote marker), so it would be glued into that line. Extend old_text {extend} so the text lands on its own line, or use replace_text with the full revised line"
+                    );
+                }
+            }
             Ok(match action {
                 _ if replace_instead => format!("{}{}{}", &old[..start], new, &old[end..]),
                 "insert_before_text" => format!("{}{}{}", &old[..start], new, &old[start..]),
