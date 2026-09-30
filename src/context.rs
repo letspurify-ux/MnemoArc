@@ -61,18 +61,25 @@ pub fn truncate(text: &str, limit: usize, model: &str) -> (String, bool) {
     if tokens(text, model) <= limit {
         return (text.into(), false);
     }
-    let chars: Vec<char> = text.chars().collect();
-    let (mut low, mut high) = (0, chars.len());
+    // Search borrowed prefixes. A Vec<char> and copied trial strings can cost
+    // several times the input size even when only a small preview is returned.
+    let prefix = |length: usize| {
+        let end = text
+            .char_indices()
+            .nth(length)
+            .map_or(text.len(), |(byte, _)| byte);
+        &text[..end]
+    };
+    let (mut low, mut high) = (0, text.chars().count());
     while low < high {
         let mid = (low + high).div_ceil(2);
-        let s: String = chars[..mid].iter().collect();
-        if tokens(&s, model) <= limit {
+        if tokens(prefix(mid), model) <= limit {
             low = mid
         } else {
             high = mid - 1
         }
     }
-    (chars[..low].iter().collect(), true)
+    (prefix(low).into(), true)
 }
 pub const CHECKPOINT_MAX_REQUESTS: usize = 8;
 pub const CHECKPOINT_MAX_FAILURES: usize = 8;

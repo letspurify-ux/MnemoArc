@@ -2835,11 +2835,15 @@ fn read_bytes_bounded(path: &Path) -> Result<Vec<u8>> {
     use std::io::Read;
 
     let file = open_regular_file(path)?;
-    if file.metadata()?.len() > MAX_FILE_BYTES as u64 {
+    let length = file.metadata()?.len();
+    if length > MAX_FILE_BYTES as u64 {
         bail!("unsupported_large_file: maximum 16MiB");
     }
     // Bound the actual read too: the file may grow after the metadata check.
-    let mut bytes = Vec::new();
+    // Reserve the expected length and one EOF probe byte. Starting empty or
+    // filling the capacity exactly makes read_to_end grow to the next power
+    // of two even for an unchanged file.
+    let mut bytes = Vec::with_capacity(length as usize + 1);
     file.take((MAX_FILE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_FILE_BYTES {
@@ -3481,9 +3485,12 @@ fn section_text<'a>(doc: &'a str, heading: &str) -> Result<&'a str> {
     Ok(&doc[h.start..h.end])
 }
 fn bounded_text(s: &Session, content: &str, offset: usize) -> Value {
-    let remaining: String = content.chars().skip(offset).collect();
+    let byte_offset = content
+        .char_indices()
+        .nth(offset)
+        .map_or(content.len(), |(byte, _)| byte);
     let (body, truncated) = context::truncate(
-        &remaining,
+        &content[byte_offset..],
         s.config
             .result_tokens
             .saturating_sub(500)
@@ -4947,18 +4954,26 @@ fn read_file(
             json!({"path":path,"hash":digest,"total_lines":total_lines,"content":{"text":"","truncated":false,"next_offset":null},"source":null,"eof":true,"next_line":null,"next_offset":0}),
         );
     }
-    let selected = contents
+    let byte_start = contents
         .split_inclusive('\n')
-        .skip(start - 1)
+        .take(start - 1)
+        .map(str::len)
+        .sum::<usize>();
+    let byte_len = contents[byte_start..]
+        .split_inclusive('\n')
         .take(lines)
-        .collect::<String>();
+        .map(str::len)
+        .sum::<usize>();
+    // The requested range is contiguous in the original file. Borrow it so
+    // unreturned lines and long lines do not create another full-size buffer.
+    let selected = &contents[byte_start..byte_start + byte_len];
     // Preserve internal line endings so a delivered multiline range can be
     // copied into an exact patch. Omit only the final line terminator, as
     // before; cursor offsets now count characters in the original text.
     let selected = selected
         .strip_suffix("\r\n")
         .or_else(|| selected.strip_suffix('\n'))
-        .unwrap_or(&selected);
+        .unwrap_or(selected);
     if offset > selected.chars().count() {
         bail!(
             "invalid_offset: offset {offset} exceeds {} characters in start_line={start}, max_lines={lines}. Offset is relative to this range, not the file. Copy next_cursor.cursor for continuation, or omit offset for a new range",

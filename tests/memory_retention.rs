@@ -4,7 +4,7 @@ use mnemoarc::{
     config::{Config, Project},
     context::{self, ContextManager},
     session::{Checkpoint, Session},
-    tools::document_review,
+    tools::{self, document_review},
 };
 use serde_json::{Value, json};
 use std::{
@@ -69,8 +69,60 @@ fn measured<T>(operation: impl FnOnce() -> T) -> (T, usize) {
 
 const MIB: usize = 1024 * 1024;
 
+fn bounded_reads_do_not_duplicate_unreturned_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = "source ".repeat(600_000);
+    std::fs::write(dir.path().join("large.txt"), &text).unwrap();
+    let mut session = Session::new(
+        Project {
+            root: dir.path().canonicalize().unwrap(),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            result_tokens: 200,
+            ..Default::default()
+        },
+    );
+    context::tokens("Warm the shared tokenizer.", &session.config.model);
+
+    let ((preview, truncated), truncate_peak) =
+        measured(|| context::truncate(&text, 64, &session.config.model));
+    eprintln!("text truncation extra live allocation peak: {truncate_peak} bytes");
+    assert!(truncated);
+    assert!(text.starts_with(&preview));
+    assert!(context::tokens(&preview, &session.config.model) <= 64);
+    drop(preview);
+
+    let (read, file_peak) = measured(|| {
+        tools::execute(
+            &mut session,
+            "file_read",
+            json!({"path":"large.txt","max_lines":1}),
+        )
+        .unwrap()
+    });
+    eprintln!("bounded file read extra live allocation peak: {file_peak} bytes");
+    let shown = read["content"]["text"].as_str().unwrap();
+    assert_eq!(read["content"]["truncated"], true);
+    assert!(!shown.is_empty());
+    assert!(text.starts_with(shown));
+    assert!(context::tokens(shown, &session.config.model) <= 100);
+    assert_eq!(read["content"]["next_offset"], shown.chars().count());
+    assert_eq!(read["content"]["first_line_complete"], true);
+    assert_eq!(read["content"]["last_line_complete"], false);
+    assert!(
+        truncate_peak < 8 * MIB,
+        "truncation copied the full input into a character array: {truncate_peak} bytes"
+    );
+    assert!(
+        file_peak < 10 * MIB,
+        "a bounded read copied unreturned file text: {file_peak} bytes"
+    );
+}
+
 #[test]
-fn review_preparation_and_checkpoint_commit_do_not_duplicate_retained_inputs() {
+fn bounded_operations_do_not_duplicate_retained_inputs() {
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("review.md");
     let mut document = String::from("# Observed behavior\n");
@@ -210,4 +262,5 @@ fn review_preparation_and_checkpoint_commit_do_not_duplicate_retained_inputs() {
             .all(|bundle| !bundle.active && bundle.reviewed)
     );
     assert!(session.checkpoint.is_none());
+    bounded_reads_do_not_duplicate_unreturned_text();
 }
