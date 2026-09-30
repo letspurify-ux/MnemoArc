@@ -155,6 +155,35 @@ fn unverified_decision_drops_only_that_finding_and_keeps_confirmed_ones() {
     assert!(review::approved(&s));
 }
 
+// Live run 2026-09-30: the document invented a "입력 중" label; the reviewer's
+// correction quoted it for removal with ui_labels [] (it cannot be listed,
+// being absent from the source), and the validator dismissed the finding as
+// omitting a proposed label. Both instructions now exclude removed strings.
+#[test]
+fn a_label_quoted_for_removal_is_not_a_proposed_ui_label() {
+    let (_dir, mut s) = fixture();
+    let review_request = review::request(&mut s).unwrap();
+    let instruction = review_request["messages"][0]["content"].as_str().unwrap();
+    assert!(instruction.contains("proposes to show or add"));
+    assert!(instruction.contains("quotes only to remove or replace"));
+    let mut invented = proposal("소스에 없는 \"삭제 완료\" 문구가 표시된다고 설명합니다.");
+    invented["correction"] = json!("\"삭제 완료\" 문구가 표시된다는 설명을 제거하세요.");
+    submit(&mut s, vec![invented]);
+    assert!(s.document_review.validating);
+    let verify = review::request(&mut s).unwrap();
+    let instruction = verify["messages"][0]["content"].as_str().unwrap();
+    assert!(instruction.contains("proposes to show or add"));
+    assert!(instruction.contains("its absence never invalidates the finding"));
+    assert_eq!(payload(verify)["candidates"][0]["ui_labels"], json!([]));
+    review::finish(
+        &mut s,
+        &json!({"decisions":[decision("F1", "confirmed")]}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(s.document_review.findings.len(), 1);
+    assert!(!review::approved(&s));
+}
+
 #[test]
 fn same_id_reworded_findings_merge_without_resetting_stall_count() {
     let (_dir, mut s) = fixture();
