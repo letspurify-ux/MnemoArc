@@ -2849,7 +2849,33 @@ fn read_bytes_bounded(path: &Path) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn hash_file(path: &Path) -> Result<String> {
-    Ok(hash(&read_bytes_bounded(path)?))
+    let file = open_regular_file(path)?;
+    if file.metadata()?.len() > MAX_FILE_BYTES as u64 {
+        bail!("unsupported_large_file: maximum 16MiB");
+    }
+    hash_reader(file)
+}
+
+fn hash_reader(reader: impl std::io::Read) -> Result<String> {
+    use std::io::Read;
+    // Freshness checks need only a digest. Never allocate the full file for
+    // each check, and enforce the same bound if it grows after metadata lookup.
+    let mut reader = reader.take((MAX_FILE_BYTES + 1) as u64);
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut bytes = 0;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes += read;
+        if bytes > MAX_FILE_BYTES {
+            bail!("unsupported_large_file: maximum 16MiB");
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 pub(crate) fn read_text(path: &Path) -> Result<String> {
@@ -5582,6 +5608,38 @@ mod panic_tests {
 #[cfg(test)]
 mod file_tests {
     use super::*;
+
+    #[test]
+    fn streaming_file_hash_matches_text_and_binary_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        for bytes in [
+            vec![],
+            "한글🙂\r\nplain text\n".as_bytes().to_vec(),
+            vec![0, 0xff, 0xfe],
+            vec![b'x'; 128 * 1024 + 3],
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(hash_file(&path).unwrap(), hash(&bytes));
+        }
+        assert!(hash_file(dir.path()).is_err());
+    }
+
+    #[test]
+    fn streaming_hash_bounds_the_actual_read_after_metadata_lookup() {
+        use std::io::Read;
+        let within_limit = std::io::repeat(0).take(MAX_FILE_BYTES as u64);
+        assert!(hash_reader(within_limit).is_ok());
+        let error = hash_reader(std::io::repeat(0)).unwrap_err();
+        assert!(error.to_string().starts_with("unsupported_large_file:"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("too-large");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_FILE_BYTES as u64 + 1)
+            .unwrap();
+        assert!(hash_file(&path).is_err());
+    }
 
     #[test]
     fn preview_preserves_valid_text_and_rejects_invalid_utf8() {

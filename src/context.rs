@@ -1,6 +1,6 @@
 use crate::{
     config::Config,
-    memory::{MemoryMeta, id},
+    memory::{MemoryMeta, id, serialized_bytes},
     session::{Checkpoint, Session, TaskState},
 };
 use anyhow::{Result, bail};
@@ -406,7 +406,7 @@ impl ContextManager {
             if b.active || !b.reviewed || !b.complete {
                 break;
             }
-            retained_bytes = retained_bytes.saturating_sub(serde_json::to_vec(b)?.len());
+            retained_bytes = retained_bytes.saturating_sub(serialized_bytes(b));
         }
         let target = (budget as f64 * s.config.low_water) as usize;
         let mut remaining = request_tokens;
@@ -432,7 +432,7 @@ impl ContextManager {
             .collect();
         for b in candidates {
             ids.push(b.id);
-            retained_bytes = retained_bytes.saturating_sub(serde_json::to_vec(b)?.len());
+            retained_bytes = retained_bytes.saturating_sub(serialized_bytes(b));
             if b.active {
                 let delivered: Vec<_> = b.messages.iter().cloned().map(model_message).collect();
                 remaining = remaining.saturating_sub(count(&json!(delivered), &s.config.model));
@@ -483,21 +483,13 @@ impl ContextManager {
             }
         }
         Self::state(s)?;
-        let ids: Vec<_> = cp
+        let ids: BTreeSet<_> = cp
             .bundle_ids
             .iter()
             .chain(&cp.maintenance_bundle_ids)
             .copied()
             .collect();
-        let mut history = s.history.clone();
-        for b in &mut history.bundles {
-            if ids.contains(&b.id) {
-                b.active = false;
-                b.reviewed = true;
-            }
-        }
-        history.prune(s.config.history_bytes)?;
-        s.history = history;
+        s.history.prune_retiring(s.config.history_bytes, &ids)?;
         s.checkpoint = None;
         s.checkpoints_completed += 1;
         // The cleared context held the review findings being repaired (a live

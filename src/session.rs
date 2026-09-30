@@ -195,17 +195,44 @@ impl SessionHistory {
             .collect()
     }
     pub fn prune(&mut self, limit: usize) -> Result<()> {
-        let mut bytes = self.bytes();
+        self.prune_retiring(limit, &BTreeSet::new())
+    }
+    pub(crate) fn prune_retiring(&mut self, limit: usize, retired: &BTreeSet<u64>) -> Result<()> {
+        // Plan removal using the flags a confirmed checkpoint will publish.
+        // A failed plan changes nothing and needs no copy of retained messages.
+        let retained_bytes = |bundle: &Bundle| {
+            let bytes = serialized_bytes(bundle);
+            if retired.contains(&bundle.id) {
+                // JSON `false` is one byte longer than `true`. Account for
+                // the final flags even at an exact history capacity boundary.
+                bytes
+                    .saturating_add(usize::from(bundle.active))
+                    .saturating_sub(usize::from(!bundle.reviewed))
+            } else {
+                bytes
+            }
+        };
+        let mut bytes = self.bundles.iter().fold(0usize, |total, bundle| {
+            total.saturating_add(retained_bytes(bundle))
+        });
         let mut remove = 0;
         for first in &self.bundles {
             if bytes <= limit {
                 break;
             }
-            if first.active || !first.reviewed || !first.complete {
+            if !first.complete
+                || ((first.active || !first.reviewed) && !retired.contains(&first.id))
+            {
                 bail!("history_capacity: checkpoint required; original history retained");
             }
-            bytes = bytes.saturating_sub(serialized_bytes(first));
+            bytes = bytes.saturating_sub(retained_bytes(first));
             remove += 1;
+        }
+        for bundle in &mut self.bundles {
+            if retired.contains(&bundle.id) {
+                bundle.active = false;
+                bundle.reviewed = true;
+            }
         }
         for _ in 0..remove {
             self.pruned_through = self.bundles.pop_front().map(|b| b.id);
@@ -237,6 +264,7 @@ impl SessionHistory {
         json!({"next_cursor":if rows.len()>items.len(){items.last().and_then(|x|x["id"].as_u64())}else{None},"items":items,"pruned_through":self.pruned_through})
     }
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub id: String,
@@ -923,5 +951,40 @@ impl Session {
             bail!("Existing memory exceeds new body limit");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_retirement_respects_exact_serialized_capacity() {
+        for active in [false, true] {
+            for reviewed in [false, true] {
+                let mut history = SessionHistory::default();
+                let id = history.push(vec![json!({"role":"user","content":"keep"})], true);
+                history.bundles[0].active = active;
+                history.bundles[0].reviewed = reviewed;
+                let mut retired = history.clone();
+                retired.bundles[0].active = false;
+                retired.bundles[0].reviewed = true;
+                let limit = retired.bytes();
+                let mut below_capacity = history.clone();
+
+                history
+                    .prune_retiring(limit, &BTreeSet::from([id]))
+                    .unwrap();
+                assert_eq!(history.bundles.len(), 1);
+                assert_eq!(history.bytes(), limit);
+                assert!(!history.bundles[0].active && history.bundles[0].reviewed);
+
+                below_capacity
+                    .prune_retiring(limit - 1, &BTreeSet::from([id]))
+                    .unwrap();
+                assert!(below_capacity.bundles.is_empty());
+                assert_eq!(below_capacity.pruned_through, Some(id));
+            }
+        }
     }
 }

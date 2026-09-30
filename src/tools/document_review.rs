@@ -104,11 +104,7 @@ pub fn current_verdict(s: &Session) -> CurrentVerdict<'_> {
     if s.document_review.policy_hash.as_deref() != Some(policy_hash()) {
         return CurrentVerdict::Unreviewed;
     }
-    let Some(document_hash) = output_path(&s.project)
-        .and_then(|p| read_text(&p))
-        .ok()
-        .map(|doc| hash(doc.as_bytes()))
-    else {
+    let Some(document_hash) = output_path(&s.project).and_then(|p| hash_file(&p)).ok() else {
         return CurrentVerdict::Unreviewed;
     };
     let requirement_hash = requirements(s);
@@ -227,12 +223,11 @@ pub fn mark_unavailable(s: &mut Session) {
         .target_requirements
         .clone()
         .unwrap_or_else(|| requirements(s));
-    let target_hash = s.document_review.target_hash.clone().or_else(|| {
-        output_path(&s.project)
-            .and_then(|p| read_text(&p))
-            .ok()
-            .map(|doc| hash(doc.as_bytes()))
-    });
+    let target_hash = s
+        .document_review
+        .target_hash
+        .clone()
+        .or_else(|| output_path(&s.project).and_then(|p| hash_file(&p)).ok());
     let source_hashes = s.document_review.source_hashes.clone();
     defer_for_repair(s);
     s.document_review.unavailable_hash = target_hash;
@@ -300,15 +295,69 @@ fn fresh(s: &Session) -> bool {
 fn hashes_fresh(s: &Session, hashes: &BTreeMap<String, String>) -> bool {
     hashes.iter().all(|(path, digest)| {
         read_path(&s.project, path)
-            .and_then(|p| read_text(&p))
+            .and_then(|p| hash_file(&p))
             .ok()
-            .is_some_and(|doc| hash(doc.as_bytes()) == *digest)
+            .is_some_and(|current| current == *digest)
     })
 }
 
+#[derive(Default)]
 struct EvidenceFile {
-    text: String,
-    lines: BTreeSet<usize>,
+    ranges: Vec<(usize, usize)>,
+}
+
+struct EvidenceChunk {
+    file: usize,
+    ranges: Vec<(usize, usize)>,
+}
+
+impl EvidenceChunk {
+    fn new(file: usize) -> Self {
+        Self {
+            file,
+            ranges: Vec::new(),
+        }
+    }
+
+    fn push_line(&mut self, line: usize) {
+        if let Some((_, end)) = self.ranges.last_mut().filter(|(_, end)| *end + 1 == line) {
+            *end = line;
+        } else {
+            self.ranges.push((line, line));
+        }
+    }
+
+    fn text(&self, source: &str) -> String {
+        selected_lines(source, self.ranges.clone())
+            .map(|(index, line)| format!("{}|{line}\n", index + 1))
+            .collect()
+    }
+}
+
+// Tokenize complete source lines within a bounded working allocation. Very
+// long lines can exhaust the tokenizer's backtracking stack before fitting.
+const MAX_EVIDENCE_LINE_BYTES: usize = 64 * 1024;
+
+fn selected_lines(
+    source: &str,
+    mut ranges: Vec<(usize, usize)>,
+) -> impl Iterator<Item = (usize, &str)> {
+    // A broad citation describes an interval, not one allocation per line.
+    // Sorting intervals also keeps overlapping citations from repeating text.
+    let end = ranges.iter().map(|&(_, end)| end).max().unwrap_or(0);
+    ranges.sort_unstable();
+    let mut ranges = ranges.into_iter().peekable();
+    source
+        .lines()
+        .take(end)
+        .enumerate()
+        .filter(move |(index, _)| {
+            let line = index + 1;
+            while ranges.peek().is_some_and(|&(_, end)| end < line) {
+                ranges.next();
+            }
+            ranges.peek().is_some_and(|&(start, _)| start <= line)
+        })
 }
 
 fn reset_pages(state: &mut ReviewState) {
@@ -344,18 +393,21 @@ const MAX_REVIEW_RESTARTS: usize = 8;
 
 pub fn request(s: &mut Session) -> Result<Value> {
     refresh_policy(s);
-    request_with_restarts(s, 0)
+    // A review page is rebuilt when the document or any previously reviewed
+    // evidence changes. End each attempt before restarting so no stale file
+    // text or page allocations accumulate on the worker stack.
+    for _ in 0..MAX_REVIEW_RESTARTS {
+        if let Some(request) = request_page(s)? {
+            return Ok(request);
+        }
+    }
+    bail!(
+        "document_review_stale: document or evidence changed repeatedly; restart review after changes settle"
+    );
 }
 
-fn request_with_restarts(s: &mut Session, restarts: usize) -> Result<Value> {
-    // A review page is rebuilt when the document or any previously reviewed
-    // evidence changes. Under a continuously written file, unbounded
-    // self-recursion could overflow the worker stack and take down the run.
-    if restarts >= MAX_REVIEW_RESTARTS {
-        bail!(
-            "document_review_stale: document or evidence changed repeatedly; restart review after changes settle"
-        );
-    }
+// None asks the bounded caller to retry after stale inputs were reset.
+fn request_page(s: &mut Session) -> Result<Option<Value>> {
     let output = output_path(&s.project)?;
     let doc = read_text(&output)?;
     let digest = hash(doc.as_bytes());
@@ -385,10 +437,10 @@ fn request_with_restarts(s: &mut Session, restarts: usize) -> Result<Value> {
         // the bounded review before accepting another verdict instead of
         // repeatedly returning document_review_stale.
         reset_stale_review(&mut s.document_review);
-        return request_with_restarts(s, restarts + 1);
+        return Ok(None);
     }
     if s.document_review.validating {
-        return findings::verification_request(s, ceiling);
+        return findings::verification_request(s, ceiling).map(Some);
     }
     // Reserve feedback independently of page selection. Otherwise a malformed
     // response changes the next document range while its evidence offset still
@@ -534,23 +586,14 @@ fn request_with_restarts(s: &mut Session, restarts: usize) -> Result<Value> {
         };
         let path = read_path(&s.project, &path)?;
         let key = path.to_string_lossy().into_owned();
-        if !files.contains_key(&key) {
-            files.insert(
-                key.clone(),
-                EvidenceFile {
-                    text: read_text(&path)?,
-                    lines: BTreeSet::new(),
-                },
-            );
-        }
-        let file = files.get_mut(&key).unwrap();
+        let file = files.entry(key).or_default();
         // `start_line`/`next_document_offset` are zero-based slice bounds;
         // citation document lines are one-based and the end bound is included.
         if (start_line + 1..=next_document_offset).contains(&document_line) {
             // Include branch/loop declarations immediately before a cited body.
             let start = begin.saturating_sub(8).max(1);
-            let stop = end.saturating_add(8).min(file.text.lines().count());
-            file.lines.extend(start..=stop);
+            let stop = end.saturating_add(8);
+            file.ranges.push((start, stop));
         }
     }
     // A page without citations is valid when later document pages contain
@@ -560,8 +603,10 @@ fn request_with_restarts(s: &mut Session, restarts: usize) -> Result<Value> {
     }
     let mut evidence = Vec::new();
     let mut hashes = BTreeMap::new();
+    let mut source_paths = Vec::new();
     // Fair chunks across files prevent a long first file from excluding all others.
     let mut chunks = Vec::new();
+    let mut chunk_count = 0usize;
     // A fixed 48-line chunk may itself exceed the request budget even when
     // every individual line fits. Bound chunks by tokens too, with room for
     // the document, manifest and JSON encoding. Keep these boundaries stable
@@ -572,50 +617,64 @@ fn request_with_restarts(s: &mut Session, restarts: usize) -> Result<Value> {
         .div_euclid(4)
         .clamp(1, 2048);
     for (path, file) in files {
-        let source = file.text;
-        let selected = file.lines;
+        // Process one bounded file at a time. Keeping every cited file's
+        // complete contents made even a small review page retain the project.
+        let source = read_text(Path::new(&path))?;
         hashes.insert(path.clone(), hash(source.as_bytes()));
-        let lines: Vec<_> = source
-            .lines()
-            .enumerate()
-            // Comments can be the cited contract itself. Paging bounds input;
-            // silently deleting comments makes a targeted reread ineffective.
-            .filter(|(i, _)| selected.contains(&(i + 1)))
-            .map(|(i, line)| format!("{}|{}\n", i + 1, line))
-            .collect();
+        let lines = selected_lines(&source, file.ranges);
         let relative = Path::new(&path)
             .strip_prefix(&s.project.root)
             .unwrap_or(Path::new(&path))
             .to_string_lossy()
             .into_owned();
-        let mut file_chunks = Vec::new();
-        let mut chunk = String::new();
+        let mut file_chunks = std::collections::VecDeque::new();
+        let file_index = source_paths.len();
+        let mut chunk = EvidenceChunk::new(file_index);
         let mut tokens = 0usize;
         let mut line_count = 0;
-        for line in lines {
-            let line_tokens = context::count(&json!(line), &s.config.model);
-            if !chunk.is_empty()
+        for (index, line) in lines {
+            // Comments remain evidence; never truncate or omit a cited line
+            // merely to make it fit. Reject an unusable line before tokenizing.
+            if line.len() > MAX_EVIDENCE_LINE_BYTES {
+                bail!(
+                    "document_review_budget: a cited source line exceeds 64KiB; narrow citations to bounded source lines"
+                );
+            }
+            let line_tokens =
+                context::count(&json!(format!("{}|{line}\n", index + 1)), &s.config.model);
+            if !chunk.ranges.is_empty()
                 && (line_count == 48 || tokens.saturating_add(line_tokens) > chunk_tokens)
             {
-                file_chunks.push(json!({"path":relative,"numbered_text":chunk}));
-                chunk = String::new();
+                file_chunks.push_back(chunk);
+                chunk = EvidenceChunk::new(file_index);
                 tokens = 0;
                 line_count = 0;
             }
-            chunk.push_str(&line);
+            if chunk.ranges.is_empty() {
+                chunk_count += 1;
+                // Each manifest entry needs at least one token. Stop an
+                // impossible manifest before retaining unbounded metadata.
+                if chunk_count > ceiling {
+                    bail!(
+                        "document_review_budget: evidence manifest exceeds bounded review input; narrow citations or split the document"
+                    );
+                }
+            }
+            chunk.push_line(index + 1);
             tokens = tokens.saturating_add(line_tokens);
             line_count += 1;
         }
-        if !chunk.is_empty() {
-            file_chunks.push(json!({"path":relative,"numbered_text":chunk}));
+        if !chunk.ranges.is_empty() {
+            file_chunks.push_back(chunk);
         }
+        source_paths.push((path, relative));
         chunks.push(file_chunks);
     }
     let mut ordered = Vec::new();
-    for index in 0..chunks.iter().map(Vec::len).max().unwrap_or(0) {
-        for file in &chunks {
-            if let Some(chunk) = file.get(index) {
-                ordered.push(chunk.clone());
+    while chunks.iter().any(|file| !file.is_empty()) {
+        for file in &mut chunks {
+            if let Some(chunk) = file.pop_front() {
+                ordered.push(chunk);
             }
         }
     }
@@ -628,7 +687,7 @@ fn request_with_restarts(s: &mut Session, restarts: usize) -> Result<Value> {
         // Discard verdicts from another document revision; never combine
         // stale pages with a new document.
         reset_stale_review(state);
-        return request_with_restarts(s, restarts + 1);
+        return Ok(None);
     }
     if continuing_page
         && state
@@ -639,7 +698,7 @@ fn request_with_restarts(s: &mut Session, restarts: usize) -> Result<Value> {
         // A later document page may cite a different set of files. Restart
         // only when a file already reviewed on an earlier page changed.
         reset_stale_review(state);
-        return request_with_restarts(s, restarts + 1);
+        return Ok(None);
     }
     let mut all_hashes = if continuing_page {
         state.source_hashes.clone()
@@ -657,11 +716,9 @@ fn request_with_restarts(s: &mut Session, restarts: usize) -> Result<Value> {
             .iter()
             .enumerate()
             .map(|(index, chunk)| {
-                let text = chunk["numbered_text"].as_str().unwrap_or("");
-                let line = |s: &str| s.split_once('|').and_then(|(n, _)| n.parse::<usize>().ok());
-                json!({"chunk":index,"path":chunk["path"],
-            "first_line":text.lines().next().and_then(line),
-            "last_line":text.lines().last().and_then(line),
+                json!({"chunk":index,"path":source_paths[chunk.file].1,
+            "first_line":chunk.ranges.first().map(|range| range.0),
+            "last_line":chunk.ranges.last().map(|range| range.1),
             "reviewed_on_prior_page":index < start})
             })
             .collect::<Vec<_>>()
@@ -675,8 +732,29 @@ fn request_with_restarts(s: &mut Session, restarts: usize) -> Result<Value> {
     }
     let mut next = start;
     payload["evidence_page"] = json!(state.evidence_page);
+    let mut loaded_source: Option<(usize, String)> = None;
     for chunk in ordered.iter().skip(start) {
-        evidence.push(chunk.clone());
+        let (path, relative) = &source_paths[chunk.file];
+        if loaded_source
+            .as_ref()
+            .is_none_or(|(file, _)| *file != chunk.file)
+        {
+            // Retain only the source being materialized and the current page,
+            // never the text of evidence scheduled for later requests.
+            drop(loaded_source.take());
+            let source = read_text(Path::new(path))?;
+            if all_hashes
+                .get(path)
+                .is_none_or(|digest| *digest != hash(source.as_bytes()))
+            {
+                reset_stale_review(state);
+                return Ok(None);
+            }
+            loaded_source = Some((chunk.file, source));
+        }
+        evidence.push(
+            json!({"path":relative,"numbered_text":chunk.text(&loaded_source.as_ref().unwrap().1)}),
+        );
         payload["evidence"] = json!(evidence);
         request["messages"][1]["content"] = json!(payload.to_string());
         if context::count(&request, &s.config.model) > ceiling.saturating_sub(128) {
@@ -685,6 +763,7 @@ fn request_with_restarts(s: &mut Session, restarts: usize) -> Result<Value> {
         }
         next += 1;
     }
+    drop(loaded_source);
     if next == start && start < ordered.len() {
         bail!(
             "document_review_budget: one evidence chunk cannot fit alongside the document; narrow citations or split the document"
@@ -711,7 +790,7 @@ fn request_with_restarts(s: &mut Session, restarts: usize) -> Result<Value> {
     state.evidence_total = ordered.len();
     state.next_document_offset = next_document_offset;
     state.document_total = doc_lines.len();
-    Ok(request)
+    Ok(Some(request))
 }
 
 #[derive(Deserialize)]
@@ -1026,6 +1105,28 @@ mod tests {
 mod retention_tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn citation_intervals_preserve_gaps_merge_overlaps_and_stop_at_eof() {
+        let source = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10";
+        let lines: Vec<_> = selected_lines(source, vec![(9, usize::MAX), (3, 5), (7, 7), (2, 4)])
+            .map(|(index, text)| (index + 1, text))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (2, "2"),
+                (3, "3"),
+                (4, "4"),
+                (5, "5"),
+                (7, "7"),
+                (9, "9"),
+                (10, "10")
+            ]
+        );
+        assert_eq!(selected_lines(source, vec![]).count(), 0);
+        assert_eq!(selected_lines(source, vec![(20, usize::MAX)]).count(), 0);
+    }
 
     #[test]
     fn private_review_evidence_is_included_in_session_capacity() {

@@ -343,8 +343,8 @@ fn snapshot_unbounded(s: &Session, draft: &str) -> Value {
         .iter()
         .filter(|(path, (_, digest))| {
             read_path(&s.project, path)
-                .and_then(|p| read_text(&p))
-                .map_or(true, |content| hash(content.as_bytes()) != *digest)
+                .and_then(|p| hash_file(&p))
+                .map_or(true, |current| current != *digest)
         })
         .map(|(path, _)| path)
         .collect();
