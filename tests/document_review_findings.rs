@@ -104,11 +104,11 @@ fn invalid_quotes_and_invented_ui_labels_never_become_empty_approvals() {
 }
 
 #[test]
-fn missing_or_unverified_validation_cannot_approve_or_partially_commit() {
+fn missing_or_unknown_validation_cannot_approve_or_partially_commit() {
     for decisions in [
         vec![],
-        vec![decision("F1", "unverified")],
         vec![decision("F9", "dismissed")],
+        vec![json!({"id":"F1","status":"unverified","reason":" ","duplicate_of":null})],
     ] {
         let (_dir, mut s) = fixture();
         review::request(&mut s).unwrap();
@@ -120,6 +120,39 @@ fn missing_or_unverified_validation_cannot_approve_or_partially_commit() {
         assert!(s.document_review.validation_log.is_empty());
         assert_eq!(s.document_review.attempts, 0);
     }
+}
+
+// Live run 2026-09-30: the validator confirmed two findings and returned
+// unverified for a third three times; rejecting the whole response abandoned
+// the review and discarded the confirmed findings.
+#[test]
+fn unverified_decision_drops_only_that_finding_and_keeps_confirmed_ones() {
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let mut other = proposal("검색 결과 문구가 다릅니다.");
+    other["document"] = json!({"start_line":3,"end_line":3,"quote":"검색 결과가 없습니다."});
+    other["sources"] = json!([{"path":"ui.js","start_line":1,"end_line":1,"quote":"const message = '검색 결과가 없습니다.';"}]);
+    submit(&mut s, vec![proposal("Timing issue"), other]);
+    validate(
+        &mut s,
+        vec![decision("F1", "confirmed"), decision("F2", "unverified")],
+    );
+    assert!(!s.document_review.validating);
+    assert_eq!(s.document_review.findings.len(), 1);
+    assert_eq!(s.document_review.findings[0].id, "F1");
+    assert_eq!(s.document_review.dismissed_findings, 1);
+    assert_eq!(
+        s.document_review.validation_log[1]["decision"]["status"],
+        "unverified"
+    );
+    assert!(!review::approved(&s));
+
+    // An unverified-only result is not a confirmed defect, so it cannot block approval.
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    submit(&mut s, vec![proposal("Timing issue")]);
+    validate(&mut s, vec![decision("F1", "unverified")]);
+    assert!(review::approved(&s));
 }
 
 #[test]

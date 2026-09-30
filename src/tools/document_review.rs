@@ -793,7 +793,11 @@ fn finish_review(s: &mut Session, digest: String) -> Result<()> {
                     .as_ref()
                     .is_some_and(|p| !doc.contains(&p.quote))
                     || state.validation_log.iter().any(|v| {
-                        v["decision"]["id"] == old.id && v["decision"]["status"] == "dismissed"
+                        v["decision"]["id"] == old.id
+                            && matches!(
+                                v["decision"]["status"].as_str(),
+                                Some("dismissed" | "unverified")
+                            )
                     }))
         })
         .count();
