@@ -26,40 +26,34 @@ If the user requests JSON only, emit exactly the requested JSON object without f
 Before answering a source-flow question, compare each claimed condition, execution order and error type against the delivered source. Preserve conditional rethrows and early exits; do not replace them with an unconditional error type. Distinguish work completion from sending a response. Inspect a helper's definition before asserting its behavior, or clearly limit the claim to the observed call site. For an execution-order claim, cite both operations; for exception behavior, cite the branch selecting the error. This is an internal evidence check, not a requirement to call audit tools or write a document.
 Do not claim completion if required investigation items remain unverified; report partial results when budgets stop the work."#;
 
+fn tokenizer(model: &str) -> &'static tiktoken_rs::CoreBPE {
+    use tiktoken_rs::tokenizer::Tokenizer;
+    // Dated aliases and user-provided model names must not allocate another
+    // vocabulary or a permanent cache key. Retain one instance per encoding.
+    match tiktoken_rs::tokenizer::get_tokenizer(model) {
+        Some(Tokenizer::O200kHarmony) => tiktoken_rs::o200k_harmony_singleton(),
+        Some(Tokenizer::O200kBase) => tiktoken_rs::o200k_base_singleton(),
+        Some(Tokenizer::P50kBase) => tiktoken_rs::p50k_base_singleton(),
+        Some(Tokenizer::P50kEdit) => tiktoken_rs::p50k_edit_singleton(),
+        Some(Tokenizer::R50kBase | Tokenizer::Gpt2) => tiktoken_rs::r50k_base_singleton(),
+        Some(Tokenizer::Cl100kBase) | None => tiktoken_rs::cl100k_base_singleton(),
+    }
+}
+
 pub fn tokens(text: &str, model: &str) -> usize {
-    type Cache = std::collections::BTreeMap<String, Option<std::sync::Arc<tiktoken_rs::CoreBPE>>>;
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
-    let bpe = {
-        let mut cache = CACHE
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache
-            .entry(model.into())
-            .or_insert_with(|| {
-                tiktoken_rs::get_bpe_from_model(model)
-                    .ok()
-                    .map(std::sync::Arc::new)
-            })
-            .clone()
-    };
-    match bpe {
-        Some(bpe) => bpe.encode_with_special_tokens(text).len(),
-        None => {
-            // Provider tokenizers vary. Use a multilingual reference encoding with
-            // 25% headroom, explicitly labelled as an estimate in the UI.
-            static FALLBACK: std::sync::OnceLock<tiktoken_rs::CoreBPE> = std::sync::OnceLock::new();
-            let n = FALLBACK
-                .get_or_init(|| tiktoken_rs::cl100k_base().expect("bundled tokenizer"))
-                .encode_with_special_tokens(text)
-                .len();
-            n.saturating_mul(5).div_ceil(4)
-        }
+    let n = tokenizer(model).encode_with_special_tokens(text).len();
+    if is_estimated(model) {
+        // Provider tokenizers vary. Keep the multilingual fallback and its
+        // 25% headroom, explicitly labelled as an estimate in the UI.
+        n.saturating_mul(5).div_ceil(4)
+    } else {
+        n
     }
 }
 pub fn is_estimated(model: &str) -> bool {
     tiktoken_rs::tokenizer::get_tokenizer(model).is_none()
 }
+
 pub fn count(value: &Value, model: &str) -> usize {
     tokens(&value.to_string(), model)
 }
@@ -517,5 +511,31 @@ impl ContextManager {
                 .ok();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tokenizer_tests {
+    use super::*;
+
+    #[test]
+    fn model_aliases_share_encodings_and_unknown_names_share_the_fallback() {
+        let known = tokenizer("gpt-4o");
+        let fallback = tokenizer("custom-model");
+        let text = "한글, English and 🧠\n<|endoftext|>";
+        for index in 0..256 {
+            let alias = format!("gpt-4o-retention-{index}");
+            assert!(std::ptr::eq(known, tokenizer(&alias)));
+            assert_eq!(tokens(text, &alias), tokens(text, "gpt-4o"));
+            let unknown = format!("custom-model-{index}");
+            assert!(std::ptr::eq(fallback, tokenizer(&unknown)));
+            assert_eq!(tokens(text, &unknown), tokens(text, "custom-model"));
+        }
+        assert!(std::ptr::eq(fallback, tokenizer("gpt-4")));
+        assert!(std::ptr::eq(tokenizer("gpt2"), tokenizer("davinci")));
+        assert_eq!(
+            tokens(text, "custom-model"),
+            tokens(text, "gpt-4").saturating_mul(5).div_ceil(4)
+        );
     }
 }

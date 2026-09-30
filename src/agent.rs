@@ -643,13 +643,17 @@ async fn snapshot(
     cancel: &CancellationToken,
     deadline: tokio::time::Instant,
 ) {
-    emit(
-        tx,
-        AgentEvent::Snapshot(Box::new(s.clone())),
-        cancel,
-        deadline,
-    )
-    .await;
+    // Reserve before cloning: a slow or disconnected consumer must not hold
+    // an extra full session while waiting for queue space.
+    let permit = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => tx.try_reserve().ok(),
+        _ = tokio::time::sleep_until(deadline) => tx.try_reserve().ok(),
+        permit = tx.reserve() => permit.ok(),
+    };
+    if let Some(permit) = permit {
+        permit.send(AgentEvent::Snapshot(Box::new(s.clone())));
+    }
 }
 fn assistant(text: &str, calls: &[ToolCall]) -> Value {
     let mut v = json!({"role":"assistant","content":text});
@@ -728,21 +732,46 @@ async fn execute_one(
 
 type ToolOutcome = (Session, Value);
 
+// Normal web admission allows 32 sessions with up to four parallel reads.
+// Timed-out OS calls can outlive their receiver, so count actual threads, not
+// awaiting runs. A permit is held until the thread and its Session finish.
+const MAX_TOOL_WORKERS: usize = 128;
+
+fn tool_workers() -> Arc<tokio::sync::Semaphore> {
+    static WORKERS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    WORKERS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_TOOL_WORKERS)))
+        .clone()
+}
+
+fn spawn_tool_thread<T: Send + 'static>(
+    workers: Arc<tokio::sync::Semaphore>,
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<oneshot::Receiver<T>> {
+    let permit = workers.try_acquire_owned().map_err(|_| {
+        std::io::Error::other("tool_worker_capacity: previous tool threads are still running; wait for them to finish before retrying")
+    })?;
+    let (sender, receiver) = oneshot::channel();
+    // A stuck OS thread must not hold runtime shutdown open. Its permit must
+    // remain alive even when the receiver is dropped after cancellation.
+    std::thread::Builder::new()
+        .name("mnemoarc-tool".into())
+        .spawn(move || {
+            let _permit = permit;
+            let _ = sender.send(operation());
+        })?;
+    Ok(receiver)
+}
+
 fn spawn_tool_worker(
     mut session: Session,
     call: ToolCall,
     cancel: CancellationToken,
 ) -> std::io::Result<oneshot::Receiver<ToolOutcome>> {
-    let (sender, receiver) = oneshot::channel();
-    // Tokio waits for spawn_blocking tasks at runtime shutdown. A stuck OS
-    // thread must not hold the API or process open after its deadline.
-    std::thread::Builder::new()
-        .name("mnemoarc-tool".into())
-        .spawn(move || {
-            let result = tools::run_call_cancellable(&mut session, &call, &cancel);
-            let _ = sender.send((session, result));
-        })?;
-    Ok(receiver)
+    spawn_tool_thread(tool_workers(), move || {
+        let result = tools::run_call_cancellable(&mut session, &call, &cancel);
+        (session, result)
+    })
 }
 
 async fn await_tool_worker(
@@ -754,6 +783,7 @@ async fn await_tool_worker(
     settle_wait: Duration,
     external_write: bool,
 ) -> ToolOutcome {
+    let _worker_cancel = child.clone().drop_guard();
     let stopped = tokio::select! {
         biased;
         outcome = &mut receiver => return received_tool_outcome(backup, outcome, external_write),
@@ -925,8 +955,15 @@ async fn read_parallel(
             }
             let deadline = ToolDeadline::new(Duration::from_secs(timeout), run_deadline);
             let child = cancel.child_token();
+            let _worker_cancel = child.clone().drop_guard();
             let mut receiver = spawn_tool_worker(temporary, call, child.clone())
-                .map_err(|error| anyhow::anyhow!("tool_worker_start_failed: {error}"))?;
+                .map_err(|error| {
+                    if error.to_string().starts_with("tool_worker_capacity:") {
+                        anyhow::Error::from(error)
+                    } else {
+                        anyhow::anyhow!("tool_worker_start_failed: {error}")
+                    }
+                })?;
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
@@ -1121,6 +1158,12 @@ pub async fn run_session_controlled(
                 .await;
             }
             Ok(false) => {}
+        }
+        // Final answers, model errors and cancelled runs can bypass the tool
+        // batch checks. Recheck before every request, including resumed runs.
+        if let Err(error) = s.check_runtime_capacity() {
+            failure = Some(error.to_string());
+            break;
         }
         if !s.config.source_answer_review && s.answer_draft.is_some() {
             // Release a paused review when the user disables it. Keep the
@@ -2596,6 +2639,13 @@ pub async fn run_session_controlled(
             }
             s.activity = json!({"stage":"tools","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.task_rounds,"tools":execution_calls[i..i+group].iter().map(|c| c.name.clone()).collect::<Vec<_>>()});
             snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
+            // A single completion can contain many groups. Stop before the
+            // next group when earlier archives or receipts exhausted capacity.
+            if failure.is_none()
+                && let Err(error) = s.check_runtime_capacity()
+            {
+                failure = Some(error.to_string());
+            }
             let results = if malformed_call {
                 vec![tools::envelope(Err(anyhow::anyhow!(
                     "malformed_tool_call: tool call id and name must be non-empty"
@@ -2945,16 +2995,9 @@ pub async fn run_session_controlled(
             failure = Some(e.to_string());
             break;
         }
-        if s.history.bytes() > s.config.history_bytes.saturating_mul(2) {
-            failure = Some("history_hard_limit: cleanup required".into());
-            break;
-        }
         // Bound ancillary session data too; never silently discard observations or receipts.
-        if s.ancillary_bytes() > s.config.memory_bytes {
-            failure = Some(
-                "session_metadata_capacity: start another session or reduce retained details"
-                    .into(),
-            );
+        if let Err(error) = s.check_runtime_capacity() {
+            failure = Some(error.to_string());
             break;
         }
         // Count the work since the last confirmed review improvement even when
@@ -3049,14 +3092,20 @@ pub async fn run_session_controlled(
 }
 
 pub async fn headless(mut s: Session, prompt: String) -> Result<Session> {
+    s.history.check_append(
+        vec![json!({"role":"user","content":prompt})],
+        s.config.history_bytes,
+    )?;
     s.add_user(prompt);
-    let (tx, mut rx) = mpsc::channel(128);
+    s.check_runtime_capacity()?;
+    let (tx, mut rx) = mpsc::channel(4);
     let cancel = CancellationToken::new();
     let c = cancel.clone();
     let listener = tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         c.cancel();
     });
+    let _listener_guard = AbortOnDrop(listener.abort_handle());
     let renderer = tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             match event {
@@ -3070,6 +3119,7 @@ pub async fn headless(mut s: Session, prompt: String) -> Result<Session> {
             }
         }
     });
+    let _renderer_guard = AbortOnDrop(renderer.abort_handle());
     let result = run_session(s, Arc::new(OpenAiClient), cancel, tx).await;
     listener.abort();
     let _ = renderer.await;
@@ -3476,6 +3526,111 @@ mod worker_wait_tests {
     use super::*;
     use crate::config::Project;
 
+    #[tokio::test]
+    async fn queued_snapshot_does_not_clone_a_session_before_queue_space_exists() {
+        let s = session();
+        let shared = s.write_outcome_uncertain.clone();
+        let initial_refs = Arc::strong_count(&shared);
+        let (events, _receiver) = mpsc::channel(1);
+        events
+            .try_send(AgentEvent::Notice {
+                session: s.id.clone(),
+                text: "full".into(),
+            })
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let future = snapshot(
+            &s,
+            &events,
+            &cancel,
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        );
+        tokio::pin!(future);
+        assert!(futures_util::poll!(&mut future).is_pending());
+        assert_eq!(Arc::strong_count(&shared), initial_refs);
+        cancel.cancel();
+        future.await;
+        assert_eq!(Arc::strong_count(&shared), initial_refs);
+    }
+
+    #[tokio::test]
+    async fn abandoned_tool_receiver_keeps_its_slot_until_the_thread_drops_its_session() {
+        let workers = Arc::new(tokio::sync::Semaphore::new(1));
+        let retained = session();
+        let weak = Arc::downgrade(&retained.write_outcome_uncertain);
+        let (release, hold) = std::sync::mpsc::channel();
+        let receiver = spawn_tool_thread(workers.clone(), move || {
+            let _ = hold.recv();
+            retained
+        })
+        .unwrap();
+        drop(receiver);
+        for _ in 0..32 {
+            let error = spawn_tool_thread(workers.clone(), || ()).unwrap_err();
+            assert!(error.to_string().starts_with("tool_worker_capacity:"));
+            assert_eq!(workers.available_permits(), 0);
+            assert!(weak.upgrade().is_some());
+        }
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while workers.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            weak.upgrade().is_none(),
+            "the abandoned worker's session must be dropped"
+        );
+        assert_eq!(
+            spawn_tool_thread(workers.clone(), || 42)
+                .unwrap()
+                .await
+                .unwrap(),
+            42
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_tool_thread_releases_its_slot() {
+        let workers = Arc::new(tokio::sync::Semaphore::new(1));
+        let receiver =
+            spawn_tool_thread(workers.clone(), || panic!("simulated tool thread panic")).unwrap();
+        assert!(receiver.await.is_err());
+        let permit = tokio::time::timeout(Duration::from_secs(2), workers.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        assert_eq!(workers.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_tool_wait_cancels_the_outliving_read() {
+        let (_sender, receiver) = oneshot::channel();
+        let cancel = CancellationToken::new();
+        let child = cancel.child_token();
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(10),
+            await_tool_worker(
+                session(),
+                receiver,
+                &cancel,
+                child.clone(),
+                ToolDeadline::new(
+                    Duration::from_secs(60),
+                    tokio::time::Instant::now() + Duration::from_secs(60),
+                ),
+                Duration::from_secs(1),
+                false,
+            ),
+        )
+        .await;
+        assert!(outcome.is_err());
+        assert!(child.is_cancelled());
+        assert!(!cancel.is_cancelled());
+    }
     fn session() -> Session {
         Session::new(Project::default(), Config::default())
     }

@@ -1,6 +1,6 @@
 use crate::{
     config::{Config, Project},
-    memory::{MemoryStore, Source, id},
+    memory::{MemoryStore, Source, id, serialized_bytes},
 };
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -168,10 +168,24 @@ impl SessionHistory {
         id
     }
     pub fn bytes(&self) -> usize {
-        self.bundles
-            .iter()
-            .map(|b| serde_json::to_vec(b).unwrap().len())
-            .sum()
+        self.bundles.iter().fold(0usize, |total, bundle| {
+            total.saturating_add(serialized_bytes(bundle))
+        })
+    }
+    pub(crate) fn check_append(&self, messages: Vec<Value>, limit: usize) -> Result<()> {
+        let bundle = Bundle {
+            id: self.next_id.saturating_add(1),
+            messages,
+            active: true,
+            reviewed: false,
+            complete: true,
+        };
+        if self.bytes().saturating_add(serialized_bytes(&bundle)) > limit {
+            bail!(
+                "history_capacity: request exceeds retained history capacity; clean up history or start another session"
+            );
+        }
+        Ok(())
     }
     pub fn active(&self) -> Vec<Value> {
         self.bundles
@@ -190,7 +204,7 @@ impl SessionHistory {
             if first.active || !first.reviewed || !first.complete {
                 bail!("history_capacity: checkpoint required; original history retained");
             }
-            bytes = bytes.saturating_sub(serde_json::to_vec(first)?.len());
+            bytes = bytes.saturating_sub(serialized_bytes(first));
             remove += 1;
         }
         for _ in 0..remove {
@@ -258,7 +272,7 @@ pub struct ReadCoverage {
 
 /// Runtime progress, retained when the same task is resumed. A new user task
 /// resets it; merely restarting a run cannot make a repeated result new work.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct ProgressRecovery {
     /// A rejected document final must return to tools before trying to finish.
     pub action_required: bool,
@@ -836,7 +850,7 @@ impl Session {
     /// the memory and history stores. Runtime turns use the same bound to
     /// avoid silently discarding observations or receipts.
     pub fn ancillary_bytes(&self) -> usize {
-        serde_json::to_vec(&(
+        serialized_bytes(&(
             &self.sources,
             &self.ledger,
             &self.investigations,
@@ -844,8 +858,52 @@ impl Session {
             &self.file_cursors,
             &self.read_coverage,
             &self.coverage_cursors,
+            &self.request_review_criteria,
+            &self.checkpoint,
+            &self.config,
+            &self.pending_config,
+            &self.project,
+            &self.active_tools,
+            &self.pending_tools,
+            &self.workflow_mode,
         ))
-        .map_or(usize::MAX, |v| v.len())
+        .saturating_add(serialized_bytes(&(
+            &self.latest_request,
+            &self.status,
+            &self.last_error,
+            self.question
+                .as_ref()
+                .map(|q| (&q.text, &q.prior_status, &q.prior_error, &q.prior_activity)),
+            &self.run_guidance,
+            &self.progress_recovery,
+            &self.completion_gaps,
+            &self.token_ratios,
+            &self.list_cursor_scopes,
+            &self.activity,
+            &self.answer_draft,
+            &self.answer_review_original,
+            &self.answer_review_issues,
+            &self.answer_review_question,
+            &self.run_history,
+        )))
+        .saturating_add(self.document_review.retained_bytes())
+        .saturating_add(self.completion_review.retained_bytes())
+        .saturating_add(self.config.api_key.as_ref().map_or(0, |key| key.0.len()))
+        .saturating_add(
+            self.pending_config
+                .as_ref()
+                .and_then(|c| c.api_key.as_ref())
+                .map_or(0, |key| key.0.len()),
+        )
+    }
+    pub(crate) fn check_runtime_capacity(&self) -> Result<()> {
+        if self.ancillary_bytes() > self.config.memory_bytes {
+            bail!("session_metadata_capacity: start another session or reduce retained details");
+        }
+        if self.history.bytes() > self.config.history_bytes.saturating_mul(2) {
+            bail!("history_hard_limit: cleanup required");
+        }
+        Ok(())
     }
     pub fn check_limits(&self, c: &Config) -> Result<()> {
         c.validate()?;

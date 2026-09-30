@@ -88,6 +88,7 @@ pub(super) async fn run(
     let result: Result<()> = async {
         settings.map_err(|error| anyhow::anyhow!("settings_pending_cleanup: {error}; task preserved"))?;
         s.config.runnable()?;
+        s.check_runtime_capacity()?;
         let mut request = request(&s);
         let tokens = context::count(&request, &s.config.model);
         if tokens.saturating_add(s.config.output_tokens).saturating_add(512) > s.config.context_tokens {

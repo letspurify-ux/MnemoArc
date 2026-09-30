@@ -64,6 +64,112 @@ async fn run(s: Session, client: Arc<dyn LlmClient>) -> Session {
     result
 }
 
+struct CapacityProbe(std::sync::atomic::AtomicUsize);
+
+#[async_trait]
+impl LlmClient for CapacityProbe {
+    async fn complete(
+        &self,
+        _: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Completion {
+            text: "A final answer must not bypass retained-state limits.".into(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn resuming_over_capacity_cannot_keep_appending_final_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.config.memory_bytes = 32 * 1024;
+    s.add_user("Keep the existing write receipt".into());
+    s.ledger.insert(
+        "retained-write".into(),
+        (
+            "file_write:receipt".into(),
+            json!({"status":"ok","receipt":"x".repeat(s.config.memory_bytes)}),
+        ),
+    );
+    let receipt = s.ledger.clone();
+    let history = s.history.bytes();
+    let client = Arc::new(CapacityProbe(std::sync::atomic::AtomicUsize::new(0)));
+    for _ in 0..3 {
+        s = run(s, client.clone()).await;
+        assert_eq!(s.status, "blocked");
+        assert!(
+            s.last_error
+                .as_deref()
+                .unwrap()
+                .starts_with("session_metadata_capacity")
+        );
+        assert_eq!(
+            s.ledger, receipt,
+            "write receipts must survive capacity failures"
+        );
+        assert_eq!(s.history.bytes(), history);
+    }
+    assert_eq!(client.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+struct ReceiptCapacityProbe;
+
+#[async_trait]
+impl LlmClient for ReceiptCapacityProbe {
+    async fn complete(
+        &self,
+        _: Value,
+        config: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        Ok(Completion {
+            calls: ["first.txt", "second.txt", "third.txt"]
+                .into_iter()
+                .map(|path| ToolCall {
+                    id: path.into(),
+                    name: "file_write".into(),
+                    arguments: json!({"path":path,"content":"x".repeat(config.memory_bytes)})
+                        .to_string(),
+                })
+                .collect(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_tool_batch_stops_starting_writes_after_retained_receipts_exceed_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.config.memory_bytes = 32 * 1024;
+    s.add_user("Save the files while preserving every successful write receipt".into());
+    let capacity = s.config.memory_bytes;
+    let result = run(s, Arc::new(ReceiptCapacityProbe)).await;
+    assert_eq!(result.status, "blocked");
+    assert!(
+        result
+            .last_error
+            .as_deref()
+            .unwrap()
+            .starts_with("session_metadata_capacity")
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("first.txt")).unwrap(),
+        "x".repeat(capacity)
+    );
+    assert!(!dir.path().join("second.txt").exists());
+    assert!(!dir.path().join("third.txt").exists());
+    assert!(result.ledger.contains_key("first.txt"));
+    assert!(!result.ledger.contains_key("second.txt"));
+    assert!(!result.ledger.contains_key("third.txt"));
+}
+
 const ORIGINAL: &str = "Explain the source module and preserve the original requirements";
 const MAINTENANCE: &str = "Clean up memory and progress. Do not modify project files.";
 

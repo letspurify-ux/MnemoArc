@@ -82,6 +82,24 @@ struct Verdict {
     checks: Vec<Check>,
 }
 
+impl ReviewState {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        crate::memory::serialized_bytes(&(
+            self,
+            &self.unavailable_fingerprint,
+            &self.draft,
+            &self.answer_prefix,
+            &self.fingerprint,
+            &self.reviewed_fingerprint,
+            &self.payload,
+            &self.files,
+            &self.receipts,
+            &self.written_paths,
+            &self.repair_todos,
+        ))
+    }
+}
+
 pub fn required(s: &Session) -> bool {
     s.config.completion_review_enabled
         && (s.completion_review.required
@@ -875,4 +893,26 @@ pub fn view(s: &Session) -> Value {
         value["checks"] = json!([]);
     }
     value
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn private_acceptance_payload_and_write_log_are_included_in_session_capacity() {
+        for write_log in [false, true] {
+            let mut s = Session::new(Project::default(), Config::default());
+            s.config.memory_bytes = 32 * 1024;
+            let retained = "x".repeat(s.config.memory_bytes);
+            if write_log {
+                s.completion_review.written_paths.push(retained);
+            } else {
+                s.completion_review.payload = json!({"evidence":retained});
+            }
+            assert!(s.ancillary_bytes() > s.config.memory_bytes);
+            assert!(s.check_limits(&s.config).is_err());
+        }
+    }
 }

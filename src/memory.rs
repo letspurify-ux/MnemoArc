@@ -6,6 +6,23 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
+/// Count logical JSON bytes without allocating a second copy of retained data.
+pub(crate) fn serialized_bytes(value: &(impl Serialize + ?Sized)) -> usize {
+    #[derive(Default)]
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter::default();
+    serde_json::to_writer(&mut counter, value).map_or(usize::MAX, |()| counter.0)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -158,10 +175,9 @@ impl MemoryStore {
     }
 
     pub fn bytes(&self) -> usize {
-        self.entries
-            .values()
-            .map(|m| serde_json::to_vec(m).map_or(usize::MAX, |b| b.len()))
-            .sum()
+        self.entries.values().fold(0usize, |total, memory| {
+            total.saturating_add(serialized_bytes(memory))
+        })
     }
     pub fn get(&self, id_or_key: &str) -> Result<&Memory> {
         self.entries
@@ -431,6 +447,25 @@ impl MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_counter_matches_json_encoding_and_fails_closed() {
+        let data = serde_json::json!({"text":"한글\n\t\"🧠", "nested":[null, true, 42, "x".repeat(100_000)]});
+        assert_eq!(
+            serialized_bytes(&data),
+            serde_json::to_vec(&data).unwrap().len()
+        );
+        struct Invalid;
+        impl Serialize for Invalid {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                _: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("cannot serialize"))
+            }
+        }
+        assert_eq!(serialized_bytes(&Invalid), usize::MAX);
+    }
 
     fn input(key: String, body: &str, expected_revision: Option<u64>) -> MemoryInput {
         MemoryInput {

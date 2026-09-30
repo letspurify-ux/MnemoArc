@@ -60,6 +60,7 @@ pub struct WebState {
     stopping: CancellationToken,
     write_outcome_uncertain: Arc<AtomicBool>,
 }
+#[derive(Debug)]
 struct ApiError(StatusCode, String);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -380,7 +381,7 @@ async fn session_get(
         .filter(|b| session.history.bundles.iter().any(|old| old.id < b.id))
         .map(|b| b.id);
     Ok(Json(
-        json!({"revision":c.revision,"id":id,"project":session.project,"config":session.config,"pending_config":session.pending_config,"credential_configured":OpenAiClient::has_key(&session.config),"status":session.status,"error":session.last_error,"run_history":session.run_history,"has_task":!session.latest_request.is_empty(),"question_running":session.question.is_some(),"task":session.task,"workflow_mode":session.workflow_mode,"document_review":session.document_review,"completion_review":crate::tools::completion_review::view(&session),"completion_gaps":session.completion_gaps,"run_guidance":session.run_guidance,"activity":session.activity,"continuation_pending":session.continuation.is_some(),"bundles":bundles,"previous":previous,"pruned_through":session.history.pruned_through,"stream":c.streams.get(&id),"memories":session.memory.recent(session.config.memory_count),"investigations":session.investigations,"active_tools":session.active_tools,"usage":{"input":session.input_tokens,"output":session.output_tokens,"cached":session.cached_tokens,"estimated":session.usage_incomplete,"context_estimated":crate::context::is_estimated(&session.config.model),"memory_bytes":session.memory.bytes(),"history_bytes":session.history.bytes(),"checkpoints":session.checkpoints_completed},"checkpoint":session.checkpoint}),
+        json!({"revision":c.revision,"id":id,"project":session.project,"config":session.config,"pending_config":session.pending_config,"credential_configured":OpenAiClient::has_key(&session.config),"status":session.status,"error":session.last_error,"run_history":session.run_history,"has_task":!session.latest_request.is_empty(),"question_running":session.question.is_some(),"task":session.task,"workflow_mode":session.workflow_mode,"document_review":session.document_review,"completion_review":crate::tools::completion_review::view(session),"completion_gaps":session.completion_gaps,"run_guidance":session.run_guidance,"activity":session.activity,"continuation_pending":session.continuation.is_some(),"bundles":bundles,"previous":previous,"pruned_through":session.history.pruned_through,"stream":c.streams.get(&id),"memories":session.memory.recent(session.config.memory_count),"investigations":session.investigations,"active_tools":session.active_tools,"usage":{"input":session.input_tokens,"output":session.output_tokens,"cached":session.cached_tokens,"estimated":session.usage_incomplete,"context_estimated":crate::context::is_estimated(&session.config.model),"memory_bytes":session.memory.bytes(),"history_bytes":session.history.bytes(),"checkpoints":session.checkpoints_completed},"checkpoint":session.checkpoint}),
     ))
 }
 #[derive(Deserialize)]
@@ -723,7 +724,17 @@ async fn run(
                         "메시지를 입력하세요.".into(),
                     ));
                 }
-                session.start_new_task(input.text);
+                session.history.check_append(
+                    vec![json!({"role":"user","content":input.text})],
+                    session.config.history_bytes,
+                )?;
+                // A new task clears some old state. Validate the resulting
+                // metadata before publishing it, preserving the current task
+                // if the request itself cannot fit.
+                let mut next = session.clone();
+                next.start_new_task(input.text);
+                next.check_runtime_capacity()?;
+                *session = next;
             }
             "question" => session.queue_question(input.text)?,
             "resume" | "cleanup" => {
@@ -739,7 +750,14 @@ async fn run(
                     ));
                 }
                 if action == "cleanup" {
-                    session.add_maintenance("Clean up memory and progress to fit the pending settings. Preserve important evidence and user constraints. Do not modify project files.".into());
+                    let text = "Clean up memory and progress to fit the pending settings. Preserve important evidence and user constraints. Do not modify project files.";
+                    // Cleanup can retire history above the soft limit, but
+                    // repeated failed cleanups cannot keep adding instructions.
+                    session.history.check_append(
+                        vec![json!({"role":"user","content":text,"maintenance":true})],
+                        session.config.history_bytes.saturating_mul(2),
+                    )?;
+                    session.add_maintenance(text.into());
                 }
             }
             _ => {
@@ -779,7 +797,9 @@ async fn run(
     };
     let state = s.clone();
     tokio::spawn(async move {
-        let (tx, mut events) = mpsc::channel(128);
+        // Each snapshot owns the retained session, including its history.
+        // Keep backpressure close to the owner instead of queuing 128 copies.
+        let (tx, mut events) = mpsc::channel(4);
         let owner = state.clone();
         let pump = tokio::spawn(async move {
             while let Some(event) = events.recv().await {
@@ -1125,6 +1145,202 @@ pub async fn serve_app(
 #[cfg(test)]
 mod worker_wait_tests {
     use super::*;
+
+    struct LifecycleProbe(tokio::sync::Notify);
+
+    #[async_trait::async_trait]
+    impl LlmClient for LifecycleProbe {
+        async fn complete(
+            &self,
+            _: Value,
+            _: &Config,
+            cancel: CancellationToken,
+            delta: mpsc::Sender<String>,
+        ) -> Result<crate::llm::Completion> {
+            delta.send("ongoing response".into()).await.unwrap();
+            self.0.notify_one();
+            cancel.cancelled().await;
+            bail!("cancelled");
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_running_session_closes_release_all_snapshots_and_web_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = Project {
+            root: dir.path().into(),
+            ..Default::default()
+        };
+        let config = Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128000),
+            source_answer_review: false,
+            completion_review_enabled: false,
+            projects: vec![project.clone()],
+            ..Default::default()
+        };
+        let client = Arc::new(LifecycleProbe(tokio::sync::Notify::new()));
+        let state = WebState::new(config, dir.path().join("config.toml"), client.clone()).unwrap();
+        let initial = state.core.lock().await.order[0].clone();
+        let _ = close_session(State(state.clone()), Path(initial))
+            .await
+            .unwrap();
+        let core_refs = Arc::strong_count(&state.core);
+        let session_refs = Arc::strong_count(&state.write_outcome_uncertain);
+        for _ in 0..16 {
+            let Json(created) = create_session(
+                State(state.clone()),
+                Json(NewSession {
+                    project: project.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+            let id = created["id"].as_str().unwrap().to_owned();
+            let _ = run(
+                State(state.clone()),
+                Path(id.clone()),
+                Json(RunInput {
+                    text: "Run until closed".into(),
+                    action: "chat".into(),
+                }),
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), client.0.notified())
+                .await
+                .unwrap();
+            let _ = close_session(State(state.clone()), Path(id)).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let empty = state.core.lock().await.running.is_empty();
+                    if empty
+                        && Arc::strong_count(&state.core) == core_refs
+                        && Arc::strong_count(&state.write_outcome_uncertain) == session_refs
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("closing must drop every private session and event pump owner");
+            let core = state.core.lock().await;
+            assert!(core.sessions.is_empty());
+            assert!(core.order.is_empty());
+            assert!(core.streams.is_empty());
+        }
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn new_task_that_cannot_fit_metadata_preserves_the_previous_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128000),
+            memory_bytes: 32 * 1024,
+            projects: vec![Project {
+                root: dir.path().into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let state = WebState::new(
+            config,
+            dir.path().join("config.toml"),
+            Arc::new(OpenAiClient),
+        )
+        .unwrap();
+        let id = state.core.lock().await.order[0].clone();
+        state
+            .core
+            .lock()
+            .await
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .add_user("Existing task".into());
+        let result = run(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(RunInput {
+                text: "x".repeat(32 * 1024),
+                action: "chat".into(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ApiError(StatusCode::BAD_REQUEST, ref error)) if error.starts_with("session_metadata_capacity:"))
+        );
+        let core = state.core.lock().await;
+        let session = &core.sessions[&id];
+        assert_eq!(session.latest_request, "Existing task");
+        assert_eq!(session.history.next_id, 1);
+        assert_eq!(session.sources.len(), 1);
+        assert!(core.running.is_empty());
+        assert_eq!(core.revision, 0);
+    }
+
+    #[tokio::test]
+    async fn new_task_at_history_capacity_is_rejected_without_mutating_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128000),
+            projects: vec![Project {
+                root: dir.path().into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let state = WebState::new(
+            config,
+            dir.path().join("config.toml"),
+            Arc::new(OpenAiClient),
+        )
+        .unwrap();
+        let id = state.core.lock().await.order[0].clone();
+        let (bytes, next_id, sources, request, revision) = {
+            let mut core = state.core.lock().await;
+            let session = core.sessions.get_mut(&id).unwrap();
+            session.add_user("Preserve the current task".into());
+            session.history.push(
+                vec![json!({"role":"assistant","content":"x".repeat(4096)})],
+                true,
+            );
+            session.config.history_bytes = session.history.bytes();
+            (
+                session.history.bytes(),
+                session.history.next_id,
+                session.sources.len(),
+                session.latest_request.clone(),
+                core.revision,
+            )
+        };
+        for _ in 0..3 {
+            let result = run(
+                State(state.clone()),
+                Path(id.clone()),
+                Json(RunInput {
+                    text: "Another task".into(),
+                    action: "chat".into(),
+                }),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(ApiError(StatusCode::BAD_REQUEST, ref error)) if error.starts_with("history_capacity"))
+            );
+            let core = state.core.lock().await;
+            let session = &core.sessions[&id];
+            assert_eq!(session.history.bytes(), bytes);
+            assert_eq!(session.history.next_id, next_id);
+            assert_eq!(session.sources.len(), sources);
+            assert_eq!(session.latest_request, request);
+            assert_eq!(core.revision, revision);
+            assert!(core.running.is_empty());
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]

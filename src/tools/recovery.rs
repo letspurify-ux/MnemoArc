@@ -34,6 +34,8 @@ pub fn describe(message: &str) -> Value {
     };
     let (class, action) = if code == "cancelled" {
         (Class::Cancelled, "stop")
+    } else if code == "tool_worker_capacity" {
+        (Class::Unavailable, "wait_for_tool_workers")
     } else if matches!(
         code,
         "tool_worker_panic" | "tool_worker_unresolved" | "tool_batch_aborted"

@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     error::Error as StdError,
     fmt::{Display, Formatter},
     sync::{
@@ -231,17 +232,53 @@ fn response_format_rejected(error: &str) -> bool {
 /// Endpoints (base URL and model) that rejected strict JSON Schema output.
 /// Later requests use plain JSON mode directly instead of paying a failed
 /// attempt each time.
-static JSON_SCHEMA_REJECTED: std::sync::Mutex<std::collections::BTreeSet<String>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
+static JSON_SCHEMA_REJECTED: std::sync::Mutex<SchemaCache> =
+    std::sync::Mutex::new(SchemaCache(VecDeque::new()));
 
 /// Some providers fail a particular strict grammar inside an otherwise valid
 /// SSE response. Remember only a successful JSON-mode recovery, per schema;
 /// a provider outage alone must not disable all structured output.
-static JSON_SCHEMA_STREAM_RECOVERED: std::sync::Mutex<std::collections::BTreeSet<String>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
+static JSON_SCHEMA_STREAM_RECOVERED: std::sync::Mutex<SchemaCache> =
+    std::sync::Mutex::new(SchemaCache(VecDeque::new()));
 
-fn schema_endpoint(c: &Config) -> String {
-    format!("{}\0{}", c.base_url, c.model)
+struct SchemaCache(VecDeque<[u8; 32]>);
+impl SchemaCache {
+    const MAX_ENTRIES: usize = 128;
+
+    fn contains(&mut self, key: &[u8; 32]) -> bool {
+        let Some(index) = self.0.iter().position(|known| known == key) else {
+            return false;
+        };
+        let key = self.0.remove(index).unwrap();
+        self.0.push_back(key);
+        true
+    }
+
+    fn insert(&mut self, key: [u8; 32]) {
+        if self.contains(&key) {
+            return;
+        }
+        if self.0.len() == Self::MAX_ENTRIES {
+            self.0.pop_front();
+        }
+        self.0.push_back(key);
+    }
+}
+
+fn schema_endpoint(c: &Config) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    for part in [&c.base_url, &c.model] {
+        hash.update(part.len().to_le_bytes());
+        hash.update(part.as_bytes());
+    }
+    hash.finalize().into()
+}
+
+fn schema_cache_key(c: &Config, format: &Value) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(schema_endpoint(c));
+    hash.update(format.to_string().as_bytes());
+    hash.finalize().into()
 }
 
 fn downgrade_json_schema(request: &mut Value) -> bool {
@@ -689,14 +726,14 @@ impl LlmClient for OpenAiClient {
             fields.remove(STREAM_DELTAS_MARKER);
         }
         let schema_key = (request["response_format"]["type"] == "json_schema")
-            .then(|| format!("{}\0{}", schema_endpoint(c), request["response_format"]));
+            .then(|| schema_cache_key(c, &request["response_format"]));
         if JSON_SCHEMA_REJECTED
             .lock()
-            .is_ok_and(|rejected| rejected.contains(&schema_endpoint(c)))
+            .is_ok_and(|mut rejected| rejected.contains(&schema_endpoint(c)))
             || schema_key.as_ref().is_some_and(|key| {
                 JSON_SCHEMA_STREAM_RECOVERED
                     .lock()
-                    .is_ok_and(|recovered| recovered.contains(key))
+                    .is_ok_and(|mut recovered| recovered.contains(key))
             })
         {
             downgrade_json_schema(&mut request);
@@ -735,7 +772,7 @@ impl LlmClient for OpenAiClient {
                         && let Some(key) = &schema_key
                         && let Ok(mut recovered) = JSON_SCHEMA_STREAM_RECOVERED.lock()
                     {
-                        recovered.insert(key.clone());
+                        recovered.insert(*key);
                     }
                     r.attempts = attempt.saturating_add(1);
                     r.attempt_diagnostics = attempt_diagnostics;
@@ -855,6 +892,39 @@ impl LlmClient for OpenAiClient {
 mod diagnostic_tests {
     use super::*;
     use crate::config::Secret;
+
+    #[test]
+    fn schema_caches_bound_retention_and_refresh_recent_keys() {
+        let config = Config::default();
+        let mut cache = SchemaCache(VecDeque::new());
+        let oldest = schema_cache_key(&config, &json!({"name":"oldest"}));
+        cache.insert(oldest);
+        for index in 1..SchemaCache::MAX_ENTRIES {
+            cache.insert(schema_cache_key(&config, &json!({"name":index})));
+        }
+        assert!(cache.contains(&oldest));
+        let evicted = schema_cache_key(&config, &json!({"name":1}));
+        let newest = schema_cache_key(
+            &config,
+            &json!({"name":"new","description":"x".repeat(100_000)}),
+        );
+        cache.insert(newest);
+        assert_eq!(cache.0.len(), SchemaCache::MAX_ENTRIES);
+        assert!(!cache.contains(&evicted));
+        assert!(cache.contains(&oldest));
+        for _ in 0..256 {
+            cache.insert(newest);
+        }
+        assert_eq!(cache.0.len(), SchemaCache::MAX_ENTRIES);
+        let mut other = config.clone();
+        other.model = "different-model".into();
+        assert_ne!(schema_endpoint(&config), schema_endpoint(&other));
+        assert_ne!(
+            schema_cache_key(&config, &json!({"name":"oldest"})),
+            schema_cache_key(&other, &json!({"name":"oldest"}))
+        );
+        assert_ne!(oldest, newest);
+    }
 
     #[test]
     fn provider_diagnostics_redact_credentials_before_clipping() {

@@ -72,6 +72,24 @@ pub struct ReviewState {
     unavailable_source_hashes: BTreeMap<String, String>,
 }
 
+impl ReviewState {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        // API serialization omits working evidence and findings. They still
+        // occupy RAM and must participate in the session's retention budget.
+        crate::memory::serialized_bytes(&(
+            self,
+            &self.page_findings,
+            &self.validation_ids,
+            &self.page_evidence,
+            &self.policy_hash,
+            &self.reviewed_sections,
+            &self.unavailable_hash,
+            &self.unavailable_requirements,
+            &self.unavailable_source_hashes,
+        ))
+    }
+}
+
 /// Only a verdict for the current document, requirements and source versions
 /// can decide completion. `issues` may still contain earlier repair context.
 #[derive(Debug, PartialEq, Eq)]
@@ -1001,5 +1019,22 @@ mod tests {
         assert!(approximate_line_issue(request, 110).is_none());
         assert!(approximate_line_issue(request, 160).is_some());
         assert!(approximate_line_issue("줄 수 제한은 없습니다.", 65).is_none());
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn private_review_evidence_is_included_in_session_capacity() {
+        let mut s = Session::new(Project::default(), Config::default());
+        s.config.memory_bytes = 32 * 1024;
+        assert!(s.check_limits(&s.config).is_ok());
+        s.document_review.page_evidence =
+            vec![json!({"numbered_text":"x".repeat(s.config.memory_bytes)})];
+        assert!(s.ancillary_bytes() > s.config.memory_bytes);
+        assert!(s.check_limits(&s.config).is_err());
     }
 }
