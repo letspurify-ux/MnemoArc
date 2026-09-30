@@ -39,6 +39,13 @@ pub struct ReviewState {
     pub dismissed_findings: usize,
     pub resolved_findings: usize,
     pub validation_log: Vec<Value>,
+    /// Document line ranges (1-based, inclusive) whose review page kept
+    /// returning invalid responses during this review. They block approval.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_ranges: Vec<(usize, usize)>,
+    /// Skipped ranges of the review that ended unavailable, for the report.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_ranges: Vec<(usize, usize)>,
     #[serde(skip)]
     next_finding_id: usize,
     #[serde(skip)]
@@ -230,6 +237,7 @@ pub fn mark_unavailable(s: &mut Session) {
         .or_else(|| output_path(&s.project).and_then(|p| hash_file(&p)).ok());
     let source_hashes = s.document_review.source_hashes.clone();
     defer_for_repair(s);
+    s.document_review.unavailable_ranges.clear();
     s.document_review.unavailable_hash = target_hash;
     s.document_review.unavailable_requirements = Some(requirement_hash);
     s.document_review.unavailable_source_hashes = source_hashes;
@@ -237,6 +245,85 @@ pub fn mark_unavailable(s: &mut Session) {
 
 pub fn unavailable_on_current(s: &Session) -> bool {
     matches!(current_verdict(s), CurrentVerdict::Unavailable)
+}
+
+/// Document ranges left unreviewed by an unavailable verdict; empty when the
+/// whole review failed rather than particular pages.
+pub fn unavailable_ranges(s: &Session) -> &[(usize, usize)] {
+    &s.document_review.unavailable_ranges
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PageSkip {
+    /// Not a skippable page (for example finding validation); abandon instead.
+    NotApplicable,
+    /// The review continues on another page or with validation, or already
+    /// produced a verdict from the collected findings.
+    Continued,
+    /// The last page was skipped and no page produced a finding: the review
+    /// is unavailable for the skipped ranges only.
+    Unavailable,
+}
+
+/// Give up on the current review page only. One page that keeps returning
+/// invalid responses used to discard the whole review, including findings
+/// already collected from other pages (a live run lost two real errors that
+/// way). Record the page's document range, move on as if it had no findings,
+/// and let the collected findings go through validation. Skipped ranges
+/// block approval and are reported when no finding remains.
+pub fn skip_failing_page(s: &mut Session) -> PageSkip {
+    let state = &s.document_review;
+    if !state.pending || state.validating || state.target_hash.is_none() {
+        return PageSkip::NotApplicable;
+    }
+    let range = (state.document_offset + 1, state.next_document_offset);
+    let state = &mut s.document_review;
+    // Consecutive skipped pages (or evidence pages of one range) are
+    // reported as one line range.
+    match state.skipped_ranges.last_mut() {
+        _ if range.0 > range.1 => {}
+        Some(last) if range.0 <= last.1 + 1 && range.1 >= last.0 => {
+            *last = (last.0.min(range.0), last.1.max(range.1));
+        }
+        _ => state.skipped_ranges.push(range),
+    }
+    if advance_page(state) {
+        return PageSkip::Continued;
+    }
+    if state.page_findings.is_empty() {
+        let skipped = std::mem::take(&mut state.skipped_ranges);
+        mark_unavailable(s);
+        s.document_review.unavailable_ranges = skipped;
+        return PageSkip::Unavailable;
+    }
+    state.validating = state.page_findings.iter().any(|f| !f.confirmed);
+    if state.validating {
+        state.pending = true;
+        return PageSkip::Continued;
+    }
+    let digest = state.target_hash.clone().unwrap_or_default();
+    match finish_review(s, digest) {
+        Ok(()) => PageSkip::Continued,
+        Err(_) => {
+            mark_unavailable(s);
+            PageSkip::Unavailable
+        }
+    }
+}
+
+/// Move to the next evidence or document page. False after the last page.
+fn advance_page(state: &mut ReviewState) -> bool {
+    if state.next_evidence_offset < state.evidence_total {
+        state.evidence_offset = state.next_evidence_offset;
+    } else if state.next_document_offset < state.document_total {
+        state.document_offset = state.next_document_offset;
+        state.evidence_offset = 0;
+    } else {
+        return false;
+    }
+    state.evidence_page += 1;
+    state.pending = true;
+    true
 }
 
 /// Hash each heading's own body (up to the next heading of any level), keyed
@@ -370,6 +457,7 @@ fn reset_pages(state: &mut ReviewState) {
     state.page_evidence.clear();
     state.validating = false;
     state.validation_ids.clear();
+    state.skipped_ranges.clear();
 }
 
 fn reset_stale_review(state: &mut ReviewState) {
@@ -843,17 +931,7 @@ pub fn finish(s: &mut Session, text: &str) -> Result<()> {
     let state = &mut s.document_review;
     // Issues are accumulated across pages. No approval or content-review
     // attempt is consumed until every evidence chunk has been examined.
-    if state.next_evidence_offset < state.evidence_total {
-        state.evidence_offset = state.next_evidence_offset;
-        state.evidence_page += 1;
-        state.pending = true;
-        return Ok(());
-    }
-    if state.next_document_offset < state.document_total {
-        state.document_offset = state.next_document_offset;
-        state.evidence_offset = 0;
-        state.evidence_page += 1;
-        state.pending = true;
+    if advance_page(state) {
         return Ok(());
     }
     state.validating = state.page_findings.iter().any(|f| !f.confirmed);
@@ -956,7 +1034,20 @@ fn finish_review(s: &mut Session, digest: String) -> Result<()> {
     state.unavailable_requirements = None;
     state.unavailable_source_hashes.clear();
     state.reviewed_requirements = state.target_requirements.clone();
+    let skipped = std::mem::take(&mut state.skipped_ranges);
+    state.unavailable_ranges.clear();
     reset_pages(state);
+    if state.issues.is_empty() && !skipped.is_empty() {
+        // A skipped page was never judged: report it instead of approving.
+        state.unavailable_hash = Some(digest);
+        state.unavailable_requirements = state.target_requirements.clone();
+        state.unavailable_source_hashes = state.source_hashes.clone();
+        state.unavailable_ranges = skipped;
+        state.approved_hash = None;
+        state.repair_requests = 0;
+        state.repair_started_round = None;
+        return Ok(());
+    }
     state.approved_hash = state.issues.is_empty().then_some(digest);
     state.repair_requests = 0;
     state.repair_started_round = (!state.issues.is_empty()).then_some(s.task_rounds);

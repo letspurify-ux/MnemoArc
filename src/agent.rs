@@ -120,7 +120,19 @@ fn collect_gaps(s: &mut Session, extra: &[String]) -> Vec<String> {
                     }
                 }
                 tools::document_review::CurrentVerdict::Unavailable => {
-                    gaps.push("문서 검토 — 검토 응답 오류로 검토를 마치지 못했습니다.".into());
+                    let ranges = tools::document_review::unavailable_ranges(s);
+                    if ranges.is_empty() {
+                        gaps.push("문서 검토 — 검토 응답 오류로 검토를 마치지 못했습니다.".into());
+                    } else {
+                        let ranges = ranges
+                            .iter()
+                            .map(|(start, end)| format!("{start}–{end}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        gaps.push(format!(
+                            "문서 검토 — {ranges}줄은 검토 응답 오류로 확인하지 못했습니다."
+                        ));
+                    }
                 }
                 tools::document_review::CurrentVerdict::Unreviewed => {
                     gaps.push("문서 검토 — 현재 문서를 마감 전에 검토하지 못했습니다.".into());
@@ -281,12 +293,34 @@ fn suppress_unchanged_repeat(
 /// Abandon a pending review whose responses keep failing validation, for
 /// document work only. In closing mode the first failure is enough. The
 /// result then finishes without that review and reports it as unchecked.
-fn abandon_failing_review(s: &mut Session, failures: usize) -> bool {
+/// Outside closing mode a document review skips only the failing page and
+/// keeps the findings of other pages. Returns the notice to show, if any.
+fn abandon_failing_review(s: &mut Session, failures: usize) -> Option<&'static str> {
     if !s.is_document_work()
         || s.checkpoint.is_some()
         || (failures < REVIEW_UNAVAILABLE_LIMIT && s.progress_recovery.closing.is_none())
     {
-        return false;
+        return None;
+    }
+    if s.document_review.pending
+        && !s.completion_review.pending
+        && s.progress_recovery.closing.is_none()
+    {
+        use tools::document_review::PageSkip;
+        match tools::document_review::skip_failing_page(s) {
+            PageSkip::NotApplicable => {}
+            PageSkip::Continued => {
+                s.last_error = None;
+                s.progress_recovery.action_required = false;
+                note_document_review_verdict(s);
+                return Some(REVIEW_PAGE_SKIPPED_NOTICE);
+            }
+            PageSkip::Unavailable => {
+                s.last_error = Some(DOCUMENT_REVIEW_UNAVAILABLE.into());
+                s.progress_recovery.action_required = false;
+                return Some(REVIEW_UNAVAILABLE_NOTICE);
+            }
+        }
     }
     if s.completion_review.pending {
         // last_error holds the rejected response's validation error; keep it
@@ -299,12 +333,30 @@ fn abandon_failing_review(s: &mut Session, failures: usize) -> bool {
         ));
     } else if s.document_review.pending {
         tools::document_review::mark_unavailable(s);
-        s.last_error = Some("document_review_unavailable: document review responses were invalid; give the final answer again and the document will be reported as unreviewed".into());
+        s.last_error = Some(DOCUMENT_REVIEW_UNAVAILABLE.into());
     } else {
-        return false;
+        return None;
     }
     s.progress_recovery.action_required = false;
-    true
+    Some(REVIEW_UNAVAILABLE_NOTICE)
+}
+
+/// After a document review verdict with findings, require their repair.
+fn note_document_review_verdict(s: &mut Session) {
+    if s.document_review.pending || s.document_review.issues.is_empty() {
+        return;
+    }
+    s.last_error = Some(format!(
+        "document_review: {}",
+        s.document_review.issues.join("; ")
+    ));
+    s.progress_recovery.action_required = true;
+    if s.document_review.stalled_attempts >= s.config.review_limit {
+        recover_document(
+            s,
+            "Document review still has unresolved findings. Correct the first finding in its original section, then verify that section; do not request another unchanged review.",
+        );
+    }
 }
 
 /// Consecutive empty replies retried before a non-document run stops.
@@ -336,6 +388,9 @@ fn note_unrepaired_final(s: &mut Session) -> usize {
 }
 
 const REVIEW_UNAVAILABLE_NOTICE: &str = "검토 응답이 반복해서 형식에 맞지 않아 이 결과의 검토를 생략하고, 완료 보고에 미검토로 표시합니다.";
+const DOCUMENT_REVIEW_UNAVAILABLE: &str = "document_review_unavailable: document review responses were invalid; give the final answer again and the document will be reported as unreviewed";
+const REVIEW_PAGE_SKIPPED_NOTICE: &str =
+    "검토 응답이 반복해서 형식에 맞지 않아 이 부분의 검토를 건너뛰고, 나머지 검토를 이어갑니다.";
 
 fn finish_cause_text(cause: &str) -> &'static str {
     match cause {
@@ -1683,7 +1738,7 @@ pub async fn run_session_controlled(
                         .saturating_add(request_config.output_tokens.saturating_mul(attempts));
                     if reviewing_completion || reviewing_document {
                         review_response_failures += 1;
-                        if abandon_failing_review(&mut s, review_response_failures) {
+                        if abandon_failing_review(&mut s, review_response_failures).is_some() {
                             review_response_failures = 0;
                         }
                     }
@@ -1765,7 +1820,7 @@ pub async fn run_session_controlled(
             if recover_unexecuted_batch(&mut s, &error.to_string()) {
                 if reviewing_completion || reviewing_document {
                     review_response_failures += 1;
-                    if abandon_failing_review(&mut s, review_response_failures) {
+                    if abandon_failing_review(&mut s, review_response_failures).is_some() {
                         review_response_failures = 0;
                     }
                 }
@@ -1838,13 +1893,13 @@ pub async fn run_session_controlled(
                     }
                     review_response_failures += 1;
                     s.last_error = Some(reason);
-                    if abandon_failing_review(&mut s, review_response_failures) {
+                    if let Some(notice) = abandon_failing_review(&mut s, review_response_failures) {
                         review_response_failures = 0;
                         emit(
                             &events,
                             AgentEvent::Notice {
                                 session: s.id.clone(),
-                                text: REVIEW_UNAVAILABLE_NOTICE.into(),
+                                text: notice.into(),
                             },
                             &cancel,
                             run_deadline(started, &s.config),
@@ -1949,14 +2004,14 @@ pub async fn run_session_controlled(
                 if (reason.starts_with("document_review_invalid:")
                     || reason.starts_with("document_review_incomplete:")
                     || reason.starts_with("document_review_stale:"))
-                    && abandon_failing_review(&mut s, review_response_failures)
+                    && let Some(notice) = abandon_failing_review(&mut s, review_response_failures)
                 {
                     review_response_failures = 0;
                     emit(
                         &events,
                         AgentEvent::Notice {
                             session: s.id.clone(),
-                            text: REVIEW_UNAVAILABLE_NOTICE.into(),
+                            text: notice.into(),
                         },
                         &cancel,
                         run_deadline(started, &s.config),
@@ -1990,19 +2045,7 @@ pub async fn run_session_controlled(
                 break;
             }
             review_response_failures = 0;
-            if !s.document_review.pending && !s.document_review.issues.is_empty() {
-                s.last_error = Some(format!(
-                    "document_review: {}",
-                    s.document_review.issues.join("; ")
-                ));
-                s.progress_recovery.action_required = true;
-                if s.document_review.stalled_attempts >= s.config.review_limit {
-                    recover_document(
-                        &mut s,
-                        "Document review still has unresolved findings. Correct the first finding in its original section, then verify that section; do not request another unchanged review.",
-                    );
-                }
-            }
+            note_document_review_verdict(&mut s);
             snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
             continue;
         }

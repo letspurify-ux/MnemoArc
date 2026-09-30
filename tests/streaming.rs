@@ -1081,7 +1081,7 @@ async fn rejected_json_mode_records_fallback_without_response_format() {
 }
 
 #[tokio::test]
-async fn sse_schema_failure_recovers_once_and_caches_only_that_schema() {
+async fn sse_schema_failure_is_cached_after_two_recoveries_and_only_for_that_schema() {
     use std::sync::{Arc, Mutex};
     let formats = Arc::new(Mutex::new(Vec::new()));
     let seen = formats.clone();
@@ -1105,7 +1105,9 @@ async fn sse_schema_failure_recovers_once_and_caches_only_that_schema() {
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let mut request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
-    for attempts in [2, 1] {
+    // One recovery may be an outage that cleared in time; the second request
+    // with the same schema confirms the grammar failure and caches it.
+    for attempts in [2, 2, 1] {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let result = OpenAiClient
             .complete(request.clone(), &config, CancellationToken::new(), tx)
@@ -1136,7 +1138,71 @@ async fn sse_schema_failure_recovers_once_and_caches_only_that_schema() {
     );
     assert_eq!(
         *formats.lock().unwrap(),
-        ["json_schema", "json_object", "json_object", "json_schema"]
+        [
+            "json_schema",
+            "json_object",
+            "json_schema",
+            "json_object",
+            "json_object",
+            "json_schema"
+        ]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn an_outage_cleared_by_the_json_mode_attempt_keeps_strict_schema_output() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    // The first request's strict attempts hit an in-stream 502 outage that
+    // clears exactly when the JSON-mode comparison attempt is sent.
+    let failures_left = Arc::new(AtomicUsize::new(1));
+    let formats = Arc::new(Mutex::new(Vec::new()));
+    let (left, seen) = (failures_left.clone(), formats.clone());
+    let app=Router::new().route("/chat/completions",post(move |axum::Json(body):axum::Json<serde_json::Value>| {
+        let (left,seen)=(left.clone(),seen.clone());
+        async move {
+            let format=body["response_format"]["type"].as_str().unwrap_or("none").to_owned();
+            let failing=format=="json_schema" && left.load(Ordering::SeqCst)>0;
+            if failing { left.fetch_sub(1,Ordering::SeqCst); }
+            seen.lock().unwrap().push(format);
+            let content=if failing { event(json!({"error":{"code":502,"message":"JSON error injected into SSE stream","metadata":{"error_type":"provider_unavailable"}}})) }
+                else { format!("{}data: [DONE]\n\n",event(json!({"choices":[{"delta":{"content":"{\"issues\":[]}"},"finish_reason":"stop"}]}))) };
+            ([(header::CONTENT_TYPE,"text/event-stream")],content)
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = Config {
+        base_url: format!("http://{}", listener.local_addr().unwrap()),
+        model: "schema-outage-cleared".into(),
+        retries: 0,
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
+    for (attempts, fail_next) in [(2, 0), (1, 1), (2, 0), (1, 0)] {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = OpenAiClient
+            .complete(request.clone(), &config, CancellationToken::new(), tx)
+            .await
+            .unwrap();
+        assert_eq!(result.attempts, attempts);
+        failures_left.store(fail_next, Ordering::SeqCst);
+    }
+    // The strict success on the second request cleared the first recovery,
+    // so the third recovery is again only a suspicion, not a cached failure.
+    assert_eq!(
+        *formats.lock().unwrap(),
+        [
+            "json_schema",
+            "json_object",
+            "json_schema",
+            "json_schema",
+            "json_object",
+            "json_schema"
+        ]
     );
     server.abort();
 }

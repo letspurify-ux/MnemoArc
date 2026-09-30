@@ -1955,3 +1955,160 @@ fn longer_repairs_count_as_progress_after_a_length_finding() {
     support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
     assert_eq!(s.document_review.stalled_attempts, 0);
 }
+
+/// Reviews a two-page document; the second page always answers invalid JSON.
+struct FailingSecondPage {
+    first_page_issue: bool,
+}
+#[async_trait]
+impl LlmClient for FailingSecondPage {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        tx: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        if let Some(review) = support::acceptance(&request) {
+            return Ok(review);
+        }
+        let payload: Value = request["messages"][1]["content"]
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(Value::Null);
+        let text = if payload["source_document_review"] == true {
+            if payload["document_line_start"] != 1 {
+                "{\"issues\":[{\"problem\":\"unterminated"
+            } else if self.first_page_issue {
+                r#"{"issues":["Flow: incorrect loop type"]}"#
+            } else {
+                r#"{"issues":[]}"#
+            }
+        } else {
+            "Done"
+        };
+        tx.send(text.into()).await.ok();
+        Ok(Completion {
+            text: text.into(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_persistently_invalid_page_is_skipped_without_losing_other_findings() {
+    for first_page_issue in [true, false] {
+        let (_dir, mut s) = fixture();
+        s.config.run_tokens = 400_000;
+        let doc = (1..=220)
+            .map(|i| format!("Line {i}: main.js:1-6\n"))
+            .collect::<String>();
+        let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+        tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"write","expected_hash":hash,"text":format!("# Flow\n{doc}")}),
+        )
+        .unwrap();
+        let read = tools::execute(&mut s, "file_read", json!({"path":"main.js"})).unwrap();
+        tools::execute(&mut s,"investigation",json!({"action":"verify","id":"flow","source_ids":[read["source"]["id"]],"verification_note":"Compared body"})).unwrap();
+        let (tx, mut rx) = mpsc::channel(256);
+        let drain = tokio::spawn(async move {
+            let mut notices = Vec::new();
+            while let Some(e) = rx.recv().await {
+                if let AgentEvent::Notice { text, .. } = e {
+                    notices.push(text);
+                }
+            }
+            notices
+        });
+        let result = run_session(
+            s,
+            Arc::new(FailingSecondPage { first_page_issue }),
+            CancellationToken::new(),
+            tx,
+        )
+        .await;
+        let notices = drain.await.unwrap();
+        assert_eq!(
+            result.status, "complete_with_gaps",
+            "{:?}",
+            result.last_error
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("이 부분의 검토를 건너뛰고")),
+            "{notices:?}"
+        );
+        assert!(!document_review::approved(&result));
+        if first_page_issue {
+            // The first page's finding survived the failing page and was
+            // validated into a rejected verdict instead of being discarded.
+            assert!(document_review::rejected_on_current_result(&result));
+            assert!(
+                result
+                    .completion_gaps
+                    .iter()
+                    .any(|gap| gap.starts_with("문서 검토 지적") && gap.contains("loop type")),
+                "{:?}",
+                result.completion_gaps
+            );
+        } else {
+            assert!(document_review::unavailable_on_current(&result));
+            let ranges = document_review::unavailable_ranges(&result);
+            // Pages 101-200 and 201-221 both failed and merge into one range.
+            assert_eq!(ranges, [(101, 221)]);
+            assert!(
+                result
+                    .completion_gaps
+                    .iter()
+                    .any(|gap| gap
+                        == "문서 검토 — 101–221줄은 검토 응답 오류로 확인하지 못했습니다."),
+                "{:?}",
+                result.completion_gaps
+            );
+        }
+    }
+}
+
+#[test]
+fn a_skipped_page_blocks_approval_even_when_other_pages_are_clean() {
+    let (_dir, mut s) = fixture();
+    let doc = (1..=220)
+        .map(|i| format!("Line {i}: main.js:1-6\n"))
+        .collect::<String>();
+    std::fs::write(&s.project.output, &doc).unwrap();
+    s.document_review = Default::default();
+    document_review::request(&mut s).unwrap();
+    s.document_review.pending = true;
+    // The first page fails; later pages review cleanly.
+    assert_eq!(
+        document_review::skip_failing_page(&mut s),
+        document_review::PageSkip::Continued
+    );
+    let first_end = s.document_review.skipped_ranges[0].1;
+    assert_eq!(s.document_review.skipped_ranges, [(1, first_end)]);
+    while s.document_review.pending {
+        document_review::request(&mut s).unwrap();
+        support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    }
+    assert!(!document_review::approved(&s));
+    assert!(document_review::unavailable_on_current(&s));
+    assert_eq!(document_review::unavailable_ranges(&s), [(1, first_end)]);
+    // Validation is not a page: failing it still abandons the whole review.
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":hash,"text":"More: main.js:1-6\n"}),
+    )
+    .unwrap();
+    document_review::request(&mut s).unwrap();
+    s.document_review.pending = true;
+    s.document_review.validating = true;
+    assert_eq!(
+        document_review::skip_failing_page(&mut s),
+        document_review::PageSkip::NotApplicable
+    );
+}

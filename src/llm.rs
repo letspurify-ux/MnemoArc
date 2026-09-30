@@ -241,6 +241,14 @@ static JSON_SCHEMA_REJECTED: std::sync::Mutex<SchemaCache> =
 static JSON_SCHEMA_STREAM_RECOVERED: std::sync::Mutex<SchemaCache> =
     std::sync::Mutex::new(SchemaCache(VecDeque::new()));
 
+/// Schemas recovered by JSON mode once. An outage that clears before the
+/// comparison attempt looks the same as a grammar failure (a live run lost
+/// strict output for a whole review after three in-stream 502s), so a schema
+/// moves to JSON_SCHEMA_STREAM_RECOVERED only when a second request needs the
+/// same recovery; a strict response that succeeds clears the suspicion.
+static JSON_SCHEMA_STREAM_SUSPECTED: std::sync::Mutex<SchemaCache> =
+    std::sync::Mutex::new(SchemaCache(VecDeque::new()));
+
 struct SchemaCache(VecDeque<[u8; 32]>);
 impl SchemaCache {
     const MAX_ENTRIES: usize = 128;
@@ -251,6 +259,14 @@ impl SchemaCache {
         };
         let key = self.0.remove(index).unwrap();
         self.0.push_back(key);
+        true
+    }
+
+    fn remove(&mut self, key: &[u8; 32]) -> bool {
+        let Some(index) = self.0.iter().position(|known| known == key) else {
+            return false;
+        };
+        self.0.remove(index);
         true
     }
 
@@ -279,6 +295,30 @@ fn schema_cache_key(c: &Config, format: &Value) -> [u8; 32] {
     hash.update(schema_endpoint(c));
     hash.update(format.to_string().as_bytes());
     hash.finalize().into()
+}
+
+/// Record how a strict-schema request finished. A JSON-mode recovery after
+/// the SSE fallback caches the schema only when the same schema already
+/// needed it on an earlier request; a strict success clears that suspicion.
+fn note_schema_stream_result(key: &[u8; 32], request: &Value, stream_fallback: bool) {
+    let Ok(mut suspected) = JSON_SCHEMA_STREAM_SUSPECTED.lock() else {
+        return;
+    };
+    match request["response_format"]["type"].as_str() {
+        Some("json_schema") => {
+            suspected.remove(key);
+        }
+        Some("json_object") if stream_fallback => {
+            if suspected.remove(key) {
+                if let Ok(mut recovered) = JSON_SCHEMA_STREAM_RECOVERED.lock() {
+                    recovered.insert(*key);
+                }
+            } else {
+                suspected.insert(*key);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn downgrade_json_schema(request: &mut Value) -> bool {
@@ -767,12 +807,8 @@ impl LlmClient for OpenAiClient {
             };
             match result {
                 Ok(mut r) => {
-                    if schema_stream_fallback
-                        && request["response_format"]["type"] == "json_object"
-                        && let Some(key) = &schema_key
-                        && let Ok(mut recovered) = JSON_SCHEMA_STREAM_RECOVERED.lock()
-                    {
-                        recovered.insert(*key);
+                    if let Some(key) = &schema_key {
+                        note_schema_stream_result(key, &request, schema_stream_fallback);
                     }
                     r.attempts = attempt.saturating_add(1);
                     r.attempt_diagnostics = attempt_diagnostics;
