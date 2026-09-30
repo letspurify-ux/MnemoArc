@@ -649,6 +649,18 @@ fn imports(node: Node<'_>, source: &str, facts: &mut FileFacts, language: &str) 
 
 /// Return the selected name and the receiver/path whose type is not inferred.
 fn expression<'a>(node: Node<'a>, source: &str) -> Option<(Node<'a>, Option<String>)> {
+    let mut node = node;
+    while node.kind() == "parenthesized_expression" {
+        let children = named(node);
+        let mut values = children
+            .into_iter()
+            .filter(|n| !matches!(n.kind(), "comment" | "line_comment" | "block_comment"));
+        let value = values.next()?;
+        if values.next().is_some() {
+            return None;
+        }
+        node = value;
+    }
     match node.kind() {
         "identifier"
         | "type_identifier"
@@ -665,7 +677,7 @@ fn expression<'a>(node: Node<'a>, source: &str) -> Option<(Node<'a>, Option<Stri
             Some((
                 name,
                 node.child_by_field_name("path")
-                    .map(|p| path_text(p, source)),
+                    .map(|p| structure::rust_type_path(p, source)),
             ))
         }
         "dotted_name" => {
@@ -842,13 +854,21 @@ fn add_binding(node: Node<'_>, facts: &mut FileFacts, source: &str, language: &s
                 .map(|n| n.kind())
         })
         .flatten();
-    let write = matches!(
-        node.kind(),
-        "assignment"
-            | "assignment_expression"
-            | "augmented_assignment"
-            | "augmented_assignment_expression"
-    ) && language != "python"
+    let update = node.kind() == "update_expression"
+        || (matches!(
+            node.kind(),
+            "prefix_unary_expression" | "postfix_unary_expression"
+        ) && node
+            .children(&mut node.walk())
+            .any(|n| matches!(n.kind(), "++" | "--")));
+    let write = update
+        || matches!(
+            node.kind(),
+            "assignment"
+                | "assignment_expression"
+                | "augmented_assignment"
+                | "augmented_assignment_expression"
+        ) && language != "python"
         || (javascript && node.kind() == "for_in_statement" && loop_kind.is_none());
     let parameter_container = |kind| {
         matches!(
@@ -909,6 +929,11 @@ fn add_binding(node: Node<'_>, facts: &mut FileFacts, source: &str, language: &s
         "as_pattern" if language == "python" => node.child_by_field_name("alias"),
         "function_expression" | "generator_function" => node.child_by_field_name("name"),
         "typed_parameter" => named(node).into_iter().find(|n| n.kind() == "identifier"),
+        _ if update => node.child_by_field_name("argument").or_else(|| {
+            named(node)
+                .into_iter()
+                .find(|n| !matches!(n.kind(), "comment" | "line_comment" | "block_comment"))
+        }),
         _ if direct_parameter => Some(node),
         _ => None,
     };
@@ -1066,7 +1091,11 @@ fn collect(
             };
             facts.declarations.push(Declaration {
                 key: (file_index, index),
-                name: text_of(name, source).into(),
+                name: if node.kind() == "impl_item" {
+                    structure::rust_type_path(name, source)
+                } else {
+                    text_of(name, source).into()
+                },
                 span,
                 name_span: name.byte_range(),
                 scope: declaration_scope(node, file.syntax.language),
@@ -1097,6 +1126,22 @@ fn collect(
                         .filter(|&n| is_function(n))
                 }?;
                 Some(((callable.start_byte(), callable.end_byte()), d.key))
+            })
+            .collect();
+        // A field/constant initializer has its own declaration scope. In a
+        // local class its instance initialization runs separately from the
+        // enclosing function, even though that function is an AST ancestor.
+        let initializer_owners: BTreeMap<_, _> = facts
+            .declarations
+            .iter()
+            .filter(|d| matches!(d.kind.as_str(), "field" | "constant" | "property" | "event"))
+            .filter_map(|d| {
+                let node = declaration_node(root, &file.symbols[d.key.1])?;
+                let value = node.child_by_field_name("value")?;
+                Some((
+                    (node.start_byte(), node.end_byte()),
+                    (value.byte_range(), d.key),
+                ))
             })
             .collect();
         let site_start = sites.len();
@@ -1218,6 +1263,7 @@ fn collect(
                 {
                     let mut parent = node.parent();
                     let mut callable = None;
+                    let mut initializer_owner = None;
                     while let Some(ancestor) = parent {
                         if is_function(ancestor)
                             && (file.syntax.language != "python"
@@ -1228,12 +1274,21 @@ fn collect(
                             callable = Some(ancestor);
                             break;
                         }
+                        if let Some((value, key)) =
+                            initializer_owners.get(&(ancestor.start_byte(), ancestor.end_byte()))
+                            && value.contains(&node.start_byte())
+                        {
+                            initializer_owner = Some(*key);
+                            break;
+                        }
                         parent = ancestor.parent();
                     }
-                    let owner = callable.and_then(|n| {
-                        callable_owners
-                            .get(&(n.start_byte(), n.end_byte()))
-                            .copied()
+                    let owner = initializer_owner.or_else(|| {
+                        callable.and_then(|n| {
+                            callable_owners
+                                .get(&(n.start_byte(), n.end_byte()))
+                                .copied()
+                        })
                     });
                     let pos = name.start_position();
                     let line_start = name.start_byte() - pos.column;

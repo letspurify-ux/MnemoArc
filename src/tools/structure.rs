@@ -91,6 +91,8 @@ pub(super) fn symbol_name<'a>(node: Node<'a>) -> Option<Node<'a>> {
         | "struct_declaration"
         | "namespace_declaration"
         | "file_scoped_namespace_declaration"
+        | "internal_module"
+        | "module"
         | "property_declaration"
         | "accessor_declaration"
         | "event_declaration"
@@ -262,7 +264,7 @@ fn category(node: Node<'_>, parent_kind: &str, source: &str) -> &'static str {
         },
         "const_item" | "static_item" => "constant",
         "type_item" | "type_alias_declaration" => "type",
-        "mod_item" => "module",
+        "mod_item" | "internal_module" | "module" => "module",
         "namespace_declaration" | "file_scoped_namespace_declaration" => "module",
         "property_declaration" | "indexer_declaration" => "property",
         "accessor_declaration" => "accessor",
@@ -290,7 +292,41 @@ fn declaration_owner(node: Node<'_>) -> Option<Node<'_>> {
     Some(parent)
 }
 
+// Rust generic arguments describe a specialization, not another named type.
+// Use AST fields instead of deleting angle-bracket text: const arguments and
+// qualified types can themselves contain operators and nested paths.
+pub(super) fn rust_type_path(node: Node<'_>, source: &str) -> String {
+    let mut result = String::new();
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "line_comment" | "block_comment") {
+            continue;
+        }
+        if matches!(node.kind(), "generic_type" | "generic_function")
+            && let Some(base) = node
+                .child_by_field_name("type")
+                .or_else(|| node.child_by_field_name("function"))
+        {
+            stack.push(base);
+        } else if node.child_count() == 0 {
+            result.push_str(&source[node.byte_range()]);
+        } else {
+            let mut cursor = node.walk();
+            stack.extend(
+                node.children(&mut cursor)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
+        }
+    }
+    result
+}
+
 fn symbol_label(node: Node<'_>, name: Node<'_>, source: &str) -> String {
+    if node.kind() == "impl_item" {
+        return rust_type_path(name, source);
+    }
     let name = &source[name.byte_range()];
     match node.kind() {
         "destructor_declaration" => format!("~{name}"),
@@ -682,6 +718,9 @@ pub(super) fn execute(
         let mut result = read_file(s, &mut read_args, cancel)?;
         if result["hash"] != digest {
             bail!("symbol_revision_conflict: source changed during read; call code_outline again");
+        }
+        if result["next_line"].as_u64().is_some_and(|next| next > end) {
+            result["next_line"] = Value::Null;
         }
         result["symbol"] = symbol.clone();
         result["engine"] = json!("tree-sitter");
