@@ -809,19 +809,12 @@ fn spawn_tool_thread<T: Send + 'static>(
     workers: Arc<tokio::sync::Semaphore>,
     operation: impl FnOnce() -> T + Send + 'static,
 ) -> std::io::Result<oneshot::Receiver<T>> {
-    let permit = workers.try_acquire_owned().map_err(|_| {
-        std::io::Error::other("tool_worker_capacity: previous tool threads are still running; wait for them to finish before retrying")
-    })?;
-    let (sender, receiver) = oneshot::channel();
-    // A stuck OS thread must not hold runtime shutdown open. Its permit must
-    // remain alive even when the receiver is dropped after cancellation.
-    std::thread::Builder::new()
-        .name("mnemoarc-tool".into())
-        .spawn(move || {
-            let _permit = permit;
-            let _ = sender.send(operation());
-        })?;
-    Ok(receiver)
+    crate::worker::spawn(
+        workers,
+        "mnemoarc-tool",
+        "tool_worker_capacity: previous tool threads are still running; wait for them to finish before retrying",
+        operation,
+    )
 }
 
 fn spawn_tool_worker(

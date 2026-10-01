@@ -8,5 +8,6 @@ pub mod memory;
 pub mod session;
 pub mod tools;
 pub mod web;
+mod worker;
 
 pub mod desktop;

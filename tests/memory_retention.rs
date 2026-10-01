@@ -69,6 +69,35 @@ fn measured<T>(operation: impl FnOnce() -> T) -> (T, usize) {
 
 const MIB: usize = 1024 * 1024;
 
+fn bounded_directory_errors_do_not_retain_every_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::new(
+        Project {
+            root: dir.path().canonicalize().unwrap(),
+            ..Default::default()
+        },
+        Config::default(),
+    );
+    // Dispatch constructs tool schemas too. Compare with the empty directory
+    // so that fixed overhead is not mistaken for retained directory entries.
+    let (error, baseline) =
+        measured(|| tools::execute(&mut session, "file_read", json!({"path":"."})).unwrap_err());
+    assert!(error.to_string().starts_with("path_is_directory:"));
+    drop(error);
+    for index in 0..2048 {
+        let name = format!("entry_{index:04}_{}", "x".repeat(200));
+        std::fs::File::create(dir.path().join(name)).unwrap();
+    }
+    let (error, peak) =
+        measured(|| tools::execute(&mut session, "file_read", json!({"path":"."})).unwrap_err());
+    assert!(error.to_string().starts_with("path_is_directory:"));
+    eprintln!("bounded directory diagnostic allocation peak: {peak} bytes (empty: {baseline})");
+    assert!(
+        peak < baseline + 64 * 1024,
+        "a short directory error retained every file name: {peak} bytes"
+    );
+}
+
 fn bounded_reads_do_not_duplicate_unreturned_text() {
     let dir = tempfile::tempdir().unwrap();
     let text = "source ".repeat(600_000);
@@ -263,4 +292,5 @@ fn bounded_operations_do_not_duplicate_retained_inputs() {
     );
     assert!(session.checkpoint.is_none());
     bounded_reads_do_not_duplicate_unreturned_text();
+    bounded_directory_errors_do_not_retain_every_name();
 }

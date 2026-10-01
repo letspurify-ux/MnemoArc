@@ -2774,11 +2774,13 @@ fn directory_entries(path: &Path) -> Vec<String> {
                         }
                     })
                 })
+                // These are examples for an error message. Stop before
+                // allocating names that the bounded diagnostic cannot show.
+                .take(MAX_ENTRIES)
                 .collect()
         })
         .unwrap_or_default();
     entries.sort();
-    entries.truncate(MAX_ENTRIES);
     entries
 }
 fn regular_metadata(metadata: &std::fs::Metadata, path: &Path) -> Result<()> {

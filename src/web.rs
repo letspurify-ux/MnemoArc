@@ -33,9 +33,13 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
-use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
+
+mod connections;
+mod file_io;
+use connections::ManagedListener;
+use file_io::FileIo;
 
 struct Running {
     cancel: CancellationToken,
@@ -58,6 +62,7 @@ pub struct WebState {
     events: broadcast::Sender<u64>,
     client: Arc<dyn LlmClient>,
     stopping: CancellationToken,
+    file_io: FileIo,
     write_outcome_uncertain: Arc<AtomicBool>,
 }
 #[derive(Debug)]
@@ -200,6 +205,7 @@ impl WebState {
             sessions.insert(session.id.clone(), session);
         }
         let (events, _) = broadcast::channel(128);
+        let stopping = CancellationToken::new();
         Ok(Self {
             core: Arc::new(Mutex::new(Core {
                 config,
@@ -213,7 +219,8 @@ impl WebState {
             })),
             events,
             client,
-            stopping: CancellationToken::new(),
+            file_io: FileIo::new(stopping.clone()),
+            stopping,
             write_outcome_uncertain,
         })
     }
@@ -782,7 +789,7 @@ async fn run(
         session.last_error = None;
         session.begin_run();
         let copy = session.clone();
-        let cancel = CancellationToken::new();
+        let cancel = s.stopping.child_token();
         let (tx, rx) = mpsc::channel(16);
         c.running.insert(
             id.clone(),
@@ -999,34 +1006,42 @@ async fn memory_get(State(s): State<WebState>, Path((id, memory)): Path<(String,
     Ok(Json(json!(value?)))
 }
 async fn output(State(s): State<WebState>, Path(id): Path<String>) -> Api {
-    let project = {
+    let (project, timeout) = {
         let c = s.core.lock().await;
-        c.sessions.get(&id).ok_or_else(missing)?.project.clone()
+        (
+            c.sessions.get(&id).ok_or_else(missing)?.project.clone(),
+            Duration::from_secs(c.config.tool_timeout_secs),
+        )
     };
-    let result = tokio::task::spawn_blocking(move || -> Result<Value> {
-        let path = tools::output_path(&project)?;
-        let (content, truncated) = tools::read_text_preview(&path, 2 * 1024 * 1024)?;
-        Ok(json!({"path":path,"content":content,"truncated":truncated}))
-    })
-    .await
-    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    let result = s
+        .file_io
+        .run(timeout, move |_| -> Result<Value> {
+            let path = tools::output_path(&project)?;
+            let (content, truncated) = tools::read_text_preview(&path, 2 * 1024 * 1024)?;
+            Ok(json!({"path":path,"content":content,"truncated":truncated}))
+        })
+        .await?;
     Ok(Json(result))
 }
 async fn output_download(
     State(s): State<WebState>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let project = {
+    let (project, timeout) = {
         let c = s.core.lock().await;
-        c.sessions.get(&id).ok_or_else(missing)?.project.clone()
+        (
+            c.sessions.get(&id).ok_or_else(missing)?.project.clone(),
+            Duration::from_secs(c.config.tool_timeout_secs),
+        )
     };
-    let file = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
-        let path = tools::output_path(&project)?;
-        tools::open_regular_file(&path)
-    })
-    .await
-    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
-    let body = Body::from_stream(ReaderStream::new(tokio::fs::File::from_std(file)));
+    let file = s
+        .file_io
+        .run(timeout, move |_| -> Result<std::fs::File> {
+            let path = tools::output_path(&project)?;
+            tools::open_regular_file(&path)
+        })
+        .await?;
+    let body = Body::from_stream(s.file_io.stream(file, timeout)?);
     Ok((
         [
             (header::CONTENT_TYPE, "text/markdown; charset=utf-8"),
@@ -1041,22 +1056,32 @@ async fn output_download(
 struct DirectoryQuery {
     path: Option<PathBuf>,
 }
-async fn directories(Query(query): Query<DirectoryQuery>) -> Api {
-    let result = tokio::task::spawn_blocking(move || -> Result<Value> {
+const MAX_DIRECTORY_ENTRIES: usize = 10_000;
+async fn directories(State(s): State<WebState>, Query(query): Query<DirectoryQuery>) -> Api {
+    let timeout = Duration::from_secs(s.core.lock().await.config.tool_timeout_secs);
+    let result = s.file_io.run(timeout, move |cancel| -> Result<Value> {
         let path = query
             .path
             .unwrap_or(std::env::current_dir()?)
             .canonicalize()?;
-        let mut entries = std::fs::read_dir(&path)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .map(|e| json!({"name":e.file_name().to_string_lossy(),"path":e.path()}))
-            .collect::<Vec<_>>();
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&path)? {
+            if cancel.is_cancelled() {
+                bail!("cancelled");
+            }
+            if let Ok(entry) = entry
+                && entry.file_type().is_ok_and(|t| t.is_dir())
+            {
+                if entries.len() == MAX_DIRECTORY_ENTRIES {
+                    bail!("directory_listing_capacity: 하위 폴더가 너무 많습니다. 원하는 폴더 경로를 직접 입력하세요.");
+                }
+                entries.push(json!({"name":entry.file_name().to_string_lossy(),"path":entry.path()}));
+            }
+        }
         entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         Ok(json!({"path":path,"parent":path.parent(),"directories":entries}))
     })
-    .await
-    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    .await?;
     Ok(Json(result))
 }
 pub async fn serve(config: Config, path: PathBuf, port: u16, frontend: PathBuf) -> Result<()> {
@@ -1080,6 +1105,26 @@ pub async fn serve_managed(
     .await
 }
 
+async fn stdin_eof() {
+    // stdin and EOF belong to the process. Restarting serve_app while stdin
+    // is still open must not leave another thread waiting for the stdin lock.
+    static CLOSED: std::sync::OnceLock<tokio::sync::watch::Sender<bool>> =
+        std::sync::OnceLock::new();
+    let mut closed = CLOSED
+        .get_or_init(|| {
+            let (sender, _) = tokio::sync::watch::channel(false);
+            let signal = sender.clone();
+            // A native reader does not keep Tokio runtime shutdown waiting.
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+                signal.send_replace(true);
+            });
+            sender
+        })
+        .subscribe();
+    let _ = closed.wait_for(|closed| *closed).await;
+}
+
 pub async fn serve_app(
     config: Config,
     path: PathBuf,
@@ -1096,6 +1141,9 @@ pub async fn serve_app(
         );
     }
     let state = WebState::new(config, path, Arc::new(OpenAiClient))?;
+    // Axum's shutdown future and agent tasks are spawned independently. A
+    // dropped/aborted server must wake them as well as the normal signal path.
+    let _stop_on_drop = state.stopping.clone().drop_guard();
     let listener =
         match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port.unwrap_or(3030)))
             .await
@@ -1119,22 +1167,14 @@ pub async fn serve_app(
             }
         });
     }
-    let (stdin_closed, closed) = tokio::sync::oneshot::channel();
-    if shutdown_on_stdin {
-        // A plain thread avoids Tokio's non-cancellable stdin reader preventing
-        // runtime shutdown after Ctrl+C. EOF also works for Windows launchers.
-        std::thread::spawn(move || {
-            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
-            let _ = stdin_closed.send(());
-        });
-    }
     let shutdown = state.clone();
+    let listener = ManagedListener::new(listener, state.stopping.clone());
     axum::serve(listener, app_router(state, frontend))
         .with_graceful_shutdown(async move {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {},
                 _ = shutdown.stopping.cancelled() => {},
-                _ = closed, if shutdown_on_stdin => {},
+                _ = stdin_eof(), if shutdown_on_stdin => {},
             }
             shutdown.shutdown().await;
         })
@@ -1145,6 +1185,31 @@ pub async fn serve_app(
 #[cfg(test)]
 mod worker_wait_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oversized_directory_listing_is_rejected_instead_of_retaining_all_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = WebState::new(
+            Config::default(),
+            dir.path().join("config.toml"),
+            Arc::new(OpenAiClient),
+        )
+        .unwrap();
+        for index in 0..=MAX_DIRECTORY_ENTRIES {
+            std::fs::create_dir(dir.path().join(index.to_string())).unwrap();
+        }
+        let error = directories(
+            State(state.clone()),
+            Query(DirectoryQuery {
+                path: Some(dir.path().into()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.starts_with("directory_listing_capacity:"));
+        state.shutdown().await;
+    }
 
     struct LifecycleProbe(tokio::sync::Notify);
 
@@ -1162,6 +1227,62 @@ mod worker_wait_tests {
             cancel.cancelled().await;
             bail!("cancelled");
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_request_releases_running_agents_without_an_explicit_shutdown_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Arc::new(LifecycleProbe(tokio::sync::Notify::new()));
+        let state = WebState::new(
+            Config {
+                model: "gpt-4o".into(),
+                model_context: Some(128000),
+                source_answer_review: false,
+                completion_review_enabled: false,
+                projects: vec![Project {
+                    root: dir.path().into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            dir.path().join("config.toml"),
+            client.clone(),
+        )
+        .unwrap();
+        let id = state.core.lock().await.order[0].clone();
+        let core_refs = Arc::strong_count(&state.core);
+        let session_refs = Arc::strong_count(&state.write_outcome_uncertain);
+        let _ = run(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(RunInput {
+                text: "Run until shutdown".into(),
+                action: "chat".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), client.0.notified())
+            .await
+            .unwrap();
+        let _ = shutdown_request(State(state.clone())).await;
+        let settled = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.core.lock().await.running.is_empty()
+                    && Arc::strong_count(&state.core) == core_refs
+                    && Arc::strong_count(&state.write_outcome_uncertain) == session_refs
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        state.shutdown().await;
+        settled.expect("shutdown signal retained the agent, event pump and private session");
+        let core = state.core.lock().await;
+        assert!(core.streams.is_empty());
+        assert_eq!(core.sessions[&id].status, "cancelled");
     }
 
     #[tokio::test]
