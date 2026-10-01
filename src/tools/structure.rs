@@ -734,8 +734,28 @@ pub(super) fn execute(
     let end = offset
         .saturating_add(n(args, "limit", 50).clamp(1, 100))
         .min(symbols.len());
-    let lines: Vec<_> = source.lines().collect();
     let mut page = symbols[offset..end].to_vec();
+    // A page needs at most three lines per declaration. Indexing every line
+    // can cost far more than the source itself, even for a compact/empty page.
+    let wanted: BTreeSet<usize> = page
+        .iter()
+        .filter(|_| filters["view"] != "compact")
+        .flat_map(|symbol| {
+            ["name_line", "signature_start_line", "signature_end_line"]
+                .map(|field| symbol[field].as_u64().unwrap() as usize - 1)
+        })
+        .collect();
+    let mut lines = BTreeMap::new();
+    if let Some(&last) = wanted.last() {
+        for (index, line) in source.lines().enumerate().take(last + 1) {
+            if index % 4096 == 0 {
+                check_budget(cancel, deadline)?;
+            }
+            if wanted.contains(&index) {
+                lines.insert(index, line);
+            }
+        }
+    }
     let root = s.project.root.canonicalize()?;
     for symbol in &mut page {
         let relative = path.strip_prefix(&root).unwrap_or(&path).display();
@@ -751,19 +771,19 @@ pub(super) fn execute(
             continue;
         }
         let line = symbol["name_line"].as_u64().unwrap() as usize;
-        let excerpt: String = lines[line - 1].chars().take(500).collect();
+        let excerpt: String = lines[&(line - 1)].chars().take(500).collect();
         let signature = symbol["signature"].as_str().unwrap().to_owned();
         let signature_start_line = symbol["signature_start_line"].as_u64().unwrap() as usize;
         let signature_end_line = symbol["signature_end_line"].as_u64().unwrap() as usize;
         let signature_line_start_complete =
-            lines.get(signature_start_line - 1).is_some_and(|line| {
+            lines.get(&(signature_start_line - 1)).is_some_and(|line| {
                 signature
                     .lines()
                     .next()
                     .is_some_and(|first| line.starts_with(first))
             });
         let signature_line_end_complete = symbol["signature_truncated"] == false
-            && lines.get(signature_end_line - 1).is_some_and(|line| {
+            && lines.get(&(signature_end_line - 1)).is_some_and(|line| {
                 signature
                     .lines()
                     .last()
@@ -779,7 +799,7 @@ pub(super) fn execute(
             &excerpt,
             super::EvidenceQuality {
                 line_start_complete: true,
-                line_end_complete: excerpt.len() == lines[line - 1].len(),
+                line_end_complete: excerpt.len() == lines[&(line - 1)].len(),
                 evidence_truncated: true,
             },
         ));

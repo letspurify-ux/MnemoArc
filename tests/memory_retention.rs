@@ -3,7 +3,7 @@
 use mnemoarc::{
     config::{Config, Project},
     context::{self, ContextManager},
-    session::{Checkpoint, Session},
+    session::{Checkpoint, Session, SessionHistory},
     tools::{self, document_review},
 };
 use serde_json::{Value, json};
@@ -68,6 +68,119 @@ fn measured<T>(operation: impl FnOnce() -> T) -> (T, usize) {
 }
 
 const MIB: usize = 1024 * 1024;
+
+fn retired_history_storage() -> usize {
+    let baseline = LIVE.load(SeqCst);
+    let mut history = SessionHistory::default();
+    for _ in 0..8192 {
+        history.push(vec![json!({"role":"assistant","content":"retired"})], true);
+        let bundle = history.bundles.back_mut().unwrap();
+        bundle.active = false;
+        bundle.reviewed = true;
+    }
+    history.prune(0).unwrap();
+    assert!(history.bundles.is_empty());
+    assert_eq!(history.pruned_through, Some(8192));
+    assert_eq!(history.next_id, 8192);
+    let retained = LIVE.load(SeqCst).saturating_sub(baseline);
+    eprintln!("empty pruned history live allocation: {retained} bytes");
+    let next = history.push(vec![json!({"role":"user","content":"new request"})], true);
+    assert_eq!(next, 8193);
+    assert_eq!(
+        history.read(next).unwrap().messages[0]["content"],
+        "new request"
+    );
+    retained
+}
+
+fn paginated_outline_peak() -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let text = format!(
+        "pub fn first() {{}}\r\n{}pub fn last(\r\n    value: bool,\r\n) -> bool {{\r\n    value\r\n}}\r\n",
+        "\n".repeat(MIB)
+    );
+    std::fs::write(dir.path().join("sparse.rs"), text).unwrap();
+    let mut session = Session::new(
+        Project {
+            root: dir.path().into(),
+            ..Default::default()
+        },
+        Config::default(),
+    );
+    session.active_tools.insert("code_outline".into());
+    let mut peak = 0;
+    for view in ["compact", "detailed"] {
+        let (outline, allocated) = measured(|| {
+            tools::execute(
+                &mut session,
+                "code_outline",
+                json!({"path":"sparse.rs","query":"last","match":"exact","view":view,"limit":1}),
+            )
+            .unwrap()
+        });
+        eprintln!("{view} outline live allocation peak: {allocated} bytes");
+        peak = peak.max(allocated);
+        assert_eq!(outline["total_symbols"], 1);
+        let symbol = &outline["symbols"][0];
+        assert_eq!(symbol["name"], "last");
+        assert_eq!(symbol["start_line"], MIB + 2);
+        if view == "detailed" {
+            assert_eq!(symbol["declaration"], "pub fn last(");
+            assert_eq!(symbol["signature_start_line"], MIB + 2);
+            assert_eq!(symbol["signature_end_line"], MIB + 4);
+            let source = &session.sources[symbol["signature_source"]["id"].as_str().unwrap()];
+            assert!(source.line_start_complete);
+            // The opening body brace is not part of the signature excerpt.
+            assert!(!source.line_end_complete);
+        }
+    }
+    peak
+}
+
+fn scoped_discovery_extra_peak() -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("kept")).unwrap();
+    std::fs::create_dir(dir.path().join("other")).unwrap();
+    std::fs::write(dir.path().join("kept/one.rs"), "fn bounded() {}\n").unwrap();
+    let mut session = Session::new(
+        Project {
+            root: dir.path().into(),
+            ..Default::default()
+        },
+        Config::default(),
+    );
+    session.active_tools.insert("source_search".into());
+    let calls = [
+        ("file_list", json!({"path":"kept","mode":"paths","limit":1})),
+        (
+            "source_search",
+            json!({"path":"kept","query":"bounded","mode":"files","limit":1}),
+        ),
+    ];
+    let baseline: Vec<_> = calls
+        .iter()
+        .map(|(tool, args)| {
+            measured(|| tools::execute(&mut session, tool, args.clone()).unwrap()).1
+        })
+        .collect();
+    for index in 0..2048 {
+        let name = format!("entry_{index:04}_{}.txt", "x".repeat(200));
+        std::fs::File::create(dir.path().join("other").join(name)).unwrap();
+    }
+    let mut extra = 0;
+    for ((tool, args), baseline) in calls.into_iter().zip(baseline) {
+        let (result, peak) = measured(|| tools::execute(&mut session, tool, args).unwrap());
+        if tool == "file_list" {
+            assert_eq!(result["paths"], json!(["kept/one.rs"]));
+            assert_eq!(result["total_files"], 1);
+        } else {
+            assert_eq!(result["matching_files"], 1);
+        }
+        eprintln!("{tool} scoped discovery peak: {peak} bytes (empty sibling: {baseline})");
+        extra = extra.max(peak.saturating_sub(baseline));
+    }
+    extra
+}
 
 fn bounded_directory_errors_do_not_retain_every_name() {
     let dir = tempfile::tempdir().unwrap();
@@ -293,4 +406,19 @@ fn bounded_operations_do_not_duplicate_retained_inputs() {
     assert!(session.checkpoint.is_none());
     bounded_reads_do_not_duplicate_unreturned_text();
     bounded_directory_errors_do_not_retain_every_name();
+    let retired_bytes = retired_history_storage();
+    let outline_peak = paginated_outline_peak();
+    let discovery_extra = scoped_discovery_extra_peak();
+    assert!(
+        retired_bytes < 4096,
+        "pruning all history retained its old bundle storage: {retired_bytes} bytes"
+    );
+    assert!(
+        outline_peak < 8 * MIB,
+        "one outline entry retained an index of every unreturned line: {outline_peak} bytes"
+    );
+    assert!(
+        discovery_extra < 128 * 1024,
+        "scoped discovery retained unrelated directory entries: {discovery_extra} extra bytes"
+    );
 }

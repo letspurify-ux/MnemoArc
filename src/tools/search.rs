@@ -136,14 +136,7 @@ pub(super) fn execute(
     let mut total_matching_lines = 0usize;
     let candidates = match exact_path {
         Some(path) => vec![path],
-        None => candidate_paths(&s.project, scope_glob, cancel)?
-            .into_iter()
-            .filter(|path| {
-                directory
-                    .as_ref()
-                    .is_none_or(|directory| path.starts_with(directory))
-            })
-            .collect(),
+        None => candidate_paths_scoped(&s.project, scope_glob, cancel, directory.as_deref(), None)?,
     };
     for path in candidates {
         if cancel.is_cancelled() {

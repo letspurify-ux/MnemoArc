@@ -2928,6 +2928,32 @@ fn candidate_paths_scoped(
     directory: Option<&Path>,
     deadline: Option<std::time::Instant>,
 ) -> Result<Vec<PathBuf>> {
+    candidate_paths_bounded(
+        p,
+        pattern,
+        cancel,
+        directory,
+        deadline,
+        FileScanLimits {
+            max_paths: 100_000,
+            max_path_bytes: 16 * 1024 * 1024,
+        },
+    )
+}
+
+struct FileScanLimits {
+    max_paths: usize,
+    max_path_bytes: usize,
+}
+
+fn candidate_paths_bounded(
+    p: &Project,
+    pattern: Option<&str>,
+    cancel: &tokio_util::sync::CancellationToken,
+    directory: Option<&Path>,
+    deadline: Option<std::time::Instant>,
+    limits: FileScanLimits,
+) -> Result<Vec<PathBuf>> {
     let check = || -> Result<()> {
         if let Some(deadline) = deadline {
             structure::check_budget(cancel, deadline)
@@ -2944,6 +2970,7 @@ fn candidate_paths_scoped(
     }
     let scope = directory.map(Path::to_path_buf);
     let mut entries = vec![];
+    let mut path_bytes = 0usize;
     let filter = pattern
         .map(globset::Glob::new)
         .transpose()?
@@ -2983,6 +3010,16 @@ fn candidate_paths_scoped(
             || filter.as_ref().is_some_and(|f| !f.is_match(rel))
         {
             continue;
+        }
+        path_bytes = path_bytes.saturating_add(entry.path().as_os_str().as_encoded_bytes().len());
+        // Page limits are applied after sorting/fingerprinting. Bound discovery
+        // itself so a broad call cannot retain an arbitrary number of paths.
+        if entries.len() >= limits.max_paths || path_bytes > limits.max_path_bytes {
+            bail!(
+                "file_scan_capacity: matched paths exceed {} entries or {} bytes; narrow path, path_glob or project include/exclude rules",
+                limits.max_paths,
+                limits.max_path_bytes
+            );
         }
         entries.push(entry.path().to_path_buf());
     }
@@ -4140,10 +4177,13 @@ fn execute_repaired(
                 None
             };
             let mode = args["mode"].as_str().unwrap_or("text");
-            let mut files = candidate_paths(&s.project, path_glob(&args)?, cancel)?;
-            if let Some(dir) = &directory {
-                files.retain(|path| path.starts_with(dir));
-            }
+            let mut files = candidate_paths_scoped(
+                &s.project,
+                path_glob(&args)?,
+                cancel,
+                directory.as_deref(),
+                None,
+            )?;
             if mode != "paths" {
                 let mut searchable = Vec::new();
                 for path in files {
@@ -5681,6 +5721,66 @@ mod panic_tests {
 #[cfg(test)]
 mod file_tests {
     use super::*;
+
+    #[test]
+    fn file_discovery_bounds_count_and_path_bytes_after_applying_scope_and_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let kept = root.join("kept");
+        std::fs::create_dir(&kept).unwrap();
+        for name in ["a.rs", "b.rs"] {
+            std::fs::write(kept.join(name), "fn observed() {}\n").unwrap();
+        }
+        for index in 0..32 {
+            std::fs::write(root.join(format!("other_{index}.txt")), "unrelated\n").unwrap();
+        }
+        let project = Project {
+            root,
+            ..Default::default()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let discover = |pattern, scope, count, bytes| {
+            candidate_paths_bounded(
+                &project,
+                pattern,
+                &cancel,
+                scope,
+                None,
+                FileScanLimits {
+                    max_paths: count,
+                    max_path_bytes: bytes,
+                },
+            )
+        };
+        let expected = vec![kept.join("a.rs"), kept.join("b.rs")];
+        let bytes: usize = expected
+            .iter()
+            .map(|p| p.as_os_str().as_encoded_bytes().len())
+            .sum();
+        // A narrow scope must fit even when the rest of the project does not.
+        assert_eq!(
+            discover(None, Some(kept.as_path()), 2, bytes).unwrap(),
+            expected
+        );
+        assert_eq!(discover(Some("**/*.rs"), None, 2, bytes).unwrap(), expected);
+        for result in [
+            discover(None, None, 2, usize::MAX),
+            discover(None, Some(kept.as_path()), 1, usize::MAX),
+            discover(None, Some(kept.as_path()), 2, bytes - 1),
+        ] {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .starts_with("file_scan_capacity:")
+            );
+        }
+        cancel.cancel();
+        assert_eq!(
+            discover(None, None, 2, bytes).unwrap_err().to_string(),
+            "cancelled"
+        );
+    }
 
     #[test]
     fn streaming_file_hash_matches_text_and_binary_contents() {

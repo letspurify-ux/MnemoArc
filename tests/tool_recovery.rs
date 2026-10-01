@@ -51,6 +51,48 @@ fn session(root: &std::path::Path) -> Session {
 }
 
 #[test]
+fn file_scan_capacity_suggests_narrowing_the_available_scan_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = session(dir.path());
+    for name in [
+        "file_list",
+        "source_search",
+        "symbol_search",
+        "symbol_relations",
+    ] {
+        let call = ToolCall {
+            id: "scan".into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        };
+        let mut result = tools::envelope(Err(anyhow::anyhow!(
+            "file_scan_capacity: narrow path or path_glob"
+        )));
+        tools::recovery::attach(&s, &call, &mut result);
+        assert_eq!(result["recovery"]["class"], "capacity");
+        assert_eq!(result["recovery"]["action"], "reduce_request_or_cleanup");
+        assert!(
+            result["recovery"]["tools"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(name))
+        );
+        assert_eq!(result["recovery"]["automatic_retry"], false);
+    }
+    let call = ToolCall {
+        id: "archive".into(),
+        name: "file_list".into(),
+        arguments: "{}".into(),
+    };
+    let mut result = tools::envelope(Err(anyhow::anyhow!("history_capacity: full")));
+    tools::recovery::attach(&s, &call, &mut result);
+    assert_eq!(
+        result["recovery"]["tools"],
+        json!(["memory_manage", "task_state", "history"])
+    );
+}
+
+#[test]
 fn source_document_write_scope_precedes_argument_errors_and_points_to_document_tools() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());

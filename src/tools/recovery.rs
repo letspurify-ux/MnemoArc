@@ -371,6 +371,11 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         }
         "refresh_matching_state" => &["code_outline", "file_read", "source_lookup", "history"],
         "reduce_request_or_cleanup" if call.name == "source_search" => &["source_search"],
+        "reduce_request_or_cleanup"
+            if call.name == "file_list" && result["recovery"]["code"] == "file_scan_capacity" =>
+        {
+            &["file_list"]
+        }
         "reduce_request_or_cleanup" if call.name == "file_patch" => &["file_patch", "file_read"],
         "reduce_request_or_cleanup" if call.name == "code_outline" => &["code_outline"],
         "reduce_request_or_cleanup"

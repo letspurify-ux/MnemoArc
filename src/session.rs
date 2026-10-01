@@ -237,6 +237,12 @@ impl SessionHistory {
         for _ in 0..remove {
             self.pruned_through = self.bundles.pop_front().map(|b| b.id);
         }
+        // Retiring messages also has to release their deque slots. Otherwise
+        // an empty history (or lower configured limit) retains its peak storage.
+        // Keep spare capacity for ordinary small checkpoints.
+        if remove > 0 && self.bundles.capacity() > self.bundles.len().saturating_mul(2) {
+            self.bundles.shrink_to_fit();
+        }
         Ok(())
     }
     pub fn read(&self, id: u64) -> Result<&Bundle> {
