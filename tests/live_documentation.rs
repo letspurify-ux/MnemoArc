@@ -593,6 +593,9 @@ async fn registered_source_documentation() {
                 AgentEvent::Tool { name, status, .. } => {
                     eprintln!("[live] tool={name} status={status}");
                 }
+                AgentEvent::Notice { text, .. } => {
+                    eprintln!("[live] notice={text}");
+                }
                 AgentEvent::Snapshot(s) => {
                     for message in s.history.bundles.iter().flat_map(|bundle| &bundle.messages) {
                         if let Some(calls) = message["tool_calls"].as_array() {

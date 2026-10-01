@@ -1602,3 +1602,86 @@ async fn closing_on_a_finished_result_asks_for_the_final_answer() {
         "{closing}"
     );
 }
+
+/// Returns `empties` empty replies, then a final answer; records requests.
+struct EmptyThenFinal {
+    empties: usize,
+    requests: Mutex<Vec<Value>>,
+}
+
+#[async_trait]
+impl LlmClient for EmptyThenFinal {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let mut requests = self.requests.lock().unwrap();
+        requests.push(request);
+        if requests.len() <= self.empties {
+            return Ok(Completion::default());
+        }
+        Ok(Completion {
+            text: "Saved out.md".into(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn repeated_empty_document_replies_change_the_request_and_close() {
+    // A live run repeated one identical request for 24 rounds: document
+    // recovery retried empty replies without changing anything until the
+    // stall ladder closed the run.
+    let (_dir, mut s) = verified_fixture();
+    s.progress_recovery.action_required = true;
+    let client = Arc::new(EmptyThenFinal {
+        empties: 3,
+        requests: Mutex::new(vec![]),
+    });
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move {
+        let mut notices = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let mnemoarc::agent::AgentEvent::Notice { text, .. } = event {
+                notices.push(text);
+            }
+        }
+        notices
+    });
+    let result = run_session(s, client.clone(), CancellationToken::new(), tx).await;
+    let notices = drain.await.unwrap();
+    let requests = client.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4, "{:?}", result.last_error);
+    assert!(
+        result.status.starts_with("complete"),
+        "{:?}",
+        result.last_error
+    );
+    // The first request requires a tool; after an empty reply the model may
+    // answer either way, and each retry differs from the previous request.
+    assert_eq!(requests[0]["tool_choice"], "required");
+    for pair in requests.windows(2) {
+        assert!(pair[1].get("tool_choice").is_none());
+        assert_ne!(pair[0]["messages"], pair[1]["messages"]);
+    }
+    assert!(
+        requests[1]["messages"]
+            .to_string()
+            .contains("returned 1 empty response(s) in a row")
+    );
+    assert_eq!(
+        result
+            .progress_recovery
+            .closing
+            .as_ref()
+            .map(|c| c.reason.as_str()),
+        Some("empty_response")
+    );
+    assert!(
+        notices.iter().any(|n| n.contains("빈 응답을 반복해")),
+        "{notices:?}"
+    );
+}

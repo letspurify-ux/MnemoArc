@@ -350,7 +350,9 @@ pub struct ProgressRecovery {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Closing {
-    /// "budget" when the reserve is reached, "stall" after sustained no progress.
+    /// "budget" when the reserve is reached, "stall" after sustained no progress,
+    /// "review_unrepaired" after unchanged rejected finals, "empty_response"
+    /// after consecutive empty model replies.
     pub reason: String,
     /// Non-review model requests (and failed review retries) since closing began.
     pub rounds: usize,

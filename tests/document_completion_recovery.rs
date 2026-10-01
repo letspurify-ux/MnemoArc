@@ -120,13 +120,24 @@ impl LlmClient for DocumentClient {
             *count < 100,
             "document recovery failed to finish or honor its budget"
         );
-        if matches!(self.delay, Delay::Final | Delay::Empty)
+        if matches!(self.delay, Delay::Final)
             && *count > 1
             && *count <= self.delay_rounds.saturating_add(1)
         {
             assert_eq!(
                 request["tool_choice"], "required",
                 "rejected finals must request a concrete action"
+            );
+        }
+        // Some providers answer a required tool choice with an empty reply,
+        // so the request after an empty reply lets the model choose.
+        if matches!(self.delay, Delay::Empty)
+            && *count > 1
+            && *count <= self.delay_rounds.saturating_add(1)
+        {
+            assert!(
+                request.get("tool_choice").is_none(),
+                "empty replies relax tool_choice"
             );
         }
         let mut response = if *count <= self.delay_rounds {

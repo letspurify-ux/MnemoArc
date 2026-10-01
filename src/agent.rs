@@ -362,6 +362,11 @@ fn note_document_review_verdict(s: &mut Session) {
 /// Consecutive empty replies retried before a non-document run stops.
 const EMPTY_COMPLETION_RETRIES: usize = 2;
 
+/// Consecutive empty replies after which document work enters closing.
+/// Document recovery used to retry an identical request until the stall
+/// ladder closed it: a live run spent 24 rounds (1.4M input tokens) there.
+const EMPTY_DOCUMENT_CLOSING: usize = 3;
+
 /// Unchanged-document final answers rejected by a review before closing.
 /// A live run closed after two with most of its budget left.
 const UNREPAIRED_FINAL_LIMIT: usize = 3;
@@ -400,6 +405,7 @@ fn finish_cause_text(cause: &str) -> &'static str {
         "budget" => "마감 예산에 도달해 마감했습니다.",
         "stall" => "진행이 오래 멈춰 마감했습니다.",
         "review_unrepaired" => "검토 지적이 반영되지 않은 채 최종 답변이 반복돼 마감했습니다.",
+        "empty_response" => "모델이 빈 응답을 반복해 마감했습니다.",
         _ => "마감했습니다.",
     }
 }
@@ -1613,8 +1619,11 @@ pub async fn run_session_controlled(
                 }
             };
         }
+        // After an empty reply, let the model choose: some providers answer a
+        // required tool choice with reasoning only and no content or calls.
         if document_work
             && s.progress_recovery.action_required
+            && empty_completions == 0
             && s.checkpoint.is_none()
             && !reviewing_completion
             && !reviewing_document
@@ -2076,17 +2085,33 @@ pub async fn run_session_controlled(
             && completion.calls.is_empty()
             && completion.text.trim().is_empty()
         {
-            if recover_document(
-                &mut s,
-                "The model returned an empty response. Use a concrete document repair or verification tool before the final answer.",
-            ) {
-                s.progress_recovery.action_required = true;
-                continue;
-            }
             // An empty reply is usually transient (the provider stopped before
             // producing content). Ask again a bounded number of times before
             // stopping; this also covers work not yet classified as a document.
             empty_completions += 1;
+            // Change the next request: an identical one tends to produce the
+            // same empty reply again. recovery_reason reaches run_guidance.
+            if recover_document(
+                &mut s,
+                &format!(
+                    "The model returned {empty_completions} empty response(s) in a row (no text and no tool call). Call one concrete document repair or verification tool, or give the final answer if the document is finished."
+                ),
+            ) {
+                s.last_error = Some(format!(
+                    "empty_completion: {empty_completions} consecutive responses had neither text nor tool calls"
+                ));
+                s.progress_recovery.action_required = true;
+                if empty_completions >= EMPTY_DOCUMENT_CLOSING
+                    && s.progress_recovery.closing.is_none()
+                {
+                    s.progress_recovery.closing = Some(crate::session::Closing {
+                        reason: "empty_response".into(),
+                        ..Default::default()
+                    });
+                    emit(&events, AgentEvent::Notice { session: s.id.clone(), text: "모델이 빈 응답을 반복해 마감 단계로 전환합니다. 저장된 문서로 마무리하고, 확인하지 못한 항목은 결과에 명시합니다.".into() }, &cancel, run_deadline(started, &s.config)).await;
+                }
+                continue;
+            }
             if empty_completions <= EMPTY_COMPLETION_RETRIES {
                 s.last_error = Some(
                     "empty_completion: the previous response had neither text nor tool calls; continue the task with a tool call or the answer".into(),

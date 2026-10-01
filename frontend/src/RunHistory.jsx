@@ -10,6 +10,7 @@ const reasons = {
   budget: "남은 예산에 맞춰 마감",
   stall: "진행 정체로 마감",
   review_unrepaired: "검토 지적 미반영으로 마감",
+  empty_response: "빈 응답 반복으로 마감",
   model_worker_panic: "모델 처리 오류",
   agent_worker_panic: "작업 처리 오류",
   checkpoint_retry_limit: "기억 정리 재시도 한도 도달",
