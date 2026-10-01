@@ -237,6 +237,7 @@ fn file_evidence_document_conflict_and_revalidation() {
     )
     .unwrap();
     let mut s = session(dir.path());
+    s.select_workflow("source_document").unwrap();
     s.active_tools.clear();
     assert!(tools::execute(&mut s, "file_read", json!({"path":"main.rs"})).is_err());
     tools::execute(
@@ -952,6 +953,52 @@ fn the_model_cannot_change_the_selected_workflow() {
     }
     assert!(!s.is_document_work());
     assert!(s.select_workflow("").is_err());
+}
+
+#[test]
+fn answer_workflow_withholds_investigation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.select_workflow("source_document").unwrap();
+    assert!(s.active_tools.contains("investigation"));
+    // Switching to answer drops it from the active and queued selections.
+    s.pending_tools = Some(s.active_tools.clone());
+    s.select_workflow("answer").unwrap();
+    assert!(!s.active_tools.contains("investigation"));
+    assert!(!s.pending_tools.as_ref().unwrap().contains("investigation"));
+    assert!(
+        tools::execute(&mut s, "investigation", json!({"action":"final_check"}))
+            .unwrap_err()
+            .to_string()
+            .starts_with("tool_not_active:")
+    );
+    // The model cannot select it by name, and the group skips it.
+    let error = tools::execute(
+        &mut s,
+        "tool_select",
+        json!({"action":"add","names":["investigation"]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("workflow_forbidden:"), "{error}");
+    let selected = tools::execute(
+        &mut s,
+        "tool_select",
+        json!({"action":"add","names":["source-docs"]}),
+    )
+    .unwrap();
+    let pending = selected["pending"].as_array().unwrap();
+    assert!(pending.iter().any(|n| n == "document_edit"));
+    assert!(!pending.iter().any(|n| n == "investigation"));
+    // A selection made under another workflow is filtered at the boundary.
+    let mut names = tools::ToolRegistry::optional_names();
+    assert!(tools::ToolRegistry::validate_tool_selection(&s, &names).is_err());
+    names = tools::ToolRegistry::normalize_tool_selection(&s, &names);
+    assert!(!names.contains("investigation"));
+    // A new request keeps it withheld.
+    s.active_tools.insert("investigation".into());
+    s.add_user("Explain main".into());
+    assert!(!s.active_tools.contains("investigation"));
 }
 
 #[test]

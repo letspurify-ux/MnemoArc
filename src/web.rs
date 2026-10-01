@@ -832,6 +832,7 @@ async fn session_workflow(
     }
     let session = c.session_mut(&id).ok_or_else(missing)?;
     session.workflow_mode = input.workflow;
+    session.drop_forbidden_workflow_tools();
     session_changed(&s, &mut c, &id, false);
     Ok(Json(json!({"saved":true})))
 }

@@ -36,6 +36,7 @@ fn session(root: &std::path::Path) -> Session {
 fn extreme_pagination_and_budget_inputs_do_not_panic() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
+    s.select_workflow("source_document").unwrap();
     for (name, args) in [
         ("task_state", json!({"action":"details","offset":u64::MAX})),
         ("investigation", json!({"action":"list","offset":u64::MAX})),

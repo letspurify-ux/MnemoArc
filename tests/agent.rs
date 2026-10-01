@@ -178,6 +178,8 @@ async fn source_documentation_full_loop_without_api() {
     )
     .unwrap();
     let mut session = s(dir.path());
+    // investigation is unavailable in the default answer workflow.
+    session.select_workflow("source_document").unwrap();
     session.add_user("Document this project's entry point with source evidence".into());
     let (tx, mut rx) = mpsc::channel(128);
     let reader = tokio::spawn(async move { while rx.recv().await.is_some() {} });

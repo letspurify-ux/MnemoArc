@@ -156,6 +156,7 @@ pub fn describe(message: &str) -> Value {
             | "call_id_collision"
             | "malformed_tool_call"
             | "workflow_locked"
+            | "workflow_forbidden"
             | "workflow_selected_by_user"
     ) {
         (Class::InvalidInput, "correct_arguments")

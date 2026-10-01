@@ -782,6 +782,7 @@ fn audit_ignores_example_citations_inside_fenced_code() {
 fn verify_drops_non_file_ids_beside_file_evidence() {
     let (dir, mut s) = setup();
     std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    s.select_workflow("source_document").unwrap();
     s.add_user("Document main.rs".into());
     let user = s
         .sources

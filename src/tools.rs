@@ -557,6 +557,19 @@ impl ToolRegistry {
                 missing.join(", ")
             );
         }
+        let forbidden: Vec<_> = s
+            .workflow_forbidden_tools()
+            .iter()
+            .filter(|name| names.contains(**name))
+            .copied()
+            .collect();
+        if !forbidden.is_empty() {
+            bail!(
+                "workflow_forbidden: the user selected workflow={} for this session, which excludes {}; remove it from the tool_select set",
+                s.workflow_mode,
+                forbidden.join(", ")
+            );
+        }
         Ok(())
     }
     /// Add tools that became mandatory after a selection was validated.
@@ -573,6 +586,9 @@ impl ToolRegistry {
                 .iter()
                 .map(|name| (*name).to_owned()),
         );
+        for name in s.workflow_forbidden_tools() {
+            normalized.remove(*name);
+        }
         normalized
     }
     /// Offered only in closing mode, where it is accepted.
@@ -3840,7 +3856,7 @@ fn execute_repaired(
                 .filter(|t| !t.is_empty())
                 .collect();
             Ok(
-                json!({"groups":["source-docs"],"tools":ToolRegistry::specs().into_iter().filter(|t|t.name != "db_query" || s.config.database.active_queries().next().is_some()).filter(|t|t.name != "db_execute" || s.config.database.free_execution_enabled()).filter(|t|terms.is_empty() || terms.iter().any(|term| t.name.contains(term) || t.description.to_lowercase().contains(term))).map(|t|json!({"name":t.name,"description":t.description,"basic":!t.optional,"active":!t.optional||s.active_tools.contains(t.name)})).collect::<Vec<_>>()}),
+                json!({"groups":["source-docs"],"tools":ToolRegistry::specs().into_iter().filter(|t|t.name != "db_query" || s.config.database.active_queries().next().is_some()).filter(|t|t.name != "db_execute" || s.config.database.free_execution_enabled()).filter(|t|terms.is_empty() || terms.iter().any(|term| t.name.contains(term) || t.description.to_lowercase().contains(term))).map(|t|json!({"name":t.name,"description":t.description,"basic":!t.optional,"active":!t.optional||s.active_tools.contains(t.name),"selectable":!s.workflow_forbidden_tools().contains(&t.name)})).collect::<Vec<_>>()}),
             )
         }
         "tool_select" => {
@@ -3848,7 +3864,13 @@ fn execute_repaired(
             let mut chosen = BTreeSet::new();
             for name in list(&args, "names") {
                 if name == "source-docs" {
-                    chosen.extend(available.clone());
+                    let forbidden = s.workflow_forbidden_tools();
+                    chosen.extend(
+                        available
+                            .iter()
+                            .filter(|n| !forbidden.contains(&n.as_str()))
+                            .cloned(),
+                    );
                 } else if available.contains(&name) {
                     chosen.insert(name);
                 } else {

@@ -544,7 +544,30 @@ impl Session {
             self.task.require_investigation = require_investigation;
             self.task.revision = self.task.revision.saturating_add(1);
         }
+        self.drop_forbidden_workflow_tools();
         self.activate_workflow_tools();
+    }
+
+    /// Optional tools the user's workflow selection excludes. Chat answers
+    /// do not track source-documentation items, so `investigation` (and its
+    /// final_check, which would turn the task into document work) is withheld.
+    pub fn workflow_forbidden_tools(&self) -> &'static [&'static str] {
+        if self.workflow_mode == "answer" {
+            &["investigation"]
+        } else {
+            &[]
+        }
+    }
+
+    /// Remove tools the current workflow selection excludes, including from a
+    /// selection still waiting for the next request.
+    pub fn drop_forbidden_workflow_tools(&mut self) {
+        for name in self.workflow_forbidden_tools() {
+            self.active_tools.remove(*name);
+            if let Some(pending) = &mut self.pending_tools {
+                pending.remove(*name);
+            }
+        }
     }
 
     /// Document workflows need their edit and verification tools active.
