@@ -3,7 +3,7 @@
 use mnemoarc::{
     config::{Config, Project},
     context::{self, ContextManager},
-    session::{Checkpoint, Session, SessionHistory},
+    session::{Checkpoint, Investigation, Session, SessionHistory},
     tools::{self, document_review},
 };
 use serde_json::{Value, json};
@@ -68,6 +68,39 @@ fn measured<T>(operation: impl FnOnce() -> T) -> (T, usize) {
 }
 
 const MIB: usize = 1024 * 1024;
+
+fn retired_task_storage() -> usize {
+    let mut session = Session::new(Project::default(), Config::default());
+    session.add_user("original task".into());
+    session.task.constraints.push("keep this constraint".into());
+    let baseline = LIVE.load(SeqCst);
+    session.investigations = (0..16_384)
+        .map(|_| Investigation {
+            id: String::new(),
+            title: String::new(),
+            status: String::new(),
+            memory_refs: Default::default(),
+            sources: Vec::new(),
+            section: String::new(),
+            document_hash: None,
+            note: String::new(),
+        })
+        .collect();
+    session.answer_review_issues = vec![String::new(); 32_768];
+    session.completion_gaps = vec![String::new(); 32_768];
+    // Resuming still owns this task's state; only a new task retires it.
+    session.add_user("continue".into());
+    assert_eq!(session.investigations.len(), 16_384);
+    session.start_new_task("next task".into());
+    assert!(session.investigations.is_empty());
+    assert!(session.answer_review_issues.is_empty());
+    assert!(session.completion_gaps.is_empty());
+    assert_eq!(session.task.constraints, ["keep this constraint"]);
+    assert_eq!(session.history.bundles.len(), 3);
+    let retained = LIVE.load(SeqCst).saturating_sub(baseline);
+    eprintln!("retired task extra live allocation: {retained} bytes");
+    retained
+}
 
 fn retired_history_storage() -> usize {
     let baseline = LIVE.load(SeqCst);
@@ -406,9 +439,14 @@ fn bounded_operations_do_not_duplicate_retained_inputs() {
     assert!(session.checkpoint.is_none());
     bounded_reads_do_not_duplicate_unreturned_text();
     bounded_directory_errors_do_not_retain_every_name();
+    let retired_task_bytes = retired_task_storage();
     let retired_bytes = retired_history_storage();
     let outline_peak = paginated_outline_peak();
     let discovery_extra = scoped_discovery_extra_peak();
+    assert!(
+        retired_task_bytes < 64 * 1024,
+        "a new task retained the previous task's empty collection storage: {retired_task_bytes} bytes"
+    );
     assert!(
         retired_bytes < 4096,
         "pruning all history retained its old bundle storage: {retired_bytes} bytes"

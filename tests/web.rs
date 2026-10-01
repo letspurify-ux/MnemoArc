@@ -62,6 +62,137 @@ async fn get(client: &reqwest::Client, url: &str, path: &str) -> Value {
 }
 
 #[tokio::test]
+async fn shared_source_projects_keep_session_ownership_and_requests_separate() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = Project {
+        name: "First project".into(),
+        root: dir.path().into(),
+        ..Default::default()
+    };
+    let second = Project {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: "Second project".into(),
+        ..first.clone()
+    };
+    let config = Config {
+        model: "gpt-4o".into(),
+        model_context: Some(128000),
+        projects: vec![first.clone(), second.clone()],
+        ..Default::default()
+    };
+    let (url, state, server) = launch_config(dir.path(), config).await;
+    let client = reqwest::Client::new();
+    let initial = get(&client, &url, "/api/state").await;
+    let first_id = initial["sessions"][0]["id"].as_str().unwrap();
+    let created = client
+        .post(format!("{url}/api/sessions"))
+        .header("x-mnemoarc-client", "web")
+        .json(&json!({"project":second}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let second_id = created["id"].as_str().unwrap();
+    assert_ne!(first_id, second_id);
+
+    // Even an empty session cannot be reassigned to another same-folder project.
+    let rejected = client
+        .put(format!("{url}/api/sessions/{first_id}/project"))
+        .header("x-mnemoarc-client", "web")
+        .json(&second)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 409);
+    assert_eq!(
+        get(&client, &url, "/api/state").await["revision"],
+        initial["revision"].as_u64().unwrap() + 1
+    );
+
+    for (id, text) in [(first_id, "First request"), (second_id, "Second request")] {
+        client
+            .post(format!("{url}/api/sessions/{id}/run"))
+            .header("x-mnemoarc-client", "web")
+            .json(&json!({"text":text}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+    state.shutdown().await;
+    for (id, project, text) in [
+        (first_id, &first, "First request"),
+        (second_id, &second, "Second request"),
+    ] {
+        let detail = get(&client, &url, &format!("/api/sessions/{id}")).await;
+        assert_eq!(detail["project"]["id"], project.id);
+        assert_eq!(detail["bundles"][0]["messages"][0]["content"], text);
+    }
+
+    client
+        .delete(format!("{url}/api/sessions/{first_id}"))
+        .header("x-mnemoarc-client", "web")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let remaining = get(&client, &url, "/api/state").await;
+    assert_eq!(remaining["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(remaining["sessions"][0]["id"], second_id);
+    assert_eq!(remaining["sessions"][0]["project"]["id"], second.id);
+    server.abort();
+}
+
+#[tokio::test]
+async fn legacy_session_project_requests_preserve_unambiguous_ownership() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, state, server) = launch(dir.path()).await;
+    let client = reqwest::Client::new();
+    let initial = get(&client, &url, "/api/state").await;
+    let mut project = initial["config"]["projects"][0].clone();
+    let project_id = project.as_object_mut().unwrap().remove("id").unwrap();
+    let created = client
+        .post(format!("{url}/api/sessions"))
+        .header("x-mnemoarc-client", "web")
+        .json(&json!({"project":project}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap();
+    assert_eq!(
+        get(&client, &url, &format!("/api/sessions/{id}")).await["project"]["id"],
+        project_id
+    );
+
+    project["name"] = json!("Session-specific name");
+    client
+        .put(format!("{url}/api/sessions/{id}/project"))
+        .header("x-mnemoarc-client", "web")
+        .json(&project)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let renamed = get(&client, &url, &format!("/api/sessions/{id}")).await;
+    assert_eq!(renamed["project"]["id"], project_id);
+    assert_eq!(renamed["project"]["name"], "Session-specific name");
+    state.shutdown().await;
+    server.abort();
+}
+
+#[tokio::test]
 async fn resume_and_cleanup_reject_missing_task_or_discarded_message() {
     let dir = tempfile::tempdir().unwrap();
     let (url, state, server) = launch(dir.path()).await;

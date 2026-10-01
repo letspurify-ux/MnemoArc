@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -71,9 +71,12 @@ pub struct Config {
     pub database: crate::database::DatabaseConfig,
     pub projects: Vec<Project>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Project {
+    /// Session ownership is independent of the source folder and editable fields.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub root: PathBuf,
     pub output: PathBuf,
@@ -84,7 +87,14 @@ pub struct Project {
 }
 impl Default for Project {
     fn default() -> Self {
-        Self { name: "project".into(), root: PathBuf::from("."), output: "docs/source-summary.md".into(), include: vec![], exclude: vec![], purpose: "Explain the architecture, main flows, data structures and error handling with source evidence".into(), audience: "Developers".into() }
+        Self { id: uuid::Uuid::new_v4().to_string(), name: "project".into(), root: PathBuf::from("."), output: "docs/source-summary.md".into(), include: vec![], exclude: vec![], purpose: "Explain the architecture, main flows, data structures and error handling with source evidence".into(), audience: "Developers".into() }
+    }
+}
+impl Project {
+    pub(crate) fn ensure_id(&mut self) {
+        if self.id.trim().is_empty() {
+            self.id = uuid::Uuid::new_v4().to_string();
+        }
     }
 }
 impl Default for Config {
@@ -140,6 +150,23 @@ impl Default for Config {
     }
 }
 impl Config {
+    pub(crate) fn ensure_project_ids(&mut self) -> Result<()> {
+        for project in &mut self.projects {
+            project.ensure_id();
+        }
+        self.validate_project_ids()
+    }
+
+    fn validate_project_ids(&self) -> Result<()> {
+        let mut ids = BTreeSet::new();
+        for project in &self.projects {
+            if !project.id.trim().is_empty() && !ids.insert(&project.id) {
+                bail!("프로젝트 식별자가 중복되었습니다. 각 프로젝트는 고유한 id가 필요합니다.");
+            }
+        }
+        Ok(())
+    }
+
     pub fn completion_url(&self) -> Result<reqwest::Url> {
         let mut url = reqwest::Url::parse(&self.base_url)?;
         if !matches!(url.scheme(), "http" | "https") {
@@ -160,6 +187,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.validate_project_ids()?;
         if !(1..=32).contains(&self.max_concurrent_sessions) {
             bail!("max_concurrent_sessions must be between 1 and 32");
         }
@@ -313,6 +341,7 @@ impl Config {
             value[k] = v.clone();
         }
         let mut config: Self = serde_json::from_value(value)?;
+        config.ensure_project_ids()?;
         let credentials = path.with_extension("credentials.json");
         if credentials.exists() {
             let keys: BTreeMap<String, String> =
@@ -323,7 +352,9 @@ impl Config {
         Ok(config)
     }
     pub fn save(&self, path: &Path) -> Result<()> {
-        self.validate()?;
+        let mut config = self.clone();
+        config.ensure_project_ids()?;
+        config.validate()?;
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -331,7 +362,7 @@ impl Config {
         std::fs::create_dir_all(parent)?;
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
         use std::io::Write;
-        temp.write_all(toml::to_string_pretty(self)?.as_bytes())?;
+        temp.write_all(toml::to_string_pretty(&config)?.as_bytes())?;
         // Replacing a file with NamedTempFile otherwise changes an existing
         // config's access mode to the temporary file's private default.
         match std::fs::metadata(path) {

@@ -26,6 +26,97 @@ fn run(s: &mut Session, name: &str, args: Value) -> Value {
 }
 
 #[test]
+fn coverage_pagination_releases_obsolete_document_versions() {
+    let (dir, mut s) = setup();
+    let observe = |s: &mut Session, name: &str, revision: usize| {
+        std::fs::write(
+            dir.path().join(name),
+            format!("# Guide\nunread first\nobserved revision {revision}\nunread last\n"),
+        )
+        .unwrap();
+        let call = mnemoarc::llm::ToolCall {
+            id: format!("read-{name}-{revision}"),
+            name: "file_read".into(),
+            arguments: json!({"path":name,"start_line":3,"max_lines":1}).to_string(),
+        };
+        let result = tools::envelope(tools::execute(
+            s,
+            "file_read",
+            serde_json::from_str(&call.arguments).unwrap(),
+        ));
+        assert_eq!(result["status"], "ok");
+        tools::record_delivered_read(s, &call, &result);
+        let page = run(s, "document_inspect", json!({"path":name,"limit":1}));
+        assert_eq!(page["coverage"]["missing_range_count"], 2);
+        assert_eq!(page["coverage"]["next_offset"], 1);
+        page
+    };
+    // A colon in a Unix filename must not make another path look like the
+    // current path's obsolete cursor prefix. Windows drive colons are also
+    // handled by splitting the version and offset from the end of each key.
+    let other_path = if cfg!(unix) {
+        "input.md:other.md"
+    } else {
+        "other.md"
+    };
+    let other = observe(&mut s, other_path, 0);
+    let mut previous: Option<Value> = None;
+    for revision in 0..4 {
+        let page = observe(&mut s, "input.md", revision);
+        if let Some(previous) = &previous {
+            let error = tools::execute(
+                &mut s,
+                "document_inspect",
+                json!({"path":"input.md","limit":1,"coverage_offset":1,"expected_hash":previous["hash"]}),
+            )
+            .unwrap_err();
+            assert!(error.to_string().starts_with("document_revision_conflict:"));
+        }
+        assert_eq!(
+            s.coverage_cursors.len(),
+            2,
+            "obsolete document pages accumulated"
+        );
+        previous = Some(page);
+    }
+    // Restoring identical old bytes must not revive a discarded legacy page:
+    // its delivered coverage may no longer match even though its hash does.
+    let input = dir.path().join("input.md");
+    let current = std::fs::read(&input).unwrap();
+    let retired = "# Guide\nunread first\nobserved revision 0\nunread last\n";
+    std::fs::write(&input, retired).unwrap();
+    let error = tools::execute(
+        &mut s,
+        "document_inspect",
+        json!({"path":"input.md","limit":1,"coverage_offset":1,"expected_hash":tools::hash(retired.as_bytes())}),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .starts_with("document_coverage_revision_conflict:")
+    );
+    std::fs::write(&input, current).unwrap();
+    for (path, page) in [("input.md", previous.unwrap()), (other_path, other)] {
+        let last = run(
+            &mut s,
+            "document_inspect",
+            json!({"path":path,"limit":1,"coverage_offset":1,"expected_hash":page["hash"]}),
+        );
+        assert!(last["coverage"]["next_offset"].is_null());
+        // A caller that echoes the revision can replay a consumed page
+        // without depending on the server's legacy continuation entry.
+        let replay = run(
+            &mut s,
+            "document_inspect",
+            json!({"path":path,"limit":1,"coverage_offset":1,"expected_hash":page["hash"],"expected_coverage_revision":page["coverage"]["revision"]}),
+        );
+        assert_eq!(replay["coverage"], last["coverage"]);
+    }
+    assert!(s.coverage_cursors.is_empty());
+}
+
+#[test]
 fn new_sections_can_be_inserted_in_outline_order() {
     let (_dir, mut s) = setup();
     let created = run(

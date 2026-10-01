@@ -966,6 +966,56 @@ fn long_user_request_keeps_a_bounded_completion_and_full_request() {
 }
 
 #[test]
+fn repeated_bounded_reads_reuse_immutable_cursor_positions() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("pages.md"),
+        "정확한 커서 위치😀 and source evidence\n".repeat(200),
+    )
+    .unwrap();
+    let mut s = session(dir.path());
+    s.config.result_tokens = 1000;
+    let call = mnemoarc::llm::ToolCall {
+        id: "repeated-position".into(),
+        name: "file_read".into(),
+        arguments: json!({"path":"pages.md","max_lines":200}).to_string(),
+    };
+    for _ in 0..4 {
+        // Bypass the call-ID ledger: these are fresh reads of the same range.
+        let raw = tools::execute(
+            &mut s,
+            "file_read",
+            serde_json::from_str(&call.arguments).unwrap(),
+        )
+        .unwrap();
+        let original = tools::limit_result(&mut s, &call, tools::envelope(Ok(raw)), 1000);
+        let original_id = original["next_cursor"]["cursor"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let original_offset = s.file_cursors[&original_id].offset;
+        let narrowed = tools::limit_result(&mut s, &call, original, 700);
+        assert!(tools::result_tokens(&call, &narrowed, &s.config.model) <= 700);
+        assert_eq!(s.file_cursors[&original_id].offset, original_offset);
+        let cursor = narrowed["next_cursor"]["cursor"].as_str().unwrap();
+        assert_eq!(
+            s.file_cursors[cursor].offset,
+            narrowed["data"]["next_offset"].as_u64().unwrap() as usize
+        );
+        let positions: std::collections::BTreeSet<_> = s
+            .file_cursors
+            .values()
+            .map(|cursor| serde_json::to_string(cursor).unwrap())
+            .collect();
+        assert_eq!(
+            s.file_cursors.len(),
+            positions.len(),
+            "an unchanged read retained duplicate cursor positions"
+        );
+    }
+}
+
+#[test]
 fn opaque_file_cursor_survives_relimiting_without_skips_or_overlap() {
     let dir = tempfile::tempdir().unwrap();
     let lines: Vec<_> = (1..=50)

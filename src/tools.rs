@@ -5158,18 +5158,36 @@ fn new_file_cursor_id() -> String {
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     )
 }
-fn register_file_cursor(s: &mut Session, id: String, result: &Value) {
+fn file_cursor(result: &Value) -> crate::session::FileCursor {
     let data = &result["data"];
-    s.file_cursors.insert(
-        id,
-        crate::session::FileCursor {
-            path: data["path"].as_str().unwrap().into(),
-            hash: data["hash"].as_str().unwrap().into(),
-            start_line: data["read_start"].as_u64().unwrap() as usize,
-            max_lines: data["read_max_lines"].as_u64().unwrap() as usize,
-            offset: data["next_offset"].as_u64().unwrap() as usize,
-        },
-    );
+    crate::session::FileCursor {
+        path: data["path"].as_str().unwrap().into(),
+        hash: data["hash"].as_str().unwrap().into(),
+        start_line: data["read_start"].as_u64().unwrap() as usize,
+        max_lines: data["read_max_lines"].as_u64().unwrap() as usize,
+        offset: data["next_offset"].as_u64().unwrap() as usize,
+    }
+}
+
+fn existing_file_cursor<'a>(
+    s: &'a Session,
+    cursor: &crate::session::FileCursor,
+) -> Option<&'a str> {
+    s.file_cursors
+        .iter()
+        .find(|(_, existing)| *existing == cursor)
+        .map(|(id, _)| id.as_str())
+}
+
+fn register_file_cursor(s: &mut Session, id: String, result: &Value) -> String {
+    let cursor = file_cursor(result);
+    // Repeated reads and repeated result bounding must not retain another
+    // opaque ID for the same immutable continuation position.
+    if let Some(existing) = existing_file_cursor(s, &cursor) {
+        return existing.into();
+    }
+    s.file_cursors.insert(id.clone(), cursor);
+    id
 }
 
 /// Keep results structured. Repeated bounding reuses the original archive rather
@@ -5203,8 +5221,7 @@ pub fn limit_result(
         && result["data"]["content"]["truncated"] == true
         && !result["next_cursor"]["cursor"].is_string()
     {
-        let id = new_file_cursor_id();
-        register_file_cursor(s, id.clone(), &result);
+        let id = register_file_cursor(s, new_file_cursor_id(), &result);
         result["truncated"] = json!(true);
         result["next_cursor"] = json!({"tool":"file_read","cursor":id});
     }
@@ -5355,6 +5372,11 @@ pub fn limit_result(
                     v["data"]["next_line"] = json!(line);
                     v["data"]["next_offset"] = json!(offset);
                     v["next_cursor"] = json!({"tool":"file_read","cursor":narrowed_cursor});
+                    // Use the actual retained ID while measuring the candidate;
+                    // its token cost can affect the final continuation offset.
+                    if let Some(id) = existing_file_cursor(s, &file_cursor(&v)) {
+                        v["next_cursor"]["cursor"] = json!(id);
+                    }
                 } else if pointer == "/data/content/text" && call.name == "document_inspect" {
                     let offset = n(&template["data"], "read_offset", 0) + length;
                     v["data"]["content"]["truncated"] = json!(true);
@@ -5382,7 +5404,8 @@ pub fn limit_result(
             }
             output = candidate(low);
             if low > 0 && result_tokens(call, &output, &s.config.model) <= limit {
-                if let Some(id) = narrowed_cursor {
+                if narrowed_cursor.is_some() {
+                    let id = output["next_cursor"]["cursor"].as_str().unwrap().into();
                     register_file_cursor(s, id, &output);
                 }
                 if let Some(mut source) = narrowed_source {

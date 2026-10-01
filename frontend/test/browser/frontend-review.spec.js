@@ -75,7 +75,7 @@ test("settings preserve local edits while incorporating refreshed server fields"
 
 test("an unedited project list follows external changes and keeps a valid selection", async ({ page, request }) => {
   const { state } = await workspace({ page, request });
-  state.config.projects.push({ ...state.config.projects[0], name: "두 번째 프로젝트" });
+  state.config.projects.push({ ...state.config.projects[0], id: "second-project", name: "두 번째 프로젝트" });
   await expect(page.locator(".project-heading").filter({ hasText: "두 번째 프로젝트" })).toBeVisible();
   await page.locator(".sidebar-bottom").getByRole("button", { name: "프로젝트 관리" }).click();
   await page.locator(".settings-tabs").getByRole("button", { name: "두 번째 프로젝트" }).click();

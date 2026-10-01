@@ -289,7 +289,7 @@ pub struct Checkpoint {
     pub starting_memory_generation: u64,
     pub failed: bool,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct FileCursor {
     pub path: String,
     pub hash: String,
@@ -556,7 +556,8 @@ impl Session {
         )]
     }
 
-    pub fn new(project: Project, config: Config) -> Self {
+    pub fn new(mut project: Project, config: Config) -> Self {
+        project.ensure_id();
         let task = TaskState {
             purpose: project.purpose.clone(),
             scope: project.root.display().to_string(),
@@ -766,7 +767,7 @@ impl Session {
             self.answer_draft = None;
             self.answer_reviewed = false;
             self.answer_review_original = None;
-            self.answer_review_issues.clear();
+            self.answer_review_issues = Vec::new();
             self.answer_review_input_tokens = 0;
             self.answer_review_output_tokens = 0;
             self.answer_review_start = self.history.next_id + 1;
@@ -788,7 +789,9 @@ impl Session {
                     revision,
                     ..Default::default()
                 };
-                self.investigations.clear();
+                // A new task no longer needs these slots. clear() keeps the
+                // previous task's peak allocation outside the metadata budget.
+                self.investigations = Vec::new();
                 self.reviews = 0;
                 self.document_review = Default::default();
                 self.document_written = false;
@@ -796,7 +799,7 @@ impl Session {
                 self.task_rounds = 0;
                 self.run_guidance = json!({});
                 self.progress_recovery = Default::default();
-                self.completion_gaps.clear();
+                self.completion_gaps = Vec::new();
             }
             // Capture caller-provided criteria before initial_completion and
             // later model task_state updates add working acceptance checks.

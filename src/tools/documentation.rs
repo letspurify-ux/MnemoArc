@@ -357,19 +357,34 @@ pub(super) fn execute(
                     );
                 }
                 let coverage_key = |page: usize| format!("{}:{}:{page}", path.display(), digest);
-                if coverage_offset > 0
-                    && let Some(expected) =
-                        args["expected_coverage_revision"].as_str().or_else(|| {
+                if coverage_offset > 0 {
+                    let expected = args["expected_coverage_revision"]
+                        .as_str()
+                        .or_else(|| {
                             s.coverage_cursors
                                 .get(&coverage_key(coverage_offset))
                                 .map(String::as_str)
                         })
-                    && coverage["revision"].as_str() != Some(expected)
-                {
-                    bail!(
-                        "document_coverage_revision_conflict: delivered coverage changed during pagination; restart document_inspect with coverage_offset 0"
-                    );
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "document_coverage_revision_conflict: coverage page is no longer retained; copy expected_coverage_revision from its first page or restart document_inspect with coverage_offset 0"
+                        ))?;
+                    if coverage["revision"].as_str() != Some(expected) {
+                        bail!(
+                            "document_coverage_revision_conflict: delivered coverage changed during pagination; restart document_inspect with coverage_offset 0"
+                        );
+                    }
                 }
+                // Keep revisions for only this document version. Discarded
+                // legacy pages must restart or supply their coverage revision,
+                // including when a file later reverts to identical old bytes.
+                let current_path = path.to_string_lossy();
+                s.coverage_cursors.retain(|key, _| {
+                    let mut parts = key.rsplitn(3, ':');
+                    let _offset = parts.next();
+                    let version = parts.next();
+                    let cursor_path = parts.next();
+                    cursor_path != Some(current_path.as_ref()) || version == Some(digest.as_str())
+                });
                 if coverage_offset > 0 {
                     s.coverage_cursors.remove(&coverage_key(coverage_offset));
                 }

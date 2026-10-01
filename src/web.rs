@@ -163,6 +163,23 @@ fn normalize_project(mut project: Project) -> Result<Project> {
     }
     Ok(project)
 }
+// Older clients omit IDs. Reuse a saved identity only for one exact definition;
+// matching by folder (or name) would merge distinct projects again.
+fn inherit_project_id(project: &mut Project, saved: &[Project]) {
+    if !project.id.trim().is_empty() {
+        return;
+    }
+    let mut matches = saved.iter().filter(|candidate| {
+        let mut definition = project.clone();
+        definition.id.clone_from(&candidate.id);
+        &definition == *candidate
+    });
+    if let Some(candidate) = matches.next()
+        && matches.next().is_none()
+    {
+        project.id.clone_from(&candidate.id);
+    }
+}
 impl WebState {
     pub fn new(mut config: Config, path: PathBuf, client: Arc<dyn LlmClient>) -> Result<Self> {
         let credentials: BTreeMap<String, Secret> = if credential_path(&path).exists() {
@@ -185,6 +202,7 @@ impl WebState {
                 ..Default::default()
             });
         }
+        config.ensure_project_ids()?;
         // Saved folders may have been moved or temporarily unmounted. Keep
         // those entries editable in settings, and start with an available
         // project instead of preventing the settings UI from opening.
@@ -408,10 +426,12 @@ fn prepare_settings(
     credentials: &BTreeMap<String, Secret>,
 ) -> Result<Config> {
     let mut config = input.config.clone();
-    config.validate()?;
     for p in &mut config.projects {
         *p = normalize_project(p.clone())?;
+        inherit_project_id(p, &old.projects);
     }
+    config.ensure_project_ids()?;
+    config.validate()?;
     if config.projects.is_empty() {
         bail!("At least one project is required");
     }
@@ -556,8 +576,9 @@ struct NewSession {
     project: Project,
 }
 async fn create_session(State(s): State<WebState>, Json(input): Json<NewSession>) -> Api {
-    let project = normalize_project(input.project)?;
+    let mut project = normalize_project(input.project)?;
     let mut c = s.core.lock().await;
+    inherit_project_id(&mut project, &c.config.projects);
     let mut session = Session::new(project, c.config.clone());
     session.write_outcome_uncertain = s.write_outcome_uncertain.clone();
     let id = session.id.clone();
@@ -571,12 +592,22 @@ async fn session_project(
     Path(id): Path<String>,
     Json(project): Json<Project>,
 ) -> Api {
-    let project = normalize_project(project)?;
+    let mut project = normalize_project(project)?;
     let mut c = s.core.lock().await;
     if c.running.contains_key(&id) {
         return Err(busy());
     }
     let session = c.sessions.get_mut(&id).ok_or_else(missing)?;
+    if project.id.trim().is_empty() {
+        project.id.clone_from(&session.project.id);
+    }
+    if project.id != session.project.id {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "세션의 프로젝트 소속은 변경할 수 없습니다. 다른 프로젝트에서 새 세션을 만드세요."
+                .into(),
+        ));
+    }
     let output_changed = tools::output_path(&project)? != tools::output_path(&session.project)?;
     // Check the durable history counter. A checkpoint can prune every bundle
     // while the task, memories and source references still belong to the old
@@ -1534,10 +1565,12 @@ mod worker_wait_tests {
             assert!(session.history.bundles.is_empty());
             assert_eq!(session.history.pruned_through, Some(1));
         }
+        let project_id = state.core.lock().await.sessions[&id].project.id.clone();
         let result = session_project(
             State(state.clone()),
             Path(id.clone()),
             Json(Project {
+                id: project_id,
                 root: replacement,
                 ..Default::default()
             }),

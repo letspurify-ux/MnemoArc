@@ -368,8 +368,8 @@ export default function App() {
           </button>
         </div>
         <div className="session-list">
-          {state?.config.projects.map((project, index) => (
-            <div className="project-group" key={`${project.root}-${index}`}>
+          {state?.config.projects.map((project) => (
+            <div className="project-group" key={project.id}>
               <button
                 className="project-heading"
                 title={project.root}
@@ -381,7 +381,7 @@ export default function App() {
                 <span className="project-plus">＋</span>
               </button>
               {state.sessions
-                .filter((s) => s.project.root === project.root)
+                .filter((s) => s.project.id === project.id)
                 .map((s) => (
                   <SessionButton
                     key={s.id}
@@ -397,7 +397,7 @@ export default function App() {
           {state?.sessions
             .filter(
               (s) =>
-                !state.config.projects.some((p) => p.root === s.project.root),
+                !state.config.projects.some((p) => p.id === s.project.id),
             )
             .map((s) => (
               <SessionButton
@@ -728,7 +728,7 @@ function Projects({ config, onSaved, onCreate, onDirtyChange, creating }) {
           className="secondary"
           disabled={creating}
           onClick={() => {
-            setList([...list, empty]);
+            setList([...list, { ...empty, id: crypto.randomUUID() }]);
             setIndex(list.length);
             setDirty(true);
           }}
@@ -740,7 +740,7 @@ function Projects({ config, onSaved, onCreate, onDirtyChange, creating }) {
         <nav className="settings-tabs">
           {list.map((p, i) => (
             <button
-              key={i}
+              key={p.id}
               className={i === index ? "active" : ""}
               onClick={() => setIndex(i)}
               disabled={creating}

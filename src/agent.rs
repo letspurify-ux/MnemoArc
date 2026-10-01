@@ -662,11 +662,15 @@ fn run_deadline(started: Instant, config: &Config) -> tokio::time::Instant {
         .unwrap_or_else(tokio::time::Instant::now)
 }
 
-fn remap_source_ids(value: &mut Value, ids: &std::collections::BTreeMap<String, String>) {
+fn remap_read_ids(
+    value: &mut Value,
+    sources: &std::collections::BTreeMap<String, String>,
+    cursors: &std::collections::BTreeMap<String, String>,
+) {
     match value {
         Value::Array(values) => {
             for value in values {
-                remap_source_ids(value, ids);
+                remap_read_ids(value, sources, cursors);
             }
         }
         Value::Object(object) => {
@@ -674,11 +678,16 @@ fn remap_source_ids(value: &mut Value, ids: &std::collections::BTreeMap<String, 
                 if matches!(key.as_str(), "source" | "signature_source")
                     && let Some(source) = value.as_object_mut()
                     && let Some(id) = source.get("id").and_then(Value::as_str).map(str::to_owned)
-                    && let Some(canonical) = ids.get(&id)
+                    && let Some(canonical) = sources.get(&id)
                 {
                     source.insert("id".into(), json!(canonical));
                 }
-                remap_source_ids(value, ids);
+                if key == "cursor"
+                    && let Some(canonical) = value.as_str().and_then(|id| cursors.get(id))
+                {
+                    *value = json!(canonical);
+                }
+                remap_read_ids(value, sources, cursors);
             }
         }
         _ => {}
@@ -1037,7 +1046,23 @@ async fn read_parallel(
     while let Some(result) = pending.next().await {
         match result {
             Ok((temp, mut result)) => {
-                s.file_cursors.extend(temp.file_cursors);
+                let mut cursor_ids = std::collections::BTreeMap::new();
+                for (id, cursor) in temp.file_cursors {
+                    // Workers start with the owner's immutable cursors. Only
+                    // newly issued positions need interning during the merge.
+                    if s.file_cursors.contains_key(&id) {
+                        continue;
+                    }
+                    if let Some((canonical, _)) = s
+                        .file_cursors
+                        .iter()
+                        .find(|(_, existing)| **existing == cursor)
+                    {
+                        cursor_ids.insert(id, canonical.clone());
+                    } else {
+                        s.file_cursors.insert(id, cursor);
+                    }
+                }
                 for (fingerprint, scope) in temp.list_cursor_scopes {
                     if !list_cursor_scopes
                         .iter()
@@ -1066,7 +1091,7 @@ async fn read_parallel(
                     };
                     source_ids.insert(source_id, id);
                 }
-                remap_source_ids(&mut result, &source_ids);
+                remap_read_ids(&mut result, &source_ids, &cursor_ids);
                 // Temporary history IDs cannot escape into the owning session.
                 if result["truncated"] == true
                     && let Some(id) = result["archive_id"]
@@ -1076,12 +1101,12 @@ async fn read_parallel(
                 {
                     // The archive was created in a temporary read session.
                     // Its result can contain source objects whose IDs were
-                    // allocated there, so remap the archived messages too;
-                    // otherwise a later history continuation exposes IDs that
-                    // the owning session cannot resolve.
+                    // allocated there, so remap sources and cursor aliases in
+                    // archived messages too. History continuations must use
+                    // the same canonical IDs as the delivered result.
                     let mut messages = bundle.messages.clone();
                     for message in &mut messages {
-                        remap_source_ids(message, &source_ids);
+                        remap_read_ids(message, &source_ids, &cursor_ids);
                     }
                     let id = s.history.push(messages, true);
                     s.history.bundles.back_mut().unwrap().active = false;
@@ -3584,6 +3609,65 @@ mod review_gap_tests {
 mod worker_wait_tests {
     use super::*;
     use crate::config::Project;
+
+    #[tokio::test]
+    async fn parallel_reads_share_cursor_positions_in_results_and_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pages.md"),
+            "정확한 커서 위치😀 and source evidence\n".repeat(200),
+        )
+        .unwrap();
+        let mut s = session();
+        s.project.root = dir.path().canonicalize().unwrap();
+        s.config.model = "gpt-4o".into();
+        s.config.result_tokens = 700;
+        s.config.read_parallelism = 2;
+        let calls: Vec<_> = (0..2)
+            .map(|index| ToolCall {
+                id: format!("parallel-position-{index}"),
+                name: "file_read".into(),
+                arguments: json!({"path":"pages.md","max_lines":200}).to_string(),
+            })
+            .collect();
+        let results = read_parallel(
+            &mut s,
+            &calls,
+            &CancellationToken::new(),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await;
+        let positions: std::collections::BTreeSet<_> = s
+            .file_cursors
+            .values()
+            .map(|cursor| serde_json::to_string(cursor).unwrap())
+            .collect();
+        assert_eq!(
+            s.file_cursors.len(),
+            positions.len(),
+            "parallel workers retained duplicate cursor positions"
+        );
+        for result in results {
+            assert_eq!(result["status"], "ok");
+            let id = result["next_cursor"]["cursor"].as_str().unwrap();
+            assert_eq!(
+                s.file_cursors[id].offset,
+                result["data"]["next_offset"].as_u64().unwrap() as usize
+            );
+            let archived = &s
+                .history
+                .read(result["archive_id"].as_u64().unwrap())
+                .unwrap()
+                .messages[0]["result"];
+            let archived_id = archived["next_cursor"]["cursor"].as_str().unwrap();
+            assert_eq!(
+                s.file_cursors[archived_id].offset,
+                archived["data"]["next_offset"].as_u64().unwrap() as usize
+            );
+            let continuation = tools::execute(&mut s, "file_read", json!({"cursor":id})).unwrap();
+            assert_eq!(continuation["read_offset"], result["data"]["next_offset"]);
+        }
+    }
 
     #[tokio::test]
     async fn parallel_reads_keep_only_read_metadata_and_preserve_suppression() {
