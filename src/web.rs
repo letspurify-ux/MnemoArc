@@ -9,8 +9,8 @@ use crate::{
 use anyhow::{Result, bail};
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    body::{Body, Bytes, HttpBody},
+    extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State},
     http::{Method, StatusCode, header},
     middleware::{self, Next},
     response::{
@@ -95,6 +95,7 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 type Api<T = Value> = std::result::Result<Json<T>, ApiError>;
+const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 fn missing() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "세션을 찾을 수 없습니다.".into())
 }
@@ -308,6 +309,35 @@ async fn local_only(request: Request, next: Next) -> Response {
         )
         .into_response();
     }
+    if request.body().is_end_stream() {
+        return next.run(request).await;
+    }
+    // Size limits alone do not release a peer that declares a body and never
+    // finishes it. Bound body receipt before handing it to any API extractor;
+    // model checks and response/SSE streams retain their own longer deadlines.
+    let (parts, body) = request.into_parts();
+    let buffered = tokio::time::timeout(
+        REQUEST_BODY_TIMEOUT,
+        Bytes::from_request(Request::from_parts(parts.clone(), body), &()),
+    )
+    .await;
+    let bytes = match buffered {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => {
+            return ([(header::CONNECTION, "close")], error.into_response()).into_response();
+        }
+        Err(_) => {
+            return (
+                [(header::CONNECTION, "close")],
+                ApiError(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "요청 데이터를 받는 시간이 초과되었습니다. 다시 시도하세요.".into(),
+                ),
+            )
+                .into_response();
+        }
+    };
+    let request = Request::from_parts(parts, Body::from(bytes));
     next.run(request).await
 }
 pub fn router(state: WebState, frontend: PathBuf) -> Router {
@@ -341,8 +371,8 @@ pub fn app_router(state: WebState, frontend: Option<PathBuf>) -> Router {
         None => router.fallback(get(crate::desktop::embedded_ui)),
     };
     router
-        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn(local_only))
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .with_state(state)
 }
 async fn shutdown_request(State(s): State<WebState>) -> Json<Value> {
@@ -897,8 +927,13 @@ async fn run(
                 changed(&owner, &mut c);
             }
         });
-        let job = agent::run_session_controlled(session, state.client.clone(), cancel, tx, rx);
-        let outcome = std::panic::AssertUnwindSafe(job).catch_unwind().await;
+        let outcome = {
+            // Completion, a deadline and a panic all end this run's file
+            // validation too. The event pump still publishes queued snapshots.
+            let _cancel_on_finish = cancel.clone().drop_guard();
+            let job = agent::run_session_controlled(session, state.client.clone(), cancel, tx, rx);
+            std::panic::AssertUnwindSafe(job).catch_unwind().await
+        };
         let _ = pump.await;
         let outcome = match outcome {
             Ok(session) => Ok(session_view::prepare(&state, session).await),
@@ -943,7 +978,7 @@ async fn run(
                         // path where a stale private copy would otherwise
                         // restore a selection that violates the final task
                         // workflow.
-                        let pending = ToolRegistry::normalize_tool_selection(&session, &pending);
+                        let pending = ToolRegistry::normalize_tool_selection(session, &pending);
                         if session.active_tools == pending {
                             // The command was consumed by the agent. A model
                             // tool_select queued on the private copy must not
@@ -1194,6 +1229,167 @@ mod worker_wait_tests {
     use super::*;
 
     #[tokio::test]
+    async fn unfinished_request_bodies_time_out_while_the_server_is_running() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = WebState::new(
+            Config {
+                projects: vec![Project {
+                    root: dir.path().into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            dir.path().join("config.toml"),
+            Arc::new(OpenAiClient),
+        )
+        .unwrap();
+        let _stop_on_drop = state.stopping.clone().drop_guard();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let managed = ManagedListener::new(listener, state.stopping.clone());
+        let app = app_router(state.clone(), None);
+        let server = tokio::spawn(async move { axum::serve(managed, app).await.unwrap() });
+        let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stalled
+            .write_all(format!("POST /api/sessions HTTP/1.1\r\nHost: {addr}\r\nx-mnemoarc-client: web\r\nContent-Type: application/json\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut interim = [0; 25];
+        tokio::time::timeout(Duration::from_secs(2), stalled.read_exact(&mut interim))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let mut response = Vec::new();
+        let closed =
+            tokio::time::timeout(Duration::from_secs(2), stalled.read_to_end(&mut response)).await;
+        tokio::time::resume();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let oversized = client
+            .post(format!("http://{addr}/api/sessions"))
+            .header("x-mnemoarc-client", "web")
+            .json(&json!({"project":Project {
+                root: dir.path().into(),
+                purpose: "x".repeat(2 * 1024 * 1024),
+                ..Default::default()
+            }}))
+            .send()
+            .await
+            .unwrap();
+        let healthy = client
+            .get(format!("http://{addr}/api/state"))
+            .send()
+            .await
+            .unwrap();
+        let sessions = state.core.lock().await.sessions.len();
+        // Clean up even when the timeout check regresses.
+        drop(stalled);
+        state.stopping.cancel();
+        server.abort();
+        let _ = server.await;
+        closed
+            .expect("unfinished HTTP request retained its connection and body without a deadline")
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 408"), "{response:?}");
+        assert_eq!(healthy.status(), StatusCode::OK);
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(sessions, 1, "partial request must not create a session");
+    }
+
+    #[tokio::test]
+    async fn body_receipt_deadline_does_not_cut_off_a_long_model_connection_check() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let upstream = Router::new().route(
+            "/chat/completions",
+            post({
+                let entered = entered.clone();
+                move |Json(request): Json<Value>| {
+                    let entered = entered.clone();
+                    async move {
+                        if request["stream"] != true {
+                            entered.notify_one();
+                            tokio::time::sleep(Duration::from_secs(40)).await;
+                            return Json(json!({"choices":[{"message":{"content":"OK"},"finish_reason":"stop"}]})).into_response();
+                        }
+                        let choice = if request["tool_choice"]["function"]["name"] == "connection_echo" {
+                            json!({"delta":{"tool_calls":[{"index":0,"id":"echo","function":{"name":"connection_echo","arguments":"{\"text\":\"OK\"}"}}]},"finish_reason":"tool_calls"})
+                        } else {
+                            json!({"delta":{"content":"OK"},"finish_reason":"stop"})
+                        };
+                        (
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[choice]})),
+                        ).into_response()
+                    }
+                }
+            }),
+        );
+        let provider = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", provider.local_addr().unwrap());
+        let provider = tokio::spawn(async move { axum::serve(provider, upstream).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            base_url,
+            model: "gpt-4o".into(),
+            model_context: Some(128000),
+            api_key_env: "MNEMOARC_TEST_UNUSED_API_KEY".into(),
+            disable_proxy: true,
+            retries: 0,
+            projects: vec![Project {
+                root: dir.path().into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let state = WebState::new(
+            config.clone(),
+            dir.path().join("config.toml"),
+            Arc::new(OpenAiClient),
+        )
+        .unwrap();
+        let _stop_on_drop = state.stopping.clone().drop_guard();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let managed = ManagedListener::new(listener, state.stopping.clone());
+        let app = app_router(state.clone(), None);
+        let server = tokio::spawn(async move { axum::serve(managed, app).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let request = tokio::spawn(async move {
+            client
+                .post(format!("http://{addr}/api/check"))
+                .header("x-mnemoarc-client", "web")
+                .json(&json!({"config":config}))
+                .send()
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(40)).await;
+        tokio::time::resume();
+        let response = tokio::time::timeout(Duration::from_secs(3), request).await;
+        state.stopping.cancel();
+        server.abort();
+        provider.abort();
+        let _ = server.await;
+        let _ = provider.await;
+        let response = response.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = response.json::<Value>().await.unwrap();
+        assert!(value["message"].as_str().unwrap().contains("succeeded"));
+    }
+
+    #[tokio::test]
     async fn closing_idle_sessions_releases_the_session_order_storage() {
         let dir = tempfile::tempdir().unwrap();
         let project = Project {
@@ -1409,6 +1605,133 @@ mod worker_wait_tests {
             assert!(core.streams.is_empty());
         }
         state.shutdown().await;
+    }
+
+    struct SettlementProbe(tokio::sync::Notify, &'static str);
+
+    #[async_trait::async_trait]
+    impl LlmClient for SettlementProbe {
+        async fn complete(
+            &self,
+            _: Value,
+            _: &Config,
+            cancel: CancellationToken,
+            delta: mpsc::Sender<String>,
+        ) -> Result<crate::llm::Completion> {
+            delta.send("ongoing response".into()).await.unwrap();
+            self.0.notify_one();
+            match self.1 {
+                "complete" => Ok(crate::llm::Completion {
+                    text: "Completed while snapshot validation was queued.".into(),
+                    ..Default::default()
+                }),
+                "panic" => panic!("simulated model panic with queued snapshots"),
+                _ => {
+                    cancel.cancelled().await;
+                    bail!("cancelled");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_runs_release_snapshots_while_file_workers_are_full() {
+        for outcome in ["cancel", "close", "complete", "panic", "timeout"] {
+            let closing = outcome == "close";
+            let dir = tempfile::tempdir().unwrap();
+            let client = Arc::new(SettlementProbe(tokio::sync::Notify::new(), outcome));
+            let mut state = WebState::new(
+                Config {
+                    model: "gpt-4o".into(),
+                    model_context: Some(128000),
+                    source_answer_review: false,
+                    completion_review_enabled: false,
+                    tool_timeout_secs: 60,
+                    run_timeout_secs: if outcome == "timeout" { 1 } else { 60 },
+                    projects: vec![Project {
+                        root: dir.path().into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                dir.path().join("config.toml"),
+                client.clone(),
+            )
+            .unwrap();
+            let workers = Arc::new(tokio::sync::Semaphore::new(1));
+            state.file_io = FileIo::with_workers(workers.clone(), state.stopping.clone());
+            let occupied = workers.acquire_owned().await.unwrap();
+            let id = state.core.lock().await.order[0].clone();
+            let core_refs = Arc::strong_count(&state.core);
+            let session_refs = Arc::strong_count(&state.write_outcome_uncertain);
+            let _ = run(
+                State(state.clone()),
+                Path(id.clone()),
+                Json(RunInput {
+                    text: "Run until stopped with pending snapshot validation".into(),
+                    action: "chat".into(),
+                }),
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), client.0.notified())
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            if closing {
+                let _ = close_session(State(state.clone()), Path(id.clone()))
+                    .await
+                    .unwrap();
+            } else if outcome == "cancel" {
+                let _ = cancel(State(state.clone()), Path(id.clone()))
+                    .await
+                    .unwrap();
+            }
+            let settled = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let core = state.core.lock().await;
+                    let expected_refs = if closing {
+                        session_refs - 1
+                    } else {
+                        session_refs
+                    };
+                    if core.running.is_empty()
+                        && Arc::strong_count(&state.core) == core_refs
+                        && Arc::strong_count(&state.write_outcome_uncertain) == expected_refs
+                    {
+                        assert!(core.streams.is_empty());
+                        if closing {
+                            assert!(core.sessions.is_empty());
+                        } else {
+                            let session = &core.sessions[&id];
+                            match outcome {
+                                "complete" => assert_eq!(session.status, "complete"),
+                                "panic" | "timeout" => {
+                                    assert_eq!(session.status, "blocked");
+                                    assert!(session.last_error.as_deref().unwrap().starts_with(
+                                        if outcome == "panic" {
+                                            "model_worker_panic"
+                                        } else {
+                                            "run_timeout"
+                                        }
+                                    ));
+                                }
+                                _ => assert_eq!(session.status, "cancelled"),
+                            }
+                        }
+                        break;
+                    }
+                    drop(core);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            // Release the fixture before asserting so a regression leaves no
+            // detached agent or event pump behind in this test's runtime.
+            drop(occupied);
+            state.shutdown().await;
+            settled.expect("stopped run retained its slot, snapshot queue and web owners");
+        }
     }
 
     #[tokio::test]

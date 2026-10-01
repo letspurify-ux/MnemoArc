@@ -131,21 +131,25 @@ fn page_view(session: &Snapshot, revision: u64, stream: Option<String>, page: Pa
 /// Every read validates again before exposing it to the UI.
 pub(super) async fn prepare(s: &WebState, session: Session) -> Arc<Snapshot> {
     let original = Arc::new(Snapshot::new(session));
-    if s.core
-        .lock()
-        .await
-        .running
-        .get(&original.id)
-        .is_none_or(|run| run.closing)
-    {
-        return original;
-    }
+    let cancel = {
+        let core = s.core.lock().await;
+        match core.running.get(&original.id) {
+            Some(run) if !run.closing => run.cancel.clone(),
+            _ => return original,
+        }
+    };
     let input = original.clone();
     let timeout = Duration::from_secs(original.config.tool_timeout_secs);
-    s.file_io
-        .run_queued(timeout, move |cancel| revalidated(input, &cancel))
-        .await
-        .unwrap_or(original)
+    // A stopped run must not keep its slot and queued snapshots while waiting
+    // for unrelated file work. Dropping run_queued also cancels a worker that
+    // already started, while preserving the authoritative agent snapshot.
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => original,
+        result = s.file_io.run_queued(timeout, move |cancel| revalidated(input, &cancel)) => {
+            result.unwrap_or(original)
+        }
+    }
 }
 
 #[cfg(test)]

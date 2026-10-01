@@ -16,6 +16,11 @@ pub(super) struct FileIo {
 }
 
 impl FileIo {
+    #[cfg(test)]
+    pub(super) fn with_workers(workers: Arc<Semaphore>, stopping: CancellationToken) -> Self {
+        Self { workers, stopping }
+    }
+
     pub(super) fn new(stopping: CancellationToken) -> Self {
         // A stuck operation can outlive a server restart. Count it across all
         // WebState instances, rather than granting another set of slots.
@@ -75,9 +80,12 @@ impl FileIo {
         let permit = tokio::select! {
             biased;
             _ = self.stopping.cancelled() => return Err(stopping()),
-            result = self.workers.clone().acquire_owned() => result.map_err(|_| stopping())?,
             _ = tokio::time::sleep_until(deadline) => return Err(timed_out()),
+            result = self.workers.clone().acquire_owned() => result.map_err(|_| stopping())?,
         };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(timed_out());
+        }
         let (receiver, _cancel_on_drop) = self.start(Some(permit), operation)?;
         self.finish(
             receiver,
@@ -369,6 +377,35 @@ mod tests {
                 "abandoned read started a worker"
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_queued_read_does_not_start_when_capacity_returns() {
+        let io = isolated();
+        let permit = io.workers.clone().acquire_owned().await.unwrap();
+        let started = Arc::new(AtomicUsize::new(0));
+        let count = started.clone();
+        let reader = io.clone();
+        let request = tokio::spawn(async move {
+            reader
+                .run_queued(Duration::from_secs(1), move |_| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        // Make both the deadline and permit ready before the waiter polls.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        drop(permit);
+        let result = request.await.unwrap();
+        idle(&io).await;
+        assert_eq!(result.unwrap_err().0, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            0,
+            "expired read started a file worker"
+        );
     }
 
     struct ReaderProbe {
