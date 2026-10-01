@@ -31,6 +31,9 @@ pub struct TodoItem {
     pub done: bool,
     #[serde(default)]
     pub result: String,
+    /// Why a completed item was reopened; cleared when it completes again.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reopen_reason: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -103,6 +106,7 @@ impl TaskState {
                 text,
                 done,
                 result: String::new(),
+                reopen_reason: String::new(),
             });
             self.todos_completed_total += usize::from(done);
             self.plan_revision = self.plan_revision.saturating_add(1);

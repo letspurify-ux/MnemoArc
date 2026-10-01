@@ -265,14 +265,47 @@ fn prerequisites_insert_move_remove_and_complete_in_order_atomically() {
         json!([{"op":"reopen","id":write,"reason":"Review found a factual error"}]),
     );
     assert_eq!(s.task.current_todo().unwrap().id, write);
-    assert!(
-        !s.task
-            .todos
-            .iter()
-            .find(|item| item.id == write)
-            .unwrap()
-            .done
+    let reopened = s.task.todos.iter().find(|item| item.id == write).unwrap();
+    assert!(!reopened.done);
+    // The reason is not a result: the item has none until it completes again.
+    assert_eq!(reopened.result, "");
+    assert_eq!(reopened.reopen_reason, "Review found a factual error");
+    apply(
+        &mut s,
+        json!([{"op":"complete","id":write,"result":"Corrected the section"}]),
     );
+    let done = s.task.todos.iter().find(|item| item.id == write).unwrap();
+    assert_eq!(done.result, "Corrected the section");
+    assert_eq!(done.reopen_reason, "");
+}
+
+#[test]
+fn completed_history_cannot_be_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(
+        &mut s,
+        json!([{"op":"insert","texts":["Read source","Write section"]}]),
+    );
+    apply(
+        &mut s,
+        json!([{"op":"complete","id":"T1","result":"Read the handler"}]),
+    );
+    let before = serde_json::to_value(&s.task).unwrap();
+    let refused = apply(
+        &mut s,
+        json!([{"op":"remove","id":"T1","reason":"Clean up history"}]),
+    );
+    assert_eq!(refused["applied"], false, "{refused}");
+    assert!(
+        refused["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Completed history"),
+        "{refused}"
+    );
+    assert_eq!(serde_json::to_value(&s.task).unwrap(), before);
+    assert_eq!(s.task.todos_completed_total, 1);
 }
 
 #[test]
@@ -701,15 +734,18 @@ impl LlmClient for EmptyPlanChurn {
                 ..Default::default()
             });
         }
-        let id = format!("T{}", *step + 1);
+        // Completed history cannot be removed, so each round completes one
+        // entry and removes a second, still pending one.
+        let done = format!("T{}", *step * 2 + 1);
+        let temporary = format!("T{}", *step * 2 + 2);
         *step += 1;
         Ok(Completion {
             calls: vec![ToolCall {
                 id: format!("churn-{step}"), name: "task_plan".into(),
                 arguments: json!({"action":"apply","expected_revision":state["task"]["plan_revision"],"operations":[
-                    {"op":"insert","texts":["Rephrase existing evidence"]},
-                    {"op":"complete","id":id,"result":"Updated the wording"},
-                    {"op":"remove","id":id,"reason":"Remove temporary plan entry"}
+                    {"op":"insert","texts":[format!("Rephrase existing evidence {step}"), format!("Temporary entry {step}")]},
+                    {"op":"complete","id":done,"result":"Updated the wording"},
+                    {"op":"remove","id":temporary,"reason":"Remove temporary plan entry"}
                 ]}).to_string(),
             }], ..Default::default()
         })
@@ -733,7 +769,8 @@ async fn completing_and_removing_items_does_not_masquerade_as_actual_progress() 
     .await;
     drain.await.unwrap();
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
-    assert!(result.task.todos.is_empty());
+    assert_eq!(result.task.todos.len(), 3);
+    assert!(result.task.todos.iter().all(|item| item.done));
     assert_eq!(result.task.todos_completed_total, 3);
 }
 
@@ -974,6 +1011,12 @@ fn insert_discards_shared_schema_fields_and_non_id_placeholder() {
     );
     assert_eq!(result["applied"], true, "{result}");
     assert_eq!(result["input_normalized"], true);
+    // The placeholder before is dropped, and the caller is told so.
+    let notice = result["notices"][0].as_str().unwrap();
+    assert!(
+        notice.contains("\"x\"") && notice.contains("appended"),
+        "{notice}"
+    );
     assert_eq!(
         s.task
             .todos

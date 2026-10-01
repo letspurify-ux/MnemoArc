@@ -1494,6 +1494,9 @@ function Inspector({
                       </span>
                       <span>{item.text}</span>
                       {item.result && <small>{item.result}</small>}
+                      {item.reopen_reason && (
+                        <small>재개 사유: {item.reopen_reason}</small>
+                      )}
                     </li>
                   ))}
                 </ol>

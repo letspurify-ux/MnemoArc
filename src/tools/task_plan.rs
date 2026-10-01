@@ -77,7 +77,7 @@ pub fn spec() -> ToolSpec {
     ]);
     ToolSpec {
         name: "task_plan",
-        description: "Manage an ordered to-do list. Read with {\"action\":\"list\"}; use offset/limit to page through the full list (default 10, maximum 20). Change with {\"action\":\"apply\",\"expected_revision\":0,\"operations\":[{\"op\":\"insert\",\"texts\":[\"Write the requested section\"]}]}; copy the actual revision, and keep operations as an array, not quoted JSON. Applies 1..16 operations atomically. insert requires texts; optional before is a pending ID (omit to append). update requires id/text. split requires an unfinished id and 2..100 smaller texts in execution order; it keeps the original ID for the first subtask and creates IDs for the rest. Split a broad item only when its parts together preserve the original outcome. move requires id and optional before. complete requires the CURRENT item's id/result after actually doing the work. remove and reopen require id/reason; reopen puts a completed item before current. Keep at most 100 unfinished small concrete outcomes; split investigation and saving when each is a meaningful result, and move promptly to writing. Retain only the latest 5 completed items and cumulative completed_total. Input/transition/capacity conflicts return applied=false without stopping; follow the correction or continue current work. Plan edits are not actual progress. Preserve user requirements in task_state.completion.",
+        description: "Manage an ordered to-do list. Read with {\"action\":\"list\"}; use offset/limit to page through the full list (default 10, maximum 20). Change with {\"action\":\"apply\",\"expected_revision\":0,\"operations\":[{\"op\":\"insert\",\"texts\":[\"Write the requested section\"]}]}; copy the actual revision, and keep operations as an array, not quoted JSON. Applies 1..16 operations atomically. insert requires texts; optional before is a pending ID (omit to append). update requires id/text. split requires an unfinished id and 2..100 smaller texts in execution order; it keeps the original ID for the first subtask and creates IDs for the rest. Split a broad item only when its parts together preserve the original outcome. move requires id and optional before. complete requires the CURRENT item's id/result after actually doing the work. remove and reopen require id/reason; remove applies only to unfinished items; reopen puts a completed item before current. Keep at most 100 unfinished small concrete outcomes; split investigation and saving when each is a meaningful result, and move promptly to writing. Retain only the latest 5 completed items and cumulative completed_total. Input/transition/capacity conflicts return applied=false without stopping; follow the correction or continue current work. Plan edits are not actual progress. Preserve user requirements in task_state.completion.",
         optional: false,
         read_only: false,
         parameters,
@@ -168,6 +168,7 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
                         text: text.into(),
                         done: false,
                         result: String::new(),
+                        reopen_reason: String::new(),
                     },
                 );
                 at += 1;
@@ -217,6 +218,7 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
                         text,
                         done: false,
                         result: String::new(),
+                        reopen_reason: String::new(),
                     },
                 );
             }
@@ -236,6 +238,11 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
         Operation::Remove { id, reason } => {
             nonempty(&reason, MAX_RESULT_CHARS)?;
             let at = index(task, &id)?;
+            if task.todos[at].done {
+                bail!(
+                    "Completed history stays fixed and drops out on its own; remove only unfinished items, or reopen this one with a reason"
+                );
+            }
             task.todos.remove(at);
         }
         Operation::Complete { id, result } => {
@@ -259,6 +266,7 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
             }
             task.todos[at].done = true;
             task.todos[at].result = result.into();
+            task.todos[at].reopen_reason.clear();
             task.todos_completed_total = task.todos_completed_total.saturating_add(1);
         }
         Operation::Reopen { id, reason } => {
@@ -269,7 +277,8 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
             }
             let mut item = task.todos.remove(at);
             item.done = false;
-            item.result = reason.into();
+            item.result.clear();
+            item.reopen_reason = reason.into();
             let to = task
                 .todos
                 .iter()
@@ -329,9 +338,14 @@ fn json_error_context(text: &str, line: usize, column: usize) -> String {
     format!("{before:?} <here> {after:?}")
 }
 
-fn parse_operations(value: &Value) -> Result<(Vec<Operation>, bool)> {
+/// Parsed operations, whether their encoding was normalized, and notices for
+/// normalizations that changed what the caller asked for.
+type Parsed = (Vec<Operation>, bool, Vec<String>);
+
+fn parse_operations(value: &Value) -> Result<Parsed> {
     let decoded;
     let mut normalized = false;
+    let mut notices = Vec::new();
     let value = if let Some(text) = value.as_str() {
         decoded = decode_json(text)?;
         normalized = true;
@@ -391,17 +405,24 @@ fn parse_operations(value: &Value) -> Result<(Vec<Operation>, bool)> {
                     normalized = true;
                 }
             }
-            if object
+            // Providers also fill before with placeholders. Append those
+            // items, but say so: a prerequisite meant for an earlier
+            // position now sits at the end and needs a move.
+            if let Some(id) = object
                 .get("before")
                 .and_then(Value::as_str)
-                .is_some_and(|id| {
+                .filter(|id| {
                     !id.starts_with('T')
                         || id.len() < 2
                         || !id[1..].bytes().all(|byte| byte.is_ascii_digit())
                 })
+                .map(str::to_owned)
             {
                 object.remove("before");
                 normalized = true;
+                notices.push(format!(
+                    "operations[{i}]: before {id:?} is not a plan ID, so the items were appended at the end; move them before the intended item if order matters"
+                ));
             }
         }
         if item["op"] == "complete" {
@@ -441,7 +462,7 @@ fn parse_operations(value: &Value) -> Result<(Vec<Operation>, bool)> {
         })?;
         operations.push(operation);
     }
-    Ok((operations, normalized))
+    Ok((operations, normalized, notices))
 }
 
 pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
@@ -467,7 +488,7 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
         }
         return Ok(unchanged(&s.task, reason));
     }
-    let (operations, normalized) = match parse_operations(&args["operations"]) {
+    let (operations, normalized, notices) = match parse_operations(&args["operations"]) {
         Ok(operations) => operations,
         Err(error) => {
             let mut result = unchanged(&s.task, format!("Invalid plan operation: {error}"));
@@ -515,9 +536,10 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
         && next.todo_sequence == s.task.todo_sequence
         && next.todos_completed_total == s.task.todos_completed_total
     {
-        return Ok(
+        return Ok(with_notices(
             json!({"applied":true,"unchanged":true,"input_normalized":normalized,"plan":view(&s.task, 0, DEFAULT_PAGE)}),
-        );
+            notices,
+        ));
     }
     next.plan_revision = next.plan_revision.saturating_add(1);
     next.revision = next.revision.saturating_add(1);
@@ -529,5 +551,15 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
         return Ok(unchanged(&s.task, "Task state budget is full; shorten item text or task_state findings/details before extending the plan".into()));
     }
     s.task = next;
-    Ok(json!({"applied":true,"input_normalized":normalized,"plan":view(&s.task, 0, DEFAULT_PAGE)}))
+    Ok(with_notices(
+        json!({"applied":true,"input_normalized":normalized,"plan":view(&s.task, 0, DEFAULT_PAGE)}),
+        notices,
+    ))
+}
+
+fn with_notices(mut result: Value, notices: Vec<String>) -> Value {
+    if !notices.is_empty() {
+        result["notices"] = json!(notices);
+    }
+    result
 }
