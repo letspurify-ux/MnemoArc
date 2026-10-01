@@ -38,6 +38,7 @@ use tower_http::services::ServeDir;
 
 mod connections;
 mod file_io;
+mod session_view;
 use connections::ManagedListener;
 use file_io::FileIo;
 
@@ -49,12 +50,28 @@ struct Running {
 struct Core {
     config: Config,
     path: PathBuf,
-    sessions: BTreeMap<String, Session>,
+    sessions: BTreeMap<String, Arc<session_view::Snapshot>>,
     order: Vec<String>,
     streams: BTreeMap<String, String>,
     running: BTreeMap<String, Running>,
     revision: u64,
     credentials: BTreeMap<String, Secret>,
+}
+impl Core {
+    fn session_mut(&mut self, id: &str) -> Option<&mut Session> {
+        Some(Arc::make_mut(self.sessions.get_mut(id)?).session_mut())
+    }
+
+    fn remove_session(&mut self, id: &str) {
+        self.sessions.remove(id);
+        self.streams.remove(id);
+        self.order.retain(|old| old != id);
+        // Retaining fewer IDs must also release storage after a large batch
+        // of session closes, including the last running session's settlement.
+        if self.order.capacity() > self.order.len().saturating_mul(2) {
+            self.order.shrink_to_fit();
+        }
+    }
 }
 #[derive(Clone)]
 pub struct WebState {
@@ -220,7 +237,10 @@ impl WebState {
             let mut session = Session::new(project, config.clone());
             session.write_outcome_uncertain = write_outcome_uncertain.clone();
             order.push(session.id.clone());
-            sessions.insert(session.id.clone(), session);
+            sessions.insert(
+                session.id.clone(),
+                Arc::new(session_view::Snapshot::new(session)),
+            );
         }
         let (events, _) = broadcast::channel(128);
         let stopping = CancellationToken::new();
@@ -370,44 +390,7 @@ async fn session_get(
     Path(id): Path<String>,
     Query(page): Query<Page>,
 ) -> Api {
-    let mut c = s.core.lock().await;
-    let state_changed = {
-        let session = c.sessions.get_mut(&id).ok_or_else(missing)?;
-        let generation = session.memory.generation;
-        let investigations: Vec<_> = session
-            .investigations
-            .iter()
-            .map(|item| (item.id.clone(), item.status.clone(), item.note.clone()))
-            .collect();
-        tools::revalidate(session)?;
-        generation != session.memory.generation
-            || investigations
-                != session
-                    .investigations
-                    .iter()
-                    .map(|item| (item.id.clone(), item.status.clone(), item.note.clone()))
-                    .collect::<Vec<_>>()
-    };
-    if state_changed {
-        changed(&s, &mut c);
-    }
-    let session = c.sessions.get(&id).ok_or_else(missing)?;
-    let mut bundles = session
-        .history
-        .bundles
-        .iter()
-        .rev()
-        .filter(|b| page.before.is_none_or(|before| b.id < before))
-        .take(page.limit.unwrap_or(50).clamp(1, 100))
-        .collect::<Vec<_>>();
-    bundles.reverse();
-    let previous = bundles
-        .first()
-        .filter(|b| session.history.bundles.iter().any(|old| old.id < b.id))
-        .map(|b| b.id);
-    Ok(Json(
-        json!({"revision":c.revision,"id":id,"project":session.project,"config":session.config,"pending_config":session.pending_config,"credential_configured":OpenAiClient::has_key(&session.config),"status":session.status,"error":session.last_error,"run_history":session.run_history,"has_task":!session.latest_request.is_empty(),"question_running":session.question.is_some(),"task":session.task,"workflow_mode":session.workflow_mode,"document_review":session.document_review,"completion_review":crate::tools::completion_review::view(session),"completion_gaps":session.completion_gaps,"run_guidance":session.run_guidance,"activity":session.activity,"continuation_pending":session.continuation.is_some(),"bundles":bundles,"previous":previous,"pruned_through":session.history.pruned_through,"stream":c.streams.get(&id),"memories":session.memory.recent(session.config.memory_count),"investigations":session.investigations,"active_tools":session.active_tools,"usage":{"input":session.input_tokens,"output":session.output_tokens,"cached":session.cached_tokens,"estimated":session.usage_incomplete,"context_estimated":crate::context::is_estimated(&session.config.model),"memory_bytes":session.memory.bytes(),"history_bytes":session.history.bytes(),"checkpoints":session.checkpoints_completed},"checkpoint":session.checkpoint}),
-    ))
+    session_view::read(s, id, session_view::Read::Page(page)).await
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -525,10 +508,10 @@ async fn session_settings(
         r.commands
             .try_send(RunCommand::Configure(Box::new(config.clone())))
             .map_err(|_| busy())?;
-        c.sessions.get_mut(&id).unwrap().pending_config = Some(config);
+        c.session_mut(&id).unwrap().pending_config = Some(config);
         true
     } else {
-        let session = c.sessions.get_mut(&id).unwrap();
+        let session = c.session_mut(&id).unwrap();
         match agent::apply_config(session, config.clone()) {
             Ok(()) => {
                 session.pending_config = None;
@@ -583,7 +566,8 @@ async fn create_session(State(s): State<WebState>, Json(input): Json<NewSession>
     session.write_outcome_uncertain = s.write_outcome_uncertain.clone();
     let id = session.id.clone();
     c.order.push(id.clone());
-    c.sessions.insert(id.clone(), session);
+    c.sessions
+        .insert(id.clone(), Arc::new(session_view::Snapshot::new(session)));
     changed(&s, &mut c);
     Ok(Json(json!({"id":id})))
 }
@@ -597,7 +581,7 @@ async fn session_project(
     if c.running.contains_key(&id) {
         return Err(busy());
     }
-    let session = c.sessions.get_mut(&id).ok_or_else(missing)?;
+    let session = c.session_mut(&id).ok_or_else(missing)?;
     if project.id.trim().is_empty() {
         project.id.clone_from(&session.project.id);
     }
@@ -644,7 +628,7 @@ async fn session_workflow(
     if c.running.contains_key(&id) {
         return Err(busy());
     }
-    let session = c.sessions.get_mut(&id).ok_or_else(missing)?;
+    let session = c.session_mut(&id).ok_or_else(missing)?;
     session.workflow_mode = input.workflow;
     changed(&s, &mut c);
     Ok(Json(json!({"saved":true})))
@@ -682,9 +666,9 @@ async fn session_tools(
         // Keep the latest request in the owner session as well. The agent
         // owns a private clone while running, so cancellation can otherwise
         // let its older active_tools overwrite a queued selection.
-        c.sessions.get_mut(&id).unwrap().pending_tools = Some(input.names);
+        c.session_mut(&id).unwrap().pending_tools = Some(input.names);
     } else {
-        let session = c.sessions.get_mut(&id).unwrap();
+        let session = c.session_mut(&id).unwrap();
         session.active_tools = input.names;
         // An explicit user selection supersedes any older model tool_select
         // that was waiting for a request boundary.
@@ -703,6 +687,44 @@ struct RunInput {
 fn auto_action() -> String {
     "auto".into()
 }
+
+fn publish_snapshot(s: &WebState, c: &mut Core, mut snapshot: Arc<session_view::Snapshot>) {
+    let closing = c
+        .running
+        .get(&snapshot.id)
+        .is_none_or(|running| running.closing);
+    if closing {
+        c.streams.remove(&snapshot.id);
+        return;
+    }
+    let advanced = c
+        .sessions
+        .get(&snapshot.id)
+        .is_some_and(|old| old.history.next_id != snapshot.history.next_id);
+    if advanced {
+        c.streams.remove(&snapshot.id);
+    }
+    // Preserve settings/tool choices accepted after the private agent copy
+    // was made, including choices made while its file worker was validating.
+    if let Some(owner) = c.sessions.get(&snapshot.id) {
+        let session = Arc::make_mut(&mut snapshot).session_mut();
+        if let Some(pending) = owner.pending_config.clone() {
+            session.pending_config = (!same_config(&session.config, &pending)).then_some(pending);
+        }
+        if let Some(pending) = owner.pending_tools.clone() {
+            let pending = ToolRegistry::normalize_tool_selection(session, &pending);
+            if session.active_tools == pending {
+                session.pending_tools = None;
+            } else {
+                session.active_tools = pending.clone();
+                session.pending_tools = Some(pending);
+            }
+        }
+    }
+    c.sessions.insert(snapshot.id.clone(), snapshot);
+    changed(s, c);
+}
+
 async fn run(
     State(s): State<WebState>,
     Path(id): Path<String>,
@@ -741,7 +763,7 @@ async fn run(
         if s.write_outcome_uncertain.load(Ordering::Acquire) {
             return Err(ApiError(StatusCode::CONFLICT, "도구 쓰기 결과를 확인할 수 없습니다. 파일 또는 데이터베이스 변경을 확인하고 앱을 다시 시작하세요.".into()));
         }
-        let session = c.sessions.get_mut(&id).ok_or_else(missing)?;
+        let session = c.session_mut(&id).ok_or_else(missing)?;
         session.config.runnable()?;
         let action = if input.action == "auto" {
             if Session::is_continuation(&input.text) && !session.latest_request.is_empty() {
@@ -841,6 +863,12 @@ async fn run(
         let owner = state.clone();
         let pump = tokio::spawn(async move {
             while let Some(event) = events.recv().await {
+                if let AgentEvent::Snapshot(snapshot) = event {
+                    let snapshot = session_view::prepare(&owner, *snapshot).await;
+                    let mut c = owner.core.lock().await;
+                    publish_snapshot(&owner, &mut c, snapshot);
+                    continue;
+                }
                 let mut c = owner.core.lock().await;
                 match event {
                     AgentEvent::Delta { session, text } => {
@@ -852,58 +880,7 @@ async fn run(
                             c.streams.entry(session).or_default().push_str(&text);
                         }
                     }
-                    AgentEvent::Snapshot(snapshot) => {
-                        let mut snapshot = *snapshot;
-                        let closing = c
-                            .running
-                            .get(&snapshot.id)
-                            .is_none_or(|running| running.closing);
-                        if closing {
-                            c.streams.remove(&snapshot.id);
-                            continue;
-                        }
-                        // A source can change while the agent is running. The
-                        // snapshot was produced from the agent's private copy,
-                        // so revalidate it before publishing it or it could
-                        // overwrite a fresher session_get result.
-                        let _ = tools::revalidate(&mut snapshot);
-                        let advanced = c
-                            .sessions
-                            .get(&snapshot.id)
-                            .is_some_and(|old| old.history.next_id != snapshot.history.next_id);
-                        if advanced {
-                            c.streams.remove(&snapshot.id);
-                        }
-                        // The owner may have accepted a setting/tool change
-                        // after this private snapshot was cloned. Preserve
-                        // that queued request until the agent consumes it;
-                        // otherwise the next snapshot would erase it.
-                        if let Some(owner) = c.sessions.get(&snapshot.id) {
-                            if let Some(pending) = owner.pending_config.clone() {
-                                if same_config(&snapshot.config, &pending) {
-                                    snapshot.pending_config = None;
-                                } else {
-                                    snapshot.pending_config = Some(pending);
-                                }
-                            }
-                            if let Some(pending) = owner.pending_tools.clone() {
-                                // The private agent can advance its workflow
-                                // after this selection was validated on the
-                                // owner snapshot. Normalize at merge time so
-                                // a stale pending set cannot remove newly
-                                // mandatory workflow tools.
-                                let pending =
-                                    ToolRegistry::normalize_tool_selection(&snapshot, &pending);
-                                if snapshot.active_tools == pending {
-                                    snapshot.pending_tools = None;
-                                } else {
-                                    snapshot.active_tools = pending.clone();
-                                    snapshot.pending_tools = Some(pending);
-                                }
-                            }
-                        }
-                        c.sessions.insert(snapshot.id.clone(), snapshot);
-                    }
+                    AgentEvent::Snapshot(_) => unreachable!(),
                     AgentEvent::Tool { session, .. } => {
                         c.streams.remove(&session);
                     }
@@ -912,7 +889,7 @@ async fn run(
                             .running
                             .get(&session)
                             .is_none_or(|running| running.closing);
-                        if !closing && let Some(v) = c.sessions.get_mut(&session) {
+                        if !closing && let Some(v) = c.session_mut(&session) {
                             v.last_error = Some(text);
                         }
                     }
@@ -923,15 +900,18 @@ async fn run(
         let job = agent::run_session_controlled(session, state.client.clone(), cancel, tx, rx);
         let outcome = std::panic::AssertUnwindSafe(job).catch_unwind().await;
         let _ = pump.await;
+        let outcome = match outcome {
+            Ok(session) => Ok(session_view::prepare(&state, session).await),
+            Err(error) => Err(error),
+        };
         let mut c = state.core.lock().await;
         c.streams.remove(&id);
         if c.running.get(&id).is_some_and(|r| r.closing) {
-            c.sessions.remove(&id);
-            c.order.retain(|old| old != &id);
+            c.remove_session(&id);
         } else {
             match outcome {
-                Ok(session) => {
-                    let mut session = session;
+                Ok(mut snapshot) => {
+                    let session = Arc::make_mut(&mut snapshot).session_mut();
                     // The web owner records a pending setting before sending
                     // the command to the agent. If cancellation wins before
                     // that command is consumed, the private agent copy still
@@ -977,11 +957,10 @@ async fn run(
                             session.pending_tools = None;
                         }
                     }
-                    let _ = tools::revalidate(&mut session);
-                    c.sessions.insert(id.clone(), session);
+                    c.sessions.insert(id.clone(), snapshot);
                 }
                 Err(_) => {
-                    if let Some(session) = c.sessions.get_mut(&id) {
+                    if let Some(session) = c.session_mut(&id) {
                         session.status = "blocked".into();
                         session.last_error = Some("agent_worker_panic: last snapshot retained; write outcomes require review".into());
                         session.note_run_estimate();
@@ -1018,23 +997,13 @@ async fn close_session(State(s): State<WebState>, Path(id): Path<String>) -> Api
         r.cancel.cancel();
         c.streams.remove(&id);
     } else {
-        c.sessions.remove(&id);
-        c.streams.remove(&id);
-        c.order.retain(|old| old != &id);
+        c.remove_session(&id);
     }
     changed(&s, &mut c);
     Ok(Json(json!({"closed":true})))
 }
 async fn memory_get(State(s): State<WebState>, Path((id, memory)): Path<(String, String)>) -> Api {
-    let mut c = s.core.lock().await;
-    let session = c.sessions.get_mut(&id).ok_or_else(missing)?;
-    let generation = session.memory.generation;
-    tools::revalidate(session)?;
-    let value = session.memory.get(&memory).cloned();
-    if session.memory.generation != generation {
-        changed(&s, &mut c);
-    }
-    Ok(Json(json!(value?)))
+    session_view::read(s, id, session_view::Read::Memory(memory)).await
 }
 async fn output(State(s): State<WebState>, Path(id): Path<String>) -> Api {
     let (project, timeout) = {
@@ -1191,13 +1160,17 @@ pub async fn serve_app(
     );
     let url = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
     // The listener is bound before launching the browser; failures leave a usable printed URL.
-    if open_browser {
-        std::thread::spawn(move || {
-            if let Err(error) = crate::desktop::open_browser(&url) {
+    let browser = open_browser.then(|| {
+        let stopping = state.stopping.clone();
+        tokio::spawn(async move {
+            let result = crate::desktop::open_browser_managed(&url, &stopping).await;
+            if let Err(error) = result
+                && !stopping.is_cancelled()
+            {
                 eprintln!("브라우저를 열지 못했습니다: {error}. 직접 접속하세요: {url}");
             }
-        });
-    }
+        })
+    });
     let shutdown = state.clone();
     let listener = ManagedListener::new(listener, state.stopping.clone());
     axum::serve(listener, app_router(state, frontend))
@@ -1210,12 +1183,64 @@ pub async fn serve_app(
             shutdown.shutdown().await;
         })
         .await?;
+    if let Some(browser) = browser {
+        let _ = browser.await;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod worker_wait_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn closing_idle_sessions_releases_the_session_order_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = Project {
+            root: dir.path().into(),
+            ..Default::default()
+        };
+        let state = WebState::new(
+            Config {
+                projects: vec![project.clone()],
+                ..Default::default()
+            },
+            dir.path().join("config.toml"),
+            Arc::new(OpenAiClient),
+        )
+        .unwrap();
+        for _ in 0..128 {
+            let _ = create_session(
+                State(state.clone()),
+                Json(NewSession {
+                    project: project.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let ids = state.core.lock().await.order.clone();
+        for id in &ids[..ids.len() - 1] {
+            let _ = close_session(State(state.clone()), Path(id.clone()))
+                .await
+                .unwrap();
+        }
+        {
+            let core = state.core.lock().await;
+            assert_eq!(core.order, ids[ids.len() - 1..]);
+            assert!(
+                core.order.capacity() <= 2,
+                "closed sessions kept order slots"
+            );
+        }
+        let _ = close_session(State(state.clone()), Path(ids.last().unwrap().clone()))
+            .await
+            .unwrap();
+        let core = state.core.lock().await;
+        assert!(core.sessions.is_empty());
+        assert!(core.order.is_empty());
+        assert_eq!(core.order.capacity(), 0);
+    }
 
     #[tokio::test]
     async fn oversized_directory_listing_is_rejected_instead_of_retaining_all_entries() {
@@ -1380,6 +1405,7 @@ mod worker_wait_tests {
             let core = state.core.lock().await;
             assert!(core.sessions.is_empty());
             assert!(core.order.is_empty());
+            assert_eq!(core.order.capacity(), 0);
             assert!(core.streams.is_empty());
         }
         state.shutdown().await;
@@ -1409,8 +1435,7 @@ mod worker_wait_tests {
             .core
             .lock()
             .await
-            .sessions
-            .get_mut(&id)
+            .session_mut(&id)
             .unwrap()
             .add_user("Existing task".into());
         let result = run(
@@ -1455,7 +1480,7 @@ mod worker_wait_tests {
         let id = state.core.lock().await.order[0].clone();
         let (bytes, next_id, sources, request, revision) = {
             let mut core = state.core.lock().await;
-            let session = core.sessions.get_mut(&id).unwrap();
+            let session = core.session_mut(&id).unwrap();
             session.add_user("Preserve the current task".into());
             session.history.push(
                 vec![json!({"role":"assistant","content":"x".repeat(4096)})],
@@ -1555,7 +1580,7 @@ mod worker_wait_tests {
         let id = state.core.lock().await.order[0].clone();
         {
             let mut core = state.core.lock().await;
-            let session = core.sessions.get_mut(&id).unwrap();
+            let session = core.session_mut(&id).unwrap();
             session.add_user("Investigate the original project".into());
             for bundle in &mut session.history.bundles {
                 bundle.active = false;

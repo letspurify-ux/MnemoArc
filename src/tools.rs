@@ -3111,45 +3111,93 @@ pub(crate) fn same_source(a: &crate::memory::Source, b: &crate::memory::Source) 
         && a.excerpt == b.excerpt
 }
 
-pub fn revalidate(s: &mut Session) -> Result<()> {
-    let paths: BTreeSet<String> = s
+pub(crate) struct Revalidation {
+    hashes: BTreeMap<String, Option<String>>,
+    stale_memories: BTreeSet<String>,
+    stale_investigations: Vec<String>,
+}
+
+impl Revalidation {
+    pub(crate) fn changed(&self) -> bool {
+        !self.stale_memories.is_empty() || !self.stale_investigations.is_empty()
+    }
+
+    pub(crate) fn apply(&self, s: &mut Session) {
+        for (path, hash) in &self.hashes {
+            s.memory.stale_path(path, hash.as_deref());
+        }
+        for item in &mut s.investigations {
+            if self.stale_investigations.contains(&item.id) {
+                item.status = "written".into();
+                item.note = "Source, memory or document changed; verification required".into();
+            }
+        }
+    }
+}
+
+/// Inspect immutable display snapshots on a file worker. Apply the result only
+/// to that same snapshot, so a slow check cannot overwrite newer session state.
+pub(crate) fn inspect_freshness(
+    s: &Session,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Revalidation> {
+    let paths: BTreeSet<&str> = s
         .memory
         .entries
         .values()
-        .flat_map(|m| m.sources.clone())
-        .chain(s.investigations.iter().flat_map(|i| i.sources.clone()))
-        .filter_map(|source| source.path)
+        .flat_map(|m| &m.sources)
+        .chain(s.investigations.iter().flat_map(|i| &i.sources))
+        .filter_map(|source| source.path.as_deref())
         .collect();
-    let mut hashes = std::collections::BTreeMap::new();
+    let mut hashes = BTreeMap::new();
     for path in paths {
-        let current = read_path(&s.project, &path)
-            .and_then(|p| hash_file(&p))
-            .ok();
-        s.memory.stale_path(&path, current.as_deref());
-        hashes.insert(path, current);
+        if cancel.is_cancelled() {
+            bail!("cancelled");
+        }
+        let current = read_path(&s.project, path).and_then(|p| hash_file(&p)).ok();
+        hashes.insert(path.to_owned(), current);
     }
-    let doc = output_path(&s.project)
-        .ok()
-        .and_then(|p| read_text(&p).ok());
-    let scopes: Vec<Option<String>> = s
-        .investigations
-        .iter()
-        .map(|item| {
-            doc.as_ref()
-                .and_then(|d| item_scope_text(d, &s.investigations, item).ok())
+    let source_changed = |source: &Source| {
+        source.path.as_ref().is_some_and(|path| {
+            hashes
+                .get(path)
+                .is_none_or(|hash| hash.as_deref() != source.hash.as_deref())
         })
+    };
+    let stale_memories: BTreeSet<_> = s
+        .memory
+        .entries
+        .values()
+        .filter(|memory| memory.status == crate::memory::MemoryStatus::Active)
+        .filter(|memory| memory.sources.iter().any(source_changed))
+        .map(|memory| memory.id.clone())
         .collect();
-    for (item, scope) in s.investigations.iter_mut().zip(scopes) {
-        let changed = item.sources.iter().any(|r| {
-            r.path.as_ref().is_some_and(|p| {
-                hashes
-                    .get(p)
-                    .is_none_or(|h| h.as_deref() != r.hash.as_deref())
-            })
-        }) || item.memory_refs.iter().any(|(id, rev)| {
-            s.memory.get(id).map_or(true, |m| {
-                m.revision != *rev || m.status != crate::memory::MemoryStatus::Active
-            })
+    let doc = (!s.investigations.is_empty())
+        .then(|| {
+            output_path(&s.project)
+                .ok()
+                .and_then(|p| read_text(&p).ok())
+        })
+        .flatten();
+    let index = doc.as_deref().map(documentation::HeadingIndex::new);
+    let mut stale_investigations = Vec::new();
+    for item in &s.investigations {
+        if cancel.is_cancelled() {
+            bail!("cancelled");
+        }
+        if item.status != "verified" {
+            continue;
+        }
+        let changed = item.sources.iter().any(source_changed)
+            || item.memory_refs.iter().any(|(id, rev)| {
+                s.memory.get(id).map_or(true, |m| {
+                    m.revision != *rev
+                        || m.status != crate::memory::MemoryStatus::Active
+                        || stale_memories.contains(&m.id)
+                })
+            });
+        let scope = doc.as_ref().zip(index.as_ref()).and_then(|(doc, index)| {
+            item_scope_text_indexed(doc, &s.investigations, item, index).ok()
         });
         // Sessions saved before scope_hash hashed the untrimmed scope.
         let doc_changed = match (scope.as_deref(), item.document_hash.as_deref()) {
@@ -3158,11 +3206,19 @@ pub fn revalidate(s: &mut Session) -> Result<()> {
             }
             (scope, recorded) => scope.is_some() || recorded.is_some(),
         };
-        if item.status == "verified" && (changed || doc_changed) {
-            item.status = "written".into();
-            item.note = "Source, memory or document changed; verification required".into();
+        if changed || doc_changed {
+            stale_investigations.push(item.id.clone());
         }
     }
+    Ok(Revalidation {
+        hashes,
+        stale_memories,
+        stale_investigations,
+    })
+}
+
+pub fn revalidate(s: &mut Session) -> Result<()> {
+    inspect_freshness(s, &tokio_util::sync::CancellationToken::new())?.apply(s);
     Ok(())
 }
 /// Session sources that cover part of a missing cited range: complete lines
@@ -3483,11 +3539,20 @@ fn scope_hash(scope: &str) -> String {
 /// had to cover and re-verify every citation in the document; a live run
 /// spent 20 rounds reading whole files for it.
 fn item_scope_text(doc: &str, items: &[Investigation], item: &Investigation) -> Result<String> {
-    let own = documentation::resolve_heading(doc, &item.section)?;
+    item_scope_text_indexed(doc, items, item, &documentation::HeadingIndex::new(doc))
+}
+
+fn item_scope_text_indexed(
+    doc: &str,
+    items: &[Investigation],
+    item: &Investigation,
+    index: &documentation::HeadingIndex,
+) -> Result<String> {
+    let own = index.resolve(&item.section)?;
     let mut cuts: Vec<(usize, usize)> = items
         .iter()
         .filter(|other| other.id != item.id && !other.section.trim().is_empty())
-        .filter_map(|other| documentation::resolve_heading(doc, &other.section).ok())
+        .filter_map(|other| index.resolve(&other.section).ok())
         .filter(|other| other.start > own.start && other.end <= own.end)
         .map(|other| (other.start, other.end))
         .collect();

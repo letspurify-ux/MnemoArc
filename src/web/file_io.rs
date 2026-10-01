@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::Duration,
 };
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 #[derive(Clone)]
@@ -28,6 +28,7 @@ impl FileIo {
 
     fn start<T: Send + 'static>(
         &self,
+        permit: Option<OwnedSemaphorePermit>,
         operation: impl FnOnce(CancellationToken) -> Result<T> + Send + 'static,
     ) -> Result<(oneshot::Receiver<Result<T>>, DropGuard), ApiError> {
         if self.stopping.is_cancelled() {
@@ -35,17 +36,21 @@ impl FileIo {
         }
         let cancel = self.stopping.child_token();
         let cancel_on_drop = cancel.clone().drop_guard();
-        let receiver = crate::worker::spawn(
-            self.workers.clone(),
-            "mnemoarc-web-io",
-            "file_worker_capacity: 이전 파일 작업이 아직 실행 중입니다. 잠시 후 다시 시도하세요.",
-            move || {
-                if cancel.is_cancelled() {
-                    anyhow::bail!("cancelled");
-                }
-                operation(cancel)
-            },
-        )
+        let operation = move || {
+            if cancel.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            operation(cancel)
+        };
+        let receiver = match permit {
+            Some(permit) => crate::worker::spawn_permitted(permit, "mnemoarc-web-io", operation),
+            None => crate::worker::spawn(
+                self.workers.clone(),
+                "mnemoarc-web-io",
+                "file_worker_capacity: 이전 파일 작업이 아직 실행 중입니다. 잠시 후 다시 시도하세요.",
+                operation,
+            ),
+        }
         .map_err(|error| ApiError(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
         Ok((receiver, cancel_on_drop))
     }
@@ -55,7 +60,37 @@ impl FileIo {
         timeout: Duration,
         operation: impl FnOnce(CancellationToken) -> Result<T> + Send + 'static,
     ) -> Result<T, ApiError> {
-        let (receiver, _cancel_on_drop) = self.start(operation)?;
+        let (receiver, _cancel_on_drop) = self.start(None, operation)?;
+        self.finish(receiver, timeout).await
+    }
+
+    /// Snapshot readers share existing snapshots while waiting. Queue short
+    /// bursts without admitting extra live threads or rejecting normal polls.
+    pub(super) async fn run_queued<T: Send + 'static>(
+        &self,
+        timeout: Duration,
+        operation: impl FnOnce(CancellationToken) -> Result<T> + Send + 'static,
+    ) -> Result<T, ApiError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let permit = tokio::select! {
+            biased;
+            _ = self.stopping.cancelled() => return Err(stopping()),
+            result = self.workers.clone().acquire_owned() => result.map_err(|_| stopping())?,
+            _ = tokio::time::sleep_until(deadline) => return Err(timed_out()),
+        };
+        let (receiver, _cancel_on_drop) = self.start(Some(permit), operation)?;
+        self.finish(
+            receiver,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await
+    }
+
+    async fn finish<T>(
+        &self,
+        receiver: oneshot::Receiver<Result<T>>,
+        timeout: Duration,
+    ) -> Result<T, ApiError> {
         tokio::select! {
             biased;
             _ = self.stopping.cancelled() => Err(stopping()),
@@ -76,7 +111,7 @@ impl FileIo {
         // cannot poll the body because the client's socket is full.
         let (sender, receiver) = mpsc::channel(1);
         let runtime = tokio::runtime::Handle::current();
-        let (finished, cancel_on_drop) = self.start(move |cancel| {
+        let (finished, cancel_on_drop) = self.start(None, move |cancel| {
             loop {
                 if cancel.is_cancelled() {
                     anyhow::bail!("cancelled");
@@ -273,6 +308,65 @@ mod tests {
                     .await
                     .unwrap(),
                 42
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_reads_wait_for_capacity_and_cancel_before_starting_work() {
+        for outcome in ["release", "abort", "shutdown", "timeout"] {
+            let io = isolated();
+            let permit = io.workers.clone().acquire_owned().await.unwrap();
+            let started = Arc::new(AtomicUsize::new(0));
+            let count = started.clone();
+            let reader = io.clone();
+            let request = tokio::spawn(async move {
+                reader
+                    .run_queued(
+                        Duration::from_millis(if outcome == "timeout" { 50 } else { 2000 }),
+                        move |_| {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            Ok(42)
+                        },
+                    )
+                    .await
+            });
+            tokio::task::yield_now().await;
+            assert!(
+                !request.is_finished(),
+                "queued read rejected a short worker burst"
+            );
+            assert_eq!(started.load(Ordering::SeqCst), 0);
+            if outcome == "release" {
+                drop(permit);
+                assert_eq!(request.await.unwrap().unwrap(), 42);
+                idle(&io).await;
+                assert_eq!(started.load(Ordering::SeqCst), 1);
+                continue;
+            }
+            match outcome {
+                "abort" => {
+                    request.abort();
+                    assert!(request.await.unwrap_err().is_cancelled());
+                }
+                "shutdown" => {
+                    io.stopping.cancel();
+                    assert_eq!(
+                        request.await.unwrap().unwrap_err().0,
+                        StatusCode::SERVICE_UNAVAILABLE
+                    );
+                }
+                _ => assert_eq!(
+                    request.await.unwrap().unwrap_err().0,
+                    StatusCode::GATEWAY_TIMEOUT
+                ),
+            }
+            drop(permit);
+            idle(&io).await;
+            assert_eq!(
+                started.load(Ordering::SeqCst),
+                0,
+                "abandoned read started a worker"
             );
         }
     }

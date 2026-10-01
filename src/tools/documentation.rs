@@ -1,5 +1,6 @@
 use super::*;
 
+#[derive(Clone)]
 pub(super) struct Heading {
     pub heading: String,
     pub start: usize,
@@ -190,90 +191,109 @@ fn short_title(title: &str) -> (Option<&str>, &str) {
 
 /// Full headings, unique bare titles, or newline-separated ancestor paths
 /// whose lines may be either form.
-pub(super) fn resolve_heading(doc: &str, requested: &str) -> Result<Heading> {
-    let requested = requested.trim();
-    let headings = headings(doc);
-    let paths = heading_paths(&headings);
-    let requested_path = requested
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let is_path = requested_path.contains('\n');
-    let matches = |(index, h): &(usize, &Heading)| {
-        if requested.is_empty() {
-            return false;
-        }
-        if is_path {
-            paths[*index] == requested_path
-        } else if requested.starts_with('#') {
-            h.heading == requested
-        } else {
-            bare_heading_title(&h.heading) == requested
-        }
-    };
-    let mut matching: Vec<_> = headings.iter().enumerate().filter(matches).collect();
-    // A heading named by its short form, e.g. "## 1. 처음 설정" or "처음 설정"
-    // for "## 1. 처음 설정: 모델 연결 정보 입력": compare the title before a
-    // colon without its section number. Section numbers must agree when both
-    // have one, and only a single match counts.
-    if matching.is_empty() && !is_path {
-        let (number, core) = short_title(bare_heading_title(requested));
-        if core.chars().count() >= 2 {
-            let short: Vec<_> = headings
-                .iter()
-                .enumerate()
-                .filter(|(_, h)| {
-                    let (other_number, other_core) = short_title(bare_heading_title(&h.heading));
-                    other_core == core
-                        && (number.is_none() || other_number.is_none() || number == other_number)
-                })
-                .collect();
-            if short.len() == 1 {
-                matching = short;
+pub(super) struct HeadingIndex {
+    headings: Vec<Heading>,
+    paths: Vec<String>,
+}
+
+impl HeadingIndex {
+    pub(super) fn new(doc: &str) -> Self {
+        let headings = headings(doc);
+        let paths = heading_paths(&headings);
+        Self { headings, paths }
+    }
+
+    pub(super) fn resolve(&self, requested: &str) -> Result<&Heading> {
+        let requested = requested.trim();
+        let headings = &self.headings;
+        let paths = &self.paths;
+        let requested_path = requested
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let is_path = requested_path.contains('\n');
+        let matches = |(index, h): &(usize, &Heading)| {
+            if requested.is_empty() {
+                return false;
+            }
+            if is_path {
+                paths[*index] == requested_path
+            } else if requested.starts_with('#') {
+                h.heading == requested
+            } else {
+                bare_heading_title(&h.heading) == requested
+            }
+        };
+        let mut matching: Vec<_> = headings.iter().enumerate().filter(matches).collect();
+        // A heading named by its short form, e.g. "## 1. 처음 설정" or "처음 설정"
+        // for "## 1. 처음 설정: 모델 연결 정보 입력": compare the title before a
+        // colon without its section number. Section numbers must agree when both
+        // have one, and only a single match counts.
+        if matching.is_empty() && !is_path {
+            let (number, core) = short_title(bare_heading_title(requested));
+            if core.chars().count() >= 2 {
+                let short: Vec<_> = headings
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, h)| {
+                        let (other_number, other_core) =
+                            short_title(bare_heading_title(&h.heading));
+                        other_core == core
+                            && (number.is_none()
+                                || other_number.is_none()
+                                || number == other_number)
+                    })
+                    .collect();
+                if short.len() == 1 {
+                    matching = short;
+                }
             }
         }
-    }
-    // A path may mix full headings and bare titles line by line; compare bare
-    // titles only when the exact path found nothing.
-    if matching.is_empty() && is_path {
-        let requested: Vec<_> = requested_path.split('\n').map(bare_heading_title).collect();
-        matching = headings
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| {
-                paths[*index]
-                    .split('\n')
-                    .map(bare_heading_title)
-                    .eq(requested.iter().copied())
-            })
-            .collect();
-    }
-    if matching.len() != 1 {
-        let candidate_indices: Vec<_> = if matching.is_empty() {
-            (0..headings.len()).take(8).collect()
-        } else {
-            matching.iter().map(|(index, _)| *index).take(8).collect()
-        };
-        let candidates: Vec<_> = candidate_indices
+        // A path may mix full headings and bare titles line by line; compare bare
+        // titles only when the exact path found nothing.
+        if matching.is_empty() && is_path {
+            let requested: Vec<_> = requested_path.split('\n').map(bare_heading_title).collect();
+            matching = headings
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| {
+                    paths[*index]
+                        .split('\n')
+                        .map(bare_heading_title)
+                        .eq(requested.iter().copied())
+                })
+                .collect();
+        }
+        if matching.len() != 1 {
+            let candidate_indices: Vec<_> = if matching.is_empty() {
+                (0..headings.len()).take(8).collect()
+            } else {
+                matching.iter().map(|(index, _)| *index).take(8).collect()
+            };
+            let candidates: Vec<_> = candidate_indices
             .into_iter()
             .map(|index| json!({"heading":headings[index].heading,"section_path":paths[index],"start_line":headings[index].line}))
             .collect();
-        if matching.is_empty() {
+            if matching.is_empty() {
+                bail!(
+                    "section_not_found: {requested:?}; use document_inspect without section for the outline. Headings: {}",
+                    json!(candidates)
+                );
+            }
             bail!(
-                "section_not_found: {requested:?}; use document_inspect without section for the outline. Headings: {}",
+                "ambiguous_section: {requested:?} matches {} headings; copy section_path from the document_inspect outline to distinguish nested headings. If the full paths also repeat, use a unique text anchor for editing. Matches: {}",
+                matching.len(),
                 json!(candidates)
             );
         }
-        bail!(
-            "ambiguous_section: {requested:?} matches {} headings; copy section_path from the document_inspect outline to distinguish nested headings. If the full paths also repeat, use a unique text anchor for editing. Matches: {}",
-            matching.len(),
-            json!(candidates)
-        );
+        Ok(matching[0].1)
     }
-    let start = matching[0].1.start;
-    Ok(headings.into_iter().find(|h| h.start == start).unwrap())
+}
+
+pub(super) fn resolve_heading(doc: &str, requested: &str) -> Result<Heading> {
+    HeadingIndex::new(doc).resolve(requested).cloned()
 }
 
 pub(super) fn execute(

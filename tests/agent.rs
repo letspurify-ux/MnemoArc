@@ -392,6 +392,9 @@ async fn unknown_model_accepts_large_memory_metadata_over_three_checkpoints() {
     let mut session = s(dir.path());
     session.config.model = "z-ai/glm-5.3-flash".into();
     session.config.index_tokens = 20_000;
+    // Leave room for small project/state additions. The explicit prepare call
+    // still forces every checkpoint, and RetryCleanup checks request capacity.
+    session.config.context_tokens += 1024;
     session
         .task
         .constraints
