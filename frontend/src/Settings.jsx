@@ -235,6 +235,7 @@ export default function Settings({
   sessionCredential,
   sessionConfig,
   sessionId,
+  sessionReady,
   onSaved,
   onClose,
   onDirtyChange,
@@ -267,6 +268,7 @@ export default function Settings({
     };
   }, [onDirtyChange]);
   const group = groups.find((g) => g.id === tab);
+  const waitingForSession = Boolean(sessionId && !sessionReady && (scope === "session" || apply));
   const change = (name, value) => {
     setDraft((d) => ({ ...d, [name]: value }));
     setDirty(true);
@@ -284,7 +286,7 @@ export default function Settings({
         : "keep",
   });
   async function save() {
-    if (operation.current) return;
+    if (operation.current || waitingForSession) return;
     operation.current = true;
     const submittedVersion = draftVersion.current;
     setBusy(true);
@@ -558,6 +560,7 @@ export default function Settings({
               {message}
             </div>
           )}
+          {waitingForSession && <p role="status" className="subtle">현재 세션의 최신 설정을 확인하는 중입니다.</p>}
           <footer className="settings-actions">
             {tab === "connection" && (
               <button className="secondary" disabled={busy} onClick={check}>
@@ -565,7 +568,7 @@ export default function Settings({
               </button>
             )}
             <span>{dirty ? "저장하지 않은 변경 사항" : ""}</span>
-            <button className="primary" disabled={busy} onClick={save}>
+            <button className="primary" disabled={busy || waitingForSession} onClick={save}>
               {busy ? "처리 중…" : "설정 저장"}
             </button>
           </footer>

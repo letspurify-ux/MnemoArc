@@ -45,11 +45,18 @@ export const FULL_REFRESH = { state: true, session: true };
 export const NO_REFRESH = { state: false, session: false };
 export const mergeRefresh = (first, second) => ({ state: first.state || second.state, session: first.session || second.session });
 
-export function changeRefresh(data, selected, revision = 0) {
+export function parseChange(data) {
   try {
     const change = JSON.parse(data);
     if (!Number.isFinite(change.revision) || typeof change.state !== "boolean" ||
-        (change.session !== null && typeof change.session !== "string")) return FULL_REFRESH;
-    return { state: change.state, session: change.session === null || (change.session === selected && change.revision > revision) };
-  } catch { return FULL_REFRESH; }
+        (change.session !== null && typeof change.session !== "string")) return null;
+    return change;
+  } catch { return null; }
+}
+
+export function changeRefresh(data, selected, revision = 0) {
+  const change = parseChange(data);
+  return change
+    ? { state: change.state, session: change.session === null || (change.session === selected && change.revision > revision) }
+    : FULL_REFRESH;
 }

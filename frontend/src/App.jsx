@@ -7,7 +7,7 @@ import { api, download, send, statusLabel, toolLabels } from "./api.js";
 import { mergeSession, mergeOlder } from "./session-history.js";
 import { useServerDraft } from "./use-server-draft.js";
 import { createComposerDrafts } from "./composer-drafts.js";
-import { createSessionCache, FULL_REFRESH, NO_REFRESH, mergeRefresh, changeRefresh } from "./session-cache.js";
+import { createSessionCache, FULL_REFRESH, NO_REFRESH, mergeRefresh, changeRefresh, parseChange } from "./session-cache.js";
 
 const DEFAULT_INSPECTOR_WIDTH = 295;
 const MIN_INSPECTOR_WIDTH = 240;
@@ -62,6 +62,8 @@ export default function App() {
     timer = useRef(null),
     alive = useRef(true),
     versions = useRef(new Map()),
+    expectedVersions = useRef(new Map()),
+    globalVersion = useRef(0),
     settingsDirty = useRef(false),
     projectsDirty = useRef(false),
     inspectorDirty = useRef(false),
@@ -83,6 +85,13 @@ export default function App() {
     setSession(value);
     if (value) cache.set(value);
   }, [cache]);
+  // A displayed response may lag a change already announced by the server.
+  // Keep that minimum separate from accepted responses and from other sessions.
+  const requiredVersion = useCallback((id) => Math.max(
+    versions.current.get(id) || 0,
+    expectedVersions.current.get(id) || 0,
+    globalVersion.current,
+  ), []);
   const refresh = useCallback((restart = false, scope = FULL_REFRESH) => {
     if (!alive.current) return Promise.resolve();
     pending.current = mergeRefresh(pending.current, scope);
@@ -116,7 +125,10 @@ export default function App() {
         const previous = displayed.current?.id === id ? displayed.current : cache.peek(id);
         displaySession(mergeSession(previous, current));
         lastChecked.current.session = Date.now();
-        setSessionReady(true);
+        setSessionReady(current.revision >= requiredVersion(id));
+      } else if (isCurrent() && selection.current === id) {
+        setSessionReady(false);
+        pending.current = mergeRefresh(pending.current, { state: false, session: true });
       }
     };
     // A known selection can load independently of the sidebar. Navigating
@@ -136,7 +148,15 @@ export default function App() {
             drafts.retain(ids);
             cache.retain(ids);
             const keep = new Set(ids);
-            for (const id of versions.current.keys()) if (!keep.has(id)) versions.current.delete(id);
+            for (const entries of [versions.current, expectedVersions.current]) {
+              for (const id of entries.keys()) if (!keep.has(id)) entries.delete(id);
+            }
+            for (const summary of next.sessions) {
+              expectedVersions.current.set(summary.id, Math.max(
+                expectedVersions.current.get(summary.id) || 0,
+                summary.revision || 0,
+              ));
+            }
           }
           let id = selection.current;
           if (!next.sessions.some((s) => s.id === id)) {
@@ -148,15 +168,19 @@ export default function App() {
             scope = { ...scope, session: true };
             window.history.replaceState(null, "", id ? `#${id}` : window.location.pathname + window.location.search);
           }
-          const summary = next.sessions.find((s) => s.id === id);
           if (id) {
+            if (requiredVersion(id) > (versions.current.get(id) ?? -1)) setSessionReady(false);
             if (early && id === earlyId) {
               const error = await early;
               if (error) throw error;
             }
             if ((scope.session && (!early || id !== earlyId)) ||
-                (summary?.revision ?? 0) > (versions.current.get(id) ?? -1)) {
+                requiredVersion(id) > (versions.current.get(id) ?? -1)) {
               await loadSession(id);
+            }
+            if (isCurrent() && requiredVersion(id) > (versions.current.get(id) ?? -1)) {
+              setSessionReady(false);
+              pending.current = mergeRefresh(pending.current, { state: false, session: true });
             }
           } else {
             displaySession(null);
@@ -188,7 +212,7 @@ export default function App() {
       if (replacement && replacement !== request) await replacement.done;
     })();
     return request.done;
-  }, [cache, displaySession, drafts]);
+  }, [cache, displaySession, drafts, requiredVersion]);
   useEffect(() => {
     if (stopped) return;
     alive.current = true;
@@ -202,6 +226,15 @@ export default function App() {
     };
     stream.addEventListener("changed", (event) => {
       const scope = changeRefresh(event.data, selection.current, versions.current.get(selection.current) || 0);
+      const change = parseChange(event.data);
+      if (change) {
+        if (change.session === null) globalVersion.current = Math.max(globalVersion.current, change.revision);
+        else expectedVersions.current.set(change.session, Math.max(
+          expectedVersions.current.get(change.session) || 0, change.revision,
+        ));
+        if (scope.session && requiredVersion(selection.current) > (versions.current.get(selection.current) || 0))
+          setSessionReady(false);
+      }
       if (!scope.state && !scope.session) return;
       pending.current = mergeRefresh(pending.current, scope);
       if (timer.current) return;
@@ -234,7 +267,7 @@ export default function App() {
       document.removeEventListener("visibilitychange", resume);
       timer.current = null;
     };
-  }, [refresh, stopped]);
+  }, [refresh, requiredVersion, stopped]);
   useEffect(() => {
     const narrow = window.matchMedia("(max-width: 1000px)");
     const closeOnNarrow = (event) => {
@@ -371,6 +404,8 @@ export default function App() {
       drafts.retain([]);
       cache.clear();
       versions.current.clear();
+      expectedVersions.current.clear();
+      globalVersion.current = 0;
       setStopped(true);
     } catch (e) {
       setError(e.message);
@@ -572,6 +607,7 @@ export default function App() {
             sessionCredential={session?.credential_configured}
             sessionConfig={session?.pending_config || session?.config}
             sessionId={session?.id}
+            sessionReady={sessionReady}
             onSaved={() => refresh(true)}
             onClose={() => showPage("chat")}
             onDirtyChange={onSettingsDirtyChange}
@@ -1363,8 +1399,9 @@ function Inspector({
                   type="checkbox"
                   aria-label={toolLabels[tool.name] || tool.name}
                   checked={!tool.optional || toolSelection.includes(tool.name)}
-                  disabled={!tool.optional || toolsSaving}
+                  disabled={navigating || !tool.optional || toolsSaving}
                   onChange={(e) => {
+                    if (navigating || toolsSaving) return;
                     const next = new Set(toolSelection);
                     e.target.checked
                       ? next.add(tool.name)
