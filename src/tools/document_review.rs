@@ -888,6 +888,20 @@ struct Verdict {
 }
 
 pub fn finish(s: &mut Session, text: &str) -> Result<()> {
+    finish_response(s, text)?;
+    // The rejected response's error is feedback for its retry only. Left in
+    // place it was sent as previous_response_error to later pages and to
+    // validation (6 of 23 review calls in a live run).
+    if s.last_error.as_deref().is_some_and(|error| {
+        error.starts_with("document_review_invalid:")
+            || error.starts_with("document_review_incomplete:")
+    }) {
+        s.last_error = None;
+    }
+    Ok(())
+}
+
+fn finish_response(s: &mut Session, text: &str) -> Result<()> {
     let mut body = text.trim();
     // Models occasionally add a JSON code fence despite the strict output
     // contract. Accept the common fenced forms, including `JSON` and CRLF,

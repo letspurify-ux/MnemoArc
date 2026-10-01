@@ -462,3 +462,35 @@ fn rewriting_the_same_unresolved_claim_does_not_fake_progress() {
         assert_eq!(s.document_review.resolved_findings, 0);
     }
 }
+
+#[test]
+fn a_rejected_response_error_is_not_resent_after_a_valid_response() {
+    // The error belongs to the retry of the rejected response only; a live
+    // run sent it to later pages and to validation.
+    let (_dir, mut s) = fixture();
+    s.last_error = Some("document_review_invalid: quote is absent on this supplied page".into());
+    let retry = payload(review::request(&mut s).unwrap());
+    assert!(
+        retry["previous_response_error"]
+            .as_str()
+            .unwrap()
+            .contains("quote is absent")
+    );
+    submit(
+        &mut s,
+        vec![proposal("문서가 반복 횟수를 잘못 설명합니다.")],
+    );
+    assert!(s.last_error.is_none());
+    assert!(s.document_review.validating);
+    let verify = payload(review::request(&mut s).unwrap());
+    assert_eq!(verify["previous_response_error"], Value::Null);
+    // Other errors are not review feedback and stay in place.
+    s.last_error = Some("document_review: unrelated repair note".into());
+    validate(&mut s, vec![decision("F1", "confirmed")]);
+    assert!(
+        s.last_error
+            .as_deref()
+            .unwrap()
+            .starts_with("document_review:")
+    );
+}
