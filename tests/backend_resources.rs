@@ -427,3 +427,274 @@ async fn aborting_the_server_releases_active_model_connections_and_event_streams
             .is_ok()
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_headless_work_exits_when_its_output_pipe_stops_reading() {
+    for close_pipe in [false, true] {
+        use std::process::Stdio;
+        use tokio::io::AsyncReadExt;
+
+        let dropped = CancellationToken::new();
+        let upstream = Router::new().route(
+            "/chat/completions",
+            post({
+                let dropped = dropped.clone();
+                move || {
+                    let guard = dropped.clone().drop_guard();
+                    async move {
+                        let stream = futures_util::stream::unfold(
+                            (guard, true),
+                            |(guard, first)| async move {
+                                let text = if first {
+                                    format!(
+                                        "data: {}\n\n",
+                                        json!({"choices":[{"delta":{"content":"x".repeat(2 * 1024 * 1024)}}]})
+                                    )
+                                } else {
+                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                    ": keepalive\n\n".into()
+                                };
+                                Some((Ok::<_, Infallible>(text), (guard, false)))
+                            },
+                        );
+                        (
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            Body::from_stream(stream),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let upstream_server =
+            tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        Config {
+            base_url,
+            model: "gpt-4o".into(),
+            model_context: Some(128_000),
+            api_key_env: "MNEMOARC_RESOURCE_TEST_KEY".into(),
+            disable_proxy: true,
+            retries: 0,
+            request_timeout_secs: 60,
+            run_timeout_secs: 60,
+            source_answer_review: false,
+            completion_review_enabled: false,
+            ..Default::default()
+        }
+        .save(&dir.path().join("config.toml"))
+        .unwrap();
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_mnemoarc"))
+            .args([
+                "--config",
+                "config.toml",
+                "run",
+                "--project",
+                ".",
+                "--prompt",
+                "Wait for cancellation",
+            ])
+            .current_dir(dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut output = Some(child.stdout.take().unwrap());
+        tokio::time::timeout(Duration::from_secs(10), output.as_mut().unwrap().read_u8())
+            .await
+            .unwrap()
+            .unwrap();
+        // Keep the pipe open without draining the multi-megabyte delta. The
+        // renderer is blocked in the OS write, rather than waiting for model data.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if close_pipe {
+            drop(output.take());
+        } else {
+            assert_eq!(
+                unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGINT) },
+                0
+            );
+        }
+        let stopped = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+        if stopped.is_err() {
+            child.kill().await.unwrap();
+        }
+        drop(output);
+        let released = tokio::time::timeout(Duration::from_secs(2), dropped.cancelled()).await;
+        upstream_server.abort();
+        let _ = upstream_server.await;
+        assert_eq!(
+            stopped
+                .expect(
+                    "headless cancellation retained a blocked renderer and prevented process shutdown"
+                )
+                .unwrap()
+                .code(),
+            Some(0)
+        );
+        released.expect("headless cancellation retained its model connection");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn headless_failure_exits_when_stderr_is_full() {
+    use std::{io::Write, os::unix::net::UnixStream, process::Stdio};
+
+    let (consumer, mut producer) = UnixStream::pair().unwrap();
+    producer.set_nonblocking(true).unwrap();
+    loop {
+        match producer.write(&[b'x'; 16 * 1024]) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("cannot fill stderr fixture: {error}"),
+        }
+    }
+    producer.set_nonblocking(false).unwrap();
+    let entered = Arc::new(Notify::new());
+    let upstream = Router::new().route(
+        "/chat/completions",
+        post({
+            let entered = entered.clone();
+            move || {
+                let entered = entered.clone();
+                async move {
+                    entered.notify_one();
+                    (axum::http::StatusCode::BAD_REQUEST, "invalid request")
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let upstream_server =
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    Config {
+        base_url,
+        model: "gpt-4o".into(),
+        model_context: Some(128_000),
+        api_key_env: "MNEMOARC_RESOURCE_TEST_KEY".into(),
+        disable_proxy: true,
+        retries: 0,
+        request_timeout_secs: 60,
+        run_timeout_secs: 60,
+        source_answer_review: false,
+        completion_review_enabled: false,
+        ..Default::default()
+    }
+    .save(&dir.path().join("config.toml"))
+    .unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_mnemoarc"))
+        .args([
+            "--config",
+            "config.toml",
+            "run",
+            "--project",
+            ".",
+            "--prompt",
+            "Return the provider failure",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::os::fd::OwnedFd::from(producer)))
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .unwrap();
+    let stopped = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+    if stopped.is_err() {
+        child.kill().await.unwrap();
+    }
+    drop(consumer);
+    upstream_server.abort();
+    let _ = upstream_server.await;
+    assert_eq!(
+        stopped
+            .expect("an unread diagnostic log retained the failed model request and Tokio runtime")
+            .unwrap()
+            .code(),
+        Some(2)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn web_startup_and_shutdown_finish_with_an_unread_output_stream() {
+    use std::{io::Write, os::unix::net::UnixStream, process::Stdio};
+
+    let (consumer, mut producer) = UnixStream::pair().unwrap();
+    producer.set_nonblocking(true).unwrap();
+    loop {
+        match producer.write(&[b'x'; 16 * 1024]) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("cannot fill stdout fixture: {error}"),
+        }
+    }
+    producer.set_nonblocking(false).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    Config::default()
+        .save(&dir.path().join("config.toml"))
+        .unwrap();
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_mnemoarc"))
+        .args([
+            "--config",
+            "config.toml",
+            "web",
+            "--no-open",
+            "--port",
+            &port.to_string(),
+            "--shutdown-on-stdin",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(producer)))
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if client
+                .get(format!("http://127.0.0.1:{port}/api/state"))
+                .send()
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(child.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    drop(child.stdin.take());
+    let stopped = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+    if stopped.is_err() {
+        child.kill().await.unwrap();
+    }
+    drop(consumer);
+    ready.expect("a startup log blocked the bound HTTP listener from serving requests");
+    assert!(
+        stopped
+            .expect("server shutdown waited for the output stream to resume reading")
+            .unwrap()
+            .success()
+    );
+}

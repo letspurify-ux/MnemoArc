@@ -4310,7 +4310,8 @@ fn execute_repaired(
             let root = s.project.root.canonicalize()?;
             let names = files
                 .iter()
-                .map(|p| p.strip_prefix(&root).unwrap().display().to_string())
+                // The root can be replaced after the walk canonicalized it.
+                .map(|p| p.strip_prefix(&root).unwrap_or(p).display().to_string())
                 .collect::<Vec<_>>();
             let fingerprint = hash(
                 serde_json::to_string(&(mode, path_glob(&args)?, &directory, &names))?.as_bytes(),

@@ -2,7 +2,8 @@
 //! writes, guesses source IDs, or relaxes validation on the model's behalf.
 use super::*;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -421,9 +422,23 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
 /// A success resets only that tool's failures; unrelated writes cannot hide it.
 #[derive(Default)]
 pub struct FailureTracker {
-    by_tool_and_code: BTreeMap<(String, String), usize>,
-    by_tool: BTreeMap<String, usize>,
-    by_invocation: BTreeMap<(String, String, String), (String, usize)>,
+    by_tool_and_code: VecDeque<CodeFailure>,
+    by_tool: BTreeMap<&'static str, usize>,
+    by_invocation: VecDeque<InvocationFailure>,
+}
+
+struct CodeFailure {
+    tool: &'static str,
+    code: [u8; 32],
+    count: usize,
+}
+
+struct InvocationFailure {
+    tool: &'static str,
+    arguments: [u8; 32],
+    code: [u8; 32],
+    error: [u8; 32],
+    count: usize,
 }
 
 /// Every failed item in a mixed batch must be correctable. An uncertain write
@@ -470,6 +485,53 @@ pub fn annotate_identical_document_failure(result: &mut Value) {
 }
 
 impl FailureTracker {
+    // Correctable document failures can continue after the ordinary retry
+    // limit and history pruning. Bound their separate repeat-detection cache;
+    // eviction never resets the aggregate per-tool failure budget.
+    const MAX_INVOCATIONS: usize = 128;
+    const MAX_CODES: usize = 128;
+    const UNSUPPORTED: &'static str = "<unsupported_tool>";
+
+    fn tool_key(tool: &str) -> &'static str {
+        // Only registered names may allocate an aggregate counter. A model
+        // changing an unsupported name must not grow this map or evade its
+        // failure budget. Retain the registry's fixed names once per process.
+        static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
+        NAMES
+            .get_or_init(|| {
+                ToolRegistry::specs()
+                    .into_iter()
+                    .map(|spec| spec.name)
+                    .collect()
+            })
+            .iter()
+            .copied()
+            .find(|name| *name == tool)
+            .unwrap_or(Self::UNSUPPORTED)
+    }
+
+    fn note_code(&mut self, tool: &'static str, code: [u8; 32]) -> usize {
+        let previous = self
+            .by_tool_and_code
+            .iter()
+            .position(|failure| failure.tool == tool && failure.code == code)
+            .and_then(|index| self.by_tool_and_code.remove(index));
+        let mut recent = previous.unwrap_or(CodeFailure {
+            tool,
+            code,
+            count: 0,
+        });
+        recent.count = recent.count.saturating_add(1);
+        let count = recent.count;
+        // Per-code counts are diagnostic. Eviction does not reset the
+        // per-tool totals that enforce the retry limit.
+        if self.by_tool_and_code.len() == Self::MAX_CODES {
+            self.by_tool_and_code.pop_front();
+        }
+        self.by_tool_and_code.push_back(recent);
+        count
+    }
+
     pub fn observe(
         &mut self,
         tool: &str,
@@ -477,48 +539,64 @@ impl FailureTracker {
         result: &Value,
         limit: usize,
     ) -> Option<String> {
-        if result["status"] == "ok" {
-            self.by_tool_and_code.retain(|(name, _), _| name != tool);
-            self.by_tool.remove(tool);
-            self.by_invocation.retain(|(name, _, _), _| name != tool);
-            return None;
-        }
         if result["status"] == "cancelled" {
             return None;
         }
+        let tool_key = Self::tool_key(tool);
+        if result["status"] == "ok" {
+            if tool_key != Self::UNSUPPORTED {
+                self.by_tool_and_code
+                    .retain(|failure| failure.tool != tool_key);
+                self.by_tool.remove(tool_key);
+                self.by_invocation
+                    .retain(|failure| failure.tool != tool_key);
+            }
+            return None;
+        }
         let code = result["recovery"]["code"].as_str().unwrap_or("tool_error");
+        let code_key = Sha256::digest(code.as_bytes()).into();
         let error = result["error"].as_str().unwrap_or("unknown failure");
         if matches!(tool, "document_edit" | "document_edit_batch")
             && result["recovery"]["class"] == "invalid_input"
         {
-            let key = (
-                tool.to_owned(),
-                super::hash(arguments.as_bytes()),
-                code.to_owned(),
-            );
-            let (previous_error, count) = self
+            let arguments = Sha256::digest(arguments.as_bytes()).into();
+            let error = Sha256::digest(error.as_bytes()).into();
+            let previous = self
                 .by_invocation
-                .entry(key)
-                .or_insert_with(|| (error.to_owned(), 0));
-            if previous_error == error {
-                *count += 1;
+                .iter()
+                .position(|failure| {
+                    failure.tool == tool_key
+                        && failure.arguments == arguments
+                        && failure.code == code_key
+                })
+                .and_then(|index| self.by_invocation.remove(index));
+            let mut recent = previous.unwrap_or(InvocationFailure {
+                tool: tool_key,
+                arguments,
+                code: code_key,
+                error,
+                count: 0,
+            });
+            if recent.error == error {
+                recent.count = recent.count.saturating_add(1);
             } else {
-                *previous_error = error.to_owned();
-                *count = 1;
+                recent.error = error;
+                recent.count = 1;
             }
-            if *count >= 2 {
+            let repeated = recent.count >= 2;
+            if self.by_invocation.len() == Self::MAX_INVOCATIONS {
+                self.by_invocation.pop_front();
+            }
+            self.by_invocation.push_back(recent);
+            if repeated {
                 return Some(format!(
                     "identical_tool_failure: {tool} repeated the same invalid arguments and identical cause ({code}); inspect the current state and use one targeted edit with corrected arguments instead of resubmitting this call"
                 ));
             }
         }
-        let code_count = self
-            .by_tool_and_code
-            .entry((tool.into(), code.into()))
-            .or_default();
-        *code_count += 1;
-        let total_count = self.by_tool.entry(tool.into()).or_default();
-        *total_count += 1;
+        let code_count = self.note_code(tool_key, code_key);
+        let total_count = self.by_tool.entry(tool_key).or_default();
+        *total_count = total_count.saturating_add(1);
         (*total_count >= limit).then(|| format!(
             "tool_recovery_limit: {tool} failed {total_count} times (latest code {code}, code count {code_count}); last cause: {error}; state and completed writes retained"
         ))

@@ -1006,6 +1006,8 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "globset",
+ "hyper",
+ "hyper-util",
  "ignore",
  "libc",
  "mime_guess",

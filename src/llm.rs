@@ -18,6 +18,8 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+mod dns;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -195,11 +197,12 @@ fn record_attempt_failure(
     };
     // Group interleaved attempts from concurrent requests without logging the
     // request payload. JSON also keeps provider newlines on one log line.
-    use std::io::Write;
-    let _ = writeln!(
-        std::io::stderr(),
-        "[llm] {}",
-        json!({"request_id":request_id,"attempt_failure":diagnostic})
+    crate::console::notice(
+        crate::console::Target::Stderr,
+        format!(
+            "[llm] {}\n",
+            json!({"request_id":request_id,"attempt_failure":diagnostic})
+        ),
     );
     diagnostics.push(diagnostic);
 }
@@ -401,7 +404,9 @@ impl SseDecoder {
 }
 impl OpenAiClient {
     fn client(c: &Config) -> Result<reqwest::Client> {
-        let mut b = reqwest::Client::builder().connect_timeout(Duration::from_secs(15));
+        let mut b = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .dns_resolver(Arc::new(dns::SystemDns::default()));
         if c.disable_proxy {
             b = b.no_proxy();
         } else if let Some(proxy) = &c.proxy {

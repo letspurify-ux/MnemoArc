@@ -66,7 +66,8 @@ impl Drop for Claim {
         if self.completed {
             return;
         }
-        let mut cache = self.cache.0.lock().unwrap();
+        // This also runs while unwinding; a poisoned lock must not abort.
+        let mut cache = self.cache.0.lock().unwrap_or_else(|p| p.into_inner());
         if cache
             .entries
             .get(&self.path)
@@ -74,7 +75,7 @@ impl Drop for Claim {
         {
             cache.entries.remove(&self.path);
         }
-        *self.check.outcome.lock().unwrap() = Outcome::Abandoned;
+        *self.check.outcome.lock().unwrap_or_else(|p| p.into_inner()) = Outcome::Abandoned;
         self.check.ready.notify_all();
     }
 }

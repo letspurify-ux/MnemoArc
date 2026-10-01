@@ -516,7 +516,7 @@ impl SyntaxFile {
                 };
                 let tree = parser
                     .parse_with_options(
-                        &mut |offset, _| &source.as_bytes()[offset..],
+                        &mut |offset, _| source.as_bytes().get(offset..).unwrap_or_default(),
                         None,
                         Some(tree_sitter::ParseOptions::new().progress_callback(&mut stop)),
                     )

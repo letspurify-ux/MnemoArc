@@ -30,6 +30,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 unicode-normalization = "0.1"
 
 axum = "0.8"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower-http = { version = "0.6", features = ["fs"] }
 tree-sitter = "0.27.0"
 tree-sitter-rust = "0.24.2"

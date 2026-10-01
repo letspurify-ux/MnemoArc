@@ -88,6 +88,33 @@ async fn completion_terminator_ignores_later_events_in_the_same_chunk() {
 }
 
 #[tokio::test]
+async fn system_dns_preserves_the_explicit_port_of_a_local_completion_server() {
+    let body = format!(
+        "{}data: [DONE]\n\n",
+        event(json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}))
+    );
+    let (url, server) = server(body).await;
+    let config = Config {
+        base_url: url.replace("127.0.0.1", "localhost"),
+        disable_proxy: true,
+        retries: 0,
+        ..Default::default()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let completion = OpenAiClient
+        .complete(
+            json!({"messages":[]}),
+            &config,
+            CancellationToken::new(),
+            tx,
+        )
+        .await;
+    server.abort();
+    let _ = server.await;
+    assert_eq!(completion.unwrap().text, "OK");
+}
+
+#[tokio::test]
 async fn connection_probe_requires_valid_plain_and_final_answers() {
     let tool = format!(
         "{}data: [DONE]\n\n",

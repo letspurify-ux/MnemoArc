@@ -220,6 +220,49 @@ fn failure_budget_is_per_tool_and_error_not_arguments_or_unrelated_success() {
 }
 
 #[test]
+fn changing_unsupported_tool_names_cannot_restart_the_failure_budget() {
+    let mut failures = FailureTracker::default();
+    let mut s = Session::new(Project::default(), Config::default());
+    for index in 0..3 {
+        let call = ToolCall {
+            id: format!("unknown-{index}"),
+            name: format!("unregistered_tool_{index}"),
+            arguments: "{}".into(),
+        };
+        let error = tools::run_call(&mut s, &call);
+        assert_eq!(error["recovery"]["code"], "unsupported_tool");
+        let stopped = failures.observe(&call.name, &call.arguments, &error, 3);
+        assert_eq!(stopped.is_some(), index == 2);
+        // Success by a real tool cannot reset these unsupported calls.
+        let _ = failures.observe("task_state", "{}", &json!({"status":"ok"}), 3);
+    }
+}
+
+#[test]
+fn changing_error_codes_and_eviction_do_not_reset_a_registered_tools_failure_budget() {
+    fn error(index: usize) -> serde_json::Value {
+        let code = format!(
+            "invalid_argument_{}{}",
+            char::from(b'a' + ((index / 26) % 26) as u8),
+            char::from(b'a' + (index % 26) as u8),
+        );
+        tools::envelope(Err(anyhow::anyhow!("{code}: rejected")))
+    }
+
+    let mut failures = FailureTracker::default();
+    for index in 0..512 {
+        let stopped = failures.observe("file_read", "{}", &error(index), 3);
+        assert_eq!(stopped.is_some(), index >= 2);
+    }
+    let _ = failures.observe("task_state", "{}", &json!({"status":"ok"}), 3);
+    let stopped = failures.observe("file_read", "{}", &error(0), 3).unwrap();
+    assert!(stopped.contains("file_read failed 513 times"));
+    assert!(stopped.contains("invalid_argument_aa"));
+    let _ = failures.observe("file_read", "{}", &json!({"status":"ok"}), 3);
+    assert!(failures.observe("file_read", "{}", &error(0), 3).is_none());
+}
+
+#[test]
 fn identical_invalid_document_call_is_reported_on_second_failure() {
     let mut failures = FailureTracker::default();
     let arguments = json!({
@@ -256,6 +299,64 @@ fn identical_invalid_document_call_is_reported_on_second_failure() {
             .contains("Do not resubmit it")
     );
 }
+#[test]
+fn recent_document_failures_refresh_without_resetting_the_aggregate_budget() {
+    for tool in ["document_edit", "document_edit_batch"] {
+        let mut failures = FailureTracker::default();
+        let error = tools::envelope(Err(anyhow::anyhow!("section_not_found: missing")));
+        let _ = failures.observe(tool, "frequent", &error, 8);
+        for index in 0..512 {
+            let _ = failures.observe(tool, &format!("heading-{index}"), &error, 8);
+            if index % 16 == 0 {
+                assert!(
+                    failures
+                        .observe(tool, "frequent", &error, 8)
+                        .unwrap()
+                        .starts_with("identical_tool_failure:")
+                );
+            }
+        }
+        // Evicting an old invocation must not let argument changes evade the
+        // cumulative per-tool budget. A recent repeated failure still wins.
+        assert!(
+            failures
+                .observe(tool, "heading-0", &error, 8)
+                .unwrap()
+                .starts_with("tool_recovery_limit:")
+        );
+        assert!(
+            failures
+                .observe(tool, "heading-511", &error, 8)
+                .unwrap()
+                .starts_with("identical_tool_failure:")
+        );
+        let _ = failures.observe("task_state", "{}", &json!({"status":"ok"}), 8);
+        assert!(failures.observe(tool, "new heading", &error, 8).is_some());
+        let _ = failures.observe(tool, "{}", &json!({"status":"ok"}), 8);
+        assert!(failures.observe(tool, "heading-511", &error, 8).is_none());
+    }
+}
+
+#[test]
+fn document_failure_fingerprints_distinguish_changes_at_the_end_of_long_errors() {
+    let mut failures = FailureTracker::default();
+    let prefix = "section_not_found: ".to_owned() + &"same details ".repeat(2048);
+    let first = tools::envelope(Err(anyhow::anyhow!("{prefix}first heading")));
+    let changed = tools::envelope(Err(anyhow::anyhow!("{prefix}second heading")));
+    assert!(failures.observe("document_edit", "{}", &first, 8).is_none());
+    assert!(
+        failures
+            .observe("document_edit", "{}", &changed, 8)
+            .is_none()
+    );
+    assert!(
+        failures
+            .observe("document_edit", "{}", &changed, 8)
+            .unwrap()
+            .starts_with("identical_tool_failure:")
+    );
+}
+
 #[test]
 fn unknown_and_uncertain_errors_never_enable_automatic_replay() {
     for (message, class) in [

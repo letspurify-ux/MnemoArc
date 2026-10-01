@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod config;
+mod console;
 pub mod context;
 pub mod database;
 pub mod evaluation;

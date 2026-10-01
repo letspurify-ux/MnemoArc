@@ -401,7 +401,9 @@ fn commit(
         .iter()
         .map(|(path, after)| {
             json!({
-                "path":path.strip_prefix(&root).unwrap().to_string_lossy(),
+                // The writes are already committed; a root that moved since must not
+                // turn their report into a panic and an unknown write outcome.
+                "path":path.strip_prefix(&root).unwrap_or(path).to_string_lossy(),
                 "exists":after.is_some(),
                 "hash":after.as_ref().map(|text| hash(text.as_bytes())),
                 "changed":originals[path] != *after || replaced_paths.contains(path)

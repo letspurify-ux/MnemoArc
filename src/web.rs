@@ -1118,82 +1118,105 @@ async fn run(
             std::panic::AssertUnwindSafe(job).catch_unwind().await
         };
         let _ = pump.await;
-        let outcome = match outcome {
-            Ok(session) => Ok(session_view::prepare(&state, session).await),
-            Err(error) => Err(error),
-        };
-        let mut c = state.core.lock().await;
-        c.streams.remove(&id);
-        if c.running.get(&id).is_some_and(|r| r.closing) {
-            c.remove_session(&id);
-        } else {
-            match outcome {
-                Ok(mut snapshot) => {
-                    let session = Arc::make_mut(&mut snapshot).session_mut();
-                    // The web owner records a pending setting before sending
-                    // the command to the agent. If cancellation wins before
-                    // that command is consumed, the private agent copy still
-                    // has the old config and would otherwise erase the owner's
-                    // pending change when its final snapshot is stored.
-                    if let Some(pending) = c
-                        .sessions
-                        .get(&id)
-                        .and_then(|owner| owner.pending_config.clone())
-                    {
-                        if same_config(&session.config, &pending) {
-                            // The command was applied even if its clearing
-                            // snapshot was not delivered before cancellation.
-                            session.pending_config = None;
-                        } else {
-                            // Preserve the newest requested config for the
-                            // next run; an older private pending value must not
-                            // hide it.
-                            session.pending_config = Some(pending);
+        let settled = std::panic::AssertUnwindSafe(async {
+            let outcome = match outcome {
+                Ok(session) => Ok(session_view::prepare(&state, session).await),
+                Err(error) => Err(error),
+            };
+            let mut c = state.core.lock().await;
+            c.streams.remove(&id);
+            if c.running.get(&id).is_some_and(|r| r.closing) {
+                c.remove_session(&id);
+            } else {
+                match outcome {
+                    Ok(mut snapshot) => {
+                        let session = Arc::make_mut(&mut snapshot).session_mut();
+                        // The web owner records a pending setting before sending
+                        // the command to the agent. If cancellation wins before
+                        // that command is consumed, the private agent copy still
+                        // has the old config and would otherwise erase the owner's
+                        // pending change when its final snapshot is stored.
+                        if let Some(pending) = c
+                            .sessions
+                            .get(&id)
+                            .and_then(|owner| owner.pending_config.clone())
+                        {
+                            if same_config(&session.config, &pending) {
+                                // The command was applied even if its clearing
+                                // snapshot was not delivered before cancellation.
+                                session.pending_config = None;
+                            } else {
+                                // Preserve the newest requested config for the
+                                // next run; an older private pending value must not
+                                // hide it.
+                                session.pending_config = Some(pending);
+                            }
                         }
-                    }
-                    if let Some(pending) = c
-                        .sessions
-                        .get(&id)
-                        .and_then(|owner| owner.pending_tools.clone())
-                    {
-                        // Apply the same request-boundary normalization used
-                        // by the running agent. This closes the cancellation
-                        // path where a stale private copy would otherwise
-                        // restore a selection that violates the final task
-                        // workflow.
-                        let pending = ToolRegistry::normalize_tool_selection(session, &pending);
-                        if session.active_tools == pending {
-                            // The command was consumed by the agent. A model
-                            // tool_select queued on the private copy must not
-                            // override the user's explicit selection.
-                            session.pending_tools = None;
-                        } else {
-                            // The command was still queued when the run
-                            // ended; make the user's latest selection active
-                            // for the next run and discard stale private work.
-                            session.active_tools = pending;
-                            session.pending_tools = None;
+                        if let Some(pending) = c
+                            .sessions
+                            .get(&id)
+                            .and_then(|owner| owner.pending_tools.clone())
+                        {
+                            // Apply the same request-boundary normalization used
+                            // by the running agent. This closes the cancellation
+                            // path where a stale private copy would otherwise
+                            // restore a selection that violates the final task
+                            // workflow.
+                            let pending = ToolRegistry::normalize_tool_selection(session, &pending);
+                            if session.active_tools == pending {
+                                // The command was consumed by the agent. A model
+                                // tool_select queued on the private copy must not
+                                // override the user's explicit selection.
+                                session.pending_tools = None;
+                            } else {
+                                // The command was still queued when the run
+                                // ended; make the user's latest selection active
+                                // for the next run and discard stale private work.
+                                session.active_tools = pending;
+                                session.pending_tools = None;
+                            }
                         }
+                        c.sessions.insert(id.clone(), snapshot);
                     }
-                    c.sessions.insert(id.clone(), snapshot);
-                }
-                Err(_) => {
-                    if let Some(session) = c.session_mut(&id) {
-                        session.status = "blocked".into();
-                        session.last_error = Some("agent_worker_panic: last snapshot retained; write outcomes require review".into());
-                        session.note_run_estimate();
-                        session.finish_maintenance();
-                        session.finish_run();
-                        session.activity = json!({"stage":"idle"});
-                        session.restore_after_question();
-                    }
+                    Err(_) => block_after_panic(&mut c, &id),
                 }
             }
+            c.running.remove(&id);
+            session_changed(&state, &mut c, &id, true);
+        })
+        .catch_unwind()
+        .await;
+        // Settlement runs outside the agent's unwind boundary. A panic there
+        // must still release the run slot, or the session stays busy and
+        // shutdown waits for it forever.
+        if settled.is_err() {
+            let mut c = state.core.lock().await;
+            if c.running.contains_key(&id) {
+                c.streams.remove(&id);
+                if c.running.get(&id).is_some_and(|r| r.closing) {
+                    c.remove_session(&id);
+                } else {
+                    block_after_panic(&mut c, &id);
+                }
+                c.running.remove(&id);
+                session_changed(&state, &mut c, &id, true);
+            }
         }
-        c.running.remove(&id);
-        session_changed(&state, &mut c, &id, true);
     });
     Ok(Json(json!({"started":true})))
+}
+fn block_after_panic(c: &mut Core, id: &str) {
+    if let Some(session) = c.session_mut(id) {
+        session.status = "blocked".into();
+        session.last_error = Some(
+            "agent_worker_panic: last snapshot retained; write outcomes require review".into(),
+        );
+        session.note_run_estimate();
+        session.finish_maintenance();
+        session.finish_run();
+        session.activity = json!({"stage":"idle"});
+        session.restore_after_question();
+    }
 }
 async fn cancel(State(s): State<WebState>, Path(id): Path<String>) -> Api {
     let c = s.core.lock().await;
@@ -1364,8 +1387,7 @@ pub async fn serve_app(
         );
     }
     let state = WebState::new(config, path, Arc::new(OpenAiClient))?;
-    // Axum's shutdown future and agent tasks are spawned independently. A
-    // dropped/aborted server must wake them as well as the normal signal path.
+    // A dropped/aborted server must wake agent tasks too.
     let _stop_on_drop = state.stopping.clone().drop_guard();
     let listener =
         match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port.unwrap_or(3030)))
@@ -1377,11 +1399,8 @@ pub async fn serve_app(
             }
             Err(error) => return Err(error.into()),
         };
-    println!(
-        "MnemoArc: http://127.0.0.1:{}",
-        listener.local_addr()?.port()
-    );
     let url = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
+    crate::console::notice(crate::console::Target::Stdout, format!("MnemoArc: {url}\n"));
     // The listener is bound before launching the browser; failures leave a usable printed URL.
     let browser = open_browser.then(|| {
         let stopping = state.stopping.clone();
@@ -1390,22 +1409,23 @@ pub async fn serve_app(
             if let Err(error) = result
                 && !stopping.is_cancelled()
             {
-                eprintln!("브라우저를 열지 못했습니다: {error}. 직접 접속하세요: {url}");
+                crate::console::notice(
+                    crate::console::Target::Stderr,
+                    format!("브라우저를 열지 못했습니다: {error}. 직접 접속하세요: {url}\n"),
+                );
             }
         })
     });
     let shutdown = state.clone();
     let listener = ManagedListener::new(listener, state.stopping.clone());
-    axum::serve(listener, app_router(state, frontend))
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {},
-                _ = shutdown.stopping.cancelled() => {},
-                _ = stdin_eof(), if shutdown_on_stdin => {},
-            }
-            shutdown.shutdown().await;
-        })
-        .await?;
+    tokio::join!(listener.serve(app_router(state, frontend)), async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = shutdown.stopping.cancelled() => {},
+            _ = stdin_eof(), if shutdown_on_stdin => {},
+        }
+        shutdown.shutdown().await;
+    });
     if let Some(browser) = browser {
         let _ = browser.await;
     }
@@ -1545,7 +1565,7 @@ mod worker_wait_tests {
         let addr = listener.local_addr().unwrap();
         let managed = ManagedListener::new(listener, state.stopping.clone());
         let app = app_router(state.clone(), None);
-        let server = tokio::spawn(async move { axum::serve(managed, app).await.unwrap() });
+        let server = tokio::spawn(managed.serve(app));
         let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
         stalled
             .write_all(format!("POST /api/sessions HTTP/1.1\r\nHost: {addr}\r\nx-mnemoarc-client: web\r\nContent-Type: application/json\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n").as_bytes())
@@ -1655,7 +1675,7 @@ mod worker_wait_tests {
         let addr = listener.local_addr().unwrap();
         let managed = ManagedListener::new(listener, state.stopping.clone());
         let app = app_router(state.clone(), None);
-        let server = tokio::spawn(async move { axum::serve(managed, app).await.unwrap() });
+        let server = tokio::spawn(managed.serve(app));
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let request = tokio::spawn(async move {
             client

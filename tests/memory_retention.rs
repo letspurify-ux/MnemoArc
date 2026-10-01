@@ -126,6 +126,52 @@ fn retired_history_storage() -> usize {
     retained
 }
 
+fn failed_edit_tracker_storage() -> usize {
+    let error = tools::envelope(Err(anyhow::anyhow!(
+        "section_not_found: {}",
+        "unmatched heading ".repeat(1024)
+    )));
+    let baseline = LIVE.load(SeqCst);
+    let mut failures = tools::recovery::FailureTracker::default();
+    for index in 0..2048 {
+        let arguments = json!({"section":format!("Heading {index}")}).to_string();
+        // Document work can correct failures past the ordinary retry limit,
+        // including after checkpoints have retired their history bundles.
+        let _ = failures.observe("document_edit", &arguments, &error, 8);
+    }
+    let retained = LIVE.load(SeqCst).saturating_sub(baseline);
+    eprintln!("document failure tracker live allocation: {retained} bytes");
+    retained
+}
+
+fn failure_budget_tracker_storage() -> (usize, usize) {
+    let baseline = LIVE.load(SeqCst);
+    let mut names = tools::recovery::FailureTracker::default();
+    for index in 0..4096 {
+        let name = format!("unregistered_{index}_{}", "x".repeat(96));
+        let error = tools::envelope(Err(anyhow::anyhow!("unsupported_tool: {name}")));
+        let _ = names.observe(&name, "{}", &error, 8);
+    }
+    let name_bytes = LIVE.load(SeqCst).saturating_sub(baseline);
+    drop(names);
+
+    let baseline = LIVE.load(SeqCst);
+    let mut codes = tools::recovery::FailureTracker::default();
+    for index in 0..4096 {
+        let code = format!(
+            "invalid_argument_{}{}{}",
+            char::from(b'a' + ((index / 676) % 26) as u8),
+            char::from(b'a' + ((index / 26) % 26) as u8),
+            char::from(b'a' + (index % 26) as u8),
+        );
+        let error = tools::envelope(Err(anyhow::anyhow!("{code}: rejected")));
+        let _ = codes.observe("document_edit", "{}", &error, 8);
+    }
+    let code_bytes = LIVE.load(SeqCst).saturating_sub(baseline);
+    eprintln!("failure budget live allocations: names={name_bytes}, codes={code_bytes} bytes");
+    (name_bytes, code_bytes)
+}
+
 fn paginated_outline_peak() -> usize {
     let dir = tempfile::tempdir().unwrap();
     let text = format!(
@@ -441,6 +487,8 @@ fn bounded_operations_do_not_duplicate_retained_inputs() {
     bounded_directory_errors_do_not_retain_every_name();
     let retired_task_bytes = retired_task_storage();
     let retired_bytes = retired_history_storage();
+    let failure_tracker_bytes = failed_edit_tracker_storage();
+    let (failure_name_bytes, failure_code_bytes) = failure_budget_tracker_storage();
     let outline_peak = paginated_outline_peak();
     let discovery_extra = scoped_discovery_extra_peak();
     assert!(
@@ -450,6 +498,14 @@ fn bounded_operations_do_not_duplicate_retained_inputs() {
     assert!(
         retired_bytes < 4096,
         "pruning all history retained its old bundle storage: {retired_bytes} bytes"
+    );
+    assert!(
+        failure_tracker_bytes < 256 * 1024,
+        "document recovery retained every failed invocation and full error body: {failure_tracker_bytes} bytes"
+    );
+    assert!(
+        failure_name_bytes < 128 * 1024 && failure_code_bytes < 128 * 1024,
+        "failure budgets retained every tool name or error code: names={failure_name_bytes}, codes={failure_code_bytes} bytes"
     );
     assert!(
         outline_peak < 8 * MIB,

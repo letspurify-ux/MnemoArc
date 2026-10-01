@@ -1,5 +1,6 @@
 use crate::{
     config::Config,
+    console,
     context::{self, ContextManager},
     llm::{LlmClient, OpenAiClient, ToolCall},
     session::Session,
@@ -3182,6 +3183,8 @@ pub async fn headless(mut s: Session, prompt: String) -> Result<Session> {
     )?;
     s.add_user(prompt);
     s.check_runtime_capacity()?;
+    let console = console::Console::new()?;
+    let output = console.sender();
     let (tx, mut rx) = mpsc::channel(4);
     let cancel = CancellationToken::new();
     let c = cancel.clone();
@@ -3190,31 +3193,54 @@ pub async fn headless(mut s: Session, prompt: String) -> Result<Session> {
         c.cancel();
     });
     let _listener_guard = AbortOnDrop(listener.abort_handle());
-    let renderer = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            match event {
-                AgentEvent::Delta { text, .. } => {
-                    print!("{text}");
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
+    let render_cancel = cancel.clone();
+    let mut renderer = tokio::spawn(async move {
+        loop {
+            let event = tokio::select! {
+                biased;
+                _ = render_cancel.cancelled() => break,
+                event = rx.recv() => match event {
+                    Some(event) => event,
+                    None => break,
+                },
+            };
+            let (target, text) = match event {
+                AgentEvent::Delta { text, .. } => (console::Target::Stdout, text),
+                AgentEvent::Tool { name, status, .. } => {
+                    (console::Target::Stderr, format!("\n[{name}: {status}]\n"))
                 }
-                AgentEvent::Tool { name, status, .. } => eprintln!("\n[{name}: {status}]"),
-                _ => {}
+                _ => continue,
+            };
+            if !output.write(target, &text, &render_cancel).await {
+                // A closed/erroring output pipe has no reader for this CLI
+                // run. Release its provider request instead of running unseen.
+                render_cancel.cancel();
+                break;
             }
         }
     });
     let _renderer_guard = AbortOnDrop(renderer.abort_handle());
     let result = run_session(s, Arc::new(OpenAiClient), cancel, tx).await;
     listener.abort();
-    let _ = renderer.await;
-    eprintln!(
+    let deadline = tokio::time::Instant::now() + console::DRAIN_TIMEOUT;
+    if tokio::time::timeout_at(deadline, &mut renderer)
+        .await
+        .is_err()
+    {
+        renderer.abort();
+        let _ = renderer.await;
+    }
+    let mut report = format!(
         "\nStatus: {}\nOutput: {}",
         result.status,
         result.project.output.display()
     );
     if let Some(e) = &result.last_error {
-        eprintln!("{e}");
+        report.push('\n');
+        report.push_str(e);
     }
+    report.push('\n');
+    console.finish(&report, deadline).await;
     Ok(result)
 }
 fn consume_commands(s: &mut Session, commands: &mut mpsc::Receiver<RunCommand>) {
