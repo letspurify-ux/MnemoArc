@@ -2855,14 +2855,29 @@ fn read_bytes_bounded(path: &Path) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn hash_file(path: &Path) -> Result<String> {
+    hash_file_cancelled(path, &tokio_util::sync::CancellationToken::new())
+}
+
+pub(crate) fn hash_file_cancelled(
+    path: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<String> {
     let file = open_regular_file(path)?;
     if file.metadata()?.len() > MAX_FILE_BYTES as u64 {
         bail!("unsupported_large_file: maximum 16MiB");
     }
-    hash_reader(file)
+    hash_reader_cancelled(file, cancel)
 }
 
+#[cfg(test)]
 fn hash_reader(reader: impl std::io::Read) -> Result<String> {
+    hash_reader_cancelled(reader, &tokio_util::sync::CancellationToken::new())
+}
+
+fn hash_reader_cancelled(
+    reader: impl std::io::Read,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<String> {
     use std::io::Read;
     // Freshness checks need only a digest. Never allocate the full file for
     // each check, and enforce the same bound if it grows after metadata lookup.
@@ -2871,6 +2886,9 @@ fn hash_reader(reader: impl std::io::Read) -> Result<String> {
     let mut buffer = [0u8; 64 * 1024];
     let mut bytes = 0;
     loop {
+        if cancel.is_cancelled() {
+            bail!("cancelled");
+        }
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -3141,6 +3159,14 @@ pub(crate) fn inspect_freshness(
     s: &Session,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Revalidation> {
+    inspect_freshness_with(s, cancel, |path| hash_file_cancelled(path, cancel))
+}
+
+pub(crate) fn inspect_freshness_with(
+    s: &Session,
+    cancel: &tokio_util::sync::CancellationToken,
+    mut file_hash: impl FnMut(&Path) -> Result<String>,
+) -> Result<Revalidation> {
     let paths: BTreeSet<&str> = s
         .memory
         .entries
@@ -3154,7 +3180,10 @@ pub(crate) fn inspect_freshness(
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
-        let current = read_path(&s.project, path).and_then(|p| hash_file(&p)).ok();
+        let current = read_path(&s.project, path).and_then(|p| file_hash(&p)).ok();
+        if cancel.is_cancelled() {
+            bail!("cancelled");
+        }
         hashes.insert(path.to_owned(), current);
     }
     let source_changed = |source: &Source| {
@@ -4987,7 +5016,7 @@ pub(crate) fn parallel_read_history(
                     .collect();
                 (!messages.is_empty()).then_some(crate::session::Bundle {
                     id: bundle.id,
-                    messages,
+                    messages: messages.into(),
                     active: true,
                     reviewed: bundle.reviewed,
                     complete: bundle.complete,

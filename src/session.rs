@@ -1,6 +1,7 @@
 use crate::{
     config::{Config, Project},
     memory::{MemoryStore, Source, id, serialized_bytes},
+    shared::Shared,
 };
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -143,19 +144,46 @@ impl Investigation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Bundle {
     pub id: u64,
-    pub messages: Vec<Value>,
+    pub messages: Shared<Vec<Value>>,
     pub active: bool,
     pub reviewed: bool,
     pub complete: bool,
 }
+impl Bundle {
+    fn bytes(&self) -> usize {
+        // Only flags and the ID change during retirement. Count their small
+        // envelope and reuse the immutable messages' serialized byte count.
+        #[derive(Serialize)]
+        struct Envelope {
+            id: u64,
+            messages: [Value; 0],
+            active: bool,
+            reviewed: bool,
+            complete: bool,
+        }
+        let envelope = Envelope {
+            id: self.id,
+            messages: [],
+            active: self.active,
+            reviewed: self.reviewed,
+            complete: self.complete,
+        };
+        serialized_bytes(&envelope)
+            .saturating_sub(2)
+            .saturating_add(self.messages.bytes())
+    }
+}
 #[derive(Clone, Debug, Default)]
 pub struct SessionHistory {
-    pub bundles: VecDeque<Bundle>,
+    pub bundles: Shared<VecDeque<Bundle>>,
     pub next_id: u64,
     pub pruned_through: Option<u64>,
 }
 impl SessionHistory {
     pub fn push(&mut self, messages: Vec<Value>, complete: bool) -> u64 {
+        self.push_shared(messages.into(), complete)
+    }
+    pub(crate) fn push_shared(&mut self, messages: Shared<Vec<Value>>, complete: bool) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
         self.bundles.push_back(Bundle {
@@ -168,19 +196,19 @@ impl SessionHistory {
         id
     }
     pub fn bytes(&self) -> usize {
-        self.bundles.iter().fold(0usize, |total, bundle| {
-            total.saturating_add(serialized_bytes(bundle))
-        })
+        self.bundles
+            .iter()
+            .fold(0usize, |total, bundle| total.saturating_add(bundle.bytes()))
     }
     pub(crate) fn check_append(&self, messages: Vec<Value>, limit: usize) -> Result<()> {
         let bundle = Bundle {
             id: self.next_id.saturating_add(1),
-            messages,
+            messages: messages.into(),
             active: true,
             reviewed: false,
             complete: true,
         };
-        if self.bytes().saturating_add(serialized_bytes(&bundle)) > limit {
+        if self.bytes().saturating_add(bundle.bytes()) > limit {
             bail!(
                 "history_capacity: request exceeds retained history capacity; clean up history or start another session"
             );
@@ -201,7 +229,7 @@ impl SessionHistory {
         // Plan removal using the flags a confirmed checkpoint will publish.
         // A failed plan changes nothing and needs no copy of retained messages.
         let retained_bytes = |bundle: &Bundle| {
-            let bytes = serialized_bytes(bundle);
+            let bytes = bundle.bytes();
             if retired.contains(&bundle.id) {
                 // JSON `false` is one byte longer than `true`. Account for
                 // the final flags even at an exact history capacity boundary.
@@ -433,17 +461,17 @@ pub struct Session {
     pub workflow_mode: String,
     pub memory: MemoryStore,
     pub history: SessionHistory,
-    pub sources: BTreeMap<String, Source>,
-    pub file_cursors: BTreeMap<String, FileCursor>,
-    pub read_coverage: BTreeMap<String, ReadCoverage>,
+    pub sources: Shared<BTreeMap<String, Source>>,
+    pub file_cursors: Shared<BTreeMap<String, FileCursor>>,
+    pub read_coverage: Shared<BTreeMap<String, ReadCoverage>>,
     /// Coverage page revisions let legacy offset callers detect intervening
     /// reads even when they do not echo expected_coverage_revision.
-    pub coverage_cursors: BTreeMap<String, String>,
+    pub coverage_cursors: Shared<BTreeMap<String, String>>,
     pub active_tools: BTreeSet<String>,
     pub pending_tools: Option<BTreeSet<String>>,
     pub investigations: Vec<Investigation>,
     pub checkpoint: Option<Checkpoint>,
-    pub ledger: BTreeMap<String, (String, Value)>,
+    pub ledger: Shared<BTreeMap<String, (String, Value)>>,
     pub latest_request: String,
     pub status: String,
     pub input_tokens: usize,
@@ -577,10 +605,10 @@ impl Session {
             request_review_criteria: Default::default(),
             memory: Default::default(),
             history: Default::default(),
-            sources: BTreeMap::new(),
-            file_cursors: BTreeMap::new(),
-            read_coverage: BTreeMap::new(),
-            coverage_cursors: BTreeMap::new(),
+            sources: Shared::default(),
+            file_cursors: Shared::default(),
+            read_coverage: Shared::default(),
+            coverage_cursors: Shared::default(),
             active_tools: [
                 "file_read",
                 "file_edit",
@@ -601,7 +629,7 @@ impl Session {
             workflow_mode: "answer".into(),
             investigations: vec![],
             checkpoint: None,
-            ledger: BTreeMap::new(),
+            ledger: Shared::default(),
             latest_request: String::new(),
             status: "idle".into(),
             input_tokens: 0,
@@ -968,6 +996,40 @@ impl Session {
 #[cfg(test)]
 mod history_tests {
     use super::*;
+
+    #[test]
+    fn cloned_histories_share_large_messages_and_edit_only_the_changed_payload() {
+        let mut original = SessionHistory::default();
+        original.push(
+            vec![json!({"role":"assistant","content":"a".repeat(4 * 1024 * 1024)})],
+            true,
+        );
+        original.push(
+            vec![json!({"role":"assistant","content":"b".repeat(4 * 1024 * 1024)})],
+            true,
+        );
+        let bytes = original.bytes();
+        let mut copy = original.clone();
+        assert!(std::ptr::eq(&*original.bundles, &*copy.bundles));
+        copy.bundles[0].active = false;
+        assert!(original.bundles[0].active);
+        assert!(std::ptr::eq(
+            &*original.bundles[0].messages,
+            &*copy.bundles[0].messages
+        ));
+        assert_eq!(copy.bytes(), bytes + 1);
+        copy.bundles[0].messages[0]["content"] = json!("edited");
+        assert_ne!(original.bundles[0].messages[0], copy.bundles[0].messages[0]);
+        assert!(std::ptr::eq(
+            &*original.bundles[1].messages,
+            &*copy.bundles[1].messages
+        ));
+        assert_eq!(original.bytes(), bytes);
+        assert_eq!(
+            copy.bytes(),
+            copy.bundles.iter().map(serialized_bytes).sum::<usize>()
+        );
+    }
 
     #[test]
     fn checkpoint_retirement_respects_exact_serialized_capacity() {

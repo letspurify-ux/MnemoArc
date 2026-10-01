@@ -1072,7 +1072,7 @@ async fn read_parallel(
                     }
                 }
                 let mut source_ids = std::collections::BTreeMap::new();
-                for source in temp.sources.into_values() {
+                for (_, source) in temp.sources {
                     let source_id = source.id.clone();
                     let canonical = s
                         .sources
@@ -1108,7 +1108,7 @@ async fn read_parallel(
                     for message in &mut messages {
                         remap_read_ids(message, &source_ids, &cursor_ids);
                     }
-                    let id = s.history.push(messages, true);
+                    let id = s.history.push_shared(messages, true);
                     s.history.bundles.back_mut().unwrap().active = false;
                     result["archive_id"] = json!(id);
                     if result["next_cursor"]["tool"] == "history" {

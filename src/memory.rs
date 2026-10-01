@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::shared::Shared;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -144,7 +145,7 @@ impl Memory {
 }
 #[derive(Clone, Debug, Default)]
 pub struct MemoryStore {
-    pub entries: BTreeMap<String, Memory>,
+    pub entries: Shared<BTreeMap<String, Shared<Memory>>>,
     pub generation: u64,
 }
 impl MemoryStore {
@@ -165,7 +166,7 @@ impl MemoryStore {
         {
             bail!("memory_key_conflict: key collides with a memory ID or another key");
         }
-        Ok(owner)
+        Ok(owner.map(|memory| &**memory))
     }
 
     fn page_fingerprint(&self, query: &str, tags: &[String]) -> String {
@@ -175,9 +176,9 @@ impl MemoryStore {
     }
 
     pub fn bytes(&self) -> usize {
-        self.entries.values().fold(0usize, |total, memory| {
-            total.saturating_add(serialized_bytes(memory))
-        })
+        self.entries
+            .values()
+            .fold(0usize, |total, memory| total.saturating_add(memory.bytes()))
     }
     pub fn get(&self, id_or_key: &str) -> Result<&Memory> {
         self.entries
@@ -187,6 +188,7 @@ impl MemoryStore {
                     .values()
                     .find(|m| m.key.as_deref() == Some(id_or_key))
             })
+            .map(|memory| &**memory)
             .ok_or_else(|| anyhow::anyhow!("memory_not_found: {id_or_key}"))
     }
     pub fn save(
@@ -282,7 +284,7 @@ impl MemoryStore {
             bail!("memory_capacity: explicitly delete/replace candidates; no memory was removed");
         }
         let meta = m.meta();
-        self.entries.insert(m.id.clone(), m);
+        self.entries.insert(m.id.clone(), m.into());
         self.generation += 1;
         Ok(meta)
     }
@@ -356,7 +358,10 @@ impl MemoryStore {
     pub fn recent(&self, n: usize) -> Vec<MemoryMeta> {
         let mut rows: Vec<_> = self.entries.values().collect();
         rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
-        rows.into_iter().take(n).map(Memory::meta).collect()
+        rows.into_iter()
+            .take(n)
+            .map(|memory| memory.meta())
+            .collect()
     }
     pub fn search(&self, query: &str, tags: &[String]) -> Vec<MemoryMeta> {
         let q = query.to_lowercase();

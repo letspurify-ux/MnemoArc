@@ -7,6 +7,7 @@ import { api, download, send, statusLabel, toolLabels } from "./api.js";
 import { mergeSession, mergeOlder } from "./session-history.js";
 import { useServerDraft } from "./use-server-draft.js";
 import { createComposerDrafts } from "./composer-drafts.js";
+import { createSessionCache, FULL_REFRESH, NO_REFRESH, mergeRefresh, changeRefresh } from "./session-cache.js";
 
 const DEFAULT_INSPECTOR_WIDTH = 295;
 const MIN_INSPECTOR_WIDTH = 240;
@@ -33,8 +34,10 @@ function loadInspectorWidth() {
 
 export default function App() {
   const [drafts] = useState(createComposerDrafts);
+  const [cache] = useState(createSessionCache);
   const [state, setState] = useState(null),
     [session, setSession] = useState(null),
+    [sessionReady, setSessionReady] = useState(false),
     [selected, setSelected] = useState(() => window.location.hash.slice(1)),
     [page, setPage] = useState("chat"),
     [error, setError] = useState(""),
@@ -50,7 +53,12 @@ export default function App() {
     [inspectorWidth, setInspectorWidth] = useState(loadInspectorWidth);
   const selection = useRef(selected),
     fetching = useRef(null),
-    pending = useRef(false),
+    pending = useRef(NO_REFRESH),
+    workspace = useRef(null),
+    displayed = useRef(null),
+    lastChecked = useRef({ state: 0, session: 0 }),
+    streamOpen = useRef(false),
+    recovering = useRef(false),
     timer = useRef(null),
     alive = useRef(true),
     versions = useRef(new Map()),
@@ -70,19 +78,26 @@ export default function App() {
   const onInspectorDirtyChange = useCallback((dirty) => {
     inspectorDirty.current = dirty;
   }, []);
-  const refresh = useCallback((restart = false) => {
+  const displaySession = useCallback((value) => {
+    displayed.current = value;
+    setSession(value);
+    if (value) cache.set(value);
+  }, [cache]);
+  const refresh = useCallback((restart = false, scope = FULL_REFRESH) => {
     if (!alive.current) return Promise.resolve();
+    pending.current = mergeRefresh(pending.current, scope);
     if (fetching.current) {
-      if (!restart) {
-        pending.current = true;
-        return fetching.current.done;
-      }
+      if (!restart) return fetching.current.done;
+      pending.current = mergeRefresh(pending.current, fetching.current.scope);
       fetching.current.controller.abort();
     }
+    scope = pending.current;
+    if (!scope.state && !scope.session) return Promise.resolve();
+    if (!workspace.current) scope = { ...scope, state: true };
     const controller = new AbortController();
-    const request = { controller, done: null };
+    const request = { controller, done: null, scope };
     fetching.current = request;
-    pending.current = false;
+    pending.current = NO_REFRESH;
     clearTimeout(timer.current);
     timer.current = null;
     const epoch = selectionEpoch.current;
@@ -93,51 +108,77 @@ export default function App() {
       timedOut = true;
       controller.abort();
     }, 15000);
+    const loadSession = async (id) => {
+      const current = await api(`/sessions/${id}`, { signal: controller.signal });
+      if (isCurrent() && selection.current === id &&
+          current.revision >= (versions.current.get(id) || 0)) {
+        versions.current.set(id, current.revision);
+        const previous = displayed.current?.id === id ? displayed.current : cache.peek(id);
+        displaySession(mergeSession(previous, current));
+        lastChecked.current.session = Date.now();
+        setSessionReady(true);
+      }
+    };
+    // A known selection can load independently of the sidebar. Navigating
+    // must not wait for an unrelated state request that is slow or stalled.
+    const earlyId = selection.current;
+    const early = scope.session && workspace.current?.sessions.some((s) => s.id === earlyId)
+      ? loadSession(earlyId).then(() => null, (error) => error) : null;
     request.done = (async () => {
       try {
-        const next = await api("/state", { signal: controller.signal });
+        const next = scope.state ? await api("/state", { signal: controller.signal }) : workspace.current;
         if (isCurrent()) {
-          setState(next);
-          drafts.retain(next.sessions.map((session) => session.id));
+          if (scope.state) {
+            workspace.current = next;
+            setState(next);
+            lastChecked.current.state = Date.now();
+            const ids = next.sessions.map((s) => s.id);
+            drafts.retain(ids);
+            cache.retain(ids);
+            const keep = new Set(ids);
+            for (const id of versions.current.keys()) if (!keep.has(id)) versions.current.delete(id);
+          }
           let id = selection.current;
           if (!next.sessions.some((s) => s.id === id)) {
             id = next.sessions[0]?.id || "";
             selection.current = id;
             setSelected(id);
-            setSession(null);
-            window.history.replaceState(
-              null,
-              "",
-              id ? `#${id}` : window.location.pathname + window.location.search,
-            );
+            displaySession(cache.get(id));
+            setSessionReady(false);
+            scope = { ...scope, session: true };
+            window.history.replaceState(null, "", id ? `#${id}` : window.location.pathname + window.location.search);
           }
+          const summary = next.sessions.find((s) => s.id === id);
           if (id) {
-            const current = await api(`/sessions/${id}`, { signal: controller.signal });
-            if (
-              isCurrent() &&
-              selection.current === id &&
-              current.revision >= (versions.current.get(id) || 0)
-            ) {
-              versions.current.set(id, current.revision);
-              setSession((old) => mergeSession(old, current));
+            if (early && id === earlyId) {
+              const error = await early;
+              if (error) throw error;
             }
-          } else setSession(null);
-          if (isCurrent()) setRefreshError("");
+            if ((scope.session && (!early || id !== earlyId)) ||
+                (summary?.revision ?? 0) > (versions.current.get(id) ?? -1)) {
+              await loadSession(id);
+            }
+          } else {
+            displaySession(null);
+            setSessionReady(false);
+          }
+          if (isCurrent()) { setRefreshError(""); recovering.current = false; }
         }
       } catch (e) {
         if (alive.current && fetching.current === request && selectionEpoch.current === epoch) {
+          recovering.current = true;
           if (timedOut) setRefreshError("작업 공간 응답이 지연되고 있습니다. 다시 연결을 시도합니다.");
           else if (!controller.signal.aborted) setRefreshError(e.message);
+          controller.abort();
         }
       } finally {
         clearTimeout(deadline);
         if (fetching.current === request) {
           fetching.current = null;
-          if (pending.current && alive.current) {
-            pending.current = false;
+          if ((pending.current.state || pending.current.session) && alive.current) {
             timer.current = setTimeout(() => {
               timer.current = null;
-              void refresh();
+              void refresh(false, NO_REFRESH);
             }, 120);
           }
         }
@@ -147,33 +188,50 @@ export default function App() {
       if (replacement && replacement !== request) await replacement.done;
     })();
     return request.done;
-  }, [drafts]);
+  }, [cache, displaySession, drafts]);
   useEffect(() => {
     if (stopped) return;
     alive.current = true;
     void refresh();
     const stream = new EventSource("/api/events");
     stream.onopen = () => {
+      streamOpen.current = true;
       setConnected(true);
-      void refresh();
+      // The server sends a full changed event on every connection. Opening
+      // the stream itself must not queue a duplicate of the initial read.
     };
-    stream.addEventListener("changed", () => {
+    stream.addEventListener("changed", (event) => {
+      const scope = changeRefresh(event.data, selection.current, versions.current.get(selection.current) || 0);
+      if (!scope.state && !scope.session) return;
+      pending.current = mergeRefresh(pending.current, scope);
       if (timer.current) return;
       timer.current = setTimeout(() => {
         timer.current = null;
-        void refresh();
+        void refresh(false, NO_REFRESH);
       }, 100);
     });
-    stream.onerror = () => setConnected(false);
-    const poll = setInterval(() => void refresh(), 3000);
+    stream.onerror = () => { streamOpen.current = false; setConnected(false); };
+    const poll = setInterval(() => {
+      if (!streamOpen.current || recovering.current) { void refresh(); return; }
+      // Events carry ordinary changes. Reconcile occasionally for missed
+      // events and external file edits, which do not emit server events.
+      void refresh(false, {
+        state: Date.now() - lastChecked.current.state >= 30000,
+        session: Date.now() - lastChecked.current.session >= 15000,
+      });
+    }, 3000);
+    const resume = () => { if (document.visibilityState === "visible") void refresh(); };
+    document.addEventListener("visibilitychange", resume);
     return () => {
       alive.current = false;
+      streamOpen.current = false;
       fetching.current?.controller.abort();
       fetching.current = null;
-      pending.current = false;
+      pending.current = NO_REFRESH;
       stream.close();
       clearInterval(poll);
       clearTimeout(timer.current);
+      document.removeEventListener("visibilitychange", resume);
       timer.current = null;
     };
   }, [refresh, stopped]);
@@ -234,10 +292,11 @@ export default function App() {
     selection.current = id;
     window.history.replaceState(null, "", `#${id}`);
     setSelected(id);
-    setSession(null);
+    displaySession(cache.get(id));
+    setSessionReady(false);
     setPage("chat");
     setMobileNav(false);
-    void refresh(true);
+    void refresh(true, { state: !workspace.current?.sessions.some((s) => s.id === id), session: true });
   }
   async function act(fn) {
     setError("");
@@ -310,6 +369,8 @@ export default function App() {
     try {
       await send("/shutdown", {});
       drafts.retain([]);
+      cache.clear();
+      versions.current.clear();
       setStopped(true);
     } catch (e) {
       setError(e.message);
@@ -541,14 +602,14 @@ export default function App() {
                 <div className="session-actions">
                   <button
                     title="보존된 상태로 재개"
-                    disabled={navigating || selectedBusy || capacityFull || workflowPending.has(selected) || !canRun || !session.has_task}
+                    disabled={navigating || !sessionReady || selectedBusy || capacityFull || workflowPending.has(selected) || !canRun || !session.has_task}
                     onClick={() => void runSession(selected, undefined, "resume").catch(() => {})}
                   >
                     재개
                   </button>
                   <button
                     title="기억과 상태 정리"
-                    disabled={navigating || selectedBusy || capacityFull || workflowPending.has(selected) || !canRun || !session.has_task}
+                    disabled={navigating || !sessionReady || selectedBusy || capacityFull || workflowPending.has(selected) || !canRun || !session.has_task}
                     onClick={() => void runSession(selected, undefined, "cleanup").catch(() => {})}
                   >
                     기억 정리
@@ -564,6 +625,7 @@ export default function App() {
                   </button>
                 </div>
               </div>
+              {!sessionReady && <div className="pending-note" role="status">최신 내용을 확인하는 중…</div>}
               {session.pending_config && (
                 <div className="pending-note">
                   설정 변경이 대기 중입니다. 현재 요청이 끝나거나 필요한 기억
@@ -574,7 +636,7 @@ export default function App() {
                 key={session.id}
                 session={session}
                 drafts={drafts}
-                busy={navigating || selectedBusy || workflowPending.has(session.id)}
+                busy={navigating || !sessionReady || selectedBusy || workflowPending.has(session.id)}
                 capacityFull={capacityFull}
                 navigating={navigating}
                 canRun={canRun}
@@ -590,7 +652,7 @@ export default function App() {
                     `/sessions/${selected}?before=${session.previous}`,
                   );
                   if (selection.current === older.id && selectionEpoch.current === epoch)
-                    setSession((old) => mergeOlder(old, older));
+                    displaySession(mergeOlder(displayed.current, older));
                 })}
               />
             </div>
@@ -602,7 +664,7 @@ export default function App() {
                 running={runningById.get(session.id) || null}
                 onAction={act}
                 onProjectDirtyChange={onInspectorDirtyChange}
-                navigating={navigating}
+                navigating={navigating || !sessionReady}
                 width={inspectorWidth}
                 onWidthChange={(next) =>
                   setInspectorWidth(clampInspectorWidth(next))

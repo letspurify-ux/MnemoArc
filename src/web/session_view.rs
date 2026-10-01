@@ -40,8 +40,10 @@ impl Deref for Snapshot {
 pub(super) fn revalidated(
     original: Arc<Snapshot>,
     cancel: &CancellationToken,
+    checks: &FileChecks,
 ) -> Result<Arc<Snapshot>> {
-    let freshness = tools::inspect_freshness(&original, cancel)?;
+    let freshness =
+        tools::inspect_freshness_with(&original, cancel, |path| checks.hash(path, cancel))?;
     if !freshness.changed() {
         return Ok(original);
     }
@@ -67,6 +69,7 @@ pub(super) async fn read(s: WebState, id: String, request: Read) -> Api {
     };
     let is_page = matches!(&request, Read::Page(_));
     let input = original.clone();
+    let checks = s.file_checks.clone();
     // Embedded routers can still read the settled sessions after shutdown.
     // Keep those reads available; the process-wide worker limit still applies.
     let reader = if s.stopping.is_cancelled() {
@@ -76,7 +79,7 @@ pub(super) async fn read(s: WebState, id: String, request: Read) -> Api {
     };
     let (snapshot, mut value) = reader
         .run_queued(timeout, move |cancel| {
-            let snapshot = revalidated(input, &cancel)?;
+            let snapshot = revalidated(input, &cancel, &checks)?;
             let value = match request {
                 Read::Page(page) => page_view(&snapshot, revision, stream, page),
                 Read::Memory(memory) => json!(snapshot.memory.get(&memory)?),
@@ -94,7 +97,7 @@ pub(super) async fn read(s: WebState, id: String, request: Read) -> Api {
     // published; a late reader must not replace a newer snapshot or settings.
     if Arc::ptr_eq(current, &original) && !Arc::ptr_eq(&snapshot, &original) {
         c.sessions.insert(id.clone(), snapshot);
-        changed(&s, &mut c);
+        session_changed(&s, &mut c, &id, false);
         if is_page {
             value["revision"] = json!(c.revision);
             value["stream"] = json!(c.streams.get(&id));
@@ -139,6 +142,7 @@ pub(super) async fn prepare(s: &WebState, session: Session) -> Arc<Snapshot> {
         }
     };
     let input = original.clone();
+    let checks = s.file_checks.clone();
     let timeout = Duration::from_secs(original.config.tool_timeout_secs);
     // A stopped run must not keep its slot and queued snapshots while waiting
     // for unrelated file work. Dropping run_queued also cancels a worker that
@@ -146,7 +150,7 @@ pub(super) async fn prepare(s: &WebState, session: Session) -> Arc<Snapshot> {
     tokio::select! {
         biased;
         _ = cancel.cancelled() => original,
-        result = s.file_io.run_queued(timeout, move |cancel| revalidated(input, &cancel)) => {
+        result = s.file_io.run_queued(timeout, move |cancel| revalidated(input, &cancel, &checks)) => {
             result.unwrap_or(original)
         }
     }

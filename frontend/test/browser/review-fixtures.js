@@ -24,6 +24,8 @@ export async function workspace({ page, request }, patch = {}) {
   state.sessions = [{ ...state.sessions[0], status: "idle", title: "리뷰 세션" }];
   await page.route("**/api/state", (route) => route.fulfill({ json: state }));
   await page.route(`**/api/sessions/${session.id}`, (route) => route.fulfill({ json: session }));
+  // These fixtures mutate JSON outside the server; exercise polling recovery.
+  await page.route("**/api/events", (route) => route.abort());
   await page.goto(`/#${session.id}`);
   await expect(page.getByRole("textbox", { name: "메시지", exact: true })).toBeVisible();
   return { state, session };

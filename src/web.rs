@@ -20,7 +20,7 @@ use axum::{
     routing::{get, post, put},
 };
 use futures_util::FutureExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -37,9 +37,11 @@ use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 
 mod connections;
+mod file_checks;
 mod file_io;
 mod session_view;
 use connections::ManagedListener;
+use file_checks::FileChecks;
 use file_io::FileIo;
 
 struct Running {
@@ -55,6 +57,7 @@ struct Core {
     streams: BTreeMap<String, String>,
     running: BTreeMap<String, Running>,
     revision: u64,
+    session_revisions: BTreeMap<String, u64>,
     credentials: BTreeMap<String, Secret>,
 }
 impl Core {
@@ -64,6 +67,7 @@ impl Core {
 
     fn remove_session(&mut self, id: &str) {
         self.sessions.remove(id);
+        self.session_revisions.remove(id);
         self.streams.remove(id);
         self.order.retain(|old| old != id);
         // Retaining fewer IDs must also release storage after a large batch
@@ -76,10 +80,11 @@ impl Core {
 #[derive(Clone)]
 pub struct WebState {
     core: Arc<Mutex<Core>>,
-    events: broadcast::Sender<u64>,
+    events: broadcast::Sender<Change>,
     client: Arc<dyn LlmClient>,
     stopping: CancellationToken,
     file_io: FileIo,
+    file_checks: FileChecks,
     write_outcome_uncertain: Arc<AtomicBool>,
 }
 #[derive(Debug)]
@@ -96,6 +101,12 @@ impl From<anyhow::Error> for ApiError {
 }
 type Api<T = Value> = std::result::Result<Json<T>, ApiError>;
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+#[derive(Clone, Debug, Default, Serialize)]
+struct Change {
+    revision: u64,
+    session: Option<String>,
+    state: bool,
+}
 fn missing() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "세션을 찾을 수 없습니다.".into())
 }
@@ -107,7 +118,28 @@ fn busy() -> ApiError {
 }
 fn changed(s: &WebState, c: &mut Core) {
     c.revision = c.revision.saturating_add(1);
-    let _ = s.events.send(c.revision);
+    for id in c.sessions.keys() {
+        c.session_revisions.insert(id.clone(), c.revision);
+    }
+    let _ = s.events.send(Change {
+        revision: c.revision,
+        session: None,
+        state: true,
+    });
+}
+fn session_changed(s: &WebState, c: &mut Core, id: &str, state: bool) {
+    c.revision = c.revision.saturating_add(1);
+    if c.sessions.contains_key(id) {
+        c.session_revisions.insert(id.to_owned(), c.revision);
+    }
+    let _ = s.events.send(Change {
+        revision: c.revision,
+        session: Some(id.into()),
+        state,
+    });
+}
+fn session_summary(session: &Session) -> Value {
+    json!({"id":session.id,"project":session.project,"status":session.status,"title":session.latest_request.chars().take(60).collect::<String>(),"memory_count":session.memory.entries.len()})
 }
 fn same_config(a: &Config, b: &Config) -> bool {
     // Config serialization intentionally omits the secret, so compare it
@@ -254,11 +286,13 @@ impl WebState {
                 streams: BTreeMap::new(),
                 running: BTreeMap::new(),
                 revision: 0,
+                session_revisions: BTreeMap::new(),
                 credentials,
             })),
             events,
             client,
             file_io: FileIo::new(stopping.clone()),
+            file_checks: FileChecks::default(),
             stopping,
             write_outcome_uncertain,
         })
@@ -390,14 +424,27 @@ async fn events(
             if stopping.is_cancelled() {
                 return None;
             }
-            if !first {
+            let change = if !first {
                 tokio::select! {
                     _ = stopping.cancelled() => return None,
-                    result = receiver.recv() => if matches!(result, Err(broadcast::error::RecvError::Closed)) { return None; },
+                    result = receiver.recv() => match result {
+                        Ok(change) => change,
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                        // A slow client may miss multiple sessions' events.
+                        Err(broadcast::error::RecvError::Lagged(_)) => Change { state: true, ..Default::default() },
+                    },
                 }
-            }
+            } else {
+                Change {
+                    state: true,
+                    ..Default::default()
+                }
+            };
             Some((
-                Ok(Event::default().event("changed").data("refresh")),
+                Ok(Event::default()
+                    .event("changed")
+                    .json_data(change)
+                    .expect("change is JSON serializable")),
                 (receiver, false, stopping),
             ))
         },
@@ -407,7 +454,7 @@ async fn events(
 async fn state_get(State(s): State<WebState>) -> Json<Value> {
     let c = s.core.lock().await;
     Json(
-        json!({"revision":c.revision,"config":c.config,"defaults":Config::default(),"credential":{"configured":OpenAiClient::has_key(&c.config),"saved":c.credentials.contains_key(&c.config.api_key_env)},"running":c.order.iter().filter_map(|id| c.running.get(id).map(|r| json!({"id":id,"closing":r.closing}))).collect::<Vec<_>>(),"sessions":c.order.iter().filter_map(|id|c.sessions.get(id)).map(|v|json!({"id":v.id,"project":v.project,"status":v.status,"title":v.latest_request.chars().take(60).collect::<String>(),"memory_count":v.memory.entries.len()})).collect::<Vec<_>>(),"tools":ToolRegistry::specs().iter().filter(|t|t.name != "db_query" && t.name != "db_execute").map(|t|json!({"name":t.name,"description":t.description,"optional":t.optional})).collect::<Vec<_>>()}),
+        json!({"revision":c.revision,"config":c.config,"defaults":Config::default(),"credential":{"configured":OpenAiClient::has_key(&c.config),"saved":c.credentials.contains_key(&c.config.api_key_env)},"running":c.order.iter().filter_map(|id| c.running.get(id).map(|r| json!({"id":id,"closing":r.closing}))).collect::<Vec<_>>(),"sessions":c.order.iter().filter_map(|id|c.sessions.get(id)).map(|v| { let mut summary = session_summary(v); summary["revision"] = json!(c.session_revisions.get(&v.id).copied().unwrap_or(0)); summary }).collect::<Vec<_>>(),"tools":ToolRegistry::specs().iter().filter(|t|t.name != "db_query" && t.name != "db_execute").map(|t|json!({"name":t.name,"description":t.description,"optional":t.optional})).collect::<Vec<_>>()}),
     )
 }
 #[derive(Default, Deserialize)]
@@ -553,7 +600,7 @@ async fn session_settings(
             }
         }
     };
-    changed(&s, &mut c);
+    session_changed(&s, &mut c, &id, false);
     Ok(Json(json!({"saved":true,"pending":pending})))
 }
 async fn check(State(s): State<WebState>, Json(input): Json<Settings>) -> Api {
@@ -598,7 +645,7 @@ async fn create_session(State(s): State<WebState>, Json(input): Json<NewSession>
     c.order.push(id.clone());
     c.sessions
         .insert(id.clone(), Arc::new(session_view::Snapshot::new(session)));
-    changed(&s, &mut c);
+    session_changed(&s, &mut c, &id, true);
     Ok(Json(json!({"id":id})))
 }
 async fn session_project(
@@ -634,7 +681,7 @@ async fn session_project(
     }
     session.project = project;
     tools::revalidate(session)?;
-    changed(&s, &mut c);
+    session_changed(&s, &mut c, &id, true);
     Ok(Json(json!({"saved":true})))
 }
 #[derive(Deserialize)]
@@ -660,7 +707,7 @@ async fn session_workflow(
     }
     let session = c.session_mut(&id).ok_or_else(missing)?;
     session.workflow_mode = input.workflow;
-    changed(&s, &mut c);
+    session_changed(&s, &mut c, &id, false);
     Ok(Json(json!({"saved":true})))
 }
 #[derive(Deserialize)]
@@ -704,7 +751,7 @@ async fn session_tools(
         // that was waiting for a request boundary.
         session.pending_tools = None;
     }
-    changed(&s, &mut c);
+    session_changed(&s, &mut c, &id, false);
     Ok(Json(json!({"saved":true})))
 }
 #[derive(Deserialize)]
@@ -751,8 +798,13 @@ fn publish_snapshot(s: &WebState, c: &mut Core, mut snapshot: Arc<session_view::
             }
         }
     }
-    c.sessions.insert(snapshot.id.clone(), snapshot);
-    changed(s, c);
+    let id = snapshot.id.clone();
+    let state_changed = c
+        .sessions
+        .get(&id)
+        .is_none_or(|old| session_summary(old) != session_summary(&snapshot));
+    c.sessions.insert(id.clone(), snapshot);
+    session_changed(s, c, &id, state_changed);
 }
 
 async fn run(
@@ -882,7 +934,7 @@ async fn run(
                 closing: false,
             },
         );
-        changed(&s, &mut c);
+        session_changed(&s, &mut c, &id, true);
         (copy, cancel, rx)
     };
     let state = s.clone();
@@ -899,6 +951,12 @@ async fn run(
                     publish_snapshot(&owner, &mut c, snapshot);
                     continue;
                 }
+                let session_id = match &event {
+                    AgentEvent::Delta { session, .. }
+                    | AgentEvent::Tool { session, .. }
+                    | AgentEvent::Notice { session, .. } => session.clone(),
+                    AgentEvent::Snapshot(_) => unreachable!(),
+                };
                 let mut c = owner.core.lock().await;
                 match event {
                     AgentEvent::Delta { session, text } => {
@@ -924,7 +982,7 @@ async fn run(
                         }
                     }
                 }
-                changed(&owner, &mut c);
+                session_changed(&owner, &mut c, &session_id, false);
             }
         });
         let outcome = {
@@ -1008,7 +1066,7 @@ async fn run(
             }
         }
         c.running.remove(&id);
-        changed(&state, &mut c);
+        session_changed(&state, &mut c, &id, true);
     });
     Ok(Json(json!({"started":true})))
 }
@@ -1034,7 +1092,7 @@ async fn close_session(State(s): State<WebState>, Path(id): Path<String>) -> Api
     } else {
         c.remove_session(&id);
     }
-    changed(&s, &mut c);
+    session_changed(&s, &mut c, &id, true);
     Ok(Json(json!({"closed":true})))
 }
 async fn memory_get(State(s): State<WebState>, Path((id, memory)): Path<(String, String)>) -> Api {
@@ -1227,6 +1285,113 @@ pub async fn serve_app(
 #[cfg(test)]
 mod worker_wait_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn session_events_identify_the_owner_without_invalidating_other_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = WebState::new(
+            Config {
+                projects: vec![Project {
+                    root: dir.path().into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            dir.path().join("config.toml"),
+            Arc::new(OpenAiClient),
+        )
+        .unwrap();
+        let first = state.core.lock().await.order[0].clone();
+        let Json(created) = create_session(
+            State(state.clone()),
+            Json(NewSession {
+                project: Project {
+                    root: dir.path().into(),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        let second = created["id"].as_str().unwrap().to_owned();
+        let mut events = state.events.subscribe();
+        let _ = session_workflow(
+            State(state.clone()),
+            Path(second.clone()),
+            Json(WorkflowSelection {
+                workflow: "document_edit".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let change = events.try_recv().unwrap();
+        assert_eq!(change.session.as_deref(), Some(second.as_str()));
+        assert!(!change.state);
+        let Json(list) = state_get(State(state.clone())).await;
+        assert_eq!(list["sessions"][0]["id"], first);
+        assert_eq!(list["sessions"][0]["revision"], 0);
+        assert_eq!(list["sessions"][1]["revision"], change.revision);
+        let _ = close_session(State(state.clone()), Path(second.clone()))
+            .await
+            .unwrap();
+        let change = events.try_recv().unwrap();
+        assert_eq!(change.session.as_deref(), Some(second.as_str()));
+        assert!(change.state);
+        assert!(
+            !state
+                .core
+                .lock()
+                .await
+                .session_revisions
+                .contains_key(&second)
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshots_refresh_the_sidebar_only_when_the_summary_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = WebState::new(
+            Config {
+                projects: vec![Project {
+                    root: dir.path().into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            dir.path().join("config.toml"),
+            Arc::new(OpenAiClient),
+        )
+        .unwrap();
+        let mut events = state.events.subscribe();
+        let mut core = state.core.lock().await;
+        let id = core.order[0].clone();
+        let (commands, _) = mpsc::channel(1);
+        core.running.insert(
+            id.clone(),
+            Running {
+                cancel: CancellationToken::new(),
+                commands,
+                closing: false,
+            },
+        );
+        let mut session = core.sessions[&id].session.clone();
+        session.input_tokens += 100;
+        publish_snapshot(
+            &state,
+            &mut core,
+            Arc::new(session_view::Snapshot::new(session.clone())),
+        );
+        let change = events.try_recv().unwrap();
+        assert_eq!(change.session.as_deref(), Some(id.as_str()));
+        assert!(!change.state);
+        session.status = "running".into();
+        publish_snapshot(
+            &state,
+            &mut core,
+            Arc::new(session_view::Snapshot::new(session)),
+        );
+        assert!(events.try_recv().unwrap().state);
+    }
 
     #[tokio::test]
     async fn unfinished_request_bodies_time_out_while_the_server_is_running() {
