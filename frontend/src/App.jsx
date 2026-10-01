@@ -7,7 +7,14 @@ import { api, download, send, statusLabel, toolLabels } from "./api.js";
 import { mergeSession, mergeOlder } from "./session-history.js";
 import { useServerDraft } from "./use-server-draft.js";
 import { createComposerDrafts } from "./composer-drafts.js";
-import { createSessionCache, FULL_REFRESH, NO_REFRESH, mergeRefresh, changeRefresh, parseChange } from "./session-cache.js";
+import {
+  createSessionCache,
+  FULL_REFRESH,
+  NO_REFRESH,
+  mergeRefresh,
+  changeRefresh,
+  parseChange,
+} from "./session-cache.js";
 
 const DEFAULT_INSPECTOR_WIDTH = 295;
 const MIN_INSPECTOR_WIDTH = 240;
@@ -26,7 +33,9 @@ function clampInspectorWidth(value) {
 
 function loadInspectorWidth() {
   try {
-    return clampInspectorWidth(window.localStorage.getItem(INSPECTOR_WIDTH_KEY));
+    return clampInspectorWidth(
+      window.localStorage.getItem(INSPECTOR_WIDTH_KEY),
+    );
   } catch {
     return DEFAULT_INSPECTOR_WIDTH;
   }
@@ -43,7 +52,9 @@ export default function App() {
     [error, setError] = useState(""),
     [refreshError, setRefreshError] = useState(""),
     [connected, setConnected] = useState(false),
-    [detail, setDetail] = useState(() => !window.matchMedia("(max-width: 1000px)").matches),
+    [detail, setDetail] = useState(
+      () => !window.matchMedia("(max-width: 1000px)").matches,
+    ),
     [mobileNav, setMobileNav] = useState(false),
     [navigating, setNavigating] = useState(false),
     [runPending, setRunPending] = useState(new Set()),
@@ -80,139 +91,204 @@ export default function App() {
   const onInspectorDirtyChange = useCallback((dirty) => {
     inspectorDirty.current = dirty;
   }, []);
-  const displaySession = useCallback((value) => {
-    displayed.current = value;
-    setSession(value);
-    if (value) cache.set(value);
-  }, [cache]);
+  const displaySession = useCallback(
+    (value) => {
+      displayed.current = value;
+      setSession(value);
+      if (value) cache.set(value);
+    },
+    [cache],
+  );
   // A displayed response may lag a change already announced by the server.
   // Keep that minimum separate from accepted responses and from other sessions.
-  const requiredVersion = useCallback((id) => Math.max(
-    versions.current.get(id) || 0,
-    expectedVersions.current.get(id) || 0,
-    globalVersion.current,
-  ), []);
-  const refresh = useCallback((restart = false, scope = FULL_REFRESH) => {
-    if (!alive.current) return Promise.resolve();
-    pending.current = mergeRefresh(pending.current, scope);
-    if (fetching.current) {
-      if (!restart) return fetching.current.done;
-      pending.current = mergeRefresh(pending.current, fetching.current.scope);
-      fetching.current.controller.abort();
-    }
-    scope = pending.current;
-    if (!scope.state && !scope.session) return Promise.resolve();
-    if (!workspace.current) scope = { ...scope, state: true };
-    const controller = new AbortController();
-    const request = { controller, done: null, scope };
-    fetching.current = request;
-    pending.current = NO_REFRESH;
-    clearTimeout(timer.current);
-    timer.current = null;
-    const epoch = selectionEpoch.current;
-    const isCurrent = () => alive.current && fetching.current === request &&
-      selectionEpoch.current === epoch && !controller.signal.aborted;
-    let timedOut = false;
-    const deadline = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, 15000);
-    const loadSession = async (id) => {
-      const current = await api(`/sessions/${id}`, { signal: controller.signal });
-      if (isCurrent() && selection.current === id &&
-          current.revision >= (versions.current.get(id) || 0)) {
-        versions.current.set(id, current.revision);
-        const previous = displayed.current?.id === id ? displayed.current : cache.peek(id);
-        displaySession(mergeSession(previous, current));
-        lastChecked.current.session = Date.now();
-        setSessionReady(current.revision >= requiredVersion(id));
-      } else if (isCurrent() && selection.current === id) {
-        setSessionReady(false);
-        pending.current = mergeRefresh(pending.current, { state: false, session: true });
+  const requiredVersion = useCallback(
+    (id) =>
+      Math.max(
+        versions.current.get(id) || 0,
+        expectedVersions.current.get(id) || 0,
+        globalVersion.current,
+      ),
+    [],
+  );
+  const refresh = useCallback(
+    (restart = false, scope = FULL_REFRESH) => {
+      if (!alive.current) return Promise.resolve();
+      pending.current = mergeRefresh(pending.current, scope);
+      if (fetching.current) {
+        if (!restart) return fetching.current.done;
+        pending.current = mergeRefresh(pending.current, fetching.current.scope);
+        fetching.current.controller.abort();
       }
-    };
-    // A known selection can load independently of the sidebar. Navigating
-    // must not wait for an unrelated state request that is slow or stalled.
-    const earlyId = selection.current;
-    const early = scope.session && workspace.current?.sessions.some((s) => s.id === earlyId)
-      ? loadSession(earlyId).then(() => null, (error) => error) : null;
-    request.done = (async () => {
-      try {
-        const next = scope.state ? await api("/state", { signal: controller.signal }) : workspace.current;
-        if (isCurrent()) {
-          if (scope.state) {
-            workspace.current = next;
-            setState(next);
-            lastChecked.current.state = Date.now();
-            const ids = next.sessions.map((s) => s.id);
-            drafts.retain(ids);
-            cache.retain(ids);
-            const keep = new Set(ids);
-            for (const entries of [versions.current, expectedVersions.current]) {
-              for (const id of entries.keys()) if (!keep.has(id)) entries.delete(id);
+      scope = pending.current;
+      if (!scope.state && !scope.session) return Promise.resolve();
+      if (!workspace.current) scope = { ...scope, state: true };
+      const controller = new AbortController();
+      const request = { controller, done: null, scope };
+      fetching.current = request;
+      pending.current = NO_REFRESH;
+      clearTimeout(timer.current);
+      timer.current = null;
+      const epoch = selectionEpoch.current;
+      const isCurrent = () =>
+        alive.current &&
+        fetching.current === request &&
+        selectionEpoch.current === epoch &&
+        !controller.signal.aborted;
+      let timedOut = false;
+      const deadline = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, 15000);
+      const loadSession = async (id) => {
+        const current = await api(`/sessions/${id}`, {
+          signal: controller.signal,
+        });
+        if (
+          isCurrent() &&
+          selection.current === id &&
+          current.revision >= (versions.current.get(id) || 0)
+        ) {
+          versions.current.set(id, current.revision);
+          const previous =
+            displayed.current?.id === id ? displayed.current : cache.peek(id);
+          displaySession(mergeSession(previous, current));
+          lastChecked.current.session = Date.now();
+          setSessionReady(current.revision >= requiredVersion(id));
+        } else if (isCurrent() && selection.current === id) {
+          setSessionReady(false);
+          pending.current = mergeRefresh(pending.current, {
+            state: false,
+            session: true,
+          });
+        }
+      };
+      // A known selection can load independently of the sidebar. Navigating
+      // must not wait for an unrelated state request that is slow or stalled.
+      const earlyId = selection.current;
+      const early =
+        scope.session &&
+        workspace.current?.sessions.some((s) => s.id === earlyId)
+          ? loadSession(earlyId).then(
+              () => null,
+              (error) => error,
+            )
+          : null;
+      request.done = (async () => {
+        try {
+          const next = scope.state
+            ? await api("/state", { signal: controller.signal })
+            : workspace.current;
+          if (isCurrent()) {
+            if (scope.state) {
+              workspace.current = next;
+              setState(next);
+              lastChecked.current.state = Date.now();
+              const ids = next.sessions.map((s) => s.id);
+              drafts.retain(ids);
+              cache.retain(ids);
+              const keep = new Set(ids);
+              for (const entries of [
+                versions.current,
+                expectedVersions.current,
+              ]) {
+                for (const id of entries.keys())
+                  if (!keep.has(id)) entries.delete(id);
+              }
+              for (const summary of next.sessions) {
+                expectedVersions.current.set(
+                  summary.id,
+                  Math.max(
+                    expectedVersions.current.get(summary.id) || 0,
+                    summary.revision || 0,
+                  ),
+                );
+              }
             }
-            for (const summary of next.sessions) {
-              expectedVersions.current.set(summary.id, Math.max(
-                expectedVersions.current.get(summary.id) || 0,
-                summary.revision || 0,
-              ));
-            }
-          }
-          let id = selection.current;
-          if (!next.sessions.some((s) => s.id === id)) {
-            id = next.sessions[0]?.id || "";
-            selection.current = id;
-            setSelected(id);
-            displaySession(cache.get(id));
-            setSessionReady(false);
-            scope = { ...scope, session: true };
-            window.history.replaceState(null, "", id ? `#${id}` : window.location.pathname + window.location.search);
-          }
-          if (id) {
-            if (requiredVersion(id) > (versions.current.get(id) ?? -1)) setSessionReady(false);
-            if (early && id === earlyId) {
-              const error = await early;
-              if (error) throw error;
-            }
-            if ((scope.session && (!early || id !== earlyId)) ||
-                requiredVersion(id) > (versions.current.get(id) ?? -1)) {
-              await loadSession(id);
-            }
-            if (isCurrent() && requiredVersion(id) > (versions.current.get(id) ?? -1)) {
+            let id = selection.current;
+            if (!next.sessions.some((s) => s.id === id)) {
+              id = next.sessions[0]?.id || "";
+              selection.current = id;
+              setSelected(id);
+              displaySession(cache.get(id));
               setSessionReady(false);
-              pending.current = mergeRefresh(pending.current, { state: false, session: true });
+              scope = { ...scope, session: true };
+              window.history.replaceState(
+                null,
+                "",
+                id
+                  ? `#${id}`
+                  : window.location.pathname + window.location.search,
+              );
             }
-          } else {
-            displaySession(null);
-            setSessionReady(false);
+            if (id) {
+              if (requiredVersion(id) > (versions.current.get(id) ?? -1))
+                setSessionReady(false);
+              if (early && id === earlyId) {
+                const error = await early;
+                if (error) throw error;
+              }
+              if (
+                (scope.session && (!early || id !== earlyId)) ||
+                requiredVersion(id) > (versions.current.get(id) ?? -1)
+              ) {
+                await loadSession(id);
+              }
+              if (
+                isCurrent() &&
+                requiredVersion(id) > (versions.current.get(id) ?? -1)
+              ) {
+                setSessionReady(false);
+                pending.current = mergeRefresh(pending.current, {
+                  state: false,
+                  session: true,
+                });
+              }
+            } else {
+              displaySession(null);
+              setSessionReady(false);
+            }
+            if (isCurrent()) {
+              setRefreshError("");
+              recovering.current = false;
+            }
           }
-          if (isCurrent()) { setRefreshError(""); recovering.current = false; }
-        }
-      } catch (e) {
-        if (alive.current && fetching.current === request && selectionEpoch.current === epoch) {
-          recovering.current = true;
-          if (timedOut) setRefreshError("작업 공간 응답이 지연되고 있습니다. 다시 연결을 시도합니다.");
-          else if (!controller.signal.aborted) setRefreshError(e.message);
-          controller.abort();
-        }
-      } finally {
-        clearTimeout(deadline);
-        if (fetching.current === request) {
-          fetching.current = null;
-          if ((pending.current.state || pending.current.session) && alive.current) {
-            timer.current = setTimeout(() => {
-              timer.current = null;
-              void refresh(false, NO_REFRESH);
-            }, 120);
+        } catch (e) {
+          if (
+            alive.current &&
+            fetching.current === request &&
+            selectionEpoch.current === epoch
+          ) {
+            recovering.current = true;
+            if (timedOut)
+              setRefreshError(
+                "작업 공간 응답이 지연되고 있습니다. 다시 연결을 시도합니다.",
+              );
+            else if (!controller.signal.aborted) setRefreshError(e.message);
+            controller.abort();
+          }
+        } finally {
+          clearTimeout(deadline);
+          if (fetching.current === request) {
+            fetching.current = null;
+            if (
+              (pending.current.state || pending.current.session) &&
+              alive.current
+            ) {
+              timer.current = setTimeout(() => {
+                timer.current = null;
+                void refresh(false, NO_REFRESH);
+              }, 120);
+            }
           }
         }
-      }
-      // Cancellation alone is not completion for an action awaiting fresh state.
-      const replacement = fetching.current;
-      if (replacement && replacement !== request) await replacement.done;
-    })();
-    return request.done;
-  }, [cache, displaySession, drafts, requiredVersion]);
+        // Cancellation alone is not completion for an action awaiting fresh state.
+        const replacement = fetching.current;
+        if (replacement && replacement !== request) await replacement.done;
+      })();
+      return request.done;
+    },
+    [cache, displaySession, drafts, requiredVersion],
+  );
   useEffect(() => {
     if (stopped) return;
     alive.current = true;
@@ -225,14 +301,31 @@ export default function App() {
       // the stream itself must not queue a duplicate of the initial read.
     };
     stream.addEventListener("changed", (event) => {
-      const scope = changeRefresh(event.data, selection.current, versions.current.get(selection.current) || 0);
+      const scope = changeRefresh(
+        event.data,
+        selection.current,
+        versions.current.get(selection.current) || 0,
+      );
       const change = parseChange(event.data);
       if (change) {
-        if (change.session === null) globalVersion.current = Math.max(globalVersion.current, change.revision);
-        else expectedVersions.current.set(change.session, Math.max(
-          expectedVersions.current.get(change.session) || 0, change.revision,
-        ));
-        if (scope.session && requiredVersion(selection.current) > (versions.current.get(selection.current) || 0))
+        if (change.session === null)
+          globalVersion.current = Math.max(
+            globalVersion.current,
+            change.revision,
+          );
+        else
+          expectedVersions.current.set(
+            change.session,
+            Math.max(
+              expectedVersions.current.get(change.session) || 0,
+              change.revision,
+            ),
+          );
+        if (
+          scope.session &&
+          requiredVersion(selection.current) >
+            (versions.current.get(selection.current) || 0)
+        )
           setSessionReady(false);
       }
       if (!scope.state && !scope.session) return;
@@ -243,9 +336,15 @@ export default function App() {
         void refresh(false, NO_REFRESH);
       }, 100);
     });
-    stream.onerror = () => { streamOpen.current = false; setConnected(false); };
+    stream.onerror = () => {
+      streamOpen.current = false;
+      setConnected(false);
+    };
     const poll = setInterval(() => {
-      if (!streamOpen.current || recovering.current) { void refresh(); return; }
+      if (!streamOpen.current || recovering.current) {
+        void refresh();
+        return;
+      }
       // Events carry ordinary changes. Reconcile occasionally for missed
       // events and external file edits, which do not emit server events.
       void refresh(false, {
@@ -253,7 +352,9 @@ export default function App() {
         session: Date.now() - lastChecked.current.session >= 15000,
       });
     }, 3000);
-    const resume = () => { if (document.visibilityState === "visible") void refresh(); };
+    const resume = () => {
+      if (document.visibilityState === "visible") void refresh();
+    };
     document.addEventListener("visibilitychange", resume);
     return () => {
       alive.current = false;
@@ -286,7 +387,13 @@ export default function App() {
   }, [inspectorWidth]);
   useEffect(() => {
     const warnBeforeUnload = (event) => {
-      if (!settingsDirty.current && !projectsDirty.current && !inspectorDirty.current && !drafts.hasText()) return;
+      if (
+        !settingsDirty.current &&
+        !projectsDirty.current &&
+        !inspectorDirty.current &&
+        !drafts.hasText()
+      )
+        return;
       event.preventDefault();
       event.returnValue = "";
     };
@@ -299,9 +406,11 @@ export default function App() {
       (page === "projects" && projectsDirty.current) ||
       (page === "chat" && inspectorDirty.current);
     if (!dirty) return true;
-    return window.confirm(projectDraftForNewSession && page === "projects"
-      ? "현재 입력한 프로젝트 정보를 새 세션에만 적용하고 이동할까요? 저장하지 않은 프로젝트 목록 변경 사항은 저장되지 않습니다."
-      : "저장하지 않은 변경 사항을 버리고 이동할까요?");
+    return window.confirm(
+      projectDraftForNewSession && page === "projects"
+        ? "현재 입력한 프로젝트 정보를 새 세션에만 적용하고 이동할까요? 저장하지 않은 프로젝트 목록 변경 사항은 저장되지 않습니다."
+        : "저장하지 않은 변경 사항을 버리고 이동할까요?",
+    );
   }
   function showPage(next) {
     if (next !== page && !canLeavePage()) return;
@@ -329,7 +438,10 @@ export default function App() {
     setSessionReady(false);
     setPage("chat");
     setMobileNav(false);
-    void refresh(true, { state: !workspace.current?.sessions.some((s) => s.id === id), session: true });
+    void refresh(true, {
+      state: !workspace.current?.sessions.some((s) => s.id === id),
+      session: true,
+    });
   }
   async function act(fn) {
     setError("");
@@ -346,7 +458,8 @@ export default function App() {
     void act(fn).catch(() => {});
   };
   async function runSession(id, text, action) {
-    if (startingRun.current.has(id)) throw new Error("이 세션의 실행 요청을 처리하고 있습니다.");
+    if (startingRun.current.has(id))
+      throw new Error("이 세션의 실행 요청을 처리하고 있습니다.");
     startingRun.current.add(id);
     setRunPending(new Set(startingRun.current));
     try {
@@ -359,7 +472,9 @@ export default function App() {
   async function changeWorkflow(id, workflow) {
     setWorkflowPending((current) => new Set([...current, id]));
     try {
-      return await act(() => send(`/sessions/${id}/workflow`, { workflow }, "PUT"));
+      return await act(() =>
+        send(`/sessions/${id}/workflow`, { workflow }, "PUT"),
+      );
     } finally {
       setWorkflowPending((current) => {
         const next = new Set(current);
@@ -369,7 +484,11 @@ export default function App() {
     }
   }
   async function create(project, { projectDraft = false } = {}) {
-    if (creating.current || !canLeavePage({ projectDraftForNewSession: projectDraft })) return;
+    if (
+      creating.current ||
+      !canLeavePage({ projectDraftForNewSession: projectDraft })
+    )
+      return;
     creating.current = true;
     const navigation = navigationEpoch.current;
     setNavigating(true);
@@ -382,7 +501,9 @@ export default function App() {
     }
   }
   async function closeSession(id) {
-    const unsaved = drafts.get(id).text.trim() || (id === selected && (settingsDirty.current || inspectorDirty.current));
+    const unsaved =
+      drafts.get(id).text.trim() ||
+      (id === selected && (settingsDirty.current || inspectorDirty.current));
     if (
       !window.confirm(
         `이 세션을 닫을까요? 대화와 기억은 사라지고 결과 문서는 유지됩니다.${unsaved ? " 저장하지 않은 변경 사항도 사라집니다." : ""}`,
@@ -417,8 +538,11 @@ export default function App() {
   const running = state?.running || [];
   const runningById = new Map(running.map((run) => [run.id, run]));
   const activeCount = new Set([...runningById.keys(), ...runPending]).size;
-  const capacityFull = activeCount >= (state?.config.max_concurrent_sessions ?? 4);
-  const selectedBusy = runPending.has(selected) || runningById.has(selected) ||
+  const capacityFull =
+    activeCount >= (state?.config.max_concurrent_sessions ?? 4);
+  const selectedBusy =
+    runPending.has(selected) ||
+    runningById.has(selected) ||
     (session?.id === selected && session.status === "running");
   const otherRunning = running.filter((run) => run.id !== selected);
   const canRun = Boolean(
@@ -492,8 +616,7 @@ export default function App() {
           ))}
           {state?.sessions
             .filter(
-              (s) =>
-                !state.config.projects.some((p) => p.id === s.project.id),
+              (s) => !state.config.projects.some((p) => p.id === s.project.id),
             )
             .map((s) => (
               <SessionButton
@@ -554,7 +677,9 @@ export default function App() {
           <div className="topbar-actions">
             {otherRunning.length > 0 && (
               <details className="running-menu" key={selected}>
-                <summary className="running-link">● 다른 세션 {otherRunning.length}개 작업 중</summary>
+                <summary className="running-link">
+                  ● 다른 세션 {otherRunning.length}개 작업 중
+                </summary>
                 <div className="running-list">
                   {otherRunning.map((run) => {
                     const item = state.sessions.find((s) => s.id === run.id);
@@ -579,7 +704,8 @@ export default function App() {
                   aria-label="상세 패널 표시"
                   aria-pressed={detail}
                   onClick={() => {
-                    if (detail && inspectorDirty.current && !canLeavePage()) return;
+                    if (detail && inspectorDirty.current && !canLeavePage())
+                      return;
                     setDetail(!detail);
                   }}
                 >
@@ -592,7 +718,13 @@ export default function App() {
         {(error || refreshError) && (
           <div className="app-error" role="alert">
             <span>{error || refreshError}</span>
-            <button aria-label="오류 닫기" onClick={() => { setError(""); setRefreshError(""); }}>
+            <button
+              aria-label="오류 닫기"
+              onClick={() => {
+                setError("");
+                setRefreshError("");
+              }}
+            >
               ×
             </button>
           </div>
@@ -617,7 +749,9 @@ export default function App() {
             config={state.config}
             onSaved={() => refresh(true)}
             onDirtyChange={onProjectsDirtyChange}
-            onCreate={(project) => act(() => create(project, { projectDraft: true }))}
+            onCreate={(project) =>
+              act(() => create(project, { projectDraft: true }))
+            }
             creating={navigating}
           />
         ) : session ? (
@@ -638,30 +772,56 @@ export default function App() {
                 <div className="session-actions">
                   <button
                     title="보존된 상태로 재개"
-                    disabled={navigating || !sessionReady || selectedBusy || capacityFull || workflowPending.has(selected) || !canRun || !session.has_task}
-                    onClick={() => void runSession(selected, undefined, "resume").catch(() => {})}
+                    disabled={
+                      navigating ||
+                      !sessionReady ||
+                      selectedBusy ||
+                      capacityFull ||
+                      workflowPending.has(selected) ||
+                      !canRun ||
+                      !session.has_task
+                    }
+                    onClick={() =>
+                      void runSession(selected, undefined, "resume").catch(
+                        () => {},
+                      )
+                    }
                   >
                     재개
                   </button>
                   <button
                     title="기억과 상태 정리"
-                    disabled={navigating || !sessionReady || selectedBusy || capacityFull || workflowPending.has(selected) || !canRun || !session.has_task}
-                    onClick={() => void runSession(selected, undefined, "cleanup").catch(() => {})}
+                    disabled={
+                      navigating ||
+                      !sessionReady ||
+                      selectedBusy ||
+                      capacityFull ||
+                      workflowPending.has(selected) ||
+                      !canRun ||
+                      !session.has_task
+                    }
+                    onClick={() =>
+                      void runSession(selected, undefined, "cleanup").catch(
+                        () => {},
+                      )
+                    }
                   >
                     기억 정리
                   </button>
                   <button
                     className="danger-text"
-                    disabled={
-                      runningById.get(selected)?.closing
-                    }
+                    disabled={runningById.get(selected)?.closing}
                     onClick={safe(() => closeSession(selected))}
                   >
                     세션 닫기
                   </button>
                 </div>
               </div>
-              {!sessionReady && <div className="pending-note" role="status">최신 내용을 확인하는 중…</div>}
+              {!sessionReady && (
+                <div className="pending-note" role="status">
+                  최신 내용을 확인하는 중…
+                </div>
+              )}
               {session.pending_config && (
                 <div className="pending-note">
                   설정 변경이 대기 중입니다. 현재 요청이 끝나거나 필요한 기억
@@ -672,24 +832,32 @@ export default function App() {
                 key={session.id}
                 session={session}
                 drafts={drafts}
-                busy={navigating || !sessionReady || selectedBusy || workflowPending.has(session.id)}
+                busy={
+                  navigating ||
+                  !sessionReady ||
+                  selectedBusy ||
+                  workflowPending.has(session.id)
+                }
                 capacityFull={capacityFull}
                 navigating={navigating}
                 canRun={canRun}
-                onSend={(text, action) =>
-                  runSession(session.id, text, action)
-                }
+                onSend={(text, action) => runSession(session.id, text, action)}
                 onWorkflow={(workflow) => changeWorkflow(session.id, workflow)}
                 onCancel={safe(() => send(`/sessions/${selected}/cancel`, {}))}
                 onSettings={() => showPage("settings")}
-                onOlder={() => act(async () => {
-                  const epoch = selectionEpoch.current;
-                  const older = await api(
-                    `/sessions/${selected}?before=${session.previous}`,
-                  );
-                  if (selection.current === older.id && selectionEpoch.current === epoch)
-                    displaySession(mergeOlder(displayed.current, older));
-                })}
+                onOlder={() =>
+                  act(async () => {
+                    const epoch = selectionEpoch.current;
+                    const older = await api(
+                      `/sessions/${selected}?before=${session.previous}`,
+                    );
+                    if (
+                      selection.current === older.id &&
+                      selectionEpoch.current === epoch
+                    )
+                      displaySession(mergeOlder(displayed.current, older));
+                  })
+                }
               />
             </div>
             {detail && (
@@ -728,11 +896,7 @@ function SessionButton({ session, active, onClick, onClose, closing }) {
   const title = session.title || "새 대화";
   return (
     <div className={`session-row ${active ? "active" : ""}`}>
-      <button
-        className="session-button"
-        onClick={onClick}
-        title={title}
-      >
+      <button className="session-button" onClick={onClick} title={title}>
         <i className={session.status === "running" ? "pulse" : ""} />
         <span>
           {title}
@@ -773,7 +937,9 @@ function Projects({ config, onSaved, onCreate, onDirtyChange, creating }) {
     [message, setMessage] = useState(""),
     [busy, setBusy] = useState(false),
     [dirty, setDirtyState] = useState(false);
-  const draftVersion = useRef(0), saving = useRef(false), mounted = useRef(true);
+  const draftVersion = useRef(0),
+    saving = useRef(false),
+    mounted = useRef(true);
   if (index >= list.length && index !== 0) setIndex(0);
   function setDirty(value) {
     if (!mounted.current) return;
@@ -803,8 +969,10 @@ function Projects({ config, onSaved, onCreate, onDirtyChange, creating }) {
       );
       markSaved(list);
       const unchanged = submittedVersion === draftVersion.current;
-      setMessage("프로젝트를 저장했습니다. 새 세션에 적용됩니다." +
-        (unchanged ? "" : " 이후 변경 사항은 아직 저장하지 않았습니다."));
+      setMessage(
+        "프로젝트를 저장했습니다. 새 세션에 적용됩니다." +
+          (unchanged ? "" : " 이후 변경 사항은 아직 저장하지 않았습니다."),
+      );
       if (unchanged) setDirty(false);
       await onSaved();
     } catch (e) {
@@ -885,7 +1053,11 @@ function Projects({ config, onSaved, onCreate, onDirtyChange, creating }) {
                 >
                   이 프로젝트로 새 세션
                 </button>
-                <button className="primary" disabled={busy || creating} onClick={save}>
+                <button
+                  className="primary"
+                  disabled={busy || creating}
+                  onClick={save}
+                >
                   프로젝트 저장
                 </button>
               </div>
@@ -1009,7 +1181,8 @@ function Inspector({
   const [projectDirty, setProjectDirty] = useState(false);
   const [projectSaving, setProjectSaving] = useState(false);
   const [projectMessage, setProjectMessage] = useState("");
-  const projectSavingRef = useRef(false), mounted = useRef(true);
+  const projectSavingRef = useRef(false),
+    mounted = useRef(true);
   const activeToolsKey = JSON.stringify(session.active_tools);
   useEffect(() => {
     if (!toolsSaving) setToolSelection(JSON.parse(activeToolsKey));
@@ -1019,9 +1192,15 @@ function Inspector({
     [memoryId, setMemoryId] = useState(null),
     [memory, setMemory] = useState(null),
     [document, setDocument] = useState(null);
-  const [project, setProject, markProjectSaved] = useServerDraft(session.project);
-  const outputKey = JSON.stringify([session.project.root, session.project.output]);
-  const outputRequest = useRef(0), outputIdentity = useRef(outputKey);
+  const [project, setProject, markProjectSaved] = useServerDraft(
+    session.project,
+  );
+  const outputKey = JSON.stringify([
+    session.project.root,
+    session.project.output,
+  ]);
+  const outputRequest = useRef(0),
+    outputIdentity = useRef(outputKey);
   outputIdentity.current = outputKey;
   useEffect(() => {
     mounted.current = true;
@@ -1033,7 +1212,9 @@ function Inspector({
   useEffect(() => {
     setDocument(null);
     setOutputLoading(false);
-    return () => { outputRequest.current++; };
+    return () => {
+      outputRequest.current++;
+    };
   }, [outputKey]);
   async function loadDocument() {
     const request = ++outputRequest.current;
@@ -1041,10 +1222,17 @@ function Inspector({
     setDocument(null);
     try {
       const next = await api(`/sessions/${session.id}/output`);
-      if (request === outputRequest.current && outputIdentity.current === outputKey)
+      if (
+        request === outputRequest.current &&
+        outputIdentity.current === outputKey
+      )
         setDocument(next);
     } catch (error) {
-      if (request === outputRequest.current && outputIdentity.current === outputKey) throw error;
+      if (
+        request === outputRequest.current &&
+        outputIdentity.current === outputKey
+      )
+        throw error;
     } finally {
       if (request === outputRequest.current) setOutputLoading(false);
     }
@@ -1055,7 +1243,11 @@ function Inspector({
     setProjectSaving(true);
     setProjectMessage("");
     try {
-      await send(`/sessions/${session.id}/project`, cleanProject(project), "PUT");
+      await send(
+        `/sessions/${session.id}/project`,
+        cleanProject(project),
+        "PUT",
+      );
       markProjectSaved(project);
       if (mounted.current) {
         setProjectDirty(false);
@@ -1067,7 +1259,9 @@ function Inspector({
       setProjectSaving(false);
     }
   }
-  const memoryKey = JSON.stringify(session.memories.find((item) => item.id === memoryId) || null);
+  const memoryKey = JSON.stringify(
+    session.memories.find((item) => item.id === memoryId) || null,
+  );
   useEffect(() => {
     setMemory(null);
     if (!memoryId) return;
@@ -1078,7 +1272,9 @@ function Inspector({
     let active = true;
     void onAction(async () => {
       try {
-        const result = await api(`/sessions/${session.id}/memories/${memoryId}`);
+        const result = await api(
+          `/sessions/${session.id}/memories/${memoryId}`,
+        );
         if (active) setMemory(result);
       } catch (error) {
         if (active) {
@@ -1087,7 +1283,9 @@ function Inspector({
         }
       }
     }).catch(() => {});
-    return () => { active = false; };
+    return () => {
+      active = false;
+    };
   }, [session.id, memoryId, memoryKey]);
   const doAction = (fn) => () => {
     void onAction(fn).catch(() => {});
@@ -1096,7 +1294,8 @@ function Inspector({
     JSON.stringify(m).toLowerCase().includes(query.toLowerCase()),
   );
   const recovering =
-    session.status === "running" && session.run_guidance?.progress_recovery?.active;
+    session.status === "running" &&
+    session.run_guidance?.progress_recovery?.active;
   const todos = session.task.todos || [];
   const currentTodo = todos.find((item) => !item.done);
   return (
@@ -1140,7 +1339,10 @@ function Inspector({
             />
             {memory ? (
               <article className="memory-detail">
-                <button className="text-button" onClick={() => setMemoryId(null)}>
+                <button
+                  className="text-button"
+                  onClick={() => setMemoryId(null)}
+                >
                   ← 목록으로
                 </button>
                 <h3>{memory.title}</h3>
@@ -1339,8 +1541,17 @@ function Inspector({
                   {(session.completion_review.checks || []).map((check) => (
                     <li key={check.id}>
                       <strong>
-                        {{ met: "충족", unmet: "미충족", unverified: "확인 불가" }[check.status]}
-                        {" · "}{check.id === "R0" ? "원래 요청" : check.criterion || "완료 조건"}
+                        {
+                          {
+                            met: "충족",
+                            unmet: "미충족",
+                            unverified: "확인 불가",
+                          }[check.status]
+                        }
+                        {" · "}
+                        {check.id === "R0"
+                          ? "원래 요청"
+                          : check.criterion || "완료 조건"}
                       </strong>
                       <p>{check.reason}</p>
                       {check.next_action && <p>보완: {check.next_action}</p>}
@@ -1348,7 +1559,8 @@ function Inspector({
                   ))}
                 </ul>
                 <small className="subtle">
-                  최근 검증 결과입니다. 결과물이나 조건이 바뀌면 다시 확인합니다.
+                  최근 검증 결과입니다. 결과물이나 조건이 바뀌면 다시
+                  확인합니다.
                 </small>
               </section>
             )}
@@ -1528,17 +1740,27 @@ function Inspector({
                 onProjectDirtyChange(true);
                 setProjectMessage("");
               }}
-              disabled={navigating || running?.id === session.id || projectSaving}
+              disabled={
+                navigating || running?.id === session.id || projectSaving
+              }
             />
             <button
               className="primary"
-              disabled={navigating || running?.id === session.id || projectSaving}
+              disabled={
+                navigating || running?.id === session.id || projectSaving
+              }
               onClick={doAction(saveProject)}
             >
               현재 세션에 적용
             </button>
-            {projectDirty && <p className="subtle">저장하지 않은 변경 사항이 있습니다.</p>}
-            {projectMessage && <p role="status" className="success-message">{projectMessage}</p>}
+            {projectDirty && (
+              <p className="subtle">저장하지 않은 변경 사항이 있습니다.</p>
+            )}
+            {projectMessage && (
+              <p role="status" className="success-message">
+                {projectMessage}
+              </p>
+            )}
           </>
         )}
       </div>
