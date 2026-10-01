@@ -38,6 +38,111 @@ fn saving_existing_config_preserves_its_file_mode() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn configuration_and_credentials_reject_fifos_without_waiting_for_eof() {
+    use mnemoarc::config::Config;
+    use std::{collections::BTreeMap, os::unix::fs::OpenOptionsExt, time::Duration};
+
+    for credentials in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let fifo = if credentials {
+            path.with_extension("credentials.json")
+        } else {
+            path.clone()
+        };
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(
+                    Config::load(&worker_path, &BTreeMap::new())
+                        .err()
+                        .map(|e| e.to_string()),
+                )
+                .unwrap();
+        });
+        let timely = receiver.recv_timeout(Duration::from_millis(500));
+        drop(writer);
+        let returned = timely.is_ok();
+        let error =
+            timely.unwrap_or_else(|_| receiver.recv_timeout(Duration::from_secs(2)).unwrap());
+        worker.join().unwrap();
+        assert!(returned, "configuration load waited for FIFO EOF");
+        assert!(error.unwrap().starts_with("unsupported_file_type:"));
+        if !credentials {
+            assert!(
+                Config::default()
+                    .save(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .starts_with("unsupported_file_type:")
+            );
+            assert!(!std::fs::metadata(&path).unwrap().is_file());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn optional_dotenv_fifo_does_not_block_startup() {
+    use std::{
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("mkfifo")
+            .arg(dir.path().join(".env"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mnemoarc"))
+        .current_dir(dir.path())
+        .env_clear()
+        .args(["--config", "missing.toml", "check"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let timed_out = child.try_wait().unwrap().is_none();
+    if timed_out {
+        child.kill().unwrap();
+    }
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        !timed_out,
+        "startup waited for an optional .env pipe writer"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(
+        stderr.contains("Configure model and model_context"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn legacy_projects_with_identical_definitions_receive_distinct_persisted_ids() {
     use mnemoarc::config::Config;

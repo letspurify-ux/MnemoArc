@@ -6,10 +6,7 @@ use oracle::{
     sql_type::{OracleType, RefCursor, ToSql, ToSqlNull},
 };
 use serde_json::{Map, Value, json};
-use std::{
-    collections::BTreeSet,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeSet, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 fn bad(message: &str) -> anyhow::Error {
@@ -362,7 +359,7 @@ pub fn execute_free(
     if cancel.is_cancelled() {
         bail!("cancelled");
     }
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let deadline = crate::config::deadline_after(timeout_secs)?;
     match mode {
         "query" | "statement" => {
             validate_shape(args, &["mode", "sql"], &["mode", "sql", "params"])?;

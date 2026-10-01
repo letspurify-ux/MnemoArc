@@ -3,7 +3,7 @@ mod relations;
 
 use super::structure::{SyntaxFile, check_budget};
 use super::*;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const MAX_FILES: usize = 2_048;
@@ -194,7 +194,7 @@ fn page(
 }
 
 pub(super) fn search(s: &mut Session, args: &Value, cancel: &CancellationToken) -> Result<Value> {
-    let deadline = Instant::now() + Duration::from_secs(s.config.tool_timeout_secs);
+    let deadline = crate::config::deadline_after(s.config.tool_timeout_secs)?;
     let workspace = Workspace::load(s, args, None, cancel, deadline)?;
     let fingerprint = request_fingerprint(&workspace, "symbol_search", args);
     let mut rows = Vec::new();

@@ -2609,8 +2609,19 @@ pub fn envelope(result: Result<Value>) -> Value {
 fn excluded(p: &Project, rel: &Path) -> Result<bool> {
     file_edit::excluded_case_alias(p, rel)
 }
+pub(crate) fn utf8_path(path: &Path) -> Result<&str> {
+    path.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "unsupported_non_utf8_path: path must contain valid UTF-8: {}",
+            path.display()
+        )
+    })
+}
+
 pub fn output_path(p: &Project) -> Result<PathBuf> {
     let root = p.root.canonicalize()?;
+    utf8_path(&root)?;
+    utf8_path(&p.output)?;
     let path = if p.output.is_absolute() {
         p.output.clone()
     } else {
@@ -2680,6 +2691,7 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
         };
         anyhow::anyhow!("{code}: resolved path {}; project root {}; configured output {}. Relative paths use project.root; use document_inspect with no path for configured output.{hint} {e}", candidate.display(), root.display(), p.output.display())
     })?;
+    utf8_path(&canonical)?;
     let output = output_path(p)?;
     if output.exists() && canonical == output.canonicalize()? {
         return Ok(canonical);
@@ -3020,6 +3032,11 @@ fn candidate_paths_bounded(
         check()?;
         let entry = entry?;
         if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        // JSON tool paths cannot address OS names that are not UTF-8. A lossy
+        // path can name a different file, and serializing the real path panics.
+        if entry.path().to_str().is_none() {
             continue;
         }
         let rel = entry.path().strip_prefix(&root)?;

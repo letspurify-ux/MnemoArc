@@ -418,8 +418,7 @@ impl OpenAiClient {
             .map(|s| s.0.clone())
             .or_else(|| std::env::var(&c.api_key_env).ok())
             .or_else(|| {
-                dotenvy::from_path_iter(".env")
-                    .ok()?
+                crate::config::dotenv_entries()?
                     .filter_map(Result::ok)
                     .find(|(k, _)| k == &c.api_key_env)
                     .map(|(_, v)| v)

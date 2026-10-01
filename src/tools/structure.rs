@@ -675,8 +675,7 @@ pub(super) fn execute(
     args: &Value,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value> {
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(s.config.tool_timeout_secs);
+    let deadline = crate::config::deadline_after(s.config.tool_timeout_secs)?;
     let path = read_path(&s.project, text(args, "path")?)?;
     let source = read_text(&path)?;
     let file = SyntaxFile::parse(path, source, cancel, deadline)?;

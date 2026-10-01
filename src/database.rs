@@ -154,7 +154,7 @@ fn password(name: &str) -> Result<String> {
     if let Ok(value) = std::env::var(name) {
         return Ok(value);
     }
-    for entry in dotenvy::from_path_iter(".env").into_iter().flatten() {
+    for entry in crate::config::dotenv_entries().into_iter().flatten() {
         let (key, value) = entry?;
         if key == name {
             return Ok(value);
@@ -435,7 +435,7 @@ pub fn execute(
     if cancel.is_cancelled() {
         bail!("cancelled");
     }
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let deadline = crate::config::deadline_after(timeout_secs)?;
     let conn = connect(config, timeout_secs, deadline)?;
     // Oracle enforces transaction read-only in addition to the SELECT-only query API.
     conn.execute("SET TRANSACTION READ ONLY", &[])?;

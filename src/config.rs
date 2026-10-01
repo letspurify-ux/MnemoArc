@@ -5,6 +5,22 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub(crate) fn dotenv_entries() -> Option<dotenvy::Iter<std::fs::File>> {
+    // An optional .env must not wait for a pipe writer during startup or
+    // credential checks. Open the same regular file that the parser reads.
+    let file = crate::tools::open_regular_file(Path::new(".env")).ok()?;
+    Some(dotenvy::from_read_iter(file))
+}
+
+pub(crate) fn deadline_after(seconds: u64) -> Result<std::time::Instant> {
+    if seconds == 0 {
+        bail!("invalid_timeout: timeout must be positive");
+    }
+    std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(seconds))
+        .ok_or_else(|| anyhow::anyhow!("invalid_timeout: timeout exceeds supported clock range"))
+}
+
 #[derive(Clone)]
 pub struct Secret(pub String);
 impl std::fmt::Debug for Secret {
@@ -91,6 +107,12 @@ impl Default for Project {
     }
 }
 impl Project {
+    pub(crate) fn validate_paths(&self) -> Result<()> {
+        crate::tools::utf8_path(&self.root)?;
+        crate::tools::utf8_path(&self.output)?;
+        Ok(())
+    }
+
     pub(crate) fn ensure_id(&mut self) {
         if self.id.trim().is_empty() {
             self.id = uuid::Uuid::new_v4().to_string();
@@ -154,12 +176,13 @@ impl Config {
         for project in &mut self.projects {
             project.ensure_id();
         }
-        self.validate_project_ids()
+        self.validate_projects()
     }
 
-    fn validate_project_ids(&self) -> Result<()> {
+    fn validate_projects(&self) -> Result<()> {
         let mut ids = BTreeSet::new();
         for project in &self.projects {
+            project.validate_paths()?;
             if !project.id.trim().is_empty() && !ids.insert(&project.id) {
                 bail!("프로젝트 식별자가 중복되었습니다. 각 프로젝트는 고유한 id가 필요합니다.");
             }
@@ -187,7 +210,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        self.validate_project_ids()?;
+        self.validate_projects()?;
         if !(1..=32).contains(&self.max_concurrent_sessions) {
             bail!("max_concurrent_sessions must be between 1 and 32");
         }
@@ -269,12 +292,7 @@ impl Config {
             self.tool_timeout_secs,
             self.run_timeout_secs,
         ] {
-            if std::time::Instant::now()
-                .checked_add(std::time::Duration::from_secs(seconds))
-                .is_none()
-            {
-                bail!("Timeout exceeds supported clock range");
-            }
+            deadline_after(seconds)?;
         }
         self.completion_url()?;
         if !self.disable_proxy
@@ -294,8 +312,7 @@ impl Config {
     }
     pub fn load(path: &Path, overrides: &BTreeMap<String, serde_json::Value>) -> Result<Self> {
         let mut value = serde_json::to_value(Self::default())?;
-        let mut env: BTreeMap<String, String> = dotenvy::from_path_iter(".env")
-            .ok()
+        let mut env: BTreeMap<String, String> = dotenv_entries()
             .into_iter()
             .flatten()
             .filter_map(Result::ok)
@@ -328,7 +345,7 @@ impl Config {
             }
         }
         if path.exists() {
-            let saved: toml::Value = toml::from_str(&std::fs::read_to_string(path)?)?;
+            let saved: toml::Value = toml::from_str(&crate::tools::read_text(path)?)?;
             let saved = serde_json::to_value(saved)?;
             for (k, v) in saved
                 .as_object()
@@ -345,7 +362,7 @@ impl Config {
         let credentials = path.with_extension("credentials.json");
         if credentials.exists() {
             let keys: BTreeMap<String, String> =
-                serde_json::from_slice(&std::fs::read(credentials)?)?;
+                serde_json::from_str(&crate::tools::read_text(&credentials)?)?;
             config.api_key = keys.get(&config.api_key_env).cloned().map(Secret);
         }
         config.validate()?;
@@ -366,7 +383,12 @@ impl Config {
         // Replacing a file with NamedTempFile otherwise changes an existing
         // config's access mode to the temporary file's private default.
         match std::fs::metadata(path) {
-            Ok(metadata) => temp.as_file().set_permissions(metadata.permissions())?,
+            Ok(metadata) => {
+                if !metadata.is_file() {
+                    bail!("unsupported_file_type: configuration must be a regular file");
+                }
+                temp.as_file().set_permissions(metadata.permissions())?;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }

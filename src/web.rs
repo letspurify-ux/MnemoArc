@@ -80,6 +80,7 @@ impl Core {
 #[derive(Clone)]
 pub struct WebState {
     core: Arc<Mutex<Core>>,
+    settings_gate: Arc<Mutex<()>>,
     events: broadcast::Sender<Change>,
     client: Arc<dyn LlmClient>,
     stopping: CancellationToken,
@@ -204,6 +205,7 @@ fn normalize_project(mut project: Project) -> Result<Project> {
         bail!("프로젝트 결과 문서 경로가 필요합니다.");
     }
     project.root = project.root.canonicalize()?;
+    project.validate_paths()?;
     if !project.root.is_dir() || project.name.trim().is_empty() {
         bail!("프로젝트 이름과 실제 폴더가 필요합니다.");
     }
@@ -234,7 +236,7 @@ impl WebState {
     pub fn new(mut config: Config, path: PathBuf, client: Arc<dyn LlmClient>) -> Result<Self> {
         let credentials: BTreeMap<String, Secret> = if credential_path(&path).exists() {
             let data: BTreeMap<String, String> =
-                serde_json::from_slice(&std::fs::read(credential_path(&path))?)?;
+                serde_json::from_str(&tools::read_text(&credential_path(&path))?)?;
             data.into_iter().map(|(k, v)| (k, Secret(v))).collect()
         } else {
             BTreeMap::new()
@@ -253,6 +255,7 @@ impl WebState {
             });
         }
         config.ensure_project_ids()?;
+        config.validate()?;
         // Saved folders may have been moved or temporarily unmounted. Keep
         // those entries editable in settings, and start with an available
         // project instead of preventing the settings UI from opening.
@@ -289,6 +292,7 @@ impl WebState {
                 session_revisions: BTreeMap::new(),
                 credentials,
             })),
+            settings_gate: Arc::new(Mutex::new(())),
             events,
             client,
             file_io: FileIo::new(stopping.clone()),
@@ -518,9 +522,41 @@ fn prepare_settings(
     Ok(config)
 }
 async fn settings(State(s): State<WebState>, Json(input): Json<Settings>) -> Api {
-    let mut c = s.core.lock().await;
-    let config = prepare_settings(&input, &c.config, &c.credentials)?;
-    let mut credentials = c.credentials.clone();
+    let (gate, deadline) = acquire_settings_gate(&s).await?;
+    let state = s.clone();
+    s.file_io
+        .run_queued(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            move |cancel| {
+                // Keep serialization with the actual worker: a timed-out or dropped
+                // HTTP request must not let a later save overtake unfinished file I/O.
+                let _gate = gate;
+                save_settings(&state, input, &cancel)
+            },
+        )
+        .await?;
+    Ok(Json(json!({"saved":true})))
+}
+
+async fn acquire_settings_gate(
+    s: &WebState,
+) -> Result<(tokio::sync::OwnedMutexGuard<()>, tokio::time::Instant), ApiError> {
+    let timeout = Duration::from_secs(s.core.lock().await.config.tool_timeout_secs);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let gate = tokio::select! {
+        biased;
+        _ = s.stopping.cancelled() => return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "앱을 종료하고 있습니다.".into())),
+        result = tokio::time::timeout_at(deadline, s.settings_gate.clone().lock_owned()) => result.map_err(|_| ApiError(StatusCode::GATEWAY_TIMEOUT, "file_operation_timeout: 설정 저장 제한 시간을 초과했습니다.".into()))?,
+    };
+    Ok((gate, deadline))
+}
+
+fn save_settings(s: &WebState, input: Settings, cancel: &CancellationToken) -> Result<()> {
+    let (old, path, mut credentials) = {
+        let c = s.core.blocking_lock();
+        (c.config.clone(), c.path.clone(), c.credentials.clone())
+    };
+    let config = prepare_settings(&input, &old, &credentials)?;
     let updates_credentials = matches!(input.credential_mode.as_str(), "save" | "clear");
     if input.credential_mode == "save" {
         credentials.insert(config.api_key_env.clone(), config.api_key.clone().unwrap());
@@ -533,35 +569,45 @@ async fn settings(State(s): State<WebState>, Json(input): Json<Settings>) -> Api
     // persistence fails after the config write, restore the exact previous
     // config so a failed request cannot leave only half of the settings live.
     let previous_config = if updates_credentials {
-        match std::fs::read(&c.path) {
-            Ok(bytes) => Some((
-                bytes,
-                std::fs::metadata(&c.path)
-                    .map_err(anyhow::Error::from)?
-                    .permissions(),
-            )),
+        match std::fs::metadata(&path) {
+            Ok(_) => {
+                use std::io::Read;
+                let file = tools::open_regular_file(&path)?;
+                let permissions = file.metadata()?.permissions();
+                let mut bytes = Vec::new();
+                file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+                if bytes.len() > 16 * 1024 * 1024 {
+                    bail!("unsupported_large_file: configuration exceeds 16MiB");
+                }
+                Some((bytes, permissions))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(anyhow::Error::from(error).into()),
+            Err(error) => return Err(error.into()),
         }
     } else {
         None
     };
-    config.save(&c.path)?;
+    if cancel.is_cancelled() {
+        bail!("cancelled");
+    }
+    config.save(&path)?;
     if updates_credentials
-        && let Err(error) = write_credentials(&credential_path(&c.path), &credentials)
+        && let Err(error) = write_credentials(&credential_path(&path), &credentials)
     {
-        if let Err(rollback) = restore_file(&c.path, previous_config.as_ref()) {
+        if let Err(rollback) = restore_file(&path, previous_config.as_ref()) {
             return Err(anyhow::anyhow!(
                 "credential save failed: {error}; config rollback failed: {rollback}"
-            )
-            .into());
+            ));
         }
-        return Err(error.into());
+        return Err(error);
     }
+    // Once persistence starts, publish the completed transaction even if the
+    // requester disconnects, keeping live settings consistent with the files.
+    let mut c = s.core.blocking_lock();
     c.config = config;
     c.credentials = credentials;
-    changed(&s, &mut c);
-    Ok(Json(json!({"saved":true})))
+    changed(s, &mut c);
+    Ok(())
 }
 async fn session_settings(
     State(s): State<WebState>,
@@ -574,12 +620,30 @@ async fn session_settings(
             "키를 저장하려면 전체 설정을 사용하세요.".into(),
         ));
     }
+    let (_gate, deadline) = acquire_settings_gate(&s).await?;
+    let (current, credentials) = {
+        let c = s.core.lock().await;
+        let old = c.sessions.get(&id).ok_or_else(missing)?;
+        // Secrets are omitted from API responses. A later `keep` request must
+        // inherit the latest queued choice, including a queued key deletion.
+        (
+            old.pending_config.as_ref().unwrap_or(&old.config).clone(),
+            c.credentials.clone(),
+        )
+    };
+    let baseline = current.clone();
+    let mut config = s
+        .file_io
+        .run_queued(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            move |_| prepare_settings(&input, &baseline, &credentials),
+        )
+        .await?;
     let mut c = s.core.lock().await;
     let old = c.sessions.get(&id).ok_or_else(missing)?;
-    // Secrets are omitted from API responses. A later `keep` request must
-    // inherit the latest queued choice, including a queued key deletion.
-    let current = old.pending_config.as_ref().unwrap_or(&old.config);
-    let mut config = prepare_settings(&input, current, &c.credentials)?;
+    if !same_config(old.pending_config.as_ref().unwrap_or(&old.config), &current) {
+        return Err(busy());
+    }
     config.max_concurrent_sessions = c.config.max_concurrent_sessions;
     let pending = if let Some(r) = c.running.get(&id) {
         r.commands
@@ -604,10 +668,20 @@ async fn session_settings(
     Ok(Json(json!({"saved":true,"pending":pending})))
 }
 async fn check(State(s): State<WebState>, Json(input): Json<Settings>) -> Api {
-    let config = {
+    let (old, credentials, timeout) = {
         let c = s.core.lock().await;
-        prepare_settings(&input, &c.config, &c.credentials)?
+        (
+            c.config.clone(),
+            c.credentials.clone(),
+            Duration::from_secs(c.config.tool_timeout_secs),
+        )
     };
+    let config = s
+        .file_io
+        .run_queued(timeout, move |_| {
+            prepare_settings(&input, &old, &credentials)
+        })
+        .await?;
     check_config(s, config).await
 }
 async fn session_check(
@@ -615,12 +689,22 @@ async fn session_check(
     Path(id): Path<String>,
     Json(input): Json<Settings>,
 ) -> Api {
-    let config = {
+    let (old, credentials, timeout) = {
         let c = s.core.lock().await;
         let session = c.sessions.get(&id).ok_or_else(missing)?;
         let current = session.pending_config.as_ref().unwrap_or(&session.config);
-        prepare_settings(&input, current, &c.credentials)?
+        (
+            current.clone(),
+            c.credentials.clone(),
+            Duration::from_secs(c.config.tool_timeout_secs),
+        )
     };
+    let config = s
+        .file_io
+        .run_queued(timeout, move |_| {
+            prepare_settings(&input, &old, &credentials)
+        })
+        .await?;
     check_config(s, config).await
 }
 async fn check_config(s: WebState, config: Config) -> Api {
@@ -636,7 +720,11 @@ struct NewSession {
     project: Project,
 }
 async fn create_session(State(s): State<WebState>, Json(input): Json<NewSession>) -> Api {
-    let mut project = normalize_project(input.project)?;
+    let timeout = Duration::from_secs(s.core.lock().await.config.tool_timeout_secs);
+    let mut project = s
+        .file_io
+        .run_queued(timeout, move |_| normalize_project(input.project))
+        .await?;
     let mut c = s.core.lock().await;
     inherit_project_id(&mut project, &c.config.projects);
     let mut session = Session::new(project, c.config.clone());
@@ -653,12 +741,47 @@ async fn session_project(
     Path(id): Path<String>,
     Json(project): Json<Project>,
 ) -> Api {
-    let mut project = normalize_project(project)?;
+    let (original, timeout) = {
+        let c = s.core.lock().await;
+        if c.running.contains_key(&id) {
+            return Err(busy());
+        }
+        (
+            c.sessions.get(&id).ok_or_else(missing)?.clone(),
+            Duration::from_secs(c.config.tool_timeout_secs),
+        )
+    };
+    let baseline = original.clone();
+    let session = s
+        .file_io
+        .run_queued(timeout, move |cancel| {
+            Ok(prepare_project_update(&baseline, project, &cancel))
+        })
+        .await??;
     let mut c = s.core.lock().await;
     if c.running.contains_key(&id) {
         return Err(busy());
     }
-    let session = c.session_mut(&id).ok_or_else(missing)?;
+    let current = c.sessions.get(&id).ok_or_else(missing)?;
+    if !Arc::ptr_eq(current, &original) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "세션 상태가 변경되었습니다. 최신 상태에서 다시 시도하세요.".into(),
+        ));
+    }
+    c.sessions
+        .insert(id.clone(), Arc::new(session_view::Snapshot::new(session)));
+    session_changed(&s, &mut c, &id, true);
+    Ok(Json(json!({"saved":true})))
+}
+
+fn prepare_project_update(
+    original: &session_view::Snapshot,
+    project: Project,
+    cancel: &CancellationToken,
+) -> Result<Session, ApiError> {
+    let mut project = normalize_project(project)?;
+    let mut session = original.session.clone();
     if project.id.trim().is_empty() {
         project.id.clone_from(&session.project.id);
     }
@@ -680,9 +803,11 @@ async fn session_project(
         ));
     }
     session.project = project;
-    tools::revalidate(session)?;
-    session_changed(&s, &mut c, &id, true);
-    Ok(Json(json!({"saved":true})))
+    tools::inspect_freshness(&session, cancel)?.apply(&mut session);
+    if cancel.is_cancelled() {
+        return Err(anyhow::anyhow!("cancelled").into());
+    }
+    Ok(session)
 }
 #[derive(Deserialize)]
 struct WorkflowSelection {
@@ -1157,6 +1282,7 @@ async fn directories(State(s): State<WebState>, Query(query): Query<DirectoryQue
             .path
             .unwrap_or(std::env::current_dir()?)
             .canonicalize()?;
+        tools::utf8_path(&path)?;
         let mut entries = Vec::new();
         for entry in std::fs::read_dir(&path)? {
             if cancel.is_cancelled() {
@@ -1165,10 +1291,14 @@ async fn directories(State(s): State<WebState>, Query(query): Query<DirectoryQue
             if let Ok(entry) = entry
                 && entry.file_type().is_ok_and(|t| t.is_dir())
             {
+                let entry_path = entry.path();
+                if entry_path.to_str().is_none() {
+                    continue;
+                }
                 if entries.len() == MAX_DIRECTORY_ENTRIES {
                     bail!("directory_listing_capacity: 하위 폴더가 너무 많습니다. 원하는 폴더 경로를 직접 입력하세요.");
                 }
-                entries.push(json!({"name":entry.file_name().to_string_lossy(),"path":entry.path()}));
+                entries.push(json!({"name":entry.file_name().to_string_lossy(),"path":entry_path}));
             }
         }
         entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
@@ -2043,6 +2173,385 @@ mod worker_wait_tests {
             0o640
         );
         assert_eq!(state.core.lock().await.revision, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn directory_listing_skips_non_utf8_names_and_rejects_non_utf8_targets() {
+        use std::{
+            ffi::OsString,
+            os::unix::{ffi::OsStringExt, fs::symlink},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let invalid = dir.path().join(OsString::from_vec(b"folder-\xff".to_vec()));
+        std::fs::create_dir(&invalid).unwrap();
+        std::fs::create_dir(dir.path().join("valid")).unwrap();
+        symlink(&invalid, dir.path().join("alias")).unwrap();
+        let state = WebState::new(
+            Config {
+                projects: vec![Project {
+                    root: dir.path().into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            dir.path().join("config.toml"),
+            Arc::new(OpenAiClient),
+        )
+        .unwrap();
+        let listed = directories(
+            State(state.clone()),
+            Query(DirectoryQuery {
+                path: Some(dir.path().into()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(listed["directories"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["directories"][0]["name"], "valid");
+        let error = directories(
+            State(state.clone()),
+            Query(DirectoryQuery {
+                path: Some(dir.path().join("alias")),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.1.starts_with("unsupported_non_utf8_path:"),
+            "{error:?}"
+        );
+        let result = create_session(
+            State(state.clone()),
+            Json(NewSession {
+                project: Project {
+                    root: dir.path().join("alias"),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ApiError(StatusCode::BAD_REQUEST, ref error)) if error.starts_with("unsupported_non_utf8_path:"))
+        );
+        assert_eq!(state.core.lock().await.sessions.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credential_save_rejects_a_fifo_without_blocking_other_api_requests() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = Config {
+            projects: vec![Project {
+                root: dir.path().into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let state = WebState::new(config.clone(), path.clone(), Arc::new(OpenAiClient)).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Keep a writer open so an unchecked read would wait indefinitely.
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let save_state = state.clone();
+        let save = tokio::spawn(async move {
+            settings(
+                State(save_state),
+                Json(Settings {
+                    config,
+                    api_key: Some("test-key".into()),
+                    credential_mode: "save".into(),
+                }),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let responsive =
+            tokio::time::timeout(Duration::from_millis(200), state_get(State(state.clone()))).await;
+        // Release a regressed reader before asserting, so the test cannot hang.
+        drop(writer);
+        let saved = tokio::time::timeout(Duration::from_secs(2), save)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            responsive.is_ok(),
+            "settings I/O retained the shared session lock"
+        );
+        assert!(
+            matches!(saved, Err(ApiError(StatusCode::BAD_REQUEST, ref error)) if error.starts_with("unsupported_file_type:")),
+            "{saved:?}"
+        );
+        assert!(!std::fs::metadata(path).unwrap().is_file());
+        assert_eq!(state.core.lock().await.revision, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_project_paths_are_rejected_before_creating_web_state() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        for field in ["root", "output"] {
+            let invalid = PathBuf::from(OsString::from_vec(b"invalid-\xff".to_vec()));
+            let mut project = Project {
+                root: dir.path().into(),
+                ..Default::default()
+            };
+            if field == "root" {
+                project.root = invalid;
+            } else {
+                project.output = invalid;
+            }
+            let config = Config {
+                projects: vec![project],
+                ..Default::default()
+            };
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .starts_with("unsupported_non_utf8_path:")
+            );
+            let error = WebState::new(
+                config,
+                dir.path().join("config.toml"),
+                Arc::new(OpenAiClient),
+            )
+            .err()
+            .expect("unserializable project was accepted");
+            assert!(error.to_string().starts_with("unsupported_non_utf8_path:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_settings_save_keeps_other_requests_responsive_and_cancels_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = Config {
+            projects: vec![Project {
+                root: dir.path().into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut state =
+            WebState::new(config.clone(), path.clone(), Arc::new(OpenAiClient)).unwrap();
+        let workers = Arc::new(tokio::sync::Semaphore::new(1));
+        let occupied = workers.clone().acquire_owned().await.unwrap();
+        state.file_io = FileIo::with_workers(workers, state.stopping.clone());
+        let save_state = state.clone();
+        let save = tokio::spawn(async move {
+            settings(
+                State(save_state),
+                Json(Settings {
+                    config,
+                    api_key: Some("test-key".into()),
+                    credential_mode: "save".into(),
+                }),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.settings_gate.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let current =
+            tokio::time::timeout(Duration::from_millis(200), state_get(State(state.clone())))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(current["revision"], 0);
+        assert!(!save.is_finished());
+        let id = current["sessions"][0]["id"].as_str().unwrap().to_owned();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(200),
+            close_session(State(state.clone()), Path(id)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(Duration::from_millis(200), state.shutdown())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), save)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, _))
+        ));
+        drop(occupied);
+        assert!(!path.exists());
+        assert!(!credential_path(&path).exists());
+        assert!(state.settings_gate.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn concurrent_settings_saves_preserve_credentials_and_match_persisted_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = Config {
+            projects: vec![Project {
+                root: dir.path().into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let state = WebState::new(config.clone(), path.clone(), Arc::new(OpenAiClient)).unwrap();
+        let mut saves = tokio::task::JoinSet::new();
+        for index in 0..6 {
+            let state = state.clone();
+            let mut config = config.clone();
+            config.api_key_env = format!("SETTINGS_TEST_{index}");
+            config.request_timeout_secs = 20 + index;
+            saves.spawn(async move {
+                settings(
+                    State(state),
+                    Json(Settings {
+                        config,
+                        api_key: Some(format!("key-{index}")),
+                        credential_mode: "save".into(),
+                    }),
+                )
+                .await
+            });
+        }
+        while let Some(result) = saves.join_next().await {
+            let _ = result.unwrap().unwrap();
+        }
+        let persisted = Config::load(&path, &BTreeMap::new()).unwrap();
+        let credentials: BTreeMap<String, String> =
+            serde_json::from_slice(&std::fs::read(credential_path(&path)).unwrap()).unwrap();
+        let core = state.core.lock().await;
+        assert!(same_config(&core.config, &persisted));
+        assert_eq!(core.revision, 6);
+        assert_eq!(credentials.len(), 6);
+        assert_eq!(core.credentials.len(), 6);
+        for index in 0..6 {
+            assert_eq!(
+                credentials[&format!("SETTINGS_TEST_{index}")],
+                format!("key-{index}")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_project_validation_cannot_overwrite_a_newer_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = WebState::new(
+            Config {
+                projects: vec![Project {
+                    root: dir.path().into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            dir.path().join("config.toml"),
+            Arc::new(OpenAiClient),
+        )
+        .unwrap();
+        let (id, mut project) = {
+            let c = state.core.lock().await;
+            let id = c.order[0].clone();
+            (id.clone(), c.sessions[&id].project.clone())
+        };
+        let original_purpose = project.purpose.clone();
+        project.purpose = "Pending project update".into();
+        let workers = Arc::new(tokio::sync::Semaphore::new(1));
+        let occupied = workers.clone().acquire_owned().await.unwrap();
+        state.file_io = FileIo::with_workers(workers, state.stopping.clone());
+        let update_state = state.clone();
+        let update_id = id.clone();
+        let update = tokio::spawn(async move {
+            session_project(State(update_state), Path(update_id), Json(project)).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if Arc::strong_count(&state.core.lock().await.sessions[&id]) > 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(200),
+            session_workflow(
+                State(state.clone()),
+                Path(id.clone()),
+                Json(WorkflowSelection {
+                    workflow: "answer".into(),
+                }),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!update.is_finished());
+        drop(occupied);
+        let result = tokio::time::timeout(Duration::from_secs(2), update)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(ApiError(StatusCode::CONFLICT, _))));
+        let core = state.core.lock().await;
+        assert_eq!(core.sessions[&id].workflow_mode, "answer");
+        assert_eq!(core.sessions[&id].project.purpose, original_purpose);
+        assert_eq!(core.revision, 1);
+    }
+
+    #[test]
+    fn web_state_rejects_extreme_timeouts_before_any_api_can_create_a_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        for field in [
+            "request_timeout_secs",
+            "tool_timeout_secs",
+            "run_timeout_secs",
+        ] {
+            let mut config = Config {
+                projects: vec![Project {
+                    root: dir.path().into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            match field {
+                "request_timeout_secs" => config.request_timeout_secs = u64::MAX,
+                "tool_timeout_secs" => config.tool_timeout_secs = u64::MAX,
+                "run_timeout_secs" => config.run_timeout_secs = u64::MAX,
+                _ => unreachable!(),
+            }
+            let error = WebState::new(
+                config,
+                dir.path().join("config.toml"),
+                Arc::new(OpenAiClient),
+            )
+            .err()
+            .expect("unsupported timeout was accepted");
+            assert!(error.to_string().contains("clock range"));
+        }
     }
 
     #[tokio::test]

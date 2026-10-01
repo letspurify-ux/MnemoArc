@@ -414,64 +414,83 @@ fn visible(facts: &FileFacts, scope: &Span, at: usize) -> bool {
 fn rust_import(
     node: Node<'_>,
     source: &str,
-    prefix: &str,
     span: &Span,
     imports: &mut Vec<Import>,
     wildcard: &mut bool,
-) {
-    let join = |value: &str| {
-        if prefix.is_empty() {
-            value.to_owned()
-        } else {
-            format!("{prefix}::{value}")
-        }
-    };
-    match node.kind() {
-        "scoped_use_list" => {
-            let path = node
-                .child_by_field_name("path")
-                .map(|p| path_text(p, source))
-                .unwrap_or_default();
-            if let Some(list) = node.child_by_field_name("list") {
-                rust_import(list, source, &join(&path), span, imports, wildcard);
-            }
-        }
-        "use_list" => {
-            for child in named(node) {
-                rust_import(child, source, prefix, span, imports, wildcard);
-            }
-        }
-        "use_wildcard" => *wildcard = true,
-        _ => {
-            let path = node.child_by_field_name("path").unwrap_or(node);
-            let full = if text_of(path, source) == "self" && !prefix.is_empty() {
-                prefix.to_owned()
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<()> {
+    // Project syntax can nest use lists deeply enough to exhaust a native
+    // worker's call stack. Keep traversal state on the heap and observe the
+    // analysis budget within each import, not just between declarations.
+    let mut stack = vec![(node, String::new())];
+    while let Some((node, prefix)) = stack.pop() {
+        check_budget(cancel, deadline)?;
+        let join = |value: &str| {
+            if prefix.is_empty() {
+                value.to_owned()
             } else {
-                join(&path_text(path, source))
-            };
-            let alias = node
-                .child_by_field_name("alias")
-                .map(|n| text_of(n, source))
-                .unwrap_or_else(|| full.rsplit("::").next().unwrap_or(""));
-            imports.push(Import {
-                alias: alias.into(),
-                module: full.clone(),
-                member: None,
-                module_receiver: None,
-                scope: span.clone(),
-                at: node.start_byte(),
-                type_only: false,
-            });
+                format!("{prefix}::{value}")
+            }
+        };
+        match node.kind() {
+            "scoped_use_list" => {
+                let path = node
+                    .child_by_field_name("path")
+                    .map(|p| path_text(p, source))
+                    .unwrap_or_default();
+                if let Some(list) = node.child_by_field_name("list") {
+                    stack.push((list, join(&path)));
+                }
+            }
+            "use_list" => {
+                stack.extend(
+                    named(node)
+                        .into_iter()
+                        .rev()
+                        .map(|child| (child, prefix.clone())),
+                );
+            }
+            "use_wildcard" => *wildcard = true,
+            _ => {
+                let path = node.child_by_field_name("path").unwrap_or(node);
+                let full = if text_of(path, source) == "self" && !prefix.is_empty() {
+                    prefix
+                } else {
+                    join(&path_text(path, source))
+                };
+                let alias = node
+                    .child_by_field_name("alias")
+                    .map(|n| text_of(n, source))
+                    .unwrap_or_else(|| full.rsplit("::").next().unwrap_or(""));
+                imports.push(Import {
+                    alias: alias.into(),
+                    module: full.clone(),
+                    member: None,
+                    module_receiver: None,
+                    scope: span.clone(),
+                    at: node.start_byte(),
+                    type_only: false,
+                });
+            }
         }
     }
+    Ok(())
 }
 
-fn imports(node: Node<'_>, source: &str, facts: &mut FileFacts, language: &str) -> bool {
+fn imports(
+    node: Node<'_>,
+    source: &str,
+    facts: &mut FileFacts,
+    language: &str,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<bool> {
     let span = scope(node, language == "python", language);
-    match (language, node.kind()) {
+    Ok(match (language, node.kind()) {
         ("javascript" | "typescript" | "typescriptreact", "import_statement") => {
             let Some(module) = node.child_by_field_name("source") else {
-                return true;
+                return Ok(true);
             };
             let module = unquote(text_of(module, source));
             let type_only_statement =
@@ -559,11 +578,12 @@ fn imports(node: Node<'_>, source: &str, facts: &mut FileFacts, language: &str) 
                 rust_import(
                     arg,
                     source,
-                    "",
                     &span,
                     &mut facts.imports,
                     &mut facts.wildcard_import,
-                );
+                    cancel,
+                    deadline,
+                )?;
             }
             true
         }
@@ -644,7 +664,7 @@ fn imports(node: Node<'_>, source: &str, facts: &mut FileFacts, language: &str) 
             true
         }
         _ => false,
-    }
+    })
 }
 
 /// Return the selected name and the receiver/path whose type is not inferred.
@@ -1197,7 +1217,14 @@ fn collect(
                     }));
                 continue;
             }
-            if imports(node, source, &mut facts, file.syntax.language) {
+            if imports(
+                node,
+                source,
+                &mut facts,
+                file.syntax.language,
+                cancel,
+                deadline,
+            )? {
                 continue;
             }
             if matches!(
@@ -2448,7 +2475,7 @@ fn resolve_exact(
 }
 
 pub(super) fn execute(s: &Session, args: &Value, cancel: &CancellationToken) -> Result<Value> {
-    let deadline = Instant::now() + Duration::from_secs(s.config.tool_timeout_secs);
+    let deadline = crate::config::deadline_after(s.config.tool_timeout_secs)?;
     let path = read_path(&s.project, text(args, "path")?)?;
     let id = text(args, "symbol_id")?;
     let workspace = Workspace::load(s, args, Some(&path), cancel, deadline)?;

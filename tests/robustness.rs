@@ -82,6 +82,165 @@ fn extreme_pagination_and_budget_inputs_do_not_panic() {
     }
 }
 
+#[test]
+fn deeply_nested_rust_imports_do_not_overflow_the_tool_worker_stack() {
+    // A stack overflow aborts the process instead of unwinding. Isolate the
+    // regression so a failed navigation worker cannot kill the test runner.
+    const CHILD: &str = "MNEMOARC_NESTED_IMPORT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "deeply_nested_rust_imports_do_not_overflow_the_tool_worker_stack",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "navigation worker aborted:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    std::thread::Builder::new()
+        .name("nested-import-worker".into())
+        .stack_size(512 * 1024)
+        .spawn(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let depth = 2048;
+            for prefix in ["module::{", "{"] {
+                let source = format!(
+                    "use {}target{};\nfn main() {{ target(); }}\n",
+                    prefix.repeat(depth),
+                    "}".repeat(depth)
+                );
+                std::fs::write(dir.path().join("main.rs"), source).unwrap();
+                let mut s = session(dir.path());
+                let outline =
+                    tools::execute(&mut s, "code_outline", json!({"path":"main.rs"})).unwrap();
+                assert_eq!(outline["has_parse_errors"], false);
+                let result = tools::execute(
+                    &mut s,
+                    "symbol_relations",
+                    json!({"path":"main.rs","symbol_id":outline["symbols"][0]["symbol_id"]}),
+                )
+                .unwrap();
+                assert_eq!(result["relations"].as_array().unwrap().len(), 1);
+                assert_eq!(result["relations"][0]["name"], "target");
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn direct_syntax_tools_reject_extreme_timeouts_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let mut s = session(dir.path());
+    let outline = tools::execute(&mut s, "code_outline", json!({"path":"main.rs"})).unwrap();
+    s.config.tool_timeout_secs = u64::MAX;
+    for (name, args) in [
+        ("code_outline", json!({"path":"main.rs"})),
+        (
+            "symbol_read",
+            json!({"path":"main.rs","symbol_id":outline["symbols"][0]["symbol_id"]}),
+        ),
+        ("symbol_search", json!({"path":"main.rs","query":"main"})),
+        (
+            "symbol_relations",
+            json!({"path":"main.rs","symbol_id":outline["symbols"][0]["symbol_id"]}),
+        ),
+    ] {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tools::execute(&mut s, name, args)
+        }));
+        assert!(
+            result.is_ok(),
+            "{name} panicked while creating its deadline"
+        );
+        assert!(result.unwrap().unwrap_err().to_string().contains("timeout"));
+    }
+}
+
+#[test]
+fn direct_database_calls_reject_extreme_timeouts_without_panicking() {
+    use mnemoarc::database::{self, DatabaseConfig, SavedQuery};
+
+    let config = DatabaseConfig {
+        enabled: true,
+        raw_query_enabled: true,
+        raw_statement_enabled: true,
+        procedure_enabled: true,
+        function_enabled: true,
+        queries: vec![SavedQuery {
+            id: "example".into(),
+            enabled: true,
+            sql: "SELECT 1 FROM dual".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let cancel = CancellationToken::new();
+    let result = std::panic::catch_unwind(|| {
+        database::execute(
+            &config,
+            &json!({"action":"run","id":"example"}),
+            &cancel,
+            u64::MAX,
+        )
+    });
+    assert!(result.is_ok(), "saved query deadline caused a panic");
+    assert!(result.unwrap().unwrap_err().to_string().contains("timeout"));
+    for mode in ["query", "statement", "procedure", "function"] {
+        let result = std::panic::catch_unwind(|| {
+            database::execute_free(&config, &json!({"mode":mode}), &cancel, u64::MAX)
+        });
+        assert!(result.is_ok(), "{mode} deadline caused a panic");
+        assert!(result.unwrap().unwrap_err().to_string().contains("timeout"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reading_a_utf8_alias_of_a_non_utf8_file_returns_an_error_without_panicking() {
+    use std::{
+        ffi::OsString,
+        os::unix::{ffi::OsStringExt, fs::symlink},
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir
+        .path()
+        .join(OsString::from_vec(b"source-\xff.rs".to_vec()));
+    std::fs::write(&source, "fn example() {}\n").unwrap();
+    symlink(&source, dir.path().join("alias.rs")).unwrap();
+    for (name, args) in [
+        ("file_read", json!({"path":"alias.rs"})),
+        ("code_outline", json!({"path":"alias.rs"})),
+        (
+            "symbol_search",
+            json!({"path":"alias.rs","query":"example"}),
+        ),
+    ] {
+        let mut current = session(dir.path());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tools::execute(&mut current, name, args)
+        }));
+        assert!(result.is_ok(), "{name} panicked while serializing a path");
+        let error = result.unwrap().unwrap_err().to_string();
+        assert!(
+            error.starts_with("unsupported_non_utf8_path:"),
+            "{name}: {error}"
+        );
+    }
+}
+
 struct Panicking;
 #[async_trait]
 impl LlmClient for Panicking {

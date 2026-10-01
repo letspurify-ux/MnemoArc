@@ -113,15 +113,14 @@ impl FileChecks {
                     *used = sequence;
                     (check.clone(), false)
                 } else {
-                    if cache.entries.len() >= CAPACITY {
-                        if let Some(oldest) = cache
+                    if cache.entries.len() >= CAPACITY
+                        && let Some(oldest) = cache
                             .entries
                             .iter()
                             .min_by_key(|(_, (used, _))| *used)
                             .map(|(path, _)| path.clone())
-                        {
-                            cache.entries.remove(&oldest);
-                        }
+                    {
+                        cache.entries.remove(&oldest);
                     }
                     let check = Arc::new(Check {
                         version: version.clone(),
@@ -171,10 +170,11 @@ impl FileChecks {
                 }
             };
             drop(outcome);
-            if let Some((digest, checked)) = ready {
-                if checked.elapsed() < MAX_AGE && Version::read(path)? == version {
-                    return Ok(digest);
-                }
+            if let Some((digest, checked)) = ready
+                && checked.elapsed() < MAX_AGE
+                && Version::read(path)? == version
+            {
+                return Ok(digest);
             }
         }
         bail!("file_changed: file changed during display validation")
