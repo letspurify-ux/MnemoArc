@@ -21,6 +21,13 @@ fn setup() -> (tempfile::TempDir, Session) {
     s.active_tools = ToolRegistry::optional_names();
     (dir, s)
 }
+/// Citation checks and section binding are source_document features; the
+/// default answer workflow reports a plain write.
+fn source_setup() -> (tempfile::TempDir, Session) {
+    let (dir, mut s) = setup();
+    s.select_workflow("source_document").unwrap();
+    (dir, s)
+}
 fn run(s: &mut Session, name: &str, args: Value) -> Value {
     tools::execute(s, name, args).unwrap()
 }
@@ -1225,7 +1232,7 @@ fn html_comment_headings_do_not_enter_the_editable_outline() {
 
 #[test]
 fn document_edit_ignores_citation_examples_inside_html_comments() {
-    let (_dir, mut s) = setup();
+    let (_dir, mut s) = source_setup();
     let result = run(
         &mut s,
         "document_edit",
@@ -1237,7 +1244,7 @@ fn document_edit_ignores_citation_examples_inside_html_comments() {
 
 #[test]
 fn document_audit_detects_list_item_fences_that_swallow_prose_and_citations() {
-    let (dir, mut s) = setup();
+    let (dir, mut s) = source_setup();
     std::fs::write(dir.path().join("source.rs"), "fn source() {}\n").unwrap();
     let result = run(
         &mut s,
@@ -1262,7 +1269,7 @@ fn document_audit_detects_list_item_fences_that_swallow_prose_and_citations() {
 
 #[test]
 fn closed_list_item_fences_keep_example_citations_out_of_the_audit() {
-    let (dir, mut s) = setup();
+    let (dir, mut s) = source_setup();
     std::fs::write(dir.path().join("source.rs"), "fn source() {}\n").unwrap();
     let result = run(
         &mut s,
@@ -1276,7 +1283,7 @@ fn closed_list_item_fences_keep_example_citations_out_of_the_audit() {
 
 #[test]
 fn inline_code_comment_marker_does_not_hide_following_citation() {
-    let (dir, mut s) = setup();
+    let (dir, mut s) = source_setup();
     std::fs::write(dir.path().join("source.rs"), "fn source() {}\n").unwrap();
     let result = run(
         &mut s,
@@ -1293,7 +1300,7 @@ fn inline_code_comment_marker_does_not_hide_following_citation() {
 
 #[test]
 fn indented_code_comment_marker_does_not_hide_following_document_content() {
-    let (dir, mut s) = setup();
+    let (dir, mut s) = source_setup();
     std::fs::write(dir.path().join("source.rs"), "fn source() {}\n").unwrap();
     let result = run(
         &mut s,
@@ -1861,7 +1868,7 @@ fn changed_file_between_execution_and_delivery_does_not_gain_coverage() {
 
 #[test]
 fn persisted_sections_become_written_but_unrelated_evidence_cannot_verify_them() {
-    let (dir, mut s) = setup();
+    let (dir, mut s) = source_setup();
     std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
     std::fs::write(dir.path().join("other.rs"), "fn other() {}\n").unwrap();
     for (id, section) in [("entry", "# Entry"), ("missing", "# Missing")] {
@@ -2062,7 +2069,7 @@ fn batch_reuse_still_requires_the_declared_item_fields() {
 
 #[test]
 fn local_edit_preserves_unrelated_verification_and_batch_reuses_it() {
-    let (dir, mut s) = setup();
+    let (dir, mut s) = source_setup();
     std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
     let source = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
     let doc = run(
@@ -2728,7 +2735,7 @@ fn delivered_evidence_of_an_older_file_version_is_not_reused() {
 
 #[test]
 fn planned_section_names_rebind_to_the_written_heading_by_title() {
-    let (dir, mut s) = setup();
+    let (dir, mut s) = source_setup();
     std::fs::write(dir.path().join("a.rs"), numbered_source(3)).unwrap();
     run(
         &mut s,
@@ -2757,7 +2764,7 @@ fn planned_section_names_rebind_to_the_written_heading_by_title() {
 
 #[test]
 fn planned_sections_rebind_by_level_free_title_or_section_number() {
-    let (dir, mut s) = setup();
+    let (dir, mut s) = source_setup();
     std::fs::write(dir.path().join("a.rs"), numbered_source(3)).unwrap();
     // The shapes from a live run: planned as level-1 headings, written as
     // level-2 headings, and the first one also reworded.

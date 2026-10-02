@@ -823,7 +823,11 @@ impl LlmClient for BudgetPhases {
 #[tokio::test]
 async fn request_budget_transitions_to_writing_then_verification() {
     let dir = tempfile::tempdir().unwrap();
-    let session = s(dir.path());
+    let mut session = s(dir.path());
+    // The answer workflow presents every phase as answering; budget phases
+    // belong to document work.
+    session.select_workflow("source_document").unwrap();
+    session.task.require_investigation = false;
     let (tx, mut rx) = mpsc::channel(128);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result = run_session(
@@ -880,7 +884,7 @@ async fn premature_final_is_retried_but_never_claimed_complete_without_coverage(
     let dir = tempfile::tempdir().unwrap();
     let mut session = s(dir.path());
     session.document_written = true;
-    session.task.require_investigation = true;
+    session.select_workflow("source_document").unwrap();
     let client = Arc::new(PrematureFinal {
         calls: Mutex::new(0),
     });
