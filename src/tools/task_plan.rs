@@ -437,6 +437,17 @@ fn parse_operations(value: &Value) -> Result<Parsed> {
                 normalized = true;
             }
         }
+        if matches!(item["op"].as_str(), Some("remove" | "reopen")) {
+            let object = item.as_object_mut().unwrap();
+            // The mirror of complete: the shared schema also offers result,
+            // and a provider may send it as the remove/reopen reason.
+            if let Some(result) = object.remove("result") {
+                if !object.contains_key("reason") && result.is_string() {
+                    object.insert("reason".into(), result);
+                }
+                normalized = true;
+            }
+        }
         // The published item schema is shared by all operation variants.
         // Providers can populate every optional field, so discard fields
         // belonging to other variants while retaining strict validation for
@@ -477,7 +488,7 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
         let revision = s.task.plan_revision;
         let mut reason = match args["expected_revision"].as_u64() {
             Some(sent) => format!(
-                "Plan revision changed: expected_revision {sent} but the plan is at revision {revision}; recheck the returned plan, then use {revision}"
+                "Plan revision changed: expected_revision {sent} but the plan is at revision {revision}; recheck the returned plan, then use {revision}. Each applied change advances the revision, so put all plan changes of one response in a single apply instead of several calls"
             ),
             None => format!("expected_revision is missing; the plan is at revision {revision}"),
         };

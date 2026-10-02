@@ -1124,3 +1124,58 @@ fn task_state_read_ignores_filled_details_paging() {
         .to_string();
     assert!(err.contains("unknown_argument: cursor"), "{err}");
 }
+
+#[test]
+fn remove_and_reopen_accept_result_as_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(
+        &mut s,
+        json!([{"op":"insert","texts":["Read source","Write section","Spare step"]}]),
+    );
+    let removed = apply(
+        &mut s,
+        json!([
+            {"op":"complete","id":"T1","result":"Read the handler"},
+            {"op":"remove","id":"T3","result":"Outside requested scope"}
+        ]),
+    );
+    assert_eq!(removed["applied"], true, "{removed}");
+    assert_eq!(removed["input_normalized"], true);
+    assert!(s.task.todos.iter().all(|item| item.id != "T3"));
+    let reopened = apply(
+        &mut s,
+        json!([{"op":"reopen","id":"T1","result":"Missed a branch"}]),
+    );
+    assert_eq!(reopened["applied"], true, "{reopened}");
+    let item = s.task.current_todo().unwrap();
+    assert_eq!(item.id, "T1");
+    assert_eq!(item.reopen_reason, "Missed a branch");
+    assert_eq!(item.result, "");
+    // An explicit reason stays authoritative over a stray result.
+    let removed = apply(
+        &mut s,
+        json!([{"op":"remove","id":"T2","reason":"Merged into T1","result":"ignored"}]),
+    );
+    assert_eq!(removed["applied"], true, "{removed}");
+}
+
+#[test]
+fn stale_revision_asks_for_one_apply_per_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(&mut s, json!([{"op":"insert","texts":["Read source"]}]));
+    // A second apply planned in the same response still carries revision 0.
+    let stale = tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Write section"]}]}),
+    )
+    .unwrap();
+    assert_eq!(stale["applied"], false, "{stale}");
+    assert!(
+        stale["reason"].as_str().unwrap().contains("single apply"),
+        "{stale}"
+    );
+    assert_eq!(s.task.todos.len(), 1);
+}
