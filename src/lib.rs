@@ -6,6 +6,7 @@ pub mod database;
 pub mod evaluation;
 pub mod llm;
 pub mod memory;
+mod paths;
 pub mod session;
 pub mod shared;
 pub mod tools;

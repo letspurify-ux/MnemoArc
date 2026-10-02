@@ -476,10 +476,11 @@ test("a new session uses the unsaved project draft only after an accurate confir
 
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "이 프로젝트로 새 세션" }).click();
-  await page
-    .getByRole("dialog", { name: "새 세션 설정" })
-    .getByLabel("결과 문서", { exact: true })
-    .fill("docs/draft-output.md");
+  await expect(
+    page
+      .getByRole("dialog", { name: "새 세션 설정" })
+      .getByLabel("결과 문서", { exact: true }),
+  ).toHaveValue("docs/draft-output.md");
   await page.getByRole("button", { name: "세션 시작", exact: true }).click();
   await expect.poll(() => submitted?.output).toBe("docs/draft-output.md");
   await expect(page.locator(".session-heading h2")).toHaveText("초안 프로젝트");

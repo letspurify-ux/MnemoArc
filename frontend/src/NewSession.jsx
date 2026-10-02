@@ -1,15 +1,12 @@
 import { useLayoutEffect, useRef, useState } from "react";
-
-export function sessionOutput(path, suffix = crypto.randomUUID().slice(0, 8)) {
-  return `${String(path || "summary.md").replace(/\.md$/i, "")}-${suffix}.md`;
-}
+import { displayPath, displayPathText } from "./paths.js";
 
 export default function NewSession({ project, projects, onCreate, onClose }) {
   const dialog = useRef(null),
     lock = useRef(false);
   const [chosen, setChosen] = useState(project);
   const [workflow, setWorkflow] = useState("answer");
-  const [output, setOutput] = useState(() => sessionOutput(project.output));
+  const [output, setOutput] = useState(project.output);
   const [saving, setSaving] = useState(false),
     [error, setError] = useState("");
   const options = [
@@ -97,7 +94,7 @@ export default function NewSession({ project, projects, onCreate, onClose }) {
                 (item) => item.id === event.target.value,
               );
               setChosen(next);
-              setOutput(sessionOutput(next.output));
+              setOutput(next.output);
             }}
           >
             {options.map((item) => (
@@ -139,19 +136,19 @@ export default function NewSession({ project, projects, onCreate, onClose }) {
         <label className="field">
           결과 문서
           <input
-            value={output}
+            value={displayPath(output)}
             required
             disabled={saving}
             onChange={(event) => setOutput(event.target.value)}
           />
         </label>
         <p className="subtle">
-          기존 문서를 수정하려면 해당 경로를 지정하세요. 작업 방식은 이 세션
-          동안 유지됩니다.
+          프로젝트의 결과 문서 경로를 기본으로 사용합니다. 필요하면 수정하세요.
+          작업 방식은 이 세션 동안 유지됩니다.
         </p>
         {error && (
           <p role="alert" className="inline-error">
-            {error}
+            {displayPathText(error)}
           </p>
         )}
         <div className="session-create-actions">

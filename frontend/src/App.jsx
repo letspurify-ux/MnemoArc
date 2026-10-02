@@ -14,6 +14,8 @@ import {
 } from "./api.js";
 import { mergeSession, mergeOlder } from "./session-history.js";
 import { useServerDraft } from "./use-server-draft.js";
+import { displayPath, displayPathText } from "./paths.js";
+import { memoryMatchesQuery } from "./memory-search.js";
 import { createComposerDrafts } from "./composer-drafts.js";
 import {
   createSessionCache,
@@ -618,7 +620,7 @@ export default function App() {
             <div className="project-group" key={project.id}>
               <button
                 className="project-heading"
-                title={project.root}
+                title={displayPath(project.root)}
                 disabled={navigating}
                 onClick={safe(() => requestSession(project))}
               >
@@ -743,7 +745,7 @@ export default function App() {
         </header>
         {(error || refreshError) && (
           <div className="app-error" role="alert">
-            <span>{error || refreshError}</span>
+            <span>{displayPathText(error || refreshError)}</span>
             <button
               aria-label="오류 닫기"
               onClick={() => {
@@ -801,7 +803,9 @@ export default function App() {
                       ([value]) => value === session.workflow_mode,
                     )?.[1] || session.workflow_mode}
                   </span>
-                  <p title={session.project.root}>{session.project.root}</p>
+                  <p title={displayPath(session.project.root)}>
+                    {displayPath(session.project.root)}
+                  </p>
                 </div>
                 <div className="session-actions">
                   <button
@@ -1114,7 +1118,7 @@ function Projects({ config, onSaved, onCreate, onDirtyChange, creating }) {
           )}
           {error && (
             <p className="inline-error" role="alert">
-              {error}
+              {displayPathText(error)}
             </p>
           )}
         </div>
@@ -1323,9 +1327,7 @@ function Inspector({
   const doAction = (fn) => () => {
     void onAction(fn).catch(() => {});
   };
-  const memories = session.memories.filter((m) =>
-    JSON.stringify(m).toLowerCase().includes(query.toLowerCase()),
-  );
+  const memories = session.memories.filter((m) => memoryMatchesQuery(m, query));
   const recovering =
     session.status === "running" &&
     session.run_guidance?.progress_recovery?.active;
@@ -1382,7 +1384,7 @@ function Inspector({
                 >
                   ← 목록으로
                 </button>
-                <h3>{memory.title}</h3>
+                <h3>{displayPathText(memory.title)}</h3>
                 <small>
                   개정 {memory.revision} · {memory.status}
                 </small>
@@ -1391,7 +1393,7 @@ function Inspector({
                 {memory.sources.map((source) => (
                   <div className="source-card" key={source.id}>
                     <code>
-                      {source.path || "사용자 발언"}{" "}
+                      {displayPath(source.path) || "사용자 발언"}{" "}
                       {source.start_line ? `:${source.start_line}` : ""}
                     </code>
                     <p>{source.excerpt}</p>
@@ -1406,10 +1408,10 @@ function Inspector({
                   onClick={() => setMemoryId(m.id)}
                 >
                   <div>
-                    <strong>{m.title}</strong>
+                    <strong>{displayPathText(m.title)}</strong>
                     <small>r{m.revision}</small>
                   </div>
-                  <p>{m.summary}</p>
+                  <p>{displayPathText(m.summary)}</p>
                   <span>
                     {m.status === "needs_review"
                       ? "재검증 필요"
@@ -1419,7 +1421,7 @@ function Inspector({
                   </span>
                   {m.tags.map((t) => (
                     <span className="tag" key={t}>
-                      {t}
+                      {displayPathText(t)}
                     </span>
                   ))}
                 </button>
@@ -1529,10 +1531,14 @@ function Inspector({
                             ? "진행 중"
                             : "대기"}
                       </span>
-                      <span>{item.text}</span>
-                      {item.result && <small>{item.result}</small>}
+                      <span>{displayPathText(item.text)}</span>
+                      {item.result && (
+                        <small>{displayPathText(item.result)}</small>
+                      )}
                       {item.reopen_reason && (
-                        <small>재개 사유: {item.reopen_reason}</small>
+                        <small>
+                          재개 사유: {displayPathText(item.reopen_reason)}
+                        </small>
                       )}
                     </li>
                   ))}
@@ -1560,7 +1566,7 @@ function Inspector({
                 </p>
                 <ul>
                   {session.completion_gaps.map((gap, i) => (
-                    <li key={i}>{gap}</li>
+                    <li key={i}>{displayPathText(gap)}</li>
                   ))}
                 </ul>
               </section>
@@ -1595,10 +1601,12 @@ function Inspector({
                           {" · "}
                           {check.id === "R0"
                             ? "현재 요청"
-                            : check.criterion || "완료 조건"}
+                            : displayPathText(check.criterion) || "완료 조건"}
                         </strong>
-                        <p>{check.reason}</p>
-                        {check.next_action && <p>보완: {check.next_action}</p>}
+                        <p>{displayPathText(check.reason)}</p>
+                        {check.next_action && (
+                          <p>보완: {displayPathText(check.next_action)}</p>
+                        )}
                       </li>
                     ))}
                   </ul>
@@ -1633,7 +1641,7 @@ function Inspector({
                   {session.task[key].length ? (
                     <ul>
                       {session.task[key].map((v, i) => (
-                        <li key={i}>{v}</li>
+                        <li key={i}>{displayPathText(v)}</li>
                       ))}
                     </ul>
                   ) : (
@@ -1645,7 +1653,7 @@ function Inspector({
             {session.workflow_mode === "source_document" && <h4>조사 목록</h4>}
             {session.investigations.map((item) => (
               <div className="source-card" key={item.id}>
-                <strong>{item.title}</strong>
+                <strong>{displayPathText(item.title)}</strong>
                 <small>
                   {{
                     uninvestigated: "미조사",
@@ -1656,7 +1664,7 @@ function Inspector({
                     superseded: "변경된 범위에서 제외",
                   }[item.status] || item.status}
                 </small>
-                <p>{item.note}</p>
+                <p>{displayPathText(item.note)}</p>
               </div>
             ))}
           </>
@@ -1707,9 +1715,9 @@ function Inspector({
                     {tool.name === "file_read" && (
                       <small style={{ overflowWrap: "anywhere" }}>
                         상대 경로는 프로젝트 루트 기준입니다:{" "}
-                        {session.project.root}
+                        {displayPath(session.project.root)}
                         <br />
-                        설정된 결과 문서: {session.project.output}
+                        설정된 결과 문서: {displayPath(session.project.output)}
                         <br />
                         결과 문서가 프로젝트 밖에 있으면 문서 구조
                         조회(document_inspect)가 반환한 절대 경로를 그대로
@@ -1744,7 +1752,7 @@ function Inspector({
         {tab === "output" && (
           <>
             <h3>결과 문서</h3>
-            <p className="directory-path">{session.project.output}</p>
+            <p className="directory-path">{displayPath(session.project.output)}</p>
             <button
               className="secondary"
               disabled={outputLoading}

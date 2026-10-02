@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { groups, inputValue, parseValue } from "./fields.js";
 import { api, send } from "./api.js";
 import { useServerDraft } from "./use-server-draft.js";
+import { displayPath, displayPathText } from "./paths.js";
 
 export function DirectoryPicker({ path, onSelect, onClose }) {
   const [data, setData] = useState(null),
@@ -62,10 +63,10 @@ export function DirectoryPicker({ path, onSelect, onClose }) {
             ×
           </button>
         </div>
-        <p className="directory-path">{data?.path || path}</p>
+        <p className="directory-path">{displayPath(data?.path || path)}</p>
         {error && (
           <p role="alert" className="inline-error">
-            {error}
+            {displayPathText(error)}
           </p>
         )}
         <div className="directory-list" aria-busy={loading}>
@@ -110,7 +111,7 @@ export function ProjectForm({ project, onChange, disabled = false }) {
         소스 폴더
         <div className="input-action">
           <input
-            value={project.root}
+            value={displayPath(project.root)}
             disabled={disabled}
             onChange={(e) => set("root", e.target.value)}
           />
@@ -126,7 +127,7 @@ export function ProjectForm({ project, onChange, disabled = false }) {
       <label>
         결과 문서 경로
         <input
-          value={project.output}
+          value={displayPath(project.output)}
           disabled={disabled}
           onChange={(e) => set("output", e.target.value)}
         />
@@ -552,7 +553,7 @@ export default function Settings({
           </div>
           {error && (
             <div className="inline-error" role="alert">
-              {error}
+              {displayPathText(error)}
             </div>
           )}
           {message && (

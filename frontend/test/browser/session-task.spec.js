@@ -7,6 +7,7 @@ for (const mode of ["answer", "source_document"]) {
     page,
     request,
   }) => {
+    const state = await (await request.get("/api/state")).json();
     await page.goto("/");
     await page.getByRole("button", { name: "새 세션", exact: true }).click();
     const label = mode === "answer" ? /일반 작업/ : /소스 기반 문서 작성/;
@@ -14,12 +15,14 @@ for (const mode of ["answer", "source_document"]) {
     const output = await dialog(page)
       .getByLabel("결과 문서", { exact: true })
       .inputValue();
-    expect(output).toMatch(/-[0-9a-f]{8}\.md$/);
+    expect(output).toBe(state.config.projects[0].output);
     await dialog(page)
       .getByRole("button", { name: "세션 시작", exact: true })
       .click();
     await expect(dialog(page)).toHaveCount(0);
     const id = (await page.evaluate(() => location.hash)).slice(1);
+    const created = await (await request.get(`/api/sessions/${id}`)).json();
+    expect(created.project.output).toBe(output);
     await expect(page.locator(".workflow-badge")).toHaveText(
       mode === "answer" ? "일반 작업" : "소스 기반 문서 작성",
     );
@@ -57,6 +60,108 @@ for (const mode of ["answer", "source_document"]) {
   });
 }
 
+test("new sessions default to the saved project output across entry points and project changes", async ({
+  page,
+  request,
+}) => {
+  const initial = await (await request.get("/api/state")).json();
+  const first = {
+    ...initial.config.projects[0],
+    output: "docs/프로젝트-결과.md",
+  };
+  const second = {
+    ...first,
+    id: "other-output-project",
+    name: "다른 결과 문서 프로젝트",
+    output: "reports/other.md",
+  };
+  const created = [];
+  try {
+    const saved = await request.put("/api/settings", {
+      headers,
+      data: { config: { ...initial.config, projects: [first, second] } },
+    });
+    expect(saved.ok(), await saved.text()).toBe(true);
+    const original = await request.post("/api/sessions", {
+      headers,
+      data: { project: { ...first, output: "docs/session-override.md" } },
+    });
+    expect(original.ok()).toBe(true);
+    const id = (await original.json()).id;
+    created.push(id);
+    await page.goto(`/#${id}`);
+    await expect(page.locator(".session-heading h2")).toHaveText(first.name);
+
+    await page.getByRole("button", { name: "새 세션", exact: true }).click();
+    const output = dialog(page).getByLabel("결과 문서", { exact: true });
+    await expect(output).toHaveValue(first.output);
+    await output.fill("docs/custom.md");
+    await dialog(page)
+      .getByRole("radio", { name: /소스 기반 문서 작성/ })
+      .check();
+    await expect(output).toHaveValue("docs/custom.md");
+    await dialog(page)
+      .getByRole("combobox", { name: "프로젝트", exact: true })
+      .selectOption(second.id);
+    await expect(output).toHaveValue(second.output);
+    await dialog(page)
+      .getByRole("combobox", { name: "프로젝트", exact: true })
+      .selectOption(first.id);
+    await expect(output).toHaveValue(first.output);
+    await output.fill("docs/new-session-only.md");
+    await dialog(page)
+      .getByRole("button", { name: "세션 시작", exact: true })
+      .click();
+    await expect(dialog(page)).toHaveCount(0);
+    const otherId = (await page.evaluate(() => location.hash)).slice(1);
+    created.push(otherId);
+    expect(
+      (await (await request.get(`/api/sessions/${otherId}`)).json()).project
+        .output,
+    ).toBe("docs/new-session-only.md");
+    expect(
+      (await (await request.get("/api/state")).json()).config.projects[0]
+        .output,
+    ).toBe(first.output);
+
+    await page
+      .locator(".project-heading")
+      .filter({ hasText: second.name })
+      .click();
+    await expect(output).toHaveValue(second.output);
+    await dialog(page)
+      .getByRole("button", { name: "취소", exact: true })
+      .click();
+    await page.getByRole("button", { name: "새 세션", exact: true }).click();
+    await expect(output).toHaveValue(first.output);
+    await dialog(page)
+      .getByRole("button", { name: "취소", exact: true })
+      .click();
+
+    await page
+      .locator(".sidebar-bottom")
+      .getByRole("button", { name: "프로젝트 관리", exact: true })
+      .click();
+    await page
+      .getByRole("button", { name: "이 프로젝트로 새 세션", exact: true })
+      .click();
+    await expect(output).toHaveValue(first.output);
+    await dialog(page)
+      .getByRole("button", { name: "취소", exact: true })
+      .click();
+  } finally {
+    for (const id of created)
+      await request.delete(`/api/sessions/${id}`, { headers });
+    const restored = await request.put("/api/settings", {
+      headers,
+      data: {
+        config: { ...initial.config, projects: initial.config.projects },
+      },
+    });
+    expect(restored.ok(), await restored.text()).toBe(true);
+  }
+});
+
 test("an empty workspace starts through the same accessible creation dialog on mobile", async ({
   page,
   request,
@@ -71,6 +176,9 @@ test("an empty workspace starts through the same accessible creation dialog on m
   ).toHaveCount(0);
   await page.getByRole("button", { name: "새 세션 시작", exact: true }).click();
   await expect(dialog(page)).toBeVisible();
+  await expect(
+    dialog(page).getByLabel("결과 문서", { exact: true }),
+  ).toHaveValue(state.config.projects[0].output);
   for (let index = 0; index < 12; index++) {
     await page.keyboard.press("Tab");
     expect(

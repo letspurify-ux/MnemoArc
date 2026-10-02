@@ -414,7 +414,10 @@ fn finish_cause_text(cause: &str) -> &'static str {
 fn gap_report(s: &Session, answer: Option<&str>, cause: Option<&str>) -> String {
     let mut text = match answer.map(str::trim).filter(|answer| !answer.is_empty()) {
         Some(answer) => answer.to_owned(),
-        None => format!("`{}` 문서 작성을 마쳤습니다.", s.project.output.display()),
+        None => format!(
+            "`{}` 문서 작성을 마쳤습니다.",
+            crate::paths::display_path(&s.project.output)
+        ),
     };
     if s.completion_gaps.is_empty() {
         return text;
@@ -425,7 +428,7 @@ fn gap_report(s: &Session, answer: Option<&str>, cause: Option<&str>) -> String 
         s.completion_gaps.len()
     ));
     for gap in &s.completion_gaps {
-        text.push_str(&format!("- {gap}\n"));
+        text.push_str(&format!("- {}\n", crate::paths::display_text(gap)));
     }
     text
 }
@@ -3173,19 +3176,56 @@ pub async fn headless(mut s: Session, prompt: String) -> Result<Session> {
         renderer.abort();
         let _ = renderer.await;
     }
+    console.finish(&console_report(&result), deadline).await;
+    Ok(result)
+}
+
+fn console_report(result: &Session) -> String {
     let mut report = format!(
         "\nStatus: {}\nOutput: {}",
         result.status,
-        result.project.output.display()
+        crate::paths::display_path(&result.project.output)
     );
     if let Some(e) = &result.last_error {
         report.push('\n');
-        report.push_str(e);
+        report.push_str(&crate::paths::display_text(e));
     }
     report.push('\n');
-    console.finish(&report, deadline).await;
-    Ok(result)
+    report
 }
+
+#[cfg(test)]
+mod path_display_tests {
+    use super::*;
+    use crate::config::Project;
+
+    #[test]
+    fn completion_and_console_reports_format_paths_without_changing_task_or_answer() {
+        let output = r"\\?\C:\프로젝트\결과.md";
+        let error = r"file_access_error: \\?\UNC\server\share\원본.md";
+        let mut session = Session::new(
+            Project {
+                output: output.into(),
+                ..Default::default()
+            },
+            Config::default(),
+        );
+        session.last_error = Some(error.into());
+        session.completion_gaps = vec![error.into()];
+        let report = gap_report(&session, None, None);
+        assert!(report.starts_with("`C:\\프로젝트\\결과.md` 문서 작성을 마쳤습니다."));
+        assert!(report.contains(r"file_access_error: \\server\share\원본.md"));
+        let console = console_report(&session);
+        assert!(console.contains("Output: C:\\프로젝트\\결과.md"));
+        assert!(console.contains(r"file_access_error: \\server\share\원본.md"));
+        let original_answer = r"소스 코드 원문: `\\?\C:\프로젝트\결과.md`";
+        assert!(gap_report(&session, Some(original_answer), None).starts_with(original_answer));
+        assert_eq!(session.project.output.to_str(), Some(output));
+        assert_eq!(session.last_error.as_deref(), Some(error));
+        assert_eq!(session.completion_gaps, vec![error]);
+    }
+}
+
 fn consume_commands(s: &mut Session, commands: &mut mpsc::Receiver<RunCommand>) {
     while let Ok(command) = commands.try_recv() {
         match command {

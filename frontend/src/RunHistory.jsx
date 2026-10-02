@@ -1,4 +1,5 @@
 import { statusLabel, workflowOptions } from "./api.js";
+import { displayPathText } from "./paths.js";
 
 const reasons = {
   complete: "정상 완료",
@@ -80,7 +81,9 @@ export default function RunHistory({ records = [] }) {
           {run.checkpoint_pending && (
             <p>기억 정리를 완료하기 전에 종료됐습니다.</p>
           )}
-          <pre className="run-error">{run.error || run.reason}</pre>
+          <pre className="run-error">
+            {displayPathText(run.error || run.reason)}
+          </pre>
         </details>
       ))}
     </section>

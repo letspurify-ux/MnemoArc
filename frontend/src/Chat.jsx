@@ -8,6 +8,7 @@ import {
 import { Message, StreamingMessage } from "./chat/Message.jsx";
 import { continuationMessages } from "./chat/continuation.js";
 import { toolLabels } from "./api.js";
+import { displayPathText, displayToolResult } from "./paths.js";
 
 export default function Chat({
   session,
@@ -232,12 +233,12 @@ export default function Chat({
                     ? "질문 답변 중지"
                     : "질문 답변을 완료하지 못했습니다"}
                 {" · 기존 작업 상태는 유지됩니다."}
-                {lastRun.error && <p>{lastRun.error}</p>}
+                {lastRun.error && <p>{displayPathText(lastRun.error)}</p>}
               </div>
             )}
           {session?.error && (
             <div className="inline-error" role="alert">
-              {session.error}
+              {displayPathText(session.error)}
             </div>
           )}
         </div>
@@ -328,12 +329,14 @@ export default function Chat({
   );
 }
 function ToolResult({ message }) {
+  const [showRaw, setShowRaw] = useState(false);
   let result;
   try {
     result = JSON.parse(message.content);
   } catch {
     result = { status: "unknown", data: message.content };
   }
+  const displayed = displayToolResult(result);
   return (
     <details
       className={`tool-result ${result.status === "ok" ? "" : "failed"}`}
@@ -342,7 +345,16 @@ function ToolResult({ message }) {
         <span>{result.status === "ok" ? "✓" : "!"}</span> 도구 결과{" "}
         <small>{result.status}</small>
       </summary>
-      <pre>{JSON.stringify(result, null, 2)}</pre>
+      <pre>{JSON.stringify(displayed, null, 2)}</pre>
+      {displayed !== result && (
+        <details
+          className="tool-result-raw"
+          onToggle={(event) => setShowRaw(event.currentTarget.open)}
+        >
+          <summary>원문 JSON</summary>
+          {showRaw && <pre>{JSON.stringify(result, null, 2)}</pre>}
+        </details>
+      )}
     </details>
   );
 }
