@@ -18,12 +18,20 @@ import {
 
 const DEFAULT_INSPECTOR_WIDTH = 295;
 const MIN_INSPECTOR_WIDTH = 240;
-const MAX_INSPECTOR_WIDTH = 560;
+// The panel may take up to this share of the chat and panel area.
+const MAX_INSPECTOR_RATIO = 0.7;
 const INSPECTOR_WIDTH_KEY = "mnemoarc.inspector-width";
 
-function clampInspectorWidth(value) {
+function maxInspectorWidth(areaWidth) {
+  return Math.max(
+    MIN_INSPECTOR_WIDTH,
+    Math.floor(areaWidth * MAX_INSPECTOR_RATIO),
+  );
+}
+
+function clampInspectorWidth(value, max = Infinity) {
   return Math.min(
-    MAX_INSPECTOR_WIDTH,
+    max,
     Math.max(
       MIN_INSPECTOR_WIDTH,
       Math.round(Number(value) || DEFAULT_INSPECTOR_WIDTH),
@@ -61,7 +69,8 @@ export default function App() {
     [workflowPending, setWorkflowPending] = useState(new Set()),
     [stopped, setStopped] = useState(false),
     [stopping, setStopping] = useState(false),
-    [inspectorWidth, setInspectorWidth] = useState(loadInspectorWidth);
+    [inspectorWidth, setInspectorWidth] = useState(loadInspectorWidth),
+    [workareaWidth, setWorkareaWidth] = useState(0);
   const selection = useRef(selected),
     fetching = useRef(null),
     pending = useRef(NO_REFRESH),
@@ -377,6 +386,19 @@ export default function App() {
     narrow.addEventListener("change", closeOnNarrow);
     return () => narrow.removeEventListener("change", closeOnNarrow);
   }, []);
+  // Track the chat and panel area so the panel limit follows window resizes.
+  const workareaObserver = useRef(null);
+  const workareaRef = useCallback((node) => {
+    workareaObserver.current?.disconnect();
+    workareaObserver.current = null;
+    if (!node || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(([entry]) =>
+      setWorkareaWidth(entry.contentRect.width),
+    );
+    observer.observe(node);
+    workareaObserver.current = observer;
+  }, []);
+  const inspectorMax = maxInspectorWidth(workareaWidth || window.innerWidth);
   useEffect(() => {
     try {
       window.localStorage.setItem(INSPECTOR_WIDTH_KEY, String(inspectorWidth));
@@ -756,7 +778,10 @@ export default function App() {
           />
         ) : session ? (
           <div
+            ref={workareaRef}
             className={`workarea ${detail ? "with-details" : ""}`}
+            // Marks the read-only wait for fresh session state without a notice.
+            aria-busy={sessionReady ? undefined : true}
             style={
               detail
                 ? { "--inspector-width": `${inspectorWidth}px` }
@@ -864,9 +889,10 @@ export default function App() {
                 onAction={act}
                 onProjectDirtyChange={onInspectorDirtyChange}
                 navigating={navigating || !sessionReady}
-                width={inspectorWidth}
+                width={Math.min(inspectorWidth, inspectorMax)}
+                maxWidth={inspectorMax}
                 onWidthChange={(next) =>
-                  setInspectorWidth(clampInspectorWidth(next))
+                  setInspectorWidth(clampInspectorWidth(next, inspectorMax))
                 }
               />
             )}
@@ -1085,7 +1111,7 @@ function Projects({ config, onSaved, onCreate, onDirtyChange, creating }) {
     </section>
   );
 }
-function InspectorResizeHandle({ width, onWidthChange }) {
+function InspectorResizeHandle({ width, maxWidth, onWidthChange }) {
   const drag = useRef(null);
   const [dragging, setDragging] = useState(false);
 
@@ -1118,7 +1144,7 @@ function InspectorResizeHandle({ width, onWidthChange }) {
       aria-label="오른쪽 패널 너비 조절"
       aria-orientation="vertical"
       aria-valuemin={MIN_INSPECTOR_WIDTH}
-      aria-valuemax={MAX_INSPECTOR_WIDTH}
+      aria-valuemax={maxWidth}
       aria-valuenow={Math.round(width)}
       aria-valuetext={`${Math.round(width)}픽셀`}
       tabIndex={0}
@@ -1150,7 +1176,7 @@ function InspectorResizeHandle({ width, onWidthChange }) {
           onWidthChange(MIN_INSPECTOR_WIDTH);
         } else if (event.key === "End") {
           event.preventDefault();
-          onWidthChange(MAX_INSPECTOR_WIDTH);
+          onWidthChange(maxWidth);
         }
       }}
     >
@@ -1167,6 +1193,7 @@ function Inspector({
   onProjectDirtyChange,
   navigating,
   width,
+  maxWidth,
   onWidthChange,
 }) {
   const [toolSelection, setToolSelection] = useState(session.active_tools);
@@ -1295,7 +1322,11 @@ function Inspector({
   const currentTodo = todos.find((item) => !item.done);
   return (
     <aside className="inspector">
-      <InspectorResizeHandle width={width} onWidthChange={onWidthChange} />
+      <InspectorResizeHandle
+        width={width}
+        maxWidth={maxWidth}
+        onWidthChange={onWidthChange}
+      />
       <div className="inspector-tabs" role="tablist">
         {[
           ["memory", "기억"],

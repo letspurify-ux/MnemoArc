@@ -288,21 +288,22 @@ test("replacing an acknowledgement refresh does not release the send lock early"
 });
 
 test("failed workflow changes restore the latest server choice", async ({ page, request }) => {
-  const { session } = await workspace({ page, request });
+  // Two workflows exist: the user picks answer while the server keeps (and
+  // re-announces) source_document, which the failed change must restore.
+  const { session } = await workspace({ page, request }, { workflow_mode: "source_document" });
   const pending = gate();
   await page.route("**/api/sessions/*/workflow", async (route) => {
     pending.seen();
     await pending.held;
     await route.fulfill({ status: 409, json: { error: "작업 방식 저장 실패" } });
   });
-  await page.getByLabel("작업 방식").selectOption("source_document");
+  await page.getByLabel("작업 방식").selectOption("answer");
   await pending.requested;
-  session.workflow_mode = "document_edit";
   session.revision++;
   await waitForSnapshot(page, session);
   pending.release();
   await expect(page.getByLabel("작업 방식")).toBeEnabled();
-  await expect(page.getByLabel("작업 방식")).toHaveValue("document_edit");
+  await expect(page.getByLabel("작업 방식")).toHaveValue("source_document");
 });
 
 test("failed tool changes restore the latest server selection", async ({ page, request }) => {

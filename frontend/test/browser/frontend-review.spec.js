@@ -698,3 +698,26 @@ test("a connection check only validates the configuration that was submitted", a
   pending.release();
   await expect(page.getByRole("status")).toContainText("현재 설정으로 다시 연결을 확인하세요");
 });
+
+test("the details panel can widen to 70% of the work area", async ({ page, request }) => {
+  await workspace({ page, request });
+  const toggle = page.getByRole("button", { name: "상세 패널 표시" });
+  if ((await toggle.getAttribute("aria-pressed")) !== "true") await toggle.click();
+  const handle = page.getByRole("separator", { name: "오른쪽 패널 너비 조절" });
+  const widths = () =>
+    page.evaluate(() => ({
+      area: document.querySelector(".workarea").getBoundingClientRect().width,
+      panel: document.querySelector(".inspector").getBoundingClientRect().width,
+    }));
+  await handle.focus();
+  await page.keyboard.press("End");
+  let { area, panel } = await widths();
+  expect(panel).toBeGreaterThan(560);
+  expect(Math.abs(panel - area * 0.7)).toBeLessThanOrEqual(2);
+  // A narrower window keeps the panel within 70% of the remaining area.
+  await page.setViewportSize({ width: 1100, height: 900 });
+  await expect.poll(async () => {
+    ({ area, panel } = await widths());
+    return panel <= area * 0.7 + 1;
+  }).toBe(true);
+});

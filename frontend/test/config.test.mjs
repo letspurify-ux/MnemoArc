@@ -50,7 +50,8 @@ test("every public Rust setting has a UI editor", async () => {
   const block = code.split("pub struct Config {")[1].split("\n}")[0];
   const keys = [...block.matchAll(/pub (\w+):/g)]
     .map((m) => m[1])
-    .filter((k) => k !== "api_key");
+    // Retired settings are only read for compatibility, never edited.
+    .filter((k) => k !== "api_key" && !k.startsWith("retired_"));
   assert.deepEqual([...fieldKeys, "projects"].sort(), keys.sort());
   assert.equal(new Set(fieldKeys).size, fieldKeys.length);
 });

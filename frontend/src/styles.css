@@ -437,7 +437,7 @@ button:hover {
   flex: 1;
 }
 .workarea.with-details {
-  grid-template-columns: minmax(0, 1fr) var(--inspector-width, 295px);
+  grid-template-columns: minmax(0, 1fr) min(var(--inspector-width, 295px), 70%);
 }
 .chat-column {
   display: flex;
@@ -686,7 +686,7 @@ button:hover {
   position: relative;
   border-left: 1px solid #e6ebe2;
   background: #fff;
-  width: var(--inspector-width, 295px);
+  width: min(var(--inspector-width, 295px), 100%);
   min-width: 0;
   min-height: 0;
   display: flex;
@@ -1375,7 +1375,7 @@ button:hover {
 }
 @media (min-width: 1600px) {
   .workarea.with-details {
-    grid-template-columns: minmax(0, 1fr) var(--inspector-width, 330px);
+    grid-template-columns: minmax(0, 1fr) min(var(--inspector-width, 330px), 70%);
   }
   .chat-scroll {
     padding: 0 50px;
@@ -1391,7 +1391,7 @@ button:hover {
     padding: 26px 12px 15px;
   }
   .workarea.with-details {
-    grid-template-columns: minmax(0, 1fr) var(--inspector-width, 260px);
+    grid-template-columns: minmax(0, 1fr) min(var(--inspector-width, 260px), 70%);
   }
   .session-heading {
     padding: 20px;

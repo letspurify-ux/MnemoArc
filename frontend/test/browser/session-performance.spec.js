@@ -25,7 +25,8 @@ async function addEventSession(page, state, session) {
   return other;
 }
 
-const verifying = (page) => page.getByRole("status").filter({ hasText: "최신 내용을 확인하는 중" });
+// The session stays read-only until fresh state arrives; no notice is shown.
+const verifying = (page) => page.locator('.workarea[aria-busy="true"]');
 
 test("returning to a cached session displays history immediately and waits for fresh state before sending", async ({ page, request }) => {
   const firstBundle = { id: 1, messages: [{ role: "assistant", content: "캐시에서 바로 보이는 대화" }] };
@@ -48,7 +49,7 @@ test("returning to a cached session displays history immediately and waits for f
   try {
     await expect(page.getByText("캐시에서 바로 보이는 대화", { exact: true })).toBeVisible();
     await expect(page.getByText("세션을 불러오는 중…", { exact: true })).toHaveCount(0);
-    await expect(page.getByRole("status")).toContainText("최신 내용을 확인하는 중");
+    await expect(verifying(page)).toBeVisible();
     await page.getByRole("textbox", { name: "메시지", exact: true }).fill("후속 질문");
     await expect(page.getByRole("button", { name: "메시지 보내기" })).toBeDisabled();
   } finally { pending.release(); }

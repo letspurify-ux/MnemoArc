@@ -23,9 +23,9 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
   await page.getByLabel("모델 최대 컨텍스트", { exact: true }).fill("128000");
   await page.getByLabel("API 키", { exact: true }).fill("browser-test-only");
   await page.getByRole("button", { name: "설정 저장", exact: true }).click();
-  await expect(page.getByRole("status")).toContainText("설정을 저장했습니다");
+  await expect(page.getByRole("status").filter({ hasText: "설정을 저장했습니다" })).toBeVisible();
   await page.getByRole("button", { name: "연결 확인", exact: true }).click();
-  await expect(page.getByRole("status")).toContainText("연결 확인 완료");
+  await expect(page.getByRole("status").filter({ hasText: "연결 확인 완료" })).toBeVisible();
   await page.getByRole("button", { name: "기억과 보관" }).click();
   await page.getByLabel("전체 기억 보관량", { exact: true }).fill("20");
   await page.getByRole("button", { name: "실행과 예산" }).click();
@@ -36,7 +36,7 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
   await page.getByLabel("동일 범위 반복 조회 제한", { exact: true }).fill("3");
   await page.getByLabel("진행 정체 감지 횟수", { exact: true }).fill("10");
   await page.getByRole("button", { name: "설정 저장", exact: true }).click();
-  await expect(page.getByRole("status")).toContainText("설정을 저장했습니다");
+  await expect(page.getByRole("status").filter({ hasText: "설정을 저장했습니다" })).toBeVisible();
   await page.screenshot({
     path: "test-artifacts/settings.png",
     fullPage: true,
@@ -102,9 +102,10 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
   await expect(
     page.getByRole("checkbox", { name: "문서 구조 조회", exact: true }),
   ).toBeVisible();
+  // The answer workflow hides the review tools.
   await expect(
     page.getByRole("checkbox", { name: "문서 근거 점검", exact: true }),
-  ).toBeVisible();
+  ).toHaveCount(0);
   await expect(
     page.getByRole("checkbox", { name: "심볼 검색", exact: true }),
   ).toBeVisible();
@@ -146,26 +147,19 @@ test("ordered to-do list follows prerequisites and preserves running work on rel
   await expect(page.locator(".status-pill")).toHaveText("중지됨");
 });
 
-test("completed to-dos return to missing acceptance criteria before final publication", async ({ page, request }) => {
+test("the answer workflow publishes its final answer without a completion review", async ({ page, request }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "새 세션", exact: true }).click();
   await page.getByRole("textbox", { name: "메시지", exact: true }).fill("완료 조건 검증 테스트");
   await page.getByRole("tab", { name: "진행", exact: true }).click();
   await page.getByRole("button", { name: "메시지 보내기" }).click();
-  const acceptance = page.getByRole("region", { name: "완료 조건 검증", exact: true });
-  await expect(acceptance).toContainText("미충족");
-  await expect(page.locator(".task-plan")).toContainText("누락된 예시를 답변에 추가합니다.");
   await expect(page.locator(".status-pill")).toHaveText("완료");
-  await expect(acceptance).toContainText("모든 완료 조건의 검증을 통과했습니다.");
-  await expect(page.locator(".chat-content")).toContainText("요약과 예시를 모두 작성했습니다.");
-  await expect(page.locator(".chat-content")).not.toContainText("요약을 작성했습니다.");
+  await expect(page.getByRole("region", { name: "완료 조건 검증", exact: true })).toHaveCount(0);
   const state = await (await request.get("/api/state")).json();
   const item = state.sessions.find((s) => s.title === "완료 조건 검증 테스트");
   const detail = await (await request.get(`/api/sessions/${item.id}`)).json();
-  expect(detail.completion_review.approved).toBe(true);
-  expect(detail.completion_review.attempts).toBe(2);
-  expect(detail.task.todos_completed_total).toBe(2);
-  await page.screenshot({ path: "test-artifacts/completion-review.png", fullPage: true });
+  expect(detail.completion_review.required).toBe(false);
+  expect(detail.completion_review.attempts).toBe(0);
 });
 
 test("project folder picker, settings validation and narrow screen", async ({
@@ -267,11 +261,10 @@ test("session window selects the workflow for the next request", async ({
   const workflow = page.getByLabel("작업 방식");
   await page.getByLabel("요청 종류").selectOption("chat");
   await expect(workflow).toHaveValue("answer");
-  // No automatic choice: the user picks one of the three workflows.
+  // No automatic choice: the user picks one of the two workflows.
   await expect(workflow.locator("option")).toHaveText([
     "질문 답변",
     "소스 기반 문서 작성",
-    "문서 편집",
   ]);
   await workflow.selectOption("source_document");
   const state = await (await request.get("/api/state")).json();
@@ -307,7 +300,7 @@ test("typing a new draft while send is pending preserves that draft", async ({ p
   await page.getByLabel("모델 최대 컨텍스트", { exact: true }).fill("128000");
   await page.getByLabel("API 키", { exact: true }).fill("browser-test-only");
   await page.getByRole("button", { name: "설정 저장", exact: true }).click();
-  await expect(page.getByRole("status")).toContainText("설정을 저장했습니다");
+  await expect(page.getByRole("status").filter({ hasText: "설정을 저장했습니다" })).toBeVisible();
   await page.getByRole("button", { name: "채팅으로 돌아가기" }).click();
   await page.getByRole("button", { name: "새 세션", exact: true }).click();
 
