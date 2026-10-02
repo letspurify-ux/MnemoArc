@@ -38,7 +38,10 @@ fn fixture() -> (tempfile::TempDir, Session) {
         },
     );
     s.add_user("Write report.md with the requested document.".into());
-    s.select_workflow("document_edit").unwrap();
+    s.select_workflow("source_document").unwrap();
+    // Exercise the shared document-work recovery without the source-evidence
+    // requirement, which the investigation tests cover.
+    s.task.require_investigation = false;
     tools::execute(
         &mut s,
         "document_edit",

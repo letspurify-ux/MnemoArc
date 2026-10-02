@@ -253,7 +253,7 @@ mod tests {
                 State(state.clone()),
                 Path(id.clone()),
                 Json(WorkflowSelection {
-                    workflow: "document_edit".into(),
+                    workflow: "source_document".into(),
                 }),
             )
             .await
@@ -274,7 +274,7 @@ mod tests {
         let Json(latest) = session_get(State(state.clone()), Path(id), Query(Page::default()))
             .await
             .unwrap();
-        assert_eq!(latest["workflow_mode"], "document_edit");
+        assert_eq!(latest["workflow_mode"], "source_document");
         assert!(latest["revision"].as_u64().unwrap() > revision);
     }
 

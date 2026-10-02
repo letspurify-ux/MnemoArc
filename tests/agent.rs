@@ -312,7 +312,7 @@ async fn settings_apply_at_next_request_and_generic_tasks_work() {
     assert_eq!(result.config.output_tokens, 4000);
     assert_eq!(result.task.findings, ["compare documents"]);
     assert!(result.active_tools.contains("file_read"));
-    assert!(!result.active_tools.contains("document_edit"));
+    assert!(!result.active_tools.contains("investigation"));
     assert_eq!(result.status, "complete");
 }
 
@@ -394,9 +394,10 @@ async fn unknown_model_accepts_large_memory_metadata_over_three_checkpoints() {
     let mut session = s(dir.path());
     session.config.model = "z-ai/glm-5.3-flash".into();
     session.config.index_tokens = 20_000;
-    // Leave room for small project/state additions. The explicit prepare call
-    // still forces every checkpoint, and RetryCleanup checks request capacity.
-    session.config.context_tokens += 1024;
+    // Leave room for small project/state additions and the default
+    // document_edit tools. The explicit prepare call still forces every
+    // checkpoint, and RetryCleanup checks request capacity.
+    session.config.context_tokens += 2048;
     session
         .task
         .constraints
@@ -718,10 +719,13 @@ async fn varied_reads_without_deliverable_progress_focus_on_writing_and_resume()
     std::fs::write(dir.path().join("main.rs"), "one\ntwo\nthree\n").unwrap();
     let mut session = s(dir.path());
     session.config.stall_round_limit = 3;
-    session.workflow_mode = "document_edit".into();
+    session.workflow_mode = "source_document".into();
     session.task.deliverables = vec!["docs/source-summary.md".into()];
     session.active_tools.insert("document_edit".into());
     session.add_user("Save a summary of the source".into());
+    // Exercise the shared document-work recovery without the source-evidence
+    // requirement, which the investigation tests cover.
+    session.task.require_investigation = false;
     let (tx, mut rx) = mpsc::channel(128);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result = run_session(
@@ -743,10 +747,13 @@ async fn resumed_document_work_retains_no_progress_count() {
     std::fs::write(dir.path().join("main.rs"), "one\ntwo\nthree\n").unwrap();
     let mut session = s(dir.path());
     session.config.stall_round_limit = 3;
-    session.workflow_mode = "document_edit".into();
+    session.workflow_mode = "source_document".into();
     session.task.deliverables = vec!["docs/source-summary.md".into()];
     session.active_tools.insert("document_edit".into());
     session.add_user("Save a summary of the source".into());
+    // Exercise the shared document-work recovery without the source-evidence
+    // requirement, which the investigation tests cover.
+    session.task.require_investigation = false;
     session.run_guidance =
         json!({"progress_recovery":{"rounds_without_progress":2,"repeated_read":false}});
     let (tx, mut rx) = mpsc::channel(128);
@@ -1356,11 +1363,18 @@ async fn simple_summary_append_completes_without_investigation_retries() {
 
 #[tokio::test]
 async fn simple_edit_cannot_complete_if_saved_file_changes_or_disappears() {
-    for remove in [false, true] {
+    for (workflow, remove) in [
+        ("source_document", false),
+        ("source_document", true),
+        ("answer", false),
+        ("answer", true),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let mut session = s(dir.path());
+        session.select_workflow(workflow).unwrap();
+        // Compare document-work closing without the evidence requirement.
+        session.task.require_investigation = false;
         session.active_tools.insert("document_edit".into());
-        session.active_tools.insert("investigation".into());
         session.project.output = dir.path().join("summary.md");
         mnemoarc::tools::execute(
             &mut session,
@@ -1388,15 +1402,21 @@ async fn simple_edit_cannot_complete_if_saved_file_changes_or_disappears() {
         .await;
         drain.await.unwrap();
         // A missing or externally changed file is not the agent's result, so
-        // closing mode cannot finish it with reported gaps.
-        assert_eq!(result.status, "blocked");
-        assert!(
-            result
-                .last_error
-                .as_deref()
-                .unwrap()
-                .starts_with("closing_round_limit")
-        );
+        // closing mode cannot finish it with reported gaps. The answer
+        // workflow does not enter document verification, but the saved-file
+        // check still keeps the run from completing.
+        if workflow == "answer" {
+            assert_eq!(result.status, "partial", "{:?}", result.last_error);
+        } else {
+            assert_eq!(result.status, "blocked");
+            assert!(
+                result
+                    .last_error
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("closing_round_limit")
+            );
+        }
         assert!(
             result.run_guidance["completion_error"]
                 .as_str()
@@ -1431,18 +1451,20 @@ fn evidence_requirement_is_explicit_and_retained_on_resume() {
     );
     session.add_user("계속 진행".into());
     assert!(session.task.require_investigation);
-    session.workflow_mode = "document_edit".into();
+    // Simple edits run in answer, which neither requires nor offers
+    // investigation, so final_check cannot turn them into document work.
+    session.workflow_mode = "answer".into();
     session.add_user("문서 제목만 바꿔줘".into());
     assert!(!session.task.require_investigation);
     assert!(!session.document_written);
-    let result = mnemoarc::tools::execute(
+    let error = mnemoarc::tools::execute(
         &mut session,
         "investigation",
         json!({"action":"final_check"}),
     )
-    .unwrap();
-    assert_eq!(result["complete"], false);
-    assert!(session.task.require_investigation);
+    .unwrap_err();
+    assert!(error.to_string().starts_with("tool_not_active:"), "{error}");
+    assert!(!session.task.require_investigation);
 }
 
 #[tokio::test]
@@ -1960,7 +1982,7 @@ async fn document_edits_preserve_explicit_hash_and_recover_omitted_hash() {
     for second_has_hash in [true, false] {
         let dir = tempfile::tempdir().unwrap();
         let mut session = s(dir.path());
-        session.select_workflow("document_edit").unwrap();
+        session.select_workflow("source_document").unwrap();
         session.config.source_document_review = false;
         session.config.completion_review_enabled = false;
         session.add_user("Append to the document".into());

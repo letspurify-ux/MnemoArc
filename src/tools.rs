@@ -539,8 +539,6 @@ impl ToolRegistry {
                 "document_edit_batch",
                 "document_audit",
             ]
-        } else if s.task.workflow == "document_edit" {
-            &["document_edit"]
         } else {
             &[]
         }

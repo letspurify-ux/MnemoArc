@@ -106,11 +106,7 @@ pub fn required(s: &Session) -> bool {
             || s.task.plan_revision > 0
             || !s.task.todos.is_empty()
             || s.task.require_investigation
-            || matches!(
-                s.task.workflow.as_str(),
-                "source_document" | "document_edit"
-            )
-            || s.document_written
+            || s.task.workflow == "source_document"
             || !s.task.deliverables.is_empty()
             || !s.task.unresolved.is_empty())
 }

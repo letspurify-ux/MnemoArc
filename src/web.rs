@@ -1470,7 +1470,7 @@ mod worker_wait_tests {
             State(state.clone()),
             Path(second.clone()),
             Json(WorkflowSelection {
-                workflow: "document_edit".into(),
+                workflow: "source_document".into(),
             }),
         )
         .await

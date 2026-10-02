@@ -43,7 +43,6 @@ export const statusLabel = {
 export const workflowOptions = [
   ["answer", "질문 답변"],
   ["source_document", "소스 기반 문서 작성"],
-  ["document_edit", "문서 편집"],
 ];
 export const toolLabels = {
   document_inspect: "문서 구조 조회",

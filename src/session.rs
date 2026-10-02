@@ -519,7 +519,8 @@ pub struct Session {
     pub continuation: Option<bool>,
 }
 /// Workflows a user selects for a session in the session window.
-pub const WORKFLOW_MODES: [&str; 3] = ["answer", "source_document", "document_edit"];
+/// Simple document edits run in answer, without document verification.
+pub const WORKFLOW_MODES: [&str; 2] = ["answer", "source_document"];
 
 impl Session {
     /// Select how this session's requests are handled and apply it to the
@@ -572,7 +573,7 @@ impl Session {
 
     /// Document workflows need their edit and verification tools active.
     pub fn activate_workflow_tools(&mut self) {
-        if self.task.require_investigation || self.task.workflow == "document_edit" {
+        if self.task.require_investigation {
             for name in [
                 "investigation",
                 "document_edit",
@@ -587,13 +588,12 @@ impl Session {
         }
     }
 
+    /// Whether document verification (progress recovery, closing, the
+    /// verify phase and final document checks) governs this task. A document
+    /// written in the answer workflow is a plain edit, not document work.
     pub fn is_document_work(&self) -> bool {
         self.task.require_investigation
-            || matches!(
-                self.task.workflow.as_str(),
-                "source_document" | "document_edit"
-            )
-            || self.document_written
+            || self.task.workflow == "source_document"
             || !self.investigations.is_empty()
     }
 
@@ -641,6 +641,9 @@ impl Session {
                 "file_edit",
                 "file_write",
                 "file_patch",
+                // Simple edits of the configured output run in answer.
+                "document_edit",
+                "document_edit_batch",
                 "document_inspect",
                 "file_list",
                 "source_search",

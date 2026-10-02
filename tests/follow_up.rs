@@ -27,7 +27,7 @@ fn fixture(root: &std::path::Path) -> Session {
         },
     );
     s.add_user("Write the original document".into());
-    s.select_workflow("document_edit").unwrap();
+    s.select_workflow("source_document").unwrap();
     tools::execute(
         &mut s,
         "document_edit",

@@ -115,7 +115,7 @@ async fn budget_stops_record_the_cause_even_when_a_saved_document_is_finalized()
         let dir = tempfile::tempdir().unwrap();
         let mut s = fixture(dir.path());
         if document {
-            s.select_workflow("document_edit").unwrap();
+            s.select_workflow("source_document").unwrap();
             tools::execute(
                 &mut s,
                 "document_edit",
@@ -173,7 +173,7 @@ async fn cancellation_and_timeouts_have_distinct_records() {
 async fn saved_document_timeout_reports_time_as_the_closing_cause() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = fixture(dir.path());
-    s.select_workflow("document_edit").unwrap();
+    s.select_workflow("source_document").unwrap();
     tools::execute(
         &mut s,
         "document_edit",

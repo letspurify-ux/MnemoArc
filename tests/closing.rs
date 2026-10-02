@@ -340,7 +340,10 @@ async fn closing_reserve_finishes_steady_work_before_the_budget() {
     );
     s.add_user("Write out.md".into());
     s.active_tools = ToolRegistry::optional_names();
-    s.select_workflow("document_edit").unwrap();
+    s.select_workflow("source_document").unwrap();
+    // Exercise the shared document-work recovery without the source-evidence
+    // requirement, which the investigation tests cover.
+    s.task.require_investigation = false;
     tools::execute(
         &mut s,
         "document_edit",

@@ -616,7 +616,7 @@ async fn many_new_document_sections_can_reach_final_completion() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     s.config.run_tokens = 5_000_000;
-    s.task.workflow = "document_edit".into();
+    s.task.workflow = "source_document".into();
     s.active_tools.insert("document_edit".into());
     s.config.source_document_review = false;
     let path = dir.path().join("docs/source-summary.md");
@@ -646,7 +646,7 @@ async fn one_long_document_section_can_expand_to_completion() {
     let mut s = session(dir.path());
     s.config.run_tokens = 5_000_000;
     s.config.source_document_review = false;
-    s.task.workflow = "document_edit".into();
+    s.task.workflow = "source_document".into();
     s.active_tools.insert("document_edit".into());
     let path = dir.path().join("docs/source-summary.md");
     let result = run(
@@ -715,7 +715,7 @@ async fn empty_line_growth_does_not_keep_a_document_loop_alive() {
     let mut s = session(dir.path());
     s.config.run_tokens = 220_000;
     s.config.source_document_review = false;
-    s.task.workflow = "document_edit".into();
+    s.task.workflow = "source_document".into();
     s.active_tools.insert("document_edit".into());
     let result = run(
         s,

@@ -687,7 +687,9 @@ fn catalog_finds_spaced_tool_names_and_new_sessions_can_read() {
     assert!(s.task.deliverables.is_empty());
     assert!(s.active_tools.contains("file_read"));
     assert!(s.active_tools.contains("document_inspect"));
-    assert!(!s.active_tools.contains("document_edit"));
+    // Simple edits run in answer; source-document tools stay off.
+    assert!(s.active_tools.contains("document_edit"));
+    assert!(!s.active_tools.contains("investigation"));
     std::fs::write(
         dir.path().join("nav.rs"),
         "fn target() { println!(\"found\"); }\n",
@@ -953,6 +955,27 @@ fn the_model_cannot_change_the_selected_workflow() {
     }
     assert!(!s.is_document_work());
     assert!(s.select_workflow("").is_err());
+}
+
+#[test]
+fn answer_workflow_document_edit_skips_document_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.add_user("Add a note to the summary".into());
+    assert_eq!(s.task.workflow, "answer");
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Note\nPlain edit.\n"}),
+    )
+    .unwrap();
+    assert!(s.document_written);
+    assert!(!s.is_document_work());
+    assert!(!tools::completion_review::required(&s));
+    // The same write is verified in a document workflow.
+    s.select_workflow("source_document").unwrap();
+    assert!(s.is_document_work());
+    assert!(tools::completion_review::required(&s));
 }
 
 #[test]

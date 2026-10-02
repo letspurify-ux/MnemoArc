@@ -670,7 +670,7 @@ async fn plan_churn_cannot_reset_recovery_and_pending_items_resume_without_block
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     s.config.stall_round_limit = 3;
-    s.task.workflow = "document_edit".into();
+    s.task.workflow = "source_document".into();
     s.active_tools.insert("document_edit".into());
     s.add_user("Write the section".into());
     apply(
