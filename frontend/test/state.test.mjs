@@ -26,6 +26,19 @@ test("API errors preserve server messages, including null error responses", asyn
   await assert.rejects(api("/settings"), /요청 실패 \(503\)/);
 });
 
+test("a stale server is detected before its state can enable task requests", async (t) => {
+  for (const state of [{ running: null }, { running: [] }, { api_version: 1, running: [] }, { api_version: 2, running: [] }]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json(state));
+    await assert.rejects(api("/state"), (error) =>
+      error.code === "server_version_mismatch" && /앱을 종료한 뒤 다시 시작/.test(error.message),
+    );
+    t.mock.restoreAll();
+  }
+  const state = { api_version: 2, server_instance: "test-server", running: [], sessions: [] };
+  t.mock.method(globalThis, "fetch", async () => Response.json(state));
+  assert.deepEqual(await api("/state"), state);
+});
+
 test("late history pages never resurrect pruned bundles or cursors", () => {
   const live = snapshot([5, 6], { revision: 3, pruned_through: 4, previous: null });
   const older = snapshot([2, 3, 4], { previous: 2 });

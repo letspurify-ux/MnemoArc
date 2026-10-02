@@ -94,6 +94,7 @@ export default function App() {
     versions = useRef(new Map()),
     expectedVersions = useRef(new Map()),
     globalVersion = useRef(0),
+    serverInstance = useRef(null),
     settingsDirty = useRef(false),
     projectsDirty = useRef(false),
     inspectorDirty = useRef(false),
@@ -159,9 +160,22 @@ export default function App() {
         controller.abort();
       }, 15000);
       const loadSession = async (id) => {
+        const instance = serverInstance.current;
         const current = await api(`/sessions/${id}`, {
           signal: controller.signal,
         });
+        if (
+          isCurrent() &&
+          selection.current === id &&
+          (instance !== serverInstance.current ||
+            current.server_instance !== serverInstance.current)
+        ) {
+          // A detail request can outlive the state request that discovers a
+          // restart. Its revision and history belong to the previous server.
+          setSessionReady(false);
+          pending.current = mergeRefresh(pending.current, FULL_REFRESH);
+          return;
+        }
         if (
           isCurrent() &&
           selection.current === id &&
@@ -199,6 +213,17 @@ export default function App() {
             : workspace.current;
           if (isCurrent()) {
             if (scope.state) {
+              if (serverInstance.current !== next.server_instance) {
+                serverInstance.current = next.server_instance;
+                versions.current.clear();
+                expectedVersions.current.clear();
+                globalVersion.current = 0;
+                cache.clear();
+                displaySession(null);
+                setSessionReady(false);
+                lastChecked.current.session = 0;
+                scope = { ...scope, session: true };
+              }
               workspace.current = next;
               setState(next);
               lastChecked.current.state = Date.now();
@@ -278,6 +303,11 @@ export default function App() {
             selectionEpoch.current === epoch
           ) {
             recovering.current = true;
+            if (e.code === "server_version_mismatch") {
+              workspace.current = null;
+              setState(null);
+              setSessionReady(false);
+            }
             if (timedOut)
               setRefreshError(
                 "작업 공간 응답이 지연되고 있습니다. 다시 연결을 시도합니다.",
@@ -320,13 +350,22 @@ export default function App() {
       // the stream itself must not queue a duplicate of the initial read.
     };
     stream.addEventListener("changed", (event) => {
-      const scope = changeRefresh(
+      let scope = changeRefresh(
         event.data,
         selection.current,
         versions.current.get(selection.current) || 0,
       );
       const change = parseChange(event.data);
-      if (change) {
+      // An event may be queued on a connection to an older server, or may
+      // announce a new server before its /state response arrives. Only the
+      // accepted state establishes which instance owns the revision numbers.
+      if (
+        change?.server_instance &&
+        change.server_instance !== serverInstance.current
+      ) {
+        setSessionReady(false);
+        scope = FULL_REFRESH;
+      } else if (change) {
         if (change.session === null)
           globalVersion.current = Math.max(
             globalVersion.current,
@@ -1752,7 +1791,9 @@ function Inspector({
         {tab === "output" && (
           <>
             <h3>결과 문서</h3>
-            <p className="directory-path">{displayPath(session.project.output)}</p>
+            <p className="directory-path">
+              {displayPath(session.project.output)}
+            </p>
             <button
               className="secondary"
               disabled={outputLoading}

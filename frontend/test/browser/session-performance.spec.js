@@ -28,6 +28,76 @@ async function addEventSession(page, state, session) {
 // The session stays read-only until fresh state arrives; no notice is shown.
 const verifying = (page) => page.locator('.workarea[aria-busy="true"]');
 
+test("a backend restart resets revision watermarks and ignores events from the previous instance", async ({ page, request }) => {
+  await eventStream(page);
+  const { state, session } = await workspace({ page, request });
+  const previousInstance = state.server_instance || "before-restart";
+  state.server_instance = previousInstance;
+  state.revision = session.revision = 100;
+  session.server_instance = previousInstance;
+  state.sessions[0].revision = 100;
+  const oldSnapshot = page.waitForResponse((response) => response.url().endsWith("/api/state"));
+  await page.evaluate((server_instance) => window.emitChange({
+    server_instance, revision: 100, session: null, state: true,
+  }), previousInstance);
+  await oldSnapshot;
+  await expect(verifying(page)).toHaveCount(0);
+
+  const fresh = {
+    ...structuredClone(session), id: "after-restart-session", revision: 1,
+    server_instance: "after-restart", bundles: [],
+  };
+  state.server_instance = fresh.server_instance;
+  state.revision = 1;
+  state.sessions = [{ ...state.sessions[0], id: fresh.id, revision: 1, title: "재시작 후 세션" }];
+  await page.route(`**/api/sessions/${fresh.id}`, (route) => route.fulfill({ json: fresh }));
+  await page.evaluate((server_instance) => window.emitChange({
+    server_instance, revision: 0, session: null, state: true,
+  }), fresh.server_instance);
+  await expect(page.locator(".session-button").filter({ hasText: "재시작 후 세션" })).toBeVisible();
+  await page.getByRole("textbox", { name: "메시지", exact: true }).fill("재시작 후 요청");
+  await expect(page.getByRole("button", { name: "메시지 보내기" })).toBeEnabled();
+  await expect(verifying(page)).toHaveCount(0);
+
+  await page.evaluate((server_instance) => window.emitChange({
+    server_instance, revision: 200, session: null, state: true,
+  }), previousInstance);
+  await expect(page.getByRole("button", { name: "메시지 보내기" })).toBeEnabled();
+  await expect(verifying(page)).toHaveCount(0);
+});
+
+test("a detail response from the previous backend cannot replace a fresh session with the same ID", async ({ page, request }) => {
+  await eventStream(page);
+  const { state, session } = await workspace({ page, request }, {
+    bundles: [{ id: 1, messages: [{ role: "assistant", content: "재시작 전 대화" }] }],
+  });
+  await expect(page.getByText("재시작 전 대화", { exact: true })).toBeVisible();
+  const old = { ...structuredClone(session), revision: 100 };
+  const first = gate();
+  let reads = 0;
+  await page.route(`**/api/sessions/${session.id}`, async (route) => {
+    if (reads++ === 0) {
+      first.seen();
+      await first.held;
+      await route.fulfill({ json: old });
+    } else await route.fulfill({ json: session });
+  });
+  state.server_instance = session.server_instance = "restored-backend";
+  state.revision = session.revision = state.sessions[0].revision = 1;
+  session.bundles = [{ id: 1, messages: [{ role: "assistant", content: "재시작 후 대화" }] }];
+  await page.evaluate((server_instance) => window.emitChange({
+    server_instance, revision: 0, session: null, state: true,
+  }), session.server_instance);
+  await first.requested;
+  try {
+    await expect(page.getByText("재시작 전 대화", { exact: true })).toHaveCount(0);
+  } finally { first.release(); }
+  await expect(page.getByText("재시작 후 대화", { exact: true })).toBeVisible();
+  await expect(page.getByText("재시작 전 대화", { exact: true })).toHaveCount(0);
+  await page.getByRole("textbox", { name: "메시지", exact: true }).fill("보존된 세션에서 계속");
+  await expect(page.getByRole("button", { name: "메시지 보내기" })).toBeEnabled();
+});
+
 test("returning to a cached session displays history immediately and waits for fresh state before sending", async ({ page, request }) => {
   const firstBundle = { id: 1, messages: [{ role: "assistant", content: "캐시에서 바로 보이는 대화" }] };
   const { state, session } = await workspace({ page, request }, { bundles: [firstBundle] });

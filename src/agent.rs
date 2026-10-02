@@ -1163,6 +1163,7 @@ pub async fn run_session_controlled(
             events.clone(),
             started,
             initial_tokens,
+            &mut commands,
         )
         .await
         {

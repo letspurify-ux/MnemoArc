@@ -35,23 +35,25 @@ export default function Chat({
   );
   const stage = session?.activity?.stage;
   const progress =
-    stage === "question"
-      ? "기존 작업을 보존하고 질문 답변 중"
-      : stage === "completion_review"
-        ? "실제 결과와 완료 조건 확인 중"
-        : stage === "document_review"
-          ? "문서와 소스 근거 대조 중"
-          : stage === "tools"
-            ? `${(session.activity.tools || []).map((name) => toolLabels[name] || name).join(" · ")} 실행 중`
-            : session?.stream
-              ? "답변 생성 중"
-              : stage === "model"
-                ? session?.continuation_pending
-                  ? "길이 제한으로 이어서 생성 중"
-                  : "모델 응답 대기 중"
-                : stage === "continuing"
-                  ? "받은 답변을 보존하고 이어서 생성 중"
-                  : "요청 준비 중";
+    stage === "message_routing"
+      ? `요청의 작업 변경 사항 확인 중${session.activity.attempt > 1 ? ` · ${session.activity.attempt}번째 시도` : ""}`
+      : stage === "question"
+        ? "기존 작업을 보존하고 질문 답변 중"
+        : stage === "completion_review"
+          ? "실제 결과와 완료 조건 확인 중"
+          : stage === "document_review"
+            ? "문서와 소스 근거 대조 중"
+            : stage === "tools"
+              ? `${(session.activity.tools || []).map((name) => toolLabels[name] || name).join(" · ")} 실행 중`
+              : session?.stream
+                ? "답변 생성 중"
+                : stage === "model"
+                  ? session?.continuation_pending
+                    ? "길이 제한으로 이어서 생성 중"
+                    : "모델 응답 대기 중"
+                  : stage === "continuing"
+                    ? "받은 답변을 보존하고 이어서 생성 중"
+                    : "요청 준비 중";
   const draft = useSyncExternalStore(drafts.subscribe, () =>
     drafts.get(session.id),
   );
@@ -222,16 +224,20 @@ export default function Chat({
             </div>
           )}
           {session?.status !== "running" &&
-            lastRun?.workflow === "follow_up" && (
+            ["follow_up", "message_routing"].includes(lastRun?.workflow) && (
               <div
                 className={lastRun.error ? "inline-error" : "subtle"}
                 role="status"
               >
-                {lastRun.status === "complete"
-                  ? "질문 답변 완료"
-                  : lastRun.status === "cancelled"
-                    ? "질문 답변 중지"
-                    : "질문 답변을 완료하지 못했습니다"}
+                {lastRun.workflow === "message_routing"
+                  ? lastRun.status === "cancelled"
+                    ? "요청 확인을 중지했습니다"
+                    : "요청 변경을 적용하지 못했습니다. 다시 보내면 재시도합니다"
+                  : lastRun.status === "complete"
+                    ? "질문 답변 완료"
+                    : lastRun.status === "cancelled"
+                      ? "질문 답변 중지"
+                      : "질문 답변을 완료하지 못했습니다"}
                 {" · 기존 작업 상태는 유지됩니다."}
                 {lastRun.error && <p>{displayPathText(lastRun.error)}</p>}
               </div>

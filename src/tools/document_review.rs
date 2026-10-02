@@ -1243,6 +1243,25 @@ mod tests {
         assert!(approximate_line_issue(effective_user_request(&s), 300).is_none());
         assert!(approximate_line_issue(effective_user_request(&s), 800).is_some());
     }
+
+    #[test]
+    fn amended_goal_is_sent_to_document_review_and_changes_requirement_freshness() {
+        let (_dir, mut s) = review_fixture();
+        let old_requirements = requirements(&s);
+        s.receive_message("분량을 300줄 내외로 바꿔줘.".into())
+            .unwrap();
+        s.accept_amendment(crate::session::TaskAmendment {
+            goal: Some("Write a user manual in about 300 lines.".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let page = payload(request(&mut s).unwrap());
+        let provenance: Value = serde_json::from_str(page["request"].as_str().unwrap()).unwrap();
+        assert_eq!(provenance["current_goal"], s.latest_request);
+        assert_eq!(provenance["initial_request"], "Write a user manual.");
+        assert_eq!(page["requirement_catalog"]["R0"], s.latest_request);
+        assert_ne!(requirements(&s), old_requirements);
+    }
 }
 
 #[cfg(test)]

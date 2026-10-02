@@ -259,9 +259,17 @@ async fn routing_cannot_promote_work_from_a_previous_instruction() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = fixture(dir.path());
     s.receive_message("Why did it stop?".into()).unwrap();
-    let (s, _) = run(s, vec![route("work", "Create the current report")]).await;
+    let (s, requests) = run(
+        s,
+        (0..3)
+            .map(|_| route("work", "Create the current report"))
+            .collect(),
+    )
+    .await;
     assert!(s.task_amendments.is_empty());
     assert_eq!(s.latest_request, "Create the current report");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(s.run_history.back().unwrap().workflow, "message_routing");
     assert!(
         s.run_history
             .back()

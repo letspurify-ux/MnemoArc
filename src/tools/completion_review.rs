@@ -917,6 +917,40 @@ mod retention_tests {
     use crate::config::Config;
 
     #[test]
+    fn amended_requirements_are_in_every_review_page_and_invalidate_cached_verdicts() {
+        let mut s = Session::new(Project::default(), Config::default());
+        s.receive_message("문서를 800줄 내외로 작성해줘. 원본은 유지해.".into())
+            .unwrap();
+        s.select_workflow("source_document").unwrap();
+        let old_goal = s.latest_request.clone();
+        let old_fingerprint = fingerprint(&snapshot_unbounded(&s, "draft"));
+        s.receive_message("분량만 300줄 내외로 바꿔줘.".into())
+            .unwrap();
+        s.accept_amendment(crate::session::TaskAmendment {
+            goal: Some("문서를 300줄 내외로 작성해줘. 원본은 유지해.".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(begin(&mut s, "draft").unwrap(), Gate::Review);
+        let page = request(&mut s).unwrap();
+        let payload: Value =
+            serde_json::from_str(page["messages"][1]["content"].as_str().unwrap()).unwrap();
+        let requirements: Value =
+            serde_json::from_str(payload["original_request"].as_str().unwrap()).unwrap();
+        assert_eq!(requirements["current_goal"], s.latest_request);
+        assert_eq!(requirements["initial_request"], old_goal);
+        assert_eq!(
+            requirements["user_changes"][0]["request"],
+            "분량만 300줄 내외로 바꿔줘."
+        );
+        assert_ne!(
+            fingerprint(&snapshot_unbounded(&s, "draft")),
+            old_fingerprint
+        );
+        assert_eq!(s.request_review_criteria.completion, Vec::<String>::new());
+    }
+
+    #[test]
     fn private_acceptance_payload_and_write_log_are_included_in_session_capacity() {
         for write_log in [false, true] {
             let mut s = Session::new(Project::default(), Config::default());

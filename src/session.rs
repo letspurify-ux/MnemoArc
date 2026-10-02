@@ -868,17 +868,16 @@ impl Session {
                 bail!("invalid_task_requirements: use at most 100 non-empty entries");
             }
         }
-        if let Some(ids) = &amendment.retire_investigation_ids {
-            if amendment.goal.is_none()
+        if let Some(ids) = &amendment.retire_investigation_ids
+            && (amendment.goal.is_none()
                 || ids.len() > 100
                 || ids
                     .iter()
-                    .any(|id| !self.investigations.iter().any(|item| item.id == *id))
-            {
-                bail!(
-                    "invalid_task_requirements: retiring evidence items requires a changed goal and existing investigation IDs"
-                );
-            }
+                    .any(|id| !self.investigations.iter().any(|item| item.id == *id)))
+        {
+            bail!(
+                "invalid_task_requirements: retiring evidence items requires a changed goal and existing investigation IDs"
+            );
         }
         let changed_requirements = amendment.goal.is_some();
         let mut next = self.clone();

@@ -15,6 +15,18 @@ export async function api(path, options = {}) {
     throw new Error(data?.error || `요청 실패 (${response.status})`);
   if (!data || typeof data !== "object" || Array.isArray(data))
     throw new Error(`서버 응답을 읽지 못했습니다 (${response.status}).`);
+  if (
+    path === "/state" &&
+    (data.api_version !== 2 ||
+      typeof data.server_instance !== "string" ||
+      !data.server_instance)
+  ) {
+    const error = new Error(
+      "실행 중인 서버와 화면 버전이 맞지 않습니다. 앱을 종료한 뒤 다시 시작하고 화면을 새로고침하세요.",
+    );
+    error.code = "server_version_mismatch";
+    throw error;
+  }
   return data;
 }
 export const send = (path, body, method = "POST") =>

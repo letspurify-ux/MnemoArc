@@ -103,6 +103,9 @@ pub(super) async fn read(s: WebState, id: String, request: Read) -> Api {
             value["stream"] = json!(c.streams.get(&id));
         }
     }
+    if is_page {
+        value["server_instance"] = json!(s.server_instance);
+    }
     Ok(Json(value))
 }
 

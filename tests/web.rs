@@ -623,6 +623,53 @@ async fn shutdown_closes_event_streams_without_waiting_for_browser_disconnect() 
 }
 
 #[tokio::test]
+async fn state_details_and_reconnected_events_identify_the_same_server_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut previous = String::new();
+    for _ in 0..2 {
+        let (url, state, server) = launch(dir.path()).await;
+        let current: Value = reqwest::get(format!("{url}/api/state"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(current["api_version"], 2);
+        let instance = current["server_instance"].as_str().unwrap();
+        assert!(uuid::Uuid::parse_str(instance).is_ok());
+        assert_ne!(instance, previous);
+        let id = current["sessions"][0]["id"].as_str().unwrap();
+        let detail: Value = reqwest::get(format!("{url}/api/sessions/{id}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(detail["server_instance"], instance);
+        // Each reconnect starts with a full-change event, even without edits.
+        let first = reqwest::get(format!("{url}/api/events")).await.unwrap();
+        let reconnect = reqwest::get(format!("{url}/api/events")).await.unwrap();
+        state.shutdown().await;
+        for response in [first, reconnect] {
+            let body = tokio::time::timeout(std::time::Duration::from_secs(1), response.text())
+                .await
+                .unwrap()
+                .unwrap();
+            let data = body
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap();
+            let event: Value = serde_json::from_str(data).unwrap();
+            assert_eq!(event["server_instance"], instance);
+            assert_eq!(event["revision"], 0);
+            assert_eq!(event["state"], true);
+        }
+        previous = instance.to_owned();
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn shutdown_interrupts_a_pending_connection_probe() {
     use axum::{Router, routing::post};
     use std::time::Duration;

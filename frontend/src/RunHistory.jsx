@@ -16,9 +16,12 @@ const reasons = {
   agent_worker_panic: "작업 처리 오류",
   checkpoint_retry_limit: "기억 정리 재시도 한도 도달",
   context_limit: "컨텍스트 한도 초과",
+  message_routing_invalid: "요청 판별 실패",
+  message_routing_context_limit: "요청과 요구사항이 컨텍스트 한도 초과",
 };
 const stages = {
   question: "기존 작업 질문",
+  message_routing: "요청 변경 확인",
   preparing: "요청 준비",
   model: "모델 응답",
   tools: "도구 실행",
@@ -53,9 +56,11 @@ export default function RunHistory({ records = [] }) {
             <dd>{statusLabel[run.status] || run.status}</dd>
             <dt>작업 방식</dt>
             <dd>
-              {(run.workflow === "follow_up"
-                ? "기존 작업 질문"
-                : workflowOptions.find(([id]) => id === run.workflow)?.[1]) ||
+              {(run.workflow === "message_routing"
+                ? "요청 변경 확인"
+                : run.workflow === "follow_up"
+                  ? "기존 작업 질문"
+                  : workflowOptions.find(([id]) => id === run.workflow)?.[1]) ||
                 run.workflow}
             </dd>
             <dt>시작 시각</dt>

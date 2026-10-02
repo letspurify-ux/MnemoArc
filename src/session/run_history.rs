@@ -69,7 +69,13 @@ impl Session {
                 ),
                 240,
             ),
-            workflow: if self.question.is_some() {
+            workflow: if self
+                .question
+                .as_ref()
+                .is_some_and(|question| question.automatic)
+            {
+                "message_routing".into()
+            } else if self.question.is_some() {
                 "follow_up".into()
             } else {
                 self.task.workflow.clone()
@@ -87,6 +93,12 @@ impl Session {
     pub(crate) fn promote_run_to_work(&mut self) {
         if let Some(run) = &mut self.active_run {
             run.workflow = self.workflow_mode.clone();
+        }
+    }
+
+    pub(crate) fn promote_run_to_question(&mut self) {
+        if let Some(run) = &mut self.active_run {
+            run.workflow = "follow_up".into();
         }
     }
 
@@ -126,7 +138,9 @@ impl Session {
         } else {
             self.status.clone()
         };
-        let last_stage = if self.question.is_some() {
+        let last_stage = if run.workflow == "message_routing" {
+            "message_routing"
+        } else if self.question.is_some() {
             "question"
         } else if self.checkpoint.is_some() {
             "checkpoint"

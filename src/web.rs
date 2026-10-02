@@ -79,6 +79,7 @@ impl Core {
 }
 #[derive(Clone)]
 pub struct WebState {
+    server_instance: String,
     core: Arc<Mutex<Core>>,
     settings_gate: Arc<Mutex<()>>,
     events: broadcast::Sender<Change>,
@@ -104,6 +105,7 @@ type Api<T = Value> = std::result::Result<Json<T>, ApiError>;
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone, Debug, Default, Serialize)]
 struct Change {
+    server_instance: String,
     revision: u64,
     session: Option<String>,
     state: bool,
@@ -123,6 +125,7 @@ fn changed(s: &WebState, c: &mut Core) {
         c.session_revisions.insert(id.clone(), c.revision);
     }
     let _ = s.events.send(Change {
+        server_instance: s.server_instance.clone(),
         revision: c.revision,
         session: None,
         state: true,
@@ -134,6 +137,7 @@ fn session_changed(s: &WebState, c: &mut Core, id: &str, state: bool) {
         c.session_revisions.insert(id.to_owned(), c.revision);
     }
     let _ = s.events.send(Change {
+        server_instance: s.server_instance.clone(),
         revision: c.revision,
         session: Some(id.into()),
         state,
@@ -275,6 +279,7 @@ impl WebState {
         let (events, _) = broadcast::channel(128);
         let stopping = CancellationToken::new();
         Ok(Self {
+            server_instance: uuid::Uuid::new_v4().to_string(),
             core: Arc::new(Mutex::new(Core {
                 config,
                 path,
@@ -417,8 +422,8 @@ async fn events(
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let receiver = s.events.subscribe();
     let stream = futures_util::stream::unfold(
-        (receiver, true, s.stopping),
-        |(mut receiver, first, stopping)| async move {
+        (receiver, true, s.stopping, s.server_instance),
+        |(mut receiver, first, stopping, server_instance)| async move {
             if stopping.is_cancelled() {
                 return None;
             }
@@ -429,11 +434,12 @@ async fn events(
                         Ok(change) => change,
                         Err(broadcast::error::RecvError::Closed) => return None,
                         // A slow client may miss multiple sessions' events.
-                        Err(broadcast::error::RecvError::Lagged(_)) => Change { state: true, ..Default::default() },
+                        Err(broadcast::error::RecvError::Lagged(_)) => Change { server_instance: server_instance.clone(), state: true, ..Default::default() },
                     },
                 }
             } else {
                 Change {
+                    server_instance: server_instance.clone(),
                     state: true,
                     ..Default::default()
                 }
@@ -443,7 +449,7 @@ async fn events(
                     .event("changed")
                     .json_data(change)
                     .expect("change is JSON serializable")),
-                (receiver, false, stopping),
+                (receiver, false, stopping, server_instance),
             ))
         },
     );
@@ -452,7 +458,7 @@ async fn events(
 async fn state_get(State(s): State<WebState>) -> Json<Value> {
     let c = s.core.lock().await;
     Json(
-        json!({"revision":c.revision,"config":c.config,"defaults":Config::default(),"credential":{"configured":OpenAiClient::has_key(&c.config),"saved":c.credentials.contains_key(&c.config.api_key_env)},"running":c.order.iter().filter_map(|id| c.running.get(id).map(|r| json!({"id":id,"closing":r.closing}))).collect::<Vec<_>>(),"sessions":c.order.iter().filter_map(|id|c.sessions.get(id)).map(|v| { let mut summary = session_summary(v); summary["revision"] = json!(c.session_revisions.get(&v.id).copied().unwrap_or(0)); summary }).collect::<Vec<_>>(),"tools":ToolRegistry::specs().iter().filter(|t|t.name != "db_query" && t.name != "db_execute").map(|t|json!({"name":t.name,"description":t.description,"optional":t.optional})).collect::<Vec<_>>()}),
+        json!({"api_version":2,"server_instance":s.server_instance,"revision":c.revision,"config":c.config,"defaults":Config::default(),"credential":{"configured":OpenAiClient::has_key(&c.config),"saved":c.credentials.contains_key(&c.config.api_key_env)},"running":c.order.iter().filter_map(|id| c.running.get(id).map(|r| json!({"id":id,"closing":r.closing}))).collect::<Vec<_>>(),"sessions":c.order.iter().filter_map(|id|c.sessions.get(id)).map(|v| { let mut summary = session_summary(v); summary["revision"] = json!(c.session_revisions.get(&v.id).copied().unwrap_or(0)); summary }).collect::<Vec<_>>(),"tools":ToolRegistry::specs().iter().filter(|t|t.name != "db_query" && t.name != "db_execute").map(|t|json!({"name":t.name,"description":t.description,"optional":t.optional})).collect::<Vec<_>>()}),
     )
 }
 #[derive(Default, Deserialize)]
