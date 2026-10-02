@@ -4317,3 +4317,58 @@ fn unknown_investigation_id_lists_existing_ids() {
     tools::recovery::attach(&s, &call, &mut result);
     assert_eq!(result["recovery"]["tools"], json!(["investigation"]));
 }
+
+#[test]
+fn appended_heading_follows_the_document_heading_spacing() {
+    let cases = [
+        // Spaced headings: one blank line whatever the document ends with.
+        (
+            "# Guide\n\n## One\nText.\n",
+            "# Guide\n\n## One\nText.\n\n## Two\nMore.\n",
+        ),
+        (
+            "# Guide\n\n## One\nText.",
+            "# Guide\n\n## One\nText.\n\n## Two\nMore.\n",
+        ),
+        (
+            "# Guide\n\n## One\nText.\n\n",
+            "# Guide\n\n## One\nText.\n\n## Two\nMore.\n",
+        ),
+        (
+            "# Guide\r\n\r\n## One\r\nText.\r\n",
+            "# Guide\r\n\r\n## One\r\nText.\r\n\r\n## Two\nMore.\n",
+        ),
+        // No later heading yet shows no spacing to follow.
+        ("# Guide\nIntro.\n", "# Guide\nIntro.\n## Two\nMore.\n"),
+        // Headings written without blank lines stay that way.
+        (
+            "# Guide\n## One\nText.\n",
+            "# Guide\n## One\nText.\n## Two\nMore.\n",
+        ),
+    ];
+    for (original, expected) in cases {
+        let (dir, mut s) = setup();
+        std::fs::write(dir.path().join("summary.md"), original).unwrap();
+        let hash = tools::hash(original.as_bytes());
+        run(
+            &mut s,
+            "document_edit",
+            json!({"action":"append","expected_hash":hash,"text":"## Two\nMore.\n"}),
+        );
+        let written = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+        assert_eq!(written, expected, "{original:?}");
+    }
+    // Appended prose still joins the document as given.
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("summary.md"), "# Guide\n\n## One\nText.\n").unwrap();
+    let hash = tools::hash(b"# Guide\n\n## One\nText.\n");
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":hash,"text":"More.\n"}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("summary.md")).unwrap(),
+        "# Guide\n\n## One\nText.\nMore.\n"
+    );
+}

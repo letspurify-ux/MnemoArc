@@ -1887,6 +1887,23 @@ fn line_delimiter_at(text: &str, position: usize) -> &str {
     }
 }
 
+fn ends_with_blank_line(text: &str) -> bool {
+    text.lines()
+        .last()
+        .is_some_and(|line| line.trim().is_empty())
+}
+
+/// Whether the document sets its headings off with a blank line; None when
+/// no heading follows other content yet.
+fn heading_spacing(text: &str) -> Option<bool> {
+    let mut later = documentation::headings(text)
+        .into_iter()
+        .filter(|heading| heading.start > 0)
+        .peekable();
+    later.peek()?;
+    Some(later.any(|heading| ends_with_blank_line(&text[..heading.start])))
+}
+
 /// Whether insertion text forms its own line or Markdown block rather than
 /// inline words.
 fn inserts_block(text: &str) -> bool {
@@ -1911,13 +1928,18 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
     match action {
         "create" | "write" => Ok(new.to_string()),
         // An appended heading starts a new block. Without a line break it
-        // would join the previous sentence and stop being a heading.
-        "append"
-            if !old.is_empty()
-                && !old.ends_with('\n')
-                && new.trim_start_matches(' ').starts_with('#') =>
-        {
-            Ok(format!("{old}\n{new}"))
+        // would join the previous sentence and stop being a heading, and it
+        // follows the document's heading spacing like an inserted section.
+        "append" if !old.is_empty() && new.trim_start_matches(' ').starts_with('#') => {
+            let delimiter = line_delimiter_at(old, old.len());
+            let mut prefix = old.to_string();
+            if !prefix.ends_with('\n') {
+                prefix.push_str(delimiter);
+            }
+            if heading_spacing(old).unwrap_or(false) && !ends_with_blank_line(&prefix) {
+                prefix.push_str(delimiter);
+            }
+            Ok(format!("{prefix}{new}"))
         }
         "append" => Ok(format!("{old}{new}")),
         "insert_before" | "insert_after" | "insert_first_child" | "insert_last_child" => {
@@ -1992,14 +2014,8 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             // Follow the document's heading spacing: when its headings are
             // set off by a blank line, keep one on both sides of the inserted
             // section instead of gluing it to the previous paragraph.
-            let blank_line_end = |text: &str| {
-                text.lines()
-                    .last()
-                    .is_some_and(|line| line.trim().is_empty())
-            };
-            let spaced = documentation::headings(old)
-                .iter()
-                .any(|heading| heading.start > 0 && blank_line_end(&old[..heading.start]));
+            let blank_line_end = ends_with_blank_line;
+            let spaced = heading_spacing(old).unwrap_or(false);
             if spaced && !prefix.is_empty() && !blank_line_end(&prefix) {
                 prefix.push_str(delimiter);
             }
