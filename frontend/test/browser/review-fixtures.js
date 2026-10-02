@@ -1,4 +1,4 @@
-import { test as base, expect } from "@playwright/test";
+import { test as base, expect } from "./fixtures.js";
 
 export { expect };
 export const test = base.extend({
@@ -12,22 +12,44 @@ export const test = base.extend({
 
 export async function workspace({ page, request }, patch = {}) {
   const state = await (await request.get("/api/state")).json();
-  const original = await (await request.get(`/api/sessions/${state.sessions[0].id}`)).json();
+  const original = await (
+    await request.get(`/api/sessions/${state.sessions[0].id}`)
+  ).json();
   const session = {
-    ...original, status: "idle", has_task: false, bundles: [], previous: null,
-    pruned_through: null, stream: "", error: null, run_history: [], memories: [],
-    workflow_mode: "answer", ...patch,
-    config: { ...original.config, model: "review-fixture", model_context: 128000 },
+    ...original,
+    status: "idle",
+    has_task: false,
+    bundles: [],
+    previous: null,
+    pruned_through: null,
+    stream: "",
+    error: null,
+    run_history: [],
+    memories: [],
+    workflow_mode: "answer",
+    can_resume: patch.has_task || false,
+    ...patch,
+    config: {
+      ...original.config,
+      model: "review-fixture",
+      model_context: 128000,
+    },
   };
   state.config = structuredClone(session.config);
   state.running = [];
-  state.sessions = [{ ...state.sessions[0], status: "idle", title: "리뷰 세션" }];
+  state.sessions = [
+    { ...state.sessions[0], status: "idle", title: "리뷰 세션" },
+  ];
   await page.route("**/api/state", (route) => route.fulfill({ json: state }));
-  await page.route(`**/api/sessions/${session.id}`, (route) => route.fulfill({ json: session }));
+  await page.route(`**/api/sessions/${session.id}`, (route) =>
+    route.fulfill({ json: session }),
+  );
   // These fixtures mutate JSON outside the server; exercise polling recovery.
   await page.route("**/api/events", (route) => route.abort());
   await page.goto(`/#${session.id}`);
-  await expect(page.getByRole("textbox", { name: "메시지", exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("textbox", { name: "메시지", exact: true }),
+  ).toBeVisible();
   return { state, session };
 }
 

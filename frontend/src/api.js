@@ -41,7 +41,7 @@ export const statusLabel = {
 };
 // How a session's requests are handled; the user selects it per session.
 export const workflowOptions = [
-  ["answer", "질문 답변"],
+  ["answer", "일반 작업"],
   ["source_document", "소스 기반 문서 작성"],
 ];
 export const toolLabels = {

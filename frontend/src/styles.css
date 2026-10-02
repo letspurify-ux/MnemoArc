@@ -622,26 +622,6 @@ button:hover {
   align-items: center;
   gap: 6px;
 }
-.workflow-select {
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-  white-space: nowrap;
-  gap: 6px;
-  margin-left: auto;
-  margin-right: 10px;
-  font-size: 10px;
-  color: #6f7d66;
-}
-.workflow-select select {
-  width: auto;
-  font-size: 11px;
-  padding: 3px 6px;
-  border: 1px solid #c9d2bf;
-  border-radius: 6px;
-  background: white;
-  color: inherit;
-}
 .small-dot {
   width: 4px;
   height: 4px;
@@ -710,7 +690,9 @@ button:hover {
   border-radius: 3px;
   background: #d5dfd5;
   opacity: 0.55;
-  transition: opacity 120ms ease, background 120ms ease;
+  transition:
+    opacity 120ms ease,
+    background 120ms ease;
 }
 .inspector-resizer:hover > span,
 .inspector-resizer:focus-visible > span,
@@ -1212,6 +1194,83 @@ button:hover {
 .modal-head > button {
   font-size: 25px;
 }
+.workflow-badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 500;
+  color: #52714e;
+  background: #edf3e7;
+  border-radius: 6px;
+  padding: 4px 8px;
+  margin-left: 10px;
+}
+.new-session-modal h2 {
+  margin: 0;
+  font-size: 19px;
+}
+.new-session-modal .field {
+  display: grid;
+  gap: 8px;
+  margin-top: 22px;
+  font-size: 12px;
+}
+.new-session-modal .field input,
+.new-session-modal .field select {
+  width: 100%;
+}
+.session-workflow-options {
+  border: 0;
+  padding: 0;
+  margin: 22px 0 0;
+  display: grid;
+  gap: 10px;
+}
+.session-workflow-options legend {
+  font-size: 12px;
+  margin-bottom: 10px;
+}
+.session-workflow-options label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid #e1e8db;
+  border-radius: 9px;
+  cursor: pointer;
+}
+.session-workflow-options label:has(input:checked) {
+  border-color: #6e9466;
+  background: #f3f8ee;
+}
+.session-workflow-options input {
+  width: auto;
+  accent-color: #52714e;
+}
+.session-workflow-options span {
+  display: grid;
+  gap: 5px;
+}
+.session-workflow-options strong {
+  font-size: 13px;
+}
+.session-workflow-options small {
+  color: #6d7966;
+  font-size: 11px;
+}
+.session-create-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 22px;
+}
+.session-create-actions button {
+  padding: 10px 15px;
+  border-radius: 8px;
+}
+.new-session-modal .subtle {
+  font-size: 11px;
+  line-height: 1.7;
+}
 .directory-path {
   word-break: break-all;
   font-size: 11px;
@@ -1375,7 +1434,10 @@ button:hover {
 }
 @media (min-width: 1600px) {
   .workarea.with-details {
-    grid-template-columns: minmax(0, 1fr) min(var(--inspector-width, 330px), 70%);
+    grid-template-columns: minmax(0, 1fr) min(
+        var(--inspector-width, 330px),
+        70%
+      );
   }
   .chat-scroll {
     padding: 0 50px;
@@ -1391,7 +1453,10 @@ button:hover {
     padding: 26px 12px 15px;
   }
   .workarea.with-details {
-    grid-template-columns: minmax(0, 1fr) min(var(--inspector-width, 260px), 70%);
+    grid-template-columns: minmax(0, 1fr) min(
+        var(--inspector-width, 260px),
+        70%
+      );
   }
   .session-heading {
     padding: 20px;
@@ -1506,7 +1571,7 @@ button:hover {
   .composer-wrap {
     padding: 10px 14px;
   }
-  /* Room for the workflow selector; Enter/Shift+Enter still work. */
+  /* Keep mobile composer controls compact. */
   .composer-bottom > span {
     display: none;
   }

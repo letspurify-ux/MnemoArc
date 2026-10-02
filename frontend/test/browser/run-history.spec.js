@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures.js";
 
 test("execution history survives another request and reload", async ({
   page,
@@ -34,7 +34,6 @@ test("execution history survives another request and reload", async ({
   const first = (await (await request.get(`/api/sessions/${id}`)).json())
     .run_history[0];
 
-  await page.getByLabel("요청 종류").selectOption("chat");
   await page
     .getByRole("textbox", { name: "메시지", exact: true })
     .fill("느린 요청 테스트");
@@ -61,8 +60,8 @@ test("execution history survives another request and reload", async ({
 
   // The next ordinary message asks about the stopped task, retaining its status.
   const beforeQuestion = after;
-  await expect(page.getByLabel("요청 종류")).toHaveValue("question");
-  await expect(page.getByLabel("작업 방식")).toBeDisabled();
+  await expect(page.getByLabel("요청 종류")).toHaveCount(0);
+  await expect(page.locator(".composer-wrap").getByLabel("작업 방식")).toHaveCount(0);
   await page
     .getByRole("textbox", { name: "메시지", exact: true })
     .fill("어떤 상황으로 종료된거야?");
@@ -86,12 +85,12 @@ test("execution history survives another request and reload", async ({
     expect(answered[key]).toEqual(beforeQuestion[key]);
   }
   expect(answered.run_history.at(-1).workflow).toBe("follow_up");
-  await page.getByLabel("요청 종류").selectOption("chat");
-  await expect(page.getByLabel("작업 방식")).toBeEnabled();
+
+  await expect(page.locator(".workflow-badge")).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.locator(".inspector")).toHaveCount(0);
-  await expect(page.getByLabel("요청 종류")).toBeVisible();
-  await expect(page.getByLabel("작업 방식")).toBeVisible();
+  await expect(page.getByLabel("요청 종류")).toHaveCount(0);
+  await expect(page.locator(".workflow-badge")).toBeVisible();
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth <= innerWidth,

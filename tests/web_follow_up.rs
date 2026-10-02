@@ -1,3 +1,4 @@
+mod support;
 use async_trait::async_trait;
 use mnemoarc::{
     config::{Config, Project},
@@ -24,11 +25,18 @@ impl LlmClient for Script {
             .unwrap_or("")
             .starts_with("Saved task snapshot:")
         {
-            assert!(request.get("tools").is_none());
+            assert!(request.get("tools").is_some());
             return Ok(Completion {
                 text: "The original task is still blocked; its repair plan is retained.".into(),
                 ..Default::default()
             });
+        }
+        if let Ok(route) =
+            serde_json::from_str::<Value>(request["messages"][1]["content"].as_str().unwrap_or(""))
+            && route["session_message_routing"] == true
+        {
+            let text = route["current_message"].as_str().unwrap();
+            return Ok(Completion { text:json!({"intent":if text=="계속" { "work" } else if text=="New task" { "new_task" } else { "discuss" },"authorization_quote":text,"changes":{}}).to_string(),..Default::default() });
         }
         let raw = request["messages"].as_array().unwrap().last().unwrap()["content"]
             .as_str()
@@ -85,7 +93,7 @@ async fn execute(c: &reqwest::Client, url: &str, id: &str, body: Value) -> Value
 }
 
 #[tokio::test]
-async fn default_follow_up_preserves_task_and_explicit_new_task_resets_it() {
+async fn default_follow_up_preserves_task_and_new_work_requires_a_new_session() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         model: "gpt-4o".into(),
@@ -103,6 +111,7 @@ async fn default_follow_up_preserves_task_and_explicit_new_task_resets_it() {
     let app = web::router(state.clone(), dir.path().into());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let c = reqwest::Client::new();
+    support::seed_session(&c, &url).await;
     let initial = get(&c, &format!("{url}/api/state")).await;
     let id = initial["sessions"][0]["id"].as_str().unwrap();
     let original = execute(&c, &url, id, json!({"text":"Original task"})).await;
@@ -130,8 +139,12 @@ async fn default_follow_up_preserves_task_and_explicit_new_task_resets_it() {
     assert_eq!(resumed["status"], "blocked");
     assert_eq!(resumed["task"]["todos"], original["task"]["todos"]);
     let new = execute(&c, &url, id, json!({"action":"chat","text":"New task"})).await;
-    assert_eq!(new["status"], "complete");
-    assert_eq!(new["task"]["todos"], json!([]));
+    assert_eq!(new["status"], "blocked");
+    assert_eq!(new["task"]["todos"], original["task"]["todos"]);
+    let new_id = support::seed_session(&c, &url).await.unwrap();
+    let fresh = execute(&c, &url, &new_id, json!({"text":"New task"})).await;
+    assert_eq!(fresh["status"], "complete");
+    assert_eq!(fresh["task"]["todos"], json!([]));
     assert_eq!(new["run_history"].as_array().unwrap().len(), 4);
     state.shutdown().await;
     server.abort();

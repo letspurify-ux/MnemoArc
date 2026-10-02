@@ -59,9 +59,14 @@ impl Session {
         self.active_run = Some(ActiveRun {
             id: crate::memory::id(),
             request: excerpt(
-                self.question
-                    .as_ref()
-                    .map_or(self.latest_request.as_str(), |q| q.text.as_str()),
+                self.question.as_ref().map_or(
+                    if self.current_request.is_empty() {
+                        self.latest_request.as_str()
+                    } else {
+                        self.current_request.as_str()
+                    },
+                    |q| q.text.as_str(),
+                ),
                 240,
             ),
             workflow: if self.question.is_some() {
@@ -77,6 +82,18 @@ impl Session {
             usage_estimated: false,
             reason: None,
         });
+    }
+
+    pub(crate) fn promote_run_to_work(&mut self) {
+        if let Some(run) = &mut self.active_run {
+            run.workflow = self.workflow_mode.clone();
+        }
+    }
+
+    pub(crate) fn run_rounds(&self) -> usize {
+        self.active_run.as_ref().map_or(self.task_rounds, |run| {
+            self.task_rounds.saturating_sub(run.rounds)
+        })
     }
 
     pub(crate) fn note_run_estimate(&mut self) {

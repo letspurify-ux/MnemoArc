@@ -121,6 +121,28 @@ fn task_patch_schema() -> Value {
 }
 
 impl ToolRegistry {
+    /// Follow-up discussion may gather and remember evidence without changing
+    /// files, the task plan, review verdicts or checkpoint state.
+    pub fn question_allows(name: &str) -> bool {
+        matches!(
+            name,
+            "file_read"
+                | "file_list"
+                | "source_search"
+                | "code_outline"
+                | "symbol_search"
+                | "symbol_relations"
+                | "symbol_read"
+                | "document_inspect"
+                | "source_lookup"
+                | "memory_read"
+                | "memory_find"
+                | "memory_write"
+                | "history"
+                | "db_query"
+        )
+    }
+
     pub fn specs() -> Vec<ToolSpec> {
         let mut specs = vec![
             ToolSpec {
@@ -655,6 +677,7 @@ impl ToolRegistry {
             && s.is_document_work()
             && s.document_written;
         Self::specs().into_iter()
+            .filter(|t| !s.read_only_turn || Self::question_allows(t.name))
             .filter(|t| t.name != "db_query" || s.config.database.active_queries().next().is_some())
             .filter(|t| t.name != "db_execute" || s.config.database.free_execution_enabled())
             .filter(|t| !t.optional || s.active_tools.contains(t.name))
@@ -844,6 +867,9 @@ impl ToolRegistry {
             .collect()
     }
     pub fn validate(s: &Session, name: &str, args: &Value) -> Result<ToolSpec> {
+        if s.read_only_turn && !Self::question_allows(name) {
+            bail!("question_tools_not_allowed: {name} changes task state or files; task preserved");
+        }
         let spec = Self::specs()
             .into_iter()
             .find(|t| t.name == name)
@@ -3425,7 +3451,11 @@ fn bind_written_sections(s: &mut Session, doc: &str) -> Vec<String> {
     let resolved: Vec<_> = s
         .investigations
         .iter()
-        .map(|item| resolved_section_path(doc, &item.section))
+        .map(|item| {
+            (item.status != "superseded")
+                .then(|| resolved_section_path(doc, &item.section))
+                .flatten()
+        })
         .collect();
     let targets: Vec<_> = s
         .investigations
@@ -3479,7 +3509,8 @@ fn resolve_named_section(s: &Session, doc: &str, section: &str, id: &str) -> Res
         Err(error) => planned_heading(doc, section, "")
             .filter(|path| {
                 !s.investigations.iter().any(|other| {
-                    other.id != id
+                    other.status != "superseded"
+                        && other.id != id
                         && resolved_section_path(doc, &other.section).as_ref() == Some(path)
                 })
             })
@@ -3691,7 +3722,9 @@ fn item_scope_text_indexed(
     let own = index.resolve(&item.section)?;
     let mut cuts: Vec<(usize, usize)> = items
         .iter()
-        .filter(|other| other.id != item.id && !other.section.trim().is_empty())
+        .filter(|other| {
+            other.status != "superseded" && other.id != item.id && !other.section.trim().is_empty()
+        })
         .filter_map(|other| index.resolve(&other.section).ok())
         .filter(|other| other.start > own.start && other.end <= own.end)
         .map(|other| (other.start, other.end))
@@ -3776,6 +3809,9 @@ pub fn execute_cancellable(
     args: Value,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value> {
+    if s.read_only_turn && !ToolRegistry::question_allows(name) {
+        bail!("question_tools_not_allowed: {name} changes task state or files; task preserved");
+    }
     let _write = writes::acquire(name, cancel, &s.write_outcome_uncertain)?;
     let result = execute_arguments(s, name, args, cancel);
     // Publish an uncertain commit before releasing the gate; another session
@@ -4560,6 +4596,14 @@ fn execute_repaired(
                     .map(str::to_string)
                     .unwrap_or_else(crate::memory::id);
                 let previous = s.investigations.iter().find(|item| item.id == id).cloned();
+                if previous
+                    .as_ref()
+                    .is_some_and(|item| item.status == "superseded")
+                {
+                    bail!(
+                        "investigation_superseded: {id} was retired by an explicit user scope change. Keep its history; register a new ID only for work required by the current goal"
+                    );
+                }
                 // Re-registering a verified item without changing its section,
                 // sources or memories keeps it verified (a live run reset one
                 // to in_progress and had to verify it again).
@@ -4604,9 +4648,10 @@ fn execute_repaired(
                     }
                 }
                 if previous.is_none()
-                    && s.investigations
-                        .iter()
-                        .any(|item| item.title == args["title"].as_str().unwrap_or(""))
+                    && s.investigations.iter().any(|item| {
+                        item.status != "superseded"
+                            && item.title == args["title"].as_str().unwrap_or("")
+                    })
                 {
                     bail!("duplicate_investigation_title: list and update the existing item by ID");
                 }
@@ -4686,7 +4731,8 @@ fn execute_repaired(
                         && section_text(&doc, &item.section).is_err()
                         && let Some(path) = planned_heading(&doc, &item.section, &item.title)
                         && !s.investigations.iter().any(|other| {
-                            other.id != item.id
+                            other.status != "superseded"
+                                && other.id != item.id
                                 && resolved_section_path(&doc, &other.section).as_ref()
                                     == Some(&path)
                         })

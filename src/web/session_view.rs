@@ -127,7 +127,7 @@ fn page_view(session: &Snapshot, revision: u64, stream: Option<String>, page: Pa
         })
         .map(|bundle| bundle.id);
     let (memory_bytes, history_bytes) = session.usage();
-    json!({"revision":revision,"id":session.id,"project":session.project,"config":session.config,"pending_config":session.pending_config,"credential_configured":OpenAiClient::has_key(&session.config),"status":session.status,"error":session.last_error,"run_history":session.run_history,"has_task":!session.latest_request.is_empty(),"question_running":session.question.is_some(),"task":session.task,"workflow_mode":session.workflow_mode,"workflow_forbidden_tools":session.workflow_forbidden_tools(),"document_review":session.document_review,"completion_review":crate::tools::completion_review::view(session),"completion_gaps":session.completion_gaps,"run_guidance":session.run_guidance,"activity":session.activity,"continuation_pending":session.continuation.is_some(),"bundles":bundles,"previous":previous,"pruned_through":session.history.pruned_through,"stream":stream,"memories":session.memory.recent(session.config.memory_count),"investigations":session.investigations,"active_tools":session.active_tools,"usage":{"input":session.input_tokens,"output":session.output_tokens,"cached":session.cached_tokens,"estimated":session.usage_incomplete,"context_estimated":crate::context::is_estimated(&session.config.model),"memory_bytes":memory_bytes,"history_bytes":history_bytes,"checkpoints":session.checkpoints_completed},"checkpoint":session.checkpoint})
+    json!({"revision":revision,"id":session.id,"project":session.project,"config":session.config,"pending_config":session.pending_config,"credential_configured":OpenAiClient::has_key(&session.config),"status":session.status,"error":session.last_error,"run_history":session.run_history,"has_task":!session.latest_request.is_empty(),"can_resume":session.can_resume(),"original_request":session.original_request,"current_goal":session.latest_request,"task_amendments":session.task_amendments,"question_running":session.question.is_some(),"task":session.task,"workflow_mode":session.workflow_mode,"workflow_forbidden_tools":session.workflow_forbidden_tools(),"document_review":session.document_review,"completion_review":crate::tools::completion_review::view(session),"completion_gaps":session.completion_gaps,"run_guidance":session.run_guidance,"activity":session.activity,"continuation_pending":session.continuation.is_some(),"bundles":bundles,"previous":previous,"pruned_through":session.history.pruned_through,"stream":stream,"memories":session.memory.recent(session.config.memory_count),"investigations":session.investigations,"active_tools":session.active_tools,"usage":{"input":session.input_tokens,"output":session.output_tokens,"cached":session.cached_tokens,"estimated":session.usage_incomplete,"context_estimated":crate::context::is_estimated(&session.config.model),"memory_bytes":memory_bytes,"history_bytes":history_bytes,"checkpoints":session.checkpoints_completed},"checkpoint":session.checkpoint})
 }
 
 /// Keep the authoritative agent snapshot even if validation is interrupted.
@@ -163,7 +163,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     fn workspace(dir: &FsPath) -> WebState {
-        WebState::new(
+        test_state(
             Config {
                 projects: vec![Project {
                     root: dir.into(),
@@ -230,6 +230,7 @@ mod tests {
             let Json(created) = create_session(
                 State(state.clone()),
                 Json(NewSession {
+                    workflow: default_workflow(),
                     project: Project {
                         root: dir.path().into(),
                         ..Default::default()
@@ -253,7 +254,7 @@ mod tests {
                 State(state.clone()),
                 Path(id.clone()),
                 Json(WorkflowSelection {
-                    workflow: "source_document".into(),
+                    workflow: "answer".into(),
                 }),
             )
             .await
@@ -274,7 +275,7 @@ mod tests {
         let Json(latest) = session_get(State(state.clone()), Path(id), Query(Page::default()))
             .await
             .unwrap();
-        assert_eq!(latest["workflow_mode"], "source_document");
+        assert_eq!(latest["workflow_mode"], "answer");
         assert!(latest["revision"].as_u64().unwrap() > revision);
     }
 

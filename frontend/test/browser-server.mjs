@@ -14,7 +14,11 @@ const provider = createServer(async (req, res) => {
   const data = JSON.parse(body);
   if (data.stream === false) {
     res.setHeader("Content-Type", "application/json");
-    res.end(JSON.stringify({ choices: [{ message: { content: "OK" }, finish_reason: "stop" }] }));
+    res.end(
+      JSON.stringify({
+        choices: [{ message: { content: "OK" }, finish_reason: "stop" }],
+      }),
+    );
     return;
   }
   res.writeHead(200, {
@@ -49,20 +53,91 @@ const provider = createServer(async (req, res) => {
     event({ choices: [{ delta: { content: text }, finish_reason: "stop" }] });
     res.end("data: [DONE]\n\n");
   };
-  if (data.messages[0]?.content.startsWith("Answer only the user's follow-up question")) {
+  const sendCall = (id, name, args) => {
+    event({
+      choices: [
+        {
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id,
+                function: { name, arguments: JSON.stringify(args) },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+    });
+    res.end("data: [DONE]\n\n");
+  };
+  let routePayload;
+  try {
+    routePayload = JSON.parse(data.messages[1]?.content);
+  } catch {}
+  if (routePayload?.session_message_routing) {
+    const message = routePayload.current_message;
+    const work =
+      message === "계속" ||
+      message === "느린 요청 테스트" ||
+      message === "일반 문서 수정 테스트" ||
+      message.includes("수정해") ||
+      message.includes("추가해");
+    sendAnswer(
+      JSON.stringify({
+        intent: work ? "work" : "discuss",
+        authorization_quote: work ? message : "",
+        changes: {},
+      }),
+    );
+    return;
+  }
+  if (
+    data.messages[0]?.content.startsWith(
+      "Answer only the user's follow-up question",
+    )
+  ) {
+    const current = data.messages.findLast(
+      (message) => message.role === "user",
+    )?.content;
+    if (current === "추가 자료 수집 테스트") {
+      if (!data.messages.some((message) => message.role === "tool"))
+        sendCall("collected-read", "file_read", {
+          path: "sample.rs",
+          start_line: 1,
+          max_lines: 1,
+        });
+      else sendAnswer("후속 질문에서도 sample.rs:1-1 자료를 수집했습니다.");
+      return;
+    }
     sendAnswer("기존 작업의 상태와 검토 지적을 유지한 질문 답변입니다.");
     return;
   }
   let reviewPayload;
-  try { reviewPayload = JSON.parse(data.messages[1]?.content); } catch {}
-  if (reviewPayload?.completion_review && reviewPayload.original_request === "완료 조건 검증 테스트") {
-    const draft = reviewPayload.evidence.find((e) => e.id === "answer")?.text || "";
+  try {
+    reviewPayload = JSON.parse(data.messages[1]?.content);
+  } catch {}
+  if (
+    reviewPayload?.completion_review &&
+    reviewPayload.original_request === "완료 조건 검증 테스트"
+  ) {
+    const draft =
+      reviewPayload.evidence.find((e) => e.id === "answer")?.text || "";
     const met = draft.includes("예시");
-    sendAnswer(JSON.stringify({ checks: reviewPayload.criteria.map((c) => ({
-      id: c.id, status: met ? "met" : "unmet",
-      reason: met ? "요약과 예시를 확인했습니다." : "요청한 예시가 빠져 있습니다.",
-      evidence: ["answer"], next_action: met ? "" : "누락된 예시를 답변에 추가합니다.",
-    })) }));
+    sendAnswer(
+      JSON.stringify({
+        checks: reviewPayload.criteria.map((c) => ({
+          id: c.id,
+          status: met ? "met" : "unmet",
+          reason: met
+            ? "요약과 예시를 확인했습니다."
+            : "요청한 예시가 빠져 있습니다.",
+          evidence: ["answer"],
+          next_action: met ? "" : "누락된 예시를 답변에 추가합니다.",
+        })),
+      }),
+    );
     return;
   }
   let retainedState;
@@ -73,15 +148,83 @@ const provider = createServer(async (req, res) => {
   if (retainedState?.checkpoint) {
     // Fixtures keep their entire working state in program-owned task fields;
     // acknowledge cleanup when schemas/history cross the context watermark.
-    event({ choices: [{ delta: { tool_calls: [{ index: 0, id: `checkpoint-${retainedState.checkpoint.id}`, function: {
-      name: "checkpoint_complete", arguments: JSON.stringify({ id: retainedState.checkpoint.id, no_save_reason: "Fixture requirements and findings are already retained in program task state.", progress: "Continue the current fixture task." }),
-    } }] }, finish_reason: "tool_calls" }] });
+    event({
+      choices: [
+        {
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: `checkpoint-${retainedState.checkpoint.id}`,
+                function: {
+                  name: "checkpoint_complete",
+                  arguments: JSON.stringify({
+                    id: retainedState.checkpoint.id,
+                    no_save_reason:
+                      "Fixture requirements and findings are already retained in program task state.",
+                    progress: "Continue the current fixture task.",
+                  }),
+                },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+    });
     res.end("data: [DONE]\n\n");
     return;
   }
-  const isRequest = (text) => retainedState?.latest_request === text || data.messages.some((m) => m.role === "user" && m.content === text);
+  if (retainedState?.current_request === "일반 문서 수정 테스트") {
+    const current = data.messages.findLast(
+      (message) =>
+        message.role === "user" && message.content === "일반 문서 수정 테스트",
+    );
+    const after = data.messages.slice(data.messages.indexOf(current) + 1);
+    const edit = after.some((message) =>
+      message.tool_calls?.some(
+        (call) => call.function.name === "document_edit",
+      ),
+    );
+    if (edit) sendAnswer("일반 문서 수정 완료");
+    else {
+      const observation = after.findLast((message) => message.role === "tool");
+      if (!observation) sendCall("inspect-update", "document_inspect", {});
+      else
+        sendCall("general-write", "document_edit", {
+          action: "append",
+          text: "후속 요청으로 추가한 내용\n",
+          expected_hash: JSON.parse(observation.content).data.hash,
+        });
+    }
+    return;
+  }
+  if (retainedState?.latest_request === "일반 문서 작업 테스트") {
+    const edited = data.messages.some((message) =>
+      message.tool_calls?.some(
+        (call) => call.function.name === "document_edit",
+      ),
+    );
+    if (edited) sendAnswer("일반 문서 작성 완료");
+    else
+      sendCall("general-write", "document_edit", {
+        action: "create",
+        text: "# 일반 작업 결과\n최초 문서 내용\n",
+      });
+    return;
+  }
+  const isRequest = (text) =>
+    retainedState?.latest_request === text ||
+    data.messages.some((m) => m.role === "user" && m.content === text);
   if (retainedState?.latest_request.startsWith("동시 실행 테스트 ")) {
-    event({ choices: [{ delta: { content: `${retainedState.latest_request} 응답 중` }, finish_reason: null }] });
+    event({
+      choices: [
+        {
+          delta: { content: `${retainedState.latest_request} 응답 중` },
+          finish_reason: null,
+        },
+      ],
+    });
     const keep = setInterval(() => res.write(": keepalive\n\n"), 1000);
     res.on("close", () => clearInterval(keep));
     return;
@@ -92,16 +235,50 @@ const provider = createServer(async (req, res) => {
     const state = JSON.parse(message.slice(message.indexOf("\n") + 1));
     const revision = state.task.plan_revision;
     if (revision > 0 && !state.run_guidance.current_todo) {
-      sendAnswer(revision === 1 ? "요약을 작성했습니다." : "요약과 예시를 모두 작성했습니다.");
+      sendAnswer(
+        revision === 1
+          ? "요약을 작성했습니다."
+          : "요약과 예시를 모두 작성했습니다.",
+      );
       return;
     }
     if (revision > 0) await new Promise((resolve) => setTimeout(resolve, 700));
-    const operations = revision === 0
-      ? [{ op: "insert", texts: ["요약과 예시 작성"] }, { op: "complete", id: "T1", result: "요약 작성" }]
-      : [{ op: "complete", id: state.run_guidance.current_todo.id, result: "예시를 답변에 추가했습니다." }];
-    event({ choices: [{ delta: { tool_calls: [{ index: 0, id: `acceptance-${revision}`, function: {
-      name: "task_plan", arguments: JSON.stringify({ action: "apply", expected_revision: revision, operations }),
-    } }] }, finish_reason: "tool_calls" }] });
+    const operations =
+      revision === 0
+        ? [
+            { op: "insert", texts: ["요약과 예시 작성"] },
+            { op: "complete", id: "T1", result: "요약 작성" },
+          ]
+        : [
+            {
+              op: "complete",
+              id: state.run_guidance.current_todo.id,
+              result: "예시를 답변에 추가했습니다.",
+            },
+          ];
+    event({
+      choices: [
+        {
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: `acceptance-${revision}`,
+                function: {
+                  name: "task_plan",
+                  arguments: JSON.stringify({
+                    action: "apply",
+                    expected_revision: revision,
+                    operations,
+                  }),
+                },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+    });
     res.end("data: [DONE]\n\n");
     return;
   }

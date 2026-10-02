@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Chat from "./Chat.jsx";
+import NewSession from "./NewSession.jsx";
 import RunHistory from "./RunHistory.jsx";
 import Settings, { ProjectForm, cleanProject } from "./Settings.jsx";
 import { Message } from "./chat/Message.jsx";
-import { api, download, send, statusLabel, toolLabels } from "./api.js";
+import {
+  api,
+  download,
+  send,
+  statusLabel,
+  toolLabels,
+  workflowOptions,
+} from "./api.js";
 import { mergeSession, mergeOlder } from "./session-history.js";
 import { useServerDraft } from "./use-server-draft.js";
 import { createComposerDrafts } from "./composer-drafts.js";
@@ -66,7 +74,7 @@ export default function App() {
     [mobileNav, setMobileNav] = useState(false),
     [navigating, setNavigating] = useState(false),
     [runPending, setRunPending] = useState(new Set()),
-    [workflowPending, setWorkflowPending] = useState(new Set()),
+    [newSession, setNewSession] = useState(null),
     [stopped, setStopped] = useState(false),
     [stopping, setStopping] = useState(false),
     [inspectorWidth, setInspectorWidth] = useState(loadInspectorWidth),
@@ -491,31 +499,27 @@ export default function App() {
       setRunPending(new Set(startingRun.current));
     }
   }
-  async function changeWorkflow(id, workflow) {
-    setWorkflowPending((current) => new Set([...current, id]));
-    try {
-      return await act(() =>
-        send(`/sessions/${id}/workflow`, { workflow }, "PUT"),
-      );
-    } finally {
-      setWorkflowPending((current) => {
-        const next = new Set(current);
-        next.delete(id);
-        return next;
-      });
-    }
-  }
-  async function create(project, { projectDraft = false } = {}) {
+  function requestSession(project, { projectDraft = false } = {}) {
     if (
+      !project ||
       creating.current ||
       !canLeavePage({ projectDraftForNewSession: projectDraft })
     )
       return;
+    const saved = state.config.projects.find((item) => item.id === project.id);
+    setNewSession({
+      project:
+        !projectDraft && saved ? { ...project, output: saved.output } : project,
+    });
+  }
+  async function create(project, workflow) {
+    if (creating.current || !newSession) return;
     creating.current = true;
     const navigation = navigationEpoch.current;
     setNavigating(true);
     try {
-      const data = await send("/sessions", { project });
+      const data = await send("/sessions", { project, workflow });
+      setNewSession(null);
       if (navigationEpoch.current === navigation) choose(data.id, true);
     } finally {
       creating.current = false;
@@ -593,7 +597,7 @@ export default function App() {
           className="new-session"
           aria-label="새 세션"
           onClick={safe(() =>
-            create(current?.project || state.config.projects[0]),
+            requestSession(current?.project || state.config.projects[0]),
           )}
           disabled={navigating || !state?.config.projects.length}
         >
@@ -616,7 +620,7 @@ export default function App() {
                 className="project-heading"
                 title={project.root}
                 disabled={navigating}
-                onClick={safe(() => create(project))}
+                onClick={safe(() => requestSession(project))}
               >
                 <span>▱</span>
                 {project.name}
@@ -772,7 +776,7 @@ export default function App() {
             onSaved={() => refresh(true)}
             onDirtyChange={onProjectsDirtyChange}
             onCreate={(project) =>
-              act(() => create(project, { projectDraft: true }))
+              requestSession(project, { projectDraft: true })
             }
             creating={navigating}
           />
@@ -792,6 +796,11 @@ export default function App() {
               <div className="session-heading">
                 <div>
                   <h2>{session.project.name}</h2>
+                  <span className="workflow-badge">
+                    {workflowOptions.find(
+                      ([value]) => value === session.workflow_mode,
+                    )?.[1] || session.workflow_mode}
+                  </span>
                   <p title={session.project.root}>{session.project.root}</p>
                 </div>
                 <div className="session-actions">
@@ -802,9 +811,8 @@ export default function App() {
                       !sessionReady ||
                       selectedBusy ||
                       capacityFull ||
-                      workflowPending.has(selected) ||
                       !canRun ||
-                      !session.has_task
+                      !session.can_resume
                     }
                     onClick={() =>
                       void runSession(selected, undefined, "resume").catch(
@@ -821,7 +829,6 @@ export default function App() {
                       !sessionReady ||
                       selectedBusy ||
                       capacityFull ||
-                      workflowPending.has(selected) ||
                       !canRun ||
                       !session.has_task
                     }
@@ -852,17 +859,11 @@ export default function App() {
                 key={session.id}
                 session={session}
                 drafts={drafts}
-                busy={
-                  navigating ||
-                  !sessionReady ||
-                  selectedBusy ||
-                  workflowPending.has(session.id)
-                }
+                busy={navigating || !sessionReady || selectedBusy}
                 capacityFull={capacityFull}
                 navigating={navigating}
                 canRun={canRun}
-                onSend={(text, action) => runSession(session.id, text, action)}
-                onWorkflow={(workflow) => changeWorkflow(session.id, workflow)}
+                onSend={(text) => runSession(session.id, text, "message")}
                 onCancel={safe(() => send(`/sessions/${selected}/cancel`, {}))}
                 onSettings={() => showPage("settings")}
                 onOlder={() =>
@@ -904,12 +905,26 @@ export default function App() {
                 ? "세션을 불러오는 중…"
                 : "첫 작업을 시작해 보세요"}
             </h2>
-            <button className="primary" onClick={() => showPage("projects")}>
-              프로젝트 관리
-            </button>
+            {!state.sessions.length && state.config.projects.length > 0 && (
+              <button
+                className="primary"
+                onClick={() => requestSession(state.config.projects[0])}
+              >
+                새 세션 시작
+              </button>
+            )}
+            <button onClick={() => showPage("projects")}>프로젝트 관리</button>
           </div>
         )}
       </main>
+      {newSession && (
+        <NewSession
+          project={newSession.project}
+          projects={state.config.projects}
+          onCreate={create}
+          onClose={() => setNewSession(null)}
+        />
+      )}
     </div>
   );
 }
@@ -1066,11 +1081,7 @@ function Projects({ config, onSaved, onCreate, onDirtyChange, creating }) {
                 <button
                   className="secondary"
                   disabled={busy || creating}
-                  onClick={() => {
-                    void onCreate(cleanProject(project)).catch((e) =>
-                      setError(e.message),
-                    );
-                  }}
+                  onClick={() => onCreate(cleanProject(project))}
                 >
                   이 프로젝트로 새 세션
                 </button>
@@ -1554,46 +1565,65 @@ function Inspector({
                 </ul>
               </section>
             )}
-            {session.completion_review?.required && (
-              <section className="progress-section" aria-label="완료 조건 검증">
-                <h4>완료 조건 검증</h4>
-                <p role="status">
-                  {session.completion_review.pending
-                    ? "실제 결과를 검증하고 있습니다."
-                    : session.completion_review.approved
-                      ? "모든 완료 조건의 검증을 통과했습니다."
-                      : session.completion_review.needs_review
-                        ? "현재 결과의 완료 조건을 다시 확인해야 합니다."
-                        : "할 일 완료 후에도 조건이 충족될 때까지 보완합니다."}
-                </p>
-                <ul>
-                  {(session.completion_review.checks || []).map((check) => (
-                    <li key={check.id}>
-                      <strong>
-                        {
+            {session.workflow_mode === "source_document" &&
+              session.completion_review?.required && (
+                <section
+                  className="progress-section"
+                  aria-label="완료 조건 검증"
+                >
+                  <h4>완료 조건 검증</h4>
+                  <p role="status">
+                    {session.completion_review.pending
+                      ? "실제 결과를 검증하고 있습니다."
+                      : session.completion_review.approved
+                        ? "모든 완료 조건의 검증을 통과했습니다."
+                        : session.completion_review.needs_review
+                          ? "현재 결과의 완료 조건을 다시 확인해야 합니다."
+                          : "할 일 완료 후에도 조건이 충족될 때까지 보완합니다."}
+                  </p>
+                  <ul>
+                    {(session.completion_review.checks || []).map((check) => (
+                      <li key={check.id}>
+                        <strong>
                           {
-                            met: "충족",
-                            unmet: "미충족",
-                            unverified: "확인 불가",
-                          }[check.status]
-                        }
-                        {" · "}
-                        {check.id === "R0"
-                          ? "원래 요청"
-                          : check.criterion || "완료 조건"}
-                      </strong>
-                      <p>{check.reason}</p>
-                      {check.next_action && <p>보완: {check.next_action}</p>}
-                    </li>
+                            {
+                              met: "충족",
+                              unmet: "미충족",
+                              unverified: "확인 불가",
+                            }[check.status]
+                          }
+                          {" · "}
+                          {check.id === "R0"
+                            ? "현재 요청"
+                            : check.criterion || "완료 조건"}
+                        </strong>
+                        <p>{check.reason}</p>
+                        {check.next_action && <p>보완: {check.next_action}</p>}
+                      </li>
+                    ))}
+                  </ul>
+                  <small className="subtle">
+                    최근 검증 결과입니다. 결과물이나 조건이 바뀌면 다시
+                    확인합니다.
+                  </small>
+                </section>
+              )}
+            <section className="progress-section" aria-label="현재 작업 목표">
+              <h4>현재 작업 목표</h4>
+              <p>{session.current_goal || session.task.purpose}</p>
+            </section>
+            {session.task_amendments?.length > 0 && (
+              <details className="progress-section">
+                <summary>
+                  요청 변경 이력 ({session.task_amendments.length})
+                </summary>
+                <ol>
+                  {session.task_amendments.map((change, index) => (
+                    <li key={index}>{change.request}</li>
                   ))}
-                </ul>
-                <small className="subtle">
-                  최근 검증 결과입니다. 결과물이나 조건이 바뀌면 다시
-                  확인합니다.
-                </small>
-              </section>
+                </ol>
+              </details>
             )}
-            <p>{session.task.purpose}</p>
             {["constraints", "completion", "findings", "unresolved"].map(
               (key, i) => (
                 <section className="progress-section" key={key}>
@@ -1612,7 +1642,7 @@ function Inspector({
                 </section>
               ),
             )}
-            <h4>조사 목록</h4>
+            {session.workflow_mode === "source_document" && <h4>조사 목록</h4>}
             {session.investigations.map((item) => (
               <div className="source-card" key={item.id}>
                 <strong>{item.title}</strong>
@@ -1623,6 +1653,7 @@ function Inspector({
                     written: "작성됨",
                     verified: "검증됨",
                     gap: "미확인",
+                    superseded: "변경된 범위에서 제외",
                   }[item.status] || item.status}
                 </small>
                 <p>{item.note}</p>

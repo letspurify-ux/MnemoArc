@@ -260,6 +260,23 @@ impl LlmClient for Reviewer {
         if let Some(review) = support::acceptance(&request) {
             return Ok(review);
         }
+        // A resumed repair can cross the context boundary. Complete the
+        // requested maintenance before producing the scripted review/final.
+        let content = request["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        if content.starts_with("CHECKPOINT CONTROL") {
+            let state: Value = serde_json::from_str(content.split_once('\n').unwrap().1)?;
+            let id = state["checkpoint"]["id"].as_str().unwrap();
+            return Ok(Completion {
+                calls: vec![mnemoarc::llm::ToolCall {
+                    id: format!("reviewer-cleanup-{id}"),
+                    name: "checkpoint_complete".into(),
+                    arguments: json!({"id":id,"progress":"Continue reviewing the corrected document","no_save_reason":"The source and repair are already retained; no new findings"}).to_string(),
+                }],
+                ..Default::default()
+            });
+        }
         let review = request["messages"][1]["content"]
             .as_str()
             .is_some_and(|s| s.contains("\"source_document_review\":true"));
@@ -1090,7 +1107,7 @@ async fn repair_interval_rechecks_and_a_changed_document_can_resume() {
         }),
     )
     .await;
-    assert_eq!(s.status, "complete");
+    assert_eq!(s.status, "complete", "{:?}", s.last_error);
     assert!(document_review::approved(&s));
 }
 

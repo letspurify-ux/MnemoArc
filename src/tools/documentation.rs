@@ -437,7 +437,10 @@ pub(super) fn execute(
             if checked == 0 {
                 issues.push(json!({"kind":"no_machine_readable_citations","guidance":"Use relative/path.ext:start-end. Other citation formats require manual review."}));
             }
-            if s.investigations.is_empty() {
+            if s.investigations
+                .iter()
+                .all(|item| item.status == "superseded")
+            {
                 issues.push(json!({"kind":"no_investigation_coverage"}));
             }
             // The output's own absolute path in its text is a run report
@@ -447,6 +450,9 @@ pub(super) fn execute(
                     "guidance":"The document states its own output path, a report of how it was produced. Remove that text; give the path, verification scope and limitations in the final chat answer instead."}));
             }
             for item in &s.investigations {
+                if item.status == "superseded" {
+                    continue;
+                }
                 // A closing-mode gap is reported as unconfirmed by the final
                 // result; it is settled, and it may never have been written.
                 if item.status == "gap" && item.section.trim().is_empty() {
@@ -534,6 +540,7 @@ fn uncovered_sections(s: &Session, doc: &str) -> Result<Vec<Value>> {
     let covered: Vec<(usize, usize)> = s
         .investigations
         .iter()
+        .filter(|item| item.status != "superseded")
         .filter(|item| !item.section.trim().is_empty())
         .filter_map(|item| resolve_heading(doc, &item.section).ok())
         .map(|heading| (heading.start, heading.end))

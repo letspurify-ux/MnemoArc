@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures.js";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -125,6 +125,7 @@ test("stale refresh does not replace a newly created session", async ({ page, re
   const externalId = (await external.json()).id;
   await stateRequested;
   await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  await page.getByRole("button", { name: "세션 시작", exact: true }).click();
   await expect.poll(async () => {
     const id = await page.evaluate(() => location.hash.slice(1));
     return id && id !== initialId && id !== externalId ? id : null;

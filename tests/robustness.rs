@@ -1,3 +1,4 @@
+mod support;
 use async_trait::async_trait;
 use mnemoarc::{
     agent,
@@ -497,6 +498,7 @@ async fn model_panic_releases_web_run_slot_and_shutdown_finishes() {
         .timeout(Duration::from_secs(3))
         .build()
         .unwrap();
+    support::seed_session(&client, &url).await;
     let initial: Value = client
         .get(format!("{url}/api/state"))
         .send()

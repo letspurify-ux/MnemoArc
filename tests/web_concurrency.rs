@@ -83,13 +83,7 @@ impl App {
             llm,
             ids: vec![],
         };
-        app.ids.push(
-            app.get("/api/state").await["sessions"][0]["id"]
-                .as_str()
-                .unwrap()
-                .into(),
-        );
-        for _ in 0..2 {
+        for _ in 0..3 {
             let added = app
                 .post("/api/sessions", json!({"project": project}))
                 .await
@@ -356,7 +350,7 @@ async fn pending_settings_and_tools_are_delivered_only_to_their_session() {
         .await
         .unwrap()
         .status(),
-        200
+        409
     );
     app.post(&format!("/api/sessions/{}/cancel", app.ids[0]), json!({}))
         .await

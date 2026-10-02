@@ -1,3 +1,4 @@
+mod support;
 use async_trait::async_trait;
 use mnemoarc::{
     config::{Config, Project},
@@ -46,6 +47,7 @@ async fn launch_config(
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
+    support::seed_session(&reqwest::Client::new(), &url).await;
     (url, state, server)
 }
 async fn get(client: &reqwest::Client, url: &str, path: &str) -> Value {
@@ -768,7 +770,7 @@ async fn output_download_returns_the_full_document() {
     assert_eq!(bytes.as_ref(), content.as_bytes());
 }
 #[tokio::test]
-async fn workflow_selection_is_validated_shown_and_locked_while_running() {
+async fn workflow_is_selected_at_creation_and_locked_for_the_session() {
     let dir = tempfile::tempdir().unwrap();
     let (url, state, server) = launch(dir.path()).await;
     let c = reqwest::Client::new();
@@ -789,7 +791,8 @@ async fn workflow_selection_is_validated_shown_and_locked_while_running() {
     for invalid in ["", "unknown"] {
         assert_eq!(select(invalid).await.unwrap().status(), 400);
     }
-    assert_eq!(select("source_document").await.unwrap().status(), 200);
+    assert_eq!(select("source_document").await.unwrap().status(), 409);
+    assert_eq!(select("answer").await.unwrap().status(), 200);
     let started = c
         .post(format!("{url}/api/sessions/{id}/run"))
         .header("x-mnemoarc-client", "web")
@@ -798,11 +801,12 @@ async fn workflow_selection_is_validated_shown_and_locked_while_running() {
         .await
         .unwrap();
     assert_eq!(started.status(), 200);
-    // The request runs under the selection; changing it waits for the end.
+    // The request keeps its creation-time workflow; even an idempotent update
+    // is rejected while the session is running.
     let running = get(&c, &url, &format!("/api/sessions/{id}")).await;
-    assert_eq!(running["workflow_mode"], "source_document");
-    assert_eq!(running["task"]["workflow"], "source_document");
-    assert_eq!(running["task"]["require_investigation"], true);
+    assert_eq!(running["workflow_mode"], "answer");
+    assert_eq!(running["task"]["workflow"], "answer");
+    assert_eq!(running["task"]["require_investigation"], false);
     assert_eq!(select("answer").await.unwrap().status(), 409);
     c.post(format!("{url}/api/sessions/{id}/cancel"))
         .header("x-mnemoarc-client", "web")

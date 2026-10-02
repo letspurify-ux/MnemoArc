@@ -21,6 +21,19 @@ pub struct FollowUpQuestion {
     pub(crate) prior_error: Option<String>,
     pub(crate) prior_activity: Value,
     pub(crate) prior_rounds: usize,
+    pub(crate) automatic: bool,
+}
+
+/// A user-authorized change, retained independently of compacted conversation.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TaskAmendment {
+    pub request: String,
+    pub goal: Option<String>,
+    pub completion: Option<Vec<String>>,
+    pub constraints: Option<Vec<String>>,
+    pub deliverables: Option<Vec<String>>,
+    pub retire_investigation_ids: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,7 +155,7 @@ impl Investigation {
     /// Verified items and closing-mode gaps are settled. A gap is reported to
     /// the user as unconfirmed; it never counts as verified evidence.
     pub fn is_settled(&self) -> bool {
-        matches!(self.status.as_str(), "verified" | "gap")
+        matches!(self.status.as_str(), "verified" | "gap" | "superseded")
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -460,9 +473,14 @@ pub struct Session {
     pub pending_config: Option<Config>,
     pub task: TaskState,
     pub request_review_criteria: RequestReviewCriteria,
-    /// Workflow the user selected for this session's requests (one of
-    /// WORKFLOW_MODES); applied to every new task.
+    /// Workflow selected when the session is created (one of WORKFLOW_MODES).
     pub workflow_mode: String,
+    pub workflow_locked: bool,
+    pub original_request: String,
+    pub current_request: String,
+    pub task_amendments: Vec<TaskAmendment>,
+    /// A query executes on a private copy with a runtime-enforced read allowlist.
+    pub read_only_turn: bool,
     pub memory: MemoryStore,
     pub history: SessionHistory,
     pub sources: Shared<BTreeMap<String, Source>>,
@@ -507,15 +525,15 @@ pub struct Session {
     pub task_rounds: usize,
     pub document_review: crate::tools::document_review::ReviewState,
     pub completion_review: crate::tools::completion_review::ReviewState,
-    /// First history id of the current request and its original text; the
+    /// First task history id and current requirements with change provenance;
     /// document and completion reviews compare results against them.
     pub answer_review_start: u64,
     pub answer_review_question: String,
     // Some(true): truncated tool batch; Some(false): text continuation.
     pub continuation: Option<bool>,
 }
-/// Workflows a user selects for a session in the session window.
-/// Simple document edits run in answer, without document verification.
+/// Workflows a user selects when creating a session.
+/// General file/document work runs in answer without document verification.
 pub const WORKFLOW_MODES: [&str; 2] = ["answer", "source_document"];
 
 impl Session {
@@ -525,13 +543,16 @@ impl Session {
         if !WORKFLOW_MODES.contains(&mode) {
             anyhow::bail!("invalid_workflow: use one of {WORKFLOW_MODES:?}");
         }
+        if self.workflow_locked && self.workflow_mode != mode {
+            bail!("workflow_locked: choose a different workflow in a new session");
+        }
         self.workflow_mode = mode.into();
         self.apply_workflow_mode();
         Ok(())
     }
 
     /// Apply the user's workflow selection to the current task and enable its
-    /// tools. A new request resets the task, so this runs for each one.
+    /// tools, including when the initial task is created.
     pub fn apply_workflow_mode(&mut self) {
         let require_investigation = self.workflow_mode == "source_document";
         if self.task.workflow != self.workflow_mode
@@ -594,6 +615,26 @@ impl Session {
             || !self.investigations.is_empty()
     }
 
+    pub fn can_resume(&self) -> bool {
+        let status = self
+            .question
+            .as_ref()
+            .map_or(self.status.as_str(), |question| {
+                question.prior_status.as_str()
+            });
+        !self.latest_request.is_empty()
+            && (matches!(
+                status,
+                "blocked" | "partial" | "cancelled" | "complete_with_gaps"
+            ) || self.investigations.iter().any(|item| !item.is_settled())
+                || self.checkpoint.is_some()
+                || self.continuation.is_some()
+                || self.task.current_todo().is_some()
+                || self.document_review.pending
+                || self.completion_review.pending
+                || !self.completion_gaps.is_empty())
+    }
+
     fn initial_completion(&self, request: &str) -> Vec<String> {
         let request = request.trim();
         let max_chars = (self.config.state_tokens / 6).clamp(24, 320);
@@ -654,6 +695,11 @@ impl Session {
             .collect(),
             pending_tools: None,
             workflow_mode: "answer".into(),
+            workflow_locked: false,
+            original_request: String::new(),
+            current_request: String::new(),
+            task_amendments: vec![],
+            read_only_turn: false,
             investigations: vec![],
             checkpoint: None,
             ledger: Shared::default(),
@@ -766,7 +812,154 @@ impl Session {
             prior_error: self.last_error.clone(),
             prior_activity: self.activity.clone(),
             prior_rounds: self.task_rounds,
+            automatic: false,
         });
+        Ok(())
+    }
+
+    /// The public message entry point: one task is initialized per session.
+    pub fn receive_message(&mut self, text: String) -> Result<()> {
+        let mut next = self.clone();
+        next.receive_message_inner(text)?;
+        *self = next;
+        Ok(())
+    }
+
+    fn receive_message_inner(&mut self, text: String) -> Result<()> {
+        if text.trim().is_empty() {
+            bail!("empty_message: enter a message");
+        }
+        if self.latest_request.is_empty() {
+            self.history.check_append(
+                vec![json!({"role":"user","content":text})],
+                self.config.history_bytes,
+            )?;
+            self.start_new_task(text);
+        } else {
+            self.queue_question(text)?;
+            self.question.as_mut().unwrap().automatic = true;
+        }
+        self.check_runtime_capacity()
+    }
+
+    /// Promote a routed message without replacing the task's plan or evidence.
+    pub(crate) fn accept_amendment(&mut self, mut amendment: TaskAmendment) -> Result<()> {
+        let question = self
+            .question
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no_pending_message"))?;
+        amendment.request = question.text.clone();
+        if amendment
+            .goal
+            .as_ref()
+            .is_some_and(|goal| goal.trim().is_empty())
+        {
+            bail!("invalid_task_goal: goal must not be empty");
+        }
+        for values in [
+            &amendment.completion,
+            &amendment.constraints,
+            &amendment.deliverables,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if values.len() > 100 || values.iter().any(|value| value.trim().is_empty()) {
+                bail!("invalid_task_requirements: use at most 100 non-empty entries");
+            }
+        }
+        if let Some(ids) = &amendment.retire_investigation_ids {
+            if amendment.goal.is_none()
+                || ids.len() > 100
+                || ids
+                    .iter()
+                    .any(|id| !self.investigations.iter().any(|item| item.id == *id))
+            {
+                bail!(
+                    "invalid_task_requirements: retiring evidence items requires a changed goal and existing investigation IDs"
+                );
+            }
+        }
+        let changed_requirements = amendment.goal.is_some();
+        let mut next = self.clone();
+        let question = next.question.take().unwrap();
+        next.current_request = question.text.clone();
+        next.observe_user(&question.text);
+        if let Some(goal) = &amendment.goal {
+            next.latest_request = goal.clone();
+        }
+        if let Some(values) = &amendment.completion {
+            next.request_review_criteria.completion = values.clone();
+            next.task.completion = if values.is_empty() {
+                next.initial_completion(&next.latest_request)
+            } else {
+                values.clone()
+            };
+        }
+        if let Some(values) = &amendment.constraints {
+            next.request_review_criteria.constraints = values.clone();
+            next.task.constraints = values.clone();
+        }
+        if let Some(values) = &amendment.deliverables {
+            next.request_review_criteria.deliverables = values.clone();
+            next.task.deliverables = values.clone();
+        }
+        if amendment.goal.is_some() && amendment.completion.is_none() {
+            next.task.completion = next.initial_completion(&next.latest_request);
+        }
+        if let Some(ids) = &amendment.retire_investigation_ids {
+            for item in &mut next.investigations {
+                if ids.contains(&item.id) {
+                    item.status = "superseded".into();
+                    item.note = format!("User changed the task scope: {}", question.text);
+                }
+            }
+        }
+        next.task_amendments.push(amendment);
+        next.answer_review_question = json!({
+            "current_goal":next.latest_request,"initial_request":next.original_request,
+            "user_changes":next.task_amendments,
+            "policy":"The latest explicit user change supersedes an earlier conflicting requirement. Unchanged requirements remain in force. Initial request and change history are provenance, not additional requirements to reimpose."
+        }).to_string();
+        if let Some(bundle) = next
+            .history
+            .bundles
+            .iter_mut()
+            .find(|bundle| bundle.id == question.bundle_id)
+        {
+            bundle.active = true;
+            for message in &mut bundle.messages {
+                message.as_object_mut().unwrap().remove("follow_up");
+                message["task_update"] = json!(true);
+            }
+        }
+        next.ledger.clear();
+        next.continuation = None;
+        next.task.phase.clear();
+        next.task.revision = next.task.revision.saturating_add(1);
+        next.progress_recovery = Default::default();
+        next.run_guidance = json!({});
+        next.completion_gaps.clear();
+        // Keep artifacts, investigations and review history. Requirements hashes
+        // invalidate old verdicts even when the document itself is unchanged.
+        next.document_review.pending = false;
+        next.document_review.approved_hash = None;
+        next.document_review.repair_started_round = None;
+        next.document_review.repair_requests = 0;
+        if changed_requirements {
+            next.document_review.invalidate_requirements();
+        }
+        next.completion_review.invalidate_requirements();
+        if let Some(cp) = &mut next.checkpoint {
+            cp.attempts = 0;
+            cp.acknowledged = false;
+            cp.failed_attempts = 0;
+            cp.last_failure = None;
+            cp.failed = false;
+        }
+        next.promote_run_to_work();
+        next.check_runtime_capacity()?;
+        *self = next;
         Ok(())
     }
 
@@ -800,6 +993,23 @@ impl Session {
         // checkpoint. Its active history remains available for fresh cleanup.
         self.checkpoint = None;
         self.finish_maintenance();
+    }
+
+    fn observe_user(&mut self, text: &str) {
+        let source = Source {
+            id: crate::memory::source_id(),
+            observed_at: chrono::Utc::now(),
+            origin: "user".into(),
+            path: None,
+            start_line: None,
+            end_line: None,
+            line_start_complete: true,
+            line_end_complete: true,
+            evidence_truncated: false,
+            hash: None,
+            excerpt: text.chars().take(2000).collect(),
+        };
+        self.sources.insert(source.id.clone(), source);
     }
 
     fn add_request(&mut self, text: String, continuation: bool) {
@@ -867,21 +1077,11 @@ impl Session {
         // requirements used after checkpointing and by completion reviews.
         if !continuation || self.latest_request.is_empty() {
             self.latest_request = text.clone();
+            self.original_request = text.clone();
+            self.task_amendments.clear();
         }
-        let source = Source {
-            id: crate::memory::source_id(),
-            observed_at: chrono::Utc::now(),
-            origin: "user".into(),
-            path: None,
-            start_line: None,
-            end_line: None,
-            line_start_complete: true,
-            line_end_complete: true,
-            evidence_truncated: false,
-            hash: None,
-            excerpt: text.chars().take(2000).collect(),
-        };
-        self.sources.insert(source.id.clone(), source);
+        self.current_request = text.clone();
+        self.observe_user(&text);
         self.history
             .push(vec![json!({"role":"user","content":text})], true);
     }
@@ -948,14 +1148,24 @@ impl Session {
             &self.active_tools,
             &self.pending_tools,
             &self.workflow_mode,
+            &self.workflow_locked,
         ))
         .saturating_add(serialized_bytes(&(
             &self.latest_request,
+            &self.original_request,
+            &self.current_request,
+            &self.task_amendments,
             &self.status,
             &self.last_error,
-            self.question
-                .as_ref()
-                .map(|q| (&q.text, &q.prior_status, &q.prior_error, &q.prior_activity)),
+            self.question.as_ref().map(|q| {
+                (
+                    &q.text,
+                    &q.prior_status,
+                    &q.prior_error,
+                    &q.prior_activity,
+                    q.automatic,
+                )
+            }),
             &self.run_guidance,
             &self.progress_recovery,
             &self.completion_gaps,
@@ -1008,6 +1218,142 @@ impl Session {
 #[cfg(test)]
 mod history_tests {
     use super::*;
+
+    #[test]
+    fn removed_scope_keeps_history_without_requiring_its_deleted_section_or_stale_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("input.txt"), "Kept content\n").unwrap();
+        std::fs::write(
+            dir.path().join("out.md"),
+            "# Kept\nKept content. input.txt:1-1\n",
+        )
+        .unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            Config::default(),
+        );
+        s.select_workflow("source_document").unwrap();
+        s.receive_message("Write kept and removed chapters".into())
+            .unwrap();
+        let read = crate::tools::execute(&mut s, "file_read", json!({"path":"input.txt"})).unwrap();
+        crate::tools::execute(&mut s, "investigation", json!({"action":"upsert","id":"kept","title":"Kept","section":"# Kept","status":"written"})).unwrap();
+        crate::tools::execute(&mut s, "investigation", json!({"action":"verify","id":"kept","source_ids":[read["source"]["id"]],"verification_note":"Compared kept content with input.txt:1"})).unwrap();
+        let mut old_source = s
+            .source_refs(&[read["source"]["id"].as_str().unwrap().into()])
+            .unwrap()
+            .remove(0);
+        old_source.hash = Some("stale-removed-evidence".into());
+        s.investigations.push(Investigation {
+            id: "removed".into(),
+            title: "Removed".into(),
+            section: "# Removed".into(),
+            status: "written".into(),
+            sources: vec![old_source],
+            memory_refs: Default::default(),
+            document_hash: None,
+            note: String::new(),
+        });
+        s.receive_message("Remove the second chapter from the goal".into())
+            .unwrap();
+        s.accept_amendment(TaskAmendment {
+            goal: Some("Write the kept chapter".into()),
+            retire_investigation_ids: Some(vec!["removed".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+        let audit = crate::tools::execute(&mut s, "document_audit", json!({})).unwrap();
+        assert_eq!(audit["structural_ok"], true, "{audit}");
+        assert_eq!(s.investigations[1].status, "superseded");
+        let error = crate::tools::execute(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":"removed","status":"written","section":"# Kept"}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().starts_with("investigation_superseded"));
+        assert_eq!(s.investigations[1].status, "superseded");
+        s.receive_message("Reintroduce the removed chapter".into())
+            .unwrap();
+        s.accept_amendment(TaskAmendment {
+            goal: Some("Write the kept and reintroduced chapters".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        crate::tools::execute(&mut s, "investigation", json!({"action":"upsert","id":"new-scope","title":"Removed","section":"# Reintroduced","status":"uninvestigated"})).unwrap();
+        assert_eq!(s.investigations.len(), 3);
+    }
+
+    #[test]
+    fn explicit_changes_preserve_artifacts_and_unaffected_work_and_invalidate_old_reviews() {
+        let mut s = Session::new(Project::default(), Config::default());
+        s.select_workflow("source_document").unwrap();
+        s.receive_message("Write both chapters, around 800 lines".into())
+            .unwrap();
+        s.document_written = true;
+        s.last_document_write = Some((std::path::PathBuf::from("out.md"), "same-hash".into()));
+        s.document_review.approved_hash = Some("same-hash".into());
+        s.document_review.issues = vec!["Old length requirement".into()];
+        s.document_review.validation_log = vec![json!({"prior":"review"})];
+        s.completion_review.approved = true;
+        s.investigations.push(Investigation {
+            id: "old-scope".into(),
+            title: "Removed chapter".into(),
+            status: "in_progress".into(),
+            memory_refs: Default::default(),
+            sources: vec![],
+            section: "# Removed".into(),
+            document_hash: None,
+            note: String::new(),
+        });
+        let original = s.original_request.clone();
+        let files = s.last_document_write.clone();
+        let sources = s.sources.clone();
+        s.receive_message("Remove the second chapter; use around 300 lines".into())
+            .unwrap();
+        s.accept_amendment(TaskAmendment {
+            goal: Some("Write the first chapter, around 300 lines".into()),
+            completion: Some(vec!["First chapter only, around 300 lines".into()]),
+            retire_investigation_ids: Some(vec!["old-scope".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(s.original_request, original);
+        assert_eq!(
+            s.latest_request,
+            "Write the first chapter, around 300 lines"
+        );
+        assert_eq!(s.last_document_write, files);
+        assert_eq!(s.sources.len(), sources.len() + 1);
+        assert!(s.document_written && s.question.is_none());
+        assert_eq!(s.request_review_criteria.completion, s.task.completion);
+        assert_eq!(s.document_review.approved_hash, None);
+        assert!(s.document_review.issues.is_empty());
+        assert_eq!(s.document_review.validation_log.len(), 1);
+        assert!(!s.completion_review.approved);
+        assert_eq!(s.investigations[0].status, "superseded");
+        assert!(s.investigations[0].is_settled());
+        assert_eq!(s.task_amendments.len(), 1);
+        assert_eq!(s.task.workflow, "source_document");
+    }
+
+    #[test]
+    fn rejected_message_admission_is_atomic_and_completed_tasks_do_not_offer_resume() {
+        let mut s = Session::new(Project::default(), Config::default());
+        s.receive_message("Task".into()).unwrap();
+        s.status = "complete".into();
+        assert!(!s.can_resume());
+        let before = s.history.bytes();
+        s.config.memory_bytes = 1;
+        assert!(s.receive_message("Follow-up".into()).is_err());
+        assert_eq!(s.history.bytes(), before);
+        assert!(s.question.is_none());
+        s.status = "cancelled".into();
+        assert!(s.can_resume());
+    }
 
     #[test]
     fn cloned_histories_share_large_messages_and_edit_only_the_changed_payload() {

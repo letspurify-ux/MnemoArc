@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures.js";
 
 test("parallel sessions survive reload and allow independent cancellation and closing", async ({ page, request }) => {
   const initial = await (await request.get("/api/state")).json();
@@ -36,7 +36,7 @@ test("parallel sessions survive reload and allow independent cancellation and cl
     await page.getByRole("textbox", { name: "메시지", exact: true }).fill("한도가 풀리면 보낼 초안");
     await expect(page.getByRole("button", { name: "메시지 보내기" })).toBeDisabled();
     await expect(page.locator(".capacity-note")).toContainText("동시 실행 한도");
-    await expect(page.getByLabel("작업 방식")).toBeEnabled();
+    await expect(page.locator(".workflow-badge")).toBeVisible();
     await page.locator("summary.running-link").click();
     await expect(page.locator(".running-list button")).toHaveCount(2);
     await page.locator(".running-list button").filter({ hasText: "동시 실행 테스트 1" }).click();

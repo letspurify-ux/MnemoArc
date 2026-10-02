@@ -7,7 +7,7 @@ import {
 } from "react";
 import { Message, StreamingMessage } from "./chat/Message.jsx";
 import { continuationMessages } from "./chat/continuation.js";
-import { toolLabels, workflowOptions } from "./api.js";
+import { toolLabels } from "./api.js";
 
 export default function Chat({
   session,
@@ -17,7 +17,6 @@ export default function Chat({
   navigating,
   canRun,
   onSend,
-  onWorkflow,
   onCancel,
   onSettings,
   onOlder,
@@ -56,18 +55,11 @@ export default function Chat({
     drafts.get(session.id),
   );
   const input = draft.text;
-  const requestKind = draft.intent || (session?.has_task ? "question" : "chat");
   const updateDraft = (patch) => drafts.update(session.id, patch);
   const lastRun = session?.run_history?.at(-1);
   const [sending, setSending] = useState(false);
-  const [workflowSaving, setWorkflowSaving] = useState(false);
-  const [workflow, setWorkflow] = useState(session?.workflow_mode ?? "answer");
   const [loadingOlder, setLoadingOlder] = useState(false);
-  const workflowLock = useRef(false),
-    olderLock = useRef(false);
-  useEffect(() => {
-    if (!workflowSaving) setWorkflow(session?.workflow_mode ?? "answer");
-  }, [session?.workflow_mode, workflowSaving]);
+  const olderLock = useRef(false);
   const inputRef = useRef(null),
     lock = useRef(false),
     composing = useRef(false),
@@ -100,41 +92,18 @@ export default function Chat({
   }, [session?.id]);
   async function submit(text = input) {
     const message = text.trim();
-    if (
-      !message ||
-      busy ||
-      capacityFull ||
-      !canRun ||
-      lock.current ||
-      workflowLock.current
-    )
-      return;
+    if (!message || busy || capacityFull || !canRun || lock.current) return;
     lock.current = true;
     setSending(true);
     const submitted = drafts.get(session.id);
     try {
-      await onSend(message, requestKind);
+      await onSend(message);
       drafts.clearIfUnchanged(session.id, submitted);
       bottom.current = true;
       inputRef.current?.focus();
     } finally {
       lock.current = false;
       setSending(false);
-    }
-  }
-  async function changeWorkflow(value) {
-    if (workflowLock.current || lock.current || busy) return;
-    workflowLock.current = true;
-    setWorkflowSaving(true);
-    setWorkflow(value);
-    try {
-      await onWorkflow(value);
-    } catch {
-      // On unlock the effect restores the latest server choice. The workspace
-      // reports failures; an older captured choice must not hide newer state.
-    } finally {
-      workflowLock.current = false;
-      setWorkflowSaving(false);
     }
   }
   async function loadOlder() {
@@ -327,44 +296,6 @@ export default function Chat({
               <i className="small-dot" />
               세션 기억 사용 · Enter 전송 / Shift+Enter 줄바꿈
             </span>
-            <label className="workflow-select">
-              요청 종류
-              <select
-                aria-label="요청 종류"
-                value={requestKind}
-                disabled={busy}
-                onChange={(e) => {
-                  updateDraft({ intent: e.target.value });
-                }}
-              >
-                <option value="question" disabled={!session?.has_task}>
-                  기존 작업 질문
-                </option>
-                <option value="chat">새 작업</option>
-              </select>
-            </label>
-            <label
-              className="workflow-select"
-              title="이 세션의 요청을 처리할 방식입니다. 다음 요청부터 적용됩니다."
-            >
-              작업 방식
-              <select
-                value={workflow}
-                disabled={
-                  busy ||
-                  sending ||
-                  workflowSaving ||
-                  requestKind === "question"
-                }
-                onChange={(e) => void changeWorkflow(e.target.value)}
-              >
-                {workflowOptions.map(([value, label]) => (
-                  <option key={value} value={value}>
-                    {label}
-                  </option>
-                ))}
-              </select>
-            </label>
             {session?.status === "running" ? (
               <button type="button" className="stop-button" onClick={onCancel}>
                 ■ 중지
@@ -375,12 +306,7 @@ export default function Chat({
                 type="submit"
                 aria-label="메시지 보내기"
                 disabled={
-                  !input.trim() ||
-                  busy ||
-                  capacityFull ||
-                  sending ||
-                  workflowSaving ||
-                  !canRun
+                  !input.trim() || busy || capacityFull || sending || !canRun
                 }
                 title={
                   capacityFull
@@ -394,9 +320,8 @@ export default function Chat({
           </div>
         </form>
         <p className="composer-footnote">
-          {requestKind === "question"
-            ? "질문은 작업 상태를 보존합니다. 수정을 계속하려면 상단의 작업 재개를, 다른 작업을 시작하려면 새 작업을 선택하세요."
-            : "새 작업은 이전 계획과 검토 상태를 초기화합니다. 저장된 문서와 실행 기록은 유지됩니다."}
+          이 세션의 작업을 이어갑니다. 목표와 완료 조건 변경도 메시지로 요청할
+          수 있습니다. 새 작업은 새 세션에서 시작하세요.
         </p>
       </div>
     </section>

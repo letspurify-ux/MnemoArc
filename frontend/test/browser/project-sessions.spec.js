@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures.js";
 
 const headers = { "x-mnemoarc-client": "web" };
 async function saveProjects(request, config, projects) {
@@ -30,6 +30,8 @@ test("same-folder projects show each session once through rename, reorder and de
     await expect(page.locator(".session-row")).toHaveCount(initial.sessions.length + 2);
 
     await group(first.name).locator(".project-heading").click();
+    await page.getByRole("button", { name: "세션 시작", exact: true }).click();
+    await expect(page.getByRole("dialog", { name: "새 세션 설정" })).toHaveCount(0);
     await expect(group(first.name).locator(".session-row")).toHaveCount(2);
     const extra = (await page.evaluate(() => location.hash)).slice(1);
     created.push(extra);
@@ -70,6 +72,7 @@ test("an unsaved same-folder project keeps its identity when added to saved proj
     await page.getByRole("textbox", { name: /^소스 폴더/ }).fill(initial.config.projects[0].root);
     page.once("dialog", (dialog) => dialog.accept());
     await page.getByRole("button", { name: "이 프로젝트로 새 세션", exact: true }).click();
+    await page.getByRole("button", { name: "세션 시작", exact: true }).click();
     await expect(page.locator(".session-heading h2")).toHaveText("같은 소스의 새 프로젝트 초안");
     created = (await page.evaluate(() => location.hash)).slice(1);
     const detail = await (await request.get(`/api/sessions/${created}`)).json();

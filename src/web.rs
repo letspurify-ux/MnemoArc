@@ -140,7 +140,12 @@ fn session_changed(s: &WebState, c: &mut Core, id: &str, state: bool) {
     });
 }
 fn session_summary(session: &Session) -> Value {
-    json!({"id":session.id,"project":session.project,"status":session.status,"title":session.latest_request.chars().take(60).collect::<String>(),"memory_count":session.memory.entries.len()})
+    let title = if session.original_request.is_empty() {
+        &session.latest_request
+    } else {
+        &session.original_request
+    };
+    json!({"id":session.id,"project":session.project,"status":session.status,"title":title.chars().take(60).collect::<String>(),"workflow_mode":session.workflow_mode,"memory_count":session.memory.entries.len()})
 }
 fn same_config(a: &Config, b: &Config) -> bool {
     // Config serialization intentionally omits the secret, so compare it
@@ -259,25 +264,14 @@ impl WebState {
         // Saved folders may have been moved or temporarily unmounted. Keep
         // those entries editable in settings, and start with an available
         // project instead of preventing the settings UI from opening.
-        let mut initial_project = None;
         for project in &mut config.projects {
             if let Ok(normalized) = normalize_project(project.clone()) {
                 *project = normalized;
-                initial_project.get_or_insert_with(|| project.clone());
             }
         }
         let write_outcome_uncertain = Arc::new(AtomicBool::new(false));
-        let mut sessions = BTreeMap::new();
-        let mut order = Vec::new();
-        if let Some(project) = initial_project {
-            let mut session = Session::new(project, config.clone());
-            session.write_outcome_uncertain = write_outcome_uncertain.clone();
-            order.push(session.id.clone());
-            sessions.insert(
-                session.id.clone(),
-                Arc::new(session_view::Snapshot::new(session)),
-            );
-        }
+        let sessions = BTreeMap::new();
+        let order = Vec::new();
         let (events, _) = broadcast::channel(128);
         let stopping = CancellationToken::new();
         Ok(Self {
@@ -718,8 +712,19 @@ async fn check_config(s: WebState, config: Config) -> Api {
 #[derive(Deserialize)]
 struct NewSession {
     project: Project,
+    #[serde(default = "default_workflow")]
+    workflow: String,
+}
+fn default_workflow() -> String {
+    "answer".into()
 }
 async fn create_session(State(s): State<WebState>, Json(input): Json<NewSession>) -> Api {
+    if !crate::session::WORKFLOW_MODES.contains(&input.workflow.as_str()) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "선택할 수 없는 작업 방식입니다.".into(),
+        ));
+    }
     let timeout = Duration::from_secs(s.core.lock().await.config.tool_timeout_secs);
     let mut project = s
         .file_io
@@ -728,6 +733,8 @@ async fn create_session(State(s): State<WebState>, Json(input): Json<NewSession>
     let mut c = s.core.lock().await;
     inherit_project_id(&mut project, &c.config.projects);
     let mut session = Session::new(project, c.config.clone());
+    session.select_workflow(&input.workflow)?;
+    session.workflow_locked = true;
     session.write_outcome_uncertain = s.write_outcome_uncertain.clone();
     let id = session.id.clone();
     c.order.push(id.clone());
@@ -813,8 +820,7 @@ fn prepare_project_update(
 struct WorkflowSelection {
     workflow: String,
 }
-/// The user's choice of how the session's requests are handled. It applies
-/// from the next request; the running one keeps the workflow it started with.
+/// Retained for older clients; a session's creation-time workflow is fixed.
 async fn session_workflow(
     State(s): State<WebState>,
     Path(id): Path<String>,
@@ -831,8 +837,13 @@ async fn session_workflow(
         return Err(busy());
     }
     let session = c.session_mut(&id).ok_or_else(missing)?;
-    session.workflow_mode = input.workflow;
-    session.drop_forbidden_workflow_tools();
+    if session.workflow_mode != input.workflow {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "작업 방식은 세션을 만들 때 선택합니다. 다른 작업 방식은 새 세션에서 시작하세요."
+                .into(),
+        ));
+    }
     session_changed(&s, &mut c, &id, false);
     Ok(Json(json!({"saved":true})))
 }
@@ -888,7 +899,7 @@ struct RunInput {
     action: String,
 }
 fn auto_action() -> String {
-    "auto".into()
+    "message".into()
 }
 
 fn publish_snapshot(s: &WebState, c: &mut Core, mut snapshot: Arc<session_view::Snapshot>) {
@@ -973,35 +984,17 @@ async fn run(
         }
         let session = c.session_mut(&id).ok_or_else(missing)?;
         session.config.runnable()?;
-        let action = if input.action == "auto" {
-            if Session::is_continuation(&input.text) && !session.latest_request.is_empty() {
-                "resume"
-            } else if !session.latest_request.is_empty() {
-                "question"
-            } else {
-                "chat"
-            }
-        } else {
-            input.action.as_str()
-        };
+        let action = input.action.as_str();
         match action {
-            "chat" => {
+            "message" | "auto" | "chat" => {
                 if input.text.trim().is_empty() {
                     return Err(ApiError(
                         StatusCode::BAD_REQUEST,
                         "메시지를 입력하세요.".into(),
                     ));
                 }
-                session.history.check_append(
-                    vec![json!({"role":"user","content":input.text})],
-                    session.config.history_bytes,
-                )?;
-                // A new task clears some old state. Validate the resulting
-                // metadata before publishing it, preserving the current task
-                // if the request itself cannot fit.
                 let mut next = session.clone();
-                next.start_new_task(input.text);
-                next.check_runtime_capacity()?;
+                next.receive_message(input.text)?;
                 *session = next;
             }
             "question" => session.queue_question(input.text)?,
@@ -1009,7 +1002,7 @@ async fn run(
                 let accepted_text = input.text.is_empty()
                     || (action == "resume" && Session::is_continuation(&input.text));
                 if !accepted_text {
-                    return Err(ApiError(StatusCode::BAD_REQUEST,"재개와 기억 정리는 메시지를 받지 않습니다. 새 요청은 새 작업으로 보내세요.".into()));
+                    return Err(ApiError(StatusCode::BAD_REQUEST,"재개와 기억 정리는 메시지를 받지 않습니다. 추가 요청은 세션의 메시지 입력창으로 보내세요.".into()));
                 }
                 if session.latest_request.is_empty() {
                     return Err(ApiError(
@@ -1027,6 +1020,12 @@ async fn run(
                     )?;
                     session.add_maintenance(text.into());
                 }
+                session.current_request = if action == "cleanup" {
+                    "기억 정리"
+                } else {
+                    "재개"
+                }
+                .into();
             }
             _ => {
                 return Err(ApiError(
@@ -1434,13 +1433,104 @@ pub async fn serve_app(
 }
 
 #[cfg(test)]
+fn test_state(config: Config, path: PathBuf, client: Arc<dyn LlmClient>) -> Result<WebState> {
+    let state = WebState::new(config, path, client)?;
+    {
+        let mut core = state.core.try_lock().unwrap();
+        if let Some(project) = core
+            .config
+            .projects
+            .iter()
+            .find(|project| project.root.is_dir())
+            .cloned()
+        {
+            let mut session = Session::new(project, core.config.clone());
+            session.workflow_locked = true;
+            session.write_outcome_uncertain = state.write_outcome_uncertain.clone();
+            core.order.push(session.id.clone());
+            core.sessions.insert(
+                session.id.clone(),
+                Arc::new(session_view::Snapshot::new(session)),
+            );
+        }
+    }
+    Ok(state)
+}
+
+#[cfg(test)]
 mod worker_wait_tests {
     use super::*;
 
     #[tokio::test]
+    async fn startup_is_empty_and_creation_selects_a_permanent_workflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = Project {
+            root: dir.path().into(),
+            ..Default::default()
+        };
+        let state = WebState::new(
+            Config {
+                projects: vec![project.clone()],
+                ..Default::default()
+            },
+            dir.path().join("config.toml"),
+            Arc::new(OpenAiClient),
+        )
+        .unwrap();
+        assert!(state.core.lock().await.sessions.is_empty());
+        let invalid = create_session(
+            State(state.clone()),
+            Json(NewSession {
+                project: project.clone(),
+                workflow: "unknown".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid.0, StatusCode::BAD_REQUEST);
+        assert!(state.core.lock().await.sessions.is_empty());
+        for workflow in ["answer", "source_document"] {
+            let created = create_session(
+                State(state.clone()),
+                Json(NewSession {
+                    project: project.clone(),
+                    workflow: workflow.into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            let id = created["id"].as_str().unwrap().to_owned();
+            let core = state.core.lock().await;
+            assert_eq!(core.sessions[&id].workflow_mode, workflow);
+            assert_eq!(core.sessions[&id].task.workflow, workflow);
+            assert_eq!(
+                core.sessions[&id].task.require_investigation,
+                workflow == "source_document"
+            );
+            drop(core);
+            let other = if workflow == "answer" {
+                "source_document"
+            } else {
+                "answer"
+            };
+            let rejected = session_workflow(
+                State(state.clone()),
+                Path(id),
+                Json(WorkflowSelection {
+                    workflow: other.into(),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(rejected.0, StatusCode::CONFLICT);
+        }
+    }
+
+    #[tokio::test]
     async fn session_events_identify_the_owner_without_invalidating_other_sessions() {
         let dir = tempfile::tempdir().unwrap();
-        let state = WebState::new(
+        let state = test_state(
             Config {
                 projects: vec![Project {
                     root: dir.path().into(),
@@ -1456,6 +1546,7 @@ mod worker_wait_tests {
         let Json(created) = create_session(
             State(state.clone()),
             Json(NewSession {
+                workflow: default_workflow(),
                 project: Project {
                     root: dir.path().into(),
                     ..Default::default()
@@ -1470,7 +1561,7 @@ mod worker_wait_tests {
             State(state.clone()),
             Path(second.clone()),
             Json(WorkflowSelection {
-                workflow: "source_document".into(),
+                workflow: "answer".into(),
             }),
         )
         .await
@@ -1501,7 +1592,7 @@ mod worker_wait_tests {
     #[tokio::test]
     async fn snapshots_refresh_the_sidebar_only_when_the_summary_changes() {
         let dir = tempfile::tempdir().unwrap();
-        let state = WebState::new(
+        let state = test_state(
             Config {
                 projects: vec![Project {
                     root: dir.path().into(),
@@ -1549,7 +1640,7 @@ mod worker_wait_tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let dir = tempfile::tempdir().unwrap();
-        let state = WebState::new(
+        let state = test_state(
             Config {
                 projects: vec![Project {
                     root: dir.path().into(),
@@ -1665,7 +1756,7 @@ mod worker_wait_tests {
             }],
             ..Default::default()
         };
-        let state = WebState::new(
+        let state = test_state(
             config.clone(),
             dir.path().join("config.toml"),
             Arc::new(OpenAiClient),
@@ -1712,7 +1803,7 @@ mod worker_wait_tests {
             root: dir.path().into(),
             ..Default::default()
         };
-        let state = WebState::new(
+        let state = test_state(
             Config {
                 projects: vec![project.clone()],
                 ..Default::default()
@@ -1725,6 +1816,7 @@ mod worker_wait_tests {
             let _ = create_session(
                 State(state.clone()),
                 Json(NewSession {
+                    workflow: default_workflow(),
                     project: project.clone(),
                 }),
             )
@@ -1757,7 +1849,7 @@ mod worker_wait_tests {
     #[tokio::test]
     async fn oversized_directory_listing_is_rejected_instead_of_retaining_all_entries() {
         let dir = tempfile::tempdir().unwrap();
-        let state = WebState::new(
+        let state = test_state(
             Config::default(),
             dir.path().join("config.toml"),
             Arc::new(OpenAiClient),
@@ -1801,7 +1893,7 @@ mod worker_wait_tests {
     async fn shutdown_request_releases_running_agents_without_an_explicit_shutdown_wait() {
         let dir = tempfile::tempdir().unwrap();
         let client = Arc::new(LifecycleProbe(tokio::sync::Notify::new()));
-        let state = WebState::new(
+        let state = test_state(
             Config {
                 model: "gpt-4o".into(),
                 model_context: Some(128000),
@@ -1867,7 +1959,7 @@ mod worker_wait_tests {
             ..Default::default()
         };
         let client = Arc::new(LifecycleProbe(tokio::sync::Notify::new()));
-        let state = WebState::new(config, dir.path().join("config.toml"), client.clone()).unwrap();
+        let state = test_state(config, dir.path().join("config.toml"), client.clone()).unwrap();
         let initial = state.core.lock().await.order[0].clone();
         let _ = close_session(State(state.clone()), Path(initial))
             .await
@@ -1878,6 +1970,7 @@ mod worker_wait_tests {
             let Json(created) = create_session(
                 State(state.clone()),
                 Json(NewSession {
+                    workflow: default_workflow(),
                     project: project.clone(),
                 }),
             )
@@ -1954,7 +2047,7 @@ mod worker_wait_tests {
             let closing = outcome == "close";
             let dir = tempfile::tempdir().unwrap();
             let client = Arc::new(SettlementProbe(tokio::sync::Notify::new(), outcome));
-            let mut state = WebState::new(
+            let mut state = test_state(
                 Config {
                     model: "gpt-4o".into(),
                     model_context: Some(128000),
@@ -2060,7 +2153,7 @@ mod worker_wait_tests {
             }],
             ..Default::default()
         };
-        let state = WebState::new(
+        let state = test_state(
             config,
             dir.path().join("config.toml"),
             Arc::new(OpenAiClient),
@@ -2107,7 +2200,7 @@ mod worker_wait_tests {
             }],
             ..Default::default()
         };
-        let state = WebState::new(
+        let state = test_state(
             config,
             dir.path().join("config.toml"),
             Arc::new(OpenAiClient),
@@ -2169,7 +2262,7 @@ mod worker_wait_tests {
             ..Default::default()
         };
         let path = dir.path().join("config.toml");
-        let state = WebState::new(config.clone(), path.clone(), Arc::new(OpenAiClient)).unwrap();
+        let state = test_state(config.clone(), path.clone(), Arc::new(OpenAiClient)).unwrap();
         let original = b"original settings";
         std::fs::write(&path, original).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
@@ -2206,7 +2299,7 @@ mod worker_wait_tests {
         std::fs::create_dir(&invalid).unwrap();
         std::fs::create_dir(dir.path().join("valid")).unwrap();
         symlink(&invalid, dir.path().join("alias")).unwrap();
-        let state = WebState::new(
+        let state = test_state(
             Config {
                 projects: vec![Project {
                     root: dir.path().into(),
@@ -2244,6 +2337,7 @@ mod worker_wait_tests {
         let result = create_session(
             State(state.clone()),
             Json(NewSession {
+                workflow: default_workflow(),
                 project: Project {
                     root: dir.path().join("alias"),
                     ..Default::default()
@@ -2271,7 +2365,7 @@ mod worker_wait_tests {
             }],
             ..Default::default()
         };
-        let state = WebState::new(config.clone(), path.clone(), Arc::new(OpenAiClient)).unwrap();
+        let state = test_state(config.clone(), path.clone(), Arc::new(OpenAiClient)).unwrap();
         assert!(
             std::process::Command::new("mkfifo")
                 .arg(&path)
@@ -2347,7 +2441,7 @@ mod worker_wait_tests {
                     .to_string()
                     .starts_with("unsupported_non_utf8_path:")
             );
-            let error = WebState::new(
+            let error = test_state(
                 config,
                 dir.path().join("config.toml"),
                 Arc::new(OpenAiClient),
@@ -2369,8 +2463,7 @@ mod worker_wait_tests {
             }],
             ..Default::default()
         };
-        let mut state =
-            WebState::new(config.clone(), path.clone(), Arc::new(OpenAiClient)).unwrap();
+        let mut state = test_state(config.clone(), path.clone(), Arc::new(OpenAiClient)).unwrap();
         let workers = Arc::new(tokio::sync::Semaphore::new(1));
         let occupied = workers.clone().acquire_owned().await.unwrap();
         state.file_io = FileIo::with_workers(workers, state.stopping.clone());
@@ -2436,7 +2529,7 @@ mod worker_wait_tests {
             }],
             ..Default::default()
         };
-        let state = WebState::new(config.clone(), path.clone(), Arc::new(OpenAiClient)).unwrap();
+        let state = test_state(config.clone(), path.clone(), Arc::new(OpenAiClient)).unwrap();
         let mut saves = tokio::task::JoinSet::new();
         for index in 0..6 {
             let state = state.clone();
@@ -2477,7 +2570,7 @@ mod worker_wait_tests {
     #[tokio::test]
     async fn queued_project_validation_cannot_overwrite_a_newer_session() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = WebState::new(
+        let mut state = test_state(
             Config {
                 projects: vec![Project {
                     root: dir.path().into(),
@@ -2561,7 +2654,7 @@ mod worker_wait_tests {
                 "run_timeout_secs" => config.run_timeout_secs = u64::MAX,
                 _ => unreachable!(),
             }
-            let error = WebState::new(
+            let error = test_state(
                 config,
                 dir.path().join("config.toml"),
                 Arc::new(OpenAiClient),
@@ -2586,7 +2679,7 @@ mod worker_wait_tests {
             }],
             ..Default::default()
         };
-        let state = WebState::new(
+        let state = test_state(
             config,
             dir.path().join("config.toml"),
             Arc::new(OpenAiClient),
@@ -2635,7 +2728,7 @@ mod worker_wait_tests {
                 }],
                 ..Default::default()
             };
-            let state = WebState::new(
+            let state = test_state(
                 config.clone(),
                 dir.path().join("config.toml"),
                 Arc::new(OpenAiClient),
@@ -2703,7 +2796,7 @@ mod worker_wait_tests {
             }],
             ..Default::default()
         };
-        let state = WebState::new(
+        let state = test_state(
             config,
             dir.path().join("config.toml"),
             Arc::new(OpenAiClient),

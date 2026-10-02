@@ -1,15 +1,21 @@
 import { test, expect, workspace, gate, addSession, waitForSnapshot } from "./review-fixtures.js";
 
-test("chat text and request kind survive settings and project navigation", async ({ page, request }) => {
+test("chat text survives settings and project navigation", async ({
+  page,
+  request,
+}) => {
   await workspace({ page, request }, { has_task: true });
   const input = page.getByRole("textbox", { name: "메시지", exact: true });
-  await page.getByLabel("요청 종류").selectOption("chat");
+
   await input.fill("설정을 확인하고 보낼 새 작업");
   await page.getByRole("button", { name: "모든 설정" }).click();
   await page.getByRole("button", { name: "채팅으로 돌아가기" }).click();
   await expect(input).toHaveValue("설정을 확인하고 보낼 새 작업");
-  await expect(page.getByLabel("요청 종류")).toHaveValue("chat");
-  await page.locator(".sidebar-bottom").getByRole("button", { name: "프로젝트 관리" }).click();
+  await expect(page.getByLabel("요청 종류")).toHaveCount(0);
+  await page
+    .locator(".sidebar-bottom")
+    .getByRole("button", { name: "프로젝트 관리" })
+    .click();
   await page.locator(".brand").click();
   await expect(input).toHaveValue("설정을 확인하고 보낼 새 작업");
 });
@@ -29,7 +35,10 @@ test("each session retains its own unsent chat draft", async ({ page, request })
 });
 
 for (const edited of [false, true]) {
-  test(`a late successful send after remount ${edited ? "preserves later edits" : "clears the submitted draft"}`, async ({ page, request }) => {
+  test(`a late successful send after remount ${edited ? "preserves later edits" : "clears the submitted draft"}`, async ({
+    page,
+    request,
+  }) => {
     const { session } = await workspace({ page, request });
     const pending = gate();
     await page.route("**/api/sessions/*/run", async (route) => {
@@ -48,7 +57,9 @@ for (const edited of [false, true]) {
     await expect(input).toHaveValue("제출한 요청");
     if (edited) await input.fill("화면을 다시 열고 쓴 초안");
     pending.release();
-    await expect(page.getByRole("button", { name: "재개", exact: true })).toBeEnabled();
+    await expect(
+      page.getByRole("button", { name: "기억 정리", exact: true }),
+    ).toBeEnabled();
     await expect(input).toHaveValue(edited ? "화면을 다시 열고 쓴 초안" : "");
   });
 }
@@ -118,23 +129,36 @@ test("resizing does not discard an unsaved session project", async ({ page, requ
   await expect(name).toHaveValue("보존할 프로젝트 초안");
 });
 
-test("a recovered refresh clears its transient error but preserves action failures", async ({ page, request }) => {
+test("a recovered refresh clears its transient error but preserves action failures", async ({
+  page,
+  request,
+}) => {
   await page.clock.install();
   const { state } = await workspace({ page, request });
   let failRefresh = true;
-  await page.route("**/api/state", (route) => route.fulfill(failRefresh
-    ? { status: 503, json: { error: "일시적인 조회 오류" } }
-    : { json: state }));
+  await page.route("**/api/state", (route) =>
+    route.fulfill(
+      failRefresh
+        ? { status: 503, json: { error: "일시적인 조회 오류" } }
+        : { json: state },
+    ),
+  );
   await page.clock.runFor(3200);
   await expect(page.getByRole("alert")).toContainText("일시적인 조회 오류");
   failRefresh = false;
   await page.clock.runFor(3200);
   await expect(page.getByRole("alert")).toHaveCount(0);
 
-  await page.route("**/api/sessions/*/workflow", (route) => route.fulfill({
-    status: 409, json: { error: "작업 방식 저장 실패" },
-  }));
-  await page.getByLabel("작업 방식").selectOption("source_document");
+  await page.route("**/api/sessions/*/run", (route) =>
+    route.fulfill({
+      status: 409,
+      json: { error: "작업 방식 저장 실패" },
+    }),
+  );
+  await page
+    .getByRole("textbox", { name: "메시지", exact: true })
+    .fill("추가 요청");
+  await page.getByRole("button", { name: "메시지 보내기" }).click();
   await expect(page.getByRole("alert")).toContainText("작업 방식 저장 실패");
   await page.clock.runFor(3200);
   await expect(page.getByRole("alert")).toContainText("작업 방식 저장 실패");
@@ -287,23 +311,25 @@ test("replacing an acknowledgement refresh does not release the send lock early"
   await expect(input).toHaveValue("후속 초안");
 });
 
-test("failed workflow changes restore the latest server choice", async ({ page, request }) => {
-  // Two workflows exist: the user picks answer while the server keeps (and
-  // re-announces) source_document, which the failed change must restore.
-  const { session } = await workspace({ page, request }, { workflow_mode: "source_document" });
-  const pending = gate();
-  await page.route("**/api/sessions/*/workflow", async (route) => {
-    pending.seen();
-    await pending.held;
-    await route.fulfill({ status: 409, json: { error: "작업 방식 저장 실패" } });
-  });
-  await page.getByLabel("작업 방식").selectOption("answer");
-  await pending.requested;
+test("the session workflow remains fixed when server snapshots refresh", async ({
+  page,
+  request,
+}) => {
+  const { session } = await workspace(
+    { page, request },
+    { workflow_mode: "source_document" },
+  );
+  await expect(page.locator(".workflow-badge")).toHaveText(
+    "소스 기반 문서 작성",
+  );
   session.revision++;
   await waitForSnapshot(page, session);
-  pending.release();
-  await expect(page.getByLabel("작업 방식")).toBeEnabled();
-  await expect(page.getByLabel("작업 방식")).toHaveValue("source_document");
+  await expect(page.locator(".workflow-badge")).toHaveText(
+    "소스 기반 문서 작성",
+  );
+  await expect(
+    page.locator(".composer-wrap").getByLabel("작업 방식"),
+  ).toHaveCount(0);
 });
 
 test("failed tool changes restore the latest server selection", async ({ page, request }) => {

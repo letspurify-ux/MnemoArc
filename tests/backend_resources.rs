@@ -1,3 +1,4 @@
+mod support;
 use axum::{Router, body::Body, http::header, routing::post};
 use mnemoarc::{
     config::{Config, Project},
@@ -137,7 +138,7 @@ async fn shutdown_finishes_when_a_download_client_stops_reading() {
         .build()
         .unwrap();
     let url = format!("http://127.0.0.1:{port}");
-    let state = tokio::time::timeout(Duration::from_secs(3), async {
+    let _state = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let Ok(response) = client.get(format!("{url}/api/state")).send().await {
                 break response.json::<Value>().await.unwrap();
@@ -151,7 +152,7 @@ async fn shutdown_finishes_when_a_download_client_stops_reading() {
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
     socket.set_recv_buffer_size(4096).unwrap();
     let mut stalled = socket.connect(([127, 0, 0, 1], port).into()).await.unwrap();
-    let id = state["sessions"][0]["id"].as_str().unwrap();
+    let id = support::seed_session(&client, &url).await.unwrap();
     stalled
         .write_all(
             format!(
@@ -380,7 +381,7 @@ async fn aborting_the_server_releases_active_model_connections_and_event_streams
         .build()
         .unwrap();
     let url = format!("http://127.0.0.1:{port}");
-    let state = tokio::time::timeout(Duration::from_secs(5), async {
+    let _state = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Ok(response) = client.get(format!("{url}/api/state")).send().await {
                 break response
@@ -401,7 +402,7 @@ async fn aborting_the_server_releases_active_model_connections_and_event_streams
         .send()
         .await
         .unwrap();
-    let id = state["sessions"][0]["id"].as_str().unwrap();
+    let id = support::seed_session(&client, &url).await.unwrap();
     client
         .post(format!("{url}/api/sessions/{id}/run"))
         .header("x-mnemoarc-client", "web")

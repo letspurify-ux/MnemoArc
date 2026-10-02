@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures.js";
 
 const pageErrors = new WeakMap();
 test.beforeEach(async ({ page }) => {
@@ -314,49 +314,46 @@ test("clicking the selected session preserves the unsent message", async ({ page
   await expect(input).toHaveValue("작성 중인 메시지");
 });
 
-test("the displayed question mode also applies to continuation phrases", async ({ page, request }) => {
+test("ordinary messages use the same-task entry point", async ({
+  page,
+  request,
+}) => {
   await workspace({ page, request }, { has_task: true });
   let submitted;
   await page.route("**/api/sessions/*/run", (route) => {
     submitted = route.request().postDataJSON();
     return route.fulfill({ json: { started: true } });
   });
-  await expect(page.getByLabel("요청 종류")).toHaveValue("question");
+  await expect(page.getByLabel("요청 종류")).toHaveCount(0);
   await page.getByRole("textbox", { name: "메시지", exact: true }).fill("계속");
   await page.getByRole("button", { name: "메시지 보내기" }).click();
-  await expect.poll(() => submitted?.action).toBe("question");
+  await expect.poll(() => submitted?.action).toBe("message");
 });
 
-test("workflow changes finish before a message can start", async ({ page, request }) => {
-  const { session } = await workspace({ page, request });
-  const pending = gate();
+test("the composer never submits a workflow change", async ({
+  page,
+  request,
+}) => {
+  const { session } = await workspace(
+    { page, request },
+    { workflow_mode: "source_document" },
+  );
   const runs = [];
-  await page.route("**/api/sessions/*/workflow", async (route) => {
-    pending.seen();
-    await pending.held;
-    session.workflow_mode = route.request().postDataJSON().workflow;
-    await route.fulfill({ json: { saved: true } });
-  });
   await page.route("**/api/sessions/*/run", (route) => {
-    runs.push(session.workflow_mode);
+    runs.push(route.request().postDataJSON());
     return route.fulfill({ json: { started: true } });
   });
-  await page.getByLabel("작업 방식").selectOption("source_document");
-  await pending.requested;
-  const input = page.getByRole("textbox", { name: "메시지", exact: true });
-  await input.fill("문서 작성 요청");
-  try {
-    await expect(page.getByRole("button", { name: "메시지 보내기" })).toBeDisabled();
-    await expect(page.getByRole("button", { name: "재개", exact: true })).toBeDisabled();
-    await expect(page.getByRole("button", { name: "기억 정리", exact: true })).toBeDisabled();
-    await input.press("Enter");
-    expect(runs).toEqual([]);
-  } finally {
-    pending.release();
-  }
-  await expect(page.getByLabel("작업 방식")).toHaveValue("source_document");
+  await expect(page.locator(".workflow-badge")).toHaveText(
+    "소스 기반 문서 작성",
+  );
+  await expect(page.getByLabel("요청 종류")).toHaveCount(0);
+  await page
+    .getByRole("textbox", { name: "메시지", exact: true })
+    .fill("문서 작성 요청");
   await page.getByRole("button", { name: "메시지 보내기" }).click();
-  await expect.poll(() => runs).toEqual(["source_document"]);
+  await expect.poll(() => runs.length).toBe(1);
+  expect(runs[0]).toEqual({ text: "문서 작성 요청", action: "message" });
+  expect(session.workflow_mode).toBe("source_document");
 });
 
 test("settings saved in flight do not mark later edits or keys as saved", async ({ page, request }) => {
@@ -408,32 +405,61 @@ test("project save preserves the dirty state of edits made during the request", 
   await expect(page.getByText("저장하지 않은 변경 사항이 있습니다.")).toBeVisible();
 });
 
-test("a failed session creation retains the project draft", async ({ page, request }) => {
+test("a failed session creation retains the project draft", async ({
+  page,
+  request,
+}) => {
   await workspace({ page, request });
-  await page.locator(".sidebar-bottom").getByRole("button", { name: "프로젝트 관리" }).click();
-  await page.getByLabel("프로젝트 이름", { exact: true }).fill("보존해야 할 프로젝트");
-  await page.route("**/api/sessions", (route) => route.fulfill({
-    status: 400, json: { error: "프로젝트 폴더를 확인하세요." },
-  }));
+  await page
+    .locator(".sidebar-bottom")
+    .getByRole("button", { name: "프로젝트 관리" })
+    .click();
+  await page
+    .getByLabel("프로젝트 이름", { exact: true })
+    .fill("보존해야 할 프로젝트");
+  await page.route("**/api/sessions", (route) =>
+    route.fulfill({
+      status: 400,
+      json: { error: "프로젝트 폴더를 확인하세요." },
+    }),
+  );
   page.on("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "이 프로젝트로 새 세션" }).click();
-  await expect(page.getByLabel("프로젝트 이름", { exact: true })).toHaveValue("보존해야 할 프로젝트");
-  await expect(page.getByRole("alert").first()).toContainText("프로젝트 폴더를 확인하세요.");
+  await expect(page.getByRole("dialog", { name: "새 세션 설정" })).toBeVisible();
+  await page.getByRole("button", { name: "세션 시작", exact: true }).click();
+  await expect(page.getByLabel("프로젝트 이름", { exact: true })).toHaveValue(
+    "보존해야 할 프로젝트",
+  );
+  await expect(page.getByRole("alert").first()).toContainText(
+    "프로젝트 폴더를 확인하세요.",
+  );
 });
 
-test("a new session uses the unsaved project draft only after an accurate confirmation", async ({ page, request }) => {
+test("a new session uses the unsaved project draft only after an accurate confirmation", async ({
+  page,
+  request,
+}) => {
   const { state, session } = await workspace({ page, request });
-  await page.locator(".sidebar-bottom").getByRole("button", { name: "프로젝트 관리" }).click();
+  await page
+    .locator(".sidebar-bottom")
+    .getByRole("button", { name: "프로젝트 관리" })
+    .click();
   await page.getByLabel("프로젝트 이름", { exact: true }).fill("초안 프로젝트");
   await page.getByLabel(/^결과 문서 경로/).fill("docs/draft-output.md");
 
   let submitted;
   const created = { ...session, id: "project-draft-session" };
-  await page.route("**/api/sessions/project-draft-session", (route) => route.fulfill({ json: created }));
+  await page.route("**/api/sessions/project-draft-session", (route) =>
+    route.fulfill({ json: created }),
+  );
   await page.route("**/api/sessions", (route) => {
     submitted = route.request().postDataJSON().project;
     created.project = submitted;
-    state.sessions.push({ ...state.sessions[0], id: created.id, project: submitted });
+    state.sessions.push({
+      ...state.sessions[0],
+      id: created.id,
+      project: submitted,
+    });
     return route.fulfill({ json: { id: created.id } });
   });
 
@@ -443,12 +469,18 @@ test("a new session uses the unsaved project draft only after an accurate confir
     await dialog.dismiss();
   });
   await page.getByRole("button", { name: "이 프로젝트로 새 세션" }).click();
+  await expect(page.getByRole("dialog", { name: "새 세션 설정" })).toHaveCount(0);
   expect(confirmation).toContain("새 세션에만 적용");
   expect(confirmation).toContain("프로젝트 목록 변경 사항은 저장되지 않습니다");
   expect(submitted).toBeUndefined();
 
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "이 프로젝트로 새 세션" }).click();
+  await page
+    .getByRole("dialog", { name: "새 세션 설정" })
+    .getByLabel("결과 문서", { exact: true })
+    .fill("docs/draft-output.md");
+  await page.getByRole("button", { name: "세션 시작", exact: true }).click();
   await expect.poll(() => submitted?.output).toBe("docs/draft-output.md");
   await expect(page.locator(".session-heading h2")).toHaveText("초안 프로젝트");
   expect(state.config.projects[0].name).not.toBe("초안 프로젝트");
@@ -600,26 +632,38 @@ test("a save finishing after navigation does not clear a new editor's dirty stat
   await expect(page.getByLabel("모델 이름", { exact: true })).toHaveValue("second-editor");
 });
 
-test("late session creation does not discard edits on another page", async ({ page, request }) => {
+test("pending creation keeps its concrete settings visible and locks cancellation", async ({
+  page,
+  request,
+}) => {
   await workspace({ page, request });
   const pending = gate();
   await page.route("**/api/sessions", async (route) => {
     pending.seen();
     await pending.held;
-    await route.fulfill({ json: { id: "new-session" } });
+    await route.fulfill({ status: 400, json: { error: "세션 생성 실패" } });
   });
   await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "새 세션 설정" });
+  await dialog.getByRole("button", { name: "세션 시작", exact: true }).click();
   await pending.requested;
-  await page.getByRole("button", { name: "모든 설정" }).click();
-  await page.getByLabel("모델 이름", { exact: true }).fill("new-page-draft");
-  const response = page.waitForResponse((res) => res.url().endsWith("/api/sessions"));
+  await expect(
+    dialog.getByRole("button", { name: "취소", exact: true }),
+  ).toBeDisabled();
+  await expect(dialog.getByLabel("결과 문서", { exact: true })).toBeDisabled();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeVisible();
   pending.release();
-  await response;
-  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-  await expect(page.getByLabel("모델 이름", { exact: true })).toHaveValue("new-page-draft");
+  await expect(dialog.getByRole("alert")).toContainText("세션 생성 실패");
+  await expect(
+    dialog.getByRole("button", { name: "취소", exact: true }),
+  ).toBeEnabled();
 });
 
-test("the old chat draft is locked during creation and restored on failure", async ({ page, request }) => {
+test("the old chat draft is locked during creation and restored on failure", async ({
+  page,
+  request,
+}) => {
   await workspace({ page, request });
   const input = page.getByRole("textbox", { name: "메시지", exact: true });
   await input.fill("기존 세션의 초안");
@@ -630,6 +674,7 @@ test("the old chat draft is locked during creation and restored on failure", asy
     await route.fulfill({ status: 400, json: { error: "세션 생성 실패" } });
   });
   await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  await page.getByRole("button", { name: "세션 시작", exact: true }).click();
   await pending.requested;
   try {
     await expect(input).toBeDisabled();
@@ -661,14 +706,26 @@ test("a removed session cannot send through the replacement session while it loa
   await expect(page.getByRole("textbox", { name: "메시지", exact: true })).toBeVisible();
 });
 
-test("a failed workflow change restores the selection and releases send controls", async ({ page, request }) => {
-  await workspace({ page, request });
-  await page.route("**/api/sessions/*/workflow", (route) => route.fulfill({ status: 409, json: { error: "작업 방식 변경 실패" } }));
-  await page.getByRole("textbox", { name: "메시지", exact: true }).fill("보존할 요청");
-  await page.getByLabel("작업 방식").selectOption("source_document");
-  await expect(page.getByRole("alert")).toContainText("작업 방식 변경 실패");
-  await expect(page.getByLabel("작업 방식")).toHaveValue("answer");
-  await expect(page.getByRole("button", { name: "메시지 보내기" })).toBeEnabled();
+test("cancelling creation preserves the current session and its unsent message", async ({
+  page,
+  request,
+}) => {
+  const { session } = await workspace({ page, request });
+  await page
+    .getByRole("textbox", { name: "메시지", exact: true })
+    .fill("보존할 요청");
+  await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  await page
+    .getByRole("dialog", { name: "새 세션 설정" })
+    .getByRole("button", { name: "취소", exact: true })
+    .click();
+  await expect(page).toHaveURL(new RegExp(`#${session.id}$`));
+  await expect(
+    page.getByRole("textbox", { name: "메시지", exact: true }),
+  ).toHaveValue("보존할 요청");
+  await expect(
+    page.getByRole("button", { name: "메시지 보내기" }),
+  ).toBeEnabled();
 });
 
 test("settings report partial success when only session application fails", async ({ page, request }) => {

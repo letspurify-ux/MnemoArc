@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures.js";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 
@@ -63,6 +63,7 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
   await page.reload();
   await expect(page.getByRole("heading", { name: "조사 결과" })).toBeVisible();
   await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  await page.getByRole("button", { name: "세션 시작", exact: true }).click();
   await page
     .getByRole("textbox", { name: "메시지", exact: true })
     .fill("느린 요청 테스트");
@@ -117,6 +118,7 @@ test("ordered to-do list follows prerequisites and preserves running work on rel
 }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  await page.getByRole("button", { name: "세션 시작", exact: true }).click();
   await page
     .getByRole("textbox", { name: "메시지", exact: true })
     .fill("할 일 목록 테스트");
@@ -150,6 +152,7 @@ test("ordered to-do list follows prerequisites and preserves running work on rel
 test("the answer workflow publishes its final answer without a completion review", async ({ page, request }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  await page.getByRole("button", { name: "세션 시작", exact: true }).click();
   await page.getByRole("textbox", { name: "메시지", exact: true }).fill("완료 조건 검증 테스트");
   await page.getByRole("tab", { name: "진행", exact: true }).click();
   await page.getByRole("button", { name: "메시지 보내기" }).click();
@@ -209,6 +212,7 @@ test("length-limited Mermaid answer continues as one rendered diagram", async ({
 }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  await page.getByRole("button", { name: "세션 시작", exact: true }).click();
   await page
     .getByRole("textbox", { name: "메시지", exact: true })
     .fill("길이 이어받기 테스트");
@@ -253,44 +257,37 @@ test("app exit can be cancelled and stops reconnecting after confirmation", asyn
   await expect(page.getByText("연결 복구 중…")).toHaveCount(0);
 });
 
-test("session window selects the workflow for the next request", async ({
+test("session creation fixes the selected workflow across reload and mobile", async ({
   page,
   request,
 }) => {
   await page.goto("/");
-  const workflow = page.getByLabel("작업 방식");
-  await page.getByLabel("요청 종류").selectOption("chat");
-  await expect(workflow).toHaveValue("answer");
-  // No automatic choice: the user picks one of the two workflows.
-  await expect(workflow.locator("option")).toHaveText([
-    "질문 답변",
+  await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "새 세션 설정" });
+  await dialog.getByRole("radio", { name: /소스 기반 문서 작성/ }).check();
+  await dialog.getByRole("button", { name: "세션 시작", exact: true }).click();
+  await expect(page.locator(".workflow-badge")).toHaveText(
     "소스 기반 문서 작성",
-  ]);
-  await workflow.selectOption("source_document");
-  const state = await (await request.get("/api/state")).json();
-  const id = state.sessions[0].id;
-  await expect
-    .poll(async () => {
-      const session = await (await request.get(`/api/sessions/${id}`)).json();
-      return session.workflow_mode;
-    })
-    .toBe("source_document");
+  );
+  const id = (await page.evaluate(() => location.hash)).slice(1);
+  expect(
+    (await (await request.get(`/api/sessions/${id}`)).json()).workflow_mode,
+  ).toBe("source_document");
   await page.reload();
-  await expect(page.getByLabel("작업 방식")).toHaveValue("source_document");
-  await page.locator(".composer-wrap").screenshot({
-    path: "test-artifacts/workflow-select-desktop.png",
-  });
+  await expect(page.locator(".workflow-badge")).toHaveText(
+    "소스 기반 문서 작성",
+  );
+  await expect(page.getByLabel("요청 종류")).toHaveCount(0);
+  await expect(
+    page.locator(".composer-wrap").getByLabel("작업 방식"),
+  ).toHaveCount(0);
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect(page.getByLabel("작업 방식")).toBeVisible();
+  await expect(page.locator(".workflow-badge")).toBeVisible();
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth <= innerWidth,
     ),
   ).toBe(true);
-  await page.screenshot({
-    path: "test-artifacts/workflow-select.png",
-    fullPage: true,
-  });
 });
 
 test("typing a new draft while send is pending preserves that draft", async ({ page }) => {
@@ -303,6 +300,7 @@ test("typing a new draft while send is pending preserves that draft", async ({ p
   await expect(page.getByRole("status").filter({ hasText: "설정을 저장했습니다" })).toBeVisible();
   await page.getByRole("button", { name: "채팅으로 돌아가기" }).click();
   await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  await page.getByRole("button", { name: "세션 시작", exact: true }).click();
 
   let release;
   let intercepted;
@@ -348,6 +346,7 @@ test("sidebar navigation confirms before discarding unsaved settings", async ({ 
     await dialog.accept();
   });
   await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  await page.getByRole("button", { name: "세션 시작", exact: true }).click();
   await expect(page.getByRole("textbox", { name: "메시지", exact: true })).toBeVisible();
   expect(confirmations).toBe(1);
 });
