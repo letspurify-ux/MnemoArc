@@ -179,10 +179,10 @@ pub fn describe(message: &str) -> Value {
         (Class::StaleState, "refresh_matching_state")
     } else if matches!(
         code,
-        "document_review_invalid" | "document_review_incomplete" | "answer_review_incomplete"
+        "document_review_invalid" | "document_review_incomplete"
     ) {
         (Class::InvalidInput, "correct_arguments")
-    } else if code == "document_review_budget" || code == "answer_review_budget" {
+    } else if code == "document_review_budget" {
         (Class::Capacity, "reduce_request_or_cleanup")
     } else if code.contains("conflict")
         || code.contains("changed")

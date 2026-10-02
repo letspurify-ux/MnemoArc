@@ -74,7 +74,9 @@ pub struct Config {
     pub review_limit: usize,
     /// Edit requests per automatic document re-review interval.
     pub document_repair_limit: usize,
-    pub source_answer_review: bool,
+    /// Retired answer-review switch, accepted so older settings still load.
+    #[serde(rename = "source_answer_review", default, skip_serializing)]
+    pub retired_source_answer_review: Option<bool>,
     pub source_document_review: bool,
     /// Run the general read-only acceptance review before completing artifacts.
     pub completion_review_enabled: bool,
@@ -164,7 +166,7 @@ impl Default for Config {
             database: crate::database::DatabaseConfig::default(),
             review_limit: 3,
             document_repair_limit: 8,
-            source_answer_review: true,
+            retired_source_answer_review: None,
             source_document_review: true,
             completion_review_enabled: true,
             projects: vec![],

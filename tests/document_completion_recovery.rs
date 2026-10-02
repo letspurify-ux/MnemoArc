@@ -32,7 +32,6 @@ fn fixture() -> (tempfile::TempDir, Session) {
             run_tokens: 1_000_000,
             output_tokens: 1024,
             stall_round_limit: 3,
-            source_answer_review: false,
             source_document_review: false,
             ..Default::default()
         },
@@ -242,65 +241,6 @@ fn finish_fixture(s: &mut Session) {
             "operations":[{"op":"complete","id":id,"result":"Saved the requested document"}]}),
     )
     .unwrap();
-}
-
-struct InvalidCitationFinal {
-    client: DocumentClient,
-    attempts: Mutex<usize>,
-    invalid_rounds: usize,
-}
-
-#[async_trait]
-impl LlmClient for InvalidCitationFinal {
-    async fn complete(
-        &self,
-        request: Value,
-        config: &Config,
-        cancel: CancellationToken,
-        tx: mpsc::Sender<String>,
-    ) -> Result<Completion> {
-        let payload: Value =
-            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
-                .unwrap_or(Value::Null);
-        if payload["completion_review"] != true {
-            let mut attempts = self.attempts.lock().unwrap();
-            *attempts += 1;
-            if *attempts <= self.invalid_rounds {
-                return Ok(Completion {
-                    text: json!({"citations":"invalid"}).to_string(),
-                    ..Default::default()
-                });
-            }
-        }
-        self.client.complete(request, config, cancel, tx).await
-    }
-}
-
-#[tokio::test]
-async fn invalid_final_citation_can_be_corrected_before_document_completion() {
-    let (_dir, mut s) = fixture();
-    // Twelve rejected finals stay below the closing threshold (3 x 5).
-    s.config.stall_round_limit = 5;
-    finish_fixture(&mut s);
-    s.answer_reviewed = true;
-    let (s, deltas) = run(
-        s,
-        Arc::new(InvalidCitationFinal {
-            client: DocumentClient {
-                path: _dir.path().join("report.md"),
-                delay: Delay::Read,
-                delay_rounds: 0,
-                calls: Mutex::new(0),
-                input_usage: 1000,
-            },
-            attempts: Mutex::new(0),
-            invalid_rounds: 12,
-        }),
-    )
-    .await;
-    assert_eq!(s.status, "complete", "{:?}", s.last_error);
-    assert!(s.completion_review.approved);
-    assert_eq!(deltas, ["Saved report.md"]);
 }
 
 struct PrematureToolText {
@@ -1331,7 +1271,6 @@ async fn oversized_batch_before_any_workflow_is_retried_not_fatal() {
             output_tokens: 1024,
             batch_tokens: 400,
             result_tokens: 400,
-            source_answer_review: false,
             source_document_review: false,
             completion_review_enabled: false,
             ..Default::default()

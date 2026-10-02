@@ -90,7 +90,6 @@ async fn default_follow_up_preserves_task_and_explicit_new_task_resets_it() {
     let config = Config {
         model: "gpt-4o".into(),
         model_context: Some(128000),
-        source_answer_review: false,
         completion_review_enabled: false,
         projects: vec![Project {
             root: dir.path().into(),

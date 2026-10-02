@@ -979,6 +979,88 @@ fn answer_workflow_document_edit_skips_document_verification() {
 }
 
 #[test]
+fn answer_workflow_runs_no_reviews_and_hides_review_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.select_workflow("source_document").unwrap();
+    assert!(s.active_tools.contains("document_audit"));
+    s.select_workflow("answer").unwrap();
+    s.add_user("Plan and answer".into());
+    // Plans, deliverables and writes do not start a completion review.
+    tools::execute(&mut s, "task_plan", json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Answer the question"]}]})).unwrap();
+    s.task.deliverables = vec!["answer".into()];
+    assert!(s.config.completion_review_enabled);
+    assert!(!tools::completion_review::required(&s));
+    for name in ["investigation", "document_audit"] {
+        assert!(!s.active_tools.contains(name), "{name}");
+        assert!(
+            !tools::ToolRegistry::definitions(&s)
+                .iter()
+                .any(|t| t["function"]["name"] == name),
+            "{name}"
+        );
+    }
+    let error = tools::execute(
+        &mut s,
+        "tool_select",
+        json!({"action":"add","names":["document_audit"]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("workflow_forbidden:"), "{error}");
+    // The same task is reviewed in source_document.
+    s.select_workflow("source_document").unwrap();
+    assert!(tools::completion_review::required(&s));
+}
+
+#[test]
+fn answer_workflow_sends_no_review_or_verification_guidance() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.add_user("Add a note to the summary".into());
+    let review_terms = [
+        "verify_batch",
+        "final_check",
+        "completion_review",
+        "document_review",
+        "require_investigation",
+        "verification_required_ids",
+        "investigation upsert",
+    ];
+    let request = ContextManager::request(&s, tools::ToolRegistry::definitions(&s)).unwrap();
+    let text = request.to_string();
+    for term in review_terms {
+        assert!(!text.contains(term), "{term}");
+    }
+    let state = ContextManager::state(&s).unwrap();
+    for key in [
+        "completion_review",
+        "document_review",
+        "pending_investigations",
+        "investigation_count",
+    ] {
+        assert!(state.get(key).is_none(), "{key}");
+    }
+    let written = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Note\nPlain edit.\n"}),
+    )
+    .unwrap();
+    for key in [
+        "verification_required_ids",
+        "verification_guidance",
+        "citation_check",
+    ] {
+        assert!(written.get(key).is_none(), "{key}");
+    }
+    assert!(written["hash"].is_string());
+    // Source documentation keeps the full verification prompt.
+    s.select_workflow("source_document").unwrap();
+    assert_eq!(context::system_prompt(&s), context::SYSTEM);
+}
+
+#[test]
 fn answer_workflow_withholds_investigation() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());

@@ -1805,7 +1805,6 @@ mod worker_wait_tests {
             Config {
                 model: "gpt-4o".into(),
                 model_context: Some(128000),
-                source_answer_review: false,
                 completion_review_enabled: false,
                 projects: vec![Project {
                     root: dir.path().into(),
@@ -1863,7 +1862,6 @@ mod worker_wait_tests {
         let config = Config {
             model: "gpt-4o".into(),
             model_context: Some(128000),
-            source_answer_review: false,
             completion_review_enabled: false,
             projects: vec![project.clone()],
             ..Default::default()
@@ -1960,7 +1958,6 @@ mod worker_wait_tests {
                 Config {
                     model: "gpt-4o".into(),
                     model_context: Some(128000),
-                    source_answer_review: false,
                     completion_review_enabled: false,
                     tool_timeout_secs: 60,
                     run_timeout_secs: if outcome == "timeout" { 1 } else { 60 },

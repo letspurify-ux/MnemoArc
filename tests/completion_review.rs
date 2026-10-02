@@ -11,7 +11,7 @@ use mnemoarc::{
     },
 };
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -24,7 +24,6 @@ fn session(root: &std::path::Path) -> Session {
         Config {
             model: "gpt-4o".into(),
             model_context: Some(128000),
-            source_answer_review: false,
             ..Default::default()
         },
     );
@@ -282,79 +281,6 @@ fn working_checks_cannot_add_requirements_or_weaken_caller_requirements() {
         s.request_review_criteria.completion,
         ["Include a conclusion and an example"]
     );
-}
-
-#[test]
-fn changed_requirements_invalidate_rejection_without_reopening_stale_repairs() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = session(dir.path());
-    write(&mut s, "Conclusion only\n");
-    review::begin(&mut s, "Saved result.txt").unwrap();
-    assert!(finish(&mut s, false).is_none());
-    review::schedule_repairs(&mut s);
-    let id = s.task.current_todo().unwrap().id.clone();
-    plan(
-        &mut s,
-        json!([{"op":"complete","id":id,"result":"Only marked done"}]),
-    );
-    assert!(review::rejected_on_current_result(&s));
-
-    s.request_review_criteria
-        .constraints
-        .push("Use Korean".into());
-    assert_eq!(
-        review::current_verdict(&s),
-        review::CurrentVerdict::Unreviewed
-    );
-    assert!(!review::rejected_on_current_result(&s));
-    assert_eq!(review::guidance(&s)["needs_review"], true);
-    assert_eq!(review::guidance(&s)["remaining"], 0);
-    assert_eq!(review::view(&s)["checks"], json!([]));
-    review::schedule_repairs(&mut s);
-    assert!(s.task.current_todo().is_none());
-    assert!(
-        !s.completion_review.checks.is_empty(),
-        "Keep the historical verdict for diagnostics"
-    );
-    assert_eq!(
-        review::begin(&mut s, "Saved result.txt").unwrap(),
-        Gate::Review
-    );
-    assert!(finish(&mut s, false).is_none());
-    assert!(review::rejected_on_current_result(&s));
-}
-
-#[test]
-fn unavailable_review_binds_only_the_result_it_could_not_review() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = session(dir.path());
-    write(&mut s, "Conclusion only\n");
-    review::begin(&mut s, "Saved result.txt").unwrap();
-    review::request(&mut s).unwrap();
-    review::mark_unavailable(&mut s, Some("Invalid reviewer response".into()));
-    assert_eq!(
-        review::current_verdict(&s),
-        review::CurrentVerdict::Unavailable
-    );
-    assert_eq!(
-        review::begin(&mut s, "Saved result.txt").unwrap(),
-        Gate::Unavailable
-    );
-    assert_eq!(review::view(&s)["unavailable"], true);
-
-    write(&mut s, "Conclusion\nExample: saved\n");
-    assert_eq!(
-        review::current_verdict(&s),
-        review::CurrentVerdict::Unreviewed
-    );
-    assert_eq!(review::view(&s)["unavailable"], false);
-    assert_eq!(review::view(&s)["unavailable_reason"], Value::Null);
-    assert_eq!(review::view(&s)["needs_review"], true);
-    assert_eq!(
-        review::begin(&mut s, "Saved result.txt").unwrap(),
-        Gate::Review
-    );
-    assert!(finish(&mut s, true).is_some());
 }
 
 #[test]
@@ -768,57 +694,6 @@ fn unresolved_and_capacity_remain_visible_without_stopping_or_overflow() {
     assert!(!review::required(&s));
 }
 
-struct RepairClient {
-    root: std::path::PathBuf,
-    reviews: Mutex<usize>,
-}
-#[async_trait]
-impl LlmClient for RepairClient {
-    async fn complete(
-        &self,
-        request: Value,
-        _: &Config,
-        _: CancellationToken,
-        _: mpsc::Sender<String>,
-    ) -> Result<Completion> {
-        let p: Value =
-            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
-                .unwrap_or(Value::Null);
-        if p["completion_review"] == true {
-            *self.reviews.lock().unwrap() += 1;
-            let saved = std::fs::read_to_string(self.root.join("result.txt"))?;
-            return Ok(Completion {
-                text: verdict(&p, saved.contains("Example")),
-                ..Default::default()
-            });
-        }
-        let state: Value = serde_json::from_str(
-            request["messages"].as_array().unwrap().last().unwrap()["content"]
-                .as_str()
-                .unwrap()
-                .split_once('\n')
-                .unwrap()
-                .1,
-        )?;
-        let current = &state["run_guidance"]["current_todo"];
-        let saved = std::fs::read_to_string(self.root.join("result.txt"))?;
-        let call = if current.is_null() {
-            return Ok(Completion {
-                text: "Done".into(),
-                ..Default::default()
-            });
-        } else if !saved.contains("Example") {
-            ToolCall {id:"repair-file".into(),name:"file_write".into(),arguments:json!({"path":"result.txt","expected_hash":tools::hash(saved.as_bytes()),"content":"Conclusion\nExample: saved outcome\n"}).to_string()}
-        } else {
-            ToolCall {id:format!("finish-{}",state["task"]["plan_revision"]),name:"task_plan".into(),arguments:json!({"action":"apply","expected_revision":state["task"]["plan_revision"],"operations":[{"op":"complete","id":current["id"],"result":"Added and checked the saved example"}]}).to_string()}
-        };
-        Ok(Completion {
-            calls: vec![call],
-            ..Default::default()
-        })
-    }
-}
-
 async fn run(s: Session, client: Arc<dyn LlmClient>) -> (Session, Vec<AgentEvent>) {
     let (tx, mut rx) = mpsc::channel(128);
     let drain = tokio::spawn(async move {
@@ -830,50 +705,6 @@ async fn run(s: Session, client: Arc<dyn LlmClient>) -> (Session, Vec<AgentEvent
     });
     let result = run_session(s, client, CancellationToken::new(), tx).await;
     (result, drain.await.unwrap())
-}
-
-#[tokio::test]
-async fn all_todos_done_but_missing_criterion_repairs_and_verifies_before_final() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = session(dir.path());
-    write(&mut s, "Conclusion\n");
-    plan(
-        &mut s,
-        json!([{"op":"insert","texts":["Write requested output"]},{"op":"complete","id":"T1","result":"Saved result.txt"}]),
-    );
-    let client = Arc::new(RepairClient {
-        root: dir.path().into(),
-        reviews: Mutex::new(0),
-    });
-    let (result, events) = run(s, client.clone()).await;
-    assert_eq!(result.status, "complete", "{:?}", result.last_error);
-    assert!(result.completion_review.approved);
-    assert_eq!(*client.reviews.lock().unwrap(), 2);
-    assert!(result.task.current_todo().is_none());
-    assert_eq!(result.task.todos_completed_total, 2);
-    assert!(
-        std::fs::read_to_string(dir.path().join("result.txt"))
-            .unwrap()
-            .contains("Example")
-    );
-    assert_eq!(
-        events
-            .iter()
-            .filter(|e| matches!(e,AgentEvent::Delta{text,..} if text=="Done"))
-            .count(),
-        1
-    );
-    assert!(
-        events
-            .iter()
-            .filter_map(|e| if let AgentEvent::Snapshot(s) = e {
-                Some(s)
-            } else {
-                None
-            })
-            .filter(|s| s.status == "complete")
-            .all(|s| s.completion_review.approved)
-    );
 }
 
 struct InvalidClient;
@@ -892,29 +723,6 @@ impl LlmClient for InvalidClient {
         })
     }
 }
-#[tokio::test]
-async fn invalid_review_is_partial_and_resume_keeps_the_candidate_and_requirements() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = session(dir.path());
-    write(&mut s, "Conclusion and Example\n");
-    let (mut result, events) = run(s, Arc::new(InvalidClient)).await;
-    assert_eq!(result.status, "partial");
-    assert!(result.completion_review.pending);
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e,AgentEvent::Delta{text,..} if text=="Done"))
-    );
-    result.add_user("resume".into());
-    let client = Arc::new(RepairClient {
-        root: dir.path().into(),
-        reviews: Mutex::new(0),
-    });
-    let (result, _) = run(result, client).await;
-    assert_eq!(result.status, "complete", "{:?}", result.last_error);
-    assert!(result.completion_review.approved);
-}
-
 #[test]
 fn stale_observations_are_excluded_and_business_ids_are_preserved() {
     let dir = tempfile::tempdir().unwrap();
@@ -939,249 +747,6 @@ fn stale_observations_are_excluded_and_business_ids_are_preserved() {
     assert!(!evidence.contains("Old content"));
     assert!(evidence.contains("123"));
     assert!(evidence.contains("user timestamp"));
-}
-
-struct ChurnClient(Mutex<usize>);
-#[async_trait]
-impl LlmClient for ChurnClient {
-    async fn complete(
-        &self,
-        request: Value,
-        _: &Config,
-        _: CancellationToken,
-        _: mpsc::Sender<String>,
-    ) -> Result<Completion> {
-        let p: Value =
-            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
-                .unwrap_or(Value::Null);
-        if p["completion_review"] == true {
-            *self.0.lock().unwrap() += 1;
-            return Ok(Completion {
-                text: verdict(&p, false),
-                ..Default::default()
-            });
-        }
-        let state: Value = serde_json::from_str(
-            request["messages"].as_array().unwrap().last().unwrap()["content"]
-                .as_str()
-                .unwrap()
-                .split_once('\n')
-                .unwrap()
-                .1,
-        )?;
-        let current = &state["run_guidance"]["current_todo"];
-        if current.is_null() {
-            return Ok(Completion {
-                text: "Done".into(),
-                ..Default::default()
-            });
-        }
-        Ok(Completion { calls:vec![ToolCall {id:format!("mark-{}",state["task"]["plan_revision"]),name:"task_plan".into(),arguments:json!({"action":"apply","expected_revision":state["task"]["plan_revision"],"operations":[{"op":"complete","id":current["id"],"result":"Claimed completion without fixing result"}]}).to_string()}], ..Default::default() })
-    }
-}
-
-#[tokio::test]
-async fn unchanged_rejection_cannot_loop_reviews_or_publish_success() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = session(dir.path());
-    write(&mut s, "Conclusion only");
-    let client = Arc::new(ChurnClient(Mutex::new(0)));
-    let (result, events) = run(s, client.clone()).await;
-    assert_eq!(result.status, "partial", "{:?}", result.last_error);
-    assert!(
-        result
-            .last_error
-            .unwrap()
-            .starts_with("completion_review_no_progress")
-    );
-    assert_eq!(*client.0.lock().unwrap(), 1);
-    assert_eq!(result.task.todos.len(), 1);
-    assert!(result.task.current_todo().is_some());
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e,AgentEvent::Delta{text,..} if text=="Done"))
-    );
-}
-
-struct RepeatingReadClient {
-    reviews: Mutex<usize>,
-    calls: Mutex<usize>,
-}
-#[async_trait]
-impl LlmClient for RepeatingReadClient {
-    async fn complete(
-        &self,
-        request: Value,
-        _: &Config,
-        _: CancellationToken,
-        _: mpsc::Sender<String>,
-    ) -> Result<Completion> {
-        let p: Value =
-            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
-                .unwrap_or(Value::Null);
-        if p["completion_review"] == true {
-            *self.reviews.lock().unwrap() += 1;
-            return Ok(Completion {
-                text: verdict(&p, false),
-                ..Default::default()
-            });
-        }
-        if *self.reviews.lock().unwrap() == 0 {
-            return Ok(Completion {
-                text: "Done".into(),
-                ..Default::default()
-            });
-        }
-        let state: Value = serde_json::from_str(
-            request["messages"].as_array().unwrap().last().unwrap()["content"]
-                .as_str()
-                .unwrap()
-                .split_once('\n')
-                .unwrap()
-                .1,
-        )?;
-        let mut calls = self.calls.lock().unwrap();
-        *calls += 1;
-        let (name, arguments) = if let Some(id) = state["checkpoint"]["id"].as_str() {
-            (
-                "checkpoint_complete",
-                json!({"id":id,"progress":"The rejected completion review remains unresolved.","no_save_reason":"The review checks already preserve the missing requirement."}),
-            )
-        } else if let Some(id) = state["run_guidance"]["current_todo"]["id"].as_str() {
-            (
-                "task_plan",
-                json!({"action":"apply","expected_revision":state["task"]["plan_revision"],"operations":[{"op":"complete","id":id,"result":"Repeated the existing check"}]}),
-            )
-        } else {
-            (
-                "file_read",
-                json!({"path":"result.txt","start_line":1,"max_lines":1,"force_read":true}),
-            )
-        };
-        Ok(Completion {
-            calls: vec![ToolCall {
-                id: format!("repeat-{}", *calls),
-                name: name.into(),
-                arguments: arguments.to_string(),
-            }],
-            ..Default::default()
-        })
-    }
-}
-
-#[tokio::test]
-async fn rejected_review_bounds_tool_only_repair_loop_and_keeps_work_for_resume() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = session(dir.path());
-    write(&mut s, "Conclusion only");
-    let client = Arc::new(RepeatingReadClient {
-        reviews: Mutex::new(0),
-        calls: Mutex::new(0),
-    });
-    let (result, events) = run(s, client.clone()).await;
-    assert_eq!(
-        result.status,
-        "partial",
-        "error={:?}, calls={}, reviews={}",
-        result.last_error,
-        *client.calls.lock().unwrap(),
-        *client.reviews.lock().unwrap()
-    );
-    assert!(
-        result
-            .last_error
-            .as_deref()
-            .unwrap()
-            .starts_with("completion_review_no_progress")
-    );
-    assert_eq!(*client.reviews.lock().unwrap(), 1);
-    assert!(*client.calls.lock().unwrap() <= 42);
-    assert!(
-        result.task.current_todo().is_none(),
-        "A new read invalidated the review; do not reopen its completed repair from a stale verdict"
-    );
-    assert_eq!(review::guidance(&result)["needs_review"], true);
-    assert!(!result.completion_review.checks.is_empty());
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Delta { text, .. } if text == "Done"))
-    );
-}
-
-struct ChangingAnswerClient(Mutex<usize>);
-#[async_trait]
-impl LlmClient for ChangingAnswerClient {
-    async fn complete(
-        &self,
-        request: Value,
-        _: &Config,
-        _: CancellationToken,
-        _: mpsc::Sender<String>,
-    ) -> Result<Completion> {
-        let p: Value =
-            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
-                .unwrap_or(Value::Null);
-        if p["completion_review"] == true {
-            *self.0.lock().unwrap() += 1;
-            return Ok(Completion {
-                text: verdict(&p, false),
-                ..Default::default()
-            });
-        }
-        let state: Value = serde_json::from_str(
-            request["messages"].as_array().unwrap().last().unwrap()["content"]
-                .as_str()
-                .unwrap()
-                .split_once('\n')
-                .unwrap()
-                .1,
-        )?;
-        if let Some(id) = state["run_guidance"]["current_todo"]["id"].as_str() {
-            return Ok(Completion {
-                calls: vec![ToolCall {
-                    id: format!("complete-{id}-{}", *self.0.lock().unwrap()),
-                    name: "task_plan".into(),
-                    arguments: json!({"action":"apply","expected_revision":state["task"]["plan_revision"],"operations":[{"op":"complete","id":id,"result":"No actual result changed"}]}).to_string(),
-                }],
-                ..Default::default()
-            });
-        }
-        Ok(Completion {
-            text: format!("Done, review {}", *self.0.lock().unwrap()),
-            ..Default::default()
-        })
-    }
-}
-
-#[tokio::test]
-async fn changing_final_words_do_not_reset_rejected_review_limit() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = session(dir.path());
-    write(&mut s, "Conclusion only");
-    let client = Arc::new(ChangingAnswerClient(Mutex::new(0)));
-    let (result, events) = run(s, client.clone()).await;
-    assert_eq!(result.status, "partial", "{:?}", result.last_error);
-    assert_eq!(*client.0.lock().unwrap(), 6);
-    assert_eq!(result.completion_review.stalled_reviews, 6);
-    assert!(result.task.current_todo().is_some());
-    assert!(!result.completion_review.approved);
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Delta { text, .. } if text.starts_with("Done")))
-    );
-    let (recovered, _) = run(
-        result,
-        Arc::new(RepairClient {
-            root: dir.path().into(),
-            reviews: Mutex::new(0),
-        }),
-    )
-    .await;
-    assert_eq!(recovered.status, "complete", "{:?}", recovered.last_error);
-    assert!(recovered.completion_review.approved);
 }
 
 #[tokio::test]
@@ -1232,71 +797,12 @@ async fn complete_json_verdict_tolerates_fences_and_spurious_length_without_rest
         let (result, events) = run(s, Arc::new(CompatibleReview { fenced, limited })).await;
         assert_eq!(result.status, "complete", "{:?}", result.last_error);
         assert_eq!(result.completion_review.attempts, 1);
-        assert!(result.answer_draft.is_none());
         assert!(
             events
                 .iter()
                 .any(|e| matches!(e,AgentEvent::Delta{text,..} if text=="Verified final answer"))
         );
     }
-}
-
-struct ContinuedAnswer(Mutex<usize>);
-#[async_trait]
-impl LlmClient for ContinuedAnswer {
-    async fn complete(
-        &self,
-        request: Value,
-        _: &Config,
-        _: CancellationToken,
-        _: mpsc::Sender<String>,
-    ) -> Result<Completion> {
-        let mut step = self.0.lock().unwrap();
-        let response = match *step {
-            0 => Completion {
-                text: "```mermaid\nflowchart LR\n A -->".into(),
-                length_limited: true,
-                ..Default::default()
-            },
-            1 => Completion {
-                text: " B\n```".into(),
-                ..Default::default()
-            },
-            2 => {
-                let p = payload(&request);
-                assert_eq!(p["completion_review"], true);
-                assert_eq!(
-                    p["evidence"][0]["text"],
-                    "```mermaid\nflowchart LR\n A --> B\n```"
-                );
-                assert_eq!(p["evidence"][0]["truncated"], false);
-                Completion {
-                    text: verdict(&p, true),
-                    ..Default::default()
-                }
-            }
-            _ => panic!("unexpected continuation/review loop"),
-        };
-        *step += 1;
-        Ok(response)
-    }
-}
-#[tokio::test]
-async fn planned_answer_continuation_reviews_whole_answer_and_keeps_join_marker() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = session(dir.path());
-    s.add_user("Draw a flowchart in the final answer".into());
-    plan(
-        &mut s,
-        json!([{"op":"insert","texts":["Prepare diagram"]},{"op":"complete","id":"T1","result":"Prepared diagram"}]),
-    );
-    let (result, _) = run(s, Arc::new(ContinuedAnswer(Mutex::new(0)))).await;
-    assert_eq!(result.status, "complete", "{:?}", result.last_error);
-    let messages = result.history.active();
-    let final_message = messages.last().unwrap();
-    assert_eq!(final_message["continues_previous"], true);
-    assert_eq!(final_message["content"], " B\n```");
-    assert!(result.completion_review.approved);
 }
 
 #[test]

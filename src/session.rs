@@ -507,12 +507,8 @@ pub struct Session {
     pub task_rounds: usize,
     pub document_review: crate::tools::document_review::ReviewState,
     pub completion_review: crate::tools::completion_review::ReviewState,
-    pub answer_draft: Option<String>,
-    pub answer_reviewed: bool,
-    pub answer_review_original: Option<String>,
-    pub answer_review_issues: Vec<String>,
-    pub answer_review_input_tokens: usize,
-    pub answer_review_output_tokens: usize,
+    /// First history id of the current request and its original text; the
+    /// document and completion reviews compare results against them.
     pub answer_review_start: u64,
     pub answer_review_question: String,
     // Some(true): truncated tool batch; Some(false): text continuation.
@@ -550,11 +546,12 @@ impl Session {
     }
 
     /// Optional tools the user's workflow selection excludes. Chat answers
-    /// do not track source-documentation items, so `investigation` (and its
-    /// final_check, which would turn the task into document work) is withheld.
+    /// do not track source-documentation items or run reviews, so
+    /// `investigation` (whose final_check would turn the task into document
+    /// work) and `document_audit` are withheld.
     pub fn workflow_forbidden_tools(&self) -> &'static [&'static str] {
         if self.workflow_mode == "answer" {
-            &["investigation"]
+            &["investigation", "document_audit"]
         } else {
             &[]
         }
@@ -685,12 +682,6 @@ impl Session {
             task_rounds: 0,
             document_review: Default::default(),
             completion_review: Default::default(),
-            answer_draft: None,
-            answer_reviewed: false,
-            answer_review_original: None,
-            answer_review_issues: vec![],
-            answer_review_input_tokens: 0,
-            answer_review_output_tokens: 0,
             answer_review_start: 0,
             answer_review_question: String::new(),
             continuation: None,
@@ -822,12 +813,6 @@ impl Session {
             self.completion_review.required = self.config.completion_review_enabled
                 && first_request
                 && !self.task.completion.is_empty();
-            self.answer_draft = None;
-            self.answer_reviewed = false;
-            self.answer_review_original = None;
-            self.answer_review_issues = Vec::new();
-            self.answer_review_input_tokens = 0;
-            self.answer_review_output_tokens = 0;
             self.answer_review_start = self.history.next_id + 1;
             self.answer_review_question = text.clone();
             self.continuation = None;
@@ -977,9 +962,6 @@ impl Session {
             &self.token_ratios,
             &self.list_cursor_scopes,
             &self.activity,
-            &self.answer_draft,
-            &self.answer_review_original,
-            &self.answer_review_issues,
             &self.answer_review_question,
             &self.run_history,
         )))

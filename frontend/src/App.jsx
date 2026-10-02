@@ -1603,23 +1603,21 @@ function Inspector({
           <>
             <h3>사용할 도구</h3>
             <p className="subtle">변경 사항은 다음 요청부터 적용됩니다.</p>
-            {tools.map((tool) => {
-              // Chat answers do not track documentation items.
-              const forbidden =
-                session.workflow_mode === "answer" &&
-                tool.name === "investigation";
-              return (
+            {tools
+              // Tools the selected workflow excludes are hidden.
+              .filter(
+                (tool) =>
+                  !(session.workflow_forbidden_tools ?? []).includes(tool.name),
+              )
+              .map((tool) => (
                 <label className="tool-toggle" key={tool.name}>
                   <input
                     type="checkbox"
                     aria-label={toolLabels[tool.name] || tool.name}
                     checked={
-                      !forbidden &&
-                      (!tool.optional || toolSelection.includes(tool.name))
+                      !tool.optional || toolSelection.includes(tool.name)
                     }
-                    disabled={
-                      navigating || !tool.optional || toolsSaving || forbidden
-                    }
+                    disabled={navigating || !tool.optional || toolsSaving}
                     onChange={(e) => {
                       if (navigating || toolsSaving) return;
                       const next = new Set(toolSelection);
@@ -1642,11 +1640,7 @@ function Inspector({
                   <span>
                     <strong>{toolLabels[tool.name] || tool.name}</strong>
                     <small>
-                      {forbidden
-                        ? "질문 답변 모드에서는 사용할 수 없음"
-                        : tool.optional
-                          ? "선택 도구"
-                          : "기본 도구 · 항상 사용"}
+                      {tool.optional ? "선택 도구" : "기본 도구 · 항상 사용"}
                     </small>
                     {tool.name === "file_read" && (
                       <small style={{ overflowWrap: "anywhere" }}>
@@ -1682,8 +1676,7 @@ function Inspector({
                     )}
                   </span>
                 </label>
-              );
-            })}
+              ))}
           </>
         )}
         {tab === "output" && (

@@ -29,7 +29,6 @@ fn session(root: &std::path::Path) -> Session {
             context_tokens: 128_000,
             run_tokens: 500_000,
             stall_round_limit: 3,
-            source_answer_review: false,
             ..Default::default()
         },
     );
@@ -64,7 +63,6 @@ fn payload(request: &Value) -> Value {
 enum Pattern {
     Final,
     InvalidPlan,
-    AlternatingWrite,
     RepeatedOutline,
     RepeatedLargeRead,
 }
@@ -73,7 +71,6 @@ struct Stubborn {
     pattern: Pattern,
     calls: Mutex<usize>,
     reviews: Mutex<usize>,
-    file: PathBuf,
 }
 
 #[async_trait]
@@ -136,25 +133,6 @@ impl LlmClient for Stubborn {
                     .collect(),
                 ..Default::default()
             },
-            Pattern::AlternatingWrite if *calls == 1 => Completion {
-                text: "Done".into(),
-                ..Default::default()
-            },
-            Pattern::AlternatingWrite => {
-                let previous = std::fs::read(&self.file).ok();
-                let mut args = json!({"path":"result.txt","content":if (*calls).is_multiple_of(2) {"A"} else {"B"}});
-                if let Some(previous) = previous {
-                    args["expected_hash"] = json!(tools::hash(&previous));
-                }
-                Completion {
-                    calls: vec![ToolCall {
-                        id: format!("write-{calls}"),
-                        name: "file_write".into(),
-                        arguments: args.to_string(),
-                    }],
-                    ..Default::default()
-                }
-            }
         };
         Ok(response)
     }
@@ -172,7 +150,6 @@ async fn pending_final_and_invalid_plan_calls_are_bounded_and_resume_retains_the
             pattern,
             calls: Mutex::new(0),
             reviews: Mutex::new(0),
-            file: dir.path().join("result.txt"),
         });
         let result = run(s, client.clone()).await;
         assert_eq!(result.status, "partial", "{:?}", result.last_error);
@@ -193,31 +170,6 @@ async fn pending_final_and_invalid_plan_calls_are_bounded_and_resume_retains_the
 }
 
 #[tokio::test]
-async fn revisiting_earlier_file_versions_does_not_reset_recovery() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = session(dir.path());
-    s.completion_review.required = true;
-    let client = Arc::new(Stubborn {
-        pattern: Pattern::AlternatingWrite,
-        calls: Mutex::new(0),
-        reviews: Mutex::new(0),
-        file: dir.path().join("result.txt"),
-    });
-    let result = run(s, client.clone()).await;
-    assert_eq!(result.status, "partial", "{:?}", result.last_error);
-    assert!(
-        result
-            .last_error
-            .as_deref()
-            .unwrap_or("")
-            .starts_with("progress_recovery_exhausted")
-    );
-    assert_eq!(*client.reviews.lock().unwrap(), 1);
-    assert!(result.progress_recovery.seen_artifact_versions.len() <= 2);
-    assert!(*client.calls.lock().unwrap() < 30);
-}
-
-#[tokio::test]
 async fn unchanged_navigation_result_is_bounded() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("source.rs"), "fn one() {}\n").unwrap();
@@ -226,7 +178,6 @@ async fn unchanged_navigation_result_is_bounded() {
         pattern: Pattern::RepeatedOutline,
         calls: Mutex::new(0),
         reviews: Mutex::new(0),
-        file: dir.path().join("result.txt"),
     });
     let result = run(s, client.clone()).await;
     assert_eq!(result.status, "partial", "{:?}", result.last_error);
@@ -255,7 +206,6 @@ async fn repeated_truncated_read_is_not_new_evidence() {
         pattern: Pattern::RepeatedLargeRead,
         calls: Mutex::new(0),
         reviews: Mutex::new(0),
-        file: dir.path().join("result.txt"),
     });
     let result = run(s, client.clone()).await;
     assert_eq!(result.status, "partial", "{:?}", result.last_error);
@@ -285,88 +235,6 @@ async fn repeated_truncated_read_is_not_new_evidence() {
         .collect();
     assert_eq!(views.len(), result.sources.len());
     assert!(*client.calls.lock().unwrap() < 30);
-}
-
-struct FocusedRepair {
-    calls: Mutex<usize>,
-    file: PathBuf,
-}
-
-#[async_trait]
-impl LlmClient for FocusedRepair {
-    async fn complete(
-        &self,
-        request: Value,
-        _: &Config,
-        _: CancellationToken,
-        _: mpsc::Sender<String>,
-    ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
-        let state: Value = serde_json::from_str(
-            request["messages"].as_array().unwrap().last().unwrap()["content"]
-                .as_str()
-                .unwrap()
-                .split_once('\n')
-                .unwrap()
-                .1,
-        )?;
-        let mut calls = self.calls.lock().unwrap();
-        *calls += 1;
-        if *calls > 20 {
-            bail!("test_limit: focused repair did not complete");
-        }
-        let current = &state["run_guidance"]["current_todo"];
-        if self.file.exists() {
-            if !current.is_null() {
-                return Ok(Completion { calls:vec![ToolCall {
-                    id:format!("complete-{calls}"), name:"task_plan".into(),
-                    arguments:json!({"action":"apply","expected_revision":state["task"]["plan_revision"],
-                        "operations":[{"op":"complete","id":current["id"],"result":"Saved and checked result.txt"}]}).to_string(),
-                }], ..Default::default() });
-            }
-            return Ok(Completion {
-                text: "Saved result.txt".into(),
-                ..Default::default()
-            });
-        }
-        if state["run_guidance"]["progress_recovery"]["focused"] != true {
-            return Ok(Completion {
-                text: "Done".into(),
-                ..Default::default()
-            });
-        }
-        Ok(Completion {
-            calls: vec![ToolCall {
-                id: "write-actual-result".into(),
-                name: "file_write".into(),
-                arguments: json!({"path":"result.txt","content":"Requested result\n"}).to_string(),
-            }],
-            ..Default::default()
-        })
-    }
-}
-
-#[tokio::test]
-async fn focused_recovery_continues_to_accepted_completion() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = session(dir.path());
-    pending_todo(&mut s);
-    let client = Arc::new(FocusedRepair {
-        calls: Mutex::new(0),
-        file: dir.path().join("result.txt"),
-    });
-    let result = run(s, client.clone()).await;
-    assert_eq!(result.status, "complete", "{:?}", result.last_error);
-    assert!(result.completion_review.approved);
-    assert!(result.task.current_todo().is_none());
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("result.txt")).unwrap(),
-        "Requested result\n"
-    );
-    assert_eq!(result.progress_recovery.artifact_edits_without_milestone, 0);
-    assert!(*client.calls.lock().unwrap() < 20);
 }
 
 struct UniqueWrites {

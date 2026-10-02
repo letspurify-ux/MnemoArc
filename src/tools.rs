@@ -1,4 +1,3 @@
-pub mod answer_review;
 pub mod completion_review;
 mod coverage;
 pub mod document_review;
@@ -203,7 +202,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "task_state",
-                description: "Read/update goals, constraints and completion criteria. Manage ordered work through task_plan; current/next/done and todos are not patch fields. State fields belong inside patch, e.g. {action:update,patch:{phase:verify}}. A new user task starts with a request-based completion condition; refine it into concrete checks before substantial work. The user selects task.workflow (answer, source_document or document_edit) and it cannot be patched; for source_document START with completion criteria matching the user request. Use investigation upsert for evidence items. Do not send empty patches or completion:[]. Updates preserve omitted fields. Evidence requirements and explicit user constraints remain in force even when a plan item is removed.",
+                description: "Read/update goals, constraints and completion criteria. Manage ordered work through task_plan; current/next/done and todos are not patch fields. State fields belong inside patch, e.g. {action:update,patch:{phase:verify}}. A new user task starts with a request-based completion condition; refine it into concrete checks before substantial work. The user selects task.workflow (answer or source_document) and it cannot be patched; for source_document START with completion criteria matching the user request. Use investigation upsert for evidence items. Do not send empty patches or completion:[]. Updates preserve omitted fields. Evidence requirements and explicit user constraints remain in force even when a plan item is removed.",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -589,6 +588,64 @@ impl ToolRegistry {
         }
         normalized
     }
+    /// Description text that refers to investigation, verification or
+    /// reviews, none of which exist in the answer workflow.
+    const ANSWER_DESCRIPTION_EDITS: &[(&str, &str, &str)] = &[
+        (
+            "document_edit",
+            " Save one investigated section at a time.",
+            "",
+        ),
+        (
+            "document_edit",
+            " Simple edits do not require investigation items; the source_document workflow enables investigation automatically from the user's selection; do not patch workflow or require_investigation.",
+            "",
+        ),
+        (
+            "document_edit_batch",
+            "; save newly investigated sections as progress is made.",
+            ".",
+        ),
+        ("task_state", "patch:{phase:verify}", "patch:{phase:answer}"),
+        (
+            "task_state",
+            "; for source_document START with completion criteria matching the user request.",
+            ".",
+        ),
+        (
+            "task_state",
+            " Use investigation upsert for evidence items.",
+            "",
+        ),
+        (
+            "task_state",
+            "Evidence requirements and explicit user constraints remain",
+            "Explicit user constraints remain",
+        ),
+    ];
+    pub fn answer_description(name: &str, base: &'static str) -> &'static str {
+        static DESCRIPTIONS: std::sync::OnceLock<BTreeMap<&'static str, &'static str>> =
+            std::sync::OnceLock::new();
+        DESCRIPTIONS
+            .get_or_init(|| {
+                let mut edited = BTreeMap::new();
+                for spec in Self::specs() {
+                    let mut text = spec.description.to_owned();
+                    for (name, old, new) in Self::ANSWER_DESCRIPTION_EDITS {
+                        if *name == spec.name {
+                            text = text.replace(old, new);
+                        }
+                    }
+                    if text != spec.description {
+                        edited.insert(spec.name, &*text.leak());
+                    }
+                }
+                edited
+            })
+            .get(name)
+            .copied()
+            .unwrap_or(base)
+    }
     /// Offered only in closing mode, where it is accepted.
     const MARK_GAP_GUIDANCE: &str = " mark_gap requires id and a specific reason; it settles an item whose claim cannot be verified with gathered evidence, and the final result lists it as unconfirmed. Qualify the related claim in its section; verifying the item later replaces the gap.";
     pub fn definitions(s: &Session) -> Vec<Value> {
@@ -647,6 +704,9 @@ impl ToolRegistry {
                     && matches!(t.name, "document_edit" | "document_edit_batch")
                 {
                     withhold_write_action(&mut t.parameters);
+                }
+                if s.task.workflow == "answer" {
+                    t.description = Self::answer_description(t.name, t.description);
                 }
                 let fields = t.parameters["properties"].clone();
                 // Keep offset for old clients, but offer the model only opaque continuation.
@@ -2238,6 +2298,10 @@ fn persist_document_edit(
     let hash = hash(result.as_bytes());
     let bytes = result.len();
     let total_lines = result.lines().count();
+    // The answer workflow verifies nothing: report the write only.
+    if s.task.workflow == "answer" {
+        return Ok(json!({"path":path,"hash":hash,"bytes":bytes,"total_lines":total_lines}));
+    }
     let citation_check = documentation::citation_check(s, path, &result)?;
     Ok(json!({
         "written_items":written_items,

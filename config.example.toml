@@ -45,8 +45,6 @@ verification_reserve_ratio = 0.25
 closing_reserve_ratio = 0.1
 # Document edit requests after each failed review (reads/checks excluded); increase to resume.
 document_repair_limit = 8
-# One bounded same-model revision for source answers; incurs an extra request.
-source_answer_review = true
 # Source-document review: read-only same-model pass, up to two attempts per task.
 source_document_review = true
 # General read-only acceptance review before completing artifacts.

@@ -100,8 +100,10 @@ impl ReviewState {
     }
 }
 
+/// The answer workflow runs no reviews; its edits are not verified.
 pub fn required(s: &Session) -> bool {
     s.config.completion_review_enabled
+        && s.task.workflow != "answer"
         && (s.completion_review.required
             || s.task.plan_revision > 0
             || !s.task.todos.is_empty()

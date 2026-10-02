@@ -23,7 +23,6 @@ fn session(root: &std::path::Path) -> Session {
         Config {
             model: "gpt-4o".into(),
             model_context: Some(128000),
-            source_answer_review: false,
             ..Default::default()
         },
     )

@@ -1,4 +1,10 @@
-import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { Message, StreamingMessage } from "./chat/Message.jsx";
 import { continuationMessages } from "./chat/continuation.js";
 import { toolLabels, workflowOptions } from "./api.js";
@@ -35,20 +41,20 @@ export default function Chat({
         ? "실제 결과와 완료 조건 확인 중"
         : stage === "document_review"
           ? "문서와 소스 근거 대조 중"
-          : stage === "answer_review"
-            ? "소스 근거와 답변 대조 중"
-            : stage === "tools"
-              ? `${(session.activity.tools || []).map((name) => toolLabels[name] || name).join(" · ")} 실행 중`
-              : session?.stream
-                ? "답변 생성 중"
-                : stage === "model"
-                  ? session?.continuation_pending
-                    ? "길이 제한으로 이어서 생성 중"
-                    : "모델 응답 대기 중"
-                  : stage === "continuing"
-                    ? "받은 답변을 보존하고 이어서 생성 중"
-                    : "요청 준비 중";
-  const draft = useSyncExternalStore(drafts.subscribe, () => drafts.get(session.id));
+          : stage === "tools"
+            ? `${(session.activity.tools || []).map((name) => toolLabels[name] || name).join(" · ")} 실행 중`
+            : session?.stream
+              ? "답변 생성 중"
+              : stage === "model"
+                ? session?.continuation_pending
+                  ? "길이 제한으로 이어서 생성 중"
+                  : "모델 응답 대기 중"
+                : stage === "continuing"
+                  ? "받은 답변을 보존하고 이어서 생성 중"
+                  : "요청 준비 중";
+  const draft = useSyncExternalStore(drafts.subscribe, () =>
+    drafts.get(session.id),
+  );
   const input = draft.text;
   const requestKind = draft.intent || (session?.has_task ? "question" : "chat");
   const updateDraft = (patch) => drafts.update(session.id, patch);
@@ -57,7 +63,8 @@ export default function Chat({
   const [workflowSaving, setWorkflowSaving] = useState(false);
   const [workflow, setWorkflow] = useState(session?.workflow_mode ?? "answer");
   const [loadingOlder, setLoadingOlder] = useState(false);
-  const workflowLock = useRef(false), olderLock = useRef(false);
+  const workflowLock = useRef(false),
+    olderLock = useRef(false);
   useEffect(() => {
     if (!workflowSaving) setWorkflow(session?.workflow_mode ?? "answer");
   }, [session?.workflow_mode, workflowSaving]);
@@ -93,7 +100,15 @@ export default function Chat({
   }, [session?.id]);
   async function submit(text = input) {
     const message = text.trim();
-    if (!message || busy || capacityFull || !canRun || lock.current || workflowLock.current) return;
+    if (
+      !message ||
+      busy ||
+      capacityFull ||
+      !canRun ||
+      lock.current ||
+      workflowLock.current
+    )
+      return;
     lock.current = true;
     setSending(true);
     const submitted = drafts.get(session.id);
@@ -273,7 +288,9 @@ export default function Chat({
           }}
         >
           {capacityFull && !busy && (
-            <p className="capacity-note">동시 실행 한도에 도달했습니다. 작업이 끝나면 보낼 수 있습니다.</p>
+            <p className="capacity-note">
+              동시 실행 한도에 도달했습니다. 작업이 끝나면 보낼 수 있습니다.
+            </p>
           )}
           <textarea
             ref={inputRef}
@@ -333,7 +350,12 @@ export default function Chat({
               작업 방식
               <select
                 value={workflow}
-                disabled={busy || sending || workflowSaving || requestKind === "question"}
+                disabled={
+                  busy ||
+                  sending ||
+                  workflowSaving ||
+                  requestKind === "question"
+                }
                 onChange={(e) => void changeWorkflow(e.target.value)}
               >
                 {workflowOptions.map(([value, label]) => (
@@ -352,8 +374,19 @@ export default function Chat({
                 className="send-button"
                 type="submit"
                 aria-label="메시지 보내기"
-                disabled={!input.trim() || busy || capacityFull || sending || workflowSaving || !canRun}
-                title={capacityFull ? "동시 실행 한도에 도달했습니다. 작업이 끝나면 보낼 수 있습니다." : "메시지 보내기"}
+                disabled={
+                  !input.trim() ||
+                  busy ||
+                  capacityFull ||
+                  sending ||
+                  workflowSaving ||
+                  !canRun
+                }
+                title={
+                  capacityFull
+                    ? "동시 실행 한도에 도달했습니다. 작업이 끝나면 보낼 수 있습니다."
+                    : "메시지 보내기"
+                }
               >
                 ↑
               </button>

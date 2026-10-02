@@ -4,7 +4,7 @@
 
 등록된 `llm_agent`의 실제 모델 실행에서 문서 작업이 단순 질문 종료 안내를 받았고, task_state에 존재하지 않는 필드를 보내며 비용을 썼다. 75줄 문서에 누적 입력 1,031,828토큰이 들었으며, 인용 구조 검사를 통과한 뒤에도 루프 종류 오류와 history 정규화 설명 누락이 남았다.
 
-작업 방식(workflow)은 사용자가 세션 창의 "작업 방식"에서 고른다: 질문 답변(`answer`, 기본값), 소스 기반 문서 작성(`source_document`). 간단한 결과 문서 편집은 `answer`에서 기본 활성화된 document_edit/document_edit_batch로 하며, 문서 작업 검증(진행 정체 처리·마감 단계·완료 조건 검토)을 받지 않는다. `answer`는 investigation을 선택할 수 없다. 선택은 다음 요청부터 적용되며 새 요청마다 task에 반영된다. `source_document`는 근거 검증 요구를 잠그고 investigation/document_edit/document_audit를 즉시 활성화한다. 모델은 workflow와 require_investigation을 바꿀 수 없고(`workflow_selected_by_user`), 첫 task_state에서 구체적인 `completion`과 deliverables만 채운다. 첫 사용자 메시지 전에 설정한 완료 조건은 보존하며, 조건이 없으면 사용자 요청을 바탕으로 초기값을 만든다. `completion: []`로 기존 조건을 지우는 갱신은 거부한다. 이후 새 요청은 검토 상태를 초기화하고 새 완료 조건을 만들며, continue/resume는 상태를 유지한다. 저장된 프로젝트 목적·출력 경로만으로 문서 작업을 추정하지 않는다.
+작업 방식(workflow)은 사용자가 세션 창의 "작업 방식"에서 고른다: 질문 답변(`answer`, 기본값), 소스 기반 문서 작성(`source_document`). 간단한 결과 문서 편집은 `answer`에서 기본 활성화된 document_edit/document_edit_batch로 하며, 문서 작업 검증(진행 정체 처리·마감 단계·완료 조건 검토)을 받지 않는다. `answer`는 완료 조건 검토를 포함한 어떤 검토도 실행하지 않으며 investigation·document_audit을 선택할 수 없다. 선택은 다음 요청부터 적용되며 새 요청마다 task에 반영된다. `source_document`는 근거 검증 요구를 잠그고 investigation/document_edit/document_audit를 즉시 활성화한다. 모델은 workflow와 require_investigation을 바꿀 수 없고(`workflow_selected_by_user`), 첫 task_state에서 구체적인 `completion`과 deliverables만 채운다. 첫 사용자 메시지 전에 설정한 완료 조건은 보존하며, 조건이 없으면 사용자 요청을 바탕으로 초기값을 만든다. `completion: []`로 기존 조건을 지우는 갱신은 거부한다. 이후 새 요청은 검토 상태를 초기화하고 새 완료 조건을 만들며, continue/resume는 상태를 유지한다. 저장된 프로젝트 목적·출력 경로만으로 문서 작업을 추정하지 않는다.
 
 ```json
 {"action":"update","patch":{"deliverables":["요청한 백엔드 문서"],"completion":["요청 검증과 history 정규화 설명","모든 분기와 종료 조건 설명"]}}

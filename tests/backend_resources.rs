@@ -365,7 +365,6 @@ async fn aborting_the_server_releases_active_model_connections_and_event_streams
         retries: 0,
         request_timeout_secs: 60,
         run_timeout_secs: 60,
-        source_answer_review: false,
         completion_review_enabled: false,
         projects: vec![Project {
             root: dir.path().into(),
@@ -480,7 +479,6 @@ async fn cancelling_headless_work_exits_when_its_output_pipe_stops_reading() {
             retries: 0,
             request_timeout_secs: 60,
             run_timeout_secs: 60,
-            source_answer_review: false,
             completion_review_enabled: false,
             ..Default::default()
         }
@@ -583,7 +581,6 @@ async fn headless_failure_exits_when_stderr_is_full() {
         retries: 0,
         request_timeout_secs: 60,
         run_timeout_secs: 60,
-        source_answer_review: false,
         completion_review_enabled: false,
         ..Default::default()
     }

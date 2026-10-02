@@ -32,7 +32,6 @@ fn fixture() -> (tempfile::TempDir, Session, Value) {
         Config {
             model: "gpt-4o".into(),
             model_context: Some(128_000),
-            source_answer_review: false,
             ..Default::default()
         },
     );
@@ -332,7 +331,6 @@ async fn closing_reserve_finishes_steady_work_before_the_budget() {
             context_tokens: 128_000,
             output_tokens: 1024,
             run_tokens: 1_000_000,
-            source_answer_review: false,
             source_document_review: false,
             completion_review_enabled: false,
             ..Default::default()
@@ -809,7 +807,6 @@ async fn reading_new_sources_before_the_first_write_is_progress() {
             context_tokens: 128_000,
             output_tokens: 1_024,
             stall_round_limit: 2,
-            source_answer_review: false,
             ..Default::default()
         },
     );
@@ -866,7 +863,6 @@ async fn discovery_tools_stay_available_until_the_document_exists() {
             context_tokens: 128_000,
             output_tokens: 1_024,
             stall_round_limit: 2,
-            source_answer_review: false,
             ..Default::default()
         },
     );
@@ -1251,7 +1247,6 @@ async fn transient_empty_replies_are_retried_before_any_workflow_is_set() {
                 model_context: Some(128_000),
                 context_tokens: 128_000,
                 output_tokens: 1_024,
-                source_answer_review: false,
                 ..Default::default()
             },
         );

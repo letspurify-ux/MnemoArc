@@ -28,7 +28,6 @@ fn s(dir: &std::path::Path) -> Session {
             ..Default::default()
         },
         Config {
-            source_answer_review: false,
             model: "gpt-4o".into(),
             model_context: Some(128000),
             ..Default::default()
@@ -1111,7 +1110,9 @@ impl LlmClient for ExpectPhase {
 }
 #[tokio::test]
 async fn resume_and_large_budgets_do_not_restart_investigation() {
-    for (phase, rounds, expected) in [("draft", 2, "draft"), ("", 6, "answer")] {
+    // A persisted draft phase is kept (not reset to investigate); the answer
+    // workflow presents drafting as answering.
+    for (phase, rounds, expected) in [("draft", 2, "answer"), ("", 6, "answer")] {
         let dir = tempfile::tempdir().unwrap();
         let mut session = s(dir.path());
         session.config.run_tokens = 5_000_000;

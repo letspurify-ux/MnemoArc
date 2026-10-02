@@ -86,14 +86,12 @@ fn retired_task_storage() -> usize {
             note: String::new(),
         })
         .collect();
-    session.answer_review_issues = vec![String::new(); 32_768];
     session.completion_gaps = vec![String::new(); 32_768];
     // Resuming still owns this task's state; only a new task retires it.
     session.add_user("continue".into());
     assert_eq!(session.investigations.len(), 16_384);
     session.start_new_task("next task".into());
     assert!(session.investigations.is_empty());
-    assert!(session.answer_review_issues.is_empty());
     assert!(session.completion_gaps.is_empty());
     assert_eq!(session.task.constraints, ["keep this constraint"]);
     assert_eq!(session.history.bundles.len(), 3);

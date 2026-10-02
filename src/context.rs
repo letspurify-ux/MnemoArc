@@ -26,6 +26,44 @@ If the user requests JSON only, emit exactly the requested JSON object without f
 Before answering a source-flow question, compare each claimed condition, execution order and error type against the delivered source. Preserve conditional rethrows and early exits; do not replace them with an unconditional error type. Distinguish work completion from sending a response. Inspect a helper's definition before asserting its behavior, or clearly limit the claim to the observed call site. For an execution-order claim, cite both operations; for exception behavior, cite the branch selecting the error. This is an internal evidence check, not a requirement to call audit tools or write a document.
 Do not claim completion if required investigation items remain unverified; report partial results when budgets stop the work."#;
 
+/// Replaces the workflow line of SYSTEM in the answer workflow.
+const ANSWER_WORKFLOW: &str = r#"The user selects this session's workflow and it appears as task.workflow; you cannot change it. This session uses workflow="answer": answer in chat, and make simple edits of the configured output with document_edit or document_edit_batch. No review, audit or verification runs in this workflow, and investigation and document_audit are unavailable."#;
+/// The answer workflow's subset of SYSTEM's run and citation rules.
+const ANSWER_RUN_RULES: &str = "If run_guidance.completion_error is present, your previous final response left unfinished work: finish it with tools instead of repeating a final response. Consult run_guidance every request. Avoid unchanged repeated reads; force_read is for deliberate repeat reads or lost context. Follow request data through normalization helpers, not just the route call site. Use project-relative path:line-line for EVERY citation, including Mermaid labels; repeat the path for separate ranges instead of comma-only line lists. Check API examples against actual schemas, event producers/consumers and tests; do not infer contracts from names. A tool rejection is not success. Fix arguments using the tool schema instead of repeating them. No need to reread a whole document just to obtain its hash.";
+
+/// The system prompt for this session's workflow. The answer workflow runs
+/// no review, audit or verification, so its prompt leaves out the
+/// source-documentation and verification rules.
+pub fn system_prompt(s: &Session) -> &'static str {
+    static ANSWER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if s.task.workflow != "answer" {
+        return SYSTEM;
+    }
+    ANSWER.get_or_init(|| {
+        let mut lines = Vec::new();
+        for line in SYSTEM.lines() {
+            if line.starts_with("The user selects this session's workflow") {
+                lines.push(ANSWER_WORKFLOW.to_owned());
+            } else if line.starts_with("If run_guidance.completion_error") {
+                lines.push(ANSWER_RUN_RULES.to_owned());
+            } else if line.starts_with("Do not claim completion if required investigation") {
+                lines.push("Report partial results when budgets stop the work.".to_owned());
+            } else if !line.starts_with("For source documentation,") {
+                lines.push(
+                    line.replace("create investigation items, audit citations, ", "")
+                        .replace(" The source_document workflow already activates the documentation tools.", "")
+                        .replace(
+                            "; investigation items and citation audits are not prerequisites unless the user requests source-evidence verification.",
+                            ".",
+                        )
+                        .replace(" Existing investigation items still require verification.", ""),
+                );
+            }
+        }
+        lines.join("\n")
+    })
+}
+
 fn tokenizer(model: &str) -> &'static tiktoken_rs::CoreBPE {
     use tiktoken_rs::tokenizer::Tokenizer;
     // Dated aliases and user-provided model names must not allocate another
@@ -247,7 +285,22 @@ impl ContextManager {
             .take(5)
             .map(|x| json!({"id":x.id,"origin":x.origin,"excerpt":x.excerpt}))
             .collect::<Vec<_>>();
-        let mut state = json!({"completion_review":crate::tools::completion_review::guidance(s),"document_review":crate::tools::document_review::guidance(s),"answer_review":{"completed":s.answer_reviewed,"citation_issues":s.answer_review_issues},"run_guidance":s.run_guidance,"pending_investigations":s.investigations.iter().filter(|i|!i.is_settled()).take(10).map(|i|json!({"id":i.id,"title":i.title,"status":i.status,"section":i.section,"previous_source_ids":i.source_ids()})).collect::<Vec<_>>(),"memory_reuse_enabled":s.config.memory_reuse,"pending_settings":s.pending_config,"task":task,"task_detail_count":s.task.details.len(),"recent_memories":recent,"related_memories":related,"referenced_memories":pinned,"project":s.project,"active_tools":s.active_tools,"latest_request":s.latest_request,"checkpoint":s.checkpoint,"user_sources":source_ids,"investigation_count":s.investigations.len(),"history_pruned_through":s.history.pruned_through});
+        let mut state = json!({"completion_review":crate::tools::completion_review::guidance(s),"document_review":crate::tools::document_review::guidance(s),"run_guidance":s.run_guidance,"pending_investigations":s.investigations.iter().filter(|i|!i.is_settled()).take(10).map(|i|json!({"id":i.id,"title":i.title,"status":i.status,"section":i.section,"previous_source_ids":i.source_ids()})).collect::<Vec<_>>(),"memory_reuse_enabled":s.config.memory_reuse,"pending_settings":s.pending_config,"task":task,"task_detail_count":s.task.details.len(),"recent_memories":recent,"related_memories":related,"referenced_memories":pinned,"project":s.project,"active_tools":s.active_tools,"latest_request":s.latest_request,"checkpoint":s.checkpoint,"user_sources":source_ids,"investigation_count":s.investigations.len(),"history_pruned_through":s.history.pruned_through});
+        if s.task.workflow == "answer" {
+            // No review, investigation or verification runs in answer.
+            let fields = state.as_object_mut().unwrap();
+            for key in [
+                "completion_review",
+                "document_review",
+                "pending_investigations",
+                "investigation_count",
+            ] {
+                fields.remove(key);
+            }
+            if let Some(task) = state["task"].as_object_mut() {
+                task.remove("require_investigation");
+            }
+        }
         let omitted_id_set: BTreeSet<_> = omitted
             .into_iter()
             .map(|memory| memory.id)
@@ -265,7 +318,7 @@ impl ContextManager {
         Ok(state)
     }
     pub fn request(s: &Session, tools: Vec<Value>) -> Result<Value> {
-        let mut instruction = SYSTEM.to_string();
+        let mut instruction = system_prompt(s).to_string();
         if s.is_document_work() {
             instruction.push_str(if s.config.source_document_review {
                 "\nThe separate source-document review is enabled for this session. It is a bounded model pass; resolve its findings before claiming the document is complete."

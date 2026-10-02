@@ -291,7 +291,6 @@ async fn length_recovery_rejects_fifo_output_and_can_cancel() {
     let mut s = session(dir.path());
     s.project.output = "out.md".into();
     s.config.run_timeout_secs = 1;
-    s.config.source_answer_review = false;
     s.config.source_document_review = false;
     s.config.completion_review_enabled = false;
     let cancel = CancellationToken::new();

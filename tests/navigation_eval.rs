@@ -425,10 +425,6 @@ async fn live_navigation_regressions() {
         .unwrap();
         config.api_key = keys.get(&config.api_key_env).cloned().map(Secret);
     }
-    if let Ok(mode) = std::env::var("MNEMOARC_NAV_REVIEW") {
-        assert!(["on", "off"].contains(&mode.as_str()));
-        config.source_answer_review = mode == "on";
-    }
     config.run_tokens = 200_000;
     config.run_timeout_secs = 600;
     let registered = config
@@ -559,7 +555,7 @@ async fn live_navigation_regressions() {
                 s.input_tokens,
                 s.output_tokens
             );
-            reports.push(json!({"case":case,"repetition":repetition,"model":config.model,"failures":failures,"calls":calls,"tool_errors":tool_errors,"errors":results.iter().filter(|r|r["status"]!="ok").collect::<Vec<_>>(),"input_tokens":s.input_tokens,"output_tokens":s.output_tokens,"usage_estimated":s.usage_incomplete,"answer":answer,"answer_text":answer_text,"source_unchanged":true,"elapsed_ms":elapsed_ms,"tool_setup":"session_defaults","review_enabled":config.source_answer_review,"review_completed":s.answer_reviewed,"review_input_tokens":s.answer_review_input_tokens,"review_output_tokens":s.answer_review_output_tokens,"session_error":s.last_error,"draft":s.answer_review_original,"draft_fact_failures":s.answer_review_original.as_deref().map(|draft|check_facts(case,&parse_answer(draft)))}));
+            reports.push(json!({"case":case,"repetition":repetition,"model":config.model,"failures":failures,"calls":calls,"tool_errors":tool_errors,"errors":results.iter().filter(|r|r["status"]!="ok").collect::<Vec<_>>(),"input_tokens":s.input_tokens,"output_tokens":s.output_tokens,"usage_estimated":s.usage_incomplete,"answer":answer,"answer_text":answer_text,"source_unchanged":true,"elapsed_ms":elapsed_ms,"tool_setup":"session_defaults","session_error":s.last_error}));
             if let Ok(path) = std::env::var("MNEMOARC_NAV_REPORT") {
                 std::fs::write(path, serde_json::to_vec_pretty(&reports).unwrap()).unwrap();
             }

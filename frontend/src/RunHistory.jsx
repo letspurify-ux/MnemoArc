@@ -22,7 +22,6 @@ const stages = {
   model: "모델 응답",
   tools: "도구 실행",
   document_review: "문서 검토",
-  answer_review: "답변 검토",
   completion_review: "완료 조건 검증",
   checkpoint: "기억 정리",
   continuing: "답변 이어 쓰기",

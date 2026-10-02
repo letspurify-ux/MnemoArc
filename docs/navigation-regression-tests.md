@@ -64,4 +64,4 @@ cargo test --test navigation_eval live_navigation_regressions -- --ignored --noc
 
 새 세션 기본 탐색 도구, 구문 트리 캐시, 호출·토큰 상한 검사와 추가 실측은 [소스 탐색 효율 개선](navigation-efficiency-improvement.md)에 기록했다. 후속 실측에는 의미·인용·비용 기준 실패가 남아 있으므로 위 과거 통과 결과를 현재 실행의 안정성 보장으로 해석하지 않는다.
 
-소스 답변 1회 검토와 문자 OR 검색의 설계·후속 평가 조건은 [소스 답변 검토](source-answer-review.md)를 참고한다. `MNEMOARC_NAV_REVIEW=off`는 검토만 끄는 비교 옵션이다.
+문자 OR 검색의 설계·후속 평가 조건은 [소스 답변 검토](source-answer-review.md)를 참고한다. 소스 답변 1회 검토와 `MNEMOARC_NAV_REVIEW` 비교 옵션은 2026-10-02에 제거했다.
