@@ -817,11 +817,6 @@ export default function App() {
                   </button>
                 </div>
               </div>
-              {!sessionReady && (
-                <div className="pending-note" role="status">
-                  최신 내용을 확인하는 중…
-                </div>
-              )}
               {session.pending_config && (
                 <div className="pending-note">
                   설정 변경이 대기 중입니다. 현재 요청이 끝나거나 필요한 기억
