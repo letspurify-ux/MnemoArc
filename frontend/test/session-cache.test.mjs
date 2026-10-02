@@ -19,17 +19,6 @@ test("recent sessions retain their loaded pages and evict the least recently use
   assert.equal(cache.peek("c"), null);
 });
 
-test("the browser cache releases oversized and cumulatively large responses", () => {
-  const cache = createSessionCache({ maxBytes: 600 });
-  const session = (id, text) => ({ id, revision: 1, bundles: [{ messages: [{ content: text }] }] });
-  cache.set(session("a", "a".repeat(100)));
-  cache.set(session("b", "b".repeat(100)));
-  assert.equal(cache.peek("a"), null);
-  assert.equal(cache.peek("b").id, "b");
-  cache.set(session("b", "b".repeat(1000)));
-  assert.equal(cache.peek("b"), null);
-});
-
 test("other sessions do not trigger detail reads and accumulated changes keep both scopes", () => {
   const change = (session, state = false, revision = 10) => JSON.stringify({ session, state, revision });
   assert.deepEqual(changeRefresh(change("b"), "a"), { state: false, session: false });

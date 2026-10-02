@@ -5,6 +5,22 @@ use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::OnceLock;
 
+/// Structured failure details survive the common envelope and batch nesting.
+/// Display retains the stable prefix used by existing recovery classification.
+#[derive(Debug)]
+pub(crate) struct DiagnosticError {
+    pub message: String,
+    pub data: Value,
+}
+
+impl std::fmt::Display for DiagnosticError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DiagnosticError {}
+
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Class {
@@ -57,6 +73,15 @@ pub fn describe(message: &str) -> Value {
         (Class::Prerequisite, "repair_checkpoint_on_next_request")
     } else if code == "memory_sources_required" {
         (Class::MissingEvidence, "restore_memory_evidence")
+    } else if code == "memory_revision_missing" {
+        (Class::InvalidInput, "supply_memory_revision")
+    } else if code == "memory_reference_unverified" {
+        (Class::Prerequisite, "repair_memory_references")
+    } else if matches!(
+        code,
+        "memory_reference_stale" | "memory_reference_missing" | "memory_reference_mixed"
+    ) {
+        (Class::StaleState, "repair_memory_references")
     } else if code == "verification_sources_required" {
         (Class::MissingEvidence, "lookup_observed_evidence")
     } else if code == "item_must_be_written_before_verification" || code == "review_repair_required"
@@ -255,6 +280,22 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
     }
     let candidates: &[&str] = match result["recovery"]["action"].as_str().unwrap_or("") {
         "restore_memory_evidence" => &["memory_read", "source_lookup", "history"],
+        "supply_memory_revision" => &[
+            "memory_read",
+            "memory_find",
+            "memory_write",
+            "memory_manage",
+        ],
+        "repair_memory_references" => &[
+            "memory_read",
+            "memory_find",
+            "source_lookup",
+            "file_read",
+            "memory_write",
+            "investigation",
+            "task_state",
+            "history",
+        ],
         "repair_checkpoint_on_next_request" => &["history", "checkpoint_complete"],
         "repair_checkpoint_memory" => &[
             "memory_write",
@@ -314,6 +355,12 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         }
         "correct_arguments" if call.name == "tool_select" => &["tool_select", "task_state"],
         "correct_arguments" if call.name == "task_state" => &["task_state"],
+        "correct_arguments" if call.name == "memory_write" => {
+            &["memory_write", "source_lookup", "history"]
+        }
+        "correct_arguments" if call.name == "memory_manage" => {
+            &["memory_manage", "memory_read", "source_lookup", "history"]
+        }
         "correct_arguments" if call.name == "task_plan" => &["task_plan"],
         "correct_arguments" if call.name == "investigation" => &["investigation"],
         "correct_arguments" if call.name == "file_list" => &["file_list"],

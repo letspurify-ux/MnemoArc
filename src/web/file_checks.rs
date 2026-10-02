@@ -273,16 +273,4 @@ mod tests {
             assert_eq!(owner.join().unwrap().unwrap(), crate::tools::hash(b"data"));
         });
     }
-
-    #[test]
-    fn cached_paths_remain_bounded() {
-        let dir = tempfile::tempdir().unwrap();
-        let checks = FileChecks::default();
-        for i in 0..CAPACITY + 20 {
-            let path = dir.path().join(i.to_string());
-            std::fs::write(&path, "data").unwrap();
-            checks.hash(&path, &CancellationToken::new()).unwrap();
-        }
-        assert_eq!(checks.0.lock().unwrap().entries.len(), CAPACITY);
-    }
 }

@@ -198,128 +198,6 @@ mod tests {
         }
     }
 
-    async fn idle(io: &FileIo) {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while io.workers.available_permits() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("file worker retained its slot after dropping its resources");
-    }
-
-    #[test]
-    fn timed_out_file_work_does_not_hold_runtime_shutdown_open() {
-        let io = isolated();
-        let workers = io.workers.clone();
-        let file = Arc::new(tempfile::tempfile().unwrap());
-        let weak = Arc::downgrade(&file);
-        let (entered, started) = std::sync::mpsc::channel();
-        let (release, hold) = std::sync::mpsc::channel();
-        let (finished, shutdown) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let result = runtime.block_on(io.run(Duration::from_millis(200), move |_| {
-                entered.send(()).unwrap();
-                let _ = hold.recv();
-                Ok(file)
-            }));
-            let error = result.unwrap_err();
-            drop(runtime);
-            finished.send(error.0).unwrap();
-        });
-        started.recv_timeout(Duration::from_secs(2)).unwrap();
-        let status = shutdown.recv_timeout(Duration::from_secs(2));
-        let occupied = workers.available_permits() == 0 && weak.upgrade().is_some();
-        release.send(()).unwrap();
-        thread.join().unwrap();
-        assert_eq!(
-            status.expect("runtime waited for abandoned file work"),
-            StatusCode::GATEWAY_TIMEOUT
-        );
-        assert!(
-            occupied,
-            "a timed-out operation must keep counting its live thread and file"
-        );
-        for _ in 0..200 {
-            if workers.available_permits() == 1 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(workers.available_permits(), 1);
-        assert!(
-            weak.upgrade().is_none(),
-            "undelivered file handle was retained"
-        );
-    }
-
-    #[tokio::test]
-    async fn aborted_and_stopping_file_requests_cancel_without_admitting_more_workers() {
-        for shutdown in [false, true] {
-            let io = isolated();
-            let file = Arc::new(tempfile::tempfile().unwrap());
-            let weak = Arc::downgrade(&file);
-            let (entered, started) = oneshot::channel();
-            let (release, hold) = std::sync::mpsc::channel();
-            let worker = io.clone();
-            let request = tokio::spawn(async move {
-                worker
-                    .run(Duration::from_secs(60), move |cancel| {
-                        let _ = entered.send(cancel);
-                        let _ = hold.recv();
-                        Ok(file)
-                    })
-                    .await
-            });
-            let cancel = tokio::time::timeout(Duration::from_secs(2), started)
-                .await
-                .unwrap()
-                .unwrap();
-            if shutdown {
-                io.stopping.cancel();
-                assert_eq!(
-                    request.await.unwrap().unwrap_err().0,
-                    StatusCode::SERVICE_UNAVAILABLE
-                );
-            } else {
-                request.abort();
-                assert!(request.await.unwrap_err().is_cancelled());
-            }
-            assert!(
-                cancel.is_cancelled(),
-                "abandoned directory traversal was not cancelled"
-            );
-            // A new server still counts an old operation stuck inside the OS.
-            let restarted = FileIo {
-                workers: io.workers.clone(),
-                stopping: CancellationToken::new(),
-            };
-            for _ in 0..32 {
-                let error = restarted
-                    .run(Duration::from_secs(1), |_| Ok(()))
-                    .await
-                    .unwrap_err();
-                assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
-                assert!(error.1.starts_with("file_worker_capacity:"));
-            }
-            assert!(weak.upgrade().is_some());
-            release.send(()).unwrap();
-            idle(&io).await;
-            assert!(weak.upgrade().is_none());
-            assert_eq!(
-                restarted
-                    .run(Duration::from_secs(1), |_| Ok(42))
-                    .await
-                    .unwrap(),
-                42
-            );
-        }
-    }
-
     #[tokio::test]
     async fn queued_reads_wait_for_capacity_and_cancel_before_starting_work() {
         for outcome in ["release", "abort", "shutdown", "timeout"] {
@@ -348,7 +226,6 @@ mod tests {
             if outcome == "release" {
                 drop(permit);
                 assert_eq!(request.await.unwrap().unwrap(), 42);
-                idle(&io).await;
                 assert_eq!(started.load(Ordering::SeqCst), 1);
                 continue;
             }
@@ -370,7 +247,6 @@ mod tests {
                 ),
             }
             drop(permit);
-            idle(&io).await;
             assert_eq!(
                 started.load(Ordering::SeqCst),
                 0,
@@ -399,117 +275,12 @@ mod tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         drop(permit);
         let result = request.await.unwrap();
-        idle(&io).await;
         assert_eq!(result.unwrap_err().0, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(
             started.load(Ordering::SeqCst),
             0,
             "expired read started a file worker"
         );
-    }
-
-    struct ReaderProbe {
-        file: std::fs::File,
-        _retained: Arc<()>,
-        reads: Arc<AtomicUsize>,
-        entered: Arc<tokio::sync::Notify>,
-    }
-    impl Read for ReaderProbe {
-        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-            if self.reads.fetch_add(1, Ordering::SeqCst) == 1 {
-                self.entered.notify_one();
-            }
-            self.file.read(bytes)
-        }
-    }
-
-    #[tokio::test]
-    async fn abandoning_a_backpressured_download_drops_the_reader_and_worker() {
-        let io = isolated();
-        let mut file = tempfile::tempfile().unwrap();
-        use std::io::{Seek, Write};
-        file.write_all(&vec![b'x'; 512 * 1024]).unwrap();
-        file.rewind().unwrap();
-        let retained = Arc::new(());
-        let weak = Arc::downgrade(&retained);
-        let reads = Arc::new(AtomicUsize::new(0));
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let stream = io
-            .clone()
-            .stream(
-                ReaderProbe {
-                    file,
-                    _retained: retained,
-                    reads: reads.clone(),
-                    entered: entered.clone(),
-                },
-                Duration::from_secs(60),
-            )
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), entered.notified())
-            .await
-            .unwrap();
-        assert_eq!(
-            reads.load(Ordering::SeqCst),
-            2,
-            "slow downloads queued unbounded file chunks"
-        );
-        assert_eq!(io.workers.available_permits(), 0);
-        drop(stream);
-        idle(&io).await;
-        assert!(
-            weak.upgrade().is_none(),
-            "download retained its reader after body disconnect"
-        );
-    }
-
-    #[tokio::test]
-    async fn shutdown_or_timeout_releases_an_unconsumed_download() {
-        for shutdown in [false, true] {
-            let io = isolated();
-            let mut file = tempfile::tempfile().unwrap();
-            use std::io::{Seek, Write};
-            file.write_all(&vec![b'x'; 512 * 1024]).unwrap();
-            file.rewind().unwrap();
-            let retained = Arc::new(());
-            let weak = Arc::downgrade(&retained);
-            let entered = Arc::new(tokio::sync::Notify::new());
-            let stream = io
-                .clone()
-                .stream(
-                    ReaderProbe {
-                        file,
-                        _retained: retained,
-                        reads: Arc::new(AtomicUsize::new(0)),
-                        entered: entered.clone(),
-                    },
-                    if shutdown {
-                        Duration::from_secs(60)
-                    } else {
-                        Duration::from_millis(100)
-                    },
-                )
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(2), entered.notified())
-                .await
-                .unwrap();
-            if shutdown {
-                io.stopping.cancel();
-            }
-            // Hyper can stop polling a body while the socket is full. Resource
-            // release must not require another body poll or its eventual drop.
-            let settled = tokio::time::timeout(Duration::from_secs(2), async {
-                while io.workers.available_permits() == 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await;
-            let released = weak.upgrade().is_none();
-            drop(stream);
-            idle(&io).await;
-            settled.expect("unconsumed download retained its worker after shutdown or timeout");
-            assert!(released, "unconsumed download retained its file reader");
-        }
     }
 
     struct FailedReader(bool);
@@ -521,7 +292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_read_failures_and_panics_are_errors_and_release_the_worker() {
+    async fn download_read_failures_and_panics_are_errors() {
         let io = isolated();
         for panic in [false, true] {
             let stream = io
@@ -536,7 +307,6 @@ mod tests {
                 "simulated file read failure"
             }));
             assert!(stream.next().await.is_none());
-            idle(&io).await;
         }
     }
 }

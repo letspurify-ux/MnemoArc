@@ -982,6 +982,150 @@ fn a_bare_apply_names_the_missing_revision_and_operations() {
 }
 
 #[test]
+fn live_out_of_order_batch_exposes_operation_and_blockers_without_committing_earlier_operations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(
+        &mut s,
+        json!([{"op":"insert","texts":["Write chapter 1","Write chapter 2","Review chapter 3","Complete chapter 4"]}]),
+    );
+    let before = json!(s.task);
+    let args = json!({"action":"apply","expected_revision":1,"operations":[
+        {"op":"complete","id":"T1","result":"Saved chapter 1"},
+        {"op":"complete","id":"T2","result":"Saved chapter 2"},
+        {"op":"complete","id":"T4","result":"Saved chapter 4"}
+    ]});
+    let call = ToolCall {
+        id: "live-order".into(),
+        name: "task_plan".into(),
+        arguments: args.to_string(),
+    };
+    let result = tools::run_call(&mut s, &call);
+    assert_eq!(result["status"], "ok");
+    assert_eq!(result["data"]["applied"], false);
+    let conflict = &result["data"]["conflict"];
+    assert_eq!(conflict["code"], "out_of_order");
+    assert_eq!(conflict["operation_index"], 2);
+    assert_eq!(conflict["operation"], "complete");
+    assert_eq!(conflict["target_id"], "T4");
+    assert_eq!(conflict["current_id"], "T3");
+    assert_eq!(conflict["blocking_ids"], json!(["T3"]));
+    assert_eq!(conflict["expected_revision"], 1);
+    assert_eq!(conflict["current_revision"], 1);
+    assert!(
+        conflict["correction"]
+            .as_str()
+            .unwrap()
+            .contains("whole batch")
+    );
+    assert_eq!(result["data"]["plan"]["current"]["id"], "T1");
+    assert_eq!(json!(s.task), before);
+    assert!(!s.ledger.contains_key(&call.id));
+    let corrected = ToolCall {
+        arguments: json!({"action":"apply","expected_revision":1,"operations":[
+            {"op":"complete","id":"T1","result":"Saved chapter 1"},
+            {"op":"complete","id":"T2","result":"Saved chapter 2"},
+            {"op":"complete","id":"T3","result":"Compared chapter 3 with its sources"},
+            {"op":"complete","id":"T4","result":"Saved chapter 4"}
+        ]})
+        .to_string(),
+        ..call
+    };
+    assert_eq!(tools::run_call(&mut s, &corrected)["data"]["applied"], true);
+    assert_eq!(s.task.todos_completed_total, 4);
+    assert_eq!(s.task.plan_revision, 2);
+}
+
+#[test]
+fn structured_plan_revision_and_parse_conflicts_remain_nonterminal_and_atomic() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(
+        &mut s,
+        json!([{"op":"insert","texts":["Write the document"]}]),
+    );
+    let before = json!(s.task);
+    for (args, code, expected, index) in [
+        (
+            json!({"action":"apply"}),
+            "missing_revision",
+            Value::Null,
+            Value::Null,
+        ),
+        (
+            json!({"action":"apply","expected_revision":0,"operations":[{"op":"remove","id":"T1","reason":"obsolete"}]}),
+            "revision_conflict",
+            json!(0),
+            Value::Null,
+        ),
+        (
+            json!({"action":"apply","expected_revision":1,"operations":[{"op":"remove","id":"T1","reason":"obsolete"},false]}),
+            "invalid_operations",
+            json!(1),
+            json!(1),
+        ),
+        (
+            json!({"action":"apply","expected_revision":1,"operations":[{"op":"complete","id":"unknown","result":"done"}]}),
+            "unknown_item",
+            json!(1),
+            json!(0),
+        ),
+    ] {
+        let result = tools::execute(&mut s, "task_plan", args).unwrap();
+        assert_eq!(result["applied"], false);
+        assert_eq!(result["conflict"]["code"], code);
+        assert_eq!(result["conflict"]["expected_revision"], expected);
+        assert_eq!(result["conflict"]["current_revision"], 1);
+        assert_eq!(result["conflict"]["operation_index"], index);
+        assert_eq!(json!(s.task), before);
+    }
+}
+
+#[test]
+fn small_plan_conflicts_preserve_machine_fields_and_archive_all_blockers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let texts: Vec<_> = (1..=100).map(|n| format!("Finish outcome {n}")).collect();
+    apply(&mut s, json!([{"op":"insert","texts":texts}]));
+    s.config.result_tokens = 200;
+    let call = ToolCall {
+        id: "many-blockers".into(),
+        name: "task_plan".into(),
+        arguments: json!({"action":"apply","expected_revision":1,"operations":[
+            {"op":"complete","id":"T1","result":"Finished outcome 1"},
+            {"op":"complete","id":"T100","result":"Finished outcome 100"}
+        ]})
+        .to_string(),
+    };
+    let result = tools::run_call(&mut s, &call);
+    assert_eq!(result["status"], "ok");
+    assert_eq!(result["data"]["applied"], false, "{result}");
+    let conflict = &result["data"]["conflict"];
+    assert_eq!(conflict["code"], "out_of_order", "{result}");
+    assert_eq!(conflict["operation_index"], 1);
+    assert_eq!(conflict["target_id"], "T100");
+    assert_eq!(conflict["current_id"], "T2");
+    assert_eq!(conflict["expected_revision"], 1);
+    assert_eq!(conflict["current_revision"], 1);
+    assert_eq!(conflict["blocking_count"], 98);
+    assert_eq!(conflict["blocking_ids"][0], "T2");
+    assert_eq!(conflict["blocking_ids_truncated"], true);
+    assert!(
+        tools::result_tokens(&call, &result, &s.config.model) <= 200,
+        "{result}"
+    );
+    let archive = s
+        .history
+        .read(result["next_cursor"]["id"].as_u64().unwrap())
+        .unwrap();
+    let full = &archive.messages[0]["result"]["data"]["conflict"];
+    assert_eq!(full["blocking_ids"].as_array().unwrap().len(), 98);
+    assert!(full["correction"].is_string());
+    assert_eq!(s.task.todos_completed_total, 0);
+    assert_eq!(s.task.current_todo().unwrap().id, "T1");
+}
+
+#[test]
 fn insert_accepts_a_single_text_and_ignores_an_invented_id() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());

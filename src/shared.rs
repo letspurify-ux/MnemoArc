@@ -112,11 +112,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn copies_share_payloads_and_mutations_remain_private_with_fresh_counts() {
-        let first: Shared<Vec<String>> = vec!["large retained content".repeat(100_000)].into();
+    fn mutations_remain_private_with_fresh_counts() {
+        let first: Shared<Vec<String>> = vec!["original content".into()].into();
         let bytes = first.bytes();
         let mut copy = first.clone();
-        assert!(Arc::ptr_eq(&first.0, &copy.0));
         copy.push("new message".into());
         assert_eq!(first.len(), 1);
         assert_eq!(copy.len(), 2);

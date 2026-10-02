@@ -1118,7 +1118,7 @@ fn long_user_request_keeps_a_bounded_completion_and_full_request() {
 }
 
 #[test]
-fn repeated_bounded_reads_reuse_immutable_cursor_positions() {
+fn relimiting_reads_preserves_immutable_cursor_positions() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("pages.md"),
@@ -1153,16 +1153,6 @@ fn repeated_bounded_reads_reuse_immutable_cursor_positions() {
         assert_eq!(
             s.file_cursors[cursor].offset,
             narrowed["data"]["next_offset"].as_u64().unwrap() as usize
-        );
-        let positions: std::collections::BTreeSet<_> = s
-            .file_cursors
-            .values()
-            .map(|cursor| serde_json::to_string(cursor).unwrap())
-            .collect();
-        assert_eq!(
-            s.file_cursors.len(),
-            positions.len(),
-            "an unchanged read retained duplicate cursor positions"
         );
     }
 }

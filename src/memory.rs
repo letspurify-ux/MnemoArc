@@ -130,6 +130,44 @@ pub struct MemoryMeta {
     pub status: MemoryStatus,
     pub revision: u64,
 }
+
+/// Preserve the optimistic-lock state without making tool callers parse prose.
+#[derive(Debug)]
+pub struct MemoryRevisionConflict {
+    pub memory: MemoryMeta,
+    pub expected_revision: Option<u64>,
+}
+
+impl std::fmt::Display for MemoryRevisionConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.expected_revision {
+            None => write!(
+                f,
+                "memory_revision_missing: this key already exists at revision {}; review memory {} and supply expected_revision; resend the intended content and observed source_ids",
+                self.memory.revision, self.memory.id
+            ),
+            Some(sent) => write!(
+                f,
+                "revision_conflict: expected {}, received {sent} for memory {}; read its latest content before updating and resend observed source_ids",
+                self.memory.revision, self.memory.id
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MemoryRevisionConflict {}
+
+fn check_revision(memory: &Memory, expected_revision: Option<u64>) -> Result<()> {
+    if expected_revision != Some(memory.revision) {
+        return Err(MemoryRevisionConflict {
+            memory: memory.meta(),
+            expected_revision,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 impl Memory {
     pub fn meta(&self) -> MemoryMeta {
         MemoryMeta {
@@ -226,9 +264,7 @@ impl MemoryStore {
                     "memory_sources_required: an observed fact cannot discard its existing sources; supply valid source_ids or explicitly mark the new claim inferred for review"
                 );
             }
-            if input.expected_revision != Some(m.revision) {
-                bail!("revision_conflict: expected {}", m.revision);
-            }
+            check_revision(m, input.expected_revision)?;
         } else if input.expected_revision.is_some() {
             bail!(
                 "revision_conflict: no memory has this key yet; omit expected_revision to create it (only updates of an existing memory use its revision)"
@@ -337,9 +373,7 @@ impl MemoryStore {
                     "memory_sources_required: an observed fact cannot discard its existing sources; supply valid source_ids or explicitly mark the new claim inferred for review"
                 );
             }
-            if input.expected_revision != Some(old.revision) {
-                bail!("revision_conflict: expected {}", old.revision);
-            }
+            check_revision(&old, input.expected_revision)?;
             // The old keyed entry is deliberately removed as part of this
             // operation, so save() must create the replacement instead of
             // trying to apply the same optimistic-lock check a second time.

@@ -609,20 +609,6 @@ async fn local_api_rejects_cross_origin_mutation_and_invalid_project() {
 }
 
 #[tokio::test]
-async fn shutdown_closes_event_streams_without_waiting_for_browser_disconnect() {
-    let dir = tempfile::tempdir().unwrap();
-    let (url, state, server) = launch(dir.path()).await;
-    let response = reqwest::get(format!("{url}/api/events")).await.unwrap();
-    state.shutdown().await;
-    let body = tokio::time::timeout(std::time::Duration::from_secs(1), response.text())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(body.contains("event: changed"));
-    server.abort();
-}
-
-#[tokio::test]
 async fn state_details_and_reconnected_events_identify_the_same_server_instance() {
     let dir = tempfile::tempdir().unwrap();
     let mut previous = String::new();

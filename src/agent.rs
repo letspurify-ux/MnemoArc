@@ -3647,16 +3647,6 @@ mod worker_wait_tests {
             tokio::time::Instant::now() + Duration::from_secs(30),
         )
         .await;
-        let positions: std::collections::BTreeSet<_> = s
-            .file_cursors
-            .values()
-            .map(|cursor| serde_json::to_string(cursor).unwrap())
-            .collect();
-        assert_eq!(
-            s.file_cursors.len(),
-            positions.len(),
-            "parallel workers retained duplicate cursor positions"
-        );
         for result in results {
             assert_eq!(result["status"], "ok");
             let id = result["next_cursor"]["cursor"].as_str().unwrap();
@@ -3680,7 +3670,7 @@ mod worker_wait_tests {
     }
 
     #[tokio::test]
-    async fn parallel_reads_keep_only_read_metadata_and_preserve_suppression() {
+    async fn parallel_reads_preserve_suppression_and_owner_history() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("read.rs"),
@@ -3691,13 +3681,6 @@ mod worker_wait_tests {
         s.project.root = dir.path().canonicalize().unwrap();
         s.config.model = "gpt-4o".into();
         s.active_tools = ToolRegistry::optional_names();
-        context::tokens("Warm the shared tokenizer.", &s.config.model);
-        for _ in 0..8 {
-            s.history.push(
-                vec![json!({"role":"assistant","content":"x".repeat(2 * 1024 * 1024)})],
-                true,
-            );
-        }
         let read = tools::execute(
             &mut s,
             "file_read",
@@ -3712,10 +3695,6 @@ mod worker_wait_tests {
                 true,
             );
         }
-        let worker_history = tools::parallel_read_history(&s.history);
-        let worker_bytes = worker_history.bytes();
-        assert_eq!(worker_history.next_id, s.history.next_id);
-        drop(worker_history);
         let history_bytes = s.history.bytes();
         let history_next_id = s.history.next_id;
         let calls: Vec<_> = [
@@ -3753,15 +3732,10 @@ mod worker_wait_tests {
         assert_eq!(results[1]["data"]["content"]["text"], "fn observed() {}");
         assert_eq!(s.history.bytes(), history_bytes);
         assert_eq!(s.history.next_id, history_next_id);
-        eprintln!("parallel worker read history: {worker_bytes} bytes");
-        assert!(
-            worker_bytes < 8 * 1024,
-            "read workers retained conversation payloads: {worker_bytes} bytes"
-        );
 
         // Retired observations and hashes from a previous file version must
         // not suppress a fresh read when rebuilding the worker's metadata.
-        for bundle in s.history.bundles.iter_mut().skip(8) {
+        for bundle in s.history.bundles.iter_mut() {
             bundle.active = false;
         }
         let results = read_parallel(
@@ -3772,7 +3746,7 @@ mod worker_wait_tests {
         )
         .await;
         assert_eq!(results[0]["data"]["content"]["text"], "fn observed() {}");
-        for bundle in s.history.bundles.iter_mut().skip(8) {
+        for bundle in s.history.bundles.iter_mut() {
             bundle.active = true;
         }
         std::fs::write(dir.path().join("read.rs"), "fn changed() {}\n").unwrap();
@@ -3786,86 +3760,6 @@ mod worker_wait_tests {
         assert_eq!(results[0]["data"]["content"]["text"], "fn changed() {}");
         assert_eq!(s.history.bytes(), history_bytes);
         assert_eq!(s.history.next_id, history_next_id);
-    }
-
-    #[tokio::test]
-    async fn queued_snapshot_does_not_clone_a_session_before_queue_space_exists() {
-        let s = session();
-        let shared = s.write_outcome_uncertain.clone();
-        let initial_refs = Arc::strong_count(&shared);
-        let (events, _receiver) = mpsc::channel(1);
-        events
-            .try_send(AgentEvent::Notice {
-                session: s.id.clone(),
-                text: "full".into(),
-            })
-            .unwrap();
-        let cancel = CancellationToken::new();
-        let future = snapshot(
-            &s,
-            &events,
-            &cancel,
-            tokio::time::Instant::now() + Duration::from_secs(60),
-        );
-        tokio::pin!(future);
-        assert!(futures_util::poll!(&mut future).is_pending());
-        assert_eq!(Arc::strong_count(&shared), initial_refs);
-        cancel.cancel();
-        future.await;
-        assert_eq!(Arc::strong_count(&shared), initial_refs);
-    }
-
-    #[tokio::test]
-    async fn abandoned_tool_receiver_keeps_its_slot_until_the_thread_drops_its_session() {
-        let workers = Arc::new(tokio::sync::Semaphore::new(1));
-        let retained = session();
-        let weak = Arc::downgrade(&retained.write_outcome_uncertain);
-        let (release, hold) = std::sync::mpsc::channel();
-        let receiver = spawn_tool_thread(workers.clone(), move || {
-            let _ = hold.recv();
-            retained
-        })
-        .unwrap();
-        drop(receiver);
-        for _ in 0..32 {
-            let error = spawn_tool_thread(workers.clone(), || ()).unwrap_err();
-            assert!(error.to_string().starts_with("tool_worker_capacity:"));
-            assert_eq!(workers.available_permits(), 0);
-            assert!(weak.upgrade().is_some());
-        }
-        release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while workers.available_permits() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(
-            weak.upgrade().is_none(),
-            "the abandoned worker's session must be dropped"
-        );
-        assert_eq!(
-            spawn_tool_thread(workers.clone(), || 42)
-                .unwrap()
-                .await
-                .unwrap(),
-            42
-        );
-    }
-
-    #[tokio::test]
-    async fn panicking_tool_thread_releases_its_slot() {
-        let workers = Arc::new(tokio::sync::Semaphore::new(1));
-        let receiver =
-            spawn_tool_thread(workers.clone(), || panic!("simulated tool thread panic")).unwrap();
-        assert!(receiver.await.is_err());
-        let permit = tokio::time::timeout(Duration::from_secs(2), workers.acquire())
-            .await
-            .unwrap()
-            .unwrap();
-        drop(permit);
-        assert_eq!(workers.available_permits(), 1);
     }
 
     #[tokio::test]

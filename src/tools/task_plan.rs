@@ -46,6 +46,34 @@ enum Operation {
     },
 }
 
+impl Operation {
+    fn identity(&self) -> (&'static str, Option<&str>) {
+        match self {
+            Self::Insert { .. } => ("insert", None),
+            Self::Update { id, .. } => ("update", Some(id)),
+            Self::Split { id, .. } => ("split", Some(id)),
+            Self::Move { id, .. } => ("move", Some(id)),
+            Self::Remove { id, .. } => ("remove", Some(id)),
+            Self::Complete { id, .. } => ("complete", Some(id)),
+            Self::Reopen { id, .. } => ("reopen", Some(id)),
+        }
+    }
+}
+
+fn operation_error(message: String, details: Value) -> anyhow::Error {
+    recovery::DiagnosticError {
+        message,
+        data: details,
+    }
+    .into()
+}
+
+fn error_details(error: &anyhow::Error, code: &str) -> Value {
+    error
+        .downcast_ref::<recovery::DiagnosticError>()
+        .map_or_else(|| json!({"code":code}), |error| error.data.clone())
+}
+
 pub fn spec() -> ToolSpec {
     let id = json!({"type":"string","minLength":1});
     let short = json!({"type":"string","minLength":1,"maxLength":MAX_TEXT_CHARS});
@@ -77,7 +105,7 @@ pub fn spec() -> ToolSpec {
     ]);
     ToolSpec {
         name: "task_plan",
-        description: "Manage an ordered to-do list. Read with {\"action\":\"list\"}; use offset/limit to page through the full list (default 10, maximum 20). Change with {\"action\":\"apply\",\"expected_revision\":0,\"operations\":[{\"op\":\"insert\",\"texts\":[\"Write the requested section\"]}]}; copy the actual revision, and keep operations as an array, not quoted JSON. Applies 1..16 operations atomically. insert requires texts; optional before is a pending ID (omit to append). update requires id/text. split requires an unfinished id and 2..100 smaller texts in execution order; it keeps the original ID for the first subtask and creates IDs for the rest. Split a broad item only when its parts together preserve the original outcome. move requires id and optional before. complete requires the CURRENT item's id/result after actually doing the work. remove and reopen require id/reason; remove applies only to unfinished items; reopen puts a completed item before current. Keep at most 100 unfinished small concrete outcomes; split investigation and saving when each is a meaningful result, and move promptly to writing. Retain only the latest 5 completed items and cumulative completed_total. Input/transition/capacity conflicts return applied=false without stopping; follow the correction or continue current work. Plan edits are not actual progress. Preserve user requirements in task_state.completion.",
+        description: "Manage an ordered to-do list; the first unfinished item is current. list accepts offset/limit (default 10, maximum 20). apply requires expected_revision copied from the returned plan and an operations array of 1..16 objects, applied atomically. insert: texts, optional before; update: id/text; split: unfinished id and 2..100 specific texts preserving its goal, keeping its ID for the first part; move: unfinished id, optional before. Omit before to append. complete: CURRENT id/result after actually doing the work. remove: unfinished id/reason; reopen: completed id/reason, placed before current. Keep at most 100 unfinished small outcomes and the latest 5 completed items plus completed_total. Recoverable conflicts return applied=false; the whole batch remains unapplied. conflict reports code, zero-based operation_index, target/current IDs, blocking_ids, expected/current revisions and correction. Continue current work; plan edits are not progress. Preserve user requirements in task_state.completion.",
         optional: false,
         read_only: false,
         parameters,
@@ -118,7 +146,12 @@ fn index(task: &TaskState, id: &str) -> Result<usize> {
     task.todos
         .iter()
         .position(|item| item.id == id)
-        .ok_or_else(|| anyhow::anyhow!("Unknown item {id}; copy IDs from the returned plan"))
+        .ok_or_else(|| {
+            operation_error(
+                format!("Unknown item {id}; copy IDs from the returned plan"),
+                json!({"code":"unknown_item","target_id":id}),
+            )
+        })
 }
 
 fn position(task: &TaskState, before: Option<&str>) -> Result<usize> {
@@ -259,10 +292,13 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
                     .filter(|item| !item.done)
                     .map(|item| item.id.as_str())
                     .collect();
-                bail!(
-                    "Complete the current item first, or insert/move its prerequisite before it; {id} can complete only after {} are completed or removed, in list order",
-                    ahead.join(", ")
-                );
+                return Err(operation_error(
+                    format!(
+                        "Complete the current item first, or insert/move its prerequisite before it; {id} can complete only after {} are completed or removed, in list order",
+                        ahead.join(", ")
+                    ),
+                    json!({"code":"out_of_order","target_id":id,"blocking_ids":ahead,"blocking_count":ahead.len()}),
+                ));
             }
             task.todos[at].done = true;
             task.todos[at].result = result.into();
@@ -290,8 +326,52 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
     Ok(())
 }
 
-fn unchanged(task: &TaskState, reason: String) -> Value {
-    json!({"applied":false,"reason":reason,"plan":view(task, 0, DEFAULT_PAGE),"guidance":"This result does not stop the task. Continue the current item's concrete work. Use the returned revision/IDs for a necessary plan correction; keep at most 100 unfinished items by completing or removing obsolete work. Do not repeat the unchanged request."})
+fn unchanged(
+    task: &TaskState,
+    reason: String,
+    expected_revision: Option<u64>,
+    mut conflict: Value,
+) -> Value {
+    conflict["expected_revision"] = json!(expected_revision);
+    conflict["current_revision"] = json!(task.plan_revision);
+    if conflict.get("current_id").is_none() {
+        conflict["current_id"] = json!(task.current_todo().map(|item| &item.id));
+    }
+    conflict["correction"] = json!(match conflict["code"].as_str() {
+        Some("out_of_order") =>
+            "No operations were committed. Continue the blocking items' actual work first; after completing it, resend the whole batch in list order using current_revision. Remove only work that is actually obsolete, with a reason.",
+        Some("missing_revision" | "revision_conflict") =>
+            "Review the returned plan, copy current_revision into expected_revision, and combine necessary changes into one apply call.",
+        Some("pending_limit" | "state_limit") =>
+            "Shorten the request or complete/remove obsolete work, then resend a smaller batch using current_revision.",
+        _ =>
+            "Correct the reported operation using the returned IDs and current_revision, then resend the whole batch. No earlier operation was committed.",
+    });
+    json!({"applied":false,"reason":reason,"conflict":conflict,"plan":view(task, 0, DEFAULT_PAGE),"guidance":"This result does not stop the task. Continue the current item's concrete work. Use the returned revision/IDs for a necessary plan correction; keep at most 100 unfinished items by completing or removing obsolete work. Do not repeat the unchanged request."})
+}
+
+pub(super) fn compact_conflict(conflict: &Value) -> Value {
+    let mut compact = json!({});
+    for field in [
+        "code",
+        "operation_index",
+        "target_id",
+        "current_id",
+        "expected_revision",
+        "current_revision",
+    ] {
+        if let Some(value) = conflict.get(field) {
+            compact[field] = value.clone();
+        }
+    }
+    if let Some(ids) = conflict["blocking_ids"].as_array() {
+        compact["blocking_ids"] = json!(ids.iter().take(3).collect::<Vec<_>>());
+        compact["blocking_count"] = json!(ids.len());
+        if ids.len() > 3 {
+            compact["blocking_ids_truncated"] = json!(true);
+        }
+    }
+    compact
 }
 
 fn value_type(value: &Value) -> &'static str {
@@ -373,18 +453,25 @@ fn parse_operations(value: &Value) -> Result<Parsed> {
     for (i, item) in items.into_iter().enumerate() {
         let decoded;
         let item = if let Some(text) = item.as_str() {
-            decoded =
-                decode_json(text).map_err(|error| anyhow::anyhow!("operations[{i}]: {error}"))?;
+            decoded = decode_json(text).map_err(|error| {
+                operation_error(
+                    format!("operations[{i}]: {error}"),
+                    json!({"code":"invalid_operations","operation_index":i}),
+                )
+            })?;
             normalized = true;
             &decoded
         } else {
             item
         };
         if !item.is_object() {
-            bail!(
-                "operations[{i}] must be an operation object; received {}",
-                value_type(item)
-            );
+            return Err(operation_error(
+                format!(
+                    "operations[{i}] must be an operation object; received {}",
+                    value_type(item)
+                ),
+                json!({"code":"invalid_operations","operation_index":i}),
+            ));
         }
         // Live runs sent insert with a single "text" and an invented "id";
         // the plan assigns IDs, so accept that shape as one new item.
@@ -467,9 +554,12 @@ fn parse_operations(value: &Value) -> Result<Parsed> {
                 normalized = true;
             }
         }
+        let operation_name = item["op"].clone();
+        let target_id = item.get("id").cloned();
         let operation = serde_json::from_value(item).map_err(|error| {
             let detail: String = error.to_string().chars().take(240).collect();
-            anyhow::anyhow!("operations[{i}]: {detail}")
+            operation_error(format!("operations[{i}]: {detail}"),
+                json!({"code":"invalid_operations","operation_index":i,"operation":operation_name,"target_id":target_id}))
         })?;
         operations.push(operation);
     }
@@ -484,7 +574,8 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
             n(args, "limit", DEFAULT_PAGE),
         ));
     }
-    if args["expected_revision"].as_u64() != Some(s.task.plan_revision) {
+    let expected_revision = args["expected_revision"].as_u64();
+    if expected_revision != Some(s.task.plan_revision) {
         let revision = s.task.plan_revision;
         let mut reason = match args["expected_revision"].as_u64() {
             Some(sent) => format!(
@@ -497,12 +588,22 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
                 "; operations is also missing: apply needs an array of operation objects",
             );
         }
-        return Ok(unchanged(&s.task, reason));
+        return Ok(unchanged(
+            &s.task,
+            reason,
+            expected_revision,
+            json!({"code":if expected_revision.is_some() { "revision_conflict" } else { "missing_revision" }}),
+        ));
     }
     let (operations, normalized, notices) = match parse_operations(&args["operations"]) {
         Ok(operations) => operations,
         Err(error) => {
-            let mut result = unchanged(&s.task, format!("Invalid plan operation: {error}"));
+            let mut result = unchanged(
+                &s.task,
+                format!("Invalid plan operation: {error}"),
+                expected_revision,
+                error_details(&error, "invalid_operations"),
+            );
             result["input_error"] = json!({
                 "field":"operations", "expected":"array of operation objects",
                 "received":args.get("operations").map_or("missing", value_type),
@@ -514,21 +615,27 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
     let mut next = s.task.clone();
     let count = operations.len();
     for (index, operation) in operations.into_iter().enumerate() {
+        let (operation_name, target_id) = operation.identity();
+        let target_id = target_id.map(str::to_owned);
+        let current = next.current_todo().map(|item| item.id.clone());
         if let Err(error) = apply(&mut next, operation) {
             // Operations apply in order, so the plan the failing one saw can
             // differ from the one the caller read. Name the operation and the
             // item that was current at that point.
-            let current = next
-                .current_todo()
-                .map_or("none".to_owned(), |item| item.id.clone());
+            let current_text = current.as_deref().unwrap_or("none");
             let reason = if count > 1 {
                 format!(
-                    "operations[{index}] failed: {error} (current item at that point: {current}). No operation in this batch was applied; earlier operations only take effect together with it"
+                    "operations[{index}] failed: {error} (current item at that point: {current_text}). No operation in this batch was applied; earlier operations only take effect together with it"
                 )
             } else {
-                format!("{error} (current item: {current})")
+                format!("{error} (current item: {current_text})")
             };
-            return Ok(unchanged(&s.task, reason));
+            let mut conflict = error_details(&error, "invalid_operation");
+            conflict["operation_index"] = json!(index);
+            conflict["operation"] = json!(operation_name);
+            conflict["target_id"] = json!(target_id);
+            conflict["current_id"] = json!(current);
+            return Ok(unchanged(&s.task, reason, expected_revision, conflict));
         }
     }
     if next.todos.iter().filter(|item| !item.done).count() > MAX_PENDING {
@@ -537,6 +644,8 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
             format!(
                 "The plan has room for at most {MAX_PENDING} unfinished items; no operations were applied"
             ),
+            expected_revision,
+            json!({"code":"pending_limit","limit":MAX_PENDING,"requested_pending":next.todos.iter().filter(|item| !item.done).count()}),
         ));
     }
     while next.todos.iter().filter(|item| item.done).count() > MAX_COMPLETED {
@@ -559,7 +668,7 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
     if context::count(&compact, &s.config.model) > s.config.state_tokens
         || serde_json::to_vec(&next)?.len() > s.config.memory_bytes
     {
-        return Ok(unchanged(&s.task, "Task state budget is full; shorten item text or task_state findings/details before extending the plan".into()));
+        return Ok(unchanged(&s.task, "Task state budget is full; shorten item text or task_state findings/details before extending the plan".into(), expected_revision, json!({"code":"state_limit"})));
     }
     s.task = next;
     Ok(with_notices(

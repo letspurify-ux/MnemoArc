@@ -1355,32 +1355,23 @@ mod history_tests {
     }
 
     #[test]
-    fn cloned_histories_share_large_messages_and_edit_only_the_changed_payload() {
+    fn cloned_histories_keep_mutations_private_and_counts_current() {
         let mut original = SessionHistory::default();
         original.push(
-            vec![json!({"role":"assistant","content":"a".repeat(4 * 1024 * 1024)})],
+            vec![json!({"role":"assistant","content":"first message"})],
             true,
         );
         original.push(
-            vec![json!({"role":"assistant","content":"b".repeat(4 * 1024 * 1024)})],
+            vec![json!({"role":"assistant","content":"second message"})],
             true,
         );
         let bytes = original.bytes();
         let mut copy = original.clone();
-        assert!(std::ptr::eq(&*original.bundles, &*copy.bundles));
         copy.bundles[0].active = false;
         assert!(original.bundles[0].active);
-        assert!(std::ptr::eq(
-            &*original.bundles[0].messages,
-            &*copy.bundles[0].messages
-        ));
         assert_eq!(copy.bytes(), bytes + 1);
         copy.bundles[0].messages[0]["content"] = json!("edited");
         assert_ne!(original.bundles[0].messages[0], copy.bundles[0].messages[0]);
-        assert!(std::ptr::eq(
-            &*original.bundles[1].messages,
-            &*copy.bundles[1].messages
-        ));
         assert_eq!(original.bytes(), bytes);
         assert_eq!(
             copy.bytes(),

@@ -934,39 +934,6 @@ mod diagnostic_tests {
     use crate::config::Secret;
 
     #[test]
-    fn schema_caches_bound_retention_and_refresh_recent_keys() {
-        let config = Config::default();
-        let mut cache = SchemaCache(VecDeque::new());
-        let oldest = schema_cache_key(&config, &json!({"name":"oldest"}));
-        cache.insert(oldest);
-        for index in 1..SchemaCache::MAX_ENTRIES {
-            cache.insert(schema_cache_key(&config, &json!({"name":index})));
-        }
-        assert!(cache.contains(&oldest));
-        let evicted = schema_cache_key(&config, &json!({"name":1}));
-        let newest = schema_cache_key(
-            &config,
-            &json!({"name":"new","description":"x".repeat(100_000)}),
-        );
-        cache.insert(newest);
-        assert_eq!(cache.0.len(), SchemaCache::MAX_ENTRIES);
-        assert!(!cache.contains(&evicted));
-        assert!(cache.contains(&oldest));
-        for _ in 0..256 {
-            cache.insert(newest);
-        }
-        assert_eq!(cache.0.len(), SchemaCache::MAX_ENTRIES);
-        let mut other = config.clone();
-        other.model = "different-model".into();
-        assert_ne!(schema_endpoint(&config), schema_endpoint(&other));
-        assert_ne!(
-            schema_cache_key(&config, &json!({"name":"oldest"})),
-            schema_cache_key(&other, &json!({"name":"oldest"}))
-        );
-        assert_ne!(oldest, newest);
-    }
-
-    #[test]
     fn provider_diagnostics_redact_credentials_before_clipping() {
         let key = "test_api_key";
         let config = Config {

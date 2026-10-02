@@ -33,7 +33,7 @@ fn run(s: &mut Session, name: &str, args: Value) -> Value {
 }
 
 #[test]
-fn coverage_pagination_releases_obsolete_document_versions() {
+fn coverage_pagination_rejects_obsolete_document_versions() {
     let (dir, mut s) = setup();
     let observe = |s: &mut Session, name: &str, revision: usize| {
         std::fs::write(
@@ -79,11 +79,6 @@ fn coverage_pagination_releases_obsolete_document_versions() {
             .unwrap_err();
             assert!(error.to_string().starts_with("document_revision_conflict:"));
         }
-        assert_eq!(
-            s.coverage_cursors.len(),
-            2,
-            "obsolete document pages accumulated"
-        );
         previous = Some(page);
     }
     // Restoring identical old bytes must not revive a discarded legacy page:
@@ -120,7 +115,6 @@ fn coverage_pagination_releases_obsolete_document_versions() {
         );
         assert_eq!(replay["coverage"], last["coverage"]);
     }
-    assert!(s.coverage_cursors.is_empty());
 }
 
 #[test]

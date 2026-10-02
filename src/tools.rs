@@ -3,6 +3,7 @@ mod coverage;
 pub mod document_review;
 mod documentation;
 mod file_edit;
+mod memory_tools;
 mod navigation;
 pub mod recovery;
 mod search;
@@ -190,7 +191,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_write",
-                description: "Save one reusable memory. Same key requires expected_revision. Updates replace evidence: resupply valid source_ids for observed facts; existing sources are not inherited. Copy source_ids exactly from tool results; never omit them to recover from unknown_source. Facts without sources, inferred memories and memories whose file evidence changed are needs_review. Source IDs must come from program observations. Metadata has no per-entry token rejection; keep it concise because memory index context still consumes index_tokens. Oversized entries may be omitted from state and remain available through memory_find/memory_read. Put details in body. kind: fact/decision/failure/question/procedure",
+                description: "Save one reusable memory: title/summary/body/kind are required plain JSON fields. Same key requires expected_revision. Missing/stale revisions return current ID/key/status/revision and a retry patch; merge it into the full intended call. Invalid input reports received/missing/unknown fields and a JSON example. Updates replace evidence: resupply observed source_ids; sources are not inherited. Never omit source_ids after unknown_source. Unsourced facts, inferred memories and changed evidence are needs_review. Keep transient progress in task_state/checkpoint_complete, separately from stable observed facts. Metadata has no per-entry token rejection; keep it concise for index_tokens. Oversized entries remain available through memory_find/memory_read. Put details in body. kind: fact/decision/failure/question/procedure",
                 optional: false,
                 read_only: false,
                 parameters: memory_input_schema(),
@@ -405,7 +406,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "investigation",
-                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. Both verify and verify_batch require existing written items. If not written, write the section and upsert with status=written and section first; source IDs alone do not mark an item written. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified; summary groups failures by code and retry_ids identifies only failed items. Already verified items in verify_batch reuse their existing evidence after section/source/memory freshness checks; new supplied evidence is ignored for those items. Use single verify to explicitly replace evidence. Verification also uses complete lines already delivered in this session for the current file version, so a lost source ID needs no re-read; a project path may stand in for its delivered sources. After edits, verify only verification_required_ids returned by document_edit. Coverage failures return all missing_ranges together. Verification coverage counts only complete file lines; partial file_read boundaries, truncated search lines and code outlines are navigation context and require a full file_read. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. status=written requires a non-empty section (supplied now or preserved from the existing item). For written items, upsert checks the current document and normalizes section to its section_path from document_inspect, including ancestors for nested headings. A unique title without # is accepted, including numbering. Planned sections may be registered before writing with status=in_progress.",
+                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. Both verify and verify_batch require existing written items. If not written, write the section and upsert with status=written and section first; source IDs alone do not mark an item written. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified; summary groups failures by code and retry_ids identifies only failed items. Already verified items in verify_batch reuse their existing evidence after section/source/memory freshness checks; new supplied evidence is ignored for those items. Use single verify to explicitly replace evidence. Verification also uses complete lines already delivered in this session for the current file version, so a lost source ID needs no re-read; a project path may stand in for its delivered sources. After edits, verify only verification_required_ids returned by document_edit. Memory failures return memory_issues and reference_update: read changed claims, explicitly refresh retained IDs, and restore active evidence when ready=false. Reading/writing alone does not refresh references. Coverage failures return all missing_ranges together. Verification coverage counts only complete file lines; partial file_read boundaries, truncated search lines and code outlines are navigation context and require a full file_read. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. status=written requires a non-empty section (supplied now or preserved from the existing item). For written items, upsert checks the current document and normalizes section to its section_path from document_inspect, including ancestors for nested headings. A unique title without # is accepted, including numbering. Planned sections may be registered before writing with status=in_progress.",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -1359,7 +1360,10 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
         // A null optional field means the field was not supplied.
         "memory_write" => {
             if let Some(object) = args.as_object_mut() {
-                object.retain(|_, value| !value.is_null());
+                let schema = memory_input_schema();
+                object.retain(|key, value| {
+                    !value.is_null() || schema["properties"].get(key).is_none()
+                });
             }
         }
         // One plan operation flattened into the call, e.g.
@@ -2720,6 +2724,8 @@ pub fn envelope(result: Result<Value>) -> Value {
             let mut result = json!({"status":status,"error":message,"recovery":recovery::describe(&message),"truncated":false,"next_cursor":null});
             if let Some(coverage) = error.downcast_ref::<documentation::CoverageMissing>() {
                 result["data"] = json!({"item_id":coverage.item_id,"missing_ranges":coverage.missing_ranges,"missing_range_count":coverage.missing_ranges.len()});
+            } else if let Some(diagnostic) = error.downcast_ref::<recovery::DiagnosticError>() {
+                result["data"] = diagnostic.data.clone();
             }
             result
         }
@@ -3838,7 +3844,9 @@ fn execute_arguments(
         bail!("cancelled");
     }
     reject_project_write_in_source_document(s, name)?;
-    if !repair_leaked_argument_markup(&mut args)? {
+    if !repair_leaked_argument_markup(&mut args)
+        .map_err(|error| memory_tools::argument_error(error, name, &args))?
+    {
         return execute_repaired(s, name, args, cancel);
     }
     // The model believes it sent what its markup held. Say which fields
@@ -3858,9 +3866,18 @@ fn execute_arguments(
         {
             return error;
         }
-        anyhow::anyhow!(
+        let message = format!(
             "{error}. Note: this call's arguments arrived with native tool-call markup (<arg_key>/<arg_value>) inside a JSON key; they were recovered, but only these fields were received: {received}. Resend every argument, including any reported missing, as a plain JSON field without <arg_key> tags"
-        )
+        );
+        if let Some(diagnostic) = error.downcast_ref::<recovery::DiagnosticError>() {
+            let mut data = diagnostic.data.clone();
+            if data["input_error"].is_object() {
+                data["input_error"]["native_markup"] = json!(true);
+                data["input_error"]["markup_recovered"] = json!(true);
+            }
+            return recovery::DiagnosticError { message, data }.into();
+        }
+        anyhow::anyhow!(message)
     })
 }
 
@@ -3872,6 +3889,13 @@ fn execute_repaired(
 ) -> Result<Value> {
     normalize_integer_arguments(name, &mut args);
     normalize_argument_aliases(s, name, &mut args)?;
+    if name == "memory_manage"
+        && args["action"] == "replace"
+        && let Some(replacement) = args.get_mut("replacement")
+    {
+        normalize_integer_arguments("memory_write", replacement);
+        normalize_argument_aliases(s, "memory_write", replacement)?;
+    }
     if name == "memory_write"
         && args["expected_revision"] == 0
         && let Some(key) = args["key"].as_str()
@@ -3907,7 +3931,9 @@ fn execute_repaired(
             fields.insert("max_lines".into(), limit);
         }
     }
-    ToolRegistry::validate(s, name, &args)?;
+    ToolRegistry::validate(s, name, &args)
+        .map_err(|error| memory_tools::argument_error(error, name, &args))?;
+    memory_tools::validate_input(name, &args)?;
     check_whole_write(s, name, &args)?;
     if s.checkpoint.is_some() && !ToolRegistry::checkpoint_allowed(name) {
         bail!("checkpoint_pending: only memory/state/history maintenance allowed");
@@ -4007,7 +4033,10 @@ fn execute_repaired(
                 anyhow::anyhow!("invalid_argument_value: memory_write fields: {error}")
             })?;
             let sources = s.source_refs(&input.source_ids)?;
-            let result = s.memory.save(input, sources, &s.config)?;
+            let result = s
+                .memory
+                .save(input, sources, &s.config)
+                .map_err(|error| memory_tools::revision_error(error, name))?;
             // A source can change between its original observation and this
             // write. Revalidate the newly stored entry too, so stale evidence
             // cannot be reported as an active fact until it is reread.
@@ -4098,7 +4127,10 @@ fn execute_repaired(
                             )
                         })?;
                     let sources = s.source_refs(&input.source_ids)?;
-                    let replacement = s.memory.replace(&actual, input, sources, &s.config)?;
+                    let replacement = s
+                        .memory
+                        .replace(&actual, input, sources, &s.config)
+                        .map_err(|error| memory_tools::revision_error(error, name))?;
                     let replacement_id = replacement.id.clone();
                     revalidate(s)?;
                     let m = s.memory.get(&replacement_id)?.meta();
@@ -4958,14 +4990,7 @@ fn execute_repaired(
                     }
                 }
                 let doc = read_text(&output_path(&s.project)?)?;
-                for (id, revision) in &item.memory_refs {
-                    let memory = s.memory.get(id)?;
-                    if memory.revision != *revision
-                        || memory.status != crate::memory::MemoryStatus::Active
-                    {
-                        bail!("memory_changed: refresh the memory and investigation references");
-                    }
-                }
+                memory_tools::check_references(s, item)?;
                 let scope = item_scope_text(&doc, &s.investigations, item)?;
                 let section = scope.as_str();
                 let mut missing = documentation::missing_citation_ranges(s, section, &sources)?;
@@ -5812,6 +5837,7 @@ pub fn limit_result(
         // the model need not rediscover it through history during recovery.
         compact["data"] = json!({
             "applied":false,"plan":{"revision":result["data"]["plan"]["revision"]},
+            "conflict":task_plan::compact_conflict(&result["data"]["conflict"]),
             "reason":context::truncate(result["data"]["reason"].as_str().unwrap_or("Plan unchanged"), 32, &s.config.model).0
         });
         if let Some(input) = result["data"].get("input_error") {
@@ -5819,6 +5845,9 @@ pub fn limit_result(
                 "field":input["field"],"expected":input["expected"],"received":input["received"]
             });
         }
+    }
+    if let Some(data) = memory_tools::compact_data(&call.name, &result["data"]) {
+        compact["data"] = data;
     }
     if let Some(recovery) = result.get("recovery") {
         compact["recovery"] = recovery.clone();
@@ -5835,6 +5864,17 @@ pub fn limit_result(
     if let Some(error) = result["error"].as_str() {
         compact["error"] =
             json!(context::truncate(error, (limit / 3).clamp(8, 128), &s.config.model).0);
+    }
+    if result_tokens(call, &compact, &s.config.model) > limit
+        && (compact["data"]["conflict"].is_object()
+            || memory_tools::compact_data(&call.name, &result["data"]).is_some())
+    {
+        // Structured causes take priority over duplicate prose at small
+        // budgets. The full correction and examples remain in the archive.
+        compact["data"].as_object_mut().unwrap().remove("reason");
+        if let Some(error) = result["recovery"]["code"].as_str() {
+            compact["error"] = json!(error);
+        }
     }
     if result_tokens(call, &compact, &s.config.model) > limit {
         compact["data"] = Value::Null;

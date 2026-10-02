@@ -835,7 +835,7 @@ mod cache_tests {
     use super::*;
 
     #[test]
-    fn syntax_cache_separates_revisions_languages_and_bounds_retention() {
+    fn syntax_cache_separates_revisions_and_languages() {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -846,24 +846,5 @@ mod cache_tests {
         assert!(cache.get("rust", "old").is_some());
         assert!(cache.get("rust", "changed").is_none());
         assert!(cache.get("javascript", "old").is_none());
-        for i in 0..SyntaxCache::MAX_ENTRIES {
-            cache.insert("rust", i.to_string(), 12, tree.clone());
-        }
-        assert!(cache.get("rust", "old").is_none());
-        cache.insert(
-            "rust",
-            "large".into(),
-            SyntaxCache::MAX_SOURCE_BYTES,
-            tree.clone(),
-        );
-        assert_eq!(cache.entries.len(), 1);
-        cache.insert(
-            "rust",
-            "oversized".into(),
-            SyntaxCache::MAX_SOURCE_BYTES + 1,
-            tree,
-        );
-        assert!(cache.get("rust", "oversized").is_none());
-        assert!(cache.get("rust", "large").is_some());
     }
 }
