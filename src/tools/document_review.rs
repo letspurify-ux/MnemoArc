@@ -410,6 +410,26 @@ pub fn guidance(s: &Session) -> Value {
     ] {
         value.as_object_mut().unwrap().remove(key);
     }
+    // Issues are the writer's only view of the findings. Without a location,
+    // two near-identical issues at different passages read as one: a live
+    // writer fixed one occurrence and left the other for three attempts.
+    let state = &s.document_review;
+    if let Some(issues) = value["issues"].as_array_mut() {
+        for (issue, finding) in issues.iter_mut().zip(&state.findings) {
+            let (Some(text), Some(p)) = (issue.as_str(), &finding.proposal.document) else {
+                continue;
+            };
+            let first = p.quote.lines().next().unwrap_or("").trim();
+            let mut quote: String = first.chars().take(80).collect();
+            if quote.chars().count() < p.quote.trim().chars().count() {
+                quote.push('…');
+            }
+            *issue = json!(format!(
+                "[reviewed lines {}-{}: \"{quote}\"] {text}",
+                p.start_line, p.end_line
+            ));
+        }
+    }
     value
 }
 

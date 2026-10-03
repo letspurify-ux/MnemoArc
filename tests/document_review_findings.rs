@@ -631,6 +631,213 @@ fn semantic_duplicates_merge_only_into_a_confirmed_target() {
     assert_eq!(s.document_review.merged_findings, 1);
 }
 
+fn duplicate_of(id: &str, target: &str) -> Value {
+    let mut d = decision(id, "duplicate");
+    d["reason"] = json!("Same defect as the target finding.");
+    d["duplicate_of"] = json!(target);
+    d
+}
+
+fn at(problem: &str, line: usize, quote: &str) -> Value {
+    let mut issue = proposal(problem);
+    issue["document"] = json!({"start_line":line,"end_line":line,"quote":quote});
+    issue
+}
+
+// Live run 2026-10-03 (MnemoArc): a reused ID split into F4 at another
+// passage; the validator then called F4 a duplicate of F2 three times, every
+// response was rejected and the whole review was discarded, losing the
+// confirmed F2 and F3.
+#[test]
+fn a_duplicate_at_another_passage_is_confirmed_for_its_own_repair() {
+    let cases = [
+        // Another document line needs its own repair.
+        (
+            at("Same defect elsewhere", 3, "검색 결과가 없습니다."),
+            true,
+        ),
+        // Grounding widens a document quote to its whole line, so a shorter
+        // quote on the target's line is the same quoted text and merges.
+        (
+            at(
+                "Same defect in the next clause",
+                2,
+                "등록한 키가 삭제됩니다.",
+            ),
+            false,
+        ),
+        (
+            at("Same defect, shorter quote", 2, "저장 시 등록한 키가"),
+            false,
+        ),
+    ];
+    for (other, separate) in cases {
+        let (_dir, mut s) = fixture();
+        review::request(&mut s).unwrap();
+        let first = at(
+            "Timing issue",
+            2,
+            "키 지우기를 누르면 저장 시 등록한 키가 삭제됩니다.",
+        );
+        submit(&mut s, vec![first, other]);
+        validate(
+            &mut s,
+            vec![decision("F1", "confirmed"), duplicate_of("F2", "F1")],
+        );
+        assert!(!s.document_review.validating);
+        let ids: Vec<_> = s
+            .document_review
+            .findings
+            .iter()
+            .map(|f| f.id.as_str())
+            .collect();
+        if separate {
+            assert_eq!(ids, ["F1", "F2"]);
+            assert_eq!(s.document_review.merged_findings, 0);
+            assert_eq!(
+                s.document_review.validation_log[1]["applied_status"],
+                "confirmed"
+            );
+            assert_eq!(
+                s.document_review.validation_log[1]["decision"]["status"],
+                "duplicate"
+            );
+        } else {
+            assert_eq!(ids, ["F1"]);
+            assert_eq!(s.document_review.merged_findings, 1);
+        }
+        assert_eq!(s.document_review.dismissed_findings, 0);
+        assert!(!review::approved(&s));
+    }
+}
+
+#[test]
+fn a_duplicate_of_another_kind_or_an_unconfirmed_target_is_still_rejected() {
+    for target_status in ["confirmed", "dismissed"] {
+        for kind in ["citation", "factual"] {
+            if target_status == "confirmed" && kind == "factual" {
+                continue;
+            }
+            let (_dir, mut s) = fixture();
+            review::request(&mut s).unwrap();
+            let mut other = at("Other defect", 3, "검색 결과가 없습니다.");
+            other["kind"] = json!(kind);
+            submit(&mut s, vec![proposal("Timing issue"), other]);
+            review::request(&mut s).unwrap();
+            let body =
+                json!({"decisions":[decision("F1", target_status), duplicate_of("F2", "F1")]});
+            let error = review::finish(&mut s, &body.to_string())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("confirmed finding of the same kind"),
+                "{error}"
+            );
+            assert!(s.document_review.validating);
+            assert_eq!(s.document_review.validation_rounds, 0);
+        }
+    }
+}
+
+// Live run 2026-10-03 (llm_agent): F3 (line 99) and F5 (line 356) had nearly
+// the same issue text; the writer, seeing only "problem; correction", fixed
+// F5 and left F3 for three review attempts.
+#[test]
+fn repair_issues_name_the_reviewed_lines_and_quote() {
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let same = "입력 상한 설명이 다릅니다.";
+    submit(
+        &mut s,
+        vec![
+            at(
+                same,
+                2,
+                "키 지우기를 누르면 저장 시 등록한 키가 삭제됩니다.",
+            ),
+            at(same, 3, "검색 결과가 없습니다."),
+        ],
+    );
+    validate(
+        &mut s,
+        vec![decision("F1", "confirmed"), decision("F2", "confirmed")],
+    );
+    let issues = review::guidance(&s)["issues"].clone();
+    assert_eq!(
+        issues[0],
+        format!(
+            "[reviewed lines 2-2: \"키 지우기를 누르면 저장 시 등록한 키가 삭제됩니다. ui.js:2\"] {same}; 저장할 때 삭제된다고 설명하세요."
+        )
+    );
+    assert!(
+        issues[1]
+            .as_str()
+            .unwrap()
+            .starts_with("[reviewed lines 3-3: \"검색 결과가 없습니다. ui.js:1\"] ")
+    );
+    assert!(review::guidance(&s).get("findings").is_none());
+    // Completion gaps and the stored verdict keep the plain issue text.
+    assert!(!s.document_review.issues[0].starts_with('['));
+}
+
+// Findings without a document quote keep the original same-target rule.
+#[test]
+fn quoteless_requirement_duplicates_still_merge_into_their_target() {
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let missing = |problem: &str| {
+        let mut issue = proposal(problem);
+        issue["kind"] = json!("requirement");
+        issue["document"] = Value::Null;
+        issue["sources"] = json!([]);
+        issue["requirement_id"] = json!("R0");
+        issue
+    };
+    submit(
+        &mut s,
+        vec![
+            missing("Missing settings section"),
+            missing("No settings guide"),
+        ],
+    );
+    validate(
+        &mut s,
+        vec![decision("F1", "confirmed"), duplicate_of("F2", "F1")],
+    );
+    assert_eq!(s.document_review.findings.len(), 1);
+    assert_eq!(s.document_review.merged_findings, 1);
+}
+
+// A duplicate confirmed only through its target was never judged at its own
+// passage, so a later attempt must not reuse that confirmation unvalidated.
+#[test]
+fn an_inferred_confirmation_is_revalidated_in_a_later_attempt() {
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let other = at("Same defect elsewhere", 3, "검색 결과가 없습니다.");
+    submit(&mut s, vec![proposal("Timing issue"), other.clone()]);
+    validate(
+        &mut s,
+        vec![decision("F1", "confirmed"), duplicate_of("F2", "F1")],
+    );
+    assert_eq!(s.document_review.findings.len(), 2);
+    review::request(&mut s).unwrap();
+    let mut first = proposal("Timing issue");
+    first["previous_id"] = json!("F1");
+    let mut again = other;
+    again["previous_id"] = json!("F2");
+    submit(&mut s, vec![first, again]);
+    assert!(s.document_review.validating);
+    let p = payload(review::request(&mut s).unwrap());
+    let ids: Vec<_> = p["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].clone())
+        .collect();
+    assert_eq!(ids, [json!("F2")]);
+}
+
 #[test]
 fn merging_repeated_findings_preserves_their_additional_evidence() {
     let (_dir, mut s) = fixture();
