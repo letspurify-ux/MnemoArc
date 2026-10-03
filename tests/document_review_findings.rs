@@ -26,6 +26,31 @@ fn fixture() -> (tempfile::TempDir, Session) {
     (dir, session)
 }
 
+fn chunked_fallback_fixture() -> (tempfile::TempDir, Session) {
+    let (dir, s) = fixture();
+    let mut lines: Vec<_> = (1..=130).map(|i| format!("// context line {i}")).collect();
+    lines[45] = "const answerText = data.answer || '';".into();
+    lines[46] = "const errorText = data.error || '';".into();
+    lines[51] = "answer = answerText || errorText || 'fallback';".into();
+    lines[99] = "UNRELATED_CHUNK_SENTINEL".into();
+    std::fs::write(dir.path().join("ui.js"), lines.join("\n")).unwrap();
+    std::fs::write(
+        &s.project.output,
+        "# 오류 안내\n빈 답변이면 기본 실패 문구가 표시됩니다. ui.js:1-130\n",
+    )
+    .unwrap();
+    (dir, s)
+}
+
+fn fallback_proposal(start_line: usize, end_line: usize) -> Value {
+    let mut issue = proposal("서버 오류 문구의 표시 우선순위가 누락됐습니다.");
+    issue["document"] = json!({"start_line":2,"end_line":2,
+        "quote":"빈 답변이면 기본 실패 문구가 표시됩니다."});
+    issue["sources"] = json!([{"path":"ui.js","start_line":start_line,"end_line":end_line,
+        "quote":"const answerText = data.answer || '';\nconst errorText = data.error || '';"}]);
+    issue
+}
+
 fn proposal(problem: &str) -> Value {
     json!({"previous_id":null,"kind":"factual",
         "document":{"start_line":2,"end_line":2,"quote":"키 지우기를 누르면 저장 시 등록한 키가 삭제됩니다."},
@@ -346,6 +371,106 @@ fn indentation_and_off_by_one_hints_are_grounded_to_actual_supplied_lines() {
     assert_eq!(s.document_review.anchor_corrections, 1);
     validate(&mut s, vec![decision("F1", "dismissed")]);
     assert!(review::approved(&s));
+}
+
+#[test]
+fn validation_preserves_original_source_evidence_for_short_quotes() {
+    // Live F5: grounding the two-line quote removed the error-priority branch
+    // from validation, although the original reviewer had seen that branch.
+    for end_line in [2, 7] {
+        let (dir, mut s) = fixture();
+        let source = "const answerText = data.answer || '';\nconst errorText = data.error || '';\n// Empty strings must be filtered.\n// A missing answer is different from a transport failure.\n// Prefer the server's error message.\n// Use a fallback only when both strings are empty.\nanswer = answerText || errorText || (res.ok ? '답변을 만들지 못했습니다.' : answer);\n";
+        std::fs::write(dir.path().join("ui.js"), source).unwrap();
+        let claim = "서버가 200으로 응답했지만 answer가 비어 있으면 기본 실패 문구가 표시됩니다.";
+        std::fs::write(
+            &s.project.output,
+            format!("# 오류 안내\n{claim} ui.js:1-7\n"),
+        )
+        .unwrap();
+        let original = payload(review::request(&mut s).unwrap());
+        let original_evidence = &original["evidence"][0]["numbered_text"];
+        assert!(original_evidence.as_str().unwrap().contains("7|answer ="));
+        let mut issue = proposal("서버 오류 문구가 우선 표시되는 조건이 누락됐습니다.");
+        issue["document"] = json!({"start_line":2,"end_line":2,"quote":claim});
+        issue["sources"] = json!([{"path":"ui.js","start_line":1,"end_line":end_line,
+            "quote":"const answerText = data.answer || '';\nconst errorText = data.error || '';"}]);
+        submit(&mut s, vec![issue]);
+        let request = review::request(&mut s).unwrap();
+        assert!(mnemoarc::context::count(&request, &s.config.model) <= 24000);
+        let validation = payload(request);
+        let candidate = &validation["candidates"][0];
+        assert!(
+            candidate["observed_context"]["sources"]
+                .to_string()
+                .contains("answer = answerText || errorText || (res.ok ?")
+        );
+        assert_eq!(candidate["sources"][0]["start_line"], 1);
+        assert_eq!(candidate["sources"][0]["end_line"], 2);
+        assert_eq!(
+            candidate["observed_context"]["sources"][0]["review_evidence"],
+            json!([original_evidence])
+        );
+        review::finish(
+            &mut s,
+            &json!({"decisions":[decision("F1", "confirmed")]}).to_string(),
+        )
+        .unwrap();
+        assert!(!review::approved(&s));
+        assert_eq!(s.document_review.findings.len(), 1);
+    }
+}
+
+#[test]
+fn validation_preserves_related_chunks_without_using_distant_line_hints() {
+    for (start_line, end_line, expected_chunks) in [(46, 52, 2), (100, 100, 1)] {
+        let (_dir, mut s) = chunked_fallback_fixture();
+        let original = payload(review::request(&mut s).unwrap());
+        assert!(original["evidence"].as_array().unwrap().len() >= 3);
+        submit(&mut s, vec![fallback_proposal(start_line, end_line)]);
+        let validation = payload(review::request(&mut s).unwrap());
+        let evidence =
+            validation["candidates"][0]["observed_context"]["sources"][0]["review_evidence"]
+                .as_array()
+                .unwrap();
+        assert_eq!(evidence.len(), expected_chunks);
+        let evidence_text = serde_json::to_string(evidence).unwrap();
+        assert!(!evidence_text.contains("UNRELATED_CHUNK_SENTINEL"));
+        if expected_chunks == 2 {
+            assert!(evidence_text.contains("52|answer ="));
+        }
+        for chunk in evidence {
+            assert!(
+                original["evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| { &v["numbered_text"] == chunk })
+            );
+        }
+    }
+}
+
+#[test]
+fn new_original_evidence_for_the_same_quote_requires_revalidation() {
+    let (_dir, mut s) = chunked_fallback_fixture();
+    review::request(&mut s).unwrap();
+    submit(&mut s, vec![fallback_proposal(46, 47)]);
+    validate(&mut s, vec![decision("F1", "confirmed")]);
+
+    review::request(&mut s).unwrap();
+    let mut first = fallback_proposal(46, 47);
+    first["previous_id"] = json!("F1");
+    let mut expanded = fallback_proposal(46, 52);
+    expanded["previous_id"] = json!("F1");
+    submit(&mut s, vec![first, expanded]);
+    assert!(s.document_review.validating);
+    let validation = payload(review::request(&mut s).unwrap());
+    assert_eq!(validation["candidates"][0]["id"], "F1");
+    assert!(
+        validation["candidates"][0]["observed_context"]["sources"]
+            .to_string()
+            .contains("52|answer =")
+    );
 }
 
 #[test]
