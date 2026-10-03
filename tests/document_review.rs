@@ -1972,6 +1972,86 @@ fn longer_repairs_count_as_progress_after_a_length_finding() {
     assert_eq!(s.document_review.stalled_attempts, 0);
 }
 
+/// The first review response is cut by the output limit mid-JSON, as when a
+/// reasoning model spends the bounded first-attempt allowance.
+struct TruncatedFirstReview {
+    reviews: std::sync::Mutex<Vec<(usize, Value)>>,
+}
+#[async_trait]
+impl LlmClient for TruncatedFirstReview {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &Config,
+        _: CancellationToken,
+        tx: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        if let Some(review) = support::acceptance(&request) {
+            return Ok(review);
+        }
+        let payload: Value = request["messages"][1]["content"]
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(Value::Null);
+        if payload["source_document_review"] == true {
+            let mut reviews = self.reviews.lock().unwrap();
+            reviews.push((
+                config.output_tokens,
+                payload["previous_response_error"].clone(),
+            ));
+            if reviews.len() == 1 {
+                return Ok(Completion {
+                    text: r#"{"issues":[{"previous_id":null,"kind":"factual","document":{"start_line":2"#
+                        .into(),
+                    length_limited: true,
+                    ..Default::default()
+                });
+            }
+            return Ok(Completion {
+                text: r#"{"issues":[]}"#.into(),
+                ..Default::default()
+            });
+        }
+        tx.send("Done".into()).await.ok();
+        Ok(Completion {
+            text: "Done".into(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn truncated_review_retry_names_the_output_limit_not_tools() {
+    let (_dir, mut s) = fixture();
+    s.config.output_tokens = 8192;
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","expected_hash":hash,"text":"# Flow\nHistory is normalized, then a for loop runs work five times. main.js:2-5\n"}),
+    )
+    .unwrap();
+    let read = tools::execute(&mut s, "file_read", json!({"path":"main.js"})).unwrap();
+    tools::execute(&mut s,"investigation",json!({"action":"verify","id":"flow","source_ids":[read["source"]["id"]],"verification_note":"Compared body"})).unwrap();
+    let client = Arc::new(TruncatedFirstReview {
+        reviews: Default::default(),
+    });
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(s, client.clone(), CancellationToken::new(), tx).await;
+    drain.await.unwrap();
+    let reviews = client.reviews.lock().unwrap();
+    assert!(reviews.len() >= 2, "{reviews:?} {:?}", result.last_error);
+    assert_eq!(reviews[0].0, 4096);
+    assert_eq!(reviews[0].1, Value::Null);
+    // The retry gets the full allowance and is told why the JSON broke off.
+    assert_eq!(reviews[1].0, 8192);
+    let error = reviews[1].1.as_str().unwrap();
+    assert!(error.starts_with("document_review_incomplete:"), "{error}");
+    assert!(error.contains("output token limit"), "{error}");
+    assert!(!error.contains("without tools"), "{error}");
+}
+
 /// Reviews a two-page document; the second page always answers invalid JSON.
 struct FailingSecondPage {
     first_page_issue: bool,

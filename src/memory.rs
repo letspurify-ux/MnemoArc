@@ -266,8 +266,10 @@ impl MemoryStore {
             }
             check_revision(m, input.expected_revision)?;
         } else if input.expected_revision.is_some() {
+            // Nothing changed underneath the caller: the argument itself is
+            // wrong, so this must not share the stale-state revision_conflict.
             bail!(
-                "revision_conflict: no memory has this key yet; omit expected_revision to create it (only updates of an existing memory use its revision)"
+                "memory_revision_unexpected: no memory has this key yet; omit expected_revision to create it (only updates of an existing memory use its revision)"
             );
         }
         let status = if input.inferred || (input.kind == MemoryKind::Fact && sources.is_empty()) {

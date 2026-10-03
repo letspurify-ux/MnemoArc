@@ -75,6 +75,8 @@ pub fn describe(message: &str) -> Value {
         (Class::MissingEvidence, "restore_memory_evidence")
     } else if code == "memory_revision_missing" {
         (Class::InvalidInput, "supply_memory_revision")
+    } else if code == "memory_revision_unexpected" {
+        (Class::InvalidInput, "correct_arguments")
     } else if code == "memory_reference_unverified" {
         (Class::Prerequisite, "repair_memory_references")
     } else if matches!(

@@ -228,6 +228,34 @@ fn unknown_null_fields_are_rejected_while_known_replacement_placeholders_remain_
 }
 
 #[test]
+fn revision_on_a_new_key_asks_to_correct_arguments_not_refresh_state() {
+    // Live run: the model copied another memory's revision onto a new key.
+    // Nothing is stale, so recovery must point back at memory_write itself.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut s, mut input, _, _) = fixture(dir.path());
+    input["key"] = json!("new-fact");
+    input["expected_revision"] = json!(5);
+    let before = json!(s.memory.entries);
+    let result = run(&mut s, "new-key-revision", "memory_write", input.clone());
+    assert_eq!(result["status"], "error", "{result}");
+    assert_eq!(result["recovery"]["code"], "memory_revision_unexpected");
+    assert_eq!(result["recovery"]["class"], "invalid_input");
+    assert_eq!(result["recovery"]["action"], "correct_arguments");
+    assert_eq!(result["recovery"]["tools"][0], "memory_write");
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("omit expected_revision")
+    );
+    assert_eq!(json!(s.memory.entries), before);
+    input.as_object_mut().unwrap().remove("expected_revision");
+    let saved = run(&mut s, "new-key-create", "memory_write", input);
+    assert_eq!(saved["status"], "ok", "{saved}");
+    assert!(s.memory.get("new-fact").is_ok());
+}
+
+#[test]
 fn missing_and_stale_revisions_are_distinct_and_atomic_for_writes_and_replacements() {
     for name in ["memory_write", "memory_manage"] {
         let dir = tempfile::tempdir().unwrap();

@@ -2028,23 +2028,34 @@ pub async fn run_session_controlled(
             // or report finish_reason=length even when the JSON object is
             // complete. The review request has no executable tools, so a
             // complete, hash-checked verdict is safe to accept in that case.
-            let review_result = if completion.discarded_tool_calls
-                || !completion.calls.is_empty()
-                || completion.text.trim().is_empty()
-            {
+            // A reasoning model can spend the bounded first-attempt allowance
+            // before the JSON closes. Name that cause instead of tool use, so
+            // the retry shortens its verdict rather than looking for tools.
+            let truncated = || {
+                anyhow::anyhow!(
+                    "document_review_incomplete: response reached the output token limit before the JSON closed; return one complete issues JSON object with fewer, shorter issues and quotes"
+                )
+            };
+            let review_result = if completion.discarded_tool_calls || !completion.calls.is_empty() {
                 Err(anyhow::anyhow!(
                     "document_review_incomplete: review must return complete JSON without tools"
                 ))
+            } else if completion.text.trim().is_empty() {
+                Err(if completion.length_limited {
+                    truncated()
+                } else {
+                    anyhow::anyhow!(
+                        "document_review_incomplete: review returned no text; return complete issues JSON"
+                    )
+                })
             } else {
                 match tools::document_review::finish(&mut s, &completion.text) {
                     Ok(()) => Ok(()),
                     Err(error)
-                        if (completion.length_limited || !completion.calls.is_empty())
+                        if completion.length_limited
                             && error.to_string().starts_with("document_review_invalid:") =>
                     {
-                        Err(anyhow::anyhow!(
-                            "document_review_incomplete: review must return complete JSON without tools"
-                        ))
+                        Err(truncated())
                     }
                     Err(error) => Err(error),
                 }
