@@ -47,7 +47,10 @@ fn diagnostics(name: &str, args: &Value) -> Option<Value> {
     let schema = memory_input_schema();
     let properties = schema["properties"].as_object().unwrap();
     let object = value.as_object();
-    let received: Vec<_> = object.into_iter().flat_map(|o| o.keys()).collect();
+    let mut received: Vec<_> = object.into_iter().flat_map(|o| o.keys()).collect();
+    // Dependency features can change JSON map storage; diagnostics retain
+    // their original alphabetical field order either way.
+    received.sort_unstable();
     let unknown: Vec<_> = received
         .iter()
         .filter(|key| !properties.contains_key(**key))
@@ -60,7 +63,8 @@ fn diagnostics(name: &str, args: &Value) -> Option<Value> {
         .collect();
     let mut invalid = Vec::new();
     if let Some(object) = object {
-        for (key, value) in object {
+        for &key in &received {
+            let value = &object[key];
             let Some(spec) = properties.get(key) else {
                 continue;
             };

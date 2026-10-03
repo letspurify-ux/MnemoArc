@@ -434,6 +434,24 @@ pub(super) fn execute(
             }
             let doc = read_text(&path)?;
             let (checked, mut issues) = citation_issues(s, &path, &doc)?;
+            let format = super::document_format::check(&doc);
+            let format_check = format.summary();
+            // The citation scanner already catches many unclosed fences. Keep
+            // one diagnostic per fence while adding AST coverage for containers.
+            let mut fence_lines: BTreeSet<_> = issues
+                .iter()
+                .filter(|issue| issue["kind"] == "unclosed_code_fence")
+                .filter_map(|issue| issue["line"].as_u64())
+                .collect();
+            for issue in format.issues {
+                if issue["kind"] != "unclosed_code_fence"
+                    || issue["line"]
+                        .as_u64()
+                        .is_none_or(|line| fence_lines.insert(line))
+                {
+                    issues.push(issue);
+                }
+            }
             if checked == 0 {
                 issues.push(json!({"kind":"no_machine_readable_citations","guidance":"Use relative/path.ext:start-end. Other citation formats require manual review."}));
             }
@@ -487,6 +505,7 @@ pub(super) fn execute(
                 document_hash.as_str(),
                 checked,
                 &issues,
+                &format_check,
             ))?);
             let offset = n(args, "offset", 0);
             if offset > 0 {
@@ -509,7 +528,7 @@ pub(super) fn execute(
             }
             let end = (offset + n(args, "limit", 30).clamp(1, 100)).min(issues.len());
             Ok(
-                json!({"hash":document_hash,"revision":revision,"total_lines":doc.lines().count(),"citations_checked":checked,"structural_ok":issues.is_empty(),"semantic_verified":false,"issue_count":issues.len(),"issues":issues[offset..end],"next_offset":(end<issues.len()).then_some(end)}),
+                json!({"hash":document_hash,"revision":revision,"total_lines":doc.lines().count(),"citations_checked":checked,"structural_ok":issues.is_empty(),"semantic_verified":false,"format_check":format_check,"issue_count":issues.len(),"issues":issues[offset..end],"next_offset":(end<issues.len()).then_some(end)}),
             )
         }
         _ => bail!("unsupported_tool"),

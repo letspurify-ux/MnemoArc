@@ -43,17 +43,21 @@ pub struct ReviewState {
     pub dismissed_findings: usize,
     pub resolved_findings: usize,
     pub validation_log: Vec<Value>,
-    /// Document line ranges (1-based, inclusive) whose review page kept
-    /// returning invalid responses during this review. They block approval.
+    /// Document line ranges (1-based, inclusive) left undecided by invalid
+    /// page responses or unverified reanchored scope findings. They block approval.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped_ranges: Vec<(usize, usize)>,
-    /// Skipped ranges of the review that ended unavailable, for the report.
+    /// Undecided ranges of the review that ended unavailable, for the report.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unavailable_ranges: Vec<(usize, usize)>,
     #[serde(skip)]
     next_finding_id: usize,
     #[serde(skip)]
     validation_ids: Vec<String>,
+    /// Reanchored scope findings whose fresh validation could not decide.
+    /// They leave a coverage gap and cannot count as resolved repairs.
+    #[serde(skip)]
+    unverified_scope_ids: BTreeSet<String>,
     #[serde(skip)]
     page_evidence: Vec<Value>,
     pub repair_started_round: Option<usize>,
@@ -110,6 +114,7 @@ impl ReviewState {
                 .map(|f| &f.context)
                 .collect::<Vec<_>>(),
             &self.validation_ids,
+            &self.unverified_scope_ids,
             &self.page_evidence,
             &self.policy_hash,
             &self.reviewed_sections,
@@ -522,6 +527,7 @@ fn reset_pages(state: &mut ReviewState) {
     state.page_evidence.clear();
     state.validating = false;
     state.validation_ids.clear();
+    state.unverified_scope_ids.clear();
     state.skipped_ranges.clear();
 }
 
@@ -1069,9 +1075,10 @@ fn finish_review(s: &mut Session, digest: String) -> Result<()> {
         .findings
         .iter()
         .filter(|old| {
-            !next_findings
-                .iter()
-                .any(|new| new.id == old.id || findings::same_subject(&old.proposal, &new.proposal))
+            !state.unverified_scope_ids.contains(&old.id)
+                && !next_findings.iter().any(|new| {
+                    new.id == old.id || findings::same_subject(&old.proposal, &new.proposal)
+                })
                 && (old
                     .proposal
                     .document

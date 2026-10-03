@@ -1,5 +1,6 @@
 pub mod completion_review;
 mod coverage;
+mod document_format;
 pub mod document_review;
 mod documentation;
 mod file_edit;
@@ -336,7 +337,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_audit",
-                description: "Check output citations path:line[-line], source freshness, section coverage and pending investigations in one call. Structural checks do NOT prove semantic correctness. Paginated issues; the first result returns revision, and offset > 0 requires expected_revision copied from that result. Restart from offset 0 when the revision changes.",
+                description: "Check output citations path:line[-line], source freshness, section coverage, pending investigations, Markdown tables/code fences and fenced Mermaid syntax in one call. format_check reports parser coverage and warnings for unchecked UI extensions. Structural checks do NOT prove semantic correctness or browser layout. Paginated errors; the first result returns revision, and offset > 0 requires expected_revision copied from that result. Restart from offset 0 when the revision changes.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -2360,6 +2361,7 @@ fn persist_document_edit(
         return Ok(json!({"path":path,"hash":hash,"bytes":bytes,"total_lines":total_lines}));
     }
     let citation_check = documentation::citation_check(s, path, &result)?;
+    let format_check = document_format::check(&result).write_result();
     Ok(json!({
         "written_items":written_items,
         "verification_required_ids":s.investigations.iter().filter(|i| !i.is_settled()).map(|i| &i.id).collect::<Vec<_>>(),
@@ -2369,7 +2371,8 @@ fn persist_document_edit(
         "hash":hash,
         "bytes":bytes,
         "total_lines":total_lines,
-        "citation_check":citation_check
+        "citation_check":citation_check,
+        "format_check":format_check
     }))
 }
 
@@ -4879,7 +4882,10 @@ fn execute_repaired(
                 revalidate(s)?;
                 let mut reused_ids = vec![];
                 let mut results = vec![];
-                for (id, entry) in items {
+                // Preserve the original ID ordering even when a dependency
+                // enables serde_json's preserve_order feature globally.
+                let ordered_items: BTreeMap<_, _> = items.iter().collect();
+                for (id, entry) in ordered_items {
                     if cancel.is_cancelled() {
                         bail!("cancelled");
                     }
@@ -5191,7 +5197,7 @@ fn execute_repaired(
                 let audit = documentation::execute(s, "document_audit", &json!({}), cancel)?;
                 if audit["structural_ok"] != true {
                     return Ok(
-                        json!({"complete":false,"audit":audit,"review":s.reviews,"guidance":"Fix structural evidence issues before final review."}),
+                        json!({"complete":false,"audit":audit,"review":s.reviews,"guidance":"Fix document format and structural evidence issues before final review."}),
                     );
                 }
                 // This is a read-only structural preflight, not a model review
@@ -5205,7 +5211,7 @@ fn execute_repaired(
                     .map(|i| json!({"id":i.id,"title":i.title,"status":i.status}))
                     .collect();
                 let complete = !s.investigations.is_empty() && incomplete.is_empty();
-                let mut result = json!({"complete":complete,"semantic_verified":false,"completion_scope":"structural preflight; enabled source-document model review runs before task completion","incomplete":incomplete,"review":s.reviews,"output":s.project.output});
+                let mut result = json!({"complete":complete,"semantic_verified":false,"format_check":audit["format_check"],"completion_scope":"structural preflight; enabled source-document model review runs before task completion","incomplete":incomplete,"review":s.reviews,"output":s.project.output});
                 // A passing preflight is not the finish: say what is. A live
                 // run repeated final_check and list for rounds after passing.
                 if complete {

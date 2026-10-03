@@ -1136,6 +1136,238 @@ fn rewriting_the_same_unresolved_claim_does_not_fake_progress() {
     }
 }
 
+const OLD_SCOPE_TEXT: &str =
+    "답변이 길거나 특수한 글자가 섞이면 렌더가 실패할 수 있습니다. 그럴 때 말풍선 자체가";
+const NEW_SCOPE_TEXT: &str =
+    "답변이 길거나 특수한 글자가 섞여 있어 화면에 제대로 표시되지 못할 때가 있습니다. 그럴 때는";
+
+fn scope_fixture() -> (tempfile::TempDir, Session) {
+    let (dir, s) = fixture();
+    std::fs::write(
+        &s.project.output,
+        format!(
+            "# UI 매뉴얼\n\n## 답변 보기\n\n답변을 선택합니다. ui.js:1\n\n{OLD_SCOPE_TEXT}\n말풍선에서 원문을 확인합니다. ui.js:2\n\n다음 답변을 확인합니다. ui.js:1\n\n## 설정\n\n설정을 저장합니다. ui.js:2\n"
+        ),
+    )
+    .unwrap();
+    (dir, s)
+}
+
+fn scope_proposal(s: &Session, quote: &str, previous_id: Option<&str>) -> Value {
+    let doc = std::fs::read_to_string(&s.project.output).unwrap();
+    let start = doc
+        .lines()
+        .position(|line| line == quote.lines().next().unwrap())
+        .unwrap()
+        + 1;
+    json!({"previous_id":previous_id,"kind":"scope",
+        "document":{"start_line":start,"end_line":start + quote.lines().count() - 1,"quote":quote},
+        "requirement_id":"R0","sources":[],"problem":"문서가 내부 렌더 용어를 노출합니다.",
+        "correction":"사용자가 보는 현상으로 설명하세요.","ui_labels":[]})
+}
+
+fn confirm_scope(s: &mut Session) {
+    review::request(s).unwrap();
+    let issue = scope_proposal(s, OLD_SCOPE_TEXT, None);
+    submit(s, vec![issue]);
+    validate(s, vec![decision("F1", "confirmed")]);
+}
+
+fn rewrite_scope(s: &Session) {
+    let doc = std::fs::read_to_string(&s.project.output).unwrap();
+    std::fs::write(
+        &s.project.output,
+        doc.replace(OLD_SCOPE_TEXT, NEW_SCOPE_TEXT),
+    )
+    .unwrap();
+}
+
+// Live call 48 reused F34 after its source-less scope passage was rewritten.
+// Keep the ID, but let semantic validation dismiss the now-stale criticism.
+#[test]
+fn rewritten_source_less_scope_is_revalidated_and_can_be_dismissed() {
+    let (_dir, mut s) = scope_fixture();
+    confirm_scope(&mut s);
+    rewrite_scope(&s);
+    // Absolute line numbers may shift without changing the paragraph's identity.
+    let doc = std::fs::read_to_string(&s.project.output).unwrap();
+    std::fs::write(&s.project.output, format!("\n\n{doc}")).unwrap();
+    review::request(&mut s).unwrap();
+    let quote = format!("{NEW_SCOPE_TEXT}\n말풍선에서 원문을 확인합니다. ui.js:2");
+    let changed = scope_proposal(&s, &quote, Some("F1"));
+    submit(&mut s, vec![changed]);
+    assert!(
+        s.document_review.validating,
+        "never reuse the old confirmation"
+    );
+    let request = payload(review::request(&mut s).unwrap());
+    assert_eq!(request["candidates"][0]["id"], "F1");
+    assert!(
+        request["candidates"][0]["document"]["quote"]
+            .as_str()
+            .unwrap()
+            .starts_with(NEW_SCOPE_TEXT)
+    );
+    review::finish(
+        &mut s,
+        &json!({"decisions":[decision("F1", "dismissed")]}).to_string(),
+    )
+    .unwrap();
+    assert!(review::approved(&s));
+    assert_eq!(s.document_review.resolved_findings, 1);
+}
+
+#[test]
+fn rewritten_source_less_scope_keeps_its_id_without_fake_progress() {
+    let (_dir, mut s) = scope_fixture();
+    confirm_scope(&mut s);
+    rewrite_scope(&s);
+    review::request(&mut s).unwrap();
+    let changed = scope_proposal(&s, NEW_SCOPE_TEXT, Some("F1"));
+    submit(&mut s, vec![changed]);
+    assert!(s.document_review.validating);
+    validate(&mut s, vec![decision("F1", "confirmed")]);
+    assert_eq!(s.document_review.findings[0].id, "F1");
+    assert_eq!(s.document_review.resolved_findings, 0);
+    assert_eq!(s.document_review.stalled_attempts, 1);
+    assert_eq!(s.document_review.validation_rounds, 2);
+    assert!(!review::approved(&s));
+    // Once that fresh confirmation succeeds, unchanged evidence still reuses
+    // the normal cache instead of adding another validation call.
+    review::request(&mut s).unwrap();
+    let unchanged = scope_proposal(&s, NEW_SCOPE_TEXT, Some("F1"));
+    submit(&mut s, vec![unchanged]);
+    assert!(!s.document_review.validating);
+    assert_eq!(s.document_review.validation_rounds, 2);
+    assert_eq!(s.document_review.stalled_attempts, 2);
+}
+
+#[test]
+fn unverified_reanchored_scope_leaves_a_gap_instead_of_approval() {
+    let (_dir, mut s) = scope_fixture();
+    confirm_scope(&mut s);
+    rewrite_scope(&s);
+    review::request(&mut s).unwrap();
+    let changed = scope_proposal(&s, NEW_SCOPE_TEXT, Some("F1"));
+    let line = changed["document"]["start_line"].as_u64().unwrap() as usize;
+    submit(&mut s, vec![changed]);
+    validate(&mut s, vec![decision("F1", "unverified")]);
+    assert!(!review::approved(&s));
+    assert!(review::unavailable_on_current(&s));
+    assert_eq!(review::unavailable_ranges(&s), &[(line, line)]);
+    assert_eq!(s.document_review.resolved_findings, 0);
+    assert_eq!(s.document_review.dismissed_findings, 0);
+    assert!(
+        s.document_review.issues.is_empty(),
+        "unknown judgments are not repair instructions"
+    );
+}
+
+#[test]
+fn source_less_scope_cannot_reuse_an_id_at_another_location_or_requirement() {
+    for change in [
+        "context",
+        "paragraph",
+        "section",
+        "requirement",
+        "kind",
+        "source",
+        "duplicate_heading",
+        "ambiguous",
+    ] {
+        let (_dir, mut s) = scope_fixture();
+        if change == "duplicate_heading" {
+            let doc = std::fs::read_to_string(&s.project.output).unwrap();
+            std::fs::write(&s.project.output, doc.replace("## 설정", "## 답변 보기")).unwrap();
+        }
+        if change == "ambiguous" {
+            // The same neighboring blocks identify two paragraphs: neither is unique.
+            let doc = std::fs::read_to_string(&s.project.output).unwrap();
+            let repeated = format!(
+                "\n공통 안내\n\n{OLD_SCOPE_TEXT}\n\n공통 안내\n\nother text\n\n공통 안내\n\nother paragraph\n\n공통 안내\n"
+            );
+            std::fs::write(
+                &s.project.output,
+                doc.replace(
+                    &format!("\n{OLD_SCOPE_TEXT}\n말풍선에서 원문을 확인합니다. ui.js:2\n"),
+                    &repeated,
+                ),
+            )
+            .unwrap();
+        }
+        confirm_scope(&mut s);
+        rewrite_scope(&s);
+        let mut doc = std::fs::read_to_string(&s.project.output).unwrap();
+        if change == "context" {
+            doc = doc.replace("답변을 선택합니다.", "다른 문단 앞의 문맥입니다.");
+        } else if change == "section" {
+            doc = doc.replace("## 답변 보기", "## 다른 화면");
+        }
+        std::fs::write(&s.project.output, doc).unwrap();
+        review::request(&mut s).unwrap();
+        let quote = if change == "paragraph" {
+            "다음 답변을 확인합니다. ui.js:1"
+        } else {
+            NEW_SCOPE_TEXT
+        };
+        let mut changed = scope_proposal(&s, quote, Some("F1"));
+        if change == "requirement" {
+            changed["requirement_id"] = json!("audience");
+        } else if change == "kind" {
+            changed["kind"] = json!("requirement");
+        } else if change == "source" {
+            changed["sources"] = json!([{"path":"ui.js","start_line":2,"end_line":2,"quote":"function save() { if (clearKey) deleteKey(); }"}]);
+        }
+        reject(&mut s, vec![changed]);
+        assert_eq!(s.document_review.validation_rounds, 1);
+        assert!(!review::approved(&s));
+    }
+}
+
+#[test]
+fn a_new_source_less_defect_on_the_same_paragraph_gets_its_own_id() {
+    let (_dir, mut s) = scope_fixture();
+    confirm_scope(&mut s);
+    rewrite_scope(&s);
+    review::request(&mut s).unwrap();
+    let same = scope_proposal(&s, NEW_SCOPE_TEXT, Some("F1"));
+    let mut new = same.clone();
+    new["previous_id"] = Value::Null;
+    new["problem"] = json!("별개의 범위 문제입니다.");
+    new["correction"] = json!("별개의 범위 문제를 수정하세요.");
+    submit(&mut s, vec![same, new]);
+    validate(
+        &mut s,
+        vec![decision("F1", "confirmed"), decision("F2", "confirmed")],
+    );
+    assert_eq!(s.document_review.findings.len(), 2);
+    assert_eq!(s.document_review.findings[0].id, "F1");
+    assert_eq!(s.document_review.findings[1].id, "F2");
+    assert_eq!(s.document_review.resolved_findings, 0);
+}
+
+#[test]
+fn a_reanchored_scope_gap_survives_an_invalid_sibling_and_empty_retry() {
+    let (_dir, mut s) = scope_fixture();
+    confirm_scope(&mut s);
+    rewrite_scope(&s);
+    review::request(&mut s).unwrap();
+    let changed = scope_proposal(&s, NEW_SCOPE_TEXT, Some("F1"));
+    let line = changed["document"]["start_line"].as_u64().unwrap() as usize;
+    let mut bad = changed.clone();
+    bad["previous_id"] = Value::Null;
+    bad["document"]["quote"] = json!("문서에 없는 인용문");
+    reject(&mut s, vec![changed, bad]);
+    let retry = payload(review::request(&mut s).unwrap());
+    assert_eq!(retry["retry_findings"][0]["id"], "F1");
+    submit(&mut s, vec![]);
+    validate(&mut s, vec![decision("F1", "unverified")]);
+    assert!(review::unavailable_on_current(&s));
+    assert_eq!(review::unavailable_ranges(&s), &[(line, line)]);
+    assert_eq!(s.document_review.resolved_findings, 0);
+    assert!(!review::approved(&s));
+}
+
 #[test]
 fn a_rejected_response_error_is_not_resent_after_a_valid_response() {
     // The error belongs to the retry of the rejected response only; a live

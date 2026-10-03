@@ -2390,7 +2390,7 @@ pub async fn run_session_controlled(
                         Ok(audit) => {
                             s.status = "partial".into();
                             s.last_error = Some(format!(
-                                "Document evidence audit has {} issues; use document_audit",
+                                "Document format/evidence audit has {} issues; use document_audit",
                                 audit["issue_count"]
                             ));
                         }

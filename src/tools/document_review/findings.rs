@@ -47,6 +47,10 @@ pub struct Finding {
     /// must validate it again instead of reusing the confirmation.
     #[serde(skip)]
     pub inferred: bool,
+    /// A rewritten source-less scope passage linked by its paragraph context.
+    /// Its old confirmation cannot decide the rewritten passage.
+    #[serde(skip)]
+    reanchored_scope: bool,
 }
 
 pub fn summary(f: &Finding) -> Value {
@@ -284,6 +288,67 @@ pub fn same_subject(a: &Proposal, b: &Proposal) -> bool {
     })
 }
 
+/// Locate a blank-line-delimited passage by its unique heading path and the
+/// unchanged blocks immediately before/after it, never by its old line number.
+/// Ambiguous headings or neighboring blocks deliberately provide no anchor.
+fn scope_anchor(doc: &str, passage: &Passage) -> Option<Value> {
+    let lines: Vec<_> = doc.lines().collect();
+    let headings = documentation::headings(doc);
+    let paths = documentation::heading_paths(&headings);
+    let heading = headings.iter().rposition(|h| h.line < passage.start_line);
+    let (start, end, section) = if let Some(index) = heading {
+        if paths.iter().filter(|path| *path == &paths[index]).count() != 1 {
+            return None;
+        }
+        (
+            headings[index].line,
+            headings.get(index + 1).map_or(lines.len(), |h| h.line - 1),
+            Some(&paths[index]),
+        )
+    } else {
+        (
+            0,
+            headings.first().map_or(lines.len(), |h| h.line - 1),
+            None,
+        )
+    };
+    let mut blocks = Vec::new();
+    let mut offset = start;
+    while offset < end {
+        if lines[offset].trim().is_empty() {
+            offset += 1;
+            continue;
+        }
+        let first = offset;
+        while offset < end && !lines[offset].trim().is_empty() {
+            offset += 1;
+        }
+        blocks.push((first, offset));
+    }
+    let target = blocks
+        .iter()
+        .position(|&(first, end)| passage.start_line > first && passage.end_line <= end)?;
+    let hashes: Vec<_> = blocks
+        .iter()
+        .map(|&(first, end)| hash(normalize(&lines[first..end].join("\n")).as_bytes()))
+        .collect();
+    let neighbors = |index: usize| {
+        (
+            index.checked_sub(1).map(|i| &hashes[i]),
+            hashes.get(index + 1),
+        )
+    };
+    let (before, after) = neighbors(target);
+    if (0..blocks.len())
+        .filter(|&i| neighbors(i) == (before, after))
+        .count()
+        != 1
+    {
+        return None;
+    }
+    Some(json!({"section":section,"before":before,"after":after}))
+}
+
 fn restore_candidates(next: &mut Vec<Finding>, recovered: Vec<Finding>) {
     for finding in recovered {
         if let Some(existing) = next.iter_mut().find(|f| f.id == finding.id) {
@@ -501,7 +566,27 @@ fn collect_one(
                 })
         })
         .transpose()?;
-    if previous.is_some_and(|f| !same_subject(&f.proposal, &proposal)) {
+    let scope_anchor = (proposal.kind == "scope" && proposal.sources.is_empty())
+        .then(|| {
+            proposal
+                .document
+                .as_ref()
+                .and_then(|p| scope_anchor(doc, p))
+        })
+        .flatten();
+    // Only an explicit ID from the preceding review may use this exception.
+    // Current-page occurrences still follow the existing separate-ID rules.
+    let reanchored_scope = previous.is_some_and(|old| {
+        !same_subject(&old.proposal, &proposal)
+            && old.proposal.kind == "scope"
+            && old.proposal.sources.is_empty()
+            && old.proposal.requirement_id == proposal.requirement_id
+            && scope_anchor
+                .as_ref()
+                .is_some_and(|anchor| old.context.get("scope_anchor") == Some(anchor))
+            && !next.iter().any(|f| f.id == old.id)
+    });
+    if previous.is_some_and(|f| !same_subject(&f.proposal, &proposal)) && !reanchored_scope {
         bail!(
             "document_review_invalid: reused finding id points to a different problem location/type; use null for a new finding"
         );
@@ -566,7 +651,10 @@ fn collect_one(
         // Keep reviewing coverage; the next repair review can report further findings.
         return Ok((0, corrections));
     }
-    let context = json!({"document_context":document_context,"sources":sources});
+    let mut context = json!({"document_context":document_context,"sources":sources});
+    if let Some(anchor) = scope_anchor {
+        context["scope_anchor"] = anchor;
+    }
     let fingerprint = hash(
         json!({"proposal":proposal,"context":context,"requirements":catalog,
         "source_versions":state.source_hashes})
@@ -576,7 +664,7 @@ fn collect_one(
     let cached = state
         .findings
         .iter()
-        .find(|f| f.fingerprint == fingerprint && f.confirmed && !f.inferred);
+        .find(|f| !reanchored_scope && f.fingerprint == fingerprint && f.confirmed && !f.inferred);
     let id = id
         .or_else(|| cached.map(|f| f.id.clone()))
         .unwrap_or_else(|| {
@@ -590,6 +678,7 @@ fn collect_one(
         fingerprint,
         confirmed: cached.is_some(),
         inferred: false,
+        reanchored_scope,
     });
     Ok((0, corrections))
 }
@@ -697,6 +786,15 @@ pub fn finish_verification(s: &mut Session, body: &str) -> Result<()> {
             .iter()
             .find(|f| f.id == decision.id)
             .unwrap();
+        let scope_gap = (finding.reanchored_scope && decision.status == "unverified")
+            .then(|| {
+                finding
+                    .proposal
+                    .document
+                    .as_ref()
+                    .map(|p| (p.start_line, p.end_line))
+            })
+            .flatten();
         let is_inferred = inferred.contains(&decision.id);
         let mut entry = json!({"finding":finding,"decision":decision});
         if is_inferred {
@@ -714,10 +812,18 @@ pub fn finish_verification(s: &mut Session, body: &str) -> Result<()> {
             finding.inferred = is_inferred;
         } else {
             state.page_findings.retain(|f| f.id != decision.id);
-            // An unverified finding failed the confirmation bar: the same
-            // evidence cannot decide it on a retry, so it is dropped like a
-            // dismissal while confirmed findings in this response still apply.
-            if decision.status == "duplicate" {
+            // An unverified finding is not repair guidance. Ordinary new
+            // candidates retain their existing dismissal behavior; a linked
+            // formerly confirmed scope finding additionally leaves a gap.
+            if let Some(range) = scope_gap {
+                // Uncertainty about a formerly confirmed defect is neither
+                // a dismissal nor a repair verdict. Reuse the coverage-gap
+                // path so completion cannot silently approve this passage.
+                state.unverified_scope_ids.insert(decision.id.clone());
+                state.skipped_ranges.push(range);
+                state.skipped_ranges.sort_unstable();
+                state.skipped_ranges.dedup();
+            } else if decision.status == "duplicate" {
                 state.merged_findings += 1;
             } else {
                 state.dismissed_findings += 1;
