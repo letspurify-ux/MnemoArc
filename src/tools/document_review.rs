@@ -47,7 +47,7 @@ pub struct ReviewState {
     /// page responses or unverified reanchored scope findings. They block approval.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped_ranges: Vec<(usize, usize)>,
-    /// Undecided ranges of the review that ended unavailable, for the report.
+    /// Undecided ranges of the completed review, including mixed rejections.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unavailable_ranges: Vec<(usize, usize)>,
     #[serde(skip)]
@@ -111,7 +111,7 @@ impl ReviewState {
                 .iter()
                 .chain(&self.retry_findings)
                 .chain(&self.findings)
-                .map(|f| &f.context)
+                .map(|f| (&f.context, &f.previous_scope))
                 .collect::<Vec<_>>(),
             &self.validation_ids,
             &self.unverified_scope_ids,
@@ -283,10 +283,19 @@ pub fn unavailable_on_current(s: &Session) -> bool {
     matches!(current_verdict(s), CurrentVerdict::Unavailable)
 }
 
-/// Document ranges left unreviewed by an unavailable verdict; empty when the
-/// whole review failed rather than particular pages.
+/// Undecided ranges for the current rejection or unavailable verdict; empty
+/// for stale reviews or when the whole review failed without specific ranges.
 pub fn unavailable_ranges(s: &Session) -> &[(usize, usize)] {
-    &s.document_review.unavailable_ranges
+    if !s.document_review.unavailable_ranges.is_empty()
+        && matches!(
+            current_verdict(s),
+            CurrentVerdict::Rejected(_) | CurrentVerdict::Unavailable
+        )
+    {
+        &s.document_review.unavailable_ranges
+    } else {
+        &[]
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -306,7 +315,7 @@ pub enum PageSkip {
 /// already collected from other pages (a live run lost two real errors that
 /// way). Record the page's document range, preserve grounded retry candidates,
 /// and let the collected findings go through validation. Skipped ranges
-/// block approval and are reported when no finding remains.
+/// block approval and are reported alongside any confirmed findings.
 pub fn skip_failing_page(s: &mut Session) -> PageSkip {
     let state = &s.document_review;
     if !state.pending || state.validating || state.target_hash.is_none() {
@@ -403,6 +412,9 @@ pub fn response_format() -> Value {
 /// Working context carries accepted repair guidance, not unconfirmed proposals.
 pub fn guidance(s: &Session) -> Value {
     let mut value = json!(s.document_review);
+    if unavailable_ranges(s).is_empty() {
+        value.as_object_mut().unwrap().remove("unavailable_ranges");
+    }
     for key in [
         "validation_log",
         "findings",
@@ -1107,13 +1119,14 @@ fn finish_review(s: &mut Session, digest: String) -> Result<()> {
     if let Some(issue) = length_issue {
         next_issues.push(issue);
     }
-    if next_issues.is_empty() {
+    // A formerly confirmed scope defect becoming uncertain is not a repair.
+    // Include these gaps only in progress accounting, never repair guidance.
+    let remaining = next_issues.len() + state.unverified_scope_ids.len();
+    if remaining == 0 {
         state.stalled_attempts = 0;
         state.best_issue_count = Some(0);
     } else {
-        let improved_count = state
-            .best_issue_count
-            .is_some_and(|best| next_issues.len() < best);
+        let improved_count = state.best_issue_count.is_some_and(|best| remaining < best);
         let added_section = sections > state.last_reviewed_section_count;
         // Repairs usually lengthen the document, so longer text is progress
         // only when the previous verdict asked for more length. Otherwise a
@@ -1138,7 +1151,7 @@ fn finish_review(s: &mut Session, digest: String) -> Result<()> {
         state.best_issue_count = Some(
             state
                 .best_issue_count
-                .map_or(next_issues.len(), |best| best.min(next_issues.len())),
+                .map_or(remaining, |best| best.min(remaining)),
         );
     }
     state.last_reviewed_section_count = state.last_reviewed_section_count.max(sections);
@@ -1152,14 +1165,13 @@ fn finish_review(s: &mut Session, digest: String) -> Result<()> {
     state.unavailable_source_hashes.clear();
     state.reviewed_requirements = state.target_requirements.clone();
     let skipped = std::mem::take(&mut state.skipped_ranges);
-    state.unavailable_ranges.clear();
+    state.unavailable_ranges = skipped;
     reset_pages(state);
-    if state.issues.is_empty() && !skipped.is_empty() {
+    if state.issues.is_empty() && !state.unavailable_ranges.is_empty() {
         // A skipped page was never judged: report it instead of approving.
         state.unavailable_hash = Some(digest);
         state.unavailable_requirements = state.target_requirements.clone();
         state.unavailable_source_hashes = state.source_hashes.clone();
-        state.unavailable_ranges = skipped;
         state.approved_hash = None;
         state.repair_requests = 0;
         state.repair_started_round = None;

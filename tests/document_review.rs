@@ -940,8 +940,9 @@ async fn malformed_review_has_bounded_recovery_without_consuming_valid_review_bu
                 result
                     .completion_gaps
                     .iter()
-                    .any(|gap| gap.contains("검토 응답 오류"))
+                    .any(|gap| gap.contains("검토를 마치지 못했습니다."))
             );
+            assert!(document_review::unavailable_on_current(&result));
             assert_eq!(result.document_review.attempts, 0);
             assert!(!result.document_review.pending);
         } else {
@@ -2159,8 +2160,7 @@ async fn a_persistently_invalid_page_is_skipped_without_losing_other_findings() 
                 result
                     .completion_gaps
                     .iter()
-                    .any(|gap| gap
-                        == "문서 검토 — 101–221줄은 검토 응답 오류로 확인하지 못했습니다."),
+                    .any(|gap| gap == "문서 검토 — 101–221줄은 검토를 마치지 못했습니다."),
                 "{:?}",
                 result.completion_gaps
             );

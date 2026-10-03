@@ -113,6 +113,7 @@ fn collect_gaps(s: &mut Session, extra: &[String]) -> Vec<String> {
             ));
         }
         if s.document_written && s.config.source_document_review {
+            let ranges = tools::document_review::unavailable_ranges(s);
             match tools::document_review::current_verdict(s) {
                 tools::document_review::CurrentVerdict::Approved => {}
                 tools::document_review::CurrentVerdict::Rejected(issues) => {
@@ -121,23 +122,23 @@ fn collect_gaps(s: &mut Session, extra: &[String]) -> Vec<String> {
                     }
                 }
                 tools::document_review::CurrentVerdict::Unavailable => {
-                    let ranges = tools::document_review::unavailable_ranges(s);
                     if ranges.is_empty() {
                         gaps.push("문서 검토 — 검토 응답 오류로 검토를 마치지 못했습니다.".into());
-                    } else {
-                        let ranges = ranges
-                            .iter()
-                            .map(|(start, end)| format!("{start}–{end}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        gaps.push(format!(
-                            "문서 검토 — {ranges}줄은 검토 응답 오류로 확인하지 못했습니다."
-                        ));
                     }
                 }
                 tools::document_review::CurrentVerdict::Unreviewed => {
                     gaps.push("문서 검토 — 현재 문서를 마감 전에 검토하지 못했습니다.".into());
                 }
+            }
+            if !ranges.is_empty() {
+                let ranges = ranges
+                    .iter()
+                    .map(|(start, end)| format!("{start}–{end}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                gaps.push(format!(
+                    "문서 검토 — {ranges}줄은 검토를 마치지 못했습니다."
+                ));
             }
         }
     }
@@ -3426,6 +3427,7 @@ mod review_gap_tests {
         .unwrap();
 
         tools::document_review::request(&mut s).unwrap();
+        s.document_review.skipped_ranges.push((2, 2));
         tools::document_review::test_finish(
             &mut s,
             r#"{"issues":["Flow: the loop is for, not while"]}"#,
@@ -3433,6 +3435,10 @@ mod review_gap_tests {
         .unwrap();
         let gaps = collect_gaps(&mut s, &[]);
         assert!(gaps.iter().any(|gap| gap.contains("the loop is for")));
+        assert!(
+            gaps.iter()
+                .any(|gap| gap == "문서 검토 — 2–2줄은 검토를 마치지 못했습니다.")
+        );
 
         let expected = s.last_document_write.as_ref().unwrap().1.clone();
         tools::execute(
@@ -3447,6 +3453,7 @@ mod review_gap_tests {
                 .any(|gap| gap == "문서 검토 — 현재 문서를 마감 전에 검토하지 못했습니다.")
         );
         assert!(!gaps.iter().any(|gap| gap.contains("the loop is for")));
+        assert!(!gaps.iter().any(|gap| gap.contains("2–2줄")));
 
         s.config.source_document_review = false;
         let gaps = collect_gaps(&mut s, &[]);

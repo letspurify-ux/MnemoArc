@@ -853,6 +853,7 @@ fn merging_repeated_findings_preserves_their_additional_evidence() {
     submit(&mut s, vec![first, repeated]);
     let p = payload(review::request(&mut s).unwrap());
     assert_eq!(p["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(p["candidates"][0]["problem"], "Timing issue");
     assert_eq!(p["candidates"][0]["sources"].as_array().unwrap().len(), 2);
     assert_eq!(
         p["candidates"][0]["observed_context"]["sources"]
@@ -1202,6 +1203,14 @@ fn rewritten_source_less_scope_is_revalidated_and_can_be_dismissed() {
     );
     let request = payload(review::request(&mut s).unwrap());
     assert_eq!(request["candidates"][0]["id"], "F1");
+    assert_eq!(
+        request["candidates"][0]["previous_scope"]["document"]["quote"],
+        OLD_SCOPE_TEXT
+    );
+    assert_eq!(
+        request["candidates"][0]["previous_scope"]["problem"],
+        "문서가 내부 렌더 용어를 노출합니다."
+    );
     assert!(
         request["candidates"][0]["document"]["quote"]
             .as_str()
@@ -1366,6 +1375,174 @@ fn a_reanchored_scope_gap_survives_an_invalid_sibling_and_empty_retry() {
     assert_eq!(review::unavailable_ranges(&s), &[(line, line)]);
     assert_eq!(s.document_review.resolved_findings, 0);
     assert!(!review::approved(&s));
+}
+
+#[test]
+fn unchanged_scope_cannot_be_replaced_by_another_claim_in_the_same_paragraph() {
+    for multiline in [false, true] {
+        let (_dir, mut s) = scope_fixture();
+        let quote = if multiline {
+            format!("{OLD_SCOPE_TEXT}\n말풍선에서 원문을 확인합니다. ui.js:2")
+        } else {
+            OLD_SCOPE_TEXT.to_owned()
+        };
+        review::request(&mut s).unwrap();
+        let original = scope_proposal(&s, &quote, None);
+        submit(&mut s, vec![original]);
+        validate(&mut s, vec![decision("F1", "confirmed")]);
+        let mut other = scope_proposal(&s, "말풍선에서 원문을 확인합니다. ui.js:2", Some("F1"));
+        other["problem"] = json!("원문 확인 안내를 더 자세히 써야 합니다.");
+        other["correction"] = json!("원문 확인 안내를 확대하세요.");
+        if multiline {
+            // Line endings and indentation do not remove the old claim.
+            let doc = std::fs::read_to_string(&s.project.output).unwrap();
+            std::fs::write(
+                &s.project.output,
+                doc.replace(&quote, &quote.replace('\n', "\n  "))
+                    .replace('\n', "\r\n"),
+            )
+            .unwrap();
+        }
+        review::request(&mut s).unwrap();
+        reject(&mut s, vec![other]);
+        assert_eq!(s.document_review.validation_rounds, 1);
+        assert_eq!(
+            s.document_review.findings[0].proposal.problem,
+            "문서가 내부 렌더 용어를 노출합니다."
+        );
+        assert!(!review::approved(&s));
+    }
+}
+
+#[test]
+fn reanchored_scope_protection_survives_cached_and_later_reviews() {
+    for cached_id in [None, Some("F1")] {
+        let (_dir, mut s) = scope_fixture();
+        confirm_scope(&mut s);
+        rewrite_scope(&s);
+        review::request(&mut s).unwrap();
+        let changed = scope_proposal(&s, NEW_SCOPE_TEXT, Some("F1"));
+        submit(&mut s, vec![changed]);
+        validate(&mut s, vec![decision("F1", "confirmed")]);
+
+        review::request(&mut s).unwrap();
+        let unchanged = scope_proposal(&s, NEW_SCOPE_TEXT, cached_id);
+        submit(&mut s, vec![unchanged]);
+        assert!(!s.document_review.validating);
+        assert_eq!(s.document_review.validation_rounds, 2);
+
+        let doc = std::fs::read_to_string(&s.project.output).unwrap();
+        std::fs::write(
+            &s.project.output,
+            doc.replace(
+                "말풍선에서 원문을 확인합니다.",
+                "같은 말풍선에서 원문을 볼 수 있습니다.",
+            ),
+        )
+        .unwrap();
+        review::request(&mut s).unwrap();
+        let unchanged = scope_proposal(&s, NEW_SCOPE_TEXT, Some("F1"));
+        submit(&mut s, vec![unchanged]);
+        assert!(s.document_review.validating);
+        validate(&mut s, vec![decision("F1", "unverified")]);
+        assert!(review::unavailable_on_current(&s));
+        assert!(!review::unavailable_ranges(&s).is_empty());
+        assert_eq!(s.document_review.resolved_findings, 0);
+        assert_eq!(s.document_review.best_issue_count, Some(1));
+        assert_eq!(s.document_review.stalled_attempts, 3);
+    }
+}
+
+#[test]
+fn mixed_scope_gap_is_reported_without_counting_uncertainty_as_progress() {
+    let (_dir, mut s) = scope_fixture();
+    review::request(&mut s).unwrap();
+    let first = scope_proposal(&s, OLD_SCOPE_TEXT, None);
+    let mut second = scope_proposal(&s, "설정을 저장합니다. ui.js:2", None);
+    second["problem"] = json!("설정 안내에 별도 문제가 있습니다.");
+    submit(&mut s, vec![first, second.clone()]);
+    validate(
+        &mut s,
+        vec![decision("F1", "confirmed"), decision("F2", "confirmed")],
+    );
+    rewrite_scope(&s);
+    review::request(&mut s).unwrap();
+    let changed = scope_proposal(&s, NEW_SCOPE_TEXT, Some("F1"));
+    let line = changed["document"]["start_line"].as_u64().unwrap() as usize;
+    second["previous_id"] = json!("F2");
+    submit(&mut s, vec![changed, second]);
+    validate(&mut s, vec![decision("F1", "unverified")]);
+    assert!(review::rejected_on_current_result(&s));
+    assert_eq!(s.document_review.findings.len(), 1);
+    assert_eq!(review::unavailable_ranges(&s), &[(line, line)]);
+    assert_eq!(
+        review::guidance(&s)["unavailable_ranges"],
+        json!([[line, line]])
+    );
+    assert_eq!(s.document_review.resolved_findings, 0);
+    assert_eq!(s.document_review.best_issue_count, Some(2));
+    assert_eq!(s.document_review.stalled_attempts, 1);
+
+    // The range belongs to that reviewed version, not subsequent edits.
+    let doc = std::fs::read_to_string(&s.project.output).unwrap();
+    std::fs::write(&s.project.output, format!("\n{doc}")).unwrap();
+    assert!(review::unavailable_ranges(&s).is_empty());
+    assert!(review::guidance(&s).get("unavailable_ranges").is_none());
+    review::request(&mut s).unwrap();
+    submit(&mut s, vec![]);
+    assert!(review::approved(&s));
+    assert!(s.document_review.unavailable_ranges.is_empty());
+}
+
+#[test]
+fn an_explicit_retry_updates_the_proposal_but_preserves_observed_evidence() {
+    for invalid_retry in [false, true] {
+        let (_dir, mut s) = fixture();
+        review::request(&mut s).unwrap();
+        let mut initial = proposal("Initial timing description");
+        initial["sources"].as_array_mut().unwrap().push(json!({"path":"ui.js","start_line":1,"end_line":1,"quote":"const message = '검색 결과가 없습니다.';"}));
+        initial["correction"] = json!("‘검색 결과가 없습니다.’ 안내를 확인하세요.");
+        initial["ui_labels"] = json!(["검색 결과가 없습니다."]);
+        let mut bad = initial.clone();
+        bad["document"]["quote"] = json!("Absent document quote");
+        reject(&mut s, vec![initial, bad.clone()]);
+        review::request(&mut s).unwrap();
+        let mut corrected = proposal("Corrected timing description");
+        corrected["previous_id"] = json!("F1");
+        if invalid_retry {
+            reject(&mut s, vec![corrected.clone(), bad]);
+            assert!(!s.document_review.validating);
+            assert!(s.document_review.findings.is_empty());
+            review::request(&mut s).unwrap();
+            submit(&mut s, vec![]);
+        } else {
+            submit(&mut s, vec![corrected.clone()]);
+        }
+        let request = payload(review::request(&mut s).unwrap());
+        let candidate = &request["candidates"][0];
+        assert_eq!(candidate["id"], "F1");
+        assert_eq!(candidate["problem"], corrected["problem"]);
+        assert_eq!(candidate["correction"], corrected["correction"]);
+        assert_eq!(candidate["ui_labels"], json!([]));
+        assert_eq!(candidate["sources"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            candidate["observed_context"]["sources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        review::finish(
+            &mut s,
+            &json!({"decisions":[decision("F1", "confirmed")]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            s.document_review.findings[0].proposal.problem,
+            "Corrected timing description"
+        );
+        assert!(!review::approved(&s));
+    }
 }
 
 #[test]
