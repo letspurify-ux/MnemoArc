@@ -643,3 +643,56 @@ fn small_reference_results_preserve_the_item_and_stale_revision_cause() {
         true
     );
 }
+
+#[test]
+fn a_path_source_id_resolves_to_its_delivered_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/a.rs"),
+        "fn main() {}\nfn helper() {}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("src/unread.rs"), "fn other() {}\n").unwrap();
+    let mut s = session(dir.path());
+    let read = tools::execute(
+        &mut s,
+        "file_read",
+        json!({"path":"src/a.rs","start_line":1,"max_lines":1}),
+    )
+    .unwrap();
+    let source = read["source"]["id"].as_str().unwrap().to_owned();
+    let write = |s: &mut Session, key: &str, ids: Value| {
+        run(
+            s,
+            key,
+            "memory_write",
+            json!({"key":key,"title":"Entry","summary":"main is declared","body":"main is empty","kind":"fact","source_ids":ids}),
+        )
+    };
+    // The live shape: a project path, or a document citation, in place of an S-ID.
+    for (key, path) in [("by-path", "src/a.rs"), ("by-citation", "src/a.rs:1")] {
+        let result = write(&mut s, key, json!([path]));
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(result["data"]["resolved_source_ids"][path], json!([source]));
+        let memory = s.memory.get(key).unwrap();
+        assert_eq!(memory.sources.len(), 1);
+        assert_eq!(memory.sources[0].id, source);
+    }
+    // A citation range or a file with no delivered lines is still refused,
+    // so a memory never cites evidence the session did not observe.
+    for (key, path) in [
+        ("unread-range", "src/a.rs:2"),
+        ("unread-file", "src/unread.rs"),
+    ] {
+        let result = write(&mut s, key, json!([path]));
+        assert_eq!(result["status"], "error", "{result}");
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("no complete lines"),
+            "{result}"
+        );
+    }
+}

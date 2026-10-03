@@ -261,13 +261,14 @@ fn file_evidence_document_conflict_and_revalidation() {
     )
     .unwrap();
     let h = doc["hash"].as_str().unwrap();
-    // Edits without expected_hash are refused (an append right after the
-    // model's own write is the one exception, covered in documentation.rs).
+    // Section edits without expected_hash are refused (an append right after
+    // the model's own write is one exception, covered in documentation.rs;
+    // anchored text edits are another, their exact old_text is the guard).
     assert!(
         tools::execute(
             &mut s,
             "document_edit",
-            json!({"action":"replace_text","old_text":"main prints hello.","text":"bad"})
+            json!({"action":"insert_after","section":"# Entry","text":"# Bad\n"})
         )
         .is_err()
     );

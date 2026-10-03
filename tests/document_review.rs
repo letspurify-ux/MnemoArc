@@ -146,7 +146,7 @@ fn source_workflow_activates_tools_and_schema_prevents_guessing() {
         tools::execute(
             &mut s,
             "document_edit",
-            json!({"action":"replace_text","old_text":"A while loop","text":"x"})
+            json!({"action":"insert_after","section":"# Flow","text":"# Extra\n"})
         )
         .unwrap_err()
         .to_string()

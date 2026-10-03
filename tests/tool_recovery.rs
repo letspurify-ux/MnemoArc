@@ -497,9 +497,9 @@ fn missing_document_edit_hash_points_to_document_tools() {
         id: "missing-document-hash".into(),
         name: "document_edit".into(),
         arguments: json!({
-            "action": "insert_after_text",
-            "old_text": "existing passage",
-            "text": "new passage"
+            "action": "insert_after",
+            "section": "# Existing",
+            "text": "# New\n"
         })
         .to_string(),
     };

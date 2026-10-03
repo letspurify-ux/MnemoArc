@@ -191,7 +191,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_write",
-                description: "Save one reusable memory: title/summary/body/kind are required plain JSON fields. Same key requires expected_revision. Missing/stale revisions return current ID/key/status/revision and a retry patch; merge it into the full intended call. Invalid input reports received/missing/unknown fields and a JSON example. Updates replace evidence: resupply observed source_ids; sources are not inherited. Never omit source_ids after unknown_source. Unsourced facts, inferred memories and changed evidence are needs_review. Keep transient progress in task_state/checkpoint_complete, separately from stable observed facts. Metadata has no per-entry token rejection; keep it concise for index_tokens. Oversized entries remain available through memory_find/memory_read. Put details in body. kind: fact/decision/failure/question/procedure",
+                description: "Save one reusable memory: title/summary/body/kind are required plain JSON fields. Same key requires expected_revision. Missing/stale revisions return current ID/key/status/revision and a retry patch; merge it into the full intended call. Invalid input reports received/missing/unknown fields and a JSON example. Updates replace evidence: resupply observed source_ids; sources are not inherited. Never omit source_ids after unknown_source. A project path (or path:start-end) stands in for the evidence already delivered from it. Unsourced facts, inferred memories and changed evidence are needs_review. Keep transient progress in task_state/checkpoint_complete, separately from stable observed facts. Metadata has no per-entry token rejection; keep it concise for index_tokens. Oversized entries remain available through memory_find/memory_read. Put details in body. kind: fact/decision/failure/question/procedure",
                 optional: false,
                 read_only: false,
                 parameters: memory_input_schema(),
@@ -386,7 +386,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit",
-                description: "Edit ONLY configured Markdown output. Save one investigated section at a time. Inspect the outline and copy section_path when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash. Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and also requires expected_section_hash; its text must retain the original full heading. Simple edits do not require investigation items; the source_document workflow enables investigation automatically from the user's selection; do not patch workflow or require_investigation. Returns measured lines and new hash",
+                description: "Edit ONLY configured Markdown output. Save one investigated section at a time. Inspect the outline and copy section_path when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition (a supplied hash is still checked). Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and also requires expected_section_hash; its text must retain the original full heading. Simple edits do not require investigation items; the source_document workflow enables investigation automatically from the user's selection; do not patch workflow or require_investigation. Returns measured lines and new hash",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -775,8 +775,8 @@ impl ToolRegistry {
                         {"type":"object","properties":{"action":{"enum":["create","write"]},"text":fields["text"],"expected_hash":fields["expected_hash"]},"required":["text"],"additionalProperties":false},
                         {"type":"object","properties":{"action":{"const":"append"},"text":fields["text"],"expected_hash":fields["expected_hash"]},"required":["text","expected_hash"],"additionalProperties":false},
                         {"type":"object","properties":{"action":{"enum":["insert_before","insert_after","insert_first_child","insert_last_child"]},"text":fields["text"],"expected_hash":fields["expected_hash"],"section":fields["section"]},"required":["text","expected_hash","section"],"additionalProperties":false},
-                        {"type":"object","properties":{"action":{"enum":["patch","replace_text","insert_before_text","insert_after_text"]},"text":fields["text"],"expected_hash":fields["expected_hash"],"old_text":fields["old_text"],"section":fields["section"]},"required":["text","expected_hash","old_text"],"additionalProperties":false},
-                        {"type":"object","properties":{"action":{"const":"delete_text"},"expected_hash":fields["expected_hash"],"old_text":fields["old_text"],"section":fields["section"]},"required":["expected_hash","old_text"],"additionalProperties":false},
+                        {"type":"object","properties":{"action":{"enum":["patch","replace_text","insert_before_text","insert_after_text"]},"text":fields["text"],"expected_hash":fields["expected_hash"],"old_text":fields["old_text"],"section":fields["section"]},"required":["text","old_text"],"additionalProperties":false},
+                        {"type":"object","properties":{"action":{"const":"delete_text"},"expected_hash":fields["expected_hash"],"old_text":fields["old_text"],"section":fields["section"]},"required":["old_text"],"additionalProperties":false},
                         {"type":"object","properties":{"action":{"const":"section"},"text":fields["text"],"expected_hash":fields["expected_hash"],"section":fields["section"],"expected_section_hash":fields["expected_section_hash"]},"required":["text","expected_hash","section","expected_section_hash"],"additionalProperties":false}
                     ]);
                 }
@@ -1122,8 +1122,12 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
     }
     match action {
         "append" => require("expected_hash")?,
+        // An exact old_text that must match the current document once is
+        // already the precondition, so expected_hash is optional here.
         "patch" | "replace_text" | "insert_before_text" | "insert_after_text" | "delete_text" => {
-            require("expected_hash")?;
+            if args.get("expected_hash").is_some() {
+                require("expected_hash")?;
+            }
             require("old_text")?;
             if args.get("section").is_some() {
                 require("section")?;
@@ -1946,6 +1950,13 @@ fn inserts_block(text: &str) -> bool {
         || ["- ", "* ", "+ ", "#", "|", "> ", "```"]
             .iter()
             .any(|marker| first.starts_with(marker))
+}
+
+fn is_anchored_text_edit(action: &str) -> bool {
+    matches!(
+        action,
+        "patch" | "replace_text" | "delete_text" | "insert_before_text" | "insert_after_text"
+    )
 }
 
 fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
@@ -3449,6 +3460,59 @@ fn delivered_sources_for(
     Ok(found)
 }
 
+/// Most recent delivered sources kept for one path given as a source ID.
+const PATH_SOURCE_LIMIT: usize = 8;
+
+/// Live runs pass project paths, and `path:10-20` citations, as memory_write
+/// source_ids. Replace each with the evidence already delivered from that
+/// file (range) in its current version, as investigation verify does; a path
+/// with no delivered evidence still fails, so nothing unobserved is cited.
+fn resolve_path_source_ids(
+    s: &Session,
+    ids: &[String],
+) -> Result<(Vec<String>, serde_json::Map<String, Value>)> {
+    let mut out: Vec<String> = Vec::new();
+    let mut resolved = serde_json::Map::new();
+    for id in ids {
+        let path = strip_line_suffix(id);
+        if s.source_refs(std::slice::from_ref(id)).is_ok()
+            || !(id.contains('/') || id.contains('.'))
+            || read_path(&s.project, path).is_err()
+        {
+            out.push(id.clone());
+            continue;
+        }
+        let (start, end) = id[path.len()..]
+            .strip_prefix(':')
+            .map(|lines| {
+                let mut bounds = lines.split('-').map(|b| b.parse::<usize>().unwrap_or(0));
+                let start = bounds.next().unwrap_or(0);
+                (start, bounds.next().unwrap_or(start))
+            })
+            .unwrap_or((1, usize::MAX));
+        let mut found = delivered_sources_for(
+            s,
+            &[json!({"path":path,"start_line":start,"end_line":end})],
+            &[],
+        )?;
+        if found.is_empty() {
+            bail!(
+                "unknown_source: {id} is a path, not a source ID, and no complete lines of its current version were delivered in this session; file_read the relevant range first, then pass the returned S-ID"
+            );
+        }
+        found.sort_by_key(|source| std::cmp::Reverse(source.observed_at));
+        let ids: Vec<String> = found
+            .into_iter()
+            .take(PATH_SOURCE_LIMIT)
+            .map(|source| source.id)
+            .filter(|found| !out.contains(found))
+            .collect();
+        out.extend(ids.iter().cloned());
+        resolved.insert(id.clone(), json!(ids));
+    }
+    Ok((out, resolved))
+}
+
 /// Mark unsettled items written once their section has body text. A section
 /// registered while planning often differs from the heading finally written;
 /// when it no longer resolves, rebind it to the heading found by
@@ -4029,9 +4093,11 @@ fn execute_repaired(
             Ok(json!({"pending":pending,"applies":"next_request"}))
         }
         "memory_write" => {
-            let input: MemoryInput = serde_json::from_value(args).map_err(|error| {
+            let mut input: MemoryInput = serde_json::from_value(args).map_err(|error| {
                 anyhow::anyhow!("invalid_argument_value: memory_write fields: {error}")
             })?;
+            let resolved_paths;
+            (input.source_ids, resolved_paths) = resolve_path_source_ids(s, &input.source_ids)?;
             let sources = s.source_refs(&input.source_ids)?;
             let result = s
                 .memory
@@ -4042,7 +4108,11 @@ fn execute_repaired(
             // cannot be reported as an active fact until it is reread.
             let id = result.id.clone();
             revalidate(s)?;
-            Ok(json!(s.memory.get(&id)?.meta()))
+            let mut meta = json!(s.memory.get(&id)?.meta());
+            if !resolved_paths.is_empty() {
+                meta["resolved_source_ids"] = Value::Object(resolved_paths);
+            }
+            Ok(meta)
         }
         "memory_read" => {
             if !s.config.memory_reuse {
@@ -4538,11 +4608,20 @@ fn execute_repaired(
             if action == "create" && exists {
                 bail!("document_exists");
             }
-            if exists && action != "create" && args["expected_hash"].as_str().is_none() {
+            // Anchored text edits match an exact old_text once in the current
+            // document; that match is their precondition, so a hash is
+            // optional for them. A supplied hash is still enforced.
+            let anchored = is_anchored_text_edit(action);
+            let omitted = args.get("expected_hash").is_none();
+            if exists && action != "create" && !anchored && args["expected_hash"].as_str().is_none()
+            {
                 bail!("document_hash_required: existing document edits require expected_hash");
             }
             let digest = hash(old.as_bytes());
-            if exists && args["expected_hash"].as_str() != Some(digest.as_str()) {
+            if exists
+                && !(anchored && omitted)
+                && args["expected_hash"].as_str() != Some(digest.as_str())
+            {
                 return Err(revision_conflict(&args, &digest));
             }
             if !exists && action != "create" && action != "write" {

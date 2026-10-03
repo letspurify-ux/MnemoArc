@@ -1276,6 +1276,39 @@ mod tests {
     }
 
     #[test]
+    fn a_reused_id_at_another_passage_becomes_its_own_finding() {
+        let (_dir, mut s) = review_fixture();
+        std::fs::write(
+            &s.project.output,
+            "# Manual\nOpen chat. main.js:1\n\nAgain, open chat. main.js:1\n",
+        )
+        .unwrap();
+        request(&mut s).unwrap();
+        let first = json!({"previous_id":null,"kind":"factual",
+            "document":{"start_line":2,"end_line":2,"quote":"Open chat."},
+            "requirement_id":null,"sources":[{"path":"main.js","start_line":1,"end_line":1,"quote":"function openChat() {}"}],
+            "problem":"The open behavior is overstated","correction":"Describe observed behavior","ui_labels":[]});
+        // The live shape: the same defect found again at another line, with
+        // the first finding's ID reused instead of null.
+        let mut again = first.clone();
+        again["previous_id"] = json!("F1");
+        again["document"] = json!({"start_line":4,"end_line":4,"quote":"Again, open chat."});
+        finish(&mut s, &json!({"issues":[first,again]}).to_string()).unwrap();
+        let found: Vec<_> = s
+            .document_review
+            .page_findings
+            .iter()
+            .map(|f| {
+                (
+                    f.id.clone(),
+                    f.proposal.document.as_ref().unwrap().start_line,
+                )
+            })
+            .collect();
+        assert_eq!(found, vec![("F1".to_string(), 2), ("F2".to_string(), 4)]);
+    }
+
+    #[test]
     fn recovered_candidate_context_participates_in_retention_budget() {
         let (_dir, mut s) = review_fixture();
         request(&mut s).unwrap();

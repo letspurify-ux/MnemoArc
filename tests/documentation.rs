@@ -3410,7 +3410,8 @@ fn an_append_after_the_models_own_write_may_omit_the_hash() {
     .unwrap_err()
     .to_string();
     assert!(error.contains("expected_hash"), "{error}");
-    // Other actions keep requiring it even right after a write.
+    // Section actions keep requiring it even right after a write (anchored
+    // text edits never need it; their exact old_text is the precondition).
     let hash = tools::hash(b"# Guide\nChanged elsewhere.\n");
     run(
         &mut s,
@@ -3420,7 +3421,7 @@ fn an_append_after_the_models_own_write_may_omit_the_hash() {
     let error = tools::execute(
         &mut s,
         "document_edit",
-        json!({"action":"replace_text","old_text":"Three","text":"3"}),
+        json!({"action":"insert_after","section":"## Three","text":"## Four\n"}),
     )
     .unwrap_err()
     .to_string();
@@ -4364,5 +4365,61 @@ fn appended_heading_follows_the_document_heading_spacing() {
     assert_eq!(
         std::fs::read_to_string(dir.path().join("summary.md")).unwrap(),
         "# Guide\n\n## One\nText.\nMore.\n"
+    );
+}
+
+#[test]
+fn anchored_text_edits_accept_an_omitted_hash_but_check_a_supplied_one() {
+    let (_dir, mut s) = setup();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\nfirst line\nlast line\n"}),
+    );
+    // The exact old_text match is the precondition, so no hash is needed.
+    for edit in [
+        json!({"action":"replace_text","old_text":"first line","text":"opening line"}),
+        json!({"action":"patch","old_text":"opening line","text":"start line"}),
+        json!({"action":"insert_after_text","old_text":"start line\n","text":"middle line\n"}),
+        json!({"action":"insert_before_text","old_text":"last line","text":"extra line\n"}),
+        json!({"action":"delete_text","old_text":"extra line\n"}),
+    ] {
+        run(&mut s, "document_edit", edit);
+    }
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\nstart line\nmiddle line\nlast line\n"
+    );
+    // Text that is no longer in the document still fails, so a stale view
+    // cannot silently apply.
+    let stale = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","old_text":"first line","text":"x"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(stale.contains("patch_target_must_match_once"), "{stale}");
+    // A supplied hash is still the optimistic lock.
+    let conflict = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":"0".repeat(64),"old_text":"start line","text":"x"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        conflict.contains("document_revision_conflict"),
+        "{conflict}"
+    );
+    for edit in [
+        json!({"action":"replace_text","expected_hash":"","old_text":"start line","text":"x"}),
+        json!({"action":"insert_after","section":"# Guide","text":"## More\n"}),
+    ] {
+        assert!(tools::execute(&mut s, "document_edit", edit).is_err());
+    }
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\nstart line\nmiddle line\nlast line\n"
     );
 }

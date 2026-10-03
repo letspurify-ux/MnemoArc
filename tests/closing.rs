@@ -1556,7 +1556,10 @@ async fn new_evidence_read_for_open_review_findings_is_progress() {
 
 #[tokio::test]
 async fn progress_recovery_verify_does_not_persist_into_the_task_phase() {
-    let (_dir, s) = verified_fixture();
+    let (_dir, mut s) = verified_fixture();
+    // Ten idle rounds sit near the default 64K high-water mark; a memory
+    // checkpoint would suspend progress recovery, which is not under test.
+    s.config.context_tokens = 128_000;
     let steps = (0..10)
         .map(|i| call(&format!("idle-{i}"), "task_state", json!({"action":"read"})))
         .collect();

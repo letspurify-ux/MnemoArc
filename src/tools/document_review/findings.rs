@@ -477,8 +477,18 @@ fn collect_one(
             "document_review_invalid: reused finding id points to a different problem location/type; use null for a new finding"
         );
     }
-    let id = previous.map(|f| f.id.clone());
+    let mut id = previous.map(|f| f.id.clone());
     proposal.previous_id = None;
+    // A reused ID naming a finding already collected in this review at
+    // another passage is a further occurrence of the same defect. Keep it as
+    // its own finding: rejecting it made a live reviewer resend the same
+    // reuse three times until the page was skipped.
+    if id.as_ref().is_some_and(|id| {
+        next.iter()
+            .any(|f| &f.id == id && f.proposal.document != proposal.document)
+    }) {
+        id = None;
+    }
     if let Some(existing) = next
         .iter()
         .position(|f| id.as_ref() == Some(&f.id) || f.proposal == proposal)
