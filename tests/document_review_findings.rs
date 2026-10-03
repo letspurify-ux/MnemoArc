@@ -72,6 +72,347 @@ fn validate(s: &mut Session, decisions: Vec<Value>) {
     review::finish(s, &json!({"decisions":decisions}).to_string()).unwrap();
 }
 
+fn reject(s: &mut Session, issues: Vec<Value>) {
+    // The agent schedules a pending review before calling these direct APIs.
+    s.document_review.pending = true;
+    let error = review::finish(s, &json!({"issues":issues}).to_string())
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("document_review_invalid:"));
+    s.last_error = Some(error);
+}
+
+// Live run 2026-10-03: calls 20 and 21 mixed a valid finding with a bad
+// document quote, in opposite orders. Both valid findings were discarded;
+// call 22's empty retry then silently advanced the page.
+#[test]
+fn a_bad_sibling_cannot_erase_a_grounded_candidate_in_either_order() {
+    for valid_first in [false, true] {
+        for invalid_kind in 0..4 {
+            let (_dir, mut s) = fixture();
+            let first = payload(review::request(&mut s).unwrap());
+            let good = proposal("Grounded timing candidate");
+            let mut bad = proposal("Invalid sibling must never reach validation");
+            match invalid_kind {
+                0 => bad["document"]["quote"] = json!("Absent document quote"),
+                1 => bad["sources"][0]["quote"] = json!("Absent source quote"),
+                2 => bad["ui_labels"] = json!(["Invented UI label"]),
+                _ => {
+                    bad.as_object_mut().unwrap().remove("correction");
+                }
+            }
+            reject(
+                &mut s,
+                if valid_first {
+                    vec![good, bad]
+                } else {
+                    vec![bad, good]
+                },
+            );
+            assert_eq!(s.document_review.attempts, 0);
+            assert!(s.document_review.findings.is_empty());
+            assert!(s.document_review.issues.is_empty());
+            assert!(!s.document_review.validating);
+            assert!(!review::approved(&s));
+
+            let request = review::request(&mut s).unwrap();
+            assert!(mnemoarc::context::count(&request, &s.config.model) <= 24_000);
+            let retry = payload(request);
+            assert_eq!(retry["document"], first["document"]);
+            assert_eq!(retry["evidence"], first["evidence"]);
+            assert_eq!(retry["evidence_manifest"], first["evidence_manifest"]);
+            assert_eq!(retry["current_findings"], json!([]));
+            assert_eq!(retry["retry_findings"].as_array().unwrap().len(), 1);
+            assert_eq!(retry["retry_findings"][0]["id"], "F1");
+            assert_eq!(
+                retry["retry_findings"][0]["text"],
+                "Grounded timing candidate"
+            );
+
+            submit(&mut s, vec![]);
+            assert!(s.document_review.validating);
+            assert_eq!(s.document_review.attempts, 0);
+            assert!(s.document_review.issues.is_empty());
+            let verify = payload(review::request(&mut s).unwrap());
+            assert_eq!(verify["review_stage"], "validate_findings");
+            assert_eq!(verify["candidates"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                verify["candidates"][0]["problem"],
+                "Grounded timing candidate"
+            );
+            review::finish(
+                &mut s,
+                &json!({"decisions":[decision("F1", "confirmed")]}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(s.document_review.findings.len(), 1);
+            assert_eq!(s.document_review.attempts, 1);
+            assert!(!review::approved(&s));
+        }
+    }
+}
+
+#[test]
+fn repeated_invalid_retries_keep_stable_ids_and_deduplicate_saved_candidates() {
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let first = proposal("First grounded candidate");
+    let mut bad = proposal("Bad sibling");
+    bad["document"]["quote"] = json!("Absent document quote");
+    reject(&mut s, vec![first.clone(), bad.clone()]);
+    review::request(&mut s).unwrap();
+    reject(
+        &mut s,
+        vec![bad.clone(), proposal("Second grounded candidate")],
+    );
+    review::request(&mut s).unwrap();
+    let mut repeated = first;
+    repeated["previous_id"] = json!("F1");
+    reject(&mut s, vec![repeated, bad]);
+    // Even a completely unparseable retry cannot clear earlier candidates.
+    assert!(review::finish(&mut s, "not JSON").is_err());
+    let retry = payload(review::request(&mut s).unwrap());
+    let ids: Vec<_> = retry["retry_findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["F1", "F2"]);
+    submit(&mut s, vec![]);
+    let verify = payload(review::request(&mut s).unwrap());
+    assert_eq!(verify["candidates"].as_array().unwrap().len(), 2);
+    review::finish(
+        &mut s,
+        &json!({"decisions":[decision("F1", "confirmed"), decision("F2", "dismissed")]})
+            .to_string(),
+    )
+    .unwrap();
+    assert_eq!(s.document_review.findings.len(), 1);
+    assert_eq!(s.document_review.findings[0].id, "F1");
+    assert_eq!(s.document_review.dismissed_findings, 1);
+    assert!(!review::approved(&s));
+}
+
+#[test]
+fn a_saved_candidate_keeps_original_source_chunks_for_semantic_validation() {
+    let (_dir, mut s) = chunked_fallback_fixture();
+    review::request(&mut s).unwrap();
+    let good = fallback_proposal(46, 80);
+    let mut bad = good.clone();
+    bad["document"]["quote"] = json!("Absent document quote");
+    reject(&mut s, vec![good, bad]);
+    review::request(&mut s).unwrap();
+    submit(&mut s, vec![]);
+    let verify = payload(review::request(&mut s).unwrap());
+    let source = &verify["candidates"][0]["observed_context"]["sources"][0];
+    assert!(
+        !source["context"]
+            .as_str()
+            .unwrap()
+            .contains("answer = answerText")
+    );
+    assert!(
+        source["review_evidence"]
+            .to_string()
+            .contains("answer = answerText || errorText")
+    );
+    review::finish(
+        &mut s,
+        &json!({"decisions":[decision("F1", "dismissed")]}).to_string(),
+    )
+    .unwrap();
+    assert!(review::approved(&s));
+}
+
+#[test]
+fn skipping_a_bad_page_still_validates_its_grounded_candidates() {
+    for paginated in [false, true] {
+        for status in ["confirmed", "dismissed"] {
+            let (_dir, mut s) = fixture();
+            if paginated {
+                let mut doc = std::fs::read_to_string(&s.project.output).unwrap();
+                doc.push_str(&"Additional manual context. ui.js:2\n".repeat(220));
+                std::fs::write(&s.project.output, doc).unwrap();
+            }
+            let first = payload(review::request(&mut s).unwrap());
+            let mut bad = proposal("Bad sibling");
+            bad["document"]["quote"] = json!("Absent document quote");
+            reject(
+                &mut s,
+                vec![proposal("Candidate from the skipped page"), bad],
+            );
+            assert_eq!(
+                review::skip_failing_page(&mut s),
+                review::PageSkip::Continued
+            );
+            for _ in 0..4 {
+                if s.document_review.validating {
+                    break;
+                }
+                let next = payload(review::request(&mut s).unwrap());
+                assert_eq!(next["retry_findings"], json!([]));
+                assert_eq!(next["current_findings"].as_array().unwrap().len(), 1);
+                submit(&mut s, vec![]);
+            }
+            assert!(s.document_review.validating);
+            let verify = payload(review::request(&mut s).unwrap());
+            assert_eq!(
+                verify["candidates"][0]["problem"],
+                "Candidate from the skipped page"
+            );
+            review::finish(
+                &mut s,
+                &json!({"decisions":[decision("F1", status)]}).to_string(),
+            )
+            .unwrap();
+            assert!(!review::approved(&s));
+            if status == "confirmed" {
+                assert_eq!(s.document_review.findings.len(), 1);
+                assert!(matches!(
+                    review::current_verdict(&s),
+                    review::CurrentVerdict::Rejected(_)
+                ));
+            } else {
+                assert!(s.document_review.findings.is_empty());
+                assert_eq!(
+                    review::current_verdict(&s),
+                    review::CurrentVerdict::Unavailable
+                );
+                assert_eq!(
+                    s.document_review.unavailable_ranges,
+                    vec![(1, first["document_line_end"].as_u64().unwrap() as usize)]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn stale_inputs_discard_saved_candidates_instead_of_validating_or_skipping_them() {
+    for (changed, skip_stale) in ["document", "source", "requirements", "audience"]
+        .into_iter()
+        .flat_map(|changed| [false, true].map(|skip_stale| (changed, skip_stale)))
+    {
+        let (dir, mut s) = fixture();
+        review::request(&mut s).unwrap();
+        let mut bad = proposal("Bad sibling");
+        bad["document"]["quote"] = json!("Absent document quote");
+        reject(&mut s, vec![proposal("Candidate from old inputs"), bad]);
+        match changed {
+            "document" => {
+                let doc = std::fs::read_to_string(&s.project.output).unwrap();
+                std::fs::write(
+                    &s.project.output,
+                    format!("{doc}New instruction. ui.js:2\n"),
+                )
+                .unwrap();
+            }
+            "source" => {
+                std::fs::write(dir.path().join("ui.js"), "function save() { keepKey(); }\n")
+                    .unwrap();
+            }
+            "requirements" => s.answer_review_question = "Write a different manual".into(),
+            _ => s.project.audience = "개발자".into(),
+        }
+        assert!(
+            review::finish(&mut s, r#"{"issues":[]}"#)
+                .unwrap_err()
+                .to_string()
+                .starts_with("document_review_stale:")
+        );
+        if skip_stale {
+            assert_eq!(
+                review::skip_failing_page(&mut s),
+                review::PageSkip::NotApplicable
+            );
+        }
+        let restarted = payload(review::request(&mut s).unwrap());
+        assert_eq!(restarted["document_line_start"], 1);
+        assert_eq!(restarted["current_findings"], json!([]));
+        assert_eq!(restarted["retry_findings"], json!([]));
+        submit(&mut s, vec![]);
+        assert!(!s.document_review.validating);
+        assert!(review::approved(&s));
+    }
+}
+
+#[test]
+fn saved_candidate_feedback_is_bounded_without_changing_page_selection() {
+    let (_dir, mut s) = fixture();
+    let mut doc = std::fs::read_to_string(&s.project.output).unwrap();
+    doc.push_str(&"Additional manual context. ui.js:2\n".repeat(120));
+    std::fs::write(&s.project.output, doc).unwrap();
+    let first = payload(review::request(&mut s).unwrap());
+    let mut bad = proposal("Bad sibling");
+    bad["document"]["quote"] = json!("Absent document quote");
+    for index in 0..16 {
+        let problem = format!(
+            "Candidate {index}: {}",
+            "Detailed source comparison. ".repeat(40)
+        );
+        reject(&mut s, vec![proposal(&problem), bad.clone()]);
+        let request = review::request(&mut s).unwrap();
+        assert!(mnemoarc::context::count(&request, &s.config.model) <= 24_000);
+        let retry = payload(request);
+        assert_eq!(
+            retry["retry_findings"].as_array().unwrap().len(),
+            (index + 1).min(12)
+        );
+        assert_eq!(retry["document"], first["document"]);
+        assert_eq!(retry["evidence"], first["evidence"]);
+        assert_eq!(retry["evidence_manifest"], first["evidence_manifest"]);
+    }
+    submit(&mut s, vec![]);
+    let next = payload(review::request(&mut s).unwrap());
+    assert_eq!(next["retry_findings"], json!([]));
+    assert_eq!(next["current_findings"].as_array().unwrap().len(), 12);
+    submit(&mut s, vec![]);
+    let request = review::request(&mut s).unwrap();
+    assert!(mnemoarc::context::count(&request, &s.config.model) <= 24_000);
+    let verify = payload(request);
+    assert_eq!(verify["candidates"].as_array().unwrap().len(), 12);
+}
+
+#[test]
+fn recovery_preserves_candidates_already_collected_from_other_pages() {
+    let (_dir, mut s) = fixture();
+    let mut doc = std::fs::read_to_string(&s.project.output).unwrap();
+    for line in 4..=223 {
+        doc.push_str(&format!("Later manual claim {line}. ui.js:2\n"));
+    }
+    std::fs::write(&s.project.output, &doc).unwrap();
+    review::request(&mut s).unwrap();
+    submit(&mut s, vec![proposal("Finding from a valid earlier page")]);
+    let second = payload(review::request(&mut s).unwrap());
+    let line = second["document_line_start"].as_u64().unwrap() as usize;
+    let mut recovered = proposal("Finding from a rejected later page");
+    recovered["document"] = json!({"start_line":line,"end_line":line,
+        "quote":doc.lines().nth(line - 1).unwrap()});
+    let mut bad = recovered.clone();
+    bad["document"]["quote"] = json!("Absent document quote");
+    reject(&mut s, vec![bad, recovered]);
+    let retry = payload(review::request(&mut s).unwrap());
+    assert_eq!(retry["current_findings"].as_array().unwrap().len(), 1);
+    assert_eq!(retry["current_findings"][0]["id"], "F1");
+    assert_eq!(retry["retry_findings"].as_array().unwrap().len(), 1);
+    assert_eq!(retry["retry_findings"][0]["id"], "F2");
+    submit(&mut s, vec![]);
+    review::request(&mut s).unwrap();
+    submit(&mut s, vec![]);
+    let verify = payload(review::request(&mut s).unwrap());
+    assert_eq!(verify["candidates"].as_array().unwrap().len(), 2);
+    review::finish(
+        &mut s,
+        &json!({"decisions":[decision("F1", "confirmed"), decision("F2", "dismissed")]})
+            .to_string(),
+    )
+    .unwrap();
+    assert_eq!(s.document_review.findings.len(), 1);
+    assert_eq!(s.document_review.findings[0].id, "F1");
+    assert!(!review::approved(&s));
+}
+
 #[test]
 fn a_misreading_is_not_a_repair_instruction_until_validation() {
     let (_dir, mut s) = fixture();

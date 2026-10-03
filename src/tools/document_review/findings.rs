@@ -255,233 +255,302 @@ pub fn same_subject(a: &Proposal, b: &Proposal) -> bool {
     })
 }
 
-pub fn collect(s: &mut Session, proposals: Vec<Proposal>, doc: &str) -> Result<()> {
+fn restore_candidates(next: &mut Vec<Finding>, recovered: Vec<Finding>) {
+    for finding in recovered {
+        if let Some(existing) = next.iter_mut().find(|f| f.id == finding.id) {
+            *existing = finding;
+        } else {
+            next.push(finding);
+        }
+    }
+}
+
+pub fn recover_retry_findings(state: &mut ReviewState) {
+    let recovered = std::mem::take(&mut state.retry_findings);
+    restore_candidates(&mut state.page_findings, recovered);
+}
+
+pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str) -> Result<()> {
     if proposals.len() > 12 {
         bail!("document_review_invalid: at most 12 findings per page");
     }
     let catalog = requirements_catalog(s);
     let state = &s.document_review;
     let mut next = state.page_findings.clone();
+    restore_candidates(&mut next, state.retry_findings.clone());
     let mut next_id = state.next_finding_id;
     let mut merged = 0;
     let mut corrections = 0;
-    // Validate the whole response before advancing IDs, offsets or findings.
-    for (issue_index, mut proposal) in proposals.into_iter().enumerate() {
-        if !["factual", "citation", "requirement", "scope"].contains(&proposal.kind.as_str())
-            || proposal.problem.trim().is_empty()
-            || proposal.correction.trim().is_empty()
-            || proposal.problem.chars().count() > 1500
-            || proposal.correction.chars().count() > 1500
-            || proposal.sources.len() > 4
-            || proposal.ui_labels.len() > 12
-        {
-            bail!(
-                "document_review_invalid: kind must be factual, citation, requirement or scope; problem/correction must be nonempty and at most 1500 characters; at most 4 sources and 12 UI labels"
-            );
-        }
-        if let Some(id) = &proposal.requirement_id
-            && !catalog.contains_key(id)
-        {
-            bail!("document_review_invalid: unknown requirement id {id}");
-        }
-        if matches!(proposal.kind.as_str(), "requirement" | "scope")
-            && proposal.requirement_id.is_none()
-        {
-            bail!(
-                "document_review_invalid: requirement/scope finding needs a current requirement id"
-            );
-        }
-        if matches!(proposal.kind.as_str(), "factual" | "citation")
-            && (proposal.sources.is_empty() || proposal.document.is_none())
-        {
-            bail!(
-                "document_review_invalid: factual/citation finding needs a current document quote and source evidence"
-            );
-        }
-        let document_context = if let Some(p) = &mut proposal.document {
-            let allowed = (state.document_offset + 1..=state.next_document_offset).collect();
-            let (context, corrected) = ground(doc, p, &allowed).map_err(|e| {
-                anyhow::anyhow!("document_review_invalid: issues[{issue_index}].document: {e}")
-            })?;
-            corrections += usize::from(corrected);
-            context
-        } else if proposal.kind == "requirement" {
-            doc.to_owned()
-        } else {
-            bail!("document_review_invalid: only a missing requirement may omit a document quote");
-        };
-        let mut sources = Vec::new();
-        for (source_index, source) in proposal.sources.iter_mut().enumerate() {
-            let source_path = read_path(&s.project, &source.path)
-                .map_err(|e| anyhow::anyhow!("document_review_invalid: source path: {e}"))?;
-            source.path = source_path.to_string_lossy().into_owned();
-            let page_sources: Vec<_> = state
-                .page_evidence
-                .iter()
-                .filter(|v| {
-                    v["path"]
-                        .as_str()
-                        .and_then(|path| read_path(&s.project, path).ok())
-                        .as_ref()
-                        == Some(&source_path)
-                })
-                .collect();
-            let observed = page_sources
-                .iter()
-                .flat_map(|v| v["numbered_text"].as_str().unwrap_or("").lines())
-                .filter_map(|line| {
-                    line.split_once('|')
-                        .and_then(|(n, t)| n.parse::<usize>().ok().map(|n| (n, t)))
-                })
-                .collect::<BTreeMap<_, _>>();
-            if observed.is_empty() {
-                bail!(
-                    "document_review_invalid: issues[{issue_index}].sources[{source_index}]: source was not supplied on this evidence page"
-                );
+    let mut first_error = None;
+    // Check every proposal, even after a bad quote or malformed sibling.
+    // Keep page verdicts atomic; only grounded, unconfirmed retry candidates
+    // survive a rejected batch, with their original evidence and stable IDs.
+    for (issue_index, proposal) in proposals.into_iter().enumerate() {
+        let result = serde_json::from_value::<Proposal>(proposal)
+            .map_err(|e| anyhow::anyhow!("document_review_invalid: issues[{issue_index}]: {e}"))
+            .and_then(|proposal| {
+                collect_one(
+                    s,
+                    proposal,
+                    doc,
+                    &catalog,
+                    &mut next,
+                    &mut next_id,
+                    issue_index,
+                )
+            });
+        match result {
+            Ok((m, c)) => {
+                merged += m;
+                corrections += c;
             }
-            let source_text = read_text(&source_path)?;
-            let allowed = observed.keys().copied().collect();
-            let hinted_range = source.passage.start_line..=source.passage.end_line;
-            let (surrounding,corrected)=ground(&source_text,&mut source.passage,&allowed)
-                .map_err(|e|anyhow::anyhow!("document_review_invalid: issues[{issue_index}].sources[{source_index}] {}: {e}",source.path))?;
-            corrections += usize::from(corrected);
-            // Quote normalization locates the anchor, not the complete proof.
-            // Preserve original bounded chunks covering the anchor and any
-            // overlapping range hint, including branches beyond the local
-            // three-line context. Disjoint, repaired hints are not evidence.
-            let anchor = source.passage.start_line..=source.passage.end_line;
-            let related_hint =
-                hinted_range.start() <= anchor.end() && anchor.start() <= hinted_range.end();
-            let review_evidence: Vec<_> = page_sources
-                .iter()
-                .filter(|v| {
-                    v["numbered_text"]
-                        .as_str()
-                        .unwrap_or("")
-                        .lines()
-                        .any(|line| {
-                            line.split_once('|')
-                                .and_then(|(n, _)| n.parse::<usize>().ok())
-                                .is_some_and(|n| {
-                                    anchor.contains(&n)
-                                        || (related_hint && hinted_range.contains(&n))
-                                })
-                        })
-                })
-                .map(|v| v["numbered_text"].clone())
-                .collect();
-            sources.push(json!({"path":source.path,"passage":source.passage,
-                "context":surrounding,"review_evidence":review_evidence}));
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
         }
-        for label in &proposal.ui_labels {
-            if label.trim().is_empty()
-                || !proposal
-                    .sources
+    }
+    let state = &mut s.document_review;
+    state.next_finding_id = next_id;
+    state.merged_findings += merged;
+    state.anchor_corrections += corrections;
+    if let Some(error) = first_error {
+        state.retry_findings = next
+            .into_iter()
+            .filter(|f| {
+                !state
+                    .page_findings
                     .iter()
-                    .any(|s| s.passage.quote.contains(label))
-            {
-                bail!(
-                    "document_review_invalid: proposed UI label is not present in quoted source evidence"
-                );
-            }
+                    .any(|old| old.id == f.id && old.fingerprint == f.fingerprint)
+            })
+            .map(|mut f| {
+                f.confirmed = false;
+                f
+            })
+            .collect();
+        return Err(error);
+    }
+    state.page_findings = next;
+    state.retry_findings.clear();
+    Ok(())
+}
+
+fn collect_one(
+    s: &Session,
+    mut proposal: Proposal,
+    doc: &str,
+    catalog: &BTreeMap<String, String>,
+    next: &mut Vec<Finding>,
+    next_id: &mut usize,
+    issue_index: usize,
+) -> Result<(usize, usize)> {
+    let state = &s.document_review;
+    let mut corrections = 0;
+    if !["factual", "citation", "requirement", "scope"].contains(&proposal.kind.as_str())
+        || proposal.problem.trim().is_empty()
+        || proposal.correction.trim().is_empty()
+        || proposal.problem.chars().count() > 1500
+        || proposal.correction.chars().count() > 1500
+        || proposal.sources.len() > 4
+        || proposal.ui_labels.len() > 12
+    {
+        bail!(
+            "document_review_invalid: kind must be factual, citation, requirement or scope; problem/correction must be nonempty and at most 1500 characters; at most 4 sources and 12 UI labels"
+        );
+    }
+    if let Some(id) = &proposal.requirement_id
+        && !catalog.contains_key(id)
+    {
+        bail!("document_review_invalid: unknown requirement id {id}");
+    }
+    if matches!(proposal.kind.as_str(), "requirement" | "scope")
+        && proposal.requirement_id.is_none()
+    {
+        bail!("document_review_invalid: requirement/scope finding needs a current requirement id");
+    }
+    if matches!(proposal.kind.as_str(), "factual" | "citation")
+        && (proposal.sources.is_empty() || proposal.document.is_none())
+    {
+        bail!(
+            "document_review_invalid: factual/citation finding needs a current document quote and source evidence"
+        );
+    }
+    let document_context = if let Some(p) = &mut proposal.document {
+        let allowed = (state.document_offset + 1..=state.next_document_offset).collect();
+        let (context, corrected) = ground(doc, p, &allowed).map_err(|e| {
+            anyhow::anyhow!("document_review_invalid: issues[{issue_index}].document: {e}")
+        })?;
+        corrections += usize::from(corrected);
+        context
+    } else if proposal.kind == "requirement" {
+        doc.to_owned()
+    } else {
+        bail!("document_review_invalid: only a missing requirement may omit a document quote");
+    };
+    let mut sources = Vec::new();
+    for (source_index, source) in proposal.sources.iter_mut().enumerate() {
+        let source_path = read_path(&s.project, &source.path)
+            .map_err(|e| anyhow::anyhow!("document_review_invalid: source path: {e}"))?;
+        source.path = source_path.to_string_lossy().into_owned();
+        let page_sources: Vec<_> = state
+            .page_evidence
+            .iter()
+            .filter(|v| {
+                v["path"]
+                    .as_str()
+                    .and_then(|path| read_path(&s.project, path).ok())
+                    .as_ref()
+                    == Some(&source_path)
+            })
+            .collect();
+        let observed = page_sources
+            .iter()
+            .flat_map(|v| v["numbered_text"].as_str().unwrap_or("").lines())
+            .filter_map(|line| {
+                line.split_once('|')
+                    .and_then(|(n, t)| n.parse::<usize>().ok().map(|n| (n, t)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if observed.is_empty() {
+            bail!(
+                "document_review_invalid: issues[{issue_index}].sources[{source_index}]: source was not supplied on this evidence page"
+            );
         }
-        let previous = proposal
-            .previous_id
-            .as_ref()
-            .map(|id| {
-                next.iter()
-                    .chain(state.findings.iter())
-                    .find(|f| &f.id == id)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("document_review_invalid: unknown previous finding {id}")
+        let source_text = read_text(&source_path)?;
+        let allowed = observed.keys().copied().collect();
+        let hinted_range = source.passage.start_line..=source.passage.end_line;
+        let (surrounding,corrected)=ground(&source_text,&mut source.passage,&allowed)
+            .map_err(|e|anyhow::anyhow!("document_review_invalid: issues[{issue_index}].sources[{source_index}] {}: {e}",source.path))?;
+        corrections += usize::from(corrected);
+        // Quote normalization locates the anchor, not the complete proof.
+        // Preserve original bounded chunks covering the anchor and any
+        // overlapping range hint, including branches beyond the local
+        // three-line context. Disjoint, repaired hints are not evidence.
+        let anchor = source.passage.start_line..=source.passage.end_line;
+        let related_hint =
+            hinted_range.start() <= anchor.end() && anchor.start() <= hinted_range.end();
+        let review_evidence: Vec<_> = page_sources
+            .iter()
+            .filter(|v| {
+                v["numbered_text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .lines()
+                    .any(|line| {
+                        line.split_once('|')
+                            .and_then(|(n, _)| n.parse::<usize>().ok())
+                            .is_some_and(|n| {
+                                anchor.contains(&n) || (related_hint && hinted_range.contains(&n))
+                            })
                     })
             })
-            .transpose()?;
-        if previous.is_some_and(|f| !same_subject(&f.proposal, &proposal)) {
+            .map(|v| v["numbered_text"].clone())
+            .collect();
+        sources.push(json!({"path":source.path,"passage":source.passage,
+            "context":surrounding,"review_evidence":review_evidence}));
+    }
+    for label in &proposal.ui_labels {
+        if label.trim().is_empty()
+            || !proposal
+                .sources
+                .iter()
+                .any(|s| s.passage.quote.contains(label))
+        {
             bail!(
-                "document_review_invalid: reused finding id points to a different problem location/type; use null for a new finding"
+                "document_review_invalid: proposed UI label is not present in quoted source evidence"
             );
         }
-        let id = previous.map(|f| f.id.clone());
-        proposal.previous_id = None;
-        if let Some(existing) = next
-            .iter()
-            .position(|f| id.as_ref() == Some(&f.id) || f.proposal == proposal)
-        {
-            let existing = &mut next[existing];
-            if existing.proposal.document != proposal.document {
-                bail!(
-                    "document_review_invalid: distinct document occurrences need separate finding IDs"
-                );
-            }
-            // Evidence can arrive on another page. Merging a duplicate must
-            // retain that evidence, including evidence contradicting the claim.
-            let mut changed = false;
-            for source in proposal.sources {
-                if !existing.proposal.sources.contains(&source) {
-                    existing.proposal.sources.push(source);
-                    changed = true;
-                }
-            }
-            let contexts = existing.context["sources"].as_array_mut().unwrap();
-            for context in sources {
-                if !contexts.contains(&context) {
-                    contexts.push(context);
-                    changed = true;
-                }
-            }
-            for label in proposal.ui_labels {
-                if !existing.proposal.ui_labels.contains(&label) {
-                    existing.proposal.ui_labels.push(label);
-                    changed = true;
-                }
-            }
-            if changed {
-                existing.confirmed = false;
-                existing.fingerprint = hash(
-                    json!({"proposal":existing.proposal,"context":existing.context,
-                    "requirements":catalog,"source_versions":state.source_hashes})
-                    .to_string()
-                    .as_bytes(),
-                );
-            }
-            merged += 1;
-            continue;
-        }
-        if next.len() >= 12 {
-            // Keep reviewing coverage; the next repair review can report further findings.
-            continue;
-        }
-        let context = json!({"document_context":document_context,"sources":sources});
-        let fingerprint = hash(
-            json!({"proposal":proposal,"context":context,"requirements":catalog,
-            "source_versions":state.source_hashes})
-            .to_string()
-            .as_bytes(),
-        );
-        let cached = state
-            .findings
-            .iter()
-            .find(|f| f.fingerprint == fingerprint && f.confirmed);
-        let id = id
-            .or_else(|| cached.map(|f| f.id.clone()))
-            .unwrap_or_else(|| {
-                next_id += 1;
-                format!("F{next_id}")
-            });
-        next.push(Finding {
-            id,
-            proposal,
-            context,
-            fingerprint,
-            confirmed: cached.is_some(),
-        });
     }
-    s.document_review.page_findings = next;
-    s.document_review.next_finding_id = next_id;
-    s.document_review.merged_findings += merged;
-    s.document_review.anchor_corrections += corrections;
-    Ok(())
+    let previous = proposal
+        .previous_id
+        .as_ref()
+        .map(|id| {
+            next.iter()
+                .chain(state.findings.iter())
+                .find(|f| &f.id == id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("document_review_invalid: unknown previous finding {id}")
+                })
+        })
+        .transpose()?;
+    if previous.is_some_and(|f| !same_subject(&f.proposal, &proposal)) {
+        bail!(
+            "document_review_invalid: reused finding id points to a different problem location/type; use null for a new finding"
+        );
+    }
+    let id = previous.map(|f| f.id.clone());
+    proposal.previous_id = None;
+    if let Some(existing) = next
+        .iter()
+        .position(|f| id.as_ref() == Some(&f.id) || f.proposal == proposal)
+    {
+        let existing = &mut next[existing];
+        if existing.proposal.document != proposal.document {
+            bail!(
+                "document_review_invalid: distinct document occurrences need separate finding IDs"
+            );
+        }
+        // Evidence can arrive on another page. Merging a duplicate must
+        // retain that evidence, including evidence contradicting the claim.
+        let mut changed = false;
+        for source in proposal.sources {
+            if !existing.proposal.sources.contains(&source) {
+                existing.proposal.sources.push(source);
+                changed = true;
+            }
+        }
+        let contexts = existing.context["sources"].as_array_mut().unwrap();
+        for context in sources {
+            if !contexts.contains(&context) {
+                contexts.push(context);
+                changed = true;
+            }
+        }
+        for label in proposal.ui_labels {
+            if !existing.proposal.ui_labels.contains(&label) {
+                existing.proposal.ui_labels.push(label);
+                changed = true;
+            }
+        }
+        if changed {
+            existing.confirmed = false;
+            existing.fingerprint = hash(
+                json!({"proposal":existing.proposal,"context":existing.context,
+                "requirements":catalog,"source_versions":state.source_hashes})
+                .to_string()
+                .as_bytes(),
+            );
+        }
+        return Ok((1, corrections));
+    }
+    if next.len() >= 12 {
+        // Keep reviewing coverage; the next repair review can report further findings.
+        return Ok((0, corrections));
+    }
+    let context = json!({"document_context":document_context,"sources":sources});
+    let fingerprint = hash(
+        json!({"proposal":proposal,"context":context,"requirements":catalog,
+        "source_versions":state.source_hashes})
+        .to_string()
+        .as_bytes(),
+    );
+    let cached = state
+        .findings
+        .iter()
+        .find(|f| f.fingerprint == fingerprint && f.confirmed);
+    let id = id
+        .or_else(|| cached.map(|f| f.id.clone()))
+        .unwrap_or_else(|| {
+            *next_id += 1;
+            format!("F{}", *next_id)
+        });
+    next.push(Finding {
+        id,
+        proposal,
+        context,
+        fingerprint,
+        confirmed: cached.is_some(),
+    });
+    Ok((0, corrections))
 }
 
 pub fn verification_request(s: &mut Session, ceiling: usize) -> Result<Value> {
