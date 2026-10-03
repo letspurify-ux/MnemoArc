@@ -100,9 +100,9 @@ pub async fn run(config: Config, suite_path: &Path, output: &Path) -> Result<()>
                 let mut config = config.clone();
                 config.memory_reuse = variant == "full";
                 let started = std::time::Instant::now();
-                let session =
-                    agent::headless(Session::new(project.clone(), config), case.prompt.clone())
-                        .await?;
+                let mut session = Session::new(project.clone(), config);
+                session.select_workflow("source_document")?;
+                let session = agent::headless(session, case.prompt.clone()).await?;
                 let text = std::fs::read_to_string(&doc)
                     .unwrap_or_default()
                     .to_lowercase();
