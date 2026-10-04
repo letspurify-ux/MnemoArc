@@ -192,7 +192,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_write",
-                description: "Save one reusable memory: title/summary/body/kind are required plain JSON fields. Same key requires expected_revision. Missing/stale revisions return current ID/key/status/revision and a retry patch; merge it into the full intended call. Invalid input reports received/missing/unknown fields and a JSON example. Updates replace evidence: resupply observed source_ids; sources are not inherited. Never omit source_ids after unknown_source. A project path (or path:start-end) stands in for the evidence already delivered from it. Unsourced facts, inferred memories and changed evidence are needs_review. Keep transient progress in task_state/checkpoint_complete, separately from stable observed facts. Metadata has no per-entry token rejection; keep it concise for index_tokens. Oversized entries remain available through memory_find/memory_read. Put details in body. kind: fact/decision/failure/question/procedure",
+                description: "Save one self-contained finding useful beyond the current step: an observed fact, decision with rationale, reusable procedure, failure lesson with its conditions, or question with lasting relevance. Pending reads, retry instructions, temporary blockers and completion updates belong in task_state or checkpoint_complete progress, not a memory. title/summary/body/kind are required plain JSON fields. Same key requires expected_revision. Missing/stale revisions return current ID/key/status/revision and a retry patch; merge it into the full intended call. Invalid input reports received/missing/unknown fields and a JSON example. Updates replace evidence: resupply observed source_ids; sources are not inherited. Never omit source_ids after unknown_source. A project path (or path:start-end) stands in for the evidence already delivered from it. For failure lessons, separate the observed tool/input conditions and actual result from a suspected cause. One failed call does not establish a universal limitation. Set inferred=true for unconfirmed explanations or generalizations, even with source_ids. Unsourced facts, inferred memories and changed evidence are needs_review. Keep stable fact keys separate from progress; never replace an observed fact with a progress summary. Metadata has no per-entry token rejection; keep it concise for index_tokens. Oversized entries remain available through memory_find/memory_read. Put details in body. kind: fact/decision/failure/question/procedure",
                 optional: false,
                 read_only: false,
                 parameters: memory_input_schema(),
@@ -206,7 +206,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_find",
-                description: "Search metadata by key/tag/keywords, or list all with empty query; use next cursor until exhausted. A cursor is bound to the memory generation and the exact query/tag filters and expires if either changes",
+                description: "Search memories by ID/key, title, tags, summary, source path or body. Unicode/case and identifier word boundaries are normalized; full ID/key matches rank first, followed by term coverage, field relevance and memory status. Tags are exact AND filters. An empty query lists every status by recency. Needs-review/superseded results remain discoverable and are not verified facts. Use next cursor until exhausted; it is bound to memory generation and the exact query/tag filters and expires if either changes",
                 optional: false,
                 read_only: true,
                 parameters: schema(
@@ -216,7 +216,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_manage",
-                description: "List cleanup candidates, delete unreferenced memories, or atomically replace IDs and redirect references. delete requires ids; replace requires ids and replacement; duplicate IDs are ignored. replacement uses memory_write fields and must use a new key or a key among the replaced IDs; when it reuses a replaced key, expected_revision and observed-source rules are checked before removal",
+                description: "List cleanup candidates, delete unreferenced memories, or atomically replace IDs and redirect references. delete requires ids; replace requires ids and replacement; duplicate IDs are ignored. replacement follows the same reusable-knowledge and inference rules as memory_write; keep transient progress in task_state/checkpoint_complete. It uses memory_write fields and must use a new key or a key among the replaced IDs; when it reuses a replaced key, expected_revision and observed-source rules are checked before removal",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -257,7 +257,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "checkpoint_complete",
-                description: "Finish a checkpoint and preserve the ordered task_plan in ONE call. Required progress is a concise checkpoint summary; it does not complete or replace plan items. Save needed memories first, or explain no new memory is needed with no_save_reason. Evaluated after other calls in this batch. Continue the first unfinished plan item after cleanup.",
+                description: "Finish a checkpoint and preserve the ordered task_plan in ONE call. Required progress is a concise checkpoint summary including current blockers, pending reads and retry instructions; it does not complete or replace plan items. Save new reusable knowledge in memory first. If knowledge is already saved or only progress changed, provide progress and no_save_reason without creating a progress memory. Evaluated after other calls in this batch. Continue the first unfinished plan item after cleanup.",
                 optional: false,
                 read_only: false,
                 parameters: schema(

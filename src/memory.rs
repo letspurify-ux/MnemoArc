@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
+mod search;
+
 /// Count logical JSON bytes without allocating a second copy of retained data.
 pub(crate) fn serialized_bytes(value: &(impl Serialize + ?Sized)) -> usize {
     #[derive(Default)]
@@ -400,37 +402,13 @@ impl MemoryStore {
             .collect()
     }
     pub fn search(&self, query: &str, tags: &[String]) -> Vec<MemoryMeta> {
-        let q = query.to_lowercase();
-        let words: Vec<_> = q.split_whitespace().collect();
-        let mut matches: Vec<_> = self
-            .entries
-            .values()
-            .filter(|m| tags.iter().all(|t| m.tags.contains(t)))
-            .filter_map(|m| {
-                let title =
-                    format!("{} {} {}", m.title, m.summary, m.tags.join(" ")).to_lowercase();
-                let body = m.body.to_lowercase();
-                let score = if q.is_empty() {
-                    1
-                } else if m.id == query || m.key.as_deref() == Some(query) {
-                    10000
-                } else {
-                    words
-                        .iter()
-                        .map(|w| {
-                            usize::from(title.contains(w)) * 10 + usize::from(body.contains(w))
-                        })
-                        .sum()
-                };
-                (score > 0).then_some((score, m))
-            })
-            .collect();
-        matches.sort_by(|(sa, a), (sb, b)| {
-            sb.cmp(sa)
-                .then(b.updated_at.cmp(&a.updated_at))
-                .then(a.id.cmp(&b.id))
-        });
-        matches.into_iter().map(|(_, m)| m.meta()).collect()
+        search::rank(self, query, "", tags, false)
+    }
+
+    /// Automatic recall scores the request and current work separately, so a
+    /// long plan item cannot outweigh a short user query by repeating terms.
+    pub(crate) fn related(&self, request: &str, current_work: &str) -> Vec<MemoryMeta> {
+        search::rank(self, request, current_work, &[], true)
     }
     pub fn page(
         &self,

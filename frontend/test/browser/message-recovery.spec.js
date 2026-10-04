@@ -77,7 +77,7 @@ test("a failed change is identified separately from a question and can be resubm
     page.getByText("질문 답변을 완료하지 못했습니다", { exact: true }),
   ).toHaveCount(0);
   await expect(page.locator(".status-pill")).toHaveText("중지됨");
-  await page.getByRole("tab", { name: "진행", exact: true }).click();
+  await page.getByRole("tab", { name: "실행 기록", exact: true }).click();
   const history = page.getByRole("region", { name: "실행 기록" });
   await expect(history).toContainText("요청 판별 실패");
   await history.locator("summary").click();

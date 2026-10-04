@@ -22,12 +22,26 @@ test("execution history survives another request and reload", async ({
   });
   expect(configured.ok()).toBe(true);
   await page.goto("/");
+  await expect(
+    page.getByRole("heading", { name: "이 세션의 사용량" }),
+  ).toHaveCount(0);
+  await page.getByRole("tab", { name: "사용량", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "이 세션의 사용량" }),
+  ).toBeVisible();
+  await page.getByRole("tab", { name: "실행 기록", exact: true }).click();
+  await expect(page.getByText("아직 실행 기록이 없습니다.")).toBeVisible();
+  await page.getByRole("tab", { name: "진행", exact: true }).click();
+  await expect(page.getByRole("region", { name: "실행 기록" })).toHaveCount(0);
+  await expect(
+    page.getByRole("heading", { name: "이 세션의 사용량" }),
+  ).toHaveCount(0);
   await page
     .getByRole("textbox", { name: "메시지", exact: true })
     .fill("첫 번째 실행");
   await page.getByRole("button", { name: "메시지 보내기" }).click();
   await expect(page.locator(".status-pill")).toHaveText("완료");
-  await page.getByRole("tab", { name: "진행", exact: true }).click();
+  await page.getByRole("tab", { name: "실행 기록", exact: true }).click();
   const history = page.getByRole("region", { name: "실행 기록" });
   await expect(history.locator("details")).toHaveCount(1);
   await expect(history).toContainText("정상 완료");
@@ -49,7 +63,7 @@ test("execution history survives another request and reload", async ({
   expect(after.run_history[1].reason).toBe("cancelled");
 
   await page.reload();
-  await page.getByRole("tab", { name: "진행", exact: true }).click();
+  await page.getByRole("tab", { name: "실행 기록", exact: true }).click();
   await expect(history.locator("details")).toHaveCount(2);
   await history.locator("summary").first().click();
   await expect(history).toContainText("마지막 단계");
@@ -61,7 +75,9 @@ test("execution history survives another request and reload", async ({
   // The next ordinary message asks about the stopped task, retaining its status.
   const beforeQuestion = after;
   await expect(page.getByLabel("요청 종류")).toHaveCount(0);
-  await expect(page.locator(".composer-wrap").getByLabel("작업 방식")).toHaveCount(0);
+  await expect(
+    page.locator(".composer-wrap").getByLabel("작업 방식"),
+  ).toHaveCount(0);
   await page
     .getByRole("textbox", { name: "메시지", exact: true })
     .fill("어떤 상황으로 종료된거야?");

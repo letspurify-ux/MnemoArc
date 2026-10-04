@@ -1,3 +1,4 @@
+import RobotIcon from "./RobotIcon.jsx";
 import {
   useEffect,
   useLayoutEffect,
@@ -161,19 +162,9 @@ export default function Chat({
           {!haveText && !session?.stream && (
             <div className="welcome">
               <div className="welcome-mark">
-                m<span>·</span>
+                <RobotIcon variant="standing" />
               </div>
               <span className="eyebrow">YOUR PROJECT, REMEMBERED</span>
-              <h1>
-                맥락을 기억하고,
-                <br />
-                작업을 이어갑니다.
-              </h1>
-              <p>
-                프로젝트를 조사하고 근거를 기억하며
-                <br />
-                함께 문서를 완성해 보세요.
-              </p>
               <div className="suggestions">
                 {[
                   "프로젝트 구조와 주요 실행 흐름을 문서로 정리해줘",
@@ -299,10 +290,6 @@ export default function Chat({
             }}
           />
           <div className="composer-bottom">
-            <span>
-              <i className="small-dot" />
-              세션 기억 사용 · Enter 전송 / Shift+Enter 줄바꿈
-            </span>
             {session?.status === "running" ? (
               <button type="button" className="stop-button" onClick={onCancel}>
                 ■ 중지
@@ -326,10 +313,6 @@ export default function Chat({
             )}
           </div>
         </form>
-        <p className="composer-footnote">
-          이 세션의 작업을 이어갑니다. 목표와 완료 조건 변경도 메시지로 요청할
-          수 있습니다. 새 작업은 새 세션에서 시작하세요.
-        </p>
       </div>
     </section>
   );

@@ -127,7 +127,12 @@ impl LlmClient for Script {
                         .1,
                 )
                 .unwrap();
-                let memory_id = state["recent_memories"][0]["id"].clone();
+                let memory_id = ["referenced_memories", "related_memories", "recent_memories"]
+                    .into_iter()
+                    .flat_map(|bucket| state[bucket].as_array().unwrap())
+                    .find(|memory| memory["key"] == "entry")
+                    .expect("the saved entry remains available in the memory index")["id"]
+                    .clone();
                 let source = source_id(&request);
                 call(
                     "item",
@@ -717,6 +722,10 @@ async fn varied_reads_without_deliverable_progress_focus_on_writing_and_resume()
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("main.rs"), "one\ntwo\nthree\n").unwrap();
     let mut session = s(dir.path());
+    // This fixed six-step client exercises progress recovery, not cleanup.
+    // Leave room for tools/state: random path/ID token counts near the default
+    // watermark must not send a final-answer-only fixture into a checkpoint.
+    session.config.context_tokens = 96000;
     session.config.stall_round_limit = 3;
     session.workflow_mode = "source_document".into();
     session.task.deliverables = vec!["docs/source-summary.md".into()];

@@ -52,7 +52,7 @@
         width: 40px; height: 40px; border-radius: 12px;
         background: var(--robot-bg);
         display: flex; align-items: center; justify-content: center;
-        font-size: 19px; font-weight: 800; color: #fff;
+        font-size: 13px; font-weight: 800; color: #fff;
         box-shadow: 0 2px 10px rgba(30, 64, 105, 0.08), inset 0 0 0 1px #e0eaf5;
       }
       .robot-icon { position: relative; display: block; flex-shrink: 0; width: 100%; height: 100%; border-radius: inherit; overflow: hidden; background: var(--robot-bg); }
@@ -60,7 +60,7 @@
       .robot-ready canvas { animation: robot-reveal 850ms cubic-bezier(0.22, 1, 0.36, 1) both; }
       @keyframes robot-reveal { from { opacity: 0; } to { opacity: 1; } }
       .brand-copy { display: flex; flex-direction: column; min-width: 0; }
-      .brand-title { font-size: 17px; font-weight: 800; letter-spacing: -0.2px; }
+      .brand-title { font-size: 13px; font-weight: 800; letter-spacing: -0.2px; }
       .brand-title > span { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
       .brand-subtitle { margin-top: 1px; font-size: 12px; color: var(--muted); }
       /* 대화를 접고 첫 화면(빈 상태)으로 되돌리는 단추. 화면이 하나뿐인 앱이라
@@ -83,7 +83,7 @@
         .home-btn .home-label { display: none; }
         .brand-home { gap: 8px; }
         .brand-home .logo { flex-shrink: 0; width: 34px; height: 34px; }
-        .brand-title { font-size: 15px; }
+        .brand-title { font-size: 13px; }
         .brand-subtitle { font-size: 11px; }
       }
       /* 좁은 화면에서 말풍선의 기본 90% 제한도 낭비다 — 320px 창에서 답변 안의 표는 159px, 열 두 개도 못 담는
@@ -141,11 +141,11 @@
       .empty-icon {
         width: 96px; height: 96px; flex-shrink: 0; border-radius: 32px; margin: 0 auto 20px;
         background: var(--robot-bg); display: flex; align-items: center; justify-content: center;
-        font-size: 32px; font-weight: 800; color: #fff;
+        font-size: 13px; font-weight: 800; color: #fff;
         box-shadow: 0 12px 30px -12px rgba(99, 86, 138, 0.22), 0 2px 6px rgba(99, 86, 138, 0.04);
       }
-      .empty h2 { margin: 0 0 6px; font-size: 22px; font-weight: 800; letter-spacing: -0.3px; }
-      .empty p { margin: 0 0 20px; color: var(--muted); font-size: 14px; }
+      .empty h2 { margin: 0 0 6px; font-size: 13px; font-weight: 800; letter-spacing: -0.3px; }
+      .empty p { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
       .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
       .chip {
         border: 1px solid var(--border); background: var(--surface); color: var(--text);
@@ -159,7 +159,7 @@
       .row { display: flex; }
       .row.user { justify-content: flex-end; }
       .bubble {
-        max-width: 90%; padding: 12px 16px; font-size: 14px; line-height: 1.6;
+        max-width: 90%; padding: 12px 16px; font-size: 13px; line-height: 1.6;
         /* 말풍선 '상자'는 max-width로 묶이지만 내용은 그렇지 않다 — URL·식별자처럼 공백 없는
            긴 토큰은 기본값(overflow-wrap: normal)에서 줄바꿈 지점이 없어 상자를 그대로 뚫고 나간다.
            표준은 anywhere지만 Safari 15.4 미만은 모르므로, 구형에서도 같은 효과를 내는
@@ -191,7 +191,7 @@
 
       /* assistant 말풍선 안의 markdown */
       .md p { margin: 0 0 8px; }
-      .md h1, .md h2, .md h3 { margin: 12px 0 6px; font-size: 14px; font-weight: 700; color: var(--accent); }
+      .md h1, .md h2, .md h3 { margin: 12px 0 6px; font-size: 13px; font-weight: 700; color: var(--accent); }
       .md ul, .md ol { margin: 4px 0 8px; padding-left: 20px; }
       .md table { border-collapse: collapse; margin: 8px 0; display: block; overflow-x: auto; }
       .md th, .md td { border: 1px solid var(--border); padding: 6px 12px; font-size: 13px; text-align: left; white-space: nowrap; }
@@ -201,14 +201,14 @@
       .md .rich-cell .chart, .md .rich-cell .mermaid { width: 480px; max-width: min(480px, 72vw); }
       .md .rich-cell .chart-table { max-width: min(480px, 72vw); }
       .md tr:nth-child(even) td { background: #fafbfe; }
-      .md code { background: #eef0fa; padding: 1px 6px; border-radius: 5px; font-size: 12.5px; }
+      .md code { background: #eef0fa; padding: 1px 6px; border-radius: 5px; font-size: 12px; }
       /* 코드블록(```). 이 규칙이 없으면 <pre> 기본값(white-space: pre)대로 한 줄을 끝까지 늘여
          말풍선 밖으로 수백 px 삐져나간다 — 위의 줄바꿈 규칙은 pre에 닿지 않으므로
          (줄바꿈을 막는 것이 pre의 정의다) 대신 가로 스크롤로 가둔다. .trace-grid와 같은 처방이다. */
       .md pre {
         margin: 8px 0; padding: 10px 12px; border-radius: 10px;
         background: #f1f3fb; border: 1px solid var(--border);
-        overflow-x: auto; font-size: 12.5px; line-height: 1.5;
+        overflow-x: auto; font-size: 12px; line-height: 1.5;
       }
       /* 블록 안의 code에는 인라인용 알약 배경·여백을 걷어낸다 — 두 배경이 겹쳐 얼룩덜룩해진다 */
       .md pre code { background: none; padding: 0; border-radius: 0; font-size: inherit; }
@@ -239,7 +239,7 @@
          두고 든 보기가 정확히 차트의 범례다. 글자는 손대지 않는다 — 그쪽은 고대비가 지켜야 한다. */
       .md .chart-legend i { width: 9px; height: 9px; border-radius: 2px; flex: none; forced-color-adjust: none; }
       /* 차트 아래 '표로 보기'. 접힌 줄은 눈에 띄지 않게, 펼치면 표는 원래 규칙(.md table)대로 */
-      .md .chart-table { margin: 0 0 8px; font-size: 12.5px; }
+      .md .chart-table { margin: 0 0 8px; font-size: 12px; }
       .md .chart-table summary { cursor: pointer; color: var(--muted); user-select: none; }
       .md .chart-table[open] summary { margin-bottom: 4px; }
       /* recharts 툴팁 등은 자기 스타일을 인라인으로 갖는다. 글자 줄바꿈 규칙만 말풍선 것을 되돌린다 —
@@ -314,7 +314,7 @@
       .trace-head {
         display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px;
         padding: 7px 10px;
-        background: #0f172a; color: #c7d2fe; font-size: 11.5px; line-height: 1.5;
+        background: #0f172a; color: #c7d2fe; font-size: 12px; line-height: 1.5;
       }
       .trace-head code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
       .trace-head .trace-count { color: #a5b4fc; }
@@ -412,7 +412,7 @@
       .composer:focus-within { border-color: var(--accent); box-shadow: 0 8px 30px rgba(79, 70, 229, 0.18); }
       .composer textarea {
         flex: 1; border: none; outline: none; background: transparent;
-        font-size: 14.5px; color: var(--text); font-family: inherit;
+        font-size: 13px; color: var(--text); font-family: inherit;
         /* 높이는 App.jsx가 내용에 맞춰 직접 준다. 여기서 정하는 것은 한 줄일 때의 크기(padding+line-height로
            보내기 단추와 같은 42px)와 여기까지만 자란다는 한계뿐이다. 그 뒤로는 안에서 스크롤된다. */
         /* overflow-y는 App.jsx가 max-height에 걸렸을 때만 auto로 바꾼다 — 여기서는 꺼 둔다. */
@@ -430,7 +430,7 @@
       .composer textarea::placeholder { color: #9aa4bd; }
       .send {
         width: 42px; height: 42px; border-radius: 50%; border: none; flex-shrink: 0;
-        background: var(--grad); color: #fff; font-size: 17px; cursor: pointer;
+        background: var(--grad); color: #fff; font-size: 13px; cursor: pointer;
         display: flex; align-items: center; justify-content: center;
         box-shadow: 0 4px 12px rgba(79, 70, 229, 0.35);
         transition: transform 0.12s ease, opacity 0.15s ease;

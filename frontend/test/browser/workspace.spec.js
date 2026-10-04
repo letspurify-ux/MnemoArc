@@ -10,7 +10,7 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
   page.on("pageerror", (e) => errors.push(e.message));
   await page.goto("/");
   await expect(
-    page.getByRole("heading", { name: "맥락을 기억하고, 작업을 이어갑니다." }),
+    page.getByRole("button", { name: /프로젝트 구조와 주요 실행 흐름을 문서로 정리해줘/ }),
   ).toBeVisible();
   await page.screenshot({
     path: "test-artifacts/workspace.png",

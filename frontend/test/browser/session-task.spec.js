@@ -125,8 +125,7 @@ test("new sessions default to the saved project output across entry points and p
     ).toBe(first.output);
 
     await page
-      .locator(".project-heading")
-      .filter({ hasText: second.name })
+      .getByRole("button", { name: `${second.name} 새 세션`, exact: true })
       .click();
     await expect(output).toHaveValue(second.output);
     await dialog(page)

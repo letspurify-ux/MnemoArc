@@ -1,3 +1,4 @@
+import RobotIcon from "./RobotIcon.jsx";
 import { useCallback, useEffect, useRef, useState } from "react";
 import Chat from "./Chat.jsx";
 import NewSession from "./NewSession.jsx";
@@ -74,6 +75,7 @@ export default function App() {
       () => !window.matchMedia("(max-width: 1000px)").matches,
     ),
     [mobileNav, setMobileNav] = useState(false),
+    [collapsedProjects, setCollapsedProjects] = useState(new Set()),
     [navigating, setNavigating] = useState(false),
     [runPending, setRunPending] = useState(new Set()),
     [newSession, setNewSession] = useState(null),
@@ -561,6 +563,11 @@ export default function App() {
     try {
       const data = await send("/sessions", { project, workflow });
       setNewSession(null);
+      setCollapsedProjects((previous) => {
+        const next = new Set(previous);
+        next.delete(project.id);
+        return next;
+      });
       if (navigationEpoch.current === navigation) choose(data.id, true);
     } finally {
       creating.current = false;
@@ -628,7 +635,7 @@ export default function App() {
       <aside className={`sidebar ${mobileNav ? "mobile-open" : ""}`}>
         <button className="brand" onClick={() => showPage("chat")}>
           <span className="brand-symbol">
-            m<span>·</span>
+            <RobotIcon />
           </span>
           <span>
             MnemoArc<small>기억하는 작업 공간</small>
@@ -657,28 +664,53 @@ export default function App() {
         <div className="session-list">
           {state?.config.projects.map((project) => (
             <div className="project-group" key={project.id}>
-              <button
-                className="project-heading"
-                title={displayPath(project.root)}
-                disabled={navigating}
-                onClick={safe(() => requestSession(project))}
+              <div className="project-header">
+                <button
+                  className="project-heading"
+                  title={displayPath(project.root)}
+                  aria-expanded={!collapsedProjects.has(project.id)}
+                  aria-controls={`project-sessions-${project.id}`}
+                  onClick={() =>
+                    setCollapsedProjects((previous) => {
+                      const next = new Set(previous);
+                      if (next.has(project.id)) next.delete(project.id);
+                      else next.add(project.id);
+                      return next;
+                    })
+                  }
+                >
+                  <span aria-hidden="true">
+                    {collapsedProjects.has(project.id) ? "▸" : "▾"}
+                  </span>
+                  <span className="project-name">{project.name}</span>
+                </button>
+                <button
+                  className="project-plus"
+                  aria-label={`${project.name} 새 세션`}
+                  title="새 세션"
+                  disabled={navigating}
+                  onClick={safe(() => requestSession(project))}
+                >
+                  ＋
+                </button>
+              </div>
+              <div
+                id={`project-sessions-${project.id}`}
+                hidden={collapsedProjects.has(project.id)}
               >
-                <span>▱</span>
-                {project.name}
-                <span className="project-plus">＋</span>
-              </button>
-              {state.sessions
-                .filter((s) => s.project.id === project.id)
-                .map((s) => (
-                  <SessionButton
-                    key={s.id}
-                    session={s}
-                    active={s.id === selected && page === "chat"}
-                    onClick={() => choose(s.id)}
-                    onClose={safe(() => closeSession(s.id))}
-                    closing={runningById.get(s.id)?.closing}
-                  />
-                ))}
+                {state.sessions
+                  .filter((s) => s.project.id === project.id)
+                  .map((s) => (
+                    <SessionButton
+                      key={s.id}
+                      session={s}
+                      active={s.id === selected && page === "chat"}
+                      onClick={() => choose(s.id)}
+                      onClose={safe(() => closeSession(s.id))}
+                      closing={runningById.get(s.id)?.closing}
+                    />
+                  ))}
+              </div>
             </div>
           ))}
           {state?.sessions
@@ -706,23 +738,24 @@ export default function App() {
             aria-label="프로젝트 관리"
             onClick={() => showPage("projects")}
           >
-            <span>▱</span>프로젝트 관리
+            <span aria-hidden="true">▱</span>프로젝트 관리
           </button>
           <button
             className={page === "settings" ? "selected" : ""}
             onClick={() => showPage("settings")}
           >
-            <span>⚙</span>모든 설정
+            <span aria-hidden="true">⚙</span>모든 설정
           </button>
           <button aria-label="앱 종료" onClick={shutdown} disabled={stopping}>
-            <span>⏻</span>
+            <span aria-hidden="true">⏻</span>
             {stopping ? "종료 요청 중…" : "앱 종료"}
           </button>
-          <p>탭을 닫아도 작업은 계속됩니다. 종료하려면 앱 종료를 누르세요.</p>
         </div>
       </aside>
       <main className="main-workspace">
-        <header className="topbar">
+        <header
+          className={`topbar ${page === "chat" && session ? "session-heading" : "utility-bar"} ${otherRunning.length ? "has-running" : ""}`}
+        >
           <button
             className="mobile-menu"
             aria-label="메뉴 열기"
@@ -730,17 +763,68 @@ export default function App() {
           >
             ☰
           </button>
-          <div className="breadcrumb">
-            <span>작업 공간</span>
-            <b>/</b>
-            <strong>
-              {page === "settings"
-                ? "설정"
-                : page === "projects"
-                  ? "프로젝트"
-                  : current?.project.name || "새 작업"}
-            </strong>
-          </div>
+          {page === "chat" && session && (
+            <>
+              <div className="session-heading-info">
+                <h2>{session.project.name}</h2>
+                <div className="session-heading-meta">
+                  <span className="workflow-badge">
+                    {workflowOptions.find(
+                      ([value]) => value === session.workflow_mode,
+                    )?.[1] || session.workflow_mode}
+                  </span>
+                  <p title={displayPath(session.project.root)}>
+                    {displayPath(session.project.root)}
+                  </p>
+                </div>
+              </div>
+              <div className="session-actions">
+                <button
+                  title="보존된 상태로 재개"
+                  disabled={
+                    navigating ||
+                    !sessionReady ||
+                    selectedBusy ||
+                    capacityFull ||
+                    !canRun ||
+                    !session.can_resume
+                  }
+                  onClick={() =>
+                    void runSession(selected, undefined, "resume").catch(
+                      () => {},
+                    )
+                  }
+                >
+                  재개
+                </button>
+                <button
+                  title="기억과 상태 정리"
+                  disabled={
+                    navigating ||
+                    !sessionReady ||
+                    selectedBusy ||
+                    capacityFull ||
+                    !canRun ||
+                    !session.has_task
+                  }
+                  onClick={() =>
+                    void runSession(selected, undefined, "cleanup").catch(
+                      () => {},
+                    )
+                  }
+                >
+                  기억 정리
+                </button>
+                <button
+                  className="danger-text"
+                  disabled={runningById.get(selected)?.closing}
+                  onClick={safe(() => closeSession(selected))}
+                >
+                  세션 닫기
+                </button>
+              </div>
+            </>
+          )}
           <div className="topbar-actions">
             {otherRunning.length > 0 && (
               <details className="running-menu" key={selected}>
@@ -834,64 +918,6 @@ export default function App() {
             }
           >
             <div className="chat-column">
-              <div className="session-heading">
-                <div>
-                  <h2>{session.project.name}</h2>
-                  <span className="workflow-badge">
-                    {workflowOptions.find(
-                      ([value]) => value === session.workflow_mode,
-                    )?.[1] || session.workflow_mode}
-                  </span>
-                  <p title={displayPath(session.project.root)}>
-                    {displayPath(session.project.root)}
-                  </p>
-                </div>
-                <div className="session-actions">
-                  <button
-                    title="보존된 상태로 재개"
-                    disabled={
-                      navigating ||
-                      !sessionReady ||
-                      selectedBusy ||
-                      capacityFull ||
-                      !canRun ||
-                      !session.can_resume
-                    }
-                    onClick={() =>
-                      void runSession(selected, undefined, "resume").catch(
-                        () => {},
-                      )
-                    }
-                  >
-                    재개
-                  </button>
-                  <button
-                    title="기억과 상태 정리"
-                    disabled={
-                      navigating ||
-                      !sessionReady ||
-                      selectedBusy ||
-                      capacityFull ||
-                      !canRun ||
-                      !session.has_task
-                    }
-                    onClick={() =>
-                      void runSession(selected, undefined, "cleanup").catch(
-                        () => {},
-                      )
-                    }
-                  >
-                    기억 정리
-                  </button>
-                  <button
-                    className="danger-text"
-                    disabled={runningById.get(selected)?.closing}
-                    onClick={safe(() => closeSession(selected))}
-                  >
-                    세션 닫기
-                  </button>
-                </div>
-              </div>
               {session.pending_config && (
                 <div className="pending-note">
                   설정 변경이 대기 중입니다. 현재 요청이 끝나거나 필요한 기억
@@ -943,6 +969,9 @@ export default function App() {
           </div>
         ) : (
           <div className="loading-state">
+            <div className="welcome-mark">
+              <RobotIcon variant="standing" />
+            </div>
             <h2>
               {state.sessions.length
                 ? "세션을 불러오는 중…"
@@ -1386,6 +1415,8 @@ function Inspector({
           ["tools", "도구"],
           ["output", "문서"],
           ["project", "프로젝트"],
+          ["usage", "사용량"],
+          ["history", "실행 기록"],
         ].map(([id, label]) => (
           <button
             key={id}
@@ -1475,36 +1506,44 @@ function Inspector({
                 </p>
               </div>
             )}
-            <div className="usage-card">
-              <h4>이 세션의 사용량</h4>
-              <dl>
-                <dt>입력 토큰</dt>
-                <dd>{session.usage.input.toLocaleString()}</dd>
-                <dt>출력 토큰</dt>
-                <dd>{session.usage.output.toLocaleString()}</dd>
-                <dt>캐시 토큰</dt>
-                <dd>{session.usage.cached ?? "제공 안 됨"}</dd>
-                <dt>체크포인트</dt>
-                <dd>{session.usage.checkpoints}회</dd>
-                <dt>원문 보관</dt>
-                <dd>
-                  {(session.usage.history_bytes / 1048576).toFixed(2)} MiB
-                </dd>
-              </dl>
-              <small>
-                {session.usage.estimated
-                  ? "일부 사용량은 추정치입니다."
-                  : "제공된 사용량 기준"}
-                {session.usage.context_estimated &&
-                  " · 컨텍스트 예산은 기준 토크나이저 + 25% 여유로 추정합니다."}
-              </small>
-            </div>
           </>
         )}
+        {tab === "usage" && (
+          <div className="usage-card">
+            <h4>이 세션의 사용량</h4>
+            <dl>
+              <dt>입력 토큰</dt>
+              <dd>{session.usage.input.toLocaleString()}</dd>
+              <dt>출력 토큰</dt>
+              <dd>{session.usage.output.toLocaleString()}</dd>
+              <dt>캐시 토큰</dt>
+              <dd>{session.usage.cached ?? "제공 안 됨"}</dd>
+              <dt>체크포인트</dt>
+              <dd>{session.usage.checkpoints}회</dd>
+              <dt>원문 보관</dt>
+              <dd>{(session.usage.history_bytes / 1048576).toFixed(2)} MiB</dd>
+            </dl>
+            <small>
+              {session.usage.estimated
+                ? "일부 사용량은 추정치입니다."
+                : "제공된 사용량 기준"}
+              {session.usage.context_estimated &&
+                " · 컨텍스트 예산은 기준 토크나이저 + 25% 여유로 추정합니다."}
+            </small>
+          </div>
+        )}
+        {tab === "history" &&
+          (session.run_history?.length ? (
+            <RunHistory records={session.run_history} />
+          ) : (
+            <section aria-label="실행 기록">
+              <h3>실행 기록</h3>
+              <p className="subtle">아직 실행 기록이 없습니다.</p>
+            </section>
+          ))}
         {tab === "progress" && (
           <>
             <h3>목표와 진행</h3>
-            <RunHistory records={session.run_history} />
             {session.run_guidance?.phase && (
               <p>
                 실행 단계:{" "}
@@ -1794,15 +1833,15 @@ function Inspector({
             <p className="directory-path">
               {displayPath(session.project.output)}
             </p>
-            <button
-              className="secondary"
-              disabled={outputLoading}
-              onClick={doAction(loadDocument)}
-            >
-              문서 불러오기
-            </button>
-            {document && (
-              <>
+            <div className="document-actions">
+              <button
+                className="secondary"
+                disabled={outputLoading}
+                onClick={doAction(loadDocument)}
+              >
+                문서 불러오기
+              </button>
+              {document && (
                 <button
                   className="text-button"
                   disabled={downloading}
@@ -1833,6 +1872,10 @@ function Inspector({
                 >
                   Markdown 내려받기
                 </button>
+              )}
+            </div>
+            {document && (
+              <>
                 {document.truncated && (
                   <p>미리보기 한도로 일부만 표시합니다.</p>
                 )}
