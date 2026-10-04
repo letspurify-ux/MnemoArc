@@ -724,3 +724,138 @@ fn a_path_source_id_resolves_to_its_delivered_evidence() {
         );
     }
 }
+
+#[test]
+fn replacement_paths_keep_evidence_and_redirect_only_affected_references() {
+    for form in ["relative", "citation", "absolute"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, mut input, memory, source) = fixture(dir.path());
+        let other = tools::execute(&mut s, "memory_write", json!({"key":"other","title":"Other","summary":"Also main","body":"main is empty","kind":"fact","source_ids":[source]})).unwrap();
+        tools::execute(&mut s, "investigation", json!({"action":"upsert","id":"other","title":"Other","status":"written","section":"# Other","memory_ids":[other["id"]],"source_ids":[source]})).unwrap();
+        tools::execute(&mut s, "investigation", verify(&source)).unwrap();
+        let mut other_verify = verify(&source);
+        other_verify["id"] = json!("other");
+        tools::execute(&mut s, "investigation", other_verify).unwrap();
+        s.task.memory_ids = vec![
+            memory["id"].as_str().unwrap().into(),
+            "main-fact".into(),
+            other["id"].as_str().unwrap().into(),
+        ];
+        let untouched = json!({"memory":s.memory.get("other").unwrap(),"item":s.investigations.iter().find(|i| i.id == "other").unwrap()});
+        let path = match form {
+            "relative" => "a.rs".to_owned(),
+            "citation" => "a.rs:1".to_owned(),
+            _ => format!("{}:1", dir.path().join("a.rs").display()),
+        };
+        input["source_ids"] = json!([path]);
+        input["expected_revision"] = json!(1);
+        input["body"] = json!("main has no parameters and an empty body");
+        input["metadata"] = json!({"custom":["unchanged",{"count":3}]});
+        let generation = s.memory.generation;
+        let result = run(
+            &mut s,
+            "replace-path",
+            "memory_manage",
+            json!({"action":"replace","ids":[memory["id"], "main-fact"],"replacement":input}),
+        );
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(
+            result["data"]["resolved_source_ids"][&path],
+            json!([source])
+        );
+        let replacement = s.memory.get("main-fact").unwrap();
+        assert_ne!(replacement.id, memory["id"].as_str().unwrap());
+        assert_eq!(replacement.sources.len(), 1);
+        assert_eq!(replacement.sources[0].id, source);
+        assert_eq!(replacement.status, MemoryStatus::Active);
+        assert_eq!(replacement.metadata, input["metadata"]);
+        assert_eq!(replacement.body, input["body"].as_str().unwrap());
+        assert_eq!(s.memory.entries.len(), 2);
+        assert_eq!(s.memory.generation, generation + 1);
+        assert!(s.memory.get(memory["id"].as_str().unwrap()).is_err());
+        assert_eq!(s.task.memory_ids.len(), 2);
+        assert!(s.task.memory_ids.contains(&replacement.id));
+        assert!(
+            s.task
+                .memory_ids
+                .contains(&other["id"].as_str().unwrap().to_owned())
+        );
+        let item = s.investigations.iter().find(|i| i.id == "main").unwrap();
+        assert_eq!(item.status, "written");
+        assert_eq!(item.memory_refs.len(), 1);
+        assert_eq!(
+            item.memory_refs.get(&replacement.id),
+            Some(&replacement.revision)
+        );
+        assert_eq!(
+            json!({"memory":s.memory.get("other").unwrap(),"item":s.investigations.iter().find(|i| i.id == "other").unwrap()}),
+            untouched
+        );
+    }
+}
+
+#[test]
+fn replacement_path_failures_preserve_memories_and_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut s, input, memory, source) = fixture(dir.path());
+    s.task.memory_ids = vec![memory["id"].as_str().unwrap().into()];
+    tools::execute(&mut s, "investigation", verify(&source)).unwrap();
+    std::fs::write(
+        dir.path().join("ranges.rs"),
+        "fn read() {}\nfn unread() {}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("unread.rs"), "fn other() {}\n").unwrap();
+    tools::execute(
+        &mut s,
+        "file_read",
+        json!({"path":"ranges.rs","start_line":1,"max_lines":1}),
+    )
+    .unwrap();
+    let before = json!({"memory":s.memory.entries,"generation":s.memory.generation,"task":s.task,"items":s.investigations});
+    for (i, (sources, revision, code)) in [
+        (json!(["a.rs:1"]), Value::Null, "memory_revision_missing"),
+        (json!(["a.rs:1"]), json!(0), "revision_conflict"),
+        (json!(["ranges.rs:2"]), json!(1), "unknown_source"),
+        (json!(["unread.rs"]), json!(1), "unknown_source"),
+        (json!(["missing.rs"]), json!(1), "unknown_source"),
+        (json!(["S-nonexistent"]), json!(1), "unknown_source"),
+        (json!([]), json!(1), "memory_sources_required"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut replacement = input.clone();
+        replacement["source_ids"] = sources;
+        replacement["expected_revision"] = revision;
+        let result = run(
+            &mut s,
+            &format!("bad-replacement-{i}"),
+            "memory_manage",
+            json!({"action":"replace","ids":[memory["id"]],"replacement":replacement}),
+        );
+        assert_eq!(result["status"], "error", "{result}");
+        assert_eq!(result["recovery"]["code"], code, "{result}");
+        assert_eq!(
+            json!({"memory":s.memory.entries,"generation":s.memory.generation,"task":s.task,"items":s.investigations}),
+            before
+        );
+    }
+    // An old observation of this path cannot certify its new file version.
+    std::fs::write(dir.path().join("a.rs"), "fn changed() {}\n").unwrap();
+    let mut replacement = input;
+    replacement["source_ids"] = json!(["a.rs:1"]);
+    replacement["expected_revision"] = json!(1);
+    let result = run(
+        &mut s,
+        "stale-path",
+        "memory_manage",
+        json!({"action":"replace","ids":[memory["id"]],"replacement":replacement}),
+    );
+    assert_eq!(result["status"], "error", "{result}");
+    assert_eq!(result["recovery"]["code"], "unknown_source");
+    assert_eq!(
+        json!({"memory":s.memory.entries,"generation":s.memory.generation,"task":s.task,"items":s.investigations}),
+        before
+    );
+}

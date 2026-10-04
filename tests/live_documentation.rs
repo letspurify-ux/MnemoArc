@@ -823,6 +823,12 @@ async fn registered_source_documentation() {
             skip["lines"], skip["evidence_page"], skip["error"]
         );
     }
+    for drop in &result.document_review.label_drop_log {
+        eprintln!(
+            "[live] review_issue_dropped lines={} evidence_page={} error={}",
+            drop["lines"], drop["evidence_page"], drop["error"]
+        );
+    }
     eprintln!(
         "documentation: status={} rounds={} tools={} input={} output={} seconds={:.1}",
         result.status,

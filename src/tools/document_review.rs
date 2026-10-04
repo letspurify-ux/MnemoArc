@@ -60,7 +60,7 @@ pub struct ReviewState {
     pub resolved_findings: usize,
     pub validation_log: Vec<Value>,
     /// Document line ranges (1-based, inclusive) left undecided by invalid
-    /// page responses or unverified reanchored scope findings. They block approval.
+    /// page responses or undecided previously confirmed findings. They block approval.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped_ranges: Vec<(usize, usize)>,
     /// Undecided ranges of the completed review, including mixed rejections.
@@ -71,16 +71,24 @@ pub struct ReviewState {
     /// carries that error as previous_response_error.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skip_log: Vec<Value>,
+    /// Issues dropped from a last-try response because a UI label was not in
+    /// any of their source quotes, with the rejection. Diagnostics only.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub label_drop_log: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_failure: Option<ReviewFailure>,
     #[serde(skip)]
     next_finding_id: usize,
     #[serde(skip)]
     validation_ids: Vec<String>,
-    /// Reanchored scope findings whose fresh validation could not decide.
+    /// Previously confirmed findings whose fresh review could not decide.
     /// They leave a coverage gap and cannot count as resolved repairs.
     #[serde(skip)]
-    unverified_scope_ids: BTreeSet<String>,
+    unverified_finding_ids: BTreeSet<String>,
+    /// Last-try label rejections linked to prior findings. Delay the gap
+    /// until collection and validation finish: a candidate alone is no verdict.
+    #[serde(skip)]
+    label_gap_ranges: BTreeMap<String, (usize, usize)>,
     #[serde(skip)]
     page_evidence: Vec<Value>,
     pub repair_started_round: Option<usize>,
@@ -119,6 +127,7 @@ impl ReviewState {
             output_tokens: old.output_tokens,
             validation_log: old.validation_log,
             skip_log: old.skip_log,
+            label_drop_log: old.label_drop_log,
             unavailable_failure: old.unavailable_failure,
             policy_hash: old.policy_hash,
             ..Default::default()
@@ -139,7 +148,7 @@ impl ReviewState {
                 .map(|f| (&f.context, &f.previous_scope))
                 .collect::<Vec<_>>(),
             &self.validation_ids,
-            &self.unverified_scope_ids,
+            (&self.unverified_finding_ids, &self.label_gap_ranges),
             &self.page_evidence,
             &self.policy_hash,
             &self.reviewed_sections,
@@ -409,6 +418,7 @@ pub fn skip_failing_page(s: &mut Session) -> PageSkip {
         return PageSkip::Continued;
     }
     if state.page_findings.is_empty() {
+        findings::preserve_label_gaps(state);
         let skipped = std::mem::take(&mut state.skipped_ranges);
         mark_unavailable(s);
         s.document_review.unavailable_ranges = skipped;
@@ -478,6 +488,7 @@ pub fn guidance(s: &Session) -> Value {
     for key in [
         "validation_log",
         "skip_log",
+        "label_drop_log",
         "unavailable_failure",
         "findings",
         "validating",
@@ -601,7 +612,8 @@ fn reset_pages(state: &mut ReviewState) {
     state.page_evidence.clear();
     state.validating = false;
     state.validation_ids.clear();
-    state.unverified_scope_ids.clear();
+    state.unverified_finding_ids.clear();
+    state.label_gap_ranges.clear();
     state.skipped_ranges.clear();
 }
 
@@ -1063,7 +1075,21 @@ struct Verdict {
 }
 
 pub fn finish(s: &mut Session, text: &str) -> Result<()> {
-    finish_response(s, text)?;
+    finish_attempt(s, text, false)
+}
+
+/// Accept the last response a review will retry before it skips the page or,
+/// in closing mode, abandons the whole review. An issue whose ui_labels lack
+/// a quoted source line is dropped (and logged) instead of rejecting every
+/// sibling: in a live run one such label turned the single closing review
+/// into an unreviewed result. A dropped, previously confirmed defect still
+/// leaves a review gap unless a valid candidate covers it.
+pub fn finish_last_try(s: &mut Session, text: &str) -> Result<()> {
+    finish_attempt(s, text, true)
+}
+
+fn finish_attempt(s: &mut Session, text: &str, last_try: bool) -> Result<()> {
+    finish_response(s, text, last_try)?;
     // The rejected response's error is feedback for its retry only. Left in
     // place it was sent as previous_response_error to later pages and to
     // validation (6 of 23 review calls in a live run).
@@ -1076,7 +1102,7 @@ pub fn finish(s: &mut Session, text: &str) -> Result<()> {
     Ok(())
 }
 
-fn finish_response(s: &mut Session, text: &str) -> Result<()> {
+fn finish_response(s: &mut Session, text: &str, last_try: bool) -> Result<()> {
     let mut body = text.trim();
     // Models occasionally add a JSON code fence despite the strict output
     // contract. Accept the common fenced forms, including `JSON` and CRLF,
@@ -1116,7 +1142,7 @@ fn finish_response(s: &mut Session, text: &str) -> Result<()> {
     let verdict: Verdict =
         serde_json::from_str(body).map_err(|e| anyhow::anyhow!("document_review_invalid: {e}"))?;
     let doc_text = read_text(&output_path(&s.project)?)?;
-    findings::collect(s, verdict.issues, &doc_text)?;
+    findings::collect(s, verdict.issues, &doc_text, last_try)?;
     let state = &mut s.document_review;
     // Issues are accumulated across pages. No approval or content-review
     // attempt is consumed until every evidence chunk has been examined.
@@ -1141,6 +1167,7 @@ fn finish_review(s: &mut Session, digest: String) -> Result<()> {
         .filter(|i| i.status == "verified")
         .count();
     let state = &mut s.document_review;
+    findings::preserve_label_gaps(state);
     state.attempts += 1;
     state.pending = false;
     state.evidence_omitted = false;
@@ -1149,7 +1176,7 @@ fn finish_review(s: &mut Session, digest: String) -> Result<()> {
         .findings
         .iter()
         .filter(|old| {
-            !state.unverified_scope_ids.contains(&old.id)
+            !state.unverified_finding_ids.contains(&old.id)
                 && !next_findings.iter().any(|new| {
                     new.id == old.id || findings::same_subject(&old.proposal, &new.proposal)
                 })
@@ -1181,9 +1208,9 @@ fn finish_review(s: &mut Session, digest: String) -> Result<()> {
     if let Some(issue) = length_issue {
         next_issues.push(issue);
     }
-    // A formerly confirmed scope defect becoming uncertain is not a repair.
+    // A formerly confirmed defect becoming uncertain is not a repair.
     // Include these gaps only in progress accounting, never repair guidance.
-    let remaining = next_issues.len() + state.unverified_scope_ids.len();
+    let remaining = next_issues.len() + state.unverified_finding_ids.len();
     if remaining == 0 {
         state.stalled_attempts = 0;
         state.best_issue_count = Some(0);

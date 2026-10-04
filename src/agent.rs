@@ -2050,7 +2050,17 @@ pub async fn run_session_controlled(
                     )
                 })
             } else {
-                match tools::document_review::finish(&mut s, &completion.text) {
+                // Mirror abandon_failing_review: this response is the last
+                // one before a page skip or, in closing, an unreviewed result.
+                let last_try = s.checkpoint.is_none()
+                    && (s.progress_recovery.closing.is_some()
+                        || review_response_failures + 1 >= REVIEW_UNAVAILABLE_LIMIT);
+                let finish = if last_try {
+                    tools::document_review::finish_last_try
+                } else {
+                    tools::document_review::finish
+                };
+                match finish(&mut s, &completion.text) {
                     Ok(()) => Ok(()),
                     Err(error)
                         if completion.length_limited

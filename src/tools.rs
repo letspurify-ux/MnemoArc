@@ -3541,7 +3541,7 @@ fn delivered_sources_for(
 /// Most recent delivered sources kept for one path given as a source ID.
 const PATH_SOURCE_LIMIT: usize = 8;
 
-/// Live runs pass project paths, and `path:10-20` citations, as memory_write
+/// Live runs pass project paths, and `path:10-20` citations, as memory input
 /// source_ids. Replace each with the evidence already delivered from that
 /// file (range) in its current version, as investigation verify does; a path
 /// with no delivered evidence still fails, so nothing unobserved is cited.
@@ -4268,12 +4268,15 @@ fn execute_repaired(
                                 .collect::<BTreeMap<_, _>>()
                         })
                         .collect::<Vec<_>>();
-                    let input: MemoryInput = serde_json::from_value(args["replacement"].clone())
-                        .map_err(|error| {
+                    let mut input: MemoryInput =
+                        serde_json::from_value(args["replacement"].clone()).map_err(|error| {
                             anyhow::anyhow!(
                                 "invalid_argument_value: memory_manage replacement fields: {error}"
                             )
                         })?;
+                    let resolved_paths;
+                    (input.source_ids, resolved_paths) =
+                        resolve_path_source_ids(s, &input.source_ids)?;
                     let sources = s.source_refs(&input.source_ids)?;
                     let replacement = s
                         .memory
@@ -4303,7 +4306,11 @@ fn execute_repaired(
                             item.status = "written".into();
                         }
                     }
-                    Ok(json!(m))
+                    let mut meta = json!(m);
+                    if !resolved_paths.is_empty() {
+                        meta["resolved_source_ids"] = Value::Object(resolved_paths);
+                    }
+                    Ok(meta)
                 }
                 _ => unreachable!(),
             }

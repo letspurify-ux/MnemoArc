@@ -461,7 +461,43 @@ pub fn recover_retry_findings(state: &mut ReviewState) {
     restore_candidates(&mut state.page_findings, recovered);
 }
 
-pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str) -> Result<()> {
+/// Do not mistake a rejected correction for proof that an old defect is gone.
+/// Finalize only after semantic validation. Decisive judgments remove their
+/// own IDs from label_gap_ranges; exact cached confirmations remain in the
+/// candidate list. A shared passage or source is not the same defect.
+pub fn preserve_label_gaps(state: &mut ReviewState) {
+    for (id, range) in std::mem::take(&mut state.label_gap_ranges) {
+        let covered = state
+            .page_findings
+            .iter()
+            .any(|candidate| candidate.id == id && candidate.confirmed);
+        if !covered {
+            state.unverified_finding_ids.insert(id);
+            state.skipped_ranges.push(range);
+        }
+    }
+    state.skipped_ranges.sort_unstable();
+    state.skipped_ranges.dedup();
+}
+
+/// A UI label absent from every source quote of its issue. Only that issue
+/// is unproven; on a last try it is dropped instead of failing the response.
+#[derive(Debug)]
+struct UnprovenLabel {
+    message: String,
+    prior_ids: Vec<String>,
+    range: (usize, usize),
+}
+
+impl std::fmt::Display for UnprovenLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UnprovenLabel {}
+
+pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str, last_try: bool) -> Result<()> {
     if proposals.len() > 12 {
         bail!("document_review_invalid: at most 12 findings per page");
     }
@@ -473,6 +509,7 @@ pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str) -> Result<()> 
     let mut merged = 0;
     let mut corrections = 0;
     let mut first_error = None;
+    let mut dropped = Vec::new();
     // Check every proposal, even after a bad quote or malformed sibling.
     // Keep page verdicts atomic; only grounded, unconfirmed retry candidates
     // survive a rejected batch, with their original evidence and stable IDs.
@@ -495,12 +532,30 @@ pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str) -> Result<()> 
                 merged += m;
                 corrections += c;
             }
+            Err(error) if last_try && error.is::<UnprovenLabel>() => {
+                dropped.push(error.downcast::<UnprovenLabel>().unwrap());
+            }
             Err(error) => {
                 first_error.get_or_insert(error);
             }
         }
     }
     let state = &mut s.document_review;
+    if first_error.is_none() {
+        for error in dropped {
+            state.label_drop_log.push(
+                json!({"lines":[state.document_offset + 1, state.next_document_offset],
+                "evidence_page":state.evidence_page,"error":error.message}),
+            );
+            for id in error.prior_ids {
+                state.label_gap_ranges.entry(id).or_insert(error.range);
+            }
+        }
+        if state.label_drop_log.len() > 24 {
+            let excess = state.label_drop_log.len() - 24;
+            state.label_drop_log.drain(..excess);
+        }
+    }
     state.next_finding_id = next_id;
     state.merged_findings += merged;
     state.anchor_corrections += corrections;
@@ -639,24 +694,6 @@ fn collect_one(
         sources.push(json!({"path":source.path,"passage":source.passage,
             "context":surrounding,"review_evidence":review_evidence}));
     }
-    // Name the issue and label: a bare "label is not present" left a live
-    // reviewer repeating the same label until the page was skipped.
-    for (label_index, label) in proposal.ui_labels.iter().enumerate() {
-        if label.trim().is_empty() {
-            bail!(
-                "document_review_invalid: issues[{issue_index}].ui_labels[{label_index}] is empty; remove it"
-            );
-        }
-        if !proposal
-            .sources
-            .iter()
-            .any(|s| s.passage.quote.contains(label))
-        {
-            bail!(
-                "document_review_invalid: issues[{issue_index}].ui_labels[{label_index}] {label:?} is not in any sources[].quote of this issue; add a sources entry quoting the source line that contains it, or remove it from ui_labels (list only strings the correction proposes to show or add)"
-            );
-        }
-    }
     let previous = proposal
         .previous_id
         .as_ref()
@@ -724,6 +761,41 @@ fn collect_one(
             "document_review_invalid: issues[{issue_index}].previous_id {:?} cannot be reused: {reason}; set previous_id to null for this finding",
             old.id
         );
+    }
+    // Name the issue and label: a bare "label is not present" left a live
+    // reviewer repeating the same label until the page was skipped.
+    for (label_index, label) in proposal.ui_labels.iter().enumerate() {
+        if label.trim().is_empty() {
+            bail!(
+                "document_review_invalid: issues[{issue_index}].ui_labels[{label_index}] is empty; remove it"
+            );
+        }
+        if !proposal
+            .sources
+            .iter()
+            .any(|s| s.passage.quote.contains(label))
+        {
+            let prior_ids = state
+                .findings
+                .iter()
+                .filter(|old| {
+                    old.confirmed
+                        && proposal.previous_id.as_ref().map_or_else(
+                            || same_subject(&old.proposal, &proposal),
+                            |id| id == &old.id,
+                        )
+                })
+                .map(|old| old.id.clone())
+                .collect();
+            let range = proposal.document.as_ref().map_or(
+                (state.document_offset + 1, state.next_document_offset),
+                |p| (p.start_line, p.end_line),
+            );
+            return Err(UnprovenLabel { message: format!(
+                "document_review_invalid: issues[{issue_index}].ui_labels[{label_index}] {label:?} is not in any sources[].quote of this issue; add a sources entry quoting the source line that contains it, or remove it from ui_labels (list only strings the correction proposes to show or add)"
+            ), prior_ids, range }
+            .into());
+        }
     }
     let retry_update = previous
         .is_some_and(|old| !old.confirmed && state.retry_findings.iter().any(|f| f.id == old.id));
@@ -949,13 +1021,21 @@ pub fn finish_verification(s: &mut Session, body: &str) -> Result<()> {
             .iter()
             .find(|f| f.id == decision.id)
             .unwrap();
-        let scope_gap = (finding.previous_scope.is_some() && decision.status == "unverified")
+        let review_gap = (decision.status == "unverified")
             .then(|| {
-                finding
-                    .proposal
-                    .document
-                    .as_ref()
-                    .map(|p| (p.start_line, p.end_line))
+                state
+                    .label_gap_ranges
+                    .get(&decision.id)
+                    .copied()
+                    .or_else(|| {
+                        finding.previous_scope.as_ref().and_then(|_| {
+                            finding
+                                .proposal
+                                .document
+                                .as_ref()
+                                .map(|p| (p.start_line, p.end_line))
+                        })
+                    })
             })
             .flatten();
         let is_inferred = inferred.contains(&decision.id);
@@ -965,6 +1045,10 @@ pub fn finish_verification(s: &mut Session, body: &str) -> Result<()> {
             entry["applied_status"] = json!("confirmed");
         }
         state.validation_log.push(entry);
+        // This whole batch passed validation above. Only this finding's
+        // decision can settle its label gap; an uncertain decision transfers
+        // the gap below instead of counting it as a dismissal or repair.
+        state.label_gap_ranges.remove(&decision.id);
         if decision.status == "confirmed" || is_inferred {
             let finding = state
                 .page_findings
@@ -977,12 +1061,12 @@ pub fn finish_verification(s: &mut Session, body: &str) -> Result<()> {
             state.page_findings.retain(|f| f.id != decision.id);
             // An unverified finding is not repair guidance. Ordinary new
             // candidates retain their existing dismissal behavior; a linked
-            // formerly confirmed scope finding additionally leaves a gap.
-            if let Some(range) = scope_gap {
+            // formerly confirmed finding additionally leaves a gap.
+            if let Some(range) = review_gap {
                 // Uncertainty about a formerly confirmed defect is neither
                 // a dismissal nor a repair verdict. Reuse the coverage-gap
                 // path so completion cannot silently approve this passage.
-                state.unverified_scope_ids.insert(decision.id.clone());
+                state.unverified_finding_ids.insert(decision.id.clone());
                 state.skipped_ranges.push(range);
                 state.skipped_ranges.sort_unstable();
                 state.skipped_ranges.dedup();

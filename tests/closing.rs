@@ -477,15 +477,15 @@ async fn closing_preserves_the_failed_document_review_in_state_and_run_history()
     s.config.closing_reserve_ratio = 0.8;
     s.config.verification_reserve_ratio = 0.85;
     s.config.writing_reserve_ratio = 0.9;
-    // A UI label without quoted source evidence is rejected by the real
+    // A document quote absent from the page is rejected by the real
     // validator. The first answer's usage starts closing before that review.
     let invalid = json!({"issues":[{
         "previous_id":null,"kind":"scope",
         "document":{"start_line":2,"end_line":2,
-            "quote":"A for loop runs work five times. main.js:3-5"},
+            "quote":"A while loop runs work forever."},
         "requirement_id":"R0","sources":[],
-        "problem":"Remove an implementation name","correction":"Refer to Cancel",
-        "ui_labels":["Cancel"]
+        "problem":"Remove an implementation name","correction":"Describe the visible result",
+        "ui_labels":[]
     }]})
     .to_string();
     let mut check = s.clone();
@@ -495,7 +495,7 @@ async fn closing_preserves_the_failed_document_review_in_state_and_run_history()
     let error = document_review::finish(&mut check, &invalid)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("ui_labels[0]"), "{error}");
+    assert!(error.contains("issues[0].document"), "{error}");
     let document_hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
     let final_answer = || Completion {
         text: "Saved out.md".into(),
@@ -551,6 +551,68 @@ async fn closing_preserves_the_failed_document_review_in_state_and_run_history()
     assert_eq!(result.run_history.len(), 2);
     assert_eq!(json!(result.run_history[0]), record);
     assert!(json!(result.run_history[1])["document_review_failure"].is_null());
+}
+
+// Live run 2026-10-04: the single closing review failed on one scope issue
+// listing kept labels ("Undo", "Redo") without sources, and the whole review
+// ended unreviewed. On the last try only that issue is dropped and logged.
+#[tokio::test]
+async fn closing_review_drops_only_an_issue_with_an_unproven_label() {
+    let (_dir, mut s) = verified_fixture();
+    s.config.source_document_review = true;
+    s.config.run_tokens = 100_000;
+    s.config.closing_reserve_ratio = 0.8;
+    s.config.verification_reserve_ratio = 0.85;
+    s.config.writing_reserve_ratio = 0.9;
+    let unproven = json!({"issues":[{
+        "previous_id":null,"kind":"scope",
+        "document":{"start_line":2,"end_line":2,
+            "quote":"A for loop runs work five times. main.js:3-5"},
+        "requirement_id":"R0","sources":[],
+        "problem":"Remove an implementation name","correction":"Refer to Cancel",
+        "ui_labels":["Cancel"]
+    }]})
+    .to_string();
+    let final_answer = || Completion {
+        text: "Saved out.md".into(),
+        ..Default::default()
+    };
+    let (result, _) = run_scripted(
+        s,
+        vec![
+            Completion {
+                usage: Some(Usage {
+                    input: 30_000,
+                    output: 10,
+                    cached: None,
+                }),
+                ..final_answer()
+            },
+            Completion {
+                text: unproven,
+                ..Default::default()
+            },
+            final_answer(),
+        ],
+    )
+    .await;
+    assert!(!document_review::unavailable_on_current(&result));
+    assert!(document_review::approved(&result));
+    assert!(result.document_review.unavailable_failure.is_none());
+    let drops = &result.document_review.label_drop_log;
+    assert_eq!(drops.len(), 1, "{drops:?}");
+    assert!(
+        drops[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("issues[0].ui_labels[0] \"Cancel\""),
+        "{drops:?}"
+    );
+    assert!(
+        document_review::guidance(&result)
+            .get("label_drop_log")
+            .is_none()
+    );
 }
 
 async fn run_scripted(s: Session, steps: Vec<Completion>) -> (Session, Vec<Value>) {

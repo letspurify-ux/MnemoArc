@@ -92,6 +92,133 @@ async fn run(s: Session, replies: Vec<Completion>) -> (Session, Vec<Value>) {
     let requests = client.1.lock().unwrap().clone();
     (s, requests)
 }
+
+fn follow_up_snapshot(requests: &[Value]) -> Value {
+    requests
+        .iter()
+        .flat_map(|r| r["messages"].as_array().unwrap())
+        .filter_map(|m| m["content"].as_str())
+        .find_map(|text| text.strip_prefix("Saved task snapshot:\n"))
+        .map(|text| serde_json::from_str(text).unwrap())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn follow_up_errors_keep_the_originating_calls_without_changing_saved_state() {
+    for automatic in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = fixture(dir.path());
+        let old = s.history.push(vec![
+            json!({"role":"assistant","tool_calls":[{"id":"reused","function":{"name":"memory_write","arguments":"{\"key\":\"old\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"reused","content":json!({"status":"error","error":"old memory failure"}).to_string()}),
+        ], true);
+        let args = json!({"action":"upsert","id":"section","source_ids":["src/a.rs"]});
+        let error = json!({"status":"error","error":"unknown_source: src/a.rs","recovery":{"code":"unknown_source","tools":["source_lookup","history"]},"data":{"detail":"preserve the original error"}});
+        let recent = s.history.push(vec![
+            json!({"role":"assistant","tool_calls":[
+                {"id":"reused","function":{"name":"investigation","arguments":args.to_string()}},
+                {"id":"search","function":{"name":"source_search","arguments":"{\"after\":25}"}},
+            ]}),
+            json!({"role":"tool","tool_call_id":"search","content":json!({"status":"error","error":"invalid_argument_value: after"}).to_string()}),
+            json!({"role":"tool","tool_call_id":"reused","content":error.to_string()}),
+            // Follow-up bundles can contain several rounds and reused IDs.
+            json!({"role":"assistant","tool_calls":[{"id":"reused","function":{"name":"memory_read","arguments":"{\"id\":\"missing\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"reused","content":json!({"status":"error","error":"memory_not_found"}).to_string()}),
+        ], true);
+        let plan = json!(s.task);
+        let memories = json!(s.memory.entries);
+        let history = s.history.read(recent).unwrap().messages.clone();
+        let mut replies = vec![];
+        if automatic {
+            s.receive_message("Which tools failed?".into()).unwrap();
+            replies.push(route("discuss", ""));
+        } else {
+            s.queue_question("Which tools failed?".into()).unwrap();
+        }
+        replies.push(Completion {
+            text: "The calls are identified in the snapshot.".into(),
+            ..Default::default()
+        });
+        let (s, requests) = run(s, replies).await;
+        let snapshot = follow_up_snapshot(&requests);
+        let errors = snapshot["recent_tool_errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 4);
+        assert_eq!(errors[0]["call"]["name"], "memory_read");
+        assert_eq!(errors[1]["call"]["name"], "investigation");
+        assert_eq!(errors[1]["call"]["action"], "upsert");
+        assert_eq!(errors[1]["call"]["bundle_id"], recent);
+        assert_eq!(errors[1]["call"]["tool_call_id"], "reused");
+        assert_eq!(
+            serde_json::from_str::<Value>(errors[1]["call"]["arguments"].as_str().unwrap())
+                .unwrap(),
+            args
+        );
+        for (key, value) in error.as_object().unwrap() {
+            assert_eq!(&errors[1][key], value);
+        }
+        assert_eq!(errors[2]["call"]["name"], "source_search");
+        assert_eq!(errors[3]["call"]["name"], "memory_write");
+        assert_eq!(errors[3]["call"]["bundle_id"], old);
+        assert_eq!(json!(s.task), plan);
+        assert_eq!(json!(s.memory.entries), memories);
+        assert_eq!(s.history.read(recent).unwrap().messages, history);
+        assert_eq!(s.status, "blocked");
+    }
+}
+
+#[tokio::test]
+async fn follow_up_error_previews_are_bounded_and_do_not_guess_missing_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = fixture(dir.path());
+    for i in 0..6 {
+        s.history.push(vec![
+            json!({"role":"assistant","tool_calls":[{"id":"orphan","function":{"name":"memory_write","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"orphan","content":json!({"status":"error","error":format!("old-{i}")}).to_string()}),
+        ], true);
+    }
+    let long_args = format!(
+        "{{\"text\":\"{}\",\"action\":\"insert_after\"}}",
+        "가".repeat(5000)
+    );
+    let recent = s.history.push(vec![
+        json!({"role":"assistant","tool_calls":[{"id":"long","function":{"name":"document_edit","arguments":long_args}}]}),
+        json!({"role":"tool","tool_call_id":"long","content":json!({"status":"error","error":"missing_argument: expected_hash"}).to_string()}),
+        json!({"role":"assistant","tool_calls":[{"id":"malformed","function":{"name":"source_search","arguments":"{\"query\":"}}]}),
+        json!({"role":"tool","tool_call_id":"malformed","content":json!({"status":"error","error":"invalid_json"}).to_string()}),
+        // Neither another bundle's call nor a future call may own this result.
+        json!({"role":"tool","tool_call_id":"orphan","content":json!({"status":"error","error":"unknown origin","recovery":{"tools":["source_lookup"]}}).to_string()}),
+        json!({"role":"assistant","tool_calls":[{"id":"orphan","function":{"name":"memory_read","arguments":"{}"}}]}),
+        json!({"role":"tool","tool_call_id":"ignored","content":"not JSON"}),
+        json!({"role":"tool","tool_call_id":"ignored","content":"{\"status\":\"ok\"}"}),
+    ], true);
+    s.queue_question("Explain the recent errors".into())
+        .unwrap();
+    let (_, requests) = run(
+        s,
+        vec![Completion {
+            text: "Some call details are unavailable.".into(),
+            ..Default::default()
+        }],
+    )
+    .await;
+    let snapshot = follow_up_snapshot(&requests);
+    let errors = snapshot["recent_tool_errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 5);
+    assert_eq!(errors[0]["call"]["bundle_id"], recent);
+    assert_eq!(errors[0]["call"]["tool_call_id"], "orphan");
+    assert!(errors[0]["call"].get("name").is_none());
+    assert!(errors[0]["call"].get("arguments").is_none());
+    assert_eq!(errors[1]["call"]["arguments"], "{\"query\":");
+    assert!(errors[1]["call"].get("action").is_none());
+    let preview = errors[2]["call"]["arguments"].as_str().unwrap();
+    assert!(preview.chars().count() < 1650);
+    assert!(preview.ends_with("… [truncated]"));
+    // The action stays available even when it follows a large text payload.
+    assert_eq!(errors[2]["call"]["action"], "insert_after");
+    assert_eq!(errors[3]["error"], "old-5");
+    assert_eq!(errors[4]["error"], "old-4");
+}
+
 #[tokio::test]
 async fn general_follow_up_collects_files_and_remembers_evidence_without_reviews_or_resuming() {
     let dir = tempfile::tempdir().unwrap();

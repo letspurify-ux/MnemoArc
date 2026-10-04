@@ -29,19 +29,68 @@ fn bounded(value: Value, limit: usize) -> Value {
     }
 }
 
-fn request(s: &Session) -> Value {
-    let question = s.question.as_ref().unwrap();
-    let recent_errors: Vec<_> = s
-        .history
+fn recent_tool_errors(s: &Session) -> Vec<Value> {
+    s.history
         .bundles
         .iter()
         .rev()
-        .flat_map(|b| b.messages.iter().rev())
-        .filter(|m| m["role"] == "tool")
-        .filter_map(|m| serde_json::from_str::<Value>(m["content"].as_str()?).ok())
-        .filter(|result| result["status"] == "error")
+        .flat_map(|bundle| {
+            bundle
+                .messages
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(move |(at, message)| {
+                    if message["role"] != "tool" {
+                        return None;
+                    }
+                    let mut result: Value =
+                        serde_json::from_str(message["content"].as_str()?).ok()?;
+                    if result["status"] != "error" {
+                        return None;
+                    }
+                    let mut call =
+                        json!({"bundle_id":bundle.id,"tool_call_id":message["tool_call_id"]});
+                    // IDs may repeat in later rounds. Only the nearest preceding
+                    // call in this bundle can explain this result; never guess
+                    // its tool from recovery suggestions or another bundle.
+                    if let Some(id) = message["tool_call_id"].as_str().filter(|id| !id.is_empty())
+                        && let Some(function) = bundle.messages[..at]
+                            .iter()
+                            .rev()
+                            .filter(|m| m["role"] == "assistant")
+                            .filter_map(|m| m["tool_calls"].as_array())
+                            .flatten()
+                            .find(|c| c["id"] == id)
+                            .and_then(|c| c.get("function"))
+                    {
+                        call["name"] = function["name"].clone();
+                        if let Some(arguments) = function.get("arguments") {
+                            let raw = arguments
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| arguments.to_string());
+                            if let Ok(parsed) = serde_json::from_str::<Value>(&raw)
+                                && let Some(action) = parsed.get("action").and_then(Value::as_str)
+                            {
+                                call["action"] = json!(action);
+                            }
+                            // Keep the whole argument preview subject to the
+                            // snapshot's string limit, including malformed JSON.
+                            call["arguments"] = json!(raw);
+                        }
+                    }
+                    result["call"] = call;
+                    Some(result)
+                })
+        })
         .take(5)
-        .collect();
+        .collect()
+}
+
+fn request(s: &Session) -> Value {
+    let question = s.question.as_ref().unwrap();
+    let recent_errors = recent_tool_errors(s);
     let recent_questions: Vec<_> = s
         .history
         .bundles
@@ -60,7 +109,7 @@ fn request(s: &Session) -> Value {
         "recent_runs":s.run_history.iter().rev().take(3).collect::<Vec<_>>(),
         "recent_tool_errors":recent_errors,"recent_questions":recent_questions,
         "document_written":s.document_written,"output":s.project.output,
-        "context_note":"Lists are limited to 20 items and long strings are shortened. This is a saved snapshot; no files were reread."
+        "context_note":"Lists are limited to 20 items and long strings are shortened. This is a saved snapshot; no files were reread. recent_tool_errors are historical failures, not necessarily current blockers. Their call metadata identifies the originating tool when its recorded call is available."
     });
     if s.task.workflow == "answer" {
         // The answer workflow runs no reviews or investigations.

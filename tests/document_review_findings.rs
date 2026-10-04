@@ -489,6 +489,48 @@ fn a_label_missing_from_the_quotes_names_the_issue_and_label() {
 }
 
 #[test]
+fn a_last_try_drops_only_the_issue_with_an_unproven_label() {
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let mut item = proposal("Incorrect deletion timing");
+    item["ui_labels"] = json!(["서버와 통신하지 못했습니다."]);
+    let response = json!({"issues":[proposal("Other defect"), item]}).to_string();
+    // Earlier tries still reject the response so the reviewer can fix it.
+    assert!(review::finish(&mut s.clone(), &response).is_err());
+    review::finish_last_try(&mut s, &response).unwrap();
+    assert!(s.document_review.validating);
+    assert_eq!(s.document_review.label_drop_log.len(), 1);
+    let drop = &s.document_review.label_drop_log[0];
+    assert!(
+        drop["error"]
+            .as_str()
+            .unwrap()
+            .contains("issues[1].ui_labels[0]"),
+        "{drop}"
+    );
+    assert_eq!(drop["evidence_page"], 0);
+    // Only the sibling reaches semantic validation.
+    validate(&mut s, vec![decision("F1", "confirmed")]);
+    assert_eq!(s.document_review.findings.len(), 1);
+    assert_eq!(
+        s.document_review.findings[0].proposal.problem,
+        "Other defect"
+    );
+
+    // Any other invalid issue still rejects the last try as a whole.
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let mut bad_quote = proposal("Incorrect deletion timing");
+    bad_quote["document"]["quote"] = json!("즉시 삭제됩니다");
+    let mut item = proposal("Label defect");
+    item["ui_labels"] = json!(["서버와 통신하지 못했습니다."]);
+    assert!(
+        review::finish_last_try(&mut s, &json!({"issues":[bad_quote, item]}).to_string()).is_err()
+    );
+    assert!(s.document_review.label_drop_log.is_empty());
+}
+
+#[test]
 fn missing_or_unknown_validation_cannot_approve_or_partially_commit() {
     for decisions in [
         vec![],
@@ -1404,6 +1446,365 @@ fn unverified_reanchored_scope_leaves_a_gap_instead_of_approval() {
         s.document_review.issues.is_empty(),
         "unknown judgments are not repair instructions"
     );
+}
+
+#[test]
+fn last_try_label_drops_cannot_resolve_a_previously_confirmed_scope() {
+    for (rewritten, previous_id) in [(false, None), (false, Some("F1")), (true, Some("F1"))] {
+        let (_dir, mut s) = scope_fixture();
+        confirm_scope(&mut s);
+        if rewritten {
+            rewrite_scope(&s);
+        }
+        review::request(&mut s).unwrap();
+        let quote = if rewritten {
+            NEW_SCOPE_TEXT
+        } else {
+            OLD_SCOPE_TEXT
+        };
+        let mut issue = scope_proposal(&s, quote, previous_id);
+        let line = issue["document"]["start_line"].as_u64().unwrap() as usize;
+        issue["ui_labels"] = json!(["Unproven label"]);
+        review::finish_last_try(&mut s, &json!({"issues":[issue]}).to_string()).unwrap();
+
+        assert!(!review::approved(&s));
+        assert!(review::unavailable_on_current(&s));
+        assert_eq!(review::unavailable_ranges(&s), &[(line, line)]);
+        assert_eq!(s.document_review.resolved_findings, 0);
+        assert_eq!(s.document_review.best_issue_count, Some(1));
+        assert_eq!(s.document_review.stalled_attempts, 1);
+        assert_eq!(s.document_review.validation_rounds, 1);
+        assert!(s.document_review.issues.is_empty());
+        assert_eq!(s.document_review.label_drop_log.len(), 1);
+
+        // The gap belongs to this review. A subsequent valid review can approve.
+        review::request(&mut s).unwrap();
+        submit(&mut s, vec![]);
+        assert!(review::approved(&s));
+        assert!(review::unavailable_ranges(&s).is_empty());
+    }
+}
+
+#[test]
+fn last_try_label_gaps_keep_valid_siblings_in_either_order() {
+    for bad_first in [false, true] {
+        let (_dir, mut s) = scope_fixture();
+        confirm_scope(&mut s);
+        rewrite_scope(&s);
+        review::request(&mut s).unwrap();
+        let mut bad = scope_proposal(&s, NEW_SCOPE_TEXT, Some("F1"));
+        let line = bad["document"]["start_line"].as_u64().unwrap() as usize;
+        bad["ui_labels"] = json!(["Unproven label"]);
+        let mut good = scope_proposal(&s, "설정을 저장합니다. ui.js:2", None);
+        good["problem"] = json!("Independent settings defect");
+        let issues = if bad_first {
+            vec![bad, good]
+        } else {
+            vec![good, bad]
+        };
+        review::finish_last_try(&mut s, &json!({"issues":issues}).to_string()).unwrap();
+        assert!(s.document_review.validating);
+        validate(&mut s, vec![decision("F2", "confirmed")]);
+        assert!(review::rejected_on_current_result(&s));
+        assert!(!review::approved(&s));
+        assert_eq!(s.document_review.findings.len(), 1);
+        assert_eq!(s.document_review.findings[0].id, "F2");
+        assert_eq!(review::unavailable_ranges(&s), &[(line, line)]);
+        assert_eq!(s.document_review.resolved_findings, 0);
+        assert_eq!(s.document_review.stalled_attempts, 1);
+    }
+}
+
+#[test]
+fn a_valid_sibling_for_the_dropped_prior_finding_keeps_its_normal_verdict() {
+    for bad_first in [false, true] {
+        for status in ["confirmed", "dismissed", "unverified"] {
+            let (_dir, mut s) = scope_fixture();
+            confirm_scope(&mut s);
+            rewrite_scope(&s);
+            review::request(&mut s).unwrap();
+            let good = scope_proposal(&s, NEW_SCOPE_TEXT, Some("F1"));
+            let mut bad = good.clone();
+            bad["ui_labels"] = json!(["Unproven label"]);
+            let issues = if bad_first {
+                vec![bad, good]
+            } else {
+                vec![good, bad]
+            };
+            review::finish_last_try(&mut s, &json!({"issues":issues}).to_string()).unwrap();
+            validate(&mut s, vec![decision("F1", status)]);
+            assert_eq!(review::approved(&s), status == "dismissed");
+            assert_eq!(review::unavailable_on_current(&s), status == "unverified");
+            assert_eq!(
+                review::rejected_on_current_result(&s),
+                status == "confirmed"
+            );
+            assert_eq!(
+                s.document_review.resolved_findings,
+                usize::from(status == "dismissed")
+            );
+            assert_eq!(
+                review::unavailable_ranges(&s).is_empty(),
+                status != "unverified"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_different_finding_on_the_same_passage_cannot_clear_a_label_gap() {
+    for bad_first in [false, true] {
+        for status in ["confirmed", "dismissed", "unverified"] {
+            let (_dir, mut s) = scope_fixture();
+            confirm_scope(&mut s);
+            review::request(&mut s).unwrap();
+            let mut bad = scope_proposal(&s, OLD_SCOPE_TEXT, Some("F1"));
+            let line = bad["document"]["start_line"].as_u64().unwrap() as usize;
+            bad["ui_labels"] = json!(["Unproven label"]);
+            let mut other = scope_proposal(&s, OLD_SCOPE_TEXT, None);
+            other["problem"] = json!("A different scope criticism on the same passage");
+            other["correction"] = json!("Describe a different visible result");
+            let issues = if bad_first {
+                vec![bad, other]
+            } else {
+                vec![other, bad]
+            };
+            review::finish_last_try(&mut s, &json!({"issues":issues}).to_string()).unwrap();
+            validate(&mut s, vec![decision("F2", status)]);
+            assert!(!review::approved(&s));
+            assert_eq!(review::unavailable_ranges(&s), &[(line, line)]);
+            assert_eq!(review::unavailable_on_current(&s), status != "confirmed");
+            assert_eq!(s.document_review.resolved_findings, 0);
+        }
+    }
+}
+
+#[test]
+fn a_label_gap_waits_for_the_linked_findings_actual_verdict() {
+    for kind in ["scope", "factual", "requirement"] {
+        for status in ["confirmed", "dismissed", "unverified"] {
+            let (_dir, mut s) = fixture();
+            let mut original = proposal("Previously confirmed defect");
+            if kind != "factual" {
+                original["kind"] = json!(kind);
+                original["sources"] = json!([]);
+                original["requirement_id"] = json!("R0");
+                if kind == "requirement" {
+                    original["document"] = Value::Null;
+                }
+            }
+            review::request(&mut s).unwrap();
+            submit(&mut s, vec![original.clone()]);
+            validate(&mut s, vec![decision("F1", "confirmed")]);
+            review::request(&mut s).unwrap();
+            let mut candidate = original;
+            candidate["previous_id"] = json!("F1");
+            candidate["correction"] = json!("Fresh correction requiring a new semantic decision");
+            let mut bad = candidate.clone();
+            bad["ui_labels"] = json!(["Unproven label"]);
+            review::finish_last_try(&mut s, &json!({"issues":[bad,candidate]}).to_string())
+                .unwrap();
+            assert!(s.document_review.validating);
+            let before = json!(s.document_review);
+            review::request(&mut s).unwrap();
+            assert!(review::finish(&mut s, r#"{"decisions":[]}"#).is_err());
+            assert_eq!(json!(s.document_review), before);
+            validate(&mut s, vec![decision("F1", status)]);
+            assert_eq!(review::approved(&s), status == "dismissed");
+            assert_eq!(review::unavailable_on_current(&s), status == "unverified");
+            assert_eq!(
+                s.document_review.resolved_findings,
+                usize::from(status == "dismissed")
+            );
+            assert_eq!(
+                s.document_review.dismissed_findings,
+                usize::from(status == "dismissed")
+            );
+            if status == "unverified" {
+                assert_eq!(s.document_review.best_issue_count, Some(1));
+                assert_eq!(
+                    review::unavailable_ranges(&s),
+                    if kind == "requirement" {
+                        &[(1, 3)]
+                    } else {
+                        &[(2, 2)]
+                    }
+                );
+            } else {
+                assert!(review::unavailable_ranges(&s).is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn label_gaps_keep_exact_cached_confirmations_and_validated_duplicates() {
+    for cached in [false, true] {
+        let (_dir, mut s) = scope_fixture();
+        confirm_scope(&mut s);
+        review::request(&mut s).unwrap();
+        let mut bad = scope_proposal(&s, OLD_SCOPE_TEXT, Some("F1"));
+        bad["ui_labels"] = json!(["Unproven label"]);
+        if cached {
+            // The exact unchanged finding keeps its ID even without previous_id.
+            let good = scope_proposal(&s, OLD_SCOPE_TEXT, None);
+            review::finish_last_try(&mut s, &json!({"issues":[bad,good]}).to_string()).unwrap();
+            assert!(!s.document_review.validating);
+            assert_eq!(s.document_review.validation_rounds, 1);
+            assert_eq!(s.document_review.findings[0].id, "F1");
+        } else {
+            let mut good = scope_proposal(&s, OLD_SCOPE_TEXT, Some("F1"));
+            good["correction"] = json!("A fresh wording of the same repair");
+            let mut duplicate = good.clone();
+            duplicate["previous_id"] = Value::Null;
+            duplicate["problem"] = json!("A separately proposed equivalent scope defect");
+            review::finish_last_try(&mut s, &json!({"issues":[bad,good,duplicate]}).to_string())
+                .unwrap();
+            let mut merged = decision("F1", "duplicate");
+            merged["duplicate_of"] = json!("F2");
+            validate(&mut s, vec![merged, decision("F2", "confirmed")]);
+            assert_eq!(s.document_review.findings.len(), 1);
+            assert_eq!(s.document_review.findings[0].id, "F2");
+            assert_eq!(s.document_review.merged_findings, 1);
+        }
+        assert!(review::rejected_on_current_result(&s));
+        assert!(review::unavailable_ranges(&s).is_empty());
+        assert_eq!(s.document_review.resolved_findings, 0);
+    }
+}
+
+#[test]
+fn an_explicit_label_rejection_does_not_create_gaps_for_other_prior_findings() {
+    let (_dir, mut s) = scope_fixture();
+    review::request(&mut s).unwrap();
+    let original = scope_proposal(&s, OLD_SCOPE_TEXT, None);
+    let mut other = original.clone();
+    other["problem"] = json!("A different old criticism on the same passage");
+    submit(&mut s, vec![original, other]);
+    validate(
+        &mut s,
+        vec![decision("F1", "confirmed"), decision("F2", "confirmed")],
+    );
+    review::request(&mut s).unwrap();
+    let mut candidate = scope_proposal(&s, OLD_SCOPE_TEXT, Some("F1"));
+    candidate["correction"] = json!("A freshly worded correction");
+    let mut bad = candidate.clone();
+    bad["ui_labels"] = json!(["Unproven label"]);
+    // This review no longer reports F2. A malformed F1 must not manufacture
+    // a gap for F2 merely because both old findings quoted this same passage.
+    review::finish_last_try(&mut s, &json!({"issues":[bad,candidate]}).to_string()).unwrap();
+    validate(&mut s, vec![decision("F1", "dismissed")]);
+    assert!(review::approved(&s));
+    assert!(review::unavailable_ranges(&s).is_empty());
+    assert_eq!(s.document_review.resolved_findings, 1);
+}
+
+#[test]
+fn last_try_labels_cannot_hide_an_invalid_previous_finding_id() {
+    for id in ["missing", "F1"] {
+        let (_dir, mut s) = scope_fixture();
+        confirm_scope(&mut s);
+        review::request(&mut s).unwrap();
+        let mut bad = scope_proposal(&s, "설정을 저장합니다. ui.js:2", Some(id));
+        bad["ui_labels"] = json!(["Unproven label"]);
+        assert!(review::finish_last_try(&mut s, &json!({"issues":[bad]}).to_string()).is_err());
+        assert!(s.document_review.label_drop_log.is_empty());
+        assert_eq!(s.document_review.findings[0].id, "F1");
+        assert!(!review::approved(&s));
+    }
+}
+
+#[test]
+fn label_gaps_also_protect_facts_and_requirements_without_document_quotes() {
+    for kind in ["factual", "requirement"] {
+        let (_dir, mut s) = fixture();
+        review::request(&mut s).unwrap();
+        let mut issue = proposal("Previously confirmed defect");
+        if kind == "requirement" {
+            issue["kind"] = json!(kind);
+            issue["document"] = Value::Null;
+            issue["sources"] = json!([]);
+            issue["requirement_id"] = json!("R0");
+        }
+        submit(&mut s, vec![issue.clone()]);
+        validate(&mut s, vec![decision("F1", "confirmed")]);
+        review::request(&mut s).unwrap();
+        // Also recognize a matching old subject when the reviewer omits its ID.
+        issue["ui_labels"] = json!(["Unproven label"]);
+        review::finish_last_try(&mut s, &json!({"issues":[issue]}).to_string()).unwrap();
+        assert!(review::unavailable_on_current(&s));
+        assert!(!review::approved(&s));
+        assert_eq!(s.document_review.resolved_findings, 0);
+        assert_eq!(s.document_review.best_issue_count, Some(1));
+        assert_eq!(
+            review::unavailable_ranges(&s),
+            if kind == "factual" {
+                &[(2, 2)]
+            } else {
+                &[(1, 3)]
+            }
+        );
+    }
+}
+
+#[test]
+fn label_gaps_wait_for_later_evidence_and_reset_with_changed_inputs() {
+    for outcome in ["gap", "valid_candidate", "changed_input"] {
+        let (dir, mut s) = scope_fixture();
+        confirm_scope(&mut s);
+        let mut source = std::fs::read_to_string(dir.path().join("ui.js")).unwrap();
+        for i in 3..=1800 {
+            source.push_str(&format!(
+                "const value_{i} = normalize(history, {i}, 'input-{i}');\n"
+            ));
+        }
+        std::fs::write(dir.path().join("ui.js"), source).unwrap();
+        let doc = std::fs::read_to_string(&s.project.output).unwrap();
+        std::fs::write(
+            &s.project.output,
+            format!("{doc}\nEvidence: ui.js:1-1800\n"),
+        )
+        .unwrap();
+        let first = payload(review::request(&mut s).unwrap());
+        assert_eq!(first["more_evidence_pages"], true);
+        let good = scope_proposal(&s, OLD_SCOPE_TEXT, Some("F1"));
+        let line = good["document"]["start_line"].as_u64().unwrap() as usize;
+        let mut bad = good.clone();
+        bad["ui_labels"] = json!(["Unproven label"]);
+        review::finish_last_try(&mut s, &json!({"issues":[bad]}).to_string()).unwrap();
+        assert!(s.document_review.pending);
+        assert!(!s.document_review.validating);
+        if outcome == "changed_input" {
+            // Restart while a label gap is still waiting on later pages.
+            std::fs::write(&s.project.output, doc).unwrap();
+        }
+        for page in 0..12 {
+            review::request(&mut s).unwrap();
+            submit(
+                &mut s,
+                if outcome == "valid_candidate" && page == 0 {
+                    vec![good.clone()]
+                } else {
+                    vec![]
+                },
+            );
+            if !s.document_review.pending || s.document_review.validating {
+                break;
+            }
+        }
+        if outcome == "valid_candidate" {
+            assert!(s.document_review.validating);
+            validate(&mut s, vec![decision("F1", "dismissed")]);
+        }
+        assert!(!s.document_review.pending);
+        assert_eq!(review::approved(&s), outcome != "gap");
+        if outcome == "gap" {
+            assert_eq!(review::unavailable_ranges(&s), &[(line, line)]);
+            assert_eq!(s.document_review.resolved_findings, 0);
+        } else {
+            assert!(review::unavailable_ranges(&s).is_empty());
+        }
+    }
 }
 
 #[test]
