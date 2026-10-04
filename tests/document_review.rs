@@ -2178,6 +2178,7 @@ fn a_skipped_page_blocks_approval_even_when_other_pages_are_clean() {
     s.document_review = Default::default();
     document_review::request(&mut s).unwrap();
     s.document_review.pending = true;
+    s.last_error = Some("document_review_invalid: bad label".into());
     // The first page fails; later pages review cleanly.
     assert_eq!(
         document_review::skip_failing_page(&mut s),
@@ -2185,6 +2186,14 @@ fn a_skipped_page_blocks_approval_even_when_other_pages_are_clean() {
     );
     let first_end = s.document_review.skipped_ranges[0].1;
     assert_eq!(s.document_review.skipped_ranges, [(1, first_end)]);
+    // The skip ends the page's retries, so its last rejection is kept here.
+    assert_eq!(
+        s.document_review.skip_log,
+        [
+            json!({"lines":[1, first_end],"evidence_page":0,"error":"document_review_invalid: bad label"})
+        ]
+    );
+    assert!(document_review::guidance(&s).get("skip_log").is_none());
     while s.document_review.pending {
         document_review::request(&mut s).unwrap();
         support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();

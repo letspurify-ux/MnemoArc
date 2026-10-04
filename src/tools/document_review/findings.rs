@@ -543,15 +543,21 @@ fn collect_one(
         sources.push(json!({"path":source.path,"passage":source.passage,
             "context":surrounding,"review_evidence":review_evidence}));
     }
-    for label in &proposal.ui_labels {
-        if label.trim().is_empty()
-            || !proposal
-                .sources
-                .iter()
-                .any(|s| s.passage.quote.contains(label))
+    // Name the issue and label: a bare "label is not present" left a live
+    // reviewer repeating the same label until the page was skipped.
+    for (label_index, label) in proposal.ui_labels.iter().enumerate() {
+        if label.trim().is_empty() {
+            bail!(
+                "document_review_invalid: issues[{issue_index}].ui_labels[{label_index}] is empty; remove it"
+            );
+        }
+        if !proposal
+            .sources
+            .iter()
+            .any(|s| s.passage.quote.contains(label))
         {
             bail!(
-                "document_review_invalid: proposed UI label is not present in quoted source evidence"
+                "document_review_invalid: issues[{issue_index}].ui_labels[{label_index}] {label:?} is not in any sources[].quote of this issue; add a sources entry quoting the source line that contains it, or remove it from ui_labels (list only strings the correction proposes to show or add)"
             );
         }
     }

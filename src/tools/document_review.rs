@@ -50,6 +50,11 @@ pub struct ReviewState {
     /// Undecided ranges of the completed review, including mixed rejections.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unavailable_ranges: Vec<(usize, usize)>,
+    /// Pages skipped after repeated invalid responses, with the last
+    /// rejection. The skip ends the page's retries, so no later request
+    /// carries that error as previous_response_error.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skip_log: Vec<Value>,
     #[serde(skip)]
     next_finding_id: usize,
     #[serde(skip)]
@@ -95,6 +100,7 @@ impl ReviewState {
             input_tokens: old.input_tokens,
             output_tokens: old.output_tokens,
             validation_log: old.validation_log,
+            skip_log: old.skip_log,
             policy_hash: old.policy_hash,
             ..Default::default()
         };
@@ -334,7 +340,14 @@ pub fn skip_failing_page(s: &mut Session) -> PageSkip {
         return PageSkip::NotApplicable;
     }
     let range = (state.document_offset + 1, state.next_document_offset);
+    let error = s.last_error.clone();
     let state = &mut s.document_review;
+    state.skip_log.push(json!({"lines":[range.0, range.1],
+        "evidence_page":state.evidence_page,"error":error}));
+    if state.skip_log.len() > 24 {
+        let excess = state.skip_log.len() - 24;
+        state.skip_log.drain(..excess);
+    }
     findings::recover_retry_findings(state);
     // Consecutive skipped pages (or evidence pages of one range) are
     // reported as one line range.
@@ -417,6 +430,7 @@ pub fn guidance(s: &Session) -> Value {
     }
     for key in [
         "validation_log",
+        "skip_log",
         "findings",
         "validating",
         "validation_rounds",

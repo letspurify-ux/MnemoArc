@@ -816,6 +816,12 @@ async fn registered_source_documentation() {
     if let Ok(path) = std::env::var("MNEMOARC_DOC_REPORT") {
         std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
+    for skip in &result.document_review.skip_log {
+        eprintln!(
+            "[live] review_page_skipped lines={} evidence_page={} error={}",
+            skip["lines"], skip["evidence_page"], skip["error"]
+        );
+    }
     eprintln!(
         "documentation: status={} rounds={} tools={} input={} output={} seconds={:.1}",
         result.status,

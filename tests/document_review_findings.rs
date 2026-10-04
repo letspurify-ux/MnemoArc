@@ -470,6 +470,25 @@ fn invalid_quotes_and_invented_ui_labels_never_become_empty_approvals() {
 }
 
 #[test]
+fn a_label_missing_from_the_quotes_names_the_issue_and_label() {
+    // A live run skipped a review page twice: the bare "label is not present"
+    // error never said which label, so the reviewer kept repeating it.
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let mut item = proposal("Incorrect deletion timing");
+    item["ui_labels"] = json!(["서버와 통신하지 못했습니다."]);
+    let error = review::finish(
+        &mut s,
+        &json!({"issues":[proposal("Other defect"), item]}).to_string(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("issues[1].ui_labels[0]"), "{error}");
+    assert!(error.contains("\"서버와 통신하지 못했습니다.\""), "{error}");
+    assert!(error.contains("remove it from ui_labels"), "{error}");
+}
+
+#[test]
 fn missing_or_unknown_validation_cannot_approve_or_partially_commit() {
     for decisions in [
         vec![],

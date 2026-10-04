@@ -176,6 +176,10 @@ async fn cancelling_then_sending_a_changed_prompt_repairs_routing_and_finishes_t
     let config = Config {
         model: "gpt-4o".into(),
         model_context: Some(128000),
+        // The scripted engine does not answer checkpoint cleanup. The default
+        // 64K context leaves ~16.8K input budget, and the fixed prompt alone
+        // is ~12K, so five rounds crossed high_water and started a checkpoint.
+        context_tokens: 128000,
         source_document_review: false,
         completion_review_enabled: false,
         projects: vec![project.clone()],
