@@ -3530,6 +3530,42 @@ fn block_insertion_beside_a_mid_line_anchor_is_rejected() {
 }
 
 #[test]
+fn block_insertion_keeps_its_far_edge_off_the_neighboring_line() {
+    let body = "# 매뉴얼\n\n소개 문장입니다.\n\n## 1. 실행\n\n본문입니다.\n";
+    // Live shape: a section inserted before a heading anchor without a
+    // trailing newline became "...(README.md:27-28).## 1. 실행과 화면 접속".
+    let (_dir, mut s) = setup();
+    std::fs::write(&s.project.output, body).unwrap();
+    let result = run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":tools::hash(body.as_bytes()),"edits":[
+            {"action":"insert_before_text","old_text":"## 1. 실행","text":"## 구조\n\n구조 설명입니다."},
+            {"action":"insert_after_text","old_text":"소개 문장입니다.","text":"\n- 추가 항목입니다."}
+        ]}),
+    );
+    let expected = "# 매뉴얼\n\n소개 문장입니다.\n- 추가 항목입니다.\n\n## 구조\n\n구조 설명입니다.\n\n## 1. 실행\n\n본문입니다.\n";
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        expected
+    );
+    // A heading inserted after a line-ending anchor starts on its own line
+    // and keeps the blank line before it.
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after_text","expected_hash":result["hash"],"old_text":"본문입니다.","text":"## 2. 종료\n종료 설명입니다."}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        expected.replace(
+            "본문입니다.\n",
+            "본문입니다.\n\n## 2. 종료\n종료 설명입니다.\n"
+        )
+    );
+}
+
+#[test]
 fn empty_document_placeholders_do_not_block_create_or_batch_edits() {
     let (_dir, mut s) = setup();
     let created = run(

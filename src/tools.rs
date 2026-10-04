@@ -1953,6 +1953,55 @@ fn inserts_block(text: &str) -> bool {
             .any(|marker| first.starts_with(marker))
 }
 
+fn starts_with_heading(text: &str) -> bool {
+    let line = text
+        .trim_start_matches(['\r', '\n'])
+        .trim_start_matches(' ');
+    let level = line.bytes().take_while(|b| *b == b'#').count();
+    (1..=6).contains(&level) && line[level..].starts_with([' ', '\t', '\r', '\n'])
+}
+
+/// Line breaks a block inserted at a line boundary needs on both edges. The
+/// anchor side is already a boundary, but the block's far edge was joined to
+/// the neighboring line: a live run inserted a section before
+/// "## 1. ..." without a trailing newline and got "...(README.md:27-28).## 1. ...",
+/// which destroyed that heading. A heading next to the block also follows
+/// the document's blank-line heading spacing.
+fn separate_inserted_block(old: &str, at: usize, new: &str) -> String {
+    let (before, after) = old.split_at(at);
+    let delimiter = line_delimiter_at(old, at);
+    let spaced = heading_spacing(old).unwrap_or(false);
+    let leading_breaks = |text: &str| -> String {
+        text.chars()
+            .take_while(|c| matches!(c, '\r' | '\n'))
+            .collect()
+    };
+    let mut text = new.to_string();
+    if !before.is_empty() {
+        if !before.ends_with('\n') && !text.starts_with(['\r', '\n']) {
+            text.insert_str(0, delimiter);
+        }
+        if spaced
+            && starts_with_heading(&text)
+            && !ends_with_blank_line(&format!("{before}{}", leading_breaks(&text)))
+        {
+            text.insert_str(0, delimiter);
+        }
+    }
+    if !after.is_empty() {
+        if !after.starts_with(['\r', '\n']) && !text.ends_with('\n') {
+            text.push_str(delimiter);
+        }
+        if spaced
+            && starts_with_heading(after)
+            && !ends_with_blank_line(&format!("{text}{}", leading_breaks(after)))
+        {
+            text.push_str(delimiter);
+        }
+    }
+    text
+}
+
 fn is_anchored_text_edit(action: &str) -> bool {
     matches!(
         action,
@@ -2213,6 +2262,7 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             // A line or block inserted beside an anchor that stops mid-line
             // is glued into that line ("...다릅니다.- MariaDB는 ..."), which
             // leaves a broken list. Only inline text may go mid-line.
+            let mut separated = None;
             if insertion && !replace_instead && inserts_block(new) {
                 let at = if action == "insert_after_text" {
                     end
@@ -2234,7 +2284,9 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                         "invalid_argument_value: {action} old_text {edge} in the middle of a line, but text is a separate line or block (it contains a line break or starts with a list, heading, table or quote marker), so it would be glued into that line. Extend old_text {extend} so the text lands on its own line, or use replace_text with the full revised line"
                     );
                 }
+                separated = Some(separate_inserted_block(old, at, new));
             }
+            let new = separated.as_deref().unwrap_or(new);
             Ok(match action {
                 _ if replace_instead => format!("{}{}{}", &old[..start], new, &old[end..]),
                 "insert_before_text" => format!("{}{}{}", &old[..start], new, &old[start..]),
