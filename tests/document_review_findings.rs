@@ -605,6 +605,40 @@ fn same_id_reworded_findings_merge_without_resetting_stall_count() {
 }
 
 #[test]
+fn a_rejected_id_reuse_names_the_issue_id_and_mismatch() {
+    // Live run 2026-10-04: one response reused seven IDs; the bare "different
+    // problem location/type" error never said which, and it was resent.
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    submit(&mut s, vec![proposal("Timing issue")]);
+    validate(&mut s, vec![decision("F1", "confirmed")]);
+    let mut other_kind = proposal("Timing issue");
+    other_kind["kind"] = json!("citation");
+    other_kind["previous_id"] = json!("F1");
+    let mut other_place = proposal("Message text differs");
+    other_place["previous_id"] = json!("F1");
+    other_place["document"] = json!({"start_line":3,"end_line":3,"quote":"검색 결과가 없습니다."});
+    other_place["sources"] = json!([{"path":"ui.js","start_line":1,"end_line":1,
+        "quote":"const message = '검색 결과가 없습니다.';"}]);
+    for (issues, expected) in [
+        (
+            vec![other_kind],
+            "issues[0].previous_id \"F1\" cannot be reused: it was kind \"factual\", not \"citation\"",
+        ),
+        (
+            vec![proposal("Timing issue"), other_place],
+            "issues[1].previous_id \"F1\" cannot be reused: it quoted a different document passage (line 2;",
+        ),
+    ] {
+        review::request(&mut s).unwrap();
+        reject(&mut s, issues);
+        let error = s.last_error.clone().unwrap();
+        assert!(error.contains(expected), "{error}");
+        assert!(error.contains("set previous_id to null"), "{error}");
+    }
+}
+
+#[test]
 fn different_defects_on_the_same_passage_keep_distinct_ids() {
     let (_dir, mut s) = fixture();
     review::request(&mut s).unwrap();
@@ -939,6 +973,87 @@ fn indentation_and_off_by_one_hints_are_grounded_to_actual_supplied_lines() {
     assert_eq!(s.document_review.anchor_corrections, 1);
     validate(&mut s, vec![decision("F1", "dismissed")]);
     assert!(review::approved(&s));
+}
+
+// Live run 2026-10-04 (space_query): menu.rs shortcut help is a Rust string
+// continuation. The reviewer quoted the shown lines without their `\n\` tails
+// in four review rounds, and the JSON-escaped hint showed `\\n\\`, which the
+// reviewer then copied into its quote.
+const CONTINUATION_SOURCE: &str = "const HELP: &str = \"Shortcuts:\\n\\\n    Edit (SQL Editor):\\n\\\n    Ctrl+Z - Undo\\n\\\n    Ctrl+Y - Redo\\n\\\n    Query History - no shortcut\\n\\n\\\n\";\n";
+
+#[test]
+fn a_string_continuation_quote_may_drop_only_escape_tails() {
+    let (dir, mut s) = fixture();
+    std::fs::write(dir.path().join("ui.js"), CONTINUATION_SOURCE).unwrap();
+    review::request(&mut s).unwrap();
+    let mut issue = proposal("Undo is not an SQL rollback");
+    issue["sources"] = json!([{"path":"ui.js","start_line":2,"end_line":4,
+        "quote":"Edit (SQL Editor):\nCtrl+Z - Undo\nCtrl+Y - Redo"}]);
+    submit(&mut s, vec![issue]);
+    let p = payload(review::request(&mut s).unwrap());
+    let actual = &p["candidates"][0]["sources"][0];
+    assert_eq!(actual["start_line"], 2);
+    assert_eq!(actual["end_line"], 4);
+    assert_eq!(
+        actual["quote"],
+        "    Edit (SQL Editor):\\n\\\n    Ctrl+Z - Undo\\n\\\n    Ctrl+Y - Redo\\n\\"
+    );
+    assert_eq!(s.document_review.anchor_corrections, 1);
+}
+
+#[test]
+fn a_quote_dropping_words_is_rejected_with_raw_hint_lines() {
+    for quote in [
+        "Edit (SQL Editor):\nCtrl+Z\nCtrl+Y - Redo",
+        "Ctrl+Z - Undo\nQuery History - no shortcut",
+    ] {
+        let (dir, mut s) = fixture();
+        std::fs::write(dir.path().join("ui.js"), CONTINUATION_SOURCE).unwrap();
+        review::request(&mut s).unwrap();
+        let mut issue = proposal("Undo is not an SQL rollback");
+        issue["sources"] = json!([{"path":"ui.js","start_line":2,"end_line":4,"quote":quote}]);
+        reject(&mut s, vec![issue]);
+        let error = s.last_error.clone().unwrap();
+        assert!(error.contains("quote is absent"), "{error}");
+        assert!(
+            error.contains("\n2|Edit (SQL Editor):\\n\\\n3|Ctrl+Z - Undo\\n\\\n"),
+            "{error}"
+        );
+        assert!(!error.contains("\\\\n"), "{error}");
+    }
+}
+
+#[test]
+fn a_quote_cited_off_the_page_names_the_supplied_ranges() {
+    // Live run 2026-10-04: main_window.rs 10190-10193 was cited three times
+    // while the page supplied only 10274 onward; the empty hint said nothing.
+    for (field, expected) in [
+        (
+            "document",
+            "lines 40-41 are not on this page, which supplies only lines 1-3.",
+        ),
+        (
+            "source",
+            "lines 40-41 are not on this page, which supplies only lines 1-2.",
+        ),
+    ] {
+        let (_dir, mut s) = fixture();
+        review::request(&mut s).unwrap();
+        let mut issue = proposal("Incorrect deletion timing");
+        let target = if field == "document" {
+            &mut issue["document"]
+        } else {
+            &mut issue["sources"][0]
+        };
+        target["start_line"] = json!(40);
+        target["end_line"] = json!(41);
+        target["quote"] = json!("removed elsewhere");
+        reject(&mut s, vec![issue]);
+        let error = s.last_error.clone().unwrap();
+        assert!(error.contains("quote is absent"), "{error}");
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("raw lines"), "{error}");
+    }
 }
 
 #[test]

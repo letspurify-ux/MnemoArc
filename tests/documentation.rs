@@ -3566,6 +3566,54 @@ fn block_insertion_keeps_its_far_edge_off_the_neighboring_line() {
 }
 
 #[test]
+fn broken_characters_are_rejected_before_any_document_write() {
+    // Live run 2026-10-04: an append wrote "객��" (객체); the reviewer could not
+    // quote the line, and the broken word survived into the approved document.
+    let body = "# 매뉴얼\n\n객체 브라우저 설명입니다.\n";
+    let (_dir, mut s) = setup();
+    std::fs::write(&s.project.output, body).unwrap();
+    let hash = tools::hash(body.as_bytes());
+    for (name, args, field) in [
+        (
+            "document_edit",
+            json!({"action":"append","expected_hash":hash,"text":"## 5. 객체\n\n지원하는 객\u{FFFD}\u{FFFD}에만 나타납니다."}),
+            "text",
+        ),
+        (
+            "document_edit_batch",
+            json!({"expected_hash":hash,"edits":[
+                {"action":"replace_text","old_text":"설명입니다.","text":"안내입니다."},
+                {"action":"replace_text","old_text":"객체","text":"객\u{FFFD}"}
+            ]}),
+            "edits[1].text",
+        ),
+    ] {
+        let error = match tools::execute(&mut s, name, args) {
+            Ok(value) => value.to_string(),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(&format!("{field} contains U+FFFD")),
+            "{error}"
+        );
+        assert!(
+            error.contains("지원하는 객") || error.contains("객\u{FFFD}"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), body);
+    }
+    // An exact old_text may still quote a broken word to repair it.
+    let broken = "# 매뉴얼\n\n객\u{FFFD} 브라우저 설명입니다.\n";
+    std::fs::write(&s.project.output, broken).unwrap();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","old_text":"객\u{FFFD}","text":"객체"}),
+    );
+    assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), body);
+}
+
+#[test]
 fn empty_document_placeholders_do_not_block_create_or_batch_edits() {
     let (_dir, mut s) = setup();
     let created = run(

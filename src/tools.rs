@@ -1075,6 +1075,25 @@ fn validate_task_state_arguments(args: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Models sometimes emit U+FFFD for a character they failed to produce: live
+/// runs wrote "제���" and "객��" into documents. Saved, the reviewer cannot quote
+/// it (5 rejected review calls and a skipped page) and it survived into an
+/// approved document, so reject it before anything is written.
+fn reject_replacement_character(field: &str, text: &str) -> Result<()> {
+    let Some(at) = text.find('\u{FFFD}') else {
+        return Ok(());
+    };
+    let start = text[..at]
+        .char_indices()
+        .rev()
+        .nth(19)
+        .map_or(0, |(index, _)| index);
+    let around: String = text[start..].chars().take(40).collect();
+    bail!(
+        "invalid_argument_value: {field} contains U+FFFD, a broken character, in {around:?}; rewrite that word with its intended characters and send the edit again (nothing was written)"
+    );
+}
+
 fn validate_document_edit_arguments(args: &Value) -> Result<()> {
     let action = args["action"].as_str().unwrap_or("");
     validate_action_fields(
@@ -1120,6 +1139,9 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
     };
     if action != "delete_text" && args.get("text").is_none() {
         bail!("missing_argument: text for document_edit action={action}");
+    }
+    if let Some(text) = args["text"].as_str() {
+        reject_replacement_character("text", text)?;
     }
     match action {
         "append" => require("expected_hash")?,
@@ -1512,9 +1534,10 @@ fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
             let text_value = object
                 .get("text")
                 .ok_or_else(|| anyhow::anyhow!("missing_argument: edits[{index}].text"))?;
-            text_value
+            let text = text_value
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("invalid_argument_type: edits[{index}].text"))?;
+            reject_replacement_character(&format!("edits[{index}].text"), text)?;
         }
         match action {
             "patch" | "replace_text" | "delete_text" | "insert_before_text"

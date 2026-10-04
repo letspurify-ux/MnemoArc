@@ -1849,7 +1849,7 @@ fn a_page_cannot_report_a_later_section_as_missing() {
         document_review::finish(&mut s, &outside.to_string())
             .unwrap_err()
             .to_string()
-            .contains("outside this document page")
+            .contains("lines 124-124 are not on this page, which supplies only lines 1-60.")
     );
     assert!(!document_review::approved(&s));
     assert_eq!(s.document_review.attempts, 0);

@@ -131,10 +131,59 @@ pub fn requirements_catalog(s: &Session) -> BTreeMap<String, String> {
 }
 
 /// Resolve quotes only inside evidence actually supplied on this page. Line
-/// numbers are hints: indentation and an off-by-one range are repairable, but
-/// changed words, internal whitespace, missing lines and ambiguous matches are not.
+/// numbers are hints: indentation, an off-by-one range and dropped string
+/// continuation escapes are repairable, but changed words, internal
+/// whitespace, missing lines and ambiguous matches are not.
 fn normalize(text: &str) -> String {
     text.lines().map(str::trim).collect::<Vec<_>>().join("\n")
+}
+
+/// Whether a source line tail is only string-literal punctuation, such as the
+/// `\n\` that ends each line of a Rust or C string continuation.
+fn literal_tail(rest: &str) -> bool {
+    let mut chars = rest.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if matches!(chars.peek(), Some('n' | 'r' | 't')) {
+                    chars.next();
+                }
+            }
+            '"' | '\'' | ',' | ';' | '+' => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// A multi-line quote of text shown by a string continuation: a live reviewer
+/// quoted `Ctrl+Z - Undo` / `Ctrl+Y - Redo` from lines ending in `\n\` four
+/// review rounds in a row. Each line except the last may drop only such a tail.
+fn continuation_matches(lines: &[(&str, usize)], needle: &str) -> Vec<(usize, usize)> {
+    let parts: Vec<_> = needle.split('\n').collect();
+    if parts.len() < 2 || lines.len() < parts.len() {
+        return Vec::new();
+    }
+    lines
+        .windows(parts.len())
+        .filter(|window| {
+            window
+                .iter()
+                .zip(&parts)
+                .enumerate()
+                .all(|(i, ((line, _), part))| {
+                    if i + 1 == parts.len() {
+                        line.starts_with(part)
+                    } else if i == 0 {
+                        line.match_indices(part)
+                            .any(|(offset, _)| literal_tail(&line[offset + part.len()..]))
+                    } else {
+                        line.strip_prefix(part).is_some_and(literal_tail)
+                    }
+                })
+        })
+        .map(|window| (window[0].1, window[window.len() - 1].1))
+        .collect()
 }
 
 fn ground(text: &str, passage: &mut Passage, allowed: &BTreeSet<usize>) -> Result<(String, bool)> {
@@ -166,7 +215,7 @@ fn ground(text: &str, passage: &mut Passage, allowed: &BTreeSet<usize>) -> Resul
         previous = line;
     }
     let mut matches = Vec::new();
-    for (text, offsets) in blocks {
+    for (text, offsets) in &blocks {
         for (offset, _) in text.match_indices(&needle) {
             let first = offsets
                 .iter()
@@ -181,6 +230,16 @@ fn ground(text: &str, passage: &mut Passage, allowed: &BTreeSet<usize>) -> Resul
                 .unwrap()
                 .1;
             matches.push((first, last));
+        }
+    }
+    if matches.is_empty() {
+        for (text, offsets) in &blocks {
+            let lines: Vec<_> = text
+                .split('\n')
+                .zip(offsets)
+                .map(|(l, (_, n))| (l, *n))
+                .collect();
+            matches.extend(continuation_matches(&lines, &needle));
         }
     }
     let hinted: Vec<_> = matches
@@ -204,20 +263,57 @@ fn ground(text: &str, passage: &mut Passage, allowed: &BTreeSet<usize>) -> Resul
                 line >= passage.start_line && line <= passage.end_line && allowed.contains(&line)
             })
             .take(2)
-            .map(|(_, line)| *line)
+            .map(|(index, line)| format!("{}|{}", index + 1, line.trim()))
             .collect::<Vec<_>>()
             .join("\n");
         let hint = hint.chars().take(240).collect::<String>();
+        let status = if matches.is_empty() {
+            "absent"
+        } else {
+            "ambiguous"
+        };
+        if hint.is_empty() {
+            // An empty hint never said where the page was: a live reviewer
+            // cited main_window.rs 10190-10193 three times while the page
+            // supplied only 10274 onward. Name the supplied ranges instead.
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            for &line in allowed
+                .iter()
+                .filter(|&&line| line >= 1 && line <= lines.len())
+            {
+                match ranges.last_mut() {
+                    Some((_, end)) if *end + 1 == line => *end = line,
+                    _ => ranges.push((line, line)),
+                }
+            }
+            let mut supplied = ranges
+                .iter()
+                .take(8)
+                .map(|&(start, end)| {
+                    if start == end {
+                        start.to_string()
+                    } else {
+                        format!("{start}-{end}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if ranges.len() > 8 {
+                supplied.push_str(", ...");
+            }
+            bail!(
+                "quote is {status} on this supplied page; lines {}-{} are not on this page, which supplies only lines {supplied}. Quote a short exact fragment from lines shown on this page, or drop this quote",
+                passage.start_line,
+                passage.end_line
+            );
+        }
+        // Raw lines, not JSON: escaping turned a source `\n\` into `\\n\\`
+        // and a live reviewer copied the doubled backslashes into its quote.
         bail!(
-            "quote is {} on this supplied page (possibly outside this document page); supplied hint {}-{} contains {}. Copy a short exact fragment, not a reconstructed code block; indentation may differ",
-            if matches.is_empty() {
-                "absent"
-            } else {
-                "ambiguous"
-            },
+            "quote is {status} on this supplied page (possibly outside this document page); supplied hint {}-{} contains these raw lines (`N|` is the line number, not text):\n{}\nCopy a short exact fragment, not a reconstructed code block; indentation may differ",
             passage.start_line,
             passage.end_line,
-            json!(hint)
+            hint
         );
     };
     let canonical = lines[first - 1..last].join("\n");
@@ -598,9 +694,35 @@ fn collect_one(
                 .is_some_and(|anchor| old.context.get("scope_anchor") == Some(anchor))
             && !next.iter().any(|f| f.id == old.id)
     });
-    if previous.is_some_and(|f| !same_subject(&f.proposal, &proposal)) && !reanchored_scope {
+    // Name the issue, ID and mismatch: a live reviewer reused seven IDs in
+    // one response and, told only "different location/type", kept resending.
+    if let Some(old) = previous
+        && !same_subject(&old.proposal, &proposal)
+        && !reanchored_scope
+    {
+        let reason = if old.proposal.kind != proposal.kind {
+            format!(
+                "it was kind {:?}, not {:?}",
+                old.proposal.kind, proposal.kind
+            )
+        } else if old.proposal.requirement_id != proposal.requirement_id {
+            format!(
+                "it was requirement_id {:?}, not {:?}",
+                old.proposal.requirement_id, proposal.requirement_id
+            )
+        } else {
+            let line = old
+                .proposal
+                .document
+                .as_ref()
+                .map_or_else(|| "no".to_owned(), |p| format!("line {}", p.start_line));
+            format!(
+                "it quoted a different document passage ({line}; that text was since edited or this is another place) and shares no source range"
+            )
+        };
         bail!(
-            "document_review_invalid: reused finding id points to a different problem location/type; use null for a new finding"
+            "document_review_invalid: issues[{issue_index}].previous_id {:?} cannot be reused: {reason}; set previous_id to null for this finding",
+            old.id
         );
     }
     let retry_update = previous
