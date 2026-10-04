@@ -1,4 +1,5 @@
 use super::Session;
+use crate::tools::document_review::ReviewFailure;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::time::Instant;
@@ -16,6 +17,10 @@ pub struct RunRecord {
     pub status: String,
     pub reason: String,
     pub error: Option<String>,
+    /// A review may fail even when the run finishes with reported gaps and
+    /// clears its transient error. Keep this snapshot after review state resets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_review_failure: Option<ReviewFailure>,
     pub input_tokens: usize,
     pub output_tokens: usize,
     pub usage_estimated: bool,
@@ -38,6 +43,7 @@ pub(super) struct ActiveRun {
     rounds: usize,
     usage_estimated: bool,
     reason: Option<String>,
+    document_review_failure: Option<ReviewFailure>,
 }
 
 fn excerpt(text: &str, limit: usize) -> String {
@@ -87,6 +93,7 @@ impl Session {
             rounds: self.task_rounds,
             usage_estimated: false,
             reason: None,
+            document_review_failure: None,
         });
     }
 
@@ -118,6 +125,16 @@ impl Session {
         if let Some(run) = &mut self.active_run {
             run.reason = Some(reason.into());
         }
+    }
+
+    pub(crate) fn note_document_review_failure(&mut self, failure: &ReviewFailure) {
+        if let Some(run) = &mut self.active_run {
+            run.document_review_failure = Some(failure.clone());
+        }
+    }
+
+    pub(super) fn active_document_review_failure(&self) -> Option<&ReviewFailure> {
+        self.active_run.as_ref()?.document_review_failure.as_ref()
     }
 
     pub(crate) fn finish_run(&mut self) {
@@ -160,6 +177,7 @@ impl Session {
             status: self.status.clone(),
             reason,
             error: self.last_error.as_deref().map(|error| excerpt(error, 4096)),
+            document_review_failure: run.document_review_failure,
             input_tokens: self.input_tokens.saturating_sub(run.input_tokens),
             output_tokens: self.output_tokens.saturating_sub(run.output_tokens),
             usage_estimated: run.usage_estimated,

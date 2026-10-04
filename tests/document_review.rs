@@ -1416,6 +1416,7 @@ fn unavailable_verdict_stays_bound_to_the_failed_request_snapshot() {
     let (dir, mut s) = fixture();
     document_review::request(&mut s).unwrap();
     let original = std::fs::read(dir.path().join("out.md")).unwrap();
+    s.last_error = Some("document_review_invalid: rejected response".into());
     std::fs::write(
         dir.path().join("out.md"),
         "# Changed\nDifferent document.\n",
@@ -1423,6 +1424,11 @@ fn unavailable_verdict_stays_bound_to_the_failed_request_snapshot() {
     .unwrap();
     s.task.constraints.push("New requirement".into());
     document_review::mark_unavailable(&mut s);
+    // Diagnostics identify the document supplied to the failed request,
+    // even when the output file has since changed externally.
+    let failure = s.document_review.unavailable_failure.as_ref().unwrap();
+    assert_eq!(failure.document_hash, Some(tools::hash(&original)));
+    assert_eq!(failure.error.as_deref(), s.last_error.as_deref());
     assert_eq!(
         document_review::current_verdict(&s),
         document_review::CurrentVerdict::Unreviewed

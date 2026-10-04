@@ -214,6 +214,7 @@ fn live_report_records_completion_gaps_and_stop_reason() {
         status: result.status.clone(),
         reason: "closing_round_limit".into(),
         error: None,
+        document_review_failure: None,
         input_tokens: 10,
         output_tokens: 5,
         usage_estimated: false,

@@ -1173,6 +1173,7 @@ impl Session {
             &self.activity,
             &self.answer_review_question,
             &self.run_history,
+            self.active_document_review_failure(),
         )))
         .saturating_add(self.document_review.retained_bytes())
         .saturating_add(self.completion_review.retained_bytes())

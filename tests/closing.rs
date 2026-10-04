@@ -469,6 +469,90 @@ fn verified_fixture() -> (tempfile::TempDir, Session) {
     (dir, s)
 }
 
+#[tokio::test]
+async fn closing_preserves_the_failed_document_review_in_state_and_run_history() {
+    let (_dir, mut s) = verified_fixture();
+    s.config.source_document_review = true;
+    s.config.run_tokens = 100_000;
+    s.config.closing_reserve_ratio = 0.8;
+    s.config.verification_reserve_ratio = 0.85;
+    s.config.writing_reserve_ratio = 0.9;
+    // A UI label without quoted source evidence is rejected by the real
+    // validator. The first answer's usage starts closing before that review.
+    let invalid = json!({"issues":[{
+        "previous_id":null,"kind":"scope",
+        "document":{"start_line":2,"end_line":2,
+            "quote":"A for loop runs work five times. main.js:3-5"},
+        "requirement_id":"R0","sources":[],
+        "problem":"Remove an implementation name","correction":"Refer to Cancel",
+        "ui_labels":["Cancel"]
+    }]})
+    .to_string();
+    let mut check = s.clone();
+    let request = document_review::request(&mut check).unwrap();
+    let payload: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    let error = document_review::finish(&mut check, &invalid)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("ui_labels[0]"), "{error}");
+    let document_hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    let final_answer = || Completion {
+        text: "Saved out.md".into(),
+        ..Default::default()
+    };
+    let (mut result, _) = run_scripted(
+        s,
+        vec![
+            Completion {
+                usage: Some(Usage {
+                    input: 30_000,
+                    output: 10,
+                    cached: None,
+                }),
+                ..final_answer()
+            },
+            Completion {
+                text: invalid,
+                ..Default::default()
+            },
+            final_answer(),
+        ],
+    )
+    .await;
+    assert_eq!(result.status, "complete_with_gaps");
+    assert!(document_review::unavailable_on_current(&result));
+    assert!(result.last_error.is_none());
+    let state = json!(result.document_review);
+    let failure = &state["unavailable_failure"];
+    assert_eq!(failure["error"], error);
+    assert_eq!(failure["document_hash"], document_hash);
+    assert_eq!(
+        failure["lines"],
+        json!([payload["document_line_start"], payload["document_line_end"]])
+    );
+    assert_eq!(failure["evidence_page"], payload["evidence_page"]);
+    assert_eq!(failure["stage"], "review_page");
+    assert!(
+        document_review::guidance(&result)
+            .get("unavailable_failure")
+            .is_none()
+    );
+    let record = json!(result.run_history.back().unwrap());
+    assert_eq!(record["document_review_failure"], *failure);
+    assert!(record["error"].is_null());
+
+    // Resetting review state for another task cannot erase the finished run,
+    // nor attach its failure to the next run as a new failure.
+    result.document_review = Default::default();
+    result.config.source_document_review = false;
+    let (result, _) = run_scripted(result, vec![final_answer()]).await;
+    assert_eq!(result.status, "complete");
+    assert_eq!(result.run_history.len(), 2);
+    assert_eq!(json!(result.run_history[0]), record);
+    assert!(json!(result.run_history[1])["document_review_failure"].is_null());
+}
+
 async fn run_scripted(s: Session, steps: Vec<Completion>) -> (Session, Vec<Value>) {
     let (session, guidance, _) = run_scripted_tools(s, steps).await;
     (session, guidance)
