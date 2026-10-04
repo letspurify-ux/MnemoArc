@@ -18,6 +18,7 @@ import { useServerDraft } from "./use-server-draft.js";
 import { displayPath, displayPathText } from "./paths.js";
 import { memoryMatchesQuery } from "./memory-search.js";
 import { createComposerDrafts } from "./composer-drafts.js";
+import { cleanDocument } from "./document-export.js";
 import {
   createSessionCache,
   FULL_REFRESH,
@@ -1342,6 +1343,33 @@ function Inspector({
       if (request === outputRequest.current) setOutputLoading(false);
     }
   }
+  async function downloadDocument(clean = false) {
+    setDownloading(true);
+    try {
+      let blob = await download(
+        `/sessions/${encodeURIComponent(session.id)}/output/download`,
+      );
+      if (clean)
+        blob = new Blob([cleanDocument(await blob.text())], {
+          type: "text/markdown; charset=utf-8",
+        });
+      const filename =
+        session.project.output.split(/[\\/]/).pop() || "output.md";
+      const url = URL.createObjectURL(blob);
+      const link = Object.assign(window.document.createElement("a"), {
+        href: url,
+        download: clean
+          ? filename.replace(/(\.[^.]+)?$/, ".clean$1")
+          : filename,
+      });
+      window.document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } finally {
+      setDownloading(false);
+    }
+  }
   async function saveProject() {
     if (projectSavingRef.current) return;
     projectSavingRef.current = true;
@@ -1842,36 +1870,22 @@ function Inspector({
                 문서 불러오기
               </button>
               {document && (
-                <button
-                  className="text-button"
-                  disabled={downloading}
-                  onClick={doAction(async () => {
-                    setDownloading(true);
-                    try {
-                      const blob = await download(
-                        `/sessions/${encodeURIComponent(session.id)}/output/download`,
-                      );
-                      const url = URL.createObjectURL(blob);
-                      const link = Object.assign(
-                        window.document.createElement("a"),
-                        {
-                          href: url,
-                          download:
-                            session.project.output.split(/[\\/]/).pop() ||
-                            "output.md",
-                        },
-                      );
-                      window.document.body.appendChild(link);
-                      link.click();
-                      link.remove();
-                      setTimeout(() => URL.revokeObjectURL(url), 1000);
-                    } finally {
-                      setDownloading(false);
-                    }
-                  })}
-                >
-                  Markdown 내려받기
-                </button>
+                <>
+                  <button
+                    className="text-button"
+                    disabled={downloading}
+                    onClick={doAction(() => downloadDocument())}
+                  >
+                    Markdown 내려받기
+                  </button>
+                  <button
+                    className="text-button"
+                    disabled={downloading}
+                    onClick={doAction(() => downloadDocument(true))}
+                  >
+                    근거 표시 없이 내려받기
+                  </button>
+                </>
               )}
             </div>
             {document && (

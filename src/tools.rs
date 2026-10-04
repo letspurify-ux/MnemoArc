@@ -1634,7 +1634,7 @@ fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
 
 /// Explain a batch operation whose old_text did not match exactly once.
 /// `states[k]` is the document before operation k (states[0] = original).
-fn batch_target_hint(states: &[String], edit: &Value, error: &str) -> String {
+fn batch_target_hint(states: &[String], applied: &[usize], edit: &Value, error: &str) -> String {
     if error.starts_with("section_revision_conflict") {
         // The section may have matched the snapshot the caller read and been
         // changed by an earlier operation of this same batch.
@@ -1653,7 +1653,7 @@ fn batch_target_hint(states: &[String], edit: &Value, error: &str) -> String {
         {
             return format!(
                 ". The section matched when this batch started but edits[{}] in this same batch already changed it; merge the two edits into one section replacement or send them as separate requests",
-                changed_by - 1
+                applied[changed_by - 1]
             );
         }
         return String::new();
@@ -1671,7 +1671,7 @@ fn batch_target_hint(states: &[String], edit: &Value, error: &str) -> String {
     {
         return format!(
             ". old_text existed in the original document but edits[{}] in this same batch already changed it; operations apply in order, so copy old_text from the text after that edit, merge the two corrections, or send them as separate requests",
-            changed_by - 1
+            applied[changed_by - 1]
         );
     }
     String::new()
@@ -4725,28 +4725,53 @@ fn execute_repaired(
             }
             let edits = args["edits"].as_array().expect("validated edits array");
             let mut current = old.clone();
+            // states[k] is the text after edits[applied[k - 1]].
             let mut states = vec![old.clone()];
+            let mut applied = Vec::with_capacity(edits.len());
             let mut operations = Vec::with_capacity(edits.len());
+            // Keep checking after a failure so one response names every
+            // operation to fix instead of one per retry.
+            let mut failures = Vec::new();
             for (index, edit) in edits.iter().enumerate() {
                 if cancel.is_cancelled() {
                     bail!("cancelled");
                 }
                 let action = edit["action"].as_str().unwrap_or("unknown");
                 let before_hash = hash(current.as_bytes());
-                let next = apply_document_edit_operation(&current, edit).map_err(|error| {
-                    let hint = batch_target_hint(&states, edit, &error.to_string());
-                    anyhow::anyhow!(
-                        "document_batch_operation_failed: index={index}; action={action}; cause={error}{hint}; no changes persisted"
-                    )
-                })?;
+                let next = match apply_document_edit_operation(&current, edit) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        let hint = batch_target_hint(&states, &applied, edit, &error.to_string());
+                        failures.push(format!(
+                            "index={index}; action={action}; cause={error}{hint}"
+                        ));
+                        continue;
+                    }
+                };
                 current = next;
                 states.push(current.clone());
+                applied.push(index);
                 operations.push(json!({
                     "index":index,
                     "action":action,
                     "changed":before_hash != hash(current.as_bytes()),
                     "hash":hash(current.as_bytes())
                 }));
+            }
+            if let Some((first, rest)) = failures.split_first() {
+                let rest = if rest.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; {} operations failed, also {}; operations after a failed one were checked without it, so fix every listed operation",
+                        failures.len(),
+                        rest.iter()
+                            .map(|failure| format!("[{failure}]"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                bail!("document_batch_operation_failed: {first}{rest}; no changes persisted");
             }
             let result = persist_document_edit(s, &path, &old, exists, current, cancel)?;
             let final_hash = result["hash"].clone();

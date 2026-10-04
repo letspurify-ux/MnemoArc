@@ -351,23 +351,56 @@ test("sidebar navigation confirms before discarding unsaved settings", async ({ 
   expect(confirmations).toBe(1);
 });
 
-test("Markdown download includes bytes beyond the preview limit", async ({ page, request }) => {
+test("original and clean Markdown downloads include the full file without running the agent", async ({
+  page,
+  request,
+}) => {
   const state = await (await request.get("/api/state")).json();
   const session = state.sessions[0];
   const output = session.project.output;
   const path = isAbsolute(output) ? output : join(session.project.root, output);
-  const content = `${"a".repeat(2 * 1024 * 1024)}한글 끝`;
+  const prefix = `${"a".repeat(2 * 1024 * 1024)}\n`;
+  const code = "```rust\n// Example: src/a.rs:1-2\n```\n";
+  const content = `${prefix}본문. (근거: \`src/a.rs:1-2\`)\n${code}한글 끝`;
+  const clean = `${prefix}본문.\n${code}한글 끝`;
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, content);
   await page.goto("/");
+  const agentRequests = [];
+  page.on("request", (req) => {
+    if (
+      /\/api\/sessions\/[^/]+\/(run|question)$/.test(
+        new URL(req.url()).pathname,
+      )
+    )
+      agentRequests.push(req.url());
+  });
   await page.route("**/api/sessions/*/output", (route) =>
     route.fulfill({ json: { content: "미리보기", truncated: true } }),
   );
   await page.getByRole("tab", { name: "문서", exact: true }).click();
   await page.getByRole("button", { name: "문서 불러오기" }).click();
-  await expect(page.getByText("미리보기 한도로 일부만 표시합니다.")).toBeVisible();
+  await expect(
+    page.getByText("미리보기 한도로 일부만 표시합니다."),
+  ).toBeVisible();
   const downloadEvent = page.waitForEvent("download");
-  await page.getByRole("button", { name: "Markdown 내려받기" }).click();
+  await page
+    .getByRole("button", { name: "Markdown 내려받기", exact: true })
+    .click();
   const downloaded = await downloadEvent;
   expect(await readFile(await downloaded.path(), "utf8")).toBe(content);
+  const cleanEvent = page.waitForEvent("download");
+  await page
+    .getByRole("button", { name: "근거 표시 없이 내려받기", exact: true })
+    .click();
+  const cleaned = await cleanEvent;
+  expect(cleaned.suggestedFilename()).toBe(
+    output
+      .split(/[\\/]/)
+      .pop()
+      .replace(/(\.[^.]+)?$/, ".clean$1"),
+  );
+  expect(await readFile(await cleaned.path(), "utf8")).toBe(clean);
+  expect(await readFile(path, "utf8")).toBe(content);
+  expect(agentRequests).toEqual([]);
 });

@@ -2387,6 +2387,43 @@ fn section_edit_preserves_replacement_whitespace_and_line_endings() {
 }
 
 #[test]
+fn batch_failure_names_every_failing_operation() {
+    let (_dir, mut s) = setup();
+    let original = "# Doc\n## Target\nalpha beta gamma\n";
+    std::fs::write(&s.project.output, original).unwrap();
+    let inspected = run(&mut s, "document_inspect", json!({}));
+    let error = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":inspected["hash"],"edits":[
+            {"action":"replace_text","old_text":"alpha","text":"ALPHA"},
+            {"action":"replace_text","old_text":"delta","text":"DELTA"},
+            {"action":"replace_text","old_text":"gamma","text":"GAMMA"},
+            {"action":"replace_text","old_text":"beta gamma","text":"BG"}
+        ]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("document_batch_operation_failed: index=1; action=replace_text;"),
+        "{error}"
+    );
+    assert!(error.contains("2 operations failed"), "{error}");
+    assert!(error.contains("[index=3; action=replace_text;"), "{error}");
+    // Hints still name the edit index that changed the text, past the
+    // skipped failure.
+    assert!(
+        error.contains("edits[2] in this same batch already changed it"),
+        "{error}"
+    );
+    assert!(error.ends_with("no changes persisted"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        original
+    );
+}
+
+#[test]
 fn batch_failure_after_successful_edit_leaves_file_unchanged() {
     let (_dir, mut s) = setup();
     let original = "# Doc\n## Target\nold\n## Next\nrest\n";
