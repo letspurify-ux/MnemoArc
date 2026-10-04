@@ -5125,7 +5125,8 @@ fn execute_repaired(
                         keep
                     });
                 }
-                // Name each non-file ID so the caller drops only those.
+                // Name each ID without versioned file evidence so the caller
+                // drops only those. Blank lines can still cover cited ranges.
                 let rejected: Vec<String> = sources
                     .iter()
                     .filter_map(|source| {
@@ -5133,8 +5134,6 @@ fn execute_repaired(
                             format!("origin={}", source.origin)
                         } else if source.path.is_none() || source.hash.is_none() {
                             "no file version".into()
-                        } else if source.excerpt.trim().is_empty() {
-                            "empty excerpt; read a non-empty range".into()
                         } else {
                             return None;
                         };
@@ -5192,7 +5191,14 @@ fn execute_repaired(
                         missing = documentation::missing_citation_ranges(s, section, &sources)?;
                     }
                 }
-                if sources.is_empty() {
+                // Apply the content requirement to the combined evidence so
+                // supplied and supplemented blank lines behave the same on
+                // first verification and on re-verification. Blank lines can
+                // complete citation coverage, but cannot verify an item alone.
+                if !sources
+                    .iter()
+                    .any(|source| !source.excerpt.trim().is_empty())
+                {
                     bail!(
                         "verification_sources_required: pass non-empty observed file source_ids returned by file_read/source_search/symbol_read"
                     );

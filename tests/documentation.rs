@@ -2716,6 +2716,143 @@ fn verification_reuses_delivered_evidence_when_source_ids_are_lost() {
 }
 
 #[test]
+fn supplemented_blank_line_sources_survive_suggested_reverification() {
+    for (newline, blank_line) in [("\n", ""), ("\n", " \t"), ("\r\n", ""), ("\r\n", " \t")] {
+        let (dir, mut s) = source_setup();
+        std::fs::write(
+            dir.path().join("main.rs"),
+            format!("fn main() {{}}{newline}{blank_line}{newline}"),
+        )
+        .unwrap();
+        let content = run(
+            &mut s,
+            "file_read",
+            json!({"path":"main.rs","start_line":1,"max_lines":1}),
+        )["source"]["id"]
+            .clone();
+        let blank = run(
+            &mut s,
+            "file_read",
+            json!({"path":"main.rs","start_line":2,"max_lines":1}),
+        )["source"]["id"]
+            .clone();
+        run(
+            &mut s,
+            "document_edit",
+            json!({"action":"create","text":"# Entry\nmain.rs:1-2\n"}),
+        );
+        run(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":"entry","title":"entry","section":"# Entry","status":"written"}),
+        );
+        let verified = run(
+            &mut s,
+            "investigation",
+            json!({"action":"verify","id":"entry","source_ids":[content],"verification_note":"Compared both lines of main.rs."}),
+        );
+        assert_eq!(verified["supplemented_source_ids"], json!([blank]));
+        let expected_ids = json!([content, blank]);
+        assert_eq!(json!(s.investigations[0].source_ids()), expected_ids);
+
+        let doc = std::fs::read(&s.project.output).unwrap();
+        run(
+            &mut s,
+            "document_edit",
+            json!({"action":"write","expected_hash":tools::hash(&doc),"text":"# Entry\nThe entry point is main (main.rs:1-2).\n"}),
+        );
+        let check = run(&mut s, "investigation", json!({"action":"final_check"}));
+        assert_eq!(check["complete"], false);
+        assert_eq!(check["incomplete"][0]["previous_source_ids"], expected_ids);
+        let example = check["verify_batch_example"].clone();
+        assert_eq!(example["items"]["entry"]["source_ids"], expected_ids);
+        let reverified = run(&mut s, "investigation", example);
+        assert_eq!(s.investigations[0].status, "verified", "{reverified}");
+        assert_eq!(json!(s.investigations[0].source_ids()), expected_ids);
+    }
+}
+
+#[test]
+fn blank_only_evidence_cannot_verify_even_with_complete_citation_coverage() {
+    for blank_line in ["", " \t"] {
+        let (dir, mut s) = source_setup();
+        std::fs::write(dir.path().join("main.rs"), format!("{blank_line}\n")).unwrap();
+        let blank = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
+        run(
+            &mut s,
+            "document_edit",
+            json!({"action":"create","text":"# Entry\nmain.rs:1\n"}),
+        );
+        run(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":"entry","title":"entry","section":"# Entry","status":"written"}),
+        );
+        // Both an explicit ID and a path hint must enforce the same minimum
+        // content requirement, even though the observed line covers the cite.
+        for source_ids in [json!([blank]), json!(["main.rs"])] {
+            let error = tools::execute(
+                &mut s,
+                "investigation",
+                json!({"action":"verify","id":"entry","source_ids":source_ids,"verification_note":"Compared the cited range."}),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.starts_with("verification_sources_required:"),
+                "{error}"
+            );
+            assert!(error.contains("non-empty"), "{error}");
+            assert_eq!(s.investigations[0].status, "written");
+            assert!(s.investigations[0].document_hash.is_none());
+            assert!(s.investigations[0].sources.is_empty());
+        }
+    }
+}
+
+#[test]
+fn explicitly_supplied_blank_line_evidence_still_requires_the_current_file_version() {
+    let (dir, mut s) = source_setup();
+    let path = dir.path().join("main.rs");
+    std::fs::write(&path, "fn main() {}\n\n").unwrap();
+    let blank = run(
+        &mut s,
+        "file_read",
+        json!({"path":"main.rs","start_line":2,"max_lines":1}),
+    )["source"]["id"]
+        .clone();
+    std::fs::write(&path, "fn main() {}\n \t\n").unwrap();
+    let content = run(
+        &mut s,
+        "file_read",
+        json!({"path":"main.rs","start_line":1,"max_lines":1}),
+    )["source"]["id"]
+        .clone();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Entry\nmain.rs:1-2\n"}),
+    );
+    run(
+        &mut s,
+        "investigation",
+        json!({"action":"upsert","id":"entry","title":"entry","section":"# Entry","status":"written"}),
+    );
+    let error = tools::execute(
+        &mut s,
+        "investigation",
+        json!({"action":"verify","id":"entry","source_ids":[content,blank],"verification_note":"Compared the cited range."}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with(&format!("source_changed: {} (", blank.as_str().unwrap())),
+        "{error}"
+    );
+    assert_eq!(s.investigations[0].status, "written");
+}
+
+#[test]
 fn delivered_evidence_of_an_older_file_version_is_not_reused() {
     let (dir, mut s) = setup();
     std::fs::write(dir.path().join("a.rs"), numbered_source(20)).unwrap();
