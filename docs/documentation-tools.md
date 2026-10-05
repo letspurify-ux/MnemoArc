@@ -25,6 +25,7 @@
 | `source_search` 폴더 범위 | `path`에 폴더를 주면 그 아래 전체(`<폴더>/**`)를 검색한다. |
 | 탐색 도구 유지 | 진척 없는 라운드가 쌓여 집중 복구에 들어가도, 저장된 문서가 없으면 `file_list`·`source_search`·`symbol_search`·`symbol_relations`·`code_outline`을 숨기지 않는다. 작성 안내는 그대로 나간다. 문서를 쓰기 전에 탐색 도구를 숨기면 아직 소스를 찾지 못한 모델이 경로를 추측하게 된다. |
 | `document_edit` `append` | 기존 문서가 줄바꿈 없이 끝나고 붙일 내용이 `#` 제목으로 시작하면 줄바꿈을 넣어 제목이 앞 문장에 붙지 않게 한다. 그 밖의 이어 쓰기는 그대로 붙인다. |
+| 문서 해시 누락 | `append`·`section`·섹션 삽입과 `document_edit_batch`가 `expected_hash`를 빠뜨려도, 문서가 모델이 마지막으로 저장한 내용 그대로면 그 저장 결과의 해시를 채운다. 그 밖의 경우에는 편집을 메모리에서 현재 문서에 적용해 보고, 해시 누락과 함께 다른 문제(제목 수준, 없는 섹션, 일괄 수정의 실패 항목 전부)를 한 번에 알린 뒤 아무것도 쓰지 않는다. 다른 인자 오류에도 해시 누락을 덧붙인다. 섹션 삽입의 제목 수준이 틀리면 그 수준에 맞는 동작(형제면 `insert_after`/`insert_before`, 자식이면 `insert_last_child`/`insert_first_child`)을 안내한다. |
 | `symbol_search` | Tree-sitter로 Rust·JS/TS·Python·Java·C# 선언을 검색한다. `path`/`path_glob`, 이름·종류·소속 필터와 페이지 조회를 지원하며, `symbol_read`와 공유하는 심볼 ID를 반환한다. 선언 발췌는 탐색용이다. |
 | `symbol_relations` | 검색 결과의 `path`·`symbol_id`로 호출 대상·호출자·참조 위치를 조회한다. 지역 선언·import·소속을 고려하고 후보·모호함·미해결 사유를 반환한다. 원문 읽기와 의미 검증은 별도로 수행한다. |
 

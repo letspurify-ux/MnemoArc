@@ -142,6 +142,9 @@ fn source_workflow_activates_tools_and_schema_prevents_guessing() {
         .unwrap();
     // Per-action unions are not offered to the model; execution enforces them.
     assert!(edit["function"]["parameters"].get("oneOf").is_none());
+    // Without the model's own last write as a known version, a section
+    // insertion needs the hash.
+    s.last_document_write = None;
     assert!(
         tools::execute(
             &mut s,

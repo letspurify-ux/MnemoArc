@@ -493,6 +493,8 @@ fn observed_state_and_path_errors_have_actionable_recovery() {
 fn missing_document_edit_hash_points_to_document_tools() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
+    s.project.output = dir.path().join("out.md");
+    std::fs::write(&s.project.output, "# Existing\n").unwrap();
     let call = ToolCall {
         id: "missing-document-hash".into(),
         name: "document_edit".into(),
@@ -504,7 +506,7 @@ fn missing_document_edit_hash_points_to_document_tools() {
         .to_string(),
     };
     let result = tools::run_call(&mut s, &call);
-    assert_eq!(result["recovery"]["code"], "missing_argument");
+    assert_eq!(result["recovery"]["code"], "document_hash_required");
     assert_eq!(
         result["recovery"]["tools"],
         json!(["document_inspect", "document_edit"])

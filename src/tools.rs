@@ -940,7 +940,15 @@ impl ToolRegistry {
             }
         }
         for required in spec.parameters["required"].as_array().unwrap() {
+            // The batch reports a missing hash after checking its edits
+            // against the current document (see missing_document_hash).
+            if name == "document_edit_batch" && required == "expected_hash" {
+                continue;
+            }
             if !object.contains_key(required.as_str().unwrap()) {
+                if name == "document_edit_batch" && !object.contains_key("expected_hash") {
+                    bail!("missing_argument: {required}; expected_hash is also missing");
+                }
                 bail!("missing_argument: {required}");
             }
         }
@@ -1137,20 +1145,34 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
         }
         Ok(())
     };
+    // A missing hash is reported when the edit runs, together with any
+    // problem the edit has against the current document, so one retry fixes
+    // both. Argument errors found here mention it for the same reason.
+    let hash_deferred = requires_document_hash(action) && args.get("expected_hash").is_none();
+    let also_hash = |error: anyhow::Error| {
+        if hash_deferred {
+            anyhow::anyhow!("{error}; expected_hash is also missing")
+        } else {
+            error
+        }
+    };
+    let require = |key: &str| require(key).map_err(also_hash);
     if action != "delete_text" && args.get("text").is_none() {
-        bail!("missing_argument: text for document_edit action={action}");
+        return Err(also_hash(anyhow::anyhow!(
+            "missing_argument: text for document_edit action={action}"
+        )));
     }
     if let Some(text) = args["text"].as_str() {
-        reject_replacement_character("text", text)?;
+        reject_replacement_character("text", text).map_err(also_hash)?;
+    }
+    if !matches!(action, "create" | "write") && args.get("expected_hash").is_some() {
+        require("expected_hash")?;
     }
     match action {
-        "append" => require("expected_hash")?,
+        "append" => {}
         // An exact old_text that must match the current document once is
         // already the precondition, so expected_hash is optional here.
         "patch" | "replace_text" | "insert_before_text" | "insert_after_text" | "delete_text" => {
-            if args.get("expected_hash").is_some() {
-                require("expected_hash")?;
-            }
             require("old_text")?;
             if args.get("section").is_some() {
                 require("section")?;
@@ -1164,12 +1186,10 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
             }
         }
         "section" => {
-            require("expected_hash")?;
             require("section")?;
             require("expected_section_hash")?;
         }
         "insert_before" | "insert_after" | "insert_first_child" | "insert_last_child" => {
-            require("expected_hash")?;
             require("section")?;
         }
         "create" | "write" => {}
@@ -1340,17 +1360,17 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
                         }
                     }
                 }
-                // An append right after the model's own successful write
-                // often omits expected_hash (three live runs in a row). If the
-                // document is still exactly that write, its hash is known to
-                // the model already; any other change keeps the requirement.
-                if object.get("action").and_then(Value::as_str) == Some("append")
-                    && !object.contains_key("expected_hash")
-                    && let Some((written, digest)) = &s.last_document_write
-                    && output_path(&s.project).is_ok_and(|path| path == *written)
-                    && hash_file(written).is_ok_and(|current| current == *digest)
+                // An edit right after the model's own successful write often
+                // omits expected_hash (append in three live runs in a row,
+                // insert_* in several more). If the document is still exactly
+                // that write, its hash is known to the model already; any
+                // other change keeps the requirement.
+                if object
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .is_some_and(requires_document_hash)
                 {
-                    object.insert("expected_hash".into(), json!(digest));
+                    fill_hash_of_own_write(s, object);
                 }
             }
         }
@@ -1439,6 +1459,18 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
     Ok(())
 }
 
+/// Supply an omitted expected_hash when the output is still exactly the
+/// model's own last successful write, whose result carried that hash.
+fn fill_hash_of_own_write(s: &Session, object: &mut serde_json::Map<String, Value>) {
+    if !object.contains_key("expected_hash")
+        && let Some((written, digest)) = &s.last_document_write
+        && output_path(&s.project).is_ok_and(|path| path == *written)
+        && hash_file(written).is_ok_and(|current| current == *digest)
+    {
+        object.insert("expected_hash".into(), json!(digest));
+    }
+}
+
 /// A batch has one document hash. Models often repeat it inside each edit;
 /// accept that when every copy agrees, and supply a missing top-level value
 /// from them. Differing copies are a real conflict.
@@ -1475,13 +1507,22 @@ fn hoist_batch_expected_hash(args: &mut Value) -> Result<()> {
 }
 
 fn validate_document_edit_batch_arguments(args: &Value) -> Result<()> {
-    let expected_hash = args
-        .get("expected_hash")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("missing_argument: expected_hash"))?;
+    // Like document_edit, a missing hash is reported when the batch runs,
+    // after its edits were checked against the current document.
+    let Some(expected_hash) = args.get("expected_hash") else {
+        return validate_document_edit_batch_edits(args)
+            .map_err(|error| anyhow::anyhow!("{error}; expected_hash is also missing"));
+    };
+    let expected_hash = expected_hash
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid_argument_type: expected_hash must be string"))?;
     if expected_hash.trim().is_empty() {
         bail!("invalid_argument_value: expected_hash must not be empty");
     }
+    validate_document_edit_batch_edits(args)
+}
+
+fn validate_document_edit_batch_edits(args: &Value) -> Result<()> {
     let edits = args
         .get("edits")
         .and_then(Value::as_array)
@@ -1675,6 +1716,38 @@ fn batch_target_hint(states: &[String], applied: &[usize], edit: &Value, error: 
         );
     }
     String::new()
+}
+
+/// A missing hash is found only after the edit was checked against the
+/// current document in memory, so the error also names the edit's own
+/// problems (`failures`; a batch lists each failing operation) and one retry
+/// fixes both.
+fn missing_document_hash(target: &str, batch: bool, failures: &[String]) -> anyhow::Error {
+    let checked = match (batch, failures) {
+        (false, []) => {
+            "the edit was checked against the current document and has no other problem".to_owned()
+        }
+        (false, failures) => format!(
+            "the edit was also checked against the current document and failed: {}; fix it too",
+            failures.join("; ")
+        ),
+        (true, []) => {
+            "its edits were checked against the current document and have no other problem"
+                .to_owned()
+        }
+        (true, failures) => format!(
+            "its edits were also checked against the current document and {} failed: {}; operations after a failed one were checked without it, so fix every listed operation too",
+            failures.len(),
+            failures
+                .iter()
+                .map(|failure| format!("[{failure}]"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    anyhow::anyhow!(
+        "document_hash_required: {target} on an existing document requires expected_hash; copy hash from the latest document_inspect or document_edit result; {checked}; nothing was written"
+    )
 }
 
 /// A stale hash means the document changed; a malformed one was never issued
@@ -2025,6 +2098,20 @@ fn separate_inserted_block(old: &str, at: usize, new: &str) -> String {
     text
 }
 
+/// Structural edits place text by heading or document end, so only the
+/// document hash shows the model saw the version it edits.
+fn requires_document_hash(action: &str) -> bool {
+    matches!(
+        action,
+        "append"
+            | "section"
+            | "insert_before"
+            | "insert_after"
+            | "insert_first_child"
+            | "insert_last_child"
+    )
+}
+
 fn is_anchored_text_edit(action: &str) -> bool {
     matches!(
         action,
@@ -2079,11 +2166,28 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             // reads as wrong when the text does start at the right level.
             match new_headings.first() {
                 Some(first) if first.start == 0 && first.level == required_level => {}
-                Some(first) if first.start == 0 => bail!(
-                    "invalid_argument_value: {action} text must start with a level-{required_level} heading ({hashes} ...), but it starts with level-{} {:?}",
-                    first.level,
-                    first.heading
-                ),
+                Some(first) if first.start == 0 => {
+                    // The heading level usually shows the intended placement;
+                    // name the action that places it there.
+                    let fits = if child && first.level == anchor.level {
+                        format!(
+                            "; a level-{} heading is a sibling of {:?}: use insert_after or insert_before to add it beside that section",
+                            first.level, anchor.heading
+                        )
+                    } else if !child && first.level == anchor.level + 1 {
+                        format!(
+                            "; a level-{} heading is a child of {:?}: use insert_last_child or insert_first_child to add it under that section",
+                            first.level, anchor.heading
+                        )
+                    } else {
+                        String::new()
+                    };
+                    bail!(
+                        "invalid_argument_value: {action} text must start with a level-{required_level} heading ({hashes} ...), but it starts with level-{} {:?}{fits}",
+                        first.level,
+                        first.heading
+                    )
+                }
                 _ => bail!(
                     "invalid_argument_value: {action} text must start on its first line with a level-{required_level} heading ({hashes} ...); remove any text or blank line before it"
                 ),
@@ -4052,6 +4156,9 @@ fn execute_repaired(
     }
     if name == "document_edit_batch" {
         hoist_batch_expected_hash(&mut args)?;
+        if let Some(object) = args.as_object_mut() {
+            fill_hash_of_own_write(s, object);
+        }
     }
     if name == "file_read"
         && let Some(fields) = args.as_object_mut()
@@ -4701,7 +4808,16 @@ fn execute_repaired(
             let omitted = args.get("expected_hash").is_none();
             if exists && action != "create" && !anchored && args["expected_hash"].as_str().is_none()
             {
-                bail!("document_hash_required: existing document edits require expected_hash");
+                let failures: Vec<String> = apply_document_edit_operation(&old, &args)
+                    .err()
+                    .map(|error| error.to_string())
+                    .into_iter()
+                    .collect();
+                return Err(missing_document_hash(
+                    &format!("document_edit action={action}"),
+                    false,
+                    &failures,
+                ));
             }
             let digest = hash(old.as_bytes());
             if exists
@@ -4728,7 +4844,10 @@ fn execute_repaired(
             }
             let old = read_text(&path)?;
             let digest = hash(old.as_bytes());
-            if args["expected_hash"].as_str() != Some(digest.as_str()) {
+            // A missing hash still lets the edits be checked in memory, so
+            // the error names every other problem too.
+            let hash_missing = args["expected_hash"].as_str().is_none();
+            if !hash_missing && args["expected_hash"].as_str() != Some(digest.as_str()) {
                 return Err(revision_conflict(&args, &digest));
             }
             let edits = args["edits"].as_array().expect("validated edits array");
@@ -4765,6 +4884,13 @@ fn execute_repaired(
                     "changed":before_hash != hash(current.as_bytes()),
                     "hash":hash(current.as_bytes())
                 }));
+            }
+            if hash_missing {
+                return Err(missing_document_hash(
+                    "document_edit_batch",
+                    true,
+                    &failures,
+                ));
             }
             if let Some((first, rest)) = failures.split_first() {
                 let rest = if rest.is_empty() {

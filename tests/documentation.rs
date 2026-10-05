@@ -3584,14 +3584,20 @@ fn an_append_after_the_models_own_write_may_omit_the_hash() {
     .unwrap_err()
     .to_string();
     assert!(error.contains("expected_hash"), "{error}");
-    // Section actions keep requiring it even right after a write (anchored
-    // text edits never need it; their exact old_text is the precondition).
+    // Section insertions follow the same rule: right after the model's own
+    // write the hash is known, after an outside change it is required.
     let hash = tools::hash(b"# Guide\nChanged elsewhere.\n");
     run(
         &mut s,
         "document_edit",
         json!({"action":"append","expected_hash":hash,"text":"## Three\n"}),
     );
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after","section":"## Three","text":"## Four\n"}),
+    );
+    std::fs::write(&s.project.output, "# Guide\n## Three\n").unwrap();
     let error = tools::execute(
         &mut s,
         "document_edit",
@@ -3599,7 +3605,122 @@ fn an_append_after_the_models_own_write_may_omit_the_hash() {
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("expected_hash"), "{error}");
+    assert!(error.starts_with("document_hash_required"), "{error}");
+}
+
+#[test]
+fn a_missing_hash_is_reported_with_the_edits_other_problems() {
+    let (_dir, mut s) = setup();
+    let body = "# Guide\n\n## Install\n\nSteps.\n";
+    // Seeded outside the tools, so the model's own last write does not cover it.
+    std::fs::write(&s.project.output, body).unwrap();
+    // The live shape: a sibling H2 sent as a child, without a hash. One
+    // response names both problems and how to place the heading.
+    let call = |s: &mut Session, args: Value| {
+        tools::run_call(
+            s,
+            &mnemoarc::llm::ToolCall {
+                id: "edit".into(),
+                name: "document_edit".into(),
+                arguments: args.to_string(),
+            },
+        )
+    };
+    let result = call(
+        &mut s,
+        json!({"action":"insert_last_child","section":"Install","text":"## Query\n"}),
+    );
+    let error = result["error"].as_str().unwrap();
+    assert_eq!(
+        result["recovery"]["code"], "document_hash_required",
+        "{error}"
+    );
+    assert!(
+        error.starts_with("document_hash_required: document_edit action=insert_last_child"),
+        "{error}"
+    );
+    assert_eq!(
+        result["recovery"]["tools"],
+        json!(["document_inspect", "document_edit"])
+    );
+    assert!(
+        error.contains("must start with a level-3 heading"),
+        "{error}"
+    );
+    assert!(
+        error.contains("use insert_after or insert_before"),
+        "{error}"
+    );
+    assert!(error.contains("nothing was written"), "{error}");
+    // A valid edit without a hash still names only the hash.
+    let result = call(
+        &mut s,
+        json!({"action":"insert_after","section":"Install","text":"## Query\n"}),
+    );
+    let error = result["error"].as_str().unwrap();
+    assert!(error.contains("has no other problem"), "{error}");
+    // Argument errors found before the run mention the missing hash too.
+    let result = call(
+        &mut s,
+        json!({"action":"section","section":"Install","text":"## Install\n"}),
+    );
+    let error = result["error"].as_str().unwrap();
+    assert!(
+        error.contains("missing_argument: expected_section_hash"),
+        "{error}"
+    );
+    assert!(error.contains("expected_hash is also missing"), "{error}");
+    assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), body);
+    // A sent but stale hash is a revision conflict, not checked further.
+    let stale = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_last_child","section":"Install","expected_hash":tools::hash(b"old"),"text":"## Query\n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(stale.starts_with("document_revision_conflict"), "{stale}");
+
+    // A batch without a hash lists every failing operation as well.
+    let batch = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"edits":[
+            {"action":"replace_text","old_text":"Absent.","text":"x"},
+            {"action":"insert_first_child","section":"Install","text":"### Run\n"},
+            {"action":"insert_after","section":"Install","text":"### Query\n"}
+        ]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        batch.starts_with("document_hash_required: document_edit_batch"),
+        "{batch}"
+    );
+    assert!(batch.contains("its edits were also checked"), "{batch}");
+    assert!(batch.contains("2 failed: [index=0;"), "{batch}");
+    assert!(batch.contains("[index=2; action=insert_after"), "{batch}");
+    assert!(
+        batch.contains("use insert_last_child or insert_first_child"),
+        "{batch}"
+    );
+    assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), body);
+    // After the model's own write the batch hash is known and may be omitted.
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after","section":"Install","expected_hash":tools::hash(body.as_bytes()),"text":"## Query\n"}),
+    );
+    run(
+        &mut s,
+        "document_edit_batch",
+        json!({"edits":[{"action":"insert_last_child","section":"Query","text":"### Rows\n"}]}),
+    );
+    assert!(
+        std::fs::read_to_string(&s.project.output)
+            .unwrap()
+            .contains("### Rows")
+    );
 }
 
 #[test]

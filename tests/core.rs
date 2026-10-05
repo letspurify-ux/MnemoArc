@@ -261,9 +261,10 @@ fn file_evidence_document_conflict_and_revalidation() {
     )
     .unwrap();
     let h = doc["hash"].as_str().unwrap();
-    // Section edits without expected_hash are refused (an append right after
-    // the model's own write is one exception, covered in documentation.rs;
-    // anchored text edits are another, their exact old_text is the guard).
+    // Section edits without expected_hash are refused unless the document is
+    // still the model's own last write (covered in documentation.rs); anchored
+    // text edits never need it, their exact old_text is the guard.
+    s.last_document_write = None;
     assert!(
         tools::execute(
             &mut s,

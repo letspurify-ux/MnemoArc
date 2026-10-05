@@ -314,6 +314,13 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "resolve_path" => &["document_inspect", "file_list"],
         "select_file_from_directory" => &["file_list", "file_read"],
         "choose_allowed_path" => &["file_list", "document_inspect"],
+        // The edit was checked in memory; resend it with the hash.
+        "copy_document_hash" if call.name == "document_edit" => {
+            &["document_inspect", "document_edit"]
+        }
+        "copy_document_hash" if call.name == "document_edit_batch" => {
+            &["document_inspect", "document_edit_batch"]
+        }
         "copy_document_hash" => &["document_inspect"],
         "copy_file_hash" => &["file_read"],
         "use_document_editor" => &["document_inspect", "document_edit", "document_edit_batch"],
