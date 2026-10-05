@@ -2186,7 +2186,23 @@ pub async fn run_session_controlled(
                         reason: "empty_response".into(),
                         ..Default::default()
                     });
-                    emit(&events, AgentEvent::Notice { session: s.id.clone(), text: "모델이 빈 응답을 반복해 마감 단계로 전환합니다. 저장된 문서로 마무리하고, 확인하지 못한 항목은 결과에 명시합니다.".into() }, &cancel, run_deadline(started, &s.config)).await;
+                    let next_step = if document_saved(&s) {
+                        "저장된 문서로 마무리하고, 확인하지 못한 항목은 결과에 명시합니다."
+                    } else {
+                        "수집한 근거로 문서 생성을 재시도합니다. 문서가 저장되지 않으면 미완료로 종료합니다."
+                    };
+                    emit(
+                        &events,
+                        AgentEvent::Notice {
+                            session: s.id.clone(),
+                            text: format!(
+                                "모델이 빈 응답을 반복해 마감 단계로 전환합니다. {next_step}"
+                            ),
+                        },
+                        &cancel,
+                        run_deadline(started, &s.config),
+                    )
+                    .await;
                 }
                 continue;
             }

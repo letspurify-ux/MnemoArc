@@ -2484,7 +2484,9 @@ fn persist_document_edit(
         bail!("unsupported_large_file: maximum 16MiB");
     }
     if result.as_bytes().contains(&0) {
-        bail!("unsupported_binary_file");
+        bail!(
+            "invalid_argument_value: document edit text contains NUL (U+0000); remove NUL characters from the edit text and resend the edit, keeping expected_hash when the document already exists"
+        );
     }
     let parent = path
         .parent()

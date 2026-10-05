@@ -1856,4 +1856,42 @@ async fn repeated_empty_document_replies_change_the_request_and_close() {
         notices.iter().any(|n| n.contains("빈 응답을 반복해")),
         "{notices:?}"
     );
+    assert!(
+        notices.iter().any(|n| n.contains("저장된 문서로 마무리")),
+        "{notices:?}"
+    );
+}
+
+#[tokio::test]
+async fn repeated_empty_replies_without_a_document_report_creation_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128_000),
+            ..support::compact_config()
+        },
+    );
+    s.add_user("Write a source manual.".into());
+    s.select_workflow("source_document").unwrap();
+    let (result, notices) = run_scripted_notices(s, vec![Completion::default(); 16]).await;
+
+    assert_eq!(result.status, "blocked");
+    assert_eq!(
+        result.run_history.back().unwrap().reason,
+        "closing_round_limit"
+    );
+    assert!(!result.document_written);
+    assert!(!result.project.output.exists());
+    let notice = notices
+        .iter()
+        .find(|n| n.contains("빈 응답을 반복해"))
+        .expect("empty replies enter closing mode");
+    assert!(notice.contains("문서 생성을 재시도"), "{notice}");
+    assert!(!notice.contains("저장된 문서"), "{notice}");
 }

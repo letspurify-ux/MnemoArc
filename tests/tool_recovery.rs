@@ -52,6 +52,73 @@ fn session(root: &std::path::Path) -> Session {
 }
 
 #[test]
+fn nul_document_input_can_be_corrected_with_the_same_tool_in_closing_mode() {
+    for (name, existing) in [
+        ("document_edit", false),
+        ("document_edit", true),
+        ("document_edit_batch", true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session(dir.path());
+        s.project.output = dir.path().join("manual.md");
+        s.select_workflow("source_document").unwrap();
+        let original = "# Manual\nKeep this text.\n";
+        let hash = tools::hash(original.as_bytes());
+        if existing {
+            std::fs::write(&s.project.output, original).unwrap();
+        }
+        s.progress_recovery.closing = Some(Default::default());
+        let arguments = |text: &str| match (name, existing) {
+            ("document_edit_batch", _) => {
+                json!({"expected_hash":hash,"edits":[{"action":"append","text":text}]})
+            }
+            (_, true) => json!({"action":"append","expected_hash":hash,"text":text}),
+            (_, false) => json!({"action":"create","text":text}),
+        };
+        let mut call = ToolCall {
+            id: "repair-nul".into(),
+            name: name.into(),
+            arguments: arguments("# Added\nBad\u{0}text.\n").to_string(),
+        };
+        let result = tools::run_call(&mut s, &call);
+        assert_eq!(result["status"], "error", "{name}: {result}");
+        assert_eq!(result["recovery"]["code"], "invalid_argument_value");
+        assert_eq!(result["recovery"]["class"], "invalid_input");
+        assert_eq!(result["recovery"]["action"], "correct_arguments");
+        assert!(result["error"].as_str().unwrap().contains("NUL"));
+        assert!(
+            result["recovery"]["tools"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(name)),
+            "{name}: {result}"
+        );
+        assert!(tools::recovery::correctable_document_error(&result));
+        assert!(!s.document_written);
+        if existing {
+            assert_eq!(
+                std::fs::read_to_string(&s.project.output).unwrap(),
+                original
+            );
+        } else {
+            assert!(!s.project.output.exists());
+        }
+
+        // A rejected write must not cache the call ID or prevent a corrected edit.
+        call.arguments = arguments("# Added\nGood text.\n").to_string();
+        let repaired = tools::run_call(&mut s, &call);
+        assert_eq!(repaired["status"], "ok", "{name}: {repaired}");
+        assert!(s.document_written);
+        let saved = std::fs::read_to_string(&s.project.output).unwrap();
+        assert!(!saved.as_bytes().contains(&0));
+        assert!(saved.contains("Good text."));
+        if existing {
+            assert!(saved.starts_with(original));
+        }
+    }
+}
+
+#[test]
 fn file_scan_capacity_suggests_narrowing_the_available_scan_tool() {
     let dir = tempfile::tempdir().unwrap();
     let s = session(dir.path());

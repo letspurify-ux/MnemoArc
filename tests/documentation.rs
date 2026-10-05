@@ -2642,7 +2642,11 @@ fn document_edits_reject_embedded_nul_bytes() {
         ),
     ] {
         let error = tools::execute(&mut s, name, args).unwrap_err().to_string();
-        assert!(error.contains("unsupported_binary_file"), "{name}: {error}");
+        assert!(
+            error.starts_with("invalid_argument_value:"),
+            "{name}: {error}"
+        );
+        assert!(error.contains("NUL"), "{name}: {error}");
         assert_eq!(
             std::fs::read_to_string(&s.project.output).unwrap(),
             original
@@ -2658,7 +2662,8 @@ fn document_edits_reject_embedded_nul_bytes() {
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("unsupported_binary_file"));
+    assert!(error.starts_with("invalid_argument_value:"));
+    assert!(error.contains("NUL"));
     assert!(!s.project.output.exists());
 }
 
