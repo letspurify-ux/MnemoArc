@@ -160,6 +160,90 @@ async fn live_review_trace_preserves_retries_after_success_and_failure() {
     server.abort();
 }
 
+/// Resolve the original result by call ID before reading its bounded preview.
+/// Archives belong to the producing call, not to a later history-read call.
+fn tool_result_for_report(session: &Session, message: &Value) -> Option<Value> {
+    if message["role"] != "tool" {
+        return None;
+    }
+    let id = message["tool_call_id"].as_str()?;
+    session
+        .history
+        .bundles
+        .iter()
+        .flat_map(|bundle| &bundle.messages)
+        .find(|archive| {
+            archive["role"] == "tool_archive"
+                && archive["call_id"] == id
+                && archive["result"].is_object()
+        })
+        .map(|archive| archive["result"].clone())
+        .or_else(|| serde_json::from_str(message["content"].as_str()?).ok())
+}
+
+fn tool_errors_for_report(session: &Session) -> Vec<Value> {
+    session
+        .history
+        .bundles
+        .iter()
+        .flat_map(|bundle| &bundle.messages)
+        .filter_map(|message| tool_result_for_report(session, message))
+        .filter(|result| result["status"] != "ok")
+        .collect()
+}
+
+#[test]
+fn live_report_and_log_resolve_archived_batch_failure_details() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::new(
+        Project {
+            root: dir.path().into(),
+            ..Default::default()
+        },
+        Config::default(),
+    );
+    let call = mnemoarc::llm::ToolCall {
+        id: "large-verification-batch".into(),
+        name: "investigation".into(),
+        arguments: json!({"action":"verify_batch","items":{}}).to_string(),
+    };
+    let original = tools::envelope(Ok(json!({"results":(0..6).map(|id| {
+        json!({"id":format!("item-{id}"),"result":tools::envelope(Err(anyhow::anyhow!(
+            "source_coverage_missing: item-{id} {}", "missing source range ".repeat(100)
+        )))})
+    }).collect::<Vec<_>>()})));
+    let bounded = tools::limit_result(&mut session, &call, original.clone(), 256);
+    assert_eq!(bounded["truncated"], true);
+    assert!(!bounded["data"]["results"].is_array());
+    let message = json!({"role":"tool","tool_call_id":call.id,"content":bounded.to_string()});
+    session.history.push(vec![message.clone()], true);
+
+    // Both the live logger and final report read the same complete result.
+    let logged = tool_result_for_report(&session, &message).unwrap();
+    assert_eq!(logged, original);
+    assert_eq!(logged["data"]["results"].as_array().unwrap().len(), 6);
+    assert_eq!(tool_errors_for_report(&session), vec![original]);
+}
+
+#[test]
+fn live_report_does_not_substitute_another_calls_archive() {
+    let mut session = Session::new(Project::default(), Config::default());
+    session.history.push(
+        vec![json!({"role":"tool_archive","call_id":"original","result":{
+            "status":"error","error":"original failure"
+        }})],
+        true,
+    );
+    let result = json!({"status":"error","error":"history read failed","truncated":true});
+    let message = json!({"role":"tool","tool_call_id":"history-read","content":result.to_string()});
+    session.history.push(vec![message.clone()], true);
+    assert_eq!(
+        tool_result_for_report(&session, &message),
+        Some(result.clone())
+    );
+    assert_eq!(tool_errors_for_report(&session), vec![result]);
+}
+
 fn env_bool(name: &str, fallback: bool) -> bool {
     match std::env::var(name).ok().as_deref() {
         Some("1" | "true" | "yes" | "on") => true,
@@ -667,9 +751,7 @@ async fn registered_source_documentation() {
                             && let Some(id) = message["tool_call_id"].as_str()
                             && seen_result_ids.insert(id.to_owned())
                             && let Some((name, arguments)) = call_signatures.get(id)
-                            && let Some(result) = message["content"]
-                                .as_str()
-                                .and_then(|content| serde_json::from_str::<Value>(content).ok())
+                            && let Some(result) = tool_result_for_report(&s, message)
                             && result["status"] != "ok"
                         {
                             let code = result["recovery"]["code"]
@@ -780,7 +862,7 @@ async fn registered_source_documentation() {
         tools::audit_document(&mut result).unwrap_or_else(|e| json!({"error":e.to_string()}));
     let document = std::fs::read_to_string(&result.project.output).unwrap_or_default();
     let mut calls = Vec::new();
-    let mut errors = Vec::new();
+    let errors = tool_errors_for_report(&result);
     for message in result.history.bundles.iter().flat_map(|b| &b.messages) {
         calls.extend(
             message["tool_calls"]
@@ -789,14 +871,6 @@ async fn registered_source_documentation() {
                 .flatten()
                 .cloned(),
         );
-        if message["role"] == "tool"
-            && let Some(value) = message["content"]
-                .as_str()
-                .and_then(|s| serde_json::from_str::<Value>(s).ok())
-            && value["status"] != "ok"
-        {
-            errors.push(value);
-        }
     }
     let mut report = json!({"status":result.status,"error":result.last_error,"model":result.config.model,
         "budget_tokens":result.config.run_tokens,"budget_seconds":result.config.run_timeout_secs,

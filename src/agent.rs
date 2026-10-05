@@ -1808,24 +1808,103 @@ pub async fn run_session_controlled(
         let response = tokio::select! {_ = cancel.cancelled()=>Err(anyhow::anyhow!("cancelled")),result=tokio::time::timeout_at(deadline,std::panic::AssertUnwindSafe(client.complete(request,&request_config,cancel.clone(),tx)).catch_unwind())=>match result{Ok(Ok(r))=>r,Ok(Err(_))=>Err(anyhow::anyhow!("model_worker_panic: model request interrupted; session retained")),Err(_)=>Err(anyhow::anyhow!("run_timeout"))}};
         relay_done.cancel();
         let _ = relay.await;
-        let mut completion = match response {
-            Ok(r) => r,
-            Err(e) => {
+        let invalid_completion = response
+            .as_ref()
+            .ok()
+            .and_then(|completion| crate::llm::validate_completion_bounds(completion).err());
+        let response_error = response.as_ref().err().or(invalid_completion.as_ref());
+        let recovered_batch = response_error
+            .is_some_and(|error| recover_unexecuted_batch(&mut s, &error.to_string()));
+
+        // Attribute every charged request before any retry or stop can leave
+        // this iteration, including failed provider calls and invalid output.
+        match &response {
+            Err(error) => {
                 s.note_run_estimate();
                 s.usage_incomplete = true;
-                let attempts = e
+                let attempts = error
                     .downcast_ref::<crate::llm::CompletionError>()
                     .map_or(1, crate::llm::CompletionError::attempts);
                 s.input_tokens = s
                     .input_tokens
                     .saturating_add(request_tokens.saturating_mul(attempts));
-                if recover_unexecuted_batch(&mut s, &e.to_string()) {
+                if recovered_batch {
                     // Parsing failures have no trusted usage receipt. Charge
-                    // the reserved output as well as every attempted input so
-                    // malformed responses cannot escape the run token budget.
+                    // the reserved output as well as every attempted input.
                     s.output_tokens = s
                         .output_tokens
                         .saturating_add(request_config.output_tokens.saturating_mul(attempts));
+                }
+            }
+            Ok(completion) => {
+                provider_outages = 0;
+                provider_requests = 0;
+                let extra_attempts = completion.attempts.saturating_sub(1);
+                if extra_attempts > 0 {
+                    s.note_run_estimate();
+                    s.usage_incomplete = true;
+                    s.input_tokens = s
+                        .input_tokens
+                        .saturating_add(request_tokens.saturating_mul(extra_attempts));
+                }
+                if let Some(usage) = &completion.usage {
+                    if invalid_completion.is_none() && completion.attempts <= 1 {
+                        ContextManager::record_usage(&mut s, raw_request_tokens, usage.input);
+                    }
+                    s.input_tokens = s.input_tokens.saturating_add(usage.input);
+                    s.output_tokens = s.output_tokens.saturating_add(usage.output);
+                    if let Some(cached) = usage.cached {
+                        s.cached_tokens = Some(s.cached_tokens.unwrap_or(0).saturating_add(cached));
+                    }
+                } else {
+                    s.note_run_estimate();
+                    s.usage_incomplete = true;
+                    s.input_tokens = s.input_tokens.saturating_add(request_tokens);
+                    s.output_tokens = s.output_tokens.saturating_add(
+                        if invalid_completion.is_some() || completion.length_limited {
+                            // Invalid output or invisible reasoning can consume
+                            // the whole allowance without a trusted receipt.
+                            request_config.output_tokens
+                        } else {
+                            context::tokens(&completion.text, &s.config.model)
+                                + completion
+                                    .calls
+                                    .iter()
+                                    .map(|c| context::tokens(&c.arguments, &s.config.model))
+                                    .sum::<usize>()
+                        },
+                    );
+                }
+            }
+        }
+        let charged_input = s.input_tokens.saturating_sub(usage_before.0);
+        let charged_output = s.output_tokens.saturating_sub(usage_before.1);
+        if reviewing_completion {
+            s.completion_review.input_tokens = s
+                .completion_review
+                .input_tokens
+                .saturating_add(charged_input);
+            s.completion_review.output_tokens = s
+                .completion_review
+                .output_tokens
+                .saturating_add(charged_output);
+        }
+        if reviewing_document {
+            s.document_review.input_tokens =
+                s.document_review.input_tokens.saturating_add(charged_input);
+            s.document_review.output_tokens = s
+                .document_review
+                .output_tokens
+                .saturating_add(charged_output);
+        }
+        let response = match invalid_completion {
+            Some(error) => Err(error),
+            None => response,
+        };
+        let mut completion = match response {
+            Ok(completion) => completion,
+            Err(error) => {
+                if recovered_batch {
                     if reviewing_completion || reviewing_document {
                         review_response_failures += 1;
                         if abandon_failing_review(&mut s, review_response_failures).is_some() {
@@ -1836,12 +1915,11 @@ pub async fn run_session_controlled(
                 }
                 // The client's quick retries cover a blip, not an outage of a
                 // few minutes; a live run lost 3M tokens of work to one 502.
-                // Wait longer and resend the same request, which the session
-                // has not changed, before giving up on the run.
-                if e.downcast_ref::<crate::llm::CompletionError>()
-                    .is_some_and(crate::llm::CompletionError::provider_unavailable)
+                if let Some(provider) = error
+                    .downcast_ref::<crate::llm::CompletionError>()
+                    .filter(|provider| provider.provider_unavailable())
                 {
-                    provider_requests = provider_requests.saturating_add(attempts);
+                    provider_requests = provider_requests.saturating_add(provider.attempts());
                     let wait = PROVIDER_OUTAGE_WAITS
                         .get(provider_outages)
                         .map(|&secs| Duration::from_secs(secs));
@@ -1875,93 +1953,16 @@ pub async fn run_session_controlled(
                         continue;
                     }
                     failure = Some(format!(
-                        "{e}; provider unavailable after {provider_requests} requests over {} waits",
+                        "{error}; provider unavailable after {provider_requests} requests over {} waits",
                         provider_outages
                     ));
                     break;
                 }
-                failure = Some(e.to_string());
+                failure = Some(error.to_string());
                 break;
             }
         };
-        provider_outages = 0;
-        provider_requests = 0;
-        if let Err(error) = crate::llm::validate_completion_bounds(&completion) {
-            let extra_attempts = completion.attempts.saturating_sub(1);
-            if extra_attempts > 0 {
-                s.note_run_estimate();
-                s.usage_incomplete = true;
-            }
-            s.input_tokens = s
-                .input_tokens
-                .saturating_add(request_tokens.saturating_mul(extra_attempts));
-            if let Some(usage) = completion.usage {
-                s.input_tokens = s.input_tokens.saturating_add(usage.input);
-                s.output_tokens = s.output_tokens.saturating_add(usage.output);
-                if let Some(cached) = usage.cached {
-                    s.cached_tokens = Some(s.cached_tokens.unwrap_or(0).saturating_add(cached));
-                }
-            } else {
-                s.note_run_estimate();
-                s.usage_incomplete = true;
-                s.input_tokens = s.input_tokens.saturating_add(request_tokens);
-                s.output_tokens = s.output_tokens.saturating_add(request_config.output_tokens);
-            }
-            if recover_unexecuted_batch(&mut s, &error.to_string()) {
-                if reviewing_completion || reviewing_document {
-                    review_response_failures += 1;
-                    if abandon_failing_review(&mut s, review_response_failures).is_some() {
-                        review_response_failures = 0;
-                    }
-                }
-                continue;
-            }
-            failure = Some(error.to_string());
-            break;
-        }
-        if completion.attempts > 1 {
-            s.note_run_estimate();
-            s.usage_incomplete = true;
-            s.input_tokens = s
-                .input_tokens
-                .saturating_add(request_tokens.saturating_mul(completion.attempts - 1));
-        }
-        if let Some(u) = completion.usage {
-            if completion.attempts <= 1 {
-                ContextManager::record_usage(&mut s, raw_request_tokens, u.input);
-            }
-            s.input_tokens = s.input_tokens.saturating_add(u.input);
-            s.output_tokens = s.output_tokens.saturating_add(u.output);
-            if let Some(c) = u.cached {
-                s.cached_tokens = Some(s.cached_tokens.unwrap_or(0).saturating_add(c));
-            }
-        } else {
-            s.note_run_estimate();
-            s.usage_incomplete = true;
-            s.input_tokens = s.input_tokens.saturating_add(request_tokens);
-            s.output_tokens = s
-                .output_tokens
-                .saturating_add(if completion.length_limited {
-                    // No provider usage: length exhaustion may be invisible reasoning.
-                    request_config.output_tokens
-                } else {
-                    context::tokens(&completion.text, &s.config.model)
-                        + completion
-                            .calls
-                            .iter()
-                            .map(|c| context::tokens(&c.arguments, &s.config.model))
-                            .sum::<usize>()
-                });
-        }
         if reviewing_completion {
-            s.completion_review.input_tokens = s
-                .completion_review
-                .input_tokens
-                .saturating_add(s.input_tokens.saturating_sub(usage_before.0));
-            s.completion_review.output_tokens = s
-                .completion_review
-                .output_tokens
-                .saturating_add(s.output_tokens.saturating_sub(usage_before.1));
             // As with document review, a complete validated JSON verdict can
             // survive a provider's spurious length flag. Partial JSON cannot.
             let result = if completion.discarded_tool_calls || !completion.calls.is_empty() {
@@ -2059,8 +2060,6 @@ pub async fn run_session_controlled(
             }
         }
         if reviewing_document {
-            s.document_review.input_tokens += s.input_tokens.saturating_sub(usage_before.0);
-            s.document_review.output_tokens += s.output_tokens.saturating_sub(usage_before.1);
             // Validate the visible response before looking at provider
             // metadata. Some compatible providers attach a spurious tool call
             // or report finish_reason=length even when the JSON object is
@@ -4294,5 +4293,279 @@ mod provider_outage_tests {
             error.ends_with("provider unavailable after 15 requests over 4 waits"),
             "{error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod review_usage_tests {
+    use super::*;
+    use crate::{
+        config::Project,
+        llm::{Completion, CompletionError, Usage},
+    };
+    use std::sync::{Mutex, atomic::AtomicUsize};
+
+    enum Failure {
+        Provider(usize),
+        Fatal,
+        Malformed,
+        InvalidCompletion(bool),
+    }
+
+    struct Reviewer {
+        failure: Failure,
+        requests: AtomicUsize,
+        reserved_outputs: Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for Reviewer {
+        async fn complete(
+            &self,
+            request: Value,
+            config: &Config,
+            _: CancellationToken,
+            _: mpsc::Sender<String>,
+        ) -> Result<Completion> {
+            let payload = request["messages"][1]["content"]
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .unwrap_or_default();
+            let document = payload["source_document_review"] == true;
+            let acceptance = payload["completion_review"] == true;
+            if !document && !acceptance {
+                return Ok(Completion {
+                    text: "Saved source document.".into(),
+                    usage: Some(Usage {
+                        input: 11,
+                        output: 7,
+                        cached: None,
+                    }),
+                    ..Default::default()
+                });
+            }
+            let index = self.requests.fetch_add(1, Ordering::SeqCst);
+            match self.failure {
+                Failure::Provider(failures) if index < failures => {
+                    return Err(CompletionError::new(
+                        anyhow::anyhow!("provider_stream_error: test outage"),
+                        3,
+                        true,
+                    )
+                    .into());
+                }
+                Failure::Fatal => anyhow::bail!("test_review_failure"),
+                Failure::Malformed if index == 0 => {
+                    self.reserved_outputs
+                        .lock()
+                        .unwrap()
+                        .push(config.output_tokens * 2);
+                    return Err(CompletionError::new(
+                        anyhow::anyhow!("invalid_tool_arguments: test malformed response"),
+                        2,
+                        false,
+                    )
+                    .into());
+                }
+                Failure::InvalidCompletion(receipt) if index == 0 => {
+                    if !receipt {
+                        self.reserved_outputs
+                            .lock()
+                            .unwrap()
+                            .push(config.output_tokens);
+                    }
+                    return Ok(Completion {
+                        calls: (0..=crate::llm::MAX_TOOL_CALLS)
+                            .map(|id| ToolCall {
+                                id: format!("call-{id}"),
+                                name: "file_read".into(),
+                                arguments: "{}".into(),
+                            })
+                            .collect(),
+                        usage: receipt.then_some(Usage {
+                            input: 17,
+                            output: 23,
+                            cached: None,
+                        }),
+                        ..Default::default()
+                    });
+                }
+                _ => {}
+            }
+            let text = if document {
+                json!({"issues":[]}).to_string()
+            } else {
+                let evidence = payload["evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["id"] != "answer")
+                    .map(|e| e["id"].clone())
+                    .unwrap();
+                json!({"checks":payload["criteria"].as_array().unwrap().iter().map(|criterion| {
+                    json!({"id":criterion["id"],"status":"met","reason":"Fixture criterion satisfied",
+                        "evidence":[evidence],"next_action":""})
+                }).collect::<Vec<_>>()} ).to_string()
+            };
+            Ok(Completion {
+                text,
+                usage: Some(Usage {
+                    input: 13,
+                    output: 5,
+                    cached: None,
+                }),
+                ..Default::default()
+            })
+        }
+    }
+
+    async fn run(completion: bool, failure: Failure) -> (Session, Arc<Reviewer>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn run() {}\n").unwrap();
+        let mut session = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            Config {
+                model: "gpt-4o".into(),
+                model_context: Some(128_000),
+                source_document_review: !completion,
+                completion_review_enabled: completion,
+                run_timeout_secs: 3600,
+                ..Default::default()
+            },
+        );
+        session.select_workflow("source_document").unwrap();
+        session.add_user("Write a source document".into());
+        let read = tools::execute(&mut session, "file_read", json!({"path":"main.rs"})).unwrap();
+        tools::execute(
+            &mut session,
+            "document_edit",
+            json!({"action":"create","text":"# Flow\nCode. main.rs:1\n"}),
+        )
+        .unwrap();
+        tools::execute(&mut session, "investigation", json!({"action":"upsert","id":"flow","title":"Flow","section":"# Flow","status":"written"})).unwrap();
+        tools::execute(&mut session, "investigation", json!({"action":"verify","id":"flow","source_ids":[read["source"]["id"]],"verification_note":"Fixture attestation"})).unwrap();
+        if completion {
+            assert_eq!(
+                tools::completion_review::begin_final(
+                    &mut session,
+                    "Saved source document.",
+                    false
+                )
+                .unwrap(),
+                tools::completion_review::Gate::Review
+            );
+        } else {
+            tools::document_review::request(&mut session).unwrap();
+            session.document_review.pending = true;
+        }
+        let reviewer = Arc::new(Reviewer {
+            failure,
+            requests: AtomicUsize::new(0),
+            reserved_outputs: Mutex::new(Vec::new()),
+        });
+        let (tx, mut rx) = mpsc::channel(128);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let result = run_session(session, reviewer.clone(), CancellationToken::new(), tx).await;
+        drain.await.unwrap();
+        (result, reviewer)
+    }
+
+    fn review_usage(session: &Session) -> (usize, usize) {
+        let usage = if session.config.source_document_review {
+            (
+                session.document_review.input_tokens,
+                session.document_review.output_tokens,
+            )
+        } else {
+            (
+                session.completion_review.input_tokens,
+                session.completion_review.output_tokens,
+            )
+        };
+        // Only document review needs a separate, charged final answer request.
+        let final_usage = if session.status == "complete" && session.config.source_document_review {
+            (11, 7)
+        } else {
+            (0, 0)
+        };
+        assert_eq!(
+            usage,
+            (
+                session.input_tokens - final_usage.0,
+                session.output_tokens - final_usage.1
+            )
+        );
+        usage
+    }
+
+    #[tokio::test]
+    async fn failed_review_requests_are_attributed_before_stopping() {
+        for completion in [false, true] {
+            let (session, _) = run(completion, Failure::Fatal).await;
+            assert_eq!(session.status, "blocked");
+            assert!(review_usage(&session).0 > 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn review_outage_retries_and_success_are_attributed_once() {
+        for completion in [false, true] {
+            let (session, reviewer) = run(completion, Failure::Provider(2)).await;
+            assert_eq!(session.status, "complete", "{:?}", session.last_error);
+            assert_eq!(reviewer.requests.load(Ordering::SeqCst), 3);
+            let (input, output) = review_usage(&session);
+            assert!(input > 13);
+            assert_eq!(output, 5);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_review_outages_include_every_failed_attempt() {
+        for completion in [false, true] {
+            let (session, reviewer) = run(completion, Failure::Provider(usize::MAX)).await;
+            assert_eq!(session.status, "blocked");
+            assert_eq!(reviewer.requests.load(Ordering::SeqCst), 5);
+            assert!(review_usage(&session).0 > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_review_recovery_attributes_reserved_output() {
+        for completion in [false, true] {
+            let (session, reviewer) = run(completion, Failure::Malformed).await;
+            assert_eq!(session.status, "complete", "{:?}", session.last_error);
+            assert_eq!(reviewer.requests.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                review_usage(&session).1,
+                reviewer.reserved_outputs.lock().unwrap()[0] + 5
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_review_completion_keeps_its_usage_receipt() {
+        for completion in [false, true] {
+            let (session, reviewer) = run(completion, Failure::InvalidCompletion(true)).await;
+            assert_eq!(session.status, "complete", "{:?}", session.last_error);
+            assert_eq!(reviewer.requests.load(Ordering::SeqCst), 2);
+            assert_eq!(review_usage(&session), (30, 28));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_review_completion_without_usage_attributes_reserved_output() {
+        for completion in [false, true] {
+            let (session, reviewer) = run(completion, Failure::InvalidCompletion(false)).await;
+            assert_eq!(session.status, "complete", "{:?}", session.last_error);
+            assert_eq!(reviewer.requests.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                review_usage(&session).1,
+                reviewer.reserved_outputs.lock().unwrap()[0] + 5
+            );
+        }
     }
 }
