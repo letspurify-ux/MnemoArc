@@ -477,17 +477,11 @@ async fn closing_preserves_the_failed_document_review_in_state_and_run_history()
     s.config.closing_reserve_ratio = 0.8;
     s.config.verification_reserve_ratio = 0.85;
     s.config.writing_reserve_ratio = 0.9;
-    // A document quote absent from the page is rejected by the real
-    // validator. The first answer's usage starts closing before that review.
-    let invalid = json!({"issues":[{
-        "previous_id":null,"kind":"scope",
-        "document":{"start_line":2,"end_line":2,
-            "quote":"A while loop runs work forever."},
-        "requirement_id":"R0","sources":[],
-        "problem":"Remove an implementation name","correction":"Describe the visible result",
-        "ui_labels":[]
-    }]})
-    .to_string();
+    // Truncated JSON is rejected by the real validator as a whole response:
+    // a last try drops only issue-level rejections such as an absent quote.
+    // The first answer's usage starts closing before that review.
+    let invalid =
+        r#"{"issues":[{"previous_id":null,"kind":"scope","document":{"start_line":2"#.to_owned();
     let mut check = s.clone();
     let request = document_review::request(&mut check).unwrap();
     let payload: Value =
@@ -495,13 +489,13 @@ async fn closing_preserves_the_failed_document_review_in_state_and_run_history()
     let error = document_review::finish(&mut check, &invalid)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("issues[0].document"), "{error}");
+    assert!(error.starts_with("document_review_invalid:"), "{error}");
     let document_hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
     let final_answer = || Completion {
         text: "Saved out.md".into(),
         ..Default::default()
     };
-    let (mut result, _) = run_scripted(
+    let (mut result, notices) = run_scripted_notices(
         s,
         vec![
             Completion {
@@ -521,6 +515,17 @@ async fn closing_preserves_the_failed_document_review_in_state_and_run_history()
     )
     .await;
     assert_eq!(result.status, "complete_with_gaps");
+    // Closing allows one review response: the notice must not say "repeatedly".
+    assert!(
+        notices
+            .iter()
+            .any(|n| n.starts_with("마감 단계의 검토 응답")),
+        "{notices:?}"
+    );
+    assert!(
+        !notices.iter().any(|n| n.contains("반복해서")),
+        "{notices:?}"
+    );
     assert!(document_review::unavailable_on_current(&result));
     assert!(result.last_error.is_none());
     let state = json!(result.document_review);
@@ -599,7 +604,7 @@ async fn closing_review_drops_only_an_issue_with_an_unproven_label() {
     assert!(!document_review::unavailable_on_current(&result));
     assert!(document_review::approved(&result));
     assert!(result.document_review.unavailable_failure.is_none());
-    let drops = &result.document_review.label_drop_log;
+    let drops = &result.document_review.issue_drop_log;
     assert_eq!(drops.len(), 1, "{drops:?}");
     assert!(
         drops[0]["error"]
@@ -610,7 +615,7 @@ async fn closing_review_drops_only_an_issue_with_an_unproven_label() {
     );
     assert!(
         document_review::guidance(&result)
-            .get("label_drop_log")
+            .get("issue_drop_log")
             .is_none()
     );
 }
@@ -636,6 +641,26 @@ async fn run_scripted_tools(
     let guidance = client.guidance.lock().unwrap().clone();
     let tools = client.tools.lock().unwrap().clone();
     (result, guidance, tools)
+}
+
+async fn run_scripted_notices(s: Session, steps: Vec<Completion>) -> (Session, Vec<String>) {
+    let client = Arc::new(Scripted {
+        steps: Mutex::new(steps),
+        guidance: Mutex::new(vec![]),
+        tools: Mutex::new(vec![]),
+    });
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move {
+        let mut notices = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let mnemoarc::agent::AgentEvent::Notice { text, .. } = event {
+                notices.push(text);
+            }
+        }
+        notices
+    });
+    let result = run_session(s, client, CancellationToken::new(), tx).await;
+    (result, drain.await.unwrap())
 }
 
 #[tokio::test]

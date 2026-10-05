@@ -340,7 +340,12 @@ fn abandon_failing_review(s: &mut Session, failures: usize) -> Option<&'static s
         return None;
     }
     s.progress_recovery.action_required = false;
-    Some(REVIEW_UNAVAILABLE_NOTICE)
+    // Closing allows a single review response; "repeatedly" would misstate it.
+    Some(if failures < REVIEW_UNAVAILABLE_LIMIT {
+        REVIEW_CLOSING_UNAVAILABLE_NOTICE
+    } else {
+        REVIEW_UNAVAILABLE_NOTICE
+    })
 }
 
 /// After a document review verdict with findings, require their repair.
@@ -395,6 +400,7 @@ fn note_unrepaired_final(s: &mut Session) -> usize {
 }
 
 const REVIEW_UNAVAILABLE_NOTICE: &str = "검토 응답이 반복해서 형식에 맞지 않아 이 결과의 검토를 생략하고, 완료 보고에 미검토로 표시합니다.";
+const REVIEW_CLOSING_UNAVAILABLE_NOTICE: &str = "마감 단계의 검토 응답이 형식에 맞지 않아 이 결과의 검토를 생략하고, 완료 보고에 미검토로 표시합니다.";
 const DOCUMENT_REVIEW_UNAVAILABLE: &str = "document_review_unavailable: document review responses were invalid; give the final answer again and the document will be reported as unreviewed";
 const REVIEW_PAGE_SKIPPED_NOTICE: &str =
     "검토 응답이 반복해서 형식에 맞지 않아 이 부분의 검토를 건너뛰고, 나머지 검토를 이어갑니다.";

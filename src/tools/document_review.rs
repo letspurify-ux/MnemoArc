@@ -71,10 +71,14 @@ pub struct ReviewState {
     /// carries that error as previous_response_error.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skip_log: Vec<Value>,
-    /// Issues dropped from a last-try response because a UI label was not in
-    /// any of their source quotes, with the rejection. Diagnostics only.
+    /// Issues dropped from a last-try response (an unproven UI label or any
+    /// other issue-level rejection), with the rejection. Diagnostics only.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub label_drop_log: Vec<Value>,
+    pub issue_drop_log: Vec<Value>,
+    /// previous_id values released because they named a different defect;
+    /// the issue was collected as a new finding. Diagnostics only.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub released_id_log: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_failure: Option<ReviewFailure>,
     #[serde(skip)]
@@ -85,7 +89,7 @@ pub struct ReviewState {
     /// They leave a coverage gap and cannot count as resolved repairs.
     #[serde(skip)]
     unverified_finding_ids: BTreeSet<String>,
-    /// Last-try label rejections linked to prior findings. Delay the gap
+    /// Last-try issue drops linked to prior findings. Delay the gap
     /// until collection and validation finish: a candidate alone is no verdict.
     #[serde(skip)]
     label_gap_ranges: BTreeMap<String, (usize, usize)>,
@@ -127,7 +131,8 @@ impl ReviewState {
             output_tokens: old.output_tokens,
             validation_log: old.validation_log,
             skip_log: old.skip_log,
-            label_drop_log: old.label_drop_log,
+            issue_drop_log: old.issue_drop_log,
+            released_id_log: old.released_id_log,
             unavailable_failure: old.unavailable_failure,
             policy_hash: old.policy_hash,
             ..Default::default()
@@ -488,7 +493,8 @@ pub fn guidance(s: &Session) -> Value {
     for key in [
         "validation_log",
         "skip_log",
-        "label_drop_log",
+        "issue_drop_log",
+        "released_id_log",
         "unavailable_failure",
         "findings",
         "validating",
@@ -1178,7 +1184,9 @@ fn finish_review(s: &mut Session, digest: String) -> Result<()> {
         .filter(|old| {
             !state.unverified_finding_ids.contains(&old.id)
                 && !next_findings.iter().any(|new| {
-                    new.id == old.id || findings::same_subject(&old.proposal, &new.proposal)
+                    new.id == old.id
+                        || new.released_from.as_ref() == Some(&old.id)
+                        || findings::same_subject(&old.proposal, &new.proposal)
                 })
                 && (old
                     .proposal
@@ -1210,7 +1218,13 @@ fn finish_review(s: &mut Session, digest: String) -> Result<()> {
     }
     // A formerly confirmed defect becoming uncertain is not a repair.
     // Include these gaps only in progress accounting, never repair guidance.
-    let remaining = next_issues.len() + state.unverified_finding_ids.len();
+    // A finding confirmed for repair is already counted in next_issues.
+    let undecided = state
+        .unverified_finding_ids
+        .iter()
+        .filter(|id| !next_findings.iter().any(|f| &f.id == *id))
+        .count();
+    let remaining = next_issues.len() + undecided;
     if remaining == 0 {
         state.stalled_attempts = 0;
         state.best_issue_count = Some(0);

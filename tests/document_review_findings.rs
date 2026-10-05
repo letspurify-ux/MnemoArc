@@ -82,6 +82,24 @@ fn reject(s: &mut Session, issues: Vec<Value>) {
     s.last_error = Some(error);
 }
 
+/// Accept a response whose mismatched previous_id is released, and return
+/// the released log entries it added.
+fn release(s: &mut Session, issues: Vec<Value>) -> Vec<Value> {
+    s.document_review.pending = true;
+    let before = s.document_review.released_id_log.len();
+    review::finish(s, &json!({"issues":issues}).to_string()).unwrap();
+    s.document_review.released_id_log[before..].to_vec()
+}
+
+fn candidate_ids(s: &mut Session) -> Vec<String> {
+    payload(review::request(s).unwrap())["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
 // Live run 2026-10-03: calls 20 and 21 mixed a valid finding with a bad
 // document quote, in opposite orders. Both valid findings were discarded;
 // call 22's empty retry then silently advanced the page.
@@ -499,8 +517,8 @@ fn a_last_try_drops_only_the_issue_with_an_unproven_label() {
     assert!(review::finish(&mut s.clone(), &response).is_err());
     review::finish_last_try(&mut s, &response).unwrap();
     assert!(s.document_review.validating);
-    assert_eq!(s.document_review.label_drop_log.len(), 1);
-    let drop = &s.document_review.label_drop_log[0];
+    assert_eq!(s.document_review.issue_drop_log.len(), 1);
+    let drop = &s.document_review.issue_drop_log[0];
     assert!(
         drop["error"]
             .as_str()
@@ -517,17 +535,42 @@ fn a_last_try_drops_only_the_issue_with_an_unproven_label() {
         "Other defect"
     );
 
-    // Any other invalid issue still rejects the last try as a whole.
+    // Live run 2026-10-05: the single closing response lost a valid finding
+    // because a sibling's source quote was reconstructed. Any issue-level
+    // rejection drops only that issue on a last try, and an unlocatable issue
+    // leaves its lines unreviewed instead of approving them.
     let (_dir, mut s) = fixture();
     review::request(&mut s).unwrap();
     let mut bad_quote = proposal("Incorrect deletion timing");
     bad_quote["document"]["quote"] = json!("즉시 삭제됩니다");
-    let mut item = proposal("Label defect");
-    item["ui_labels"] = json!(["서버와 통신하지 못했습니다."]);
+    let mut bad_source = proposal("Reconstructed source");
+    bad_source["sources"][0]["quote"] = json!("function save() {\n  deleteKey();\n}");
+    let mut next_line = proposal("Adjacent unlocatable claim");
+    next_line["document"] = json!({"start_line":3,"end_line":3,"quote":"없는 문장입니다."});
+    let response =
+        json!({"issues":[bad_quote, proposal("Other defect"), bad_source, next_line]}).to_string();
+    assert!(review::finish(&mut s.clone(), &response).is_err());
+    review::finish_last_try(&mut s, &response).unwrap();
+    assert_eq!(s.document_review.issue_drop_log.len(), 3);
     assert!(
-        review::finish_last_try(&mut s, &json!({"issues":[bad_quote, item]}).to_string()).is_err()
+        s.document_review.issue_drop_log[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("issues[0].document"),
+        "{:?}",
+        s.document_review.issue_drop_log
     );
-    assert!(s.document_review.label_drop_log.is_empty());
+    validate(&mut s, vec![decision("F1", "dismissed")]);
+    assert!(!review::approved(&s));
+    assert!(review::unavailable_on_current(&s));
+    // Adjacent gaps are reported as one range.
+    assert_eq!(review::unavailable_ranges(&s), &[(2, 3)]);
+
+    // A whole-response error still rejects the last try.
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    assert!(review::finish_last_try(&mut s, r#"{"issues":[{"kind""#).is_err());
+    assert!(s.document_review.issue_drop_log.is_empty());
 }
 
 #[test]
@@ -646,14 +689,11 @@ fn same_id_reworded_findings_merge_without_resetting_stall_count() {
     assert_eq!(s.document_review.stalled_attempts, 1);
 }
 
+// Live run 2026-10-05: a reviewer told to keep an ID after rewording reused
+// IDs of rewritten scope findings; rejecting them cost 11 retries and two
+// skipped pages. The mismatched ID is released and the issue becomes new.
 #[test]
-fn a_rejected_id_reuse_names_the_issue_id_and_mismatch() {
-    // Live run 2026-10-04: one response reused seven IDs; the bare "different
-    // problem location/type" error never said which, and it was resent.
-    let (_dir, mut s) = fixture();
-    review::request(&mut s).unwrap();
-    submit(&mut s, vec![proposal("Timing issue")]);
-    validate(&mut s, vec![decision("F1", "confirmed")]);
+fn a_mismatched_id_reuse_is_released_as_a_new_finding() {
     let mut other_kind = proposal("Timing issue");
     other_kind["kind"] = json!("citation");
     other_kind["previous_id"] = json!("F1");
@@ -662,21 +702,37 @@ fn a_rejected_id_reuse_names_the_issue_id_and_mismatch() {
     other_place["document"] = json!({"start_line":3,"end_line":3,"quote":"검색 결과가 없습니다."});
     other_place["sources"] = json!([{"path":"ui.js","start_line":1,"end_line":1,
         "quote":"const message = '검색 결과가 없습니다.';"}]);
-    for (issues, expected) in [
+    for (issues, index, reason) in [
         (
             vec![other_kind],
-            "issues[0].previous_id \"F1\" cannot be reused: it was kind \"factual\", not \"citation\"",
+            0,
+            "it was kind \"factual\", not \"citation\"",
         ),
         (
             vec![proposal("Timing issue"), other_place],
-            "issues[1].previous_id \"F1\" cannot be reused: it quoted a different document passage (line 2;",
+            1,
+            "it quoted a different document passage (line 2;",
         ),
     ] {
+        let (_dir, mut s) = fixture();
         review::request(&mut s).unwrap();
-        reject(&mut s, issues);
-        let error = s.last_error.clone().unwrap();
-        assert!(error.contains(expected), "{error}");
-        assert!(error.contains("set previous_id to null"), "{error}");
+        submit(&mut s, vec![proposal("Timing issue")]);
+        validate(&mut s, vec![decision("F1", "confirmed")]);
+        review::request(&mut s).unwrap();
+        let released = release(&mut s, issues);
+        assert_eq!(released.len(), 1, "{released:?}");
+        assert_eq!(released[0]["issue"], index);
+        assert_eq!(released[0]["previous_id"], "F1");
+        let text = released[0]["reason"].as_str().unwrap();
+        assert!(text.contains(reason), "{text}");
+        // The released issue is validated under a fresh ID. An unchanged
+        // re-report of F1 keeps its cached confirmation and is not a candidate.
+        assert_eq!(candidate_ids(&mut s), ["F2"]);
+        assert_eq!(
+            s.document_review.findings[0].proposal.problem,
+            "Timing issue"
+        );
+        assert!(review::guidance(&s).get("released_id_log").is_none());
     }
 }
 
@@ -1359,6 +1415,53 @@ fn rewrite_scope(s: &Session) {
     .unwrap();
 }
 
+// A released ID still says the old defect persists. While its new finding is
+// confirmed, the rewritten old finding is not a resolved repair, so the stall
+// counter can advance; a dismissed new finding does resolve it.
+#[test]
+fn a_released_claim_keeps_the_old_finding_unresolved_while_confirmed() {
+    for status in ["confirmed", "dismissed", "unverified"] {
+        let (_dir, mut s) = scope_fixture();
+        confirm_scope(&mut s);
+        rewrite_scope(&s);
+        // A changed neighboring paragraph removes the re-anchoring exception.
+        let doc = std::fs::read_to_string(&s.project.output).unwrap();
+        std::fs::write(
+            &s.project.output,
+            doc.replace("답변을 선택합니다.", "다른 문단 앞의 문맥입니다."),
+        )
+        .unwrap();
+        review::request(&mut s).unwrap();
+        let claimed = scope_proposal(&s, NEW_SCOPE_TEXT, Some("F1"));
+        assert_eq!(release(&mut s, vec![claimed]).len(), 1);
+        let line = scope_proposal(&s, NEW_SCOPE_TEXT, None)["document"]["start_line"]
+            .as_u64()
+            .unwrap() as usize;
+        validate(&mut s, vec![decision("F2", status)]);
+        assert_eq!(
+            s.document_review.resolved_findings,
+            usize::from(status == "dismissed"),
+            "{status}"
+        );
+        // Uncertainty about the claimed defect leaves a gap, as for a
+        // re-anchored scope finding, instead of approving the passage.
+        assert_eq!(
+            s.document_review.stalled_attempts,
+            usize::from(status != "dismissed"),
+            "{status}"
+        );
+        assert_eq!(review::approved(&s), status == "dismissed", "{status}");
+        assert_eq!(
+            review::unavailable_ranges(&s).is_empty(),
+            status != "unverified",
+            "{status}"
+        );
+        if status == "unverified" {
+            assert_eq!(review::unavailable_ranges(&s), &[(line, line)]);
+        }
+    }
+}
+
 // Live call 48 reused F34 after its source-less scope passage was rewritten.
 // Keep the ID, but let semantic validation dismiss the now-stale criticism.
 #[test]
@@ -1475,7 +1578,7 @@ fn last_try_label_drops_cannot_resolve_a_previously_confirmed_scope() {
         assert_eq!(s.document_review.stalled_attempts, 1);
         assert_eq!(s.document_review.validation_rounds, 1);
         assert!(s.document_review.issues.is_empty());
-        assert_eq!(s.document_review.label_drop_log.len(), 1);
+        assert_eq!(s.document_review.issue_drop_log.len(), 1);
 
         // The gap belongs to this review. A subsequent valid review can approve.
         review::request(&mut s).unwrap();
@@ -1707,9 +1810,11 @@ fn last_try_labels_cannot_hide_an_invalid_previous_finding_id() {
         review::request(&mut s).unwrap();
         let mut bad = scope_proposal(&s, "설정을 저장합니다. ui.js:2", Some(id));
         bad["ui_labels"] = json!(["Unproven label"]);
-        assert!(review::finish_last_try(&mut s, &json!({"issues":[bad]}).to_string()).is_err());
-        assert!(s.document_review.label_drop_log.is_empty());
-        assert_eq!(s.document_review.findings[0].id, "F1");
+        // Dropped, but the claimed ID or the unlocatable issue leaves a gap.
+        review::finish_last_try(&mut s, &json!({"issues":[bad]}).to_string()).unwrap();
+        assert_eq!(s.document_review.issue_drop_log.len(), 1, "{id}");
+        assert_eq!(s.document_review.resolved_findings, 0, "{id}");
+        assert!(review::unavailable_on_current(&s), "{id}");
         assert!(!review::approved(&s));
     }
 }
@@ -1862,7 +1967,9 @@ fn source_less_scope_cannot_reuse_an_id_at_another_location_or_requirement() {
         } else if change == "source" {
             changed["sources"] = json!([{"path":"ui.js","start_line":2,"end_line":2,"quote":"function save() { if (clearKey) deleteKey(); }"}]);
         }
-        reject(&mut s, vec![changed]);
+        // The changed claim cannot take over F1: it is validated as F2.
+        assert_eq!(release(&mut s, vec![changed]).len(), 1, "{change}");
+        assert_eq!(candidate_ids(&mut s), ["F2"], "{change}");
         assert_eq!(s.document_review.validation_rounds, 1);
         assert!(!review::approved(&s));
     }
@@ -1939,7 +2046,8 @@ fn unchanged_scope_cannot_be_replaced_by_another_claim_in_the_same_paragraph() {
             .unwrap();
         }
         review::request(&mut s).unwrap();
-        reject(&mut s, vec![other]);
+        assert_eq!(release(&mut s, vec![other]).len(), 1);
+        assert_eq!(candidate_ids(&mut s), ["F2"]);
         assert_eq!(s.document_review.validation_rounds, 1);
         assert_eq!(
             s.document_review.findings[0].proposal.problem,

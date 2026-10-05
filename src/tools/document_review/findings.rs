@@ -52,6 +52,11 @@ pub struct Finding {
     /// uncertain judgment still cannot establish that the old defect is gone.
     #[serde(skip)]
     pub(super) previous_scope: Option<Proposal>,
+    /// The confirmed finding whose mismatched previous_id was released onto
+    /// this one. The reviewer said that defect persists: while this finding
+    /// stays confirmed, the old one does not count as a resolved repair.
+    #[serde(skip)]
+    pub(super) released_from: Option<String>,
 }
 
 pub fn summary(f: &Finding) -> Value {
@@ -476,8 +481,21 @@ pub fn preserve_label_gaps(state: &mut ReviewState) {
             state.skipped_ranges.push(range);
         }
     }
-    state.skipped_ranges.sort_unstable();
-    state.skipped_ranges.dedup();
+    merge_ranges(&mut state.skipped_ranges);
+}
+
+/// Keep gap ranges sorted and merged: a later page skip extends the last
+/// range, and the gap report lists each line once.
+pub(super) fn merge_ranges(ranges: &mut Vec<(usize, usize)>) {
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for range in ranges.drain(..) {
+        match merged.last_mut() {
+            Some(last) if range.0 <= last.1.saturating_add(1) => last.1 = last.1.max(range.1),
+            _ => merged.push(range),
+        }
+    }
+    *ranges = merged;
 }
 
 /// A UI label absent from every source quote of its issue. Only that issue
@@ -497,6 +515,42 @@ impl std::fmt::Display for UnprovenLabel {
 
 impl std::error::Error for UnprovenLabel {}
 
+/// An issue dropped from a last-try response. `gap` blocks approval of its
+/// document range: an unlocatable or malformed issue was never judged. A
+/// label drop keeps its grounded passage, so only linked prior findings gap.
+struct DroppedIssue {
+    message: String,
+    prior_ids: Vec<String>,
+    range: (usize, usize),
+    gap: bool,
+}
+
+/// Locate a raw issue well enough to keep its gap: the confirmed finding it
+/// names and its document lines when they lie on this page.
+fn drop_hint(
+    state: &ReviewState,
+    proposal: &Value,
+    page: (usize, usize),
+) -> (Vec<String>, (usize, usize)) {
+    let prior_ids = proposal["previous_id"]
+        .as_str()
+        .filter(|id| state.findings.iter().any(|f| f.confirmed && f.id == *id))
+        .map(|id| vec![id.to_owned()])
+        .unwrap_or_default();
+    let line = |key: &str| {
+        proposal["document"][key]
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+    };
+    let range = match (line("start_line"), line("end_line")) {
+        (Some(start), Some(end)) if page.0 <= start && start <= end && end <= page.1 => {
+            (start, end)
+        }
+        _ => page,
+    };
+    (prior_ids, range)
+}
+
 pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str, last_try: bool) -> Result<()> {
     if proposals.len() > 12 {
         bail!("document_review_invalid: at most 12 findings per page");
@@ -510,10 +564,16 @@ pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str, last_try: bool
     let mut corrections = 0;
     let mut first_error = None;
     let mut dropped = Vec::new();
+    let mut released = Vec::new();
+    let page = (state.document_offset + 1, state.next_document_offset);
     // Check every proposal, even after a bad quote or malformed sibling.
     // Keep page verdicts atomic; only grounded, unconfirmed retry candidates
     // survive a rejected batch, with their original evidence and stable IDs.
+    // On a last try (before a page skip or the single closing review) an
+    // issue-level rejection drops only that issue. One reconstructed source
+    // quote used to discard a closing response with a valid sibling finding.
     for (issue_index, proposal) in proposals.into_iter().enumerate() {
+        let hint = last_try.then(|| drop_hint(&s.document_review, &proposal, page));
         let result = serde_json::from_value::<Proposal>(proposal)
             .map_err(|e| anyhow::anyhow!("document_review_invalid: issues[{issue_index}]: {e}"))
             .and_then(|proposal| {
@@ -528,12 +588,28 @@ pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str, last_try: bool
                 )
             });
         match result {
-            Ok((m, c)) => {
+            Ok((m, c, r)) => {
                 merged += m;
                 corrections += c;
+                released.extend(r);
             }
             Err(error) if last_try && error.is::<UnprovenLabel>() => {
-                dropped.push(error.downcast::<UnprovenLabel>().unwrap());
+                let label = error.downcast::<UnprovenLabel>().unwrap();
+                dropped.push(DroppedIssue {
+                    message: label.message,
+                    prior_ids: label.prior_ids,
+                    range: label.range,
+                    gap: false,
+                });
+            }
+            Err(error) if last_try => {
+                let (prior_ids, range) = hint.unwrap();
+                dropped.push(DroppedIssue {
+                    message: error.to_string(),
+                    prior_ids,
+                    range,
+                    gap: true,
+                });
             }
             Err(error) => {
                 first_error.get_or_insert(error);
@@ -543,17 +619,30 @@ pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str, last_try: bool
     let state = &mut s.document_review;
     if first_error.is_none() {
         for error in dropped {
-            state.label_drop_log.push(
+            state.issue_drop_log.push(
                 json!({"lines":[state.document_offset + 1, state.next_document_offset],
                 "evidence_page":state.evidence_page,"error":error.message}),
             );
             for id in error.prior_ids {
                 state.label_gap_ranges.entry(id).or_insert(error.range);
             }
+            if error.gap && error.range.0 <= error.range.1 {
+                state.skipped_ranges.push(error.range);
+            }
         }
-        if state.label_drop_log.len() > 24 {
-            let excess = state.label_drop_log.len() - 24;
-            state.label_drop_log.drain(..excess);
+        merge_ranges(&mut state.skipped_ranges);
+        if state.issue_drop_log.len() > 24 {
+            let excess = state.issue_drop_log.len() - 24;
+            state.issue_drop_log.drain(..excess);
+        }
+        for entry in released {
+            state.released_id_log.push(json!({
+                "lines":[page.0, page.1],"evidence_page":state.evidence_page,
+                "issue":entry["issue"],"previous_id":entry["previous_id"],"reason":entry["reason"]}));
+        }
+        if state.released_id_log.len() > 24 {
+            let excess = state.released_id_log.len() - 24;
+            state.released_id_log.drain(..excess);
         }
     }
     state.next_finding_id = next_id;
@@ -588,7 +677,7 @@ fn collect_one(
     next: &mut Vec<Finding>,
     next_id: &mut usize,
     issue_index: usize,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, Option<Value>)> {
     let state = &s.document_review;
     let mut corrections = 0;
     if !["factual", "citation", "requirement", "scope"].contains(&proposal.kind.as_str())
@@ -731,8 +820,14 @@ fn collect_one(
                 .is_some_and(|anchor| old.context.get("scope_anchor") == Some(anchor))
             && !next.iter().any(|f| f.id == old.id)
     });
-    // Name the issue, ID and mismatch: a live reviewer reused seven IDs in
-    // one response and, told only "different location/type", kept resending.
+    // A mismatched ID used to reject the whole response, asking the reviewer
+    // to resend it with previous_id null. A live reviewer, told to keep an ID
+    // after the passage is reworded, resent rewritten scope findings that way
+    // (11 rejections and two skipped pages in one run). Apply that correction
+    // here: collect the issue as a new finding and log the released ID. The
+    // proposal keeps its claimed ID until collection so a last-try drop still
+    // protects the prior finding.
+    let mut released = None;
     if let Some(old) = previous
         && !same_subject(&old.proposal, &proposal)
         && !reanchored_scope
@@ -757,11 +852,14 @@ fn collect_one(
                 "it quoted a different document passage ({line}; that text was since edited or this is another place) and shares no source range"
             )
         };
-        bail!(
-            "document_review_invalid: issues[{issue_index}].previous_id {:?} cannot be reused: {reason}; set previous_id to null for this finding",
-            old.id
-        );
+        released = Some(json!({"issue":issue_index,"previous_id":old.id,"reason":reason}));
     }
+    let released_from = released
+        .as_ref()
+        .and_then(|r| r["previous_id"].as_str())
+        .filter(|id| state.findings.iter().any(|f| f.confirmed && f.id == *id))
+        .map(str::to_owned);
+    let previous = previous.filter(|_| released.is_none());
     // Name the issue and label: a bare "label is not present" left a live
     // reviewer repeating the same label until the page was skipped.
     for (label_index, label) in proposal.ui_labels.iter().enumerate() {
@@ -872,11 +970,11 @@ fn collect_one(
                 .as_bytes(),
             );
         }
-        return Ok((1, corrections));
+        return Ok((1, corrections, released));
     }
     if next.len() >= 12 {
         // Keep reviewing coverage; the next repair review can report further findings.
-        return Ok((0, corrections));
+        return Ok((0, corrections, released));
     }
     let mut context = json!({"document_context":document_context,"sources":sources});
     if let Some(anchor) = scope_anchor {
@@ -911,8 +1009,9 @@ fn collect_one(
         confirmed: cached.is_some(),
         inferred: false,
         previous_scope,
+        released_from,
     });
-    Ok((0, corrections))
+    Ok((0, corrections, released))
 }
 
 pub fn verification_request(s: &mut Session, ceiling: usize) -> Result<Value> {
@@ -1028,16 +1127,21 @@ pub fn finish_verification(s: &mut Session, body: &str) -> Result<()> {
                     .get(&decision.id)
                     .copied()
                     .or_else(|| {
-                        finding.previous_scope.as_ref().and_then(|_| {
-                            finding
-                                .proposal
-                                .document
-                                .as_ref()
-                                .map(|p| (p.start_line, p.end_line))
-                        })
+                        // A released claim also says a confirmed defect
+                        // persists: uncertainty cannot resolve that defect.
+                        (finding.previous_scope.is_some() || finding.released_from.is_some())
+                            .then(|| {
+                                finding
+                                    .proposal
+                                    .document
+                                    .as_ref()
+                                    .map(|p| (p.start_line, p.end_line))
+                            })
+                            .flatten()
                     })
             })
             .flatten();
+        let released_from = finding.released_from.clone();
         let is_inferred = inferred.contains(&decision.id);
         let mut entry = json!({"finding":finding,"decision":decision});
         if is_inferred {
@@ -1066,10 +1170,13 @@ pub fn finish_verification(s: &mut Session, body: &str) -> Result<()> {
                 // Uncertainty about a formerly confirmed defect is neither
                 // a dismissal nor a repair verdict. Reuse the coverage-gap
                 // path so completion cannot silently approve this passage.
-                state.unverified_finding_ids.insert(decision.id.clone());
+                // A released claim's own ID is new: the undecided defect is
+                // the confirmed finding it named, counted once.
+                state
+                    .unverified_finding_ids
+                    .insert(released_from.unwrap_or_else(|| decision.id.clone()));
                 state.skipped_ranges.push(range);
-                state.skipped_ranges.sort_unstable();
-                state.skipped_ranges.dedup();
+                merge_ranges(&mut state.skipped_ranges);
             } else if decision.status == "duplicate" {
                 state.merged_findings += 1;
             } else {
