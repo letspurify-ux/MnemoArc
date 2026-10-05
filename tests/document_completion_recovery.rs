@@ -17,6 +17,95 @@ use tokio_util::sync::CancellationToken;
 
 const RESULT: &str = "# Report\nThe requested document is saved and verified.\n";
 
+#[tokio::test]
+async fn uncovered_sections_receive_repair_guidance_instead_of_final_or_plan_closeout() {
+    struct StopAfterGuidance(Arc<Mutex<usize>>);
+    #[async_trait]
+    impl LlmClient for StopAfterGuidance {
+        async fn complete(
+            &self,
+            _request: Value,
+            _config: &Config,
+            _cancel: CancellationToken,
+            _delta: mpsc::Sender<String>,
+        ) -> Result<Completion> {
+            *self.0.lock().unwrap() += 1;
+            anyhow::bail!("offline readiness probe: stop before any provider call")
+        }
+    }
+    for with_todo in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            Config {
+                model: "gpt-4o".into(),
+                model_context: Some(128000),
+                context_tokens: 128000,
+                output_tokens: 1024,
+                api_key: Some(mnemoarc::config::Secret("offline-probe".into())),
+                ..Default::default()
+            },
+        );
+        s.add_user("Fix section A and preserve B.".into());
+        s.select_workflow("source_document").unwrap();
+        tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"create","text":"# Manual\n## A\na.rs:1\n## B\na.rs:2\n"}),
+        )
+        .unwrap();
+        let source = tools::execute(&mut s, "file_read", json!({"path":"a.rs"})).unwrap()["source"]
+            ["id"]
+            .clone();
+        tools::execute(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":"A","title":"A","status":"written","section":"## A"}),
+        )
+        .unwrap();
+        tools::execute(&mut s,"investigation",json!({"action":"verify","id":"A","source_ids":[source],"verification_note":"Compared a.rs:1."})).unwrap();
+        if with_todo {
+            let revision = s.task.plan_revision;
+            tools::execute(
+                &mut s,
+                "task_plan",
+                json!({"action":"apply","expected_revision":revision,
+                "operations":[{"op":"insert","text":"Finish the edit"}]}),
+            )
+            .unwrap();
+        }
+        let calls = Arc::new(Mutex::new(0));
+        let (events, mut rx) = mpsc::channel(128);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let result = run_session(
+            s,
+            Arc::new(StopAfterGuidance(calls.clone())),
+            CancellationToken::new(),
+            events,
+        )
+        .await;
+        drain.await.unwrap();
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_ne!(result.run_guidance["ready_for_final"], true);
+        assert!(result.run_guidance.get("plan_closeout").is_none());
+        assert_eq!(
+            result.run_guidance["document_readiness"]["structural_ok"],
+            false
+        );
+        assert!(
+            result.run_guidance["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("register uncovered cited sections")
+        );
+    }
+}
+
 fn fixture() -> (tempfile::TempDir, Session) {
     let dir = tempfile::tempdir().unwrap();
     let mut s = Session::new(

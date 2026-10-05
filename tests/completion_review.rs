@@ -203,6 +203,274 @@ fn payload(request: &Value) -> Value {
     serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap()
 }
 
+fn existing_document(root: &std::path::Path, before: &str) -> Session {
+    let output = root.join("manual.md");
+    std::fs::write(&output, before).unwrap();
+    let mut s = Session::new(
+        Project {
+            root: root.into(),
+            output,
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128000),
+            ..Default::default()
+        },
+    );
+    s.add_user("Fix three passages in the existing document; preserve every other passage.".into());
+    s.select_workflow("source_document").unwrap();
+    s
+}
+
+fn document_step(s: &mut Session, name: &str, args: Value) -> Value {
+    let call = ToolCall {
+        id: format!("{name}-{}", tools::hash(args.to_string().as_bytes())),
+        name: name.into(),
+        arguments: args.to_string(),
+    };
+    let result = tools::run_call(s, &call);
+    review::observe(s, &call, &result);
+    result
+}
+
+fn comparison(p: &Value) -> &Value {
+    p["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "runtime_document_changes")
+        .expect("runtime preservation evidence")
+}
+
+#[test]
+fn partial_document_edits_keep_original_net_changes_after_receipt_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = "# Manual\n## A\nOld condition.\n## B\nKeep this example.\n## C\nOld term.\n## D\nKeep this explanation.\n## E\nOld command.\n";
+    let after = before
+        .replace("Old condition.", "Correct condition.")
+        .replace("Old term.", "Correct term.")
+        .replace("Old command.", "Correct command.");
+    let mut s = existing_document(dir.path(), before);
+    let inspected = document_step(&mut s, "document_inspect", json!({"section":"# Manual"}));
+    assert_eq!(inspected["status"], "ok");
+    let edited = document_step(
+        &mut s,
+        "document_edit_batch",
+        json!({
+        "expected_hash":tools::hash(before.as_bytes()),"edits":[
+            {"action":"replace_text","old_text":"Old condition.","text":"Correct condition."},
+            {"action":"replace_text","old_text":"Old term.","text":"Correct term."},
+            {"action":"replace_text","old_text":"Old command.","text":"Correct command."}
+        ]}),
+    );
+    assert_eq!(edited["status"], "ok", "{edited}");
+    // A later successful edit must not replace the original preimage.
+    let edited = document_step(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text",
+        "expected_hash":tools::hash(after.as_bytes()),"old_text":"Correct term.","text":"Final term."}),
+    );
+    assert_eq!(edited["status"], "ok", "{edited}");
+    let after = after.replace("Correct term.", "Final term.");
+    for i in 0..20 {
+        let name = format!("source{i}.rs");
+        std::fs::write(dir.path().join(&name), format!("// evidence {i}\n")).unwrap();
+        let read = document_step(&mut s, "file_read", json!({"path":name}));
+        assert_eq!(read["status"], "ok", "{read}");
+    }
+    s.history.bundles.clear(); // Checkpoint cleanup cannot erase the baseline.
+    review::begin(&mut s, "Saved the three fixes.").unwrap();
+    let p = payload(&review::request(&mut s).unwrap());
+    let diff = comparison(&p);
+    assert_eq!(diff["baseline_hash"], tools::hash(before.as_bytes()));
+    assert_eq!(diff["current_hash"], tools::hash(after.as_bytes()));
+    assert_eq!(diff["total_changes"], 3);
+    assert_eq!(diff["truncated"], false);
+    assert_eq!(diff["unchanged_outside_reported_ranges"], true);
+    assert_eq!(diff["changes"][1]["before"]["text"], "Old term.\n");
+    assert_eq!(diff["changes"][1]["after"]["text"], "Final term.\n");
+    assert!(
+        !p["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "tool_observation" && e["data"]["tool"] == "document_inspect")
+    );
+    assert_eq!(p["evidence"][3]["kind"], "current_file");
+    assert_eq!(p["evidence"][4]["kind"], "runtime_document_changes");
+    review::finish(&mut s, &verdict(&p, true)).unwrap();
+    // Recompute from the actual current bytes, including external changes.
+    std::fs::write(
+        &s.project.output,
+        after.replace("Keep this example.", "Unexpected change."),
+    )
+    .unwrap();
+    assert_eq!(
+        review::begin(&mut s, "Saved the three fixes.").unwrap(),
+        Gate::Review
+    );
+    let p = payload(&review::request(&mut s).unwrap());
+    assert_eq!(comparison(&p)["total_changes"], 4);
+    assert!(comparison(&p).to_string().contains("Unexpected change."));
+}
+
+#[test]
+fn failed_document_edits_do_not_capture_a_stale_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = existing_document(dir.path(), "# Manual\nOld.\n");
+    let failed = document_step(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text",
+        "expected_hash":tools::hash(b"wrong version"),"old_text":"Old.","text":"Correct."}),
+    );
+    assert_eq!(failed["status"], "error");
+    let before = "# Manual\nExternal version.\n";
+    std::fs::write(&s.project.output, before).unwrap();
+    let edited = document_step(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text",
+        "expected_hash":tools::hash(before.as_bytes()),"old_text":"External version.","text":"Correct."}),
+    );
+    assert_eq!(edited["status"], "ok", "{edited}");
+    review::begin(&mut s, "Saved.").unwrap();
+    let p = payload(&review::request(&mut s).unwrap());
+    assert_eq!(
+        comparison(&p)["baseline_hash"],
+        tools::hash(before.as_bytes())
+    );
+    assert_eq!(
+        comparison(&p)["changes"][0]["before"]["text"],
+        "External version.\n"
+    );
+}
+
+#[tokio::test]
+async fn routed_amendments_preserve_unfinished_changes_and_rebase_completed_documents() {
+    const CHANGE: &str = "Also change First. to Second.; preserve all other original passages.";
+    const GOAL: &str = "Change the target to Second.; preserve all other original passages.";
+    struct AmendmentThenStop;
+    #[async_trait]
+    impl LlmClient for AmendmentThenStop {
+        async fn complete(
+            &self,
+            request: Value,
+            _: &Config,
+            _: CancellationToken,
+            _: mpsc::Sender<String>,
+        ) -> Result<Completion> {
+            if request["response_format"]["json_schema"]["name"] == "session_message_routing" {
+                return Ok(Completion {
+                    text: json!({"intent":"work","authorization_quote":CHANGE,
+                        "changes":{"goal":GOAL}})
+                    .to_string(),
+                    ..Default::default()
+                });
+            }
+            anyhow::bail!("offline amendment test: stop after routing")
+        }
+    }
+
+    for (status, preexisting) in [
+        ("blocked", true),
+        ("partial", true),
+        ("cancelled", true),
+        ("complete_with_gaps", true),
+        ("complete", true),
+        ("blocked", false),
+        ("complete", false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let before = "# Manual\n## Target\nOld.\n## Keep\nProtected original.\n";
+        let mut s = existing_document(dir.path(), before);
+        let first = before.replace("Old.", "First.");
+        let new_comparison = status == "complete" || !preexisting;
+        let first = if new_comparison {
+            first
+        } else {
+            first.replace("Protected original.", "Accidentally corrupted.")
+        };
+        let edit = if preexisting {
+            json!({"action":"write","text":first,"expected_hash":tools::hash(before.as_bytes())})
+        } else {
+            // No document existed before this task created its first draft.
+            std::fs::remove_file(&s.project.output).unwrap();
+            json!({"action":"create","text":first})
+        };
+        let edited = document_step(&mut s, "document_edit", edit);
+        assert_eq!(edited["status"], "ok", "{edited}");
+        s.status = status.into();
+        s.receive_message(CHANGE.into()).unwrap();
+        let (events, mut rx) = mpsc::channel::<AgentEvent>(128);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut s = run_session(
+            s,
+            Arc::new(AmendmentThenStop),
+            CancellationToken::new(),
+            events,
+        )
+        .await;
+        drain.await.unwrap();
+        assert_eq!(s.latest_request, GOAL, "{status}: {:?}", s.last_error);
+        // Existing originals survive an unfinished task's amendment. A
+        // completed result or a newly created draft can start a new comparison.
+        review::begin(&mut s, "Saved.").unwrap();
+        let p = payload(&review::request(&mut s).unwrap());
+        if new_comparison {
+            assert!(
+                !p["evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["kind"] == "runtime_document_changes")
+            );
+        } else {
+            assert_eq!(
+                comparison(&p)["baseline_hash"],
+                tools::hash(before.as_bytes()),
+                "{status}"
+            );
+            assert!(
+                comparison(&p).to_string().contains("Protected original."),
+                "{status}"
+            );
+        }
+        let edited = document_step(
+            &mut s,
+            "document_edit",
+            json!({"action":"replace_text","old_text":"First.","text":"Second.",
+                "expected_hash":tools::hash(first.as_bytes())}),
+        );
+        assert_eq!(edited["status"], "ok", "{edited}");
+        review::begin(&mut s, "Saved.").unwrap();
+        let p = payload(&review::request(&mut s).unwrap());
+        let diff = comparison(&p);
+        if new_comparison {
+            assert_eq!(diff["baseline_hash"], tools::hash(first.as_bytes()));
+            assert_eq!(diff["total_changes"], 1);
+            assert_eq!(diff["changes"][0]["before"]["text"], "First.\n");
+        } else {
+            assert_eq!(
+                diff["baseline_hash"],
+                tools::hash(before.as_bytes()),
+                "{status}"
+            );
+            assert_eq!(diff["total_changes"], 2, "{status}");
+            assert_eq!(
+                diff["changes"][1]["before"]["text"],
+                "Protected original.\n"
+            );
+            assert_eq!(
+                diff["changes"][1]["after"]["text"],
+                "Accidentally corrupted.\n"
+            );
+        }
+    }
+}
+
 fn verdict(payload: &Value, met: bool) -> String {
     let evidence = payload["evidence"]
         .as_array()

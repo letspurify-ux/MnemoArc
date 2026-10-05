@@ -880,6 +880,10 @@ impl Session {
             );
         }
         let changed_requirements = amendment.goal.is_some();
+        let explicit_requirements_changed = amendment.goal.is_some()
+            || amendment.completion.is_some()
+            || amendment.constraints.is_some()
+            || amendment.deliverables.is_some();
         let mut next = self.clone();
         let question = next.question.take().unwrap();
         next.current_request = question.text.clone();
@@ -948,7 +952,12 @@ impl Session {
         if changed_requirements {
             next.document_review.invalidate_requirements();
         }
-        next.completion_review.invalidate_requirements();
+        // Routing sets the current status to running; only the status saved
+        // before this message tells whether the previous work was complete.
+        next.completion_review.invalidate_requirements(
+            explicit_requirements_changed,
+            question.prior_status == "complete",
+        );
         if let Some(cp) = &mut next.checkpoint {
             cp.attempts = 0;
             cp.acknowledged = false;

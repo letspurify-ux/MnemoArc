@@ -2412,6 +2412,7 @@ fn persist_document_edit(
     } else {
         temp.persist_noclobber(path)?;
     }
+    completion_review::record_document_baseline(s, path, old, exists);
     s.document_written = true;
     // A smaller edit succeeded; whole-document writes are allowed again.
     s.progress_recovery.whole_write_withheld = false;
@@ -2441,7 +2442,7 @@ fn persist_document_edit(
         "written_items":written_items,
         "verification_required_ids":s.investigations.iter().filter(|i| !i.is_settled()).map(|i| &i.id).collect::<Vec<_>>(),
         "preserved_verified_ids":s.investigations.iter().filter(|i| i.status == "verified").map(|i| &i.id).collect::<Vec<_>>(),
-        "verification_guidance":"Verify only verification_required_ids. Unchanged sections retain verification; do not resubmit all items after a local edit. If none remain, proceed to final completion and document review.",
+        "verification_guidance":"Verify only verification_required_ids. Unchanged sections retain verification; do not resubmit all items after a local edit. If none remain, resolve any document_audit coverage/format issues before final completion and document review.",
         "path":path,
         "hash":hash,
         "bytes":bytes,

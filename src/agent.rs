@@ -227,15 +227,18 @@ fn compact_repair_audit(s: &Session, call: &ToolCall, mut result: Value) -> Valu
 
 /// Document work whose own bookkeeping is finished: the next useful step is
 /// the final answer, which starts the runtime's review and acceptance checks.
-fn ready_for_final(s: &Session) -> bool {
+fn ready_for_final(s: &mut Session) -> bool {
     s.task.current_todo().is_none() && ready_except_plan(s)
 }
 
 /// Everything the final answer needs except that to-dos remain open. The
 /// final answer is refused until they close, and closing them one per request
 /// only spends rounds, so the runtime lists them for one batched update.
-fn ready_except_plan(s: &Session) -> bool {
-    s.checkpoint.is_none()
+fn ready_except_plan(s: &mut Session) -> bool {
+    if let Some(guidance) = s.run_guidance.as_object_mut() {
+        guidance.remove("document_readiness");
+    }
+    let bookkeeping_ready = s.checkpoint.is_none()
         && s.is_document_work()
         && s.document_written
         && !s.investigations.is_empty()
@@ -244,7 +247,29 @@ fn ready_except_plan(s: &Session) -> bool {
         && !s.completion_review.pending
         && !tools::document_review::rejected_on_current_result(s)
         && !tools::completion_review::rejected_on_current_result(s)
-        && tools::verify_document_write(s).is_ok()
+        && tools::verify_document_write(s).is_ok();
+    if !bookkeeping_ready {
+        return false;
+    }
+    // Settled registered items do not cover every cited section. Use the
+    // same audit as final acceptance, including its freshness revalidation.
+    match tools::audit_document(s) {
+        Ok(audit) if audit["structural_ok"] == true => true,
+        Ok(mut audit) => {
+            if let Some(issues) = audit["issues"].as_array_mut() {
+                issues.truncate(5);
+            }
+            audit["next_offset"] =
+                json!((audit["issue_count"].as_u64().unwrap_or(0) > 5).then_some(5));
+            s.run_guidance["document_readiness"] = audit;
+            false
+        }
+        Err(error) => {
+            s.run_guidance["document_readiness"] =
+                json!({"structural_ok":false,"error":error.to_string()});
+            false
+        }
+    }
 }
 
 /// The open to-dos in order, bounded by one task_plan batch.
@@ -1533,7 +1558,7 @@ pub async fn run_session_controlled(
                 .unwrap()
                 .remove("closing_after");
         }
-        if s.progress_recovery.closing.is_none() && ready_for_final(&s) {
+        if s.progress_recovery.closing.is_none() && ready_for_final(&mut s) {
             s.run_guidance["ready_for_final"] = json!(true);
             let previous = if s.config.source_document_review {
                 s.document_review.issues.len()
@@ -1549,10 +1574,16 @@ pub async fn run_session_controlled(
             });
         } else if s.progress_recovery.closing.is_none()
             && s.task.current_todo().is_some()
-            && ready_except_plan(&s)
+            && ready_except_plan(&mut s)
         {
             s.run_guidance["plan_closeout"] = plan_closeout(&s);
             s.run_guidance["instruction"] = json!(PLAN_CLOSEOUT_INSTRUCTION);
+        } else if s.progress_recovery.closing.is_none()
+            && s.run_guidance["document_readiness"]["structural_ok"] == false
+        {
+            s.run_guidance["instruction"] = json!(
+                "The document is not ready for final acceptance. Resolve document_readiness.issues using their section paths and next actions: register uncovered cited sections and verify them against delivered sources, or repair the reported format/citation problem. Do not submit another final answer before those issues are resolved. For additional issues, use document_audit with offset=next_offset and expected_revision=revision from this audit."
+            );
         } else if s.progress_recovery.closing.is_none() && review_repair_pending(&s) {
             s.run_guidance["review_repair"] = json!({"findings":s.document_review.issues.len()});
             s.run_guidance["instruction"] = json!(REVIEW_REPAIR_INSTRUCTION);
@@ -1576,7 +1607,7 @@ pub async fn run_session_controlled(
                 "final_attempts":closing.final_attempts});
             // Closing mode kept auditing a finished result for its whole
             // allowance in live runs; once nothing is left, say so.
-            s.run_guidance["instruction"] = json!(if ready_for_final(&s) {
+            s.run_guidance["instruction"] = json!(if ready_for_final(&mut s) {
                 s.run_guidance["ready_for_final"] = json!(true);
                 format!(
                     "{READY_FOR_FINAL_INSTRUCTION} Closing mode is active: this is the time to answer."
@@ -3311,6 +3342,64 @@ mod review_gap_tests {
     use crate::config::{Project, Secret};
 
     #[test]
+    fn uncovered_sections_block_readiness_even_when_registered_items_are_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            Config {
+                model: "gpt-4o".into(),
+                ..Default::default()
+            },
+        );
+        s.add_user("Fix only section A in the existing document.".into());
+        s.select_workflow("source_document").unwrap();
+        tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"create","text":"# Manual\n## A\na.rs:1\n## B\na.rs:2\n"}),
+        )
+        .unwrap();
+        let source = tools::execute(&mut s, "file_read", json!({"path":"a.rs"})).unwrap()["source"]
+            ["id"]
+            .clone();
+        tools::execute(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":"A","title":"A","section":"## A","status":"written"}),
+        )
+        .unwrap();
+        tools::execute(&mut s, "investigation", json!({"action":"verify","id":"A","source_ids":[source.clone()],"verification_note":"Compared a.rs:1."})).unwrap();
+        assert!(s.investigations.iter().all(|item| item.is_settled()));
+        assert!(!ready_for_final(&mut s));
+        assert!(
+            s.run_guidance["document_readiness"]["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|issue| issue["kind"] == "uncovered_section"
+                    && issue["section"] == "# Manual\n## B")
+        );
+        tools::execute(
+            &mut s,
+            "investigation",
+            json!({"action":"upsert","id":"B","title":"B","section":"## B","status":"written"}),
+        )
+        .unwrap();
+        tools::execute(&mut s, "investigation", json!({"action":"verify","id":"B","source_ids":[source],"verification_note":"Compared a.rs:2."})).unwrap();
+        assert!(ready_for_final(&mut s));
+        assert!(s.run_guidance.get("document_readiness").is_none());
+        // A stale verified source must also block the ready instruction.
+        std::fs::write(dir.path().join("a.rs"), "fn changed() {}\nfn b() {}\n").unwrap();
+        assert!(!ready_for_final(&mut s));
+        assert_eq!(s.run_guidance["document_readiness"]["structural_ok"], false);
+    }
+
+    #[test]
     fn completion_readiness_and_final_gaps_use_the_current_investigation_state() {
         use tools::completion_review::{self as review, Gate};
 
@@ -3357,7 +3446,7 @@ mod review_gap_tests {
             .to_string(),
         )
         .unwrap();
-        assert!(!ready_for_final(&s));
+        assert!(!ready_for_final(&mut s));
         assert!(
             collect_gaps(&mut s, &[])
                 .iter()
@@ -3372,7 +3461,7 @@ mod review_gap_tests {
         )
         .unwrap();
         assert!(
-            ready_for_final(&s),
+            ready_for_final(&mut s),
             "Verification must unblock the final answer that starts a new review"
         );
         let gaps = collect_gaps(&mut s, &[]);
@@ -3398,7 +3487,7 @@ mod review_gap_tests {
         review::finish(&mut s, &json!({"checks":[{"id":"R0","status":"met",
             "reason":"Saved manual covers the chat screen","evidence":[file["id"]],"next_action":""}]}).to_string()).unwrap();
         assert!(collect_gaps(&mut s, &[]).is_empty());
-        assert!(ready_for_final(&s));
+        assert!(ready_for_final(&mut s));
     }
 
     #[test]
