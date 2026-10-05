@@ -1,4 +1,5 @@
 //! Explicit paid evaluation; normal cargo test never calls a provider.
+mod support;
 use mnemoarc::{
     agent::{self, AgentEvent},
     config::{Config, Project, Secret},
@@ -117,7 +118,7 @@ async fn live_review_trace_preserves_retries_after_success_and_failure() {
     let config = Config {
         base_url: format!("http://{}", listener.local_addr().unwrap()),
         retries: 1,
-        ..Default::default()
+        ..support::compact_config()
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let records = Arc::new(Mutex::new(Vec::new()));
@@ -200,7 +201,7 @@ fn live_report_and_log_resolve_archived_batch_failure_details() {
             root: dir.path().into(),
             ..Default::default()
         },
-        Config::default(),
+        support::compact_config(),
     );
     let call = mnemoarc::llm::ToolCall {
         id: "large-verification-batch".into(),
@@ -227,7 +228,7 @@ fn live_report_and_log_resolve_archived_batch_failure_details() {
 
 #[test]
 fn live_report_does_not_substitute_another_calls_archive() {
-    let mut session = Session::new(Project::default(), Config::default());
+    let mut session = Session::new(Project::default(), support::compact_config());
     session.history.push(
         vec![json!({"role":"tool_archive","call_id":"original","result":{
             "status":"error","error":"original failure"
@@ -284,7 +285,7 @@ fn report_diagnostics(result: &Session, audit: &Value) -> Value {
 
 #[test]
 fn live_report_records_completion_gaps_and_stop_reason() {
-    let mut result = Session::new(Project::default(), Config::default());
+    let mut result = Session::new(Project::default(), support::compact_config());
     result.status = "complete_with_gaps".into();
     result.completion_gaps = vec!["문서 검토 — 현재 문서를 마감 전에 검토하지 못했습니다.".into()];
     let now = chrono::Utc::now();
@@ -334,7 +335,7 @@ fn live_report_distinguishes_the_edited_document_from_its_last_review_target() {
             output: dir.path().join("manual.md"),
             ..Default::default()
         },
-        Config::default(),
+        support::compact_config(),
     );
     result.add_user("Document the loop.".into());
     result.select_workflow("source_document").unwrap();

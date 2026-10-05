@@ -1,6 +1,6 @@
+mod support;
 use anyhow::{Result, ensure};
 use mnemoarc::{
-    config::Config,
     database::{DatabaseConfig, execute_free},
     session::Session,
     tools::{self, ToolRegistry},
@@ -25,7 +25,7 @@ fn configured() -> DatabaseConfig {
 
 #[test]
 fn free_execution_requires_manual_mode_switches() {
-    let mut session = Session::new(Default::default(), Config::default());
+    let mut session = Session::new(Default::default(), support::compact_config());
     assert!(
         !ToolRegistry::definitions(&session)
             .iter()
@@ -122,7 +122,7 @@ fn free_execution_requires_manual_mode_switches() {
 
 #[test]
 fn invalid_database_bind_arguments_are_rejected_before_connecting() {
-    let mut session = Session::new(Default::default(), Config::default());
+    let mut session = Session::new(Default::default(), support::compact_config());
     session.config.database = configured();
     for field in ["direction", "type"] {
         for value in [json!(null), json!(true), json!(1), json!([]), json!({})] {

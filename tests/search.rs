@@ -1,5 +1,6 @@
+mod support;
 use mnemoarc::{
-    config::{Config, Project},
+    config::Project,
     session::Session,
     tools::{self, ToolRegistry},
 };
@@ -13,7 +14,7 @@ fn setup() -> (tempfile::TempDir, Session) {
             output: dir.path().join("out.md"),
             ..Default::default()
         },
-        Config::default(),
+        support::compact_config(),
     );
     session.active_tools = ToolRegistry::optional_names();
     (dir, session)

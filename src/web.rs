@@ -1477,7 +1477,7 @@ mod worker_wait_tests {
         let state = WebState::new(
             Config {
                 projects: vec![project.clone()],
-                ..Default::default()
+                ..Config::compact_test()
             },
             dir.path().join("config.toml"),
             Arc::new(OpenAiClient),
@@ -1542,7 +1542,7 @@ mod worker_wait_tests {
                     root: dir.path().into(),
                     ..Default::default()
                 }],
-                ..Default::default()
+                ..Config::compact_test()
             },
             dir.path().join("config.toml"),
             Arc::new(OpenAiClient),
@@ -1604,7 +1604,7 @@ mod worker_wait_tests {
                     root: dir.path().into(),
                     ..Default::default()
                 }],
-                ..Default::default()
+                ..Config::compact_test()
             },
             dir.path().join("config.toml"),
             Arc::new(OpenAiClient),
@@ -1652,7 +1652,7 @@ mod worker_wait_tests {
                     root: dir.path().into(),
                     ..Default::default()
                 }],
-                ..Default::default()
+                ..Config::compact_test()
             },
             dir.path().join("config.toml"),
             Arc::new(OpenAiClient),
@@ -1760,7 +1760,7 @@ mod worker_wait_tests {
                 root: dir.path().into(),
                 ..Default::default()
             }],
-            ..Default::default()
+            ..Config::compact_test()
         };
         let state = test_state(
             config.clone(),
@@ -1806,7 +1806,7 @@ mod worker_wait_tests {
     async fn oversized_directory_listing_is_rejected_instead_of_retaining_all_entries() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(
-            Config::default(),
+            Config::compact_test(),
             dir.path().join("config.toml"),
             Arc::new(OpenAiClient),
         )
@@ -1838,7 +1838,7 @@ mod worker_wait_tests {
                 root: dir.path().into(),
                 ..Default::default()
             }],
-            ..Default::default()
+            ..Config::compact_test()
         };
         let state = test_state(
             config,
@@ -1885,7 +1885,7 @@ mod worker_wait_tests {
                 root: dir.path().into(),
                 ..Default::default()
             }],
-            ..Default::default()
+            ..Config::compact_test()
         };
         let state = test_state(
             config,
@@ -1946,7 +1946,7 @@ mod worker_wait_tests {
                 root: dir.path().into(),
                 ..Default::default()
             }],
-            ..Default::default()
+            ..Config::compact_test()
         };
         let path = dir.path().join("config.toml");
         let state = test_state(config.clone(), path.clone(), Arc::new(OpenAiClient)).unwrap();
@@ -1992,7 +1992,7 @@ mod worker_wait_tests {
                     root: dir.path().into(),
                     ..Default::default()
                 }],
-                ..Default::default()
+                ..Config::compact_test()
             },
             dir.path().join("config.toml"),
             Arc::new(OpenAiClient),
@@ -2050,7 +2050,7 @@ mod worker_wait_tests {
                 root: dir.path().into(),
                 ..Default::default()
             }],
-            ..Default::default()
+            ..Config::compact_test()
         };
         let state = test_state(config.clone(), path.clone(), Arc::new(OpenAiClient)).unwrap();
         assert!(
@@ -2119,7 +2119,7 @@ mod worker_wait_tests {
             }
             let config = Config {
                 projects: vec![project],
-                ..Default::default()
+                ..Config::compact_test()
             };
             assert!(
                 config
@@ -2148,7 +2148,7 @@ mod worker_wait_tests {
                 root: dir.path().into(),
                 ..Default::default()
             }],
-            ..Default::default()
+            ..Config::compact_test()
         };
         let mut state = test_state(config.clone(), path.clone(), Arc::new(OpenAiClient)).unwrap();
         let workers = Arc::new(tokio::sync::Semaphore::new(1));
@@ -2214,7 +2214,7 @@ mod worker_wait_tests {
                 root: dir.path().into(),
                 ..Default::default()
             }],
-            ..Default::default()
+            ..Config::compact_test()
         };
         let state = test_state(config.clone(), path.clone(), Arc::new(OpenAiClient)).unwrap();
         let mut saves = tokio::task::JoinSet::new();
@@ -2263,7 +2263,7 @@ mod worker_wait_tests {
                     root: dir.path().into(),
                     ..Default::default()
                 }],
-                ..Default::default()
+                ..Config::compact_test()
             },
             dir.path().join("config.toml"),
             Arc::new(OpenAiClient),
@@ -2333,7 +2333,7 @@ mod worker_wait_tests {
                     root: dir.path().into(),
                     ..Default::default()
                 }],
-                ..Default::default()
+                ..Config::compact_test()
             };
             match field {
                 "request_timeout_secs" => config.request_timeout_secs = u64::MAX,
@@ -2364,7 +2364,7 @@ mod worker_wait_tests {
                 root: original.clone(),
                 ..Default::default()
             }],
-            ..Default::default()
+            ..Config::compact_test()
         };
         let state = test_state(
             config,
@@ -2413,7 +2413,7 @@ mod worker_wait_tests {
                     root: dir.path().into(),
                     ..Default::default()
                 }],
-                ..Default::default()
+                ..Config::compact_test()
             };
             let state = test_state(
                 config.clone(),
@@ -2481,7 +2481,7 @@ mod worker_wait_tests {
                 root: dir.path().into(),
                 ..Default::default()
             }],
-            ..Default::default()
+            ..Config::compact_test()
         };
         let state = test_state(
             config,

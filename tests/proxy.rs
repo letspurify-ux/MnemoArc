@@ -1,3 +1,4 @@
+mod support;
 use axum::{Router, http::header, routing::post};
 use mnemoarc::{
     config::{Config, Secret},
@@ -51,7 +52,7 @@ async fn proxy_child() {
         api_key: Some(Secret("local-test".into())),
         retries: 0,
         request_timeout_secs: 3,
-        ..Default::default()
+        ..support::compact_config()
     };
     assert!(!config.disable_proxy);
     // Control: environment proxy is actually active when the option is off.

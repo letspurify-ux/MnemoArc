@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn a_memory_key_cannot_alias_another_memory_id() {
         let mut store = MemoryStore::default();
-        let config = Config::default();
+        let config = Config::compact_test();
         let original = store
             .save(
                 input("original".into(), "original body", None),

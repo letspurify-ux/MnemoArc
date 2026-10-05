@@ -938,7 +938,7 @@ mod diagnostic_tests {
         let key = "test_api_key";
         let config = Config {
             api_key: Some(Secret(key.into())),
-            ..Default::default()
+            ..Config::compact_test()
         };
         let mut diagnostics = Vec::new();
         for error in [

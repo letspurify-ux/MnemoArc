@@ -1,3 +1,4 @@
+mod support;
 use anyhow::Result;
 use async_trait::async_trait;
 use mnemoarc::{
@@ -48,7 +49,7 @@ async fn uncovered_sections_receive_repair_guidance_instead_of_final_or_plan_clo
                 context_tokens: 128000,
                 output_tokens: 1024,
                 api_key: Some(mnemoarc::config::Secret("offline-probe".into())),
-                ..Default::default()
+                ..support::compact_config()
             },
         );
         s.add_user("Fix section A and preserve B.".into());
@@ -122,7 +123,7 @@ fn fixture() -> (tempfile::TempDir, Session) {
             output_tokens: 1024,
             stall_round_limit: 3,
             source_document_review: false,
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.add_user("Write report.md with the requested document.".into());
@@ -1362,7 +1363,7 @@ async fn oversized_batch_before_any_workflow_is_retried_not_fatal() {
             result_tokens: 400,
             source_document_review: false,
             completion_review_enabled: false,
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.add_user("List the project files.".into());

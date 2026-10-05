@@ -1,3 +1,4 @@
+mod support;
 use async_trait::async_trait;
 use mnemoarc::{
     config::{Config, Project},
@@ -183,7 +184,7 @@ async fn cancelling_then_sending_a_changed_prompt_repairs_routing_and_finishes_t
         source_document_review: false,
         completion_review_enabled: false,
         projects: vec![project.clone()],
-        ..Default::default()
+        ..support::compact_config()
     };
     let state = WebState::new(config, dir.path().join("config.toml"), engine.clone()).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

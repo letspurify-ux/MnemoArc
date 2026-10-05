@@ -27,7 +27,7 @@ fn fixture() -> (tempfile::TempDir, Session) {
         Config {
             model: "gpt-4o".into(),
             model_context: Some(128000),
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.add_user(
@@ -70,7 +70,7 @@ fn review_uses_caller_criteria_without_promoting_agent_workflow_checks() {
         },
         Config {
             model: "gpt-4o".into(),
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.task.completion = vec!["Include the named controls in the manual".into()];

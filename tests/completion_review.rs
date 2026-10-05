@@ -1,3 +1,4 @@
+mod support;
 use anyhow::Result;
 use async_trait::async_trait;
 use mnemoarc::{
@@ -24,7 +25,7 @@ fn session(root: &std::path::Path) -> Session {
         Config {
             model: "gpt-4o".into(),
             model_context: Some(128000),
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.task.completion = vec!["Conclusion is saved".into(), "An example is saved".into()];
@@ -85,7 +86,7 @@ fn disabled_completion_review_is_not_required_by_first_request() {
             model: "gpt-4o".into(),
             model_context: Some(128000),
             completion_review_enabled: false,
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.task.completion = vec!["Manual saved".into()];
@@ -215,7 +216,7 @@ fn existing_document(root: &std::path::Path, before: &str) -> Session {
         Config {
             model: "gpt-4o".into(),
             model_context: Some(128000),
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.add_user("Fix three passages in the existing document; preserve every other passage.".into());
@@ -497,7 +498,7 @@ fn working_checks_cannot_add_requirements_or_weaken_caller_requirements() {
         },
         Config {
             model: "gpt-4o".into(),
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.task.completion = vec!["Include a conclusion and an example".into()];
@@ -563,7 +564,7 @@ fn verified_manual_gets_a_fresh_review_without_a_document_edit() {
         },
         Config {
             model: "gpt-4o".into(),
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.add_user("ui 사용자 매뉴얼 만들어줘".into());

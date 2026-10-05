@@ -1,3 +1,4 @@
+mod support;
 use axum::{Json, Router, http::StatusCode, routing::post};
 use mnemoarc::{
     config::{Config, Secret},
@@ -51,7 +52,7 @@ prompt = "Document main.rs with source evidence."
         disable_proxy: true,
         retries: 0,
         request_timeout_secs: 3,
-        ..Default::default()
+        ..support::compact_config()
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let result = tokio::time::timeout(

@@ -32,7 +32,7 @@ async fn launch(path: &std::path::Path) -> (String, WebState, tokio::task::JoinH
             root: path.into(),
             ..Default::default()
         }],
-        ..Default::default()
+        ..support::compact_config()
     };
     launch_config(path, c).await
 }
@@ -80,7 +80,7 @@ async fn shared_source_projects_keep_session_ownership_and_requests_separate() {
         model: "gpt-4o".into(),
         model_context: Some(128000),
         projects: vec![first.clone(), second.clone()],
-        ..Default::default()
+        ..support::compact_config()
     };
     let (url, state, server) = launch_config(dir.path(), config).await;
     let client = reqwest::Client::new();
@@ -250,7 +250,7 @@ async fn unavailable_saved_projects_do_not_prevent_startup_or_repair() {
             model: "gpt-4o".into(),
             model_context: Some(128000),
             projects,
-            ..Default::default()
+            ..support::compact_config()
         };
         let (url, state, server) = launch_config(dir.path(), config).await;
         let client = reqwest::Client::new();

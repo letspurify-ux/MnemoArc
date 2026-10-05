@@ -32,7 +32,7 @@ fn fixture() -> (tempfile::TempDir, Session, Value) {
         Config {
             model: "gpt-4o".into(),
             model_context: Some(128_000),
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.add_user("Write a source document covering the loop and history handling.".into());
@@ -333,7 +333,7 @@ async fn closing_reserve_finishes_steady_work_before_the_budget() {
             run_tokens: 1_000_000,
             source_document_review: false,
             completion_review_enabled: false,
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.add_user("Write out.md".into());
@@ -383,7 +383,7 @@ fn cleanup_output_reservation_is_bounded_so_large_outputs_keep_input_room() {
     let large = Config {
         context_tokens: 230_000,
         output_tokens: 32_000,
-        ..Default::default()
+        ..support::compact_config()
     };
     assert_eq!(
         ContextManager::cleanup_output_tokens(&large),
@@ -395,7 +395,7 @@ fn cleanup_output_reservation_is_bounded_so_large_outputs_keep_input_room() {
     let small = Config {
         context_tokens: 64_000,
         output_tokens: 8_000,
-        ..Default::default()
+        ..support::compact_config()
     };
     assert_eq!(ContextManager::cleanup_output_tokens(&small), 8_000);
 }
@@ -787,7 +787,7 @@ fn provider_usage_calibrates_estimated_token_counts() {
             model_context: Some(140_000),
             context_tokens: 140_000,
             output_tokens: 12_000,
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     assert_eq!(ContextManager::token_ratio(&s), 1.0);
@@ -933,7 +933,7 @@ fn closing_without_a_document_withholds_reading_until_it_is_written() {
         Config {
             model: "gpt-4o".into(),
             model_context: Some(128_000),
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.add_user("Write out.md about main.js".into());
@@ -978,7 +978,7 @@ async fn reading_new_sources_before_the_first_write_is_progress() {
             context_tokens: 128_000,
             output_tokens: 1_024,
             stall_round_limit: 2,
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.add_user("Document main.js with source evidence".into());
@@ -1034,7 +1034,7 @@ async fn discovery_tools_stay_available_until_the_document_exists() {
             context_tokens: 128_000,
             output_tokens: 1_024,
             stall_round_limit: 2,
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.add_user("Document backend/src/agent.js with source evidence".into());
@@ -1085,7 +1085,7 @@ fn missing_paths_suggest_similar_project_files_and_directories_list_entries() {
             exclude: vec![".env*".into()],
             ..Default::default()
         },
-        Config::default(),
+        support::compact_config(),
     );
     // Same stem, different extension.
     let error = tools::execute(&mut s, "file_read", json!({"path":"backend/agent.py"}))
@@ -1135,7 +1135,7 @@ fn source_search_accepts_a_directory_as_its_scope() {
             output: dir.path().join("out.md"),
             ..Default::default()
         },
-        Config::default(),
+        support::compact_config(),
     );
     let result = tools::execute(
         &mut s,
@@ -1167,7 +1167,7 @@ fn list_cursor_keeps_its_scope_when_the_glob_is_omitted() {
             output: dir.path().join("out.md"),
             ..Default::default()
         },
-        Config::default(),
+        support::compact_config(),
     );
     let first = tools::execute(
         &mut s,
@@ -1276,7 +1276,7 @@ fn a_truncated_checkpoint_id_still_acknowledges_the_checkpoint() {
             model_context: Some(64_000),
             context_tokens: 64_000,
             output_tokens: 4_000,
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.add_user("Work".into());
@@ -1315,7 +1315,7 @@ fn a_checkpoint_id_with_a_one_character_typo_still_acknowledges_the_checkpoint()
             model_context: Some(64_000),
             context_tokens: 64_000,
             output_tokens: 4_000,
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.add_user("Work".into());
@@ -1418,7 +1418,7 @@ async fn transient_empty_replies_are_retried_before_any_workflow_is_set() {
                 model_context: Some(128_000),
                 context_tokens: 128_000,
                 output_tokens: 1_024,
-                ..Default::default()
+                ..support::compact_config()
             },
         );
         s.add_user("What does this project do?".into());

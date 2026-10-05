@@ -1320,7 +1320,7 @@ mod tests {
             ..Default::default()
         };
         std::fs::write(&project.output, "# Manual\nOpen chat. main.js:1\n").unwrap();
-        let mut s = Session::new(project, crate::config::Config::default());
+        let mut s = Session::new(project, crate::config::Config::compact_test());
         s.add_user("Write a user manual.".into());
         (dir, s)
     }
@@ -1519,7 +1519,7 @@ mod tests {
 
     #[test]
     fn changed_length_target_does_not_reapply_the_initial_request() {
-        let mut s = Session::new(Project::default(), crate::config::Config::default());
+        let mut s = Session::new(Project::default(), crate::config::Config::compact_test());
         s.receive_message("문서를 800줄 내외로 작성해줘.".into())
             .unwrap();
         s.receive_message("목표를 300줄 내외로 바꿔줘.".into())
@@ -1584,7 +1584,7 @@ mod retention_tests {
 
     #[test]
     fn private_review_evidence_is_included_in_session_capacity() {
-        let mut s = Session::new(Project::default(), Config::default());
+        let mut s = Session::new(Project::default(), Config::compact_test());
         s.config.memory_bytes = 32 * 1024;
         assert!(s.check_limits(&s.config).is_ok());
         s.document_review.page_evidence =

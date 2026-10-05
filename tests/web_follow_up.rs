@@ -103,7 +103,7 @@ async fn default_follow_up_preserves_task_and_new_work_requires_a_new_session() 
             root: dir.path().into(),
             ..Default::default()
         }],
-        ..Default::default()
+        ..support::compact_config()
     };
     let state = WebState::new(config, dir.path().join("config.toml"), Arc::new(Script)).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

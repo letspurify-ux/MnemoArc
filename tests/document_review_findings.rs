@@ -1,3 +1,4 @@
+mod support;
 use mnemoarc::{
     config::{Config, Project},
     session::Session,
@@ -19,7 +20,7 @@ fn fixture() -> (tempfile::TempDir, Session) {
         },
         Config {
             model: "gpt-4o".into(),
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     session.add_user("UI 사용자 매뉴얼 만들어줘".into());

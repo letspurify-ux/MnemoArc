@@ -29,7 +29,7 @@ fn session(root: &std::path::Path) -> Session {
             context_tokens: 128_000,
             run_tokens: 500_000,
             stall_round_limit: 3,
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.add_user("Write result.txt with the requested result".into());

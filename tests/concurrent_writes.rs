@@ -1,8 +1,5 @@
-use mnemoarc::{
-    config::{Config, Project},
-    session::Session,
-    tools,
-};
+mod support;
+use mnemoarc::{config::Project, session::Session, tools};
 use serde_json::json;
 use std::sync::{Arc, Barrier};
 
@@ -20,7 +17,7 @@ fn document_and_project_writers_with_the_same_revision_have_one_winner() {
                 root: dir.path().into(),
                 output: if index % 2 == 0 { "shared.md".into() } else { format!("other-{index}.md").into() },
                 ..Default::default()
-            }, Config::default());
+            }, support::compact_config());
             session.active_tools.insert("document_edit".into());
             scope.spawn(move || {
                 let replacement = format!("# Shared\n\nWriter {index}.\n");

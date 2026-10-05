@@ -1,3 +1,4 @@
+mod support;
 #[cfg(unix)]
 #[test]
 fn non_utf8_environment_does_not_panic_during_config_load() {
@@ -8,9 +9,12 @@ fn non_utf8_environment_does_not_panic_during_config_load() {
         ("REVIEW_UNRELATED", "Configure model and model_context"),
         ("MNEMOARC_MODEL", "MNEMOARC_MODEL must contain valid UTF-8"),
     ] {
+        // The built-in model would send check to the provider; an empty
+        // model keeps the run offline at the configuration check.
         let result = std::process::Command::new(env!("CARGO_BIN_EXE_mnemoarc"))
             .current_dir(dir.path())
             .env_clear()
+            .env("MNEMOARC_MODEL", "")
             .env(key, std::ffi::OsString::from_vec(vec![0xff]))
             .args(["--config", "missing.toml", "check"])
             .output()
@@ -24,14 +28,13 @@ fn non_utf8_environment_does_not_panic_during_config_load() {
 #[cfg(unix)]
 #[test]
 fn saving_existing_config_preserves_its_file_mode() {
-    use mnemoarc::config::Config;
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     std::fs::write(&path, "old content").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-    Config::default().save(&path).unwrap();
+    support::compact_config().save(&path).unwrap();
     assert_eq!(
         std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o640
@@ -86,7 +89,7 @@ fn configuration_and_credentials_reject_fifos_without_waiting_for_eof() {
         assert!(error.unwrap().starts_with("unsupported_file_type:"));
         if !credentials {
             assert!(
-                Config::default()
+                support::compact_config()
                     .save(&path)
                     .unwrap_err()
                     .to_string()
@@ -113,9 +116,11 @@ fn optional_dotenv_fifo_does_not_block_startup() {
             .unwrap()
             .success()
     );
+    // An empty model keeps check offline (see the test above).
     let mut child = Command::new(env!("CARGO_BIN_EXE_mnemoarc"))
         .current_dir(dir.path())
         .env_clear()
+        .env("MNEMOARC_MODEL", "")
         .args(["--config", "missing.toml", "check"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -185,10 +190,61 @@ fn duplicate_project_ids_are_rejected_without_overwriting_config() {
                 ..project
             },
         ],
-        ..Default::default()
+        ..support::compact_config()
     };
     std::fs::write(&path, "original config").unwrap();
     assert!(config.validate().unwrap_err().to_string().contains("중복"));
     assert!(config.save(&path).is_err());
     assert_eq!(std::fs::read_to_string(path).unwrap(), "original config");
+}
+
+#[test]
+fn a_missing_config_file_loads_the_live_tested_settings() {
+    use mnemoarc::config::Config;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::load(&dir.path().join("missing.toml"), &Default::default()).unwrap();
+    assert_eq!(config.base_url, "https://openrouter.ai/api/v1");
+    assert_eq!(config.model, "stealth/space-bunny-alpha");
+    assert_eq!(config.model_context, Some(230000));
+    assert_eq!(
+        (config.context_tokens, config.output_tokens),
+        (160000, 16000)
+    );
+    assert_eq!(config.reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(
+        (config.memory_body_bytes, config.memory_bytes),
+        (32768, 33554432)
+    );
+    assert_eq!((config.high_water, config.low_water), (0.9, 0.4));
+    assert_eq!(
+        (config.request_timeout_secs, config.run_timeout_secs),
+        (600, 3600)
+    );
+    assert_eq!((config.run_tokens, config.review_limit), (10_000_000, 20));
+    assert!(config.source_document_review && config.completion_review_enabled);
+    config.runnable().unwrap();
+}
+
+#[test]
+fn cleared_optional_settings_survive_save_and_load() {
+    use mnemoarc::config::Config;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    // Both have a built-in value, so an omitted key would bring it back.
+    let config = Config {
+        model_context: None,
+        reasoning_effort: None,
+        ..Config::default()
+    };
+    config.save(&path).unwrap();
+    let loaded = Config::load(&path, &Default::default()).unwrap();
+    assert_eq!(loaded.model_context, None);
+    assert_eq!(loaded.reasoning_effort, None);
+    // Set values are saved as they are.
+    Config::default().save(&path).unwrap();
+    let loaded = Config::load(&path, &Default::default()).unwrap();
+    assert_eq!(loaded.model_context, Some(230000));
+    assert_eq!(loaded.reasoning_effort.as_deref(), Some("low"));
 }

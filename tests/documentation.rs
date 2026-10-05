@@ -1,3 +1,4 @@
+mod support;
 use mnemoarc::{
     config::{Config, Project},
     session::Session,
@@ -15,7 +16,7 @@ fn setup() -> (tempfile::TempDir, Session) {
         Config {
             model: "gpt-4o".into(),
             model_context: Some(128000),
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.active_tools = ToolRegistry::optional_names();

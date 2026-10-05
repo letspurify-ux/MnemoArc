@@ -1,3 +1,4 @@
+mod support;
 use async_trait::async_trait;
 use mnemoarc::{
     agent::{AgentEvent, run_session},
@@ -65,7 +66,7 @@ fn fixture(path: &std::path::Path) -> Session {
             model_context: Some(128_000),
             source_document_review: false,
             completion_review_enabled: false,
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.add_user("First request".into());

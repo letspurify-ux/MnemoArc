@@ -1,3 +1,4 @@
+mod support;
 use axum::{Router, http::header, response::IntoResponse, routing::post};
 use mnemoarc::{
     config::Config,
@@ -71,7 +72,7 @@ async fn completion_terminator_ignores_later_events_in_the_same_chunk() {
     let config = Config {
         base_url: url,
         retries: 0,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let result = OpenAiClient
@@ -98,7 +99,7 @@ async fn system_dns_preserves_the_explicit_port_of_a_local_completion_server() {
         base_url: url.replace("127.0.0.1", "localhost"),
         disable_proxy: true,
         retries: 0,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let completion = OpenAiClient
@@ -178,7 +179,7 @@ async fn connection_probe_requires_valid_plain_and_final_answers() {
             model: "probe-model".into(),
             model_context: Some(128_000),
             retries: 0,
-            ..Default::default()
+            ..support::compact_config()
         };
         let result = OpenAiClient.probe(&config).await;
         server.abort();
@@ -213,7 +214,7 @@ async fn connection_probe_rejects_a_tool_call_with_the_wrong_arguments() {
             model: "probe-arguments-test-model".into(),
             model_context: Some(128_000),
             retries: 0,
-            ..Default::default()
+            ..support::compact_config()
         };
         let result = OpenAiClient.probe(&config).await;
         server.abort();
@@ -233,7 +234,7 @@ async fn completion_terminator_ignores_invalid_utf8_after_the_final_event() {
         base_url: url,
         retries: 0,
         disable_proxy: true,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let result = OpenAiClient
@@ -310,7 +311,7 @@ async fn connection_probe_times_out_despite_stream_keepalives() {
         run_timeout_secs: 1,
         retries: 0,
         disable_proxy: true,
-        ..Default::default()
+        ..support::compact_config()
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let result = tokio::time::timeout(Duration::from_secs(3), OpenAiClient.probe(&config)).await;
@@ -332,7 +333,7 @@ async fn assemble_interleaved_calls_and_usage() {
         base_url: url,
         model: "mock".into(),
         model_context: Some(64000),
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _) = tokio::sync::mpsc::channel(8);
     let out = OpenAiClient
@@ -376,7 +377,7 @@ async fn oversized_tool_identity_and_batch_are_rejected_during_streaming() {
         let config = Config {
             base_url: url,
             retries: 0,
-            ..Default::default()
+            ..support::compact_config()
         };
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let error = OpenAiClient
@@ -400,7 +401,7 @@ async fn incomplete_stream_never_returns_calls() {
     let (url, server) = server(body).await;
     let c = Config {
         base_url: url,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _) = tokio::sync::mpsc::channel(8);
     assert!(
@@ -424,7 +425,7 @@ async fn stop_finish_never_exposes_an_incomplete_tool_call() {
     let config = Config {
         base_url: url,
         retries: 0,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let error = OpenAiClient
@@ -457,7 +458,7 @@ async fn repeated_identical_finish_reason_accepts_provider_tool_call_stream() {
     let config = Config {
         base_url: url,
         retries: 0,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let completion = OpenAiClient
@@ -508,7 +509,7 @@ async fn contradictory_stream_finish_reasons_never_complete() {
         let config = Config {
             base_url: url,
             retries: 0,
-            ..Default::default()
+            ..support::compact_config()
         };
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let result = OpenAiClient
@@ -532,7 +533,7 @@ async fn missing_usage_is_not_zero() {
     let (url, server) = server(body).await;
     let c = Config {
         base_url: url,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let result = OpenAiClient
@@ -580,7 +581,7 @@ async fn disabling_thinking_overrides_saved_qwen_reasoning_effort() {
         model_context: Some(1_000_000),
         reasoning_effort: Some("xhigh".into()),
         enable_thinking: false,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     OpenAiClient
@@ -616,7 +617,7 @@ async fn retries_transient_http_error_before_accepting_a_complete_stream() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let c = Config {
         base_url: format!("http://{}", listener.local_addr().unwrap()),
-        ..Default::default()
+        ..support::compact_config()
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
@@ -683,7 +684,7 @@ async fn retries_provider_finish_error_without_accepting_partial_calls() {
     let c = Config {
         base_url: url,
         retries: 1,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let out = OpenAiClient
@@ -716,7 +717,7 @@ async fn retries_malformed_tool_arguments_once_then_returns_only_complete_call()
     let c = Config {
         base_url: url,
         retries: 2,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let out = OpenAiClient
@@ -741,7 +742,7 @@ async fn repeated_provider_finish_error_stops_at_retry_limit() {
     let c = Config {
         base_url: url,
         retries: 2,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let error = OpenAiClient
@@ -780,7 +781,7 @@ async fn interrupted_stream_is_retried_until_the_retry_limit() {
     let c = Config {
         base_url: url,
         retries: 1,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let out = OpenAiClient
@@ -800,7 +801,7 @@ async fn interrupted_stream_is_retried_until_the_retry_limit() {
     let c = Config {
         base_url: url,
         retries: 1,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let error = OpenAiClient
@@ -820,7 +821,7 @@ async fn interrupted_stream_after_visible_text_is_not_retried() {
     let c = Config {
         base_url: url,
         retries: 2,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     let error = OpenAiClient
@@ -845,7 +846,7 @@ async fn malformed_sse_event_is_labeled_and_retried_once() {
     let c = Config {
         base_url: url,
         retries: 2,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let out = OpenAiClient
@@ -872,7 +873,7 @@ async fn length_retains_last_delta_and_usage_but_discards_entire_tool_batch() {
     let (url, server) = server(body).await;
     let config = Config {
         base_url: url,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     let result = OpenAiClient
@@ -905,7 +906,7 @@ async fn length_without_done_remains_a_stream_error() {
     let config = Config {
         base_url: url,
         retries: 0,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _) = tokio::sync::mpsc::channel(8);
     let error = OpenAiClient
@@ -928,7 +929,7 @@ async fn malformed_request_and_extreme_timeout_return_errors_without_panicking()
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let result = std::panic::AssertUnwindSafe(OpenAiClient.complete(
             request,
-            &Config::default(),
+            &support::compact_config(),
             CancellationToken::new(),
             tx,
         ))
@@ -939,7 +940,7 @@ async fn malformed_request_and_extreme_timeout_return_errors_without_panicking()
     }
     let c = Config {
         request_timeout_secs: u64::MAX,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
     let result = std::panic::AssertUnwindSafe(OpenAiClient.complete(
@@ -966,7 +967,7 @@ async fn cancelling_openai_client_unblocks_a_full_delta_channel() {
     let c = Config {
         base_url: url,
         request_timeout_secs: 60,
-        ..Default::default()
+        ..support::compact_config()
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
     let observer = tx.clone();
@@ -1035,7 +1036,7 @@ async fn rejected_json_schema_degrades_to_json_mode_and_is_remembered() {
     let c = Config {
         base_url: format!("http://{}", listener.local_addr().unwrap()),
         model: "schema-fallback-test-model".into(),
-        ..Default::default()
+        ..support::compact_config()
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
@@ -1083,7 +1084,7 @@ async fn rejected_json_mode_records_fallback_without_response_format() {
     let config = Config {
         base_url: format!("http://{}", listener.local_addr().unwrap()),
         retries: 0,
-        ..Default::default()
+        ..support::compact_config()
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
@@ -1128,7 +1129,7 @@ async fn sse_schema_failure_is_cached_after_two_recoveries_and_only_for_that_sch
         base_url: format!("http://{}", listener.local_addr().unwrap()),
         model: "schema-stream-recovery".into(),
         retries: 0,
-        ..Default::default()
+        ..support::compact_config()
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let mut request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
@@ -1205,7 +1206,7 @@ async fn an_outage_cleared_by_the_json_mode_attempt_keeps_strict_schema_output()
         base_url: format!("http://{}", listener.local_addr().unwrap()),
         model: "schema-outage-cleared".into(),
         retries: 0,
-        ..Default::default()
+        ..support::compact_config()
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
@@ -1256,7 +1257,7 @@ async fn an_outage_in_both_formats_is_bounded_and_does_not_poison_schema_cache()
         base_url: format!("http://{}", listener.local_addr().unwrap()),
         model: "schema-outage-recovery".into(),
         retries: 0,
-        ..Default::default()
+        ..support::compact_config()
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
@@ -1318,7 +1319,7 @@ async fn request_timeout_bounds_silence_not_a_long_streaming_answer() {
         base_url: format!("http://{}", listener.local_addr().unwrap()),
         request_timeout_secs: 1,
         retries: 0,
-        ..Default::default()
+        ..support::compact_config()
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
@@ -1365,7 +1366,7 @@ async fn silent_request_times_out_and_is_retried() {
         base_url: format!("http://{}", listener.local_addr().unwrap()),
         request_timeout_secs: 1,
         retries: 1,
-        ..Default::default()
+        ..support::compact_config()
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
@@ -1417,7 +1418,7 @@ async fn transient_error_events_in_a_stream_are_retried_and_others_are_not() {
         let c = Config {
             base_url: format!("http://{}", listener.local_addr().unwrap()),
             retries: 1,
-            ..Default::default()
+            ..support::compact_config()
         };
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let (tx, _rx) = tokio::sync::mpsc::channel(8);

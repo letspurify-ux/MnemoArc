@@ -1,5 +1,6 @@
+mod support;
 use mnemoarc::{
-    config::{Config, Project},
+    config::Project,
     llm::{MAX_TOOL_CALL_ID_BYTES, ToolCall},
     session::Session,
     tools::{self, ToolRegistry},
@@ -13,7 +14,7 @@ fn session(root: &std::path::Path) -> Session {
             root: root.into(),
             ..Default::default()
         },
-        Config::default(),
+        support::compact_config(),
     );
     session.active_tools = ToolRegistry::optional_names();
     session

@@ -1,3 +1,4 @@
+mod support;
 use anyhow::Result;
 use async_trait::async_trait;
 use mnemoarc::{
@@ -23,7 +24,7 @@ fn session(root: &std::path::Path) -> Session {
             model: "gpt-4o".into(),
             model_context: Some(128000),
             completion_review_enabled: false,
-            ..Default::default()
+            ..support::compact_config()
         },
     )
 }

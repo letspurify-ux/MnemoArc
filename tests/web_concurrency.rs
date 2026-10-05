@@ -1,3 +1,4 @@
+mod support;
 use async_trait::async_trait;
 use mnemoarc::{
     config::{Config, Project},
@@ -61,7 +62,7 @@ impl App {
             max_concurrent_sessions: limit,
             completion_review_enabled: false,
             projects: vec![project.clone()],
-            ..Default::default()
+            ..support::compact_config()
         };
         let llm = Arc::new(Controlled {
             finish: ["first", "second", "third"]
@@ -384,7 +385,7 @@ fn concurrency_limit_is_bounded_and_old_configs_get_the_default() {
         assert!(
             Config {
                 max_concurrent_sessions: limit,
-                ..Default::default()
+                ..support::compact_config()
             }
             .validate()
             .is_err()
@@ -394,7 +395,7 @@ fn concurrency_limit_is_bounded_and_old_configs_get_the_default() {
         assert!(
             Config {
                 max_concurrent_sessions: limit,
-                ..Default::default()
+                ..support::compact_config()
             }
             .validate()
             .is_ok()

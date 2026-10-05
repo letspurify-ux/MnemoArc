@@ -200,7 +200,7 @@ mod tests {
 
     #[test]
     fn records_are_bounded_and_survive_a_new_question() {
-        let mut s = Session::new(Project::default(), Config::default());
+        let mut s = Session::new(Project::default(), Config::compact_test());
         for index in 0..RUN_HISTORY_LIMIT + 2 {
             s.add_user(format!("Question {index}"));
             s.begin_run();

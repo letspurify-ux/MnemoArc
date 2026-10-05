@@ -1,3 +1,4 @@
+mod support;
 use async_trait::async_trait;
 use mnemoarc::{
     agent::{AgentEvent, RunCommand, run_session, run_session_controlled},
@@ -97,7 +98,7 @@ async fn cancelled(root: &std::path::Path) -> Session {
             output_tokens: 1024,
             source_document_review: false,
             completion_review_enabled: false,
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.select_workflow("source_document").unwrap();

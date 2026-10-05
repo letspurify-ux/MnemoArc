@@ -3267,7 +3267,7 @@ mod path_display_tests {
                 output: output.into(),
                 ..Default::default()
             },
-            Config::default(),
+            Config::compact_test(),
         );
         session.last_error = Some(error.into());
         session.completion_gaps = vec![error.into()];
@@ -3352,7 +3352,7 @@ mod review_gap_tests {
             },
             Config {
                 model: "gpt-4o".into(),
-                ..Default::default()
+                ..Config::compact_test()
             },
         );
         s.add_user("Fix only section A in the existing document.".into());
@@ -3413,7 +3413,7 @@ mod review_gap_tests {
             Config {
                 model: "gpt-4o".into(),
                 source_document_review: false,
-                ..Default::default()
+                ..Config::compact_test()
             },
         );
         s.add_user("ui 사용자 매뉴얼 만들어줘".into());
@@ -3505,7 +3505,7 @@ mod review_gap_tests {
             },
             Config {
                 completion_review_enabled: false,
-                ..Default::default()
+                ..Config::compact_test()
             },
         );
         s.add_user("Document the loop.".into());
@@ -3910,7 +3910,7 @@ mod worker_wait_tests {
         assert!(!cancel.is_cancelled());
     }
     fn session() -> Session {
-        Session::new(Project::default(), Config::default())
+        Session::new(Project::default(), Config::compact_test())
     }
 
     #[tokio::test]
@@ -4242,7 +4242,7 @@ mod provider_outage_tests {
                 source_document_review: false,
                 completion_review_enabled: false,
                 run_timeout_secs: 3600,
-                ..Default::default()
+                ..Config::compact_test()
             },
         );
         s.add_user("First request".into());
@@ -4434,7 +4434,7 @@ mod review_usage_tests {
                 source_document_review: !completion,
                 completion_review_enabled: completion,
                 run_timeout_secs: 3600,
-                ..Default::default()
+                ..Config::compact_test()
             },
         );
         session.select_workflow("source_document").unwrap();

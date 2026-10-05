@@ -1,3 +1,4 @@
+mod support;
 use mnemoarc::{
     config::{Config, Project},
     session::Session,
@@ -20,7 +21,7 @@ fn setup(files: &[(&str, &str)]) -> (tempfile::TempDir, Session) {
         },
         Config {
             model: "gpt-4o".into(),
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     (dir, session)

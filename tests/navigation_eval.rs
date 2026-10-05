@@ -1,4 +1,5 @@
 //! Explicit paid-model regressions. Oracles check facts, not prose keywords.
+mod support;
 use mnemoarc::{
     agent,
     config::{Config, Project, Secret},
@@ -356,7 +357,7 @@ fn correct_facts_and_valid_citations_still_require_delivered_implementation() {
     assert!(check_facts("java", &answer).is_empty());
     assert!(check_citations(&project, &answer).is_empty());
     assert_eq!(check_evidence("java", &project, &answer, &[]).len(), 4);
-    let mut s = Session::new(project.clone(), Config::default());
+    let mut s = Session::new(project.clone(), support::compact_config());
     s.active_tools = ["code_outline", "file_read"]
         .into_iter()
         .map(str::to_owned)
@@ -390,7 +391,7 @@ fn contract_citation_does_not_replace_reading_the_implementation() {
         root: dir.path().into(),
         ..Default::default()
     };
-    let mut s = Session::new(project.clone(), Config::default());
+    let mut s = Session::new(project.clone(), support::compact_config());
     s.active_tools.insert("file_read".into());
     let answer = json!({"citations":[
         {"path":"backend/src/abort.js","start":1,"end":3},

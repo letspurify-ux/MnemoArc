@@ -158,7 +158,7 @@ mod tests {
                 root: dir.path().into(),
                 ..Default::default()
             },
-            Config::default(),
+            Config::compact_test(),
         );
         let held = FILE_WRITES.lock().unwrap();
         let (sent, received) = std::sync::mpsc::channel();
@@ -192,7 +192,7 @@ mod tests {
                 root: dir.path().into(),
                 ..Default::default()
             },
-            Config::default(),
+            Config::compact_test(),
         );
         let uncertain = session.write_outcome_uncertain.clone();
         let cancel = CancellationToken::new();
@@ -226,7 +226,7 @@ mod tests {
                 root: dir.path().into(),
                 ..Default::default()
             },
-            Config::default(),
+            Config::compact_test(),
         );
         tools::execute(
             &mut other,

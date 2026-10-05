@@ -25,7 +25,7 @@ fn session(root: &std::path::Path) -> Session {
         Config {
             model: "gpt-4o".into(),
             model_context: Some(128000),
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.active_tools = tools::ToolRegistry::optional_names();
@@ -57,14 +57,14 @@ fn extreme_pagination_and_budget_inputs_do_not_panic() {
     let c = Config {
         context_tokens: usize::MAX,
         output_tokens: usize::MAX / 3,
-        ..Default::default()
+        ..support::compact_config()
     };
     // Saturating arithmetic: an extreme output limit never panics.
     assert!(ContextManager::input_budget(&c) < c.context_tokens);
     let c = Config {
         context_tokens: 10_000,
         output_tokens: usize::MAX / 3,
-        ..Default::default()
+        ..support::compact_config()
     };
     assert_eq!(ContextManager::input_budget(&c), 0);
     assert!(c.validate().is_err());
@@ -73,7 +73,7 @@ fn extreme_pagination_and_budget_inputs_do_not_panic() {
         "tool_timeout_secs",
         "run_timeout_secs",
     ] {
-        let mut value = serde_json::to_value(Config::default()).unwrap();
+        let mut value = serde_json::to_value(support::compact_config()).unwrap();
         value[field] = json!(u64::MAX);
         assert!(
             serde_json::from_value::<Config>(value)

@@ -980,7 +980,7 @@ mod retention_tests {
             },
             Config {
                 model: "gpt-4o".into(),
-                ..Default::default()
+                ..Config::compact_test()
             },
         );
         s.receive_message("Fix Old.; preserve other text.".into())
@@ -1046,7 +1046,7 @@ mod retention_tests {
 
     #[test]
     fn amended_requirements_are_in_every_review_page_and_invalidate_cached_verdicts() {
-        let mut s = Session::new(Project::default(), Config::default());
+        let mut s = Session::new(Project::default(), Config::compact_test());
         s.receive_message("문서를 800줄 내외로 작성해줘. 원본은 유지해.".into())
             .unwrap();
         s.select_workflow("source_document").unwrap();
@@ -1081,7 +1081,7 @@ mod retention_tests {
     #[test]
     fn private_acceptance_payload_and_write_log_are_included_in_session_capacity() {
         for write_log in [false, true] {
-            let mut s = Session::new(Project::default(), Config::default());
+            let mut s = Session::new(Project::default(), Config::compact_test());
             s.config.memory_bytes = 32 * 1024;
             let retained = "x".repeat(s.config.memory_bytes);
             if write_log {

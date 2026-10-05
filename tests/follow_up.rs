@@ -1,3 +1,4 @@
+mod support;
 use async_trait::async_trait;
 use mnemoarc::{
     agent::{AgentEvent, run_session},
@@ -22,7 +23,7 @@ fn fixture(root: &std::path::Path) -> Session {
         Config {
             model: "gpt-4o".into(),
             model_context: Some(128000),
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.add_user("Write the original document".into());

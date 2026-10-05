@@ -1,3 +1,4 @@
+mod support;
 use mnemoarc::{
     config::{Config, Project},
     context::{self, ContextManager},
@@ -11,7 +12,7 @@ fn config() -> Config {
     Config {
         model: "gpt-4o".into(),
         model_context: Some(128000),
-        ..Default::default()
+        ..support::compact_config()
     }
 }
 fn input(key: &str, body: &str, rev: Option<u64>) -> MemoryInput {
@@ -345,7 +346,7 @@ fn settings_validation_and_lowering_keeps_original() {
 fn llm_transport_settings_are_validated_and_endpoint_is_composed_safely() {
     let mut c = Config {
         base_url: "ftp://example.com/v1".into(),
-        ..Default::default()
+        ..support::compact_config()
     };
     assert!(c.validate().is_err());
 

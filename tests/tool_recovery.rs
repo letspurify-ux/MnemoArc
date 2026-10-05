@@ -1,3 +1,4 @@
+mod support;
 use mnemoarc::{
     config::{Config, Project},
     llm::ToolCall,
@@ -43,7 +44,7 @@ fn session(root: &std::path::Path) -> Session {
         Config {
             model: "gpt-4o".into(),
             model_context: Some(128000),
-            ..Default::default()
+            ..support::compact_config()
         },
     );
     s.active_tools = ToolRegistry::optional_names();
@@ -222,7 +223,7 @@ fn failure_budget_is_per_tool_and_error_not_arguments_or_unrelated_success() {
 #[test]
 fn changing_unsupported_tool_names_cannot_restart_the_failure_budget() {
     let mut failures = FailureTracker::default();
-    let mut s = Session::new(Project::default(), Config::default());
+    let mut s = Session::new(Project::default(), support::compact_config());
     for index in 0..3 {
         let call = ToolCall {
             id: format!("unknown-{index}"),

@@ -172,7 +172,7 @@ mod tests {
                     root: dir.into(),
                     ..Default::default()
                 }],
-                ..Default::default()
+                ..Config::compact_test()
             },
             dir.join("config.toml"),
             Arc::new(OpenAiClient),

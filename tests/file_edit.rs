@@ -1,8 +1,5 @@
-use mnemoarc::{
-    config::{Config, Project},
-    session::Session,
-    tools,
-};
+mod support;
+use mnemoarc::{config::Project, session::Session, tools};
 use serde_json::{Value, json};
 
 fn setup() -> (tempfile::TempDir, Session) {
@@ -13,7 +10,7 @@ fn setup() -> (tempfile::TempDir, Session) {
             output: dir.path().join("summary.md"),
             ..Default::default()
         },
-        Config::default(),
+        support::compact_config(),
     );
     (dir, session)
 }
@@ -288,7 +285,7 @@ fn unicode_normalization_aliases_cannot_bypass_output_or_exclusions() {
             exclude: vec!["résumé.txt".into()],
             ..Default::default()
         },
-        Config::default(),
+        support::compact_config(),
     );
     let output_alias = "cafe\u{301}.md";
     let excluded_alias = "re\u{301}sume\u{301}.txt";
@@ -327,7 +324,7 @@ fn unicode_casefold_aliases_cannot_bypass_output_or_exclusions() {
             exclude: vec!["ﬁle.txt".into()],
             ..Default::default()
         },
-        Config::default(),
+        support::compact_config(),
     );
     let output_alias = dir.path().join("STRASSE.md");
     std::fs::write(&output_alias, "probe").unwrap();

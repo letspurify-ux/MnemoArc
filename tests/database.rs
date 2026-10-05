@@ -1,3 +1,4 @@
+mod support;
 use mnemoarc::{
     config::Config,
     database::{DatabaseConfig, QueryParam, SavedQuery},
@@ -19,7 +20,7 @@ fn query(id: &str, enabled: bool, sql: &str) -> SavedQuery {
 
 #[test]
 fn database_is_user_gated_and_queries_are_individual() {
-    let mut config = Config::default();
+    let mut config = support::compact_config();
     config.database.queries = vec![
         query("allowed", true, "SELECT 1 FROM dual"),
         query("blocked", false, "SELECT 2 FROM dual"),

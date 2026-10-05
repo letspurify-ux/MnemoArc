@@ -1243,7 +1243,7 @@ mod history_tests {
                 output: dir.path().join("out.md"),
                 ..Default::default()
             },
-            Config::default(),
+            Config::compact_test(),
         );
         s.select_workflow("source_document").unwrap();
         s.receive_message("Write kept and removed chapters".into())
@@ -1298,7 +1298,7 @@ mod history_tests {
 
     #[test]
     fn explicit_changes_preserve_artifacts_and_unaffected_work_and_invalidate_old_reviews() {
-        let mut s = Session::new(Project::default(), Config::default());
+        let mut s = Session::new(Project::default(), Config::compact_test());
         s.select_workflow("source_document").unwrap();
         s.receive_message("Write both chapters, around 800 lines".into())
             .unwrap();
@@ -1351,7 +1351,7 @@ mod history_tests {
 
     #[test]
     fn rejected_message_admission_is_atomic_and_completed_tasks_do_not_offer_resume() {
-        let mut s = Session::new(Project::default(), Config::default());
+        let mut s = Session::new(Project::default(), Config::compact_test());
         s.receive_message("Task".into()).unwrap();
         s.status = "complete".into();
         assert!(!s.can_resume());

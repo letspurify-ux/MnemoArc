@@ -5,39 +5,39 @@ model_context = 1000000
 # proxy = "http://localhost:8080"
 # Takes precedence over proxy and disables environment/system proxy detection.
 disable_proxy = false
-# reasoning_effort = "xhigh"
+reasoning_effort = "low"
 # Qwen thinking/reasoning toggle. false maps to reasoning_effort = "none".
 enable_thinking = true
 api_key_env = "OPENROUTER_API_KEY"
-context_tokens = 64000
-output_tokens = 8000
+context_tokens = 160000
+output_tokens = 16000
 legacy_max_tokens = false
 stream_usage = true
 memory_count = 1000
 recent_count = 20
 related_count = 5
 memory_reuse = true
-memory_body_bytes = 8192
-memory_bytes = 16777216
+memory_body_bytes = 32768
+memory_bytes = 33554432
 history_bytes = 67108864
 state_tokens = 2000
 index_tokens = 4000
 result_tokens = 4000
 batch_tokens = 8000
 checkpoint_tokens = 4000
-high_water = 0.8
-low_water = 0.6
+high_water = 0.9
+low_water = 0.4
 read_parallelism = 4
 # App-wide limit (1..32). Lowering it does not cancel existing runs.
 max_concurrent_sessions = 4
 # Seconds to wait for response headers and for each silent gap in the stream;
 # a long answer that keeps streaming is not cut off. Timeouts are retried.
-request_timeout_secs = 180
+request_timeout_secs = 600
 tool_timeout_secs = 30
 retries = 2
-run_timeout_secs = 1800
-run_tokens = 500000
-review_limit = 3
+run_timeout_secs = 3600
+run_tokens = 10000000
+review_limit = 20
 # Budget fractions: prioritize drafting, then verification, then close out the
 # document with unresolved items reported (0 < closing < verification < writing).
 writing_reserve_ratio = 0.5

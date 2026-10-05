@@ -1,7 +1,31 @@
 #[allow(dead_code)]
 pub mod document_review;
-use mnemoarc::llm::Completion;
+use mnemoarc::{config::Config, llm::Completion};
 use serde_json::{Value, json};
+
+/// The compact 64K-context profile these tests were written against, kept
+/// apart from Config::default so a default change does not rewrite their
+/// scenarios (Config::compact_test in src/config.rs holds the same profile).
+#[allow(dead_code)]
+pub fn compact_config() -> Config {
+    Config {
+        base_url: "https://api.openai.com/v1".into(),
+        model: String::new(),
+        model_context: None,
+        context_tokens: 64000,
+        output_tokens: 8000,
+        reasoning_effort: None,
+        memory_body_bytes: 8192,
+        memory_bytes: 16 * 1024 * 1024,
+        high_water: 0.8,
+        low_water: 0.6,
+        request_timeout_secs: 180,
+        run_timeout_secs: 1800,
+        run_tokens: 500000,
+        review_limit: 3,
+        ..Config::default()
+    }
+}
 
 /// Existing workflow fixtures test structural gates. Supply an explicit model
 /// acceptance verdict for the additional independent review; semantic rejection

@@ -21,6 +21,21 @@ pub(crate) fn deadline_after(seconds: u64) -> Result<std::time::Instant> {
         .ok_or_else(|| anyhow::anyhow!("invalid_timeout: timeout exceeds supported clock range"))
 }
 
+/// TOML has no null and an omitted key loads its built-in default, so a
+/// cleared optional setting whose default is set is saved as a marker that is
+/// not a usable value: a zero context or an empty effort.
+#[derive(Serialize)]
+struct SavedConfig<'a> {
+    #[serde(flatten)]
+    config: &'a Config,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_context: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
+}
+const UNSET_MODEL_CONTEXT: usize = 0;
+const UNSET_REASONING_EFFORT: &str = "";
+
 #[derive(Clone)]
 pub struct Secret(pub String);
 impl std::fmt::Debug for Secret {
@@ -125,15 +140,15 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             api_key: None,
-            base_url: "https://api.openai.com/v1".into(),
-            model: String::new(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            model: "stealth/space-bunny-alpha".into(),
             api_key_env: "OPENAI_API_KEY".into(),
             proxy: None,
             disable_proxy: false,
-            model_context: None,
-            context_tokens: 64000,
-            output_tokens: 8000,
-            reasoning_effort: None,
+            model_context: Some(230000),
+            context_tokens: 160000,
+            output_tokens: 16000,
+            reasoning_effort: Some("low".into()),
             enable_thinking: true,
             legacy_max_tokens: false,
             stream_usage: true,
@@ -141,30 +156,30 @@ impl Default for Config {
             recent_count: 20,
             related_count: 5,
             memory_reuse: true,
-            memory_body_bytes: 8192,
-            memory_bytes: 16 * 1024 * 1024,
+            memory_body_bytes: 32 * 1024,
+            memory_bytes: 32 * 1024 * 1024,
             history_bytes: 64 * 1024 * 1024,
             state_tokens: 2000,
             index_tokens: 4000,
             result_tokens: 4000,
             batch_tokens: 8000,
             checkpoint_tokens: 4000,
-            high_water: 0.8,
-            low_water: 0.6,
+            high_water: 0.9,
+            low_water: 0.4,
             read_parallelism: 4,
             max_concurrent_sessions: 4,
-            request_timeout_secs: 180,
+            request_timeout_secs: 600,
             tool_timeout_secs: 30,
             retries: 2,
-            run_timeout_secs: 1800,
-            run_tokens: 500000,
+            run_timeout_secs: 3600,
+            run_tokens: 10_000_000,
             writing_reserve_ratio: 0.5,
             verification_reserve_ratio: 0.25,
             closing_reserve_ratio: 0.1,
             repeated_read_limit: 2,
             stall_round_limit: 8,
             database: crate::database::DatabaseConfig::default(),
-            review_limit: 3,
+            review_limit: 20,
             document_repair_limit: 8,
             retired_source_answer_review: None,
             source_document_review: true,
@@ -174,6 +189,30 @@ impl Default for Config {
     }
 }
 impl Config {
+    /// The compact 64K-context profile unit tests were written against, kept
+    /// apart from the defaults so a default change does not rewrite their
+    /// scenarios (tests/support/mod.rs holds the same profile).
+    #[cfg(test)]
+    pub(crate) fn compact_test() -> Self {
+        Self {
+            base_url: "https://api.openai.com/v1".into(),
+            model: String::new(),
+            model_context: None,
+            context_tokens: 64000,
+            output_tokens: 8000,
+            reasoning_effort: None,
+            memory_body_bytes: 8192,
+            memory_bytes: 16 * 1024 * 1024,
+            high_water: 0.8,
+            low_water: 0.6,
+            request_timeout_secs: 180,
+            run_timeout_secs: 1800,
+            run_tokens: 500000,
+            review_limit: 3,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn ensure_project_ids(&mut self) -> Result<()> {
         for project in &mut self.projects {
             project.ensure_id();
@@ -359,6 +398,13 @@ impl Config {
         for (k, v) in overrides {
             value[k] = v.clone();
         }
+        // Markers written by save() for cleared settings (see SavedConfig).
+        if value["model_context"] == UNSET_MODEL_CONTEXT {
+            value["model_context"] = serde_json::Value::Null;
+        }
+        if value["reasoning_effort"] == UNSET_REASONING_EFFORT {
+            value["reasoning_effort"] = serde_json::Value::Null;
+        }
         let mut config: Self = serde_json::from_value(value)?;
         config.ensure_project_ids()?;
         let credentials = path.with_extension("credentials.json");
@@ -381,7 +427,18 @@ impl Config {
         std::fs::create_dir_all(parent)?;
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
         use std::io::Write;
-        temp.write_all(toml::to_string_pretty(&config)?.as_bytes())?;
+        let saved = SavedConfig {
+            config: &config,
+            model_context: config
+                .model_context
+                .is_none()
+                .then_some(UNSET_MODEL_CONTEXT),
+            reasoning_effort: config
+                .reasoning_effort
+                .is_none()
+                .then_some(UNSET_REASONING_EFFORT),
+        };
+        temp.write_all(toml::to_string_pretty(&saved)?.as_bytes())?;
         // Replacing a file with NamedTempFile otherwise changes an existing
         // config's access mode to the temporary file's private default.
         match std::fs::metadata(path) {
