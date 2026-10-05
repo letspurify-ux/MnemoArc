@@ -35,7 +35,7 @@
 
 ## Markdown·Mermaid 형식 검사
 
-`source_document` 작업에서 `document_edit`와 `document_edit_batch`는 저장 직후 `format_check`를 반환한다. 오류가 있는 초안도 저장되므로 다음 편집에서 고칠 수 있다. `document_audit`는 같은 검사를 다시 실행해 형식 오류를 기존 출처·조사 오류와 함께 `issues`에 넣는다. `investigation.final_check`와 실행부의 최종 완료 검사도 이 결과를 사용하므로 형식 오류가 남으면 구조 검사에 통과하지 못한다. 일반 `answer` 작업의 편집 결과는 기존처럼 저장 정보만 반환한다.
+`source_document` 작업에서 `document_edit`와 `document_edit_batch`는 저장 직후 인용 경로·줄 범위를 검사한 `citation_check`와 형식 검사 결과인 `format_check`를 함께 반환한다. 오류가 있는 초안도 저장되므로 다음 편집에서 고칠 수 있다. 조사 항목의 완료 여부는 저장 시점이 아니라 감사에서 검사한다. `document_audit`는 인용과 형식 검사를 다시 실행해 형식 오류를 출처·조사 오류와 함께 `issues`에 넣는다. `investigation.final_check`와 실행부의 최종 완료 검사도 이 결과를 사용하므로 형식 오류가 남으면 구조 검사에 통과하지 못한다. 일반 `answer` 작업의 편집 결과는 기존처럼 저장 정보만 반환한다.
 
 Markdown은 `comrak`의 GFM AST로 실제 표와 코드 펜스의 범위를 찾는다. 표는 원문 행의 열 수를 머리글과 비교한다. GFM이 부족한 셀을 빈칸으로 채우거나 넘치는 셀을 버려도 `markdown_table_columns`로 알린다. 머리글과 구분 행의 열 수 불일치, 잘못된 구분 행, 닫히지 않은 코드 펜스도 검사한다. 빈 셀과 이스케이프한 `\|`는 허용하며 목록·인용 안의 표와 펜스도 검사한다. 일반 코드 예시와 HTML 주석 안의 내용은 문서 문법으로 검사하지 않는다.
 

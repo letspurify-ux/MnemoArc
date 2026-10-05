@@ -15,7 +15,7 @@
 - 실제 전달 범위·cursor를 따르고 조사한 섹션을 하나씩 저장하도록 안내한다. 짧은 첫 섹션을 `create`로 저장하고, 이후 현재 목차를 확인해 끝에 둘 섹션은 `append`, 중간에 둘 섹션은 `insert_before`·`insert_after`, 기존 섹션 수정은 `section`으로 처리한다. 읽지 않은 내용을 채우도록 강요하지 않는다.
 - 문단이나 문장 수준의 수정은 `replace_text`·`delete_text`·`insert_before_text`·`insert_after_text`로 고유한 원문을 지정한다. 전체 파일을 다시 쓰지 않고 저장된 해시와 수정 결과를 확인한다.
 - 문서 수정 결과의 `verification_required_ids`만 재검증한다. `preserved_verified_ids`는 섹션·소스·참조 기억이 유효하여 검증을 유지한 항목이다. `verify_batch`에 다시 포함해도 유효성을 확인한 뒤 기존 검증과 근거를 재사용하며 `reused_ids`로 알린다. 근거를 의도적으로 교체하려면 단일 `verify`를 사용한다.
-- 매 문서 쓰기에서 인용 경로·줄 범위 문제를 즉시 반환한다. 부분 초안을 거부하지 않으며, 전체 조사 상태는 최종 감사에서 검사한다.
+- 매 문서 쓰기에서 인용 경로·줄 범위 문제(`citation_check`)와 Markdown·Mermaid 형식 검사 결과(`format_check`)를 함께 즉시 반환한다. 부분 초안을 거부하지 않으며, 전체 조사 상태는 최종 감사에서 검사한다.
 - 쉼표로 묶은 `file.js:3, 8-10`은 각 범위를 검사하고 검토 근거에 함께 포함한다.
 - 일반 코드 예시의 인용은 감사에서 제외하지만 Mermaid 안의 소스 인용은 검사한다.
 
