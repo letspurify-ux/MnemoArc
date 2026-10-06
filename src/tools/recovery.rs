@@ -51,17 +51,23 @@ enum Class {
     Unclassified,
 }
 
-/// Unknown errors default to inspection, never to an assumed safe retry.
-pub fn describe(message: &str) -> Value {
-    let prefix = message.split(':').next().unwrap_or("");
-    let code = if !prefix.is_empty()
+/// The leading snake_case code of an error message. A code may end at ':'
+/// or at ';' (wrappers append "; operation_index=0" to a bare code).
+pub fn error_code(message: &str) -> &str {
+    let prefix = message.split([':', ';']).next().unwrap_or("");
+    if !prefix.is_empty()
         && prefix.len() <= 80
         && prefix.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
     {
         prefix
     } else {
         "tool_error"
-    };
+    }
+}
+
+/// Unknown errors default to inspection, never to an assumed safe retry.
+pub fn describe(message: &str) -> Value {
+    let code = error_code(message);
     let (class, action) = if code == "cancelled" {
         (Class::Cancelled, "stop")
     } else if matches!(code, "tool_worker_capacity" | "tool_worker_start_failed") {
@@ -124,6 +130,12 @@ pub fn describe(message: &str) -> Value {
         (Class::Unavailable, "check_file_permissions")
     } else if code == "path_is_directory" {
         (Class::InvalidInput, "select_file_from_directory")
+    } else if matches!(
+        code,
+        "unsupported_binary_file" | "unsupported_large_file" | "unsupported_file_type"
+    ) {
+        // The tool works; this file cannot be read as text. Pick another.
+        (Class::Unavailable, "choose_allowed_path")
     } else if matches!(
         code,
         "path_outside_project"
@@ -385,6 +397,10 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "copy_document_hash" => &["document_inspect"],
         "copy_file_hash" => &["file_read"],
         "use_document_editor" => &["document_inspect", "document_edit", "document_edit_batch"],
+        // The message carries the current hash; editing is the next step.
+        "inspect_document_outline" if result["recovery"]["code"] == "document_exists" => {
+            &["document_inspect", "document_edit", "document_edit_batch"]
+        }
         "restart_document_inspection" | "inspect_document_outline" => &["document_inspect"],
         "choose_exact_section" => &["document_inspect", "file_read"],
         "repair_document_citation" => &["document_inspect", "document_edit", "document_edit_batch"],
@@ -398,6 +414,13 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             "code_outline",
         ],
         "inspect_outcome_before_retry" if call.name == "db_execute" => &["history", "db_query"],
+        // mark_gap waits for closing; the item still needs source evidence.
+        "use_available_tools" if result["recovery"]["code"] == "checkpoint_pending" => {
+            &["checkpoint_complete", "memory_write", "task_state"]
+        }
+        "use_available_tools" if result["recovery"]["code"] == "gap_requires_closing" => {
+            &["investigation", "source_lookup", "file_read"]
+        }
         "inspect_outcome_before_retry" => &["history", "document_inspect", "file_read"],
         "use_available_tools" if result["recovery"]["code"] == "workflow_write_scope" => {
             &["document_inspect", "document_edit", "document_edit_batch"]
@@ -493,6 +516,21 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             &["symbol_search", "code_outline", "symbol_relations"]
         }
         "refresh_matching_state" => &["code_outline", "file_read", "source_lookup", "history"],
+        "reduce_request_or_cleanup" if result["recovery"]["code"] == "memory_body_limit" => {
+            &["memory_write", "memory_manage"]
+        }
+        "reduce_request_or_cleanup"
+            if matches!(
+                result["recovery"]["code"].as_str(),
+                Some("task_state_limit" | "task_detail_limit")
+            ) =>
+        {
+            &["task_state", "memory_write"]
+        }
+        // References live in task_state memory_ids and investigation items.
+        "reduce_request_or_cleanup" if result["recovery"]["code"] == "memory_referenced" => {
+            &["task_state", "investigation", "memory_manage"]
+        }
         "reduce_request_or_cleanup" if call.name == "source_search" => &["source_search"],
         "reduce_request_or_cleanup" if call.name == "db_query" => &["db_query"],
         "reduce_request_or_cleanup" if call.name == "db_execute" => &["db_execute", "db_query"],
@@ -549,6 +587,14 @@ pub struct FailureTracker {
     by_tool_and_code: VecDeque<CodeFailure>,
     by_tool: BTreeMap<&'static str, usize>,
     by_invocation: VecDeque<InvocationFailure>,
+    repeated_calls: VecDeque<RepeatedCall>,
+}
+
+/// The same call that failed before for the same reason, across tools.
+struct RepeatedCall {
+    call: [u8; 32],
+    reason: [u8; 32],
+    count: usize,
 }
 
 struct CodeFailure {
@@ -663,6 +709,73 @@ impl FailureTracker {
         }
         self.by_tool_and_code.push_back(recent);
         count
+    }
+
+    const MAX_REPEATED_CALLS: usize = 32;
+
+    /// Mark an identical call that fails again for the same reason: resending
+    /// it unchanged cannot succeed. Only failures decided by the arguments
+    /// (input, path or evidence errors and unapplied plan batches) qualify;
+    /// transient or uncertain failures may succeed on a later retry. The
+    /// error text is left unchanged so other identical-failure checks hold.
+    pub fn mark_repeated_failure(&mut self, tool: &str, arguments: &str, result: &mut Value) {
+        let unapplied_plan = tool == "task_plan" && result["data"]["applied"] == false;
+        let reason = if unapplied_plan {
+            result["data"]["reason"].as_str()
+        } else if result["status"] != "ok"
+            && matches!(
+                result["recovery"]["class"].as_str(),
+                Some("invalid_input" | "missing_path" | "missing_evidence")
+            )
+        {
+            result["error"].as_str()
+        } else {
+            None
+        };
+        let call: [u8; 32] = Sha256::digest(format!("{tool}\0{arguments}").as_bytes()).into();
+        let Some(reason) = reason else {
+            self.repeated_calls.retain(|repeat| repeat.call != call);
+            return;
+        };
+        let reason: [u8; 32] = Sha256::digest(reason.as_bytes()).into();
+        let count = match self
+            .repeated_calls
+            .iter_mut()
+            .find(|repeat| repeat.call == call)
+        {
+            Some(repeat) if repeat.reason == reason => {
+                repeat.count = repeat.count.saturating_add(1);
+                repeat.count
+            }
+            Some(repeat) => {
+                repeat.reason = reason;
+                repeat.count = 1;
+                1
+            }
+            None => {
+                if self.repeated_calls.len() == Self::MAX_REPEATED_CALLS {
+                    self.repeated_calls.pop_front();
+                }
+                self.repeated_calls.push_back(RepeatedCall {
+                    call,
+                    reason,
+                    count: 1,
+                });
+                1
+            }
+        };
+        if count < 2 {
+            return;
+        }
+        let note = json!({"count":count,"guidance":format!(
+            "This exact call already got this same result {} time(s); resending it unchanged cannot succeed. Change what the error or reason names before calling again.",
+            count - 1
+        )});
+        if unapplied_plan {
+            result["data"]["repeated_unchanged"] = note;
+        } else {
+            result["recovery"]["repeated_unchanged"] = note;
+        }
     }
 
     pub fn observe(

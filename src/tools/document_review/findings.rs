@@ -551,6 +551,27 @@ fn drop_hint(
     (prior_ids, range)
 }
 
+/// A proposal quoting text that is gone from the document, which matches the
+/// old quote of an earlier finding, reports a passage the repair removed. It
+/// can never be grounded and must neither reject the page nor leave a gap.
+fn stale_resolved_quote(state: &ReviewState, proposal: &Value, doc: &str) -> Option<String> {
+    let quote = proposal["document"]["quote"].as_str()?.trim();
+    if quote.chars().count() < 8 || doc.contains(quote) {
+        return None;
+    }
+    let normalized = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let wanted = normalized(quote);
+    state
+        .findings
+        .iter()
+        .find(|finding| {
+            finding.proposal.document.as_ref().is_some_and(|passage| {
+                !doc.contains(&passage.quote) && normalized(&passage.quote).contains(&wanted)
+            })
+        })
+        .map(|finding| finding.id.clone())
+}
+
 pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str, last_try: bool) -> Result<()> {
     if proposals.len() > 12 {
         bail!("document_review_invalid: at most 12 findings per page");
@@ -572,8 +593,22 @@ pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str, last_try: bool
     // On a last try (before a page skip or the single closing review) an
     // issue-level rejection drops only that issue. One reconstructed source
     // quote used to discard a closing response with a valid sibling finding.
+    let mut stale = Vec::new();
     for (issue_index, proposal) in proposals.into_iter().enumerate() {
+        if let Some(id) = stale_resolved_quote(&s.document_review, &proposal, doc) {
+            stale.push(format!(
+                "issues[{issue_index}] copied the replaced quote of resolved finding {id}; that text is no longer in the document, so the issue was dropped without a gap"
+            ));
+            continue;
+        }
         let hint = last_try.then(|| drop_hint(&s.document_review, &proposal, page));
+        let mut proposal = proposal;
+        // previous_findings/current_findings summaries carry these markers;
+        // a reviewer copying a summary passage is not sending a new field.
+        if let Some(document) = proposal.get_mut("document").and_then(Value::as_object_mut) {
+            document.remove("quote_truncated");
+            document.remove("quote_in_document");
+        }
         let result = serde_json::from_value::<Proposal>(proposal)
             .map_err(|e| anyhow::anyhow!("document_review_invalid: issues[{issue_index}]: {e}"))
             .and_then(|proposal| {
@@ -618,6 +653,12 @@ pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str, last_try: bool
     }
     let state = &mut s.document_review;
     if first_error.is_none() {
+        for message in stale {
+            state.issue_drop_log.push(
+                json!({"lines":[state.document_offset + 1, state.next_document_offset],
+                "evidence_page":state.evidence_page,"error":message}),
+            );
+        }
         for error in dropped {
             state.issue_drop_log.push(
                 json!({"lines":[state.document_offset + 1, state.next_document_offset],

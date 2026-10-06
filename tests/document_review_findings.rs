@@ -2220,3 +2220,83 @@ fn a_rejected_response_error_is_not_resent_after_a_valid_response() {
             .starts_with("document_review:")
     );
 }
+
+#[test]
+fn a_resolved_findings_old_quote_is_marked_and_its_copy_leaves_no_gap() {
+    // Live run 2026-10-06: after F1 was repaired, the re-review copied F1's
+    // old quote as a new issue on its last try; the drop left a gap at the
+    // already repaired line and the run ended complete_with_gaps.
+    for last_try in [false, true] {
+        let (_dir, mut s) = fixture();
+        review::request(&mut s).unwrap();
+        submit(&mut s, vec![proposal("Incorrect deletion timing")]);
+        validate(&mut s, vec![decision("F1", "confirmed")]);
+        assert!(!review::approved(&s));
+        std::fs::write(
+            &s.project.output,
+            "# 설정\n키 지우기를 누르고 저장하면 등록한 키가 삭제됩니다. ui.js:2\n검색 결과가 없습니다. ui.js:1\n",
+        )
+        .unwrap();
+        let request = review::request(&mut s).unwrap();
+        let previous = &payload(request)["previous_findings"][0];
+        assert_eq!(previous["id"], "F1");
+        assert_eq!(
+            previous["document"]["quote_in_document"], false,
+            "{previous}"
+        );
+
+        let stale = json!({"issues":[proposal("Incorrect deletion timing")]}).to_string();
+        if last_try {
+            review::finish_last_try(&mut s, &stale).unwrap();
+        } else {
+            review::finish(&mut s, &stale).unwrap();
+        }
+        let drop = &s.document_review.issue_drop_log[0];
+        assert!(
+            drop["error"]
+                .as_str()
+                .unwrap()
+                .contains("replaced quote of resolved finding F1"),
+            "{drop}"
+        );
+        assert!(review::unavailable_ranges(&s).is_empty(), "{last_try}");
+        assert!(review::approved(&s), "{last_try}");
+    }
+}
+
+#[test]
+fn a_missing_quote_unrelated_to_a_resolved_finding_still_gaps() {
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let mut invented = proposal("Invented passage");
+    invented["document"]["quote"] = json!("문서에 없는 완전히 다른 문장입니다.");
+    review::finish_last_try(&mut s, &json!({"issues":[invented]}).to_string()).unwrap();
+    assert!(!review::approved(&s));
+    assert!(!review::unavailable_ranges(&s).is_empty());
+}
+
+#[test]
+fn echoed_request_keys_and_summary_markers_do_not_reject_a_review() {
+    // Live run 2026-10-06: reviewers copied requirement_catalog beside issues
+    // and quote_truncated/quote_in_document from finding summaries into an
+    // issue; deny_unknown_fields rejected otherwise valid responses.
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let mut issue = proposal("Incorrect deletion timing");
+    issue["document"]["quote_truncated"] = json!(false);
+    issue["document"]["quote_in_document"] = json!(true);
+    let response =
+        json!({"issues":[issue],"requirement_catalog":{"R0":"UI 사용자 매뉴얼 만들어줘"}});
+    review::finish(&mut s, &response.to_string()).unwrap();
+    assert!(s.document_review.validating);
+    // A genuinely misnamed issue field is still rejected.
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let mut misnamed = proposal("Incorrect deletion timing");
+    misnamed["document"]["quotes"] = json!("x");
+    assert!(review::finish(&mut s, &json!({"issues":[misnamed]}).to_string()).is_err());
+    // Issues sent as plain strings are rejected, not a panic.
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    assert!(review::finish(&mut s, r#"{"issues":["just text"]}"#).is_err());
+}

@@ -132,7 +132,10 @@ fn project_path(s: &Session, raw: &str) -> Result<PathBuf> {
                 bail!("file_symlink_not_allowed: {}", current.display())
             }
             Ok(meta) if current != candidate && !meta.is_dir() => {
-                bail!("file_parent_not_directory: {}", current.display())
+                bail!(
+                    "file_parent_not_directory: {} is a file, so {raw} cannot be created beneath it; choose a path whose parent is a directory",
+                    current.display()
+                )
             }
             Ok(_) => (),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
@@ -141,7 +144,11 @@ fn project_path(s: &Session, raw: &str) -> Result<PathBuf> {
     }
     let path = normalize_existing_prefix(&candidate)?;
     if !path.starts_with(&root) {
-        bail!("path_outside_project");
+        bail!(
+            "path_outside_project: {raw} resolves to {}, outside project root {}",
+            path.display(),
+            root.display()
+        );
     }
     if excluded(&s.project, path.strip_prefix(&root)?)? {
         bail!("path_excluded: {raw}");
@@ -160,7 +167,9 @@ fn content(value: &str) -> Result<()> {
         bail!("unsupported_large_file: maximum 16MiB");
     }
     if value.as_bytes().contains(&0) {
-        bail!("unsupported_binary_file");
+        bail!(
+            "unsupported_binary_file: the text to write contains NUL characters; send plain text without \\u0000"
+        );
     }
     Ok(())
 }

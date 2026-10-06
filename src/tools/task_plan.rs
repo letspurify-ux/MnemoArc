@@ -116,14 +116,22 @@ pub fn view(task: &TaskState, offset: usize, limit: usize) -> Value {
     let limit = limit.clamp(1, MAX_PAGE);
     let items: Vec<_> = task.todos.iter().skip(offset).take(limit).collect();
     let end = offset.saturating_add(items.len());
-    json!({
+    let mut page = json!({
         "revision":task.plan_revision,"items":items,"current":task.current_todo(),
         "offset":offset,"total_items":task.todos.len(),
         "next_offset":(end < task.todos.len()).then_some(end),
         "pending_count":task.todos.iter().filter(|item| !item.done).count(),
         "completed_total":task.todos_completed_total,
         "limits":{"pending":MAX_PENDING,"retained_completed":MAX_COMPLETED}
-    })
+    });
+    // An empty page past the end is not an empty plan.
+    if offset >= task.todos.len() && !task.todos.is_empty() {
+        page["notice"] = json!(format!(
+            "offset {offset} is past the {} plan items; list from offset 0",
+            task.todos.len()
+        ));
+    }
+    page
 }
 
 fn nonempty(value: &str, limit: usize) -> Result<&str> {

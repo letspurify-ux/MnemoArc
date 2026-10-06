@@ -204,7 +204,9 @@ impl MemoryStore {
                 .get(key)
                 .is_some_and(|by_id| owner.is_none_or(|memory| memory.id != by_id.id))
         {
-            bail!("memory_key_conflict: key collides with a memory ID or another key");
+            bail!(
+                "memory_key_conflict: key {key:?} is already another memory's ID or is shared by several memories; choose a distinct key, or omit key to create a new memory"
+            );
         }
         Ok(owner.map(|memory| &**memory))
     }
@@ -229,7 +231,11 @@ impl MemoryStore {
                     .find(|m| m.key.as_deref() == Some(id_or_key))
             })
             .map(|memory| &**memory)
-            .ok_or_else(|| anyhow::anyhow!("memory_not_found: {id_or_key}"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "memory_not_found: no memory has ID or key {id_or_key:?}; copy an ID exactly from memory_find or task_state, never guess one"
+                )
+            })
     }
     pub fn save(
         &mut self,
@@ -244,7 +250,11 @@ impl MemoryStore {
             bail!("invalid_argument_value: title, summary and body must be non-empty");
         }
         if input.body.len() > config.memory_body_bytes {
-            bail!("memory_body_limit");
+            bail!(
+                "memory_body_limit: body is {} bytes but memory_body_bytes allows {}; keep the essential finding with source_ids and split the rest into separate memories",
+                input.body.len(),
+                config.memory_body_bytes
+            );
         }
         if input.key.as_ref().is_some_and(|k| k.trim().is_empty()) {
             bail!("invalid_argument_value: key must not be empty");
@@ -331,7 +341,9 @@ impl MemoryStore {
     pub fn delete(&mut self, ident: &str, protected: &BTreeSet<String>) -> Result<()> {
         let key = self.get(ident)?.id.clone();
         if protected.contains(&key) {
-            bail!("memory_referenced: detach or replace first");
+            bail!(
+                "memory_referenced: memory {key} is still referenced by task_state memory_ids or an investigation item; remove that reference first, or use memory_manage action=replace to supersede it; nothing was deleted"
+            );
         }
         self.entries.remove(&key);
         self.generation += 1;
@@ -419,21 +431,24 @@ impl MemoryStore {
     ) -> Result<serde_json::Value> {
         let fingerprint = self.page_fingerprint(query, tags);
         let offset = if let Some(c) = cursor {
-            let (stored, offset) = c
-                .split_once(':')
-                .ok_or_else(|| anyhow::anyhow!("invalid_cursor"))?;
+            const INVALID: &str = "invalid_cursor: not a cursor memory_find issued for this query and tags; copy next_cursor exactly from the previous result, or omit cursor to start from the beginning";
+            let (stored, offset) = c.split_once(':').ok_or_else(|| anyhow::anyhow!(INVALID))?;
             if stored != fingerprint {
-                bail!("cursor_expired");
+                bail!(
+                    "cursor_expired: memories, query or tags changed since this cursor was issued; repeat memory_find without cursor"
+                );
             }
             offset
                 .parse::<usize>()
-                .map_err(|_| anyhow::anyhow!("invalid_cursor"))?
+                .map_err(|_| anyhow::anyhow!(INVALID))?
         } else {
             0
         };
         let rows = self.search(query, tags);
         if offset > rows.len() {
-            bail!("invalid_cursor");
+            bail!(
+                "invalid_cursor: not a cursor memory_find issued for this query and tags; copy next_cursor exactly from the previous result, or omit cursor to start from the beginning"
+            );
         }
         let end = offset.saturating_add(limit.clamp(1, 100)).min(rows.len());
         Ok(serde_json::json!({

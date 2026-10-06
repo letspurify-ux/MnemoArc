@@ -778,19 +778,28 @@ fn runtime_input_errors_name_the_field_and_claim_no_change_only_with_evidence() 
     let result = tools::run_call(&mut s, &invocation);
     assert_eq!(result["data"]["input_error"]["field"], "sql", "{result}");
     assert!(result["data"]["execution"].is_null(), "{result}");
-    // "query mode requires ..." mentions a word, not the rejected field.
+    // The field name first, but not as the subject: no field is guessed.
     let result = tools::run_call(
         &mut s,
-        &call_id("db_execute", json!({"mode":"query","sql":"DELETE FROM t"})),
+        &call_id("source_search", json!({"query":"(","regex":true})),
     );
     assert!(
         result["error"]
             .as_str()
             .unwrap()
-            .contains("query mode requires"),
+            .starts_with("invalid_search_regex: regex parse error"),
         "{result}"
     );
     assert!(result["data"]["input_error"].is_null(), "{result}");
+    s.config.database.function_enabled = true;
+    let result = tools::run_call(
+        &mut s,
+        &call_id("db_execute", json!({"mode":"function","name":"f"})),
+    );
+    assert_eq!(
+        result["data"]["input_error"]["field"], "return_type",
+        "{result}"
+    );
     // The diagnosis survives repeated budgets; without an execution claim the
     // compact form keeps the tool name as its marker.
     let mut big = tools::run_call(&mut s, &call_id("db_execute", json!({"mode":"query"})));
@@ -811,4 +820,288 @@ fn runtime_input_errors_name_the_field_and_claim_no_change_only_with_evidence() 
     );
     assert!(second["data"]["execution"].is_null());
     assert!(tools::result_tokens(&invocation, &second, &s.config.model) <= 200);
+}
+
+#[test]
+fn file_memory_and_document_failures_name_the_cause_and_matching_remedy() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.rs"), "fn run() {}\n").unwrap();
+    std::fs::write(dir.path().join("bin.dat"), [0u8, 1, 0]).unwrap();
+    std::fs::write(
+        dir.path().join("summary.md"),
+        "# Title\n\nBody.\n\n## Part\n\nMore.\n",
+    )
+    .unwrap();
+    let mut s = session();
+    s.project.root = dir.path().into();
+    s.project.output = dir.path().join("summary.md");
+    let run = |s: &mut Session, name: &str, args: Value| tools::run_call(s, &call_id(name, args));
+    let tools_of = |result: &Value| result["recovery"]["tools"].clone();
+
+    // A bare code followed by "; operation_index=0" is still that code.
+    let result = run(
+        &mut s,
+        "file_edit",
+        json!({"path":"bin.dat","old_text":"a","new_text":"b","expected_hash":"x"}),
+    );
+    assert_eq!(
+        result["recovery"]["code"], "unsupported_binary_file",
+        "{result}"
+    );
+    assert_eq!(result["recovery"]["action"], "choose_allowed_path");
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("bin.dat contains NUL bytes")
+    );
+
+    let result = run(&mut s, "file_read", json!({"path":"/etc/hosts"}));
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("outside project root"),
+        "{result}"
+    );
+
+    let result = run(&mut s, "file_read", json!({"path":"main.rs"}));
+    let source = result["data"]["source"]["id"].clone();
+    let body = "b".repeat(s.config.memory_body_bytes + 1);
+    let result = run(
+        &mut s,
+        "memory_write",
+        json!({"title":"t","summary":"s","body":body,"kind":"fact","source_ids":[source]}),
+    );
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("bytes but memory_body_bytes allows"),
+        "{result}"
+    );
+    assert_eq!(tools_of(&result), json!(["memory_write", "memory_manage"]));
+    let saved = run(
+        &mut s,
+        "memory_write",
+        json!({"title":"t","summary":"s","body":"b","kind":"fact","source_ids":[source]}),
+    );
+    let id = saved["data"]["id"].as_str().unwrap().to_owned();
+    s.task.memory_ids.push(id.clone());
+    let result = run(
+        &mut s,
+        "memory_manage",
+        json!({"action":"delete","ids":[id]}),
+    );
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("nothing was deleted"),
+        "{result}"
+    );
+    assert_eq!(
+        tools_of(&result),
+        json!(["task_state", "investigation", "memory_manage"])
+    );
+
+    let result = run(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"revision":3}}),
+    );
+    assert_eq!(
+        result["data"]["input_error"]["field"], "patch.revision",
+        "{result}"
+    );
+
+    s.active_tools.remove("file_list");
+    let result = run(&mut s, "file_list", json!({}));
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains(r#"tool_select {"action":"add","names":["file_list"]}"#),
+        "{result}"
+    );
+    s.active_tools = ToolRegistry::optional_names();
+
+    let result = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# New\n"}),
+    );
+    let current = tools::hash(&std::fs::read(dir.path().join("summary.md")).unwrap());
+    assert!(
+        result["error"].as_str().unwrap().contains(&current),
+        "{result}"
+    );
+    assert!(
+        tools_of(&result)
+            .as_array()
+            .unwrap()
+            .contains(&json!("document_edit"))
+    );
+
+    let result = run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":current,"edits":[
+            {"action":"replace_text","old_text":"Body.","text":"Changed."},
+            {"action":"replace_text","old_text":"Missing","text":"x"},
+            {"action":"section","section":"## Part","text":"## Part\n\nNew.\n","expected_section_hash":"bad"}
+        ]}),
+    );
+    assert_eq!(
+        result["data"]["execution"], "rejected_without_changes",
+        "{result}"
+    );
+    assert_eq!(
+        result["data"]["failed_edits"],
+        json!([
+            {"index":1,"action":"replace_text","code":"patch_target_must_match_once"},
+            {"index":2,"action":"section","code":"section_revision_conflict"}
+        ])
+    );
+    assert_eq!(
+        tools::hash(&std::fs::read(dir.path().join("summary.md")).unwrap()),
+        current
+    );
+}
+
+#[test]
+fn a_gap_outside_closing_points_to_verification_not_tool_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("summary.md"), "# Title\n\nBody.\n").unwrap();
+    let mut s = session();
+    s.project.root = dir.path().into();
+    s.project.output = dir.path().join("summary.md");
+    s.select_workflow("source_document").unwrap();
+    s.active_tools = ToolRegistry::optional_names();
+    let result = tools::run_call(
+        &mut s,
+        &call_id(
+            "investigation",
+            json!({"action":"mark_gap","id":"a","reason":"no evidence was found in the sources"}),
+        ),
+    );
+    assert_eq!(
+        result["recovery"]["code"], "gap_requires_closing",
+        "{result}"
+    );
+    assert_eq!(
+        result["recovery"]["tools"],
+        json!(["investigation", "source_lookup", "file_read"])
+    );
+}
+
+#[test]
+fn an_anchor_outside_the_named_section_names_where_it_is() {
+    // Live run 2026-10-06: insert_before_text named the previous section and
+    // anchored on the next heading; the error only said "not in the section".
+    let dir = tempfile::tempdir().unwrap();
+    let doc = "# Manual\n\n## Backend\n\nFlow.\n\n## Data\n\nTypes.\n";
+    std::fs::write(dir.path().join("summary.md"), doc).unwrap();
+    let mut s = session();
+    s.project.root = dir.path().into();
+    s.project.output = dir.path().join("summary.md");
+    let hash = tools::hash(doc.as_bytes());
+    for (name, args) in [
+        (
+            "document_edit",
+            json!({"action":"insert_before_text","section":"## Backend","old_text":"## Data","text":"More flow.\n","expected_hash":hash}),
+        ),
+        (
+            "document_edit_batch",
+            json!({"expected_hash":hash,"edits":[{"action":"insert_before_text","section":"## Backend","old_text":"## Data","text":"More flow.\n"}]}),
+        ),
+    ] {
+        let result = tools::run_call(&mut s, &call_id(name, args));
+        let error = result["error"].as_str().unwrap();
+        assert!(
+            error.contains(r###"old_text is not inside section "## Backend" (lines 3-6), but occurs in the document at line 7 under "## Data""###),
+            "{error}"
+        );
+        assert!(error.contains("Omit section"), "{error}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("summary.md")).unwrap(),
+        doc
+    );
+}
+
+#[test]
+fn an_identical_failure_is_marked_as_unchanged_but_transient_ones_are_not() {
+    let mut tracker = tools::recovery::FailureTracker::default();
+    let failed = || {
+        tools::envelope(Err(anyhow::anyhow!(
+            "invalid_argument_value: text has 371 characters"
+        )))
+    };
+    let mut first = failed();
+    tracker.mark_repeated_failure("file_edit", r#"{"a":1}"#, &mut first);
+    assert!(first["recovery"]["repeated_unchanged"].is_null());
+    let mut second = failed();
+    tracker.mark_repeated_failure("file_edit", r#"{"a":1}"#, &mut second);
+    assert_eq!(
+        second["recovery"]["repeated_unchanged"]["count"], 2,
+        "{second}"
+    );
+    // The error text stays identical for other repeated-failure checks.
+    assert_eq!(second["error"], first["error"]);
+    // Different arguments are a different call.
+    let mut other = failed();
+    tracker.mark_repeated_failure("file_edit", r#"{"a":2}"#, &mut other);
+    assert!(other["recovery"]["repeated_unchanged"].is_null());
+    // A transient failure may succeed when retried.
+    for _ in 0..2 {
+        let mut timeout = tools::envelope(Err(anyhow::anyhow!("request_timeout: slow")));
+        tracker.mark_repeated_failure("file_read", "{}", &mut timeout);
+        assert!(timeout["recovery"]["repeated_unchanged"].is_null());
+    }
+    // An unapplied plan batch is status ok but still a repeated rejection.
+    let plan = || json!({"status":"ok","data":{"applied":false,"reason":"operations[0] failed: Use nonempty text of at most 240 characters; this text has 371"}});
+    let args = r#"{"action":"apply"}"#;
+    let mut once = plan();
+    tracker.mark_repeated_failure("task_plan", args, &mut once);
+    let mut twice = plan();
+    tracker.mark_repeated_failure("task_plan", args, &mut twice);
+    assert_eq!(twice["data"]["repeated_unchanged"]["count"], 2, "{twice}");
+    // A success clears the record.
+    let mut applied = json!({"status":"ok","data":{"applied":true}});
+    tracker.mark_repeated_failure("task_plan", args, &mut applied);
+    let mut again = plan();
+    tracker.mark_repeated_failure("task_plan", args, &mut again);
+    assert!(again["data"]["repeated_unchanged"].is_null());
+}
+
+#[test]
+fn a_tool_withheld_by_a_checkpoint_names_itself_and_the_next_step() {
+    let mut s = session();
+    s.checkpoint = Some(mnemoarc::session::Checkpoint {
+        id: "cp-1".into(),
+        bundle_ids: vec![],
+        maintenance_bundle_ids: vec![],
+        acknowledged: false,
+        attempts: 0,
+        failed_attempts: 0,
+        last_failure: None,
+        source_lookup_calls: 0,
+        starting_state_revision: s.task.revision,
+        starting_memory_generation: s.memory.generation,
+        failed: false,
+    });
+    let result = tools::run_call(&mut s, &call_id("file_list", json!({})));
+    let error = result["error"].as_str().unwrap();
+    assert!(
+        error.starts_with(
+            "checkpoint_pending: file_list is withheld while checkpoint cp-1 is pending"
+        ),
+        "{error}"
+    );
+    assert!(error.contains("Allowed now: memory_write"), "{error}");
+    assert_eq!(
+        result["recovery"]["tools"][0], "checkpoint_complete",
+        "{result}"
+    );
 }

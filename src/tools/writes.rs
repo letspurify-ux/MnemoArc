@@ -41,14 +41,12 @@ pub(crate) fn external_write(name: &str) -> bool {
 
 pub(crate) fn uncertain_write_error(error: &str) -> bool {
     matches!(
-        error.split(':').next(),
-        Some(
-            "tool_worker_panic"
-                | "tool_worker_unresolved"
-                | "database_commit_uncertain"
-                | "database_rollback_uncertain"
-                | "file_patch_rollback_failed"
-        )
+        super::recovery::error_code(error),
+        "tool_worker_panic"
+            | "tool_worker_unresolved"
+            | "database_commit_uncertain"
+            | "database_rollback_uncertain"
+            | "file_patch_rollback_failed"
     )
 }
 

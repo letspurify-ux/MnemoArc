@@ -386,7 +386,9 @@ pub fn execute_free(
                     Some("SELECT" | "WITH")
                 )
             {
-                return Err(bad("query mode requires SELECT or WITH SQL"));
+                return Err(bad(
+                    "sql must begin with SELECT or WITH for mode=query; use mode=statement for DML or DDL",
+                ));
             }
             let values = sql_binds(args)?;
             let binds: Vec<(&str, &dyn ToSql)> = values
@@ -430,7 +432,7 @@ pub fn execute_free(
                 Some(
                     args["return_type"]
                         .as_str()
-                        .ok_or_else(|| bad("function requires return_type"))?,
+                        .ok_or_else(|| bad("return_type is required for mode=function: string, number, boolean or cursor"))?,
                 )
             } else {
                 None

@@ -128,6 +128,32 @@ flowchart TD
 - 문서 작업 전이나 일반 답변에서도, 실행되지 않은 응답 거절(`invalid_tool_arguments`, `malformed_tool_call`, `tool_call_batch_limit`, `response_size_limit`)에는 안내와 함께 한 번 재시도할 기회를 준다. 연속 거절은 여전히 실행을 멈춘다. 안내는 다음 실행 배치 뒤에 지워지므로 무한 반복은 생기지 않는다.
 - `memory_retrieval`의 `a_large_related_preview_can_borrow_unused_recent_space`가 가끔 실패하던 원인은 무작위 UUID 기억 ID였다. 실제 토크나이저에서 ID 하나가 19~31토큰으로 달라지는데, 288토큰 고정 예산의 여유는 몇 토큰뿐이었다. 테스트가 실제 미리보기 크기를 재고, 검증이 허용하는 최소 예산 이상으로 예산을 잡는다. 관련 미리보기가 70% 몫을 넘어 최근 몫을 빌려야 한다는 전제도 검사한다.
 
+### 오류 메시지 전수 점검 (3차)
+
+도구 코드의 모든 오류 메시지를 추출해 짧거나 원인·조치가 빠진 것을 실제 호출 경로로 재현하고 보완했다.
+
+- 오류 코드는 `:` 또는 `;` 앞까지로 읽는다(`recovery::error_code`). 전에는 `unsupported_binary_file; operation_index=0; ...`처럼 래퍼가 뒤에 붙인 단순 코드가 `tool_error`/미분류로 떨어졌다. 불확실 쓰기 판정도 같은 함수를 쓴다.
+- 이진·과대·특수 파일(`unsupported_binary_file`, `unsupported_large_file`, `unsupported_file_type`)은 도구 선택 대신 다른 파일 선택(`choose_allowed_path`)으로 안내한다. 경로와 이유도 메시지에 넣는다.
+- 기억: `memory_body_limit`은 실제 크기와 한도를 적고 `memory_write`를 권한다. `memory_not_found`, `memory_key_conflict`, `memory_find` 커서 오류도 구체적으로 안내한다. `memory_referenced`는 참조 위치(task_state, investigation)와 삭제되지 않았음을 적는다.
+- 상태: `task_state_limit`/`task_detail_limit`는 필요량과 한도를 적는다. `patch.revision`은 정확한 필드를 가리킨다.
+- `tool_not_active`는 그대로 보낼 수 있는 `tool_select` 인자를 보여 준다. `document_exists`는 현재 해시와 다음 편집 방법을 알리고, 복구 도구에 `document_edit`을 넣는다.
+- 경로: `path_outside_project`, `path_excluded`, `file_parent_not_directory`는 요청 경로, 실제 위치, 프로젝트 루트를 적는다.
+- `document_edit_batch` 실패는 `failed_edits`(index, action, code)와 `execution: rejected_without_changes`를 구조화해 돌려준다. 오래된 섹션 해시와 잘못된 old_text를 구별할 수 있다.
+- `gap_requires_closing`은 도구 선택이 아니라 증거 확인 도구(`investigation`, `source_lookup`, `file_read`)를 권한다.
+- DB 메시지는 필드를 앞에 둔다(`return_type is required for mode=function`, `sql must begin with SELECT or WITH for mode=query`). 따라서 필드 진단이 붙는다. `database_query_timeout`에는 조치를 적는다.
+- `task_plan list`를 끝 너머로 넘기면 `notice`로 알린다.
+
+### 라이브 실행에서 확인한 5건 보완 (2026-10-06)
+
+ling-3.0-flash 라이브 실행(`complete_with_gaps`)의 처리 로그에서 확인한 문제를 고쳤다.
+
+- 해결된 지적의 옛 인용: 재검토 요청의 `previous_findings`는 인용이 현재 문서에 없는(수정된) 지적에 `quote_in_document: false`를 붙인다. 리뷰어 지침은 그 옛 인용을 복사하지 말고 현재 문구를 판단하라고 안내한다. 그래도 리뷰어가 현재 문서에 없는 해결된 지적의 옛 인용을 복사해 올리면 그 항목만 버리고 `issue_drop_log`에 남긴다. 마지막 시도 여부와 관계없이 갭을 만들지 않고 응답 전체도 거절하지 않는다. 해결된 지적과 무관한, 찾을 수 없는 인용은 이전처럼 마지막 시도에서 갭이 된다.
+- 섹션 밖 앵커: `section`을 지정한 텍스트 편집에서 `old_text`가 그 섹션에는 없지만 문서의 다른 곳에 있으면, 섹션 줄 범위, 실제 위치 줄, 그 줄을 포함하는 제목을 알려 준다. 그리고 `section`을 빼거나 그 제목을 지정하라고 안내한다. 단건 편집과 배치 모두 적용된다.
+- 거절된 시도의 사용량: HTTP 상태로 거절된 시도(429, 400, 5xx 응답, `http_*` 진단)는 생성을 시작하지 않았으므로 입력 토큰과 실행 예산에 추정치를 더하지 않는다. 스트림 중 오류, 시간 초과, 잘못된 출력은 토큰을 썼을 수 있으므로 계속 추정한다. 진단이 없는 실패는 이전처럼 모든 시도를 계산한다.
+- 같은 실패의 반복: 같은 이름·인자의 호출이 같은 이유로 다시 실패하면 `repeated_unchanged`(`count`, `guidance`)를 붙인다. 오류 결과는 `recovery`에, 적용되지 않은 `task_plan`은 `data`에 붙인다. 인자로 결정되는 실패(`invalid_input`, `missing_path`, `missing_evidence`, 미적용 계획)만 대상이다. 일시적이거나 결과가 불확실한 실패는 표시하지 않는다. 오류 문구는 바꾸지 않아 기존 동일 실패 감지와 충돌하지 않는다.
+- `checkpoint_pending`은 막힌 도구 이름, 체크포인트 ID, 다음 단계(memory_write 또는 no_save_reason 후 checkpoint_complete), 지금 허용되는 도구 목록을 알린다. 복구 도구는 `checkpoint_complete`, `memory_write`, `task_state`이다.
+- 리뷰어가 요청 키(`requirement_catalog` 등)를 응답 최상위에 되돌려 보내도, 기대 필드(`issues`, `decisions`, `checks`)가 있으면 그 필드만 읽는다. 이슈 `document` 안에 지적 요약 전용 표시(`quote_truncated`, `quote_in_document`)를 복사해 넣으면 이를 제거한 뒤 해석한다. 그 밖의 알 수 없는 필드는 계속 거절한다.
+
 ## 문서 검증 도구 개선 (2026-09-21)
 
 세션에서 발생한 반복 호출을 기준으로 다음 계약을 보강했다.

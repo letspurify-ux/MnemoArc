@@ -542,19 +542,20 @@ impl ToolRegistry {
         s.task.workflow == "source_document"
     }
 
+    const CHECKPOINT_TOOLS: [&str; 9] = [
+        "memory_write",
+        "memory_read",
+        "memory_find",
+        "memory_manage",
+        "task_state",
+        "task_plan",
+        "history",
+        "checkpoint_complete",
+        "source_lookup",
+    ];
+
     fn checkpoint_allowed(name: &str) -> bool {
-        [
-            "memory_write",
-            "memory_read",
-            "memory_find",
-            "memory_manage",
-            "task_state",
-            "task_plan",
-            "history",
-            "checkpoint_complete",
-            "source_lookup",
-        ]
-        .contains(&name)
+        Self::CHECKPOINT_TOOLS.contains(&name)
     }
     fn workflow_required_tools(s: &Session) -> &'static [&'static str] {
         if s.task.require_investigation || s.task.workflow == "source_document" {
@@ -888,7 +889,9 @@ impl ToolRegistry {
             })?;
         reject_project_write_in_source_document(s, name)?;
         if spec.optional && !s.active_tools.contains(name) {
-            bail!("tool_not_active: {name}");
+            bail!(
+                "tool_not_active: {name} is an optional tool that is not active for this request; nothing was executed. Use an offered tool, or activate it with tool_select {{\"action\":\"add\",\"names\":[\"{name}\"]}} (takes effect on the next request)"
+            );
         }
         if Self::closing_withholds(s, name) {
             bail!(if s.document_written {
@@ -1043,7 +1046,9 @@ fn validate_task_state_arguments(args: &Value) -> Result<()> {
     for (key, value) in object {
         let Some(field) = properties.get(key) else {
             if key == "revision" {
-                bail!("invalid_argument_value: revision is program-owned");
+                bail!(
+                    "invalid_argument_value: patch.revision is program-owned; remove revision from patch and resend the other fields; state unchanged"
+                );
             }
             if key == "workflow" || key == "require_investigation" {
                 bail!(
@@ -1802,6 +1807,47 @@ pub(crate) fn dropped_span<'a>(current: &'a str, copy: &str) -> Option<&'a str> 
         .map(|split| &current[split..split + missing])
 }
 
+/// An anchor missing from the named section but present elsewhere: say
+/// where, so the model drops `section` or names the heading containing it.
+fn anchor_outside_section(
+    old: &str,
+    section: &documentation::Heading,
+    target: &str,
+) -> Option<anyhow::Error> {
+    let line_of = |at: usize| old[..at].matches('\n').count() + 1;
+    let lines: Vec<usize> = old
+        .match_indices(target)
+        .map(|(at, _)| line_of(at))
+        .take(4)
+        .collect();
+    let first = *lines.first()?;
+    let containing = documentation::headings(old)
+        .into_iter()
+        .rfind(|heading| heading.line <= first)
+        .map_or_else(
+            || "the text before the first heading".to_owned(),
+            |heading| format!("{:?}", heading.heading),
+        );
+    let last_line = line_of(section.end.saturating_sub(1).max(section.start));
+    let repeated = if lines.len() > 1 {
+        format!(
+            "; it occurs more than once (lines {}), so also include more surrounding text",
+            lines
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    } else {
+        String::new()
+    };
+    Some(anyhow::anyhow!(
+        "patch_target_must_match_once: old_text is not inside section {:?} (lines {}-{last_line}), but occurs in the document at line {first} under {containing}{repeated}. Omit section to anchor in the whole document, or set section to the heading that contains old_text",
+        section.heading,
+        section.line
+    ))
+}
+
 fn unique_document_text_span(old: &str, target: &str) -> Result<(usize, usize)> {
     if target.is_empty() {
         bail!("patch_target_must_match_once: old_text is empty");
@@ -2360,12 +2406,14 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                     "invalid_argument_value: {action} keeps old_text and adds text beside it, but text repeats old_text ambiguously, so the passage would appear twice. Use replace_text with an exact old_text and the full revised passage as text"
                 );
             }
-            let (base, scope) = if let Some(section) = args.get("section").and_then(Value::as_str) {
-                let heading = documentation::resolve_heading(old, section)?;
+            let scoped = args
+                .get("section")
+                .and_then(Value::as_str)
+                .map(|section| documentation::resolve_heading(old, section))
+                .transpose()?;
+            let (base, scope) = scoped.as_ref().map_or((0, old), |heading| {
                 (heading.start, &old[heading.start..heading.end])
-            } else {
-                (0, old)
-            };
+            });
             // Surrounding whitespace in old_text is copying noise (for example
             // a line's indentation kept when the passage starts mid-line).
             // When only it differs, match the trimmed passage and drop the
@@ -2385,7 +2433,14 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                 } else {
                     (target, new)
                 };
-            let (relative_start, relative_end) = unique_document_text_span(scope, target)?;
+            let (relative_start, relative_end) =
+                unique_document_text_span(scope, target).map_err(|error| {
+                    scoped
+                        .as_ref()
+                        .filter(|_| !scope.contains(target))
+                        .and_then(|heading| anchor_outside_section(old, heading, target))
+                        .unwrap_or(error)
+                })?;
             let (start, end) = (base + relative_start, base + relative_end);
             // A line or block inserted beside an anchor that stops mid-line
             // is glued into that line ("...다릅니다.- MariaDB는 ..."), which
@@ -3090,7 +3145,12 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
         return Ok(canonical);
     }
     if !canonical.starts_with(&root) {
-        bail!("path_outside_project");
+        bail!(
+            "path_outside_project: {} resolves to {} (symlinks are followed), outside project root {}; read files inside the project, or the configured output via document_inspect",
+            candidate.display(),
+            canonical.display(),
+            root.display()
+        );
     }
     // Include patterns select files. A directory scope need not itself match
     // `**/*.rs`; its children are still filtered when enumerated. Exclusion
@@ -3106,7 +3166,10 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
         p
     };
     if excluded(rules, canonical.strip_prefix(&root)?)? {
-        bail!("path_excluded");
+        bail!(
+            "path_excluded: {} is excluded by the project's include/exclude settings and cannot be read; choose a listed file from file_list",
+            canonical.strip_prefix(&root)?.display()
+        );
     }
     Ok(canonical)
 }
@@ -3236,7 +3299,10 @@ fn regular_metadata(metadata: &std::fs::Metadata, path: &Path) -> Result<()> {
         return Err(DirectoryPath(path.to_path_buf()).into());
     }
     if !metadata.is_file() {
-        bail!("unsupported_file_type: expected a regular text file");
+        bail!(
+            "unsupported_file_type: {} is not a regular file (device, socket or pipe); choose a regular text file",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -3344,9 +3410,17 @@ fn hash_reader_cancelled(
 pub(crate) fn read_text(path: &Path) -> Result<String> {
     let bytes = read_bytes_bounded(path)?;
     if bytes.contains(&0) {
-        bail!("unsupported_binary_file");
+        bail!(
+            "unsupported_binary_file: {} contains NUL bytes and is not a text file; choose a text file",
+            path.display()
+        );
     }
-    String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("unsupported_non_utf8_file"))
+    String::from_utf8(bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "unsupported_non_utf8_file: {} is not valid UTF-8 text; choose a UTF-8 text file",
+            path.display()
+        )
+    })
 }
 pub(crate) fn read_text_preview(path: &Path, max_bytes: usize) -> Result<(String, bool)> {
     use std::io::Read;
@@ -3422,8 +3496,12 @@ fn candidate_paths_bounded(
     };
     check()?;
     let root = p.root.canonicalize()?;
-    if directory.is_some_and(|scope| !scope.starts_with(&root)) {
-        bail!("path_outside_project");
+    if let Some(scope) = directory.filter(|scope| !scope.starts_with(&root)) {
+        bail!(
+            "path_outside_project: {} is outside project root {}; list a directory inside the project",
+            scope.display(),
+            root.display()
+        );
     }
     let scope = directory.map(Path::to_path_buf);
     let mut entries = vec![];
@@ -4306,8 +4384,16 @@ fn execute_repaired(
         .map_err(|error| memory_tools::argument_error(error, name, &args))?;
     memory_tools::validate_input(name, &args)?;
     check_whole_write(s, name, &args)?;
-    if s.checkpoint.is_some() && !ToolRegistry::checkpoint_allowed(name) {
-        bail!("checkpoint_pending: only memory/state/history maintenance allowed");
+    if let Some(cp) = s
+        .checkpoint
+        .as_ref()
+        .filter(|_| !ToolRegistry::checkpoint_allowed(name))
+    {
+        bail!(
+            "checkpoint_pending: {name} is withheld while checkpoint {} is pending; nothing was executed. Save needed findings with memory_write (or give no_save_reason), then call checkpoint_complete with this id and progress; {name} is available again afterwards. Allowed now: {}",
+            cp.id,
+            ToolRegistry::CHECKPOINT_TOOLS.join(", ")
+        );
     }
     if s.run_guidance["phase"] == "verify"
         && !s.investigations.is_empty()
@@ -4581,7 +4667,9 @@ fn execute_repaired(
                 let mut value = json!(s.task);
                 for (k, v) in patch {
                     if k == "revision" {
-                        bail!("invalid_argument_value: revision is program-owned");
+                        bail!(
+                            "invalid_argument_value: patch.revision is program-owned; remove revision from patch and resend the other fields; state unchanged"
+                        );
                     }
                     value[k] = v.clone();
                 }
@@ -4650,11 +4738,19 @@ fn execute_repaired(
                     &s.config.model,
                     s.config.state_tokens,
                 );
-                if context::count(&compact, &s.config.model) > s.config.state_tokens {
-                    bail!("task_state_limit");
+                let tokens = context::count(&compact, &s.config.model);
+                if tokens > s.config.state_tokens {
+                    bail!(
+                        "task_state_limit: the updated task state needs {tokens} tokens but state_tokens allows {}; shorten the patched fields and keep long notes in patch.details or memory_write; state unchanged",
+                        s.config.state_tokens
+                    );
                 }
-                if serde_json::to_vec(&next)?.len() > s.config.memory_bytes {
-                    bail!("task_detail_limit");
+                let bytes = serde_json::to_vec(&next)?.len();
+                if bytes > s.config.memory_bytes {
+                    bail!(
+                        "task_detail_limit: the task state would be {bytes} bytes but memory_bytes allows {}; remove obsolete details; state unchanged",
+                        s.config.memory_bytes
+                    );
                 }
                 s.task = next;
                 s.activate_workflow_tools();
@@ -4946,7 +5042,10 @@ fn execute_repaired(
             };
             let action = text(&args, "action")?;
             if action == "create" && exists {
-                bail!("document_exists");
+                bail!(
+                    "document_exists: the configured output already exists (hash {}); create was not applied. Edit it with section or text actions, or replace all of it with action=write and this expected_hash",
+                    hash(old.as_bytes())
+                );
             }
             // Anchored text edits match an exact old_text once in the current
             // document; that match is their precondition, so a hash is
@@ -5006,6 +5105,7 @@ fn execute_repaired(
             // Keep checking after a failure so one response names every
             // operation to fix instead of one per retry.
             let mut failures = Vec::new();
+            let mut failed_edits = Vec::new();
             for (index, edit) in edits.iter().enumerate() {
                 if cancel.is_cancelled() {
                     bail!("cancelled");
@@ -5016,6 +5116,10 @@ fn execute_repaired(
                     Ok(next) => next,
                     Err(error) => {
                         let hint = batch_target_hint(&states, &applied, edit, &error.to_string());
+                        failed_edits.push(json!({
+                            "index":index,"action":action,
+                            "code":recovery::error_code(&error.to_string())
+                        }));
                         failures.push(format!(
                             "index={index}; action={action}; cause={error}{hint}"
                         ));
@@ -5052,7 +5156,15 @@ fn execute_repaired(
                             .join(", ")
                     )
                 };
-                bail!("document_batch_operation_failed: {first}{rest}; no changes persisted");
+                // Each failure keeps its own cause code: a stale section hash
+                // needs a fresh inspection, a wrong old_text a corrected edit.
+                return Err(recovery::DiagnosticError {
+                    message: format!(
+                        "document_batch_operation_failed: {first}{rest}; no changes persisted"
+                    ),
+                    data: json!({"execution":"rejected_without_changes","failed_edits":failed_edits}),
+                }
+                .into());
             }
             let result = persist_document_edit(s, &path, &old, exists, current, cancel)?;
             let final_hash = result["hash"].clone();

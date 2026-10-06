@@ -1837,11 +1837,15 @@ pub async fn run_session_controlled(
         // this iteration, including failed provider calls and invalid output.
         match &response {
             Err(error) => {
-                s.note_run_estimate();
-                s.usage_incomplete = true;
+                // A refusal with an HTTP status (429, 400, 5xx) was not billed;
+                // estimate only attempts that may have generated tokens.
                 let attempts = error
                     .downcast_ref::<crate::llm::CompletionError>()
-                    .map_or(1, crate::llm::CompletionError::attempts);
+                    .map_or(1, crate::llm::CompletionError::billable_attempts);
+                if attempts > 0 {
+                    s.note_run_estimate();
+                    s.usage_incomplete = true;
+                }
                 s.input_tokens = s
                     .input_tokens
                     .saturating_add(request_tokens.saturating_mul(attempts));
@@ -1856,7 +1860,7 @@ pub async fn run_session_controlled(
             Ok(completion) => {
                 provider_outages = 0;
                 provider_requests = 0;
-                let extra_attempts = completion.attempts.saturating_sub(1);
+                let extra_attempts = completion.billable_failed_attempts();
                 if extra_attempts > 0 {
                     s.note_run_estimate();
                     s.usage_incomplete = true;
@@ -2851,6 +2855,9 @@ pub async fn run_session_controlled(
                 }
                 let cache_parallel_result = parallel && result["status"] == "ok";
                 tools::recovery::attach(&s, call, &mut result);
+                if !replayed_call {
+                    tool_failures.mark_repeated_failure(&call.name, &call.arguments, &mut result);
+                }
                 if let Some(reason) = tool_failures.observe(
                     &call.name,
                     &call.arguments,
@@ -4340,6 +4347,8 @@ mod review_usage_tests {
 
     enum Failure {
         Provider(usize),
+        /// Every quick retry was refused with HTTP 429 before generation.
+        Refused(usize),
         Fatal,
         Malformed,
         InvalidCompletion(bool),
@@ -4385,6 +4394,21 @@ mod review_usage_tests {
                         3,
                         true,
                     )
+                    .into());
+                }
+                Failure::Refused(failures) if index < failures => {
+                    let refused = |attempt| crate::llm::AttemptDiagnostic {
+                        attempt,
+                        code: "http_429".into(),
+                        reason: "http_429: rate-limited upstream".into(),
+                        action: crate::llm::AttemptAction::Retry,
+                    };
+                    return Err(CompletionError::new(
+                        anyhow::anyhow!("http_429: rate-limited upstream"),
+                        3,
+                        true,
+                    )
+                    .with_diagnostics((1..=3).map(refused).collect())
                     .into());
                 }
                 Failure::Fatal => anyhow::bail!("test_review_failure"),
@@ -4553,6 +4577,18 @@ mod review_usage_tests {
             let (input, output) = review_usage(&session);
             assert!(input > 13);
             assert_eq!(output, 5);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refused_attempts_are_not_charged_as_input() {
+        // Live run 2026-10-06: four 429 sequences added ~0.5M unbilled input
+        // to the run budget. A refusal with an HTTP status generated nothing.
+        for completion in [false, true] {
+            let (session, reviewer) = run(completion, Failure::Refused(2)).await;
+            assert_eq!(session.status, "complete", "{:?}", session.last_error);
+            assert_eq!(reviewer.requests.load(Ordering::SeqCst), 3);
+            assert_eq!(review_usage(&session), (13, 5));
         }
     }
 

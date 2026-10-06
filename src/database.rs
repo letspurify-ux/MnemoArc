@@ -166,7 +166,9 @@ fn password(name: &str) -> Result<String> {
 fn remaining(deadline: Instant) -> Result<Duration> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
-        bail!("database_query_timeout");
+        bail!(
+            "database_query_timeout: the database time limit for this call was reached; narrow the query (filters, fewer rows or columns) before retrying"
+        );
     }
     Ok(left.min(Duration::from_secs(15)))
 }

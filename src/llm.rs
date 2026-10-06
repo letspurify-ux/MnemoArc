@@ -75,6 +75,16 @@ pub struct AttemptDiagnostic {
     pub action: AttemptAction,
 }
 
+/// An attempt the provider refused with an HTTP status never started
+/// generating, so it is not billed and needs no usage estimate. In-stream
+/// failures, timeouts and invalid output may have consumed tokens.
+fn unbilled_attempts(diagnostics: &[AttemptDiagnostic]) -> usize {
+    diagnostics
+        .iter()
+        .filter(|attempt| attempt.code.starts_with("http_"))
+        .count()
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Completion {
     pub text: String,
@@ -84,6 +94,15 @@ pub struct Completion {
     pub attempt_diagnostics: Vec<AttemptDiagnostic>,
     pub length_limited: bool,
     pub discarded_tool_calls: bool,
+}
+
+impl Completion {
+    /// Failed attempts before this successful one that may have been billed.
+    pub fn billable_failed_attempts(&self) -> usize {
+        self.attempts
+            .saturating_sub(1)
+            .saturating_sub(unbilled_attempts(&self.attempt_diagnostics))
+    }
 }
 
 /// The provider may retry a request several times before returning an error.
@@ -110,11 +129,18 @@ impl CompletionError {
         self.attempts.max(1)
     }
 
+    /// Attempts that may have been billed. Without diagnostics every attempt
+    /// counts, so the estimate stays conservative.
+    pub fn billable_attempts(&self) -> usize {
+        self.attempts()
+            .saturating_sub(unbilled_attempts(&self.attempt_diagnostics))
+    }
+
     pub fn attempt_diagnostics(&self) -> &[AttemptDiagnostic] {
         &self.attempt_diagnostics
     }
 
-    fn with_diagnostics(mut self, diagnostics: Vec<AttemptDiagnostic>) -> Self {
+    pub(crate) fn with_diagnostics(mut self, diagnostics: Vec<AttemptDiagnostic>) -> Self {
         self.attempt_diagnostics = diagnostics;
         self
     }
