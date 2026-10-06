@@ -1000,7 +1000,7 @@ impl ToolRegistry {
             if let Some(values) = field["enum"].as_array()
                 && !values.contains(v)
             {
-                bail!("invalid_argument_value: {k}");
+                bail!("{}", enum_value_error(name, k, v, values));
             }
         }
         if name == "task_state" {
@@ -2596,6 +2596,32 @@ fn validate_history_arguments(args: &Value) -> Result<()> {
         bail!("missing_argument: id for history action=read");
     }
     Ok(())
+}
+
+/// An argument outside its schema enum. Naming only the field left a live
+/// run resending task_plan action="insert" three times; say what arrived,
+/// what is allowed and, for a plan operation name, where it belongs.
+fn enum_value_error(name: &str, key: &str, value: &Value, allowed: &[Value]) -> String {
+    let shown = match value.as_str() {
+        Some(text) => format!("{:?}", text.chars().take(80).collect::<String>()),
+        None => value.to_string().chars().take(80).collect(),
+    };
+    let allowed = allowed
+        .iter()
+        .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hint = match (name, key, value.as_str()) {
+        (
+            "task_plan",
+            "action",
+            Some(op @ ("insert" | "update" | "split" | "move" | "remove" | "complete" | "reopen")),
+        ) => format!(
+            "; {op:?} is an operation, not an action: send action \"apply\" with expected_revision and operations [{{\"op\":{op:?}, ...}}]"
+        ),
+        _ => String::new(),
+    };
+    format!("invalid_argument_value: {key} {shown} is not one of: {allowed}{hint}")
 }
 
 fn validate_action_fields(name: &str, args: &Value, allowed: &[&str]) -> Result<()> {

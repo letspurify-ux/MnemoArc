@@ -1323,3 +1323,41 @@ fn stale_revision_asks_for_one_apply_per_response() {
     );
     assert_eq!(s.task.todos.len(), 1);
 }
+
+#[test]
+fn an_operation_name_sent_as_the_action_names_the_apply_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    // A live run resent action="insert" three times: the error named only
+    // the field, never the allowed actions or where an op belongs.
+    let error = tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"insert","operations":[{"op":"insert","texts":["Write the guide"]}]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert_eq!(
+        error,
+        "invalid_argument_value: action \"insert\" is not one of: list, apply; \"insert\" is an operation, not an action: send action \"apply\" with expected_revision and operations [{\"op\":\"insert\", ...}]"
+    );
+    let error = tools::execute(&mut s, "task_plan", json!({"action":"show"}))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "invalid_argument_value: action \"show\" is not one of: list, apply"
+    );
+    // The named call succeeds.
+    let revision = s.task.plan_revision;
+    tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":revision,"operations":[{"op":"insert","texts":["Write the guide"]}]}),
+    )
+    .unwrap();
+    assert_eq!(
+        s.task.current_todo().map(|t| t.text.as_str()),
+        Some("Write the guide")
+    );
+}
