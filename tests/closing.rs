@@ -44,14 +44,6 @@ fn fixture() -> (tempfile::TempDir, Session, Value) {
         json!({"action":"create","text":"# Flow\nA for loop runs work five times. main.js:3-5\n\n# History\nHistory is normalized first. main.js:2-2\n"}),
     )
     .unwrap();
-    for (id, section) in [("flow", "# Flow"), ("history", "# History")] {
-        tools::execute(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":id,"title":id,"section":section,"status":"written"}),
-        )
-        .unwrap();
-    }
     (dir, s, read["source"]["id"].clone())
 }
 
@@ -60,73 +52,6 @@ fn tool_names(s: &Session) -> Vec<String> {
         .iter()
         .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned())
         .collect()
-}
-
-#[test]
-fn mark_gap_is_offered_and_accepted_only_in_closing_mode() {
-    let (_dir, mut s, source) = fixture();
-    let investigation = ToolRegistry::definitions(&s)
-        .into_iter()
-        .find(|tool| tool["function"]["name"] == "investigation")
-        .unwrap();
-    assert!(!investigation.to_string().contains("mark_gap"));
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"mark_gap","id":"history","reason":"The normalize helper body is outside the delivered sources"}),
-    )
-    .unwrap_err();
-    assert!(error.to_string().starts_with("gap_requires_closing"));
-
-    s.progress_recovery.closing = Some(Closing::default());
-    let investigation = ToolRegistry::definitions(&s)
-        .into_iter()
-        .find(|tool| tool["function"]["name"] == "investigation")
-        .unwrap();
-    assert!(investigation.to_string().contains("mark_gap"));
-    let short = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"mark_gap","id":"history","reason":"unknown"}),
-    );
-    assert!(short.is_err());
-    tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"mark_gap","id":"history","reason":"The normalize helper body is outside the delivered sources"}),
-    )
-    .unwrap();
-    let item = s.investigations.iter().find(|i| i.id == "history").unwrap();
-    assert_eq!(item.status, "gap");
-    assert!(item.is_settled());
-
-    // A verified item needs no gap; the remaining item still blocks.
-    tools::execute(&mut s, "investigation", json!({"action":"verify","id":"flow","source_ids":[source],"verification_note":"Compared the for loop and its bound with the document"})).unwrap();
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"mark_gap","id":"flow","reason":"Attempting to hide a verified item"}),
-    )
-    .unwrap_err();
-    assert!(error.to_string().starts_with("item_already_verified"));
-    let check = tools::execute(&mut s, "investigation", json!({"action":"final_check"})).unwrap();
-    assert_eq!(check["complete"], true, "{check}");
-
-    // Editing the gap's section does not silently turn it back into work,
-    // but a later verification replaces the gap with real evidence.
-    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
-    let edit = tools::execute(
-        &mut s,
-        "document_edit",
-        json!({"action":"replace_text","expected_hash":hash,"old_text":"History is normalized first.","text":"History is normalized first (unconfirmed helper)."}),
-    )
-    .unwrap();
-    assert_eq!(edit["verification_required_ids"], json!([]));
-    let item = s.investigations.iter().find(|i| i.id == "history").unwrap();
-    assert_eq!(item.status, "gap");
-    tools::execute(&mut s, "investigation", json!({"action":"verify","id":"history","source_ids":[source],"verification_note":"Compared the normalize call on line 2 with the history section"})).unwrap();
-    let item = s.investigations.iter().find(|i| i.id == "history").unwrap();
-    assert_eq!(item.status, "verified");
 }
 
 #[test]
@@ -154,7 +79,7 @@ fn closing_mode_and_second_stall_stage_withhold_discovery_tools() {
     ] {
         assert!(!names.iter().any(|name| name == blocked), "{blocked}");
     }
-    for kept in ["file_read", "document_edit", "investigation", "task_plan"] {
+    for kept in ["file_read", "document_edit", "task_plan"] {
         assert!(names.iter().any(|name| name == kept), "{kept}");
     }
     let error = tools::execute(&mut s, "source_search", json!({"query":"normalize"})).unwrap_err();
@@ -286,7 +211,7 @@ impl LlmClient for BudgetWriter {
                 state["run_guidance"]["instruction"]
                     .as_str()
                     .unwrap()
-                    .starts_with("Closing mode")
+                    .contains("Closing mode")
             );
             *self.closing_tools.lock().unwrap() = Some(
                 request["tools"]
@@ -339,9 +264,6 @@ async fn closing_reserve_finishes_steady_work_before_the_budget() {
     s.add_user("Write out.md".into());
     s.active_tools = ToolRegistry::optional_names();
     s.select_workflow("source_document").unwrap();
-    // Exercise the shared document-work recovery without the source-evidence
-    // requirement, which the investigation tests cover.
-    s.task.require_investigation = false;
     tools::execute(
         &mut s,
         "document_edit",
@@ -460,12 +382,9 @@ fn call(id: &str, name: &str, args: Value) -> Completion {
 }
 
 fn verified_fixture() -> (tempfile::TempDir, Session) {
-    let (dir, mut s, source) = fixture();
+    let (dir, mut s, _) = fixture();
     s.config.source_document_review = false;
     s.config.completion_review_enabled = false;
-    for id in ["flow", "history"] {
-        tools::execute(&mut s, "investigation", json!({"action":"verify","id":id,"source_ids":[source],"verification_note":"Compared the cited lines with the section"})).unwrap();
-    }
     (dir, s)
 }
 
@@ -713,8 +632,16 @@ async fn finished_bookkeeping_asks_for_the_final_answer() {
             .starts_with("Ready to finish")
     );
 
-    // An unverified item keeps the ordinary guidance.
-    let (_dir, s, _) = fixture();
+    // A cited range that was never read keeps the ordinary guidance.
+    let (_dir, mut s, _) = fixture();
+    std::fs::write(s.project.root.join("extra.js"), "export const x = 1;\n").unwrap();
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":hash,"text":"\n# Extra\nUnread. extra.js:1\n"}),
+    )
+    .unwrap();
     let (_, guidance) = run_scripted(
         s,
         vec![Completion {
@@ -890,15 +817,24 @@ async fn rejected_review_asks_for_one_batched_repair() {
 async fn audits_during_review_repair_return_a_short_page() {
     let (_dir, mut s, _) = fixture();
     s.config.completion_review_enabled = false;
-    // Pending investigations yield enough audit issues to exercise paging,
-    // while the document and cited source remain reviewable.
+    // Unread citations yield enough audit issues to exercise paging, while
+    // the document and its cited source remain reviewable.
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    let mut extra = String::from("\n# Extras\n");
     for i in 0..7 {
-        let mut item = s.investigations[0].clone();
-        item.id = format!("pending-{i}");
-        item.status = "written".into();
-        item.sources.clear();
-        s.investigations.push(item);
+        std::fs::write(
+            s.project.root.join(format!("extra{i}.js")),
+            "export const x = 1;\n",
+        )
+        .unwrap();
+        extra.push_str(&format!("Extra {i}. extra{i}.js:1\n"));
     }
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":hash,"text":extra}),
+    )
+    .unwrap();
     document_review::request(&mut s).unwrap();
     support::document_review::finish(&mut s, r#"{"issues":["Flow: fix citations"]}"#).unwrap();
     let (result, _) = run_scripted(s, vec![call("audit", "document_audit", json!({}))]).await;
@@ -1561,37 +1497,6 @@ async fn an_output_limit_truncation_withholds_whole_document_writes() {
 }
 
 #[test]
-fn repair_reverification_counts_as_fresh_progress() {
-    let (_dir, mut s, source) = fixture();
-    let verify = |s: &mut Session, id: &str| {
-        tools::execute(s, "investigation", json!({"action":"verify","id":id,"source_ids":[source],"verification_note":"Compared the cited lines with the section"})).unwrap();
-    };
-    verify(&mut s, "flow");
-    assert_eq!(s.progress_recovery.verification_events, 1);
-    // Re-verifying an unchanged, already verified item is not new work.
-    verify(&mut s, "flow");
-    assert_eq!(s.progress_recovery.verification_events, 1);
-    // A repair edit invalidates the section; verifying it again counts.
-    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
-    tools::execute(
-        &mut s,
-        "document_edit",
-        json!({"action":"replace_text","expected_hash":hash,"old_text":"A for loop runs work five times.","text":"A for loop runs work exactly five times."}),
-    )
-    .unwrap();
-    assert_ne!(
-        s.investigations
-            .iter()
-            .find(|i| i.id == "flow")
-            .unwrap()
-            .status,
-        "verified"
-    );
-    verify(&mut s, "flow");
-    assert_eq!(s.progress_recovery.verification_events, 2);
-}
-
-#[test]
 fn paged_rereview_judges_previous_findings_only_on_their_page() {
     let (_dir, mut s, _) = fixture();
     let request = document_review::request(&mut s).unwrap();
@@ -1702,8 +1607,8 @@ async fn a_forced_repair_step_refuses_non_repair_tools() {
             .contains("review_repair_required:"),
         "{audit}"
     );
-    // Re-verifying the unchanged document is not offered as repair.
-    assert!(!offered[3].iter().any(|name| name == "investigation"));
+    // Re-auditing the unchanged document is not offered as repair.
+    assert!(!offered[3].iter().any(|name| name == "document_audit"));
     assert!(offered[3].iter().any(|name| name == "document_edit_batch"));
 }
 

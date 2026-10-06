@@ -110,7 +110,6 @@ async fn cancelled(root: &std::path::Path) -> Session {
     )
     .unwrap();
     tools::execute(&mut s,"task_plan",json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Write the requested chapter"]}]})).unwrap();
-    tools::execute(&mut s,"investigation",json!({"action":"upsert","id":"main","title":"Main source","section":"# Draft","status":"written"})).unwrap();
     let (s, _) = execute(s, vec![Reply::Cancel]).await;
     assert_eq!(s.status, "cancelled");
     assert_eq!(s.run_history.back().unwrap().reason, "cancelled");
@@ -118,7 +117,7 @@ async fn cancelled(root: &std::path::Path) -> Session {
 }
 fn preserved(s: &Session) -> Value {
     json!({"goal":s.latest_request,"original":s.original_request,"task":s.task,
-        "amendments":s.task_amendments,"investigations":s.investigations,
+        "amendments":s.task_amendments,
         "document_review":s.document_review,"completion_review":s.completion_review,
         "last_write":s.last_document_write,"checkpoint":s.checkpoint})
 }
@@ -167,7 +166,6 @@ async fn a_cancelled_document_accepts_the_changed_prompt_after_invalid_classific
         assert_eq!(s.task_amendments.len(), 1);
         assert_eq!(s.task.todos.len(), plan.len());
         assert_eq!(s.task.todos[0].id, plan[0].id);
-        assert_eq!(s.investigations[0].id, "main");
         assert_eq!(s.run_history.back().unwrap().workflow, "source_document");
         assert!(s.last_error.as_deref().unwrap().starts_with("work_reached"));
         assert_eq!(std::fs::read(&s.project.output).unwrap(), saved);

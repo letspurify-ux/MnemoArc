@@ -1,7 +1,7 @@
 //! Memory-specific diagnostics. Recovery explains a correction, but never
 //! guesses content/source IDs, refreshes references, or retries a write.
 use super::*;
-use crate::memory::{MemoryRevisionConflict, MemoryStatus};
+use crate::memory::MemoryRevisionConflict;
 use recovery::DiagnosticError;
 
 fn input<'a>(name: &str, args: &'a Value) -> Option<(&'static str, &'a Value)> {
@@ -216,62 +216,8 @@ pub(super) fn revision_error(error: anyhow::Error, name: &str) -> anyhow::Error 
     }.into()
 }
 
-pub(super) fn check_references(s: &Session, item: &Investigation) -> Result<()> {
-    let mut issues = Vec::new();
-    let mut codes = BTreeSet::new();
-    let mut ids = BTreeSet::new();
-    let mut ready = true;
-    for (id, revision) in &item.memory_refs {
-        match s.memory.get(id) {
-            Ok(memory) => {
-                ids.insert(memory.id.clone());
-                let cause = match memory.status {
-                    MemoryStatus::NeedsReview => {
-                        Some(("needs_review", "memory_reference_unverified"))
-                    }
-                    MemoryStatus::Superseded => Some(("superseded", "memory_reference_unverified")),
-                    MemoryStatus::Active if memory.revision != *revision => {
-                        Some(("revision_mismatch", "memory_reference_stale"))
-                    }
-                    MemoryStatus::Active => None,
-                };
-                ready &= memory.status == MemoryStatus::Active;
-                if let Some((cause, code)) = cause {
-                    codes.insert(code);
-                    issues.push(
-                        json!({"id":id,"key":memory.key,"referenced_revision":revision,
-                        "current_revision":memory.revision,"status":memory.status,"cause":cause,
-                        "read_call":{"tool":"memory_read","arguments":{"id":memory.id}}}),
-                    );
-                }
-            }
-            Err(_) => {
-                ready = false;
-                ids.insert(id.clone());
-                codes.insert("memory_reference_missing");
-                issues.push(json!({"id":id,"referenced_revision":revision,"current_revision":null,"status":"missing","cause":"not_found"}));
-            }
-        }
-    }
-    if issues.is_empty() {
-        return Ok(());
-    }
-    let code = if codes.len() == 1 {
-        *codes.first().unwrap()
-    } else {
-        "memory_reference_mixed"
-    };
-    Err(DiagnosticError {
-        message:format!("{code}: investigation {} has {} invalid memory references; inspect memory_issues before updating references and verifying again", item.id, issues.len()),
-        data:json!({"item_id":item.id,"memory_issue_count":issues.len(),"memory_issues":issues,
-            "reference_update":{"tool":"investigation","arguments":{"action":"upsert","id":item.id,"status":"written","memory_ids":ids},"ready":ready},
-            "guidance":"Read changed memories and check that the document still matches their claims. For active revision mismatches, explicitly upsert all retained memory_ids to capture current revisions, then verify again. needs_review/superseded memories cannot verify: restore observed evidence and an active memory first. Find a replacement for a missing memory. Detach a reference only if the item no longer relies on it, while preserving the other references and document source evidence. Do not retry verify unchanged or merely rewrite a progress memory. Keep transient progress in task_state or checkpoint_complete progress, and reusable observed facts in separate stable memory keys."
-        }),
-    }.into())
-}
-
 pub(super) fn compact_data(name: &str, data: &Value) -> Option<Value> {
-    if !matches!(name, "memory_write" | "memory_manage" | "investigation") {
+    if !matches!(name, "memory_write" | "memory_manage") {
         return None;
     }
     if data["memory"].is_object() {

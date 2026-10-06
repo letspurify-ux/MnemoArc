@@ -524,51 +524,15 @@ pub(super) fn execute(
             if checked == 0 {
                 issues.push(json!({"kind":"no_machine_readable_citations","guidance":"Use relative/path.ext:start-end. Other citation formats require manual review."}));
             }
-            if s.investigations
-                .iter()
-                .all(|item| item.status == "superseded")
-            {
-                issues.push(json!({"kind":"no_investigation_coverage",
-                    "guidance":"No investigation item covers this document. Register one item per written section with investigation upsert (title, section copied from the document_inspect outline, status=written), then verify them against delivered sources with verify_batch before the final answer."}));
-            }
             // The output's own absolute path in its text is a run report
             // (where it was written), which belongs in the final answer.
             if let Some(line) = output_path_line(&path, &doc) {
                 issues.push(json!({"kind":"output_path_in_document","line":line,
                     "guidance":"The document states its own output path, a report of how it was produced. Remove that text; give the path, verification scope and limitations in the final chat answer instead."}));
             }
-            for item in &s.investigations {
-                if item.status == "superseded" {
-                    continue;
-                }
-                // A closing-mode gap is reported as unconfirmed by the final
-                // result; it is settled, and it may never have been written.
-                if item.status == "gap" && item.section.trim().is_empty() {
-                    continue;
-                }
-                if !item.is_settled() {
-                    issues.push(json!({"kind":"pending_verification","id":item.id,"section":item.section,"status":item.status,"next":"Read the linked document section and sources, then verify_batch with evidence and a comparison note."}));
-                }
-                if section_text(&doc, &item.section).is_err() {
-                    issues.push(json!({"kind":"missing_or_ambiguous_section","id":item.id,"section":item.section}));
-                }
-                for source in &item.sources {
-                    if let Some(p) = &source.path {
-                        let current = read_path(&s.project, p)
-                            .and_then(|p| read_text(&p))
-                            .ok()
-                            .map(|t| hash(t.as_bytes()));
-                        if current != source.hash {
-                            issues.push(json!({"kind":"stale_source","id":item.id,"path":p}));
-                        }
-                    }
-                }
-            }
-            if !s.investigations.is_empty() {
-                issues.extend(uncovered_sections(s, &doc)?);
-            }
-            // The issue list includes source and investigation state as well
-            // as document citations. Bind every continuation page to the
+            issues.extend(unread_citations(s, &doc)?);
+            // The issue list includes delivered-evidence state as well as
+            // document citations. Bind every continuation page to the
             // exact list that produced the first page.
             let document_hash = hash(doc.as_bytes());
             let revision = hash(&serde_json::to_vec(&(
@@ -604,7 +568,7 @@ pub(super) fn execute(
             }
             let end = (offset + n(args, "limit", 30).clamp(1, 100)).min(issues.len());
             Ok(
-                json!({"hash":document_hash,"revision":revision,"total_lines":doc.lines().count(),"citations_checked":checked,"structural_ok":issues.is_empty(),"semantic_verified":false,"format_check":format_check,"issue_count":issues.len(),"issues":issues[offset..end],"next_offset":(end<issues.len()).then_some(end)}),
+                json!({"hash":document_hash,"revision":revision,"total_lines":doc.lines().count(),"citations_checked":checked,"structural_ok":issues.iter().all(|issue| issue["kind"] == "no_machine_readable_citations"),"semantic_verified":false,"format_check":format_check,"issue_count":issues.len(),"issues":issues[offset..end],"next_offset":(end<issues.len()).then_some(end)}),
             )
         }
         _ => bail!("unsupported_tool"),
@@ -626,51 +590,6 @@ fn output_path_line(path: &Path, doc: &str) -> Option<usize> {
         .map(|index| index + 1)
 }
 
-/// Sections whose citations no investigation item covers. Verification only
-/// compares the sections items point at, so a cited section without an item
-/// would otherwise pass unchecked. An item covers its section's descendants.
-fn uncovered_sections(s: &Session, doc: &str) -> Result<Vec<Value>> {
-    let headings = headings(doc);
-    let paths = heading_paths(&headings);
-    let covered: Vec<(usize, usize)> = s
-        .investigations
-        .iter()
-        .filter(|item| item.status != "superseded")
-        .filter(|item| !item.section.trim().is_empty())
-        .filter_map(|item| resolve_heading(doc, &item.section).ok())
-        .map(|heading| (heading.start, heading.end))
-        .collect();
-    let line_starts: Vec<usize> = std::iter::once(0)
-        .chain(doc.match_indices('\n').map(|(index, _)| index + 1))
-        .collect();
-    let mut uncovered = std::collections::BTreeMap::<usize, usize>::new();
-    for citation in citation_spans(doc)? {
-        let Some(&offset) = line_starts.get(citation.document_line - 1) else {
-            continue;
-        };
-        if covered
-            .iter()
-            .any(|&(start, end)| start <= offset && offset < end)
-        {
-            continue;
-        }
-        // The innermost heading holding the citation names the section.
-        if let Some(index) = headings
-            .iter()
-            .rposition(|heading| heading.start <= offset && offset < heading.end)
-        {
-            *uncovered.entry(index).or_default() += 1;
-        }
-    }
-    Ok(uncovered
-        .into_iter()
-        .map(|(index, citations)| {
-            json!({"kind":"uncovered_section","section":paths[index],"citations":citations,
-                "next":"No investigation item covers this cited section. Register one with investigation upsert (section = this path, status=written), then verify it against its sources; or give an existing item a parent section that includes it."})
-        })
-        .collect())
-}
-
 /// Citations in prose and Mermaid are references; other fenced code is an example.
 pub(super) struct Citation {
     pub raw: String,
@@ -681,54 +600,65 @@ pub(super) struct Citation {
     pub document_line: usize,
 }
 
-#[derive(Debug)]
-pub(super) struct CoverageMissing {
-    pub item_id: String,
-    pub missing_ranges: Vec<Value>,
-}
-impl std::fmt::Display for CoverageMissing {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "source_coverage_missing: item {} has {} ranges never delivered as complete lines of the current file version; file_read exactly these ranges, then verify again (delivered evidence is added automatically): {}",
-            self.item_id,
-            self.missing_ranges.len(),
-            json!(self.missing_ranges)
-        )?;
-        // A live run read 900 lines in pages because an opening cited a
-        // whole screen component as a pointer; offer the cheaper repair.
-        let widest = self
-            .missing_ranges
-            .iter()
-            .filter_map(|range| {
-                Some(range["end_line"].as_u64()? + 1 - range["start_line"].as_u64()?)
-            })
-            .max()
-            .unwrap_or(0);
-        if widest >= BROAD_CITATION_LINES {
-            write!(
-                f,
-                ". The widest range spans {widest} lines: if its citation only points at where a screen, component or feature lives rather than supporting every line, narrow that citation in the document to the lines that support the claim with a scoped text edit, then verify again instead of reading the whole range"
-            )?;
-        }
-        Ok(())
-    }
-}
 /// A missing cited range this long is more likely a pointer than evidence.
-const BROAD_CITATION_LINES: u64 = 120;
-impl std::error::Error for CoverageMissing {}
+const BROAD_CITATION_LINES: usize = 120;
 
-/// Subtract the union of supplied evidence from every cited interval. Merge
-/// overlapping citations so the recovery plan never asks to read a gap twice.
-pub(super) fn missing_citation_ranges(
-    s: &Session,
-    section: &str,
-    sources: &[Source],
-) -> Result<Vec<Value>> {
-    let mut missing = std::collections::BTreeMap::<PathBuf, Vec<(usize, usize)>>::new();
-    for citation in citation_spans(section)? {
+/// Cited ranges never delivered to the model as complete lines of the current
+/// file version in this session, merged per file. The runtime derives this
+/// from the delivered-source registry on every save and audit, so no
+/// bookkeeping call attests a comparison: the model reads a listed range or
+/// narrows the citation to the lines it read. Unreadable paths and invalid
+/// ranges are the citation check's issues, not unread evidence.
+pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
+    let output = output_path(&s.project)?;
+    // Delivered complete-line ranges of each file's current version.
+    let mut versions = BTreeMap::<PathBuf, Option<String>>::new();
+    let mut delivered = BTreeMap::<PathBuf, Vec<(usize, usize)>>::new();
+    for source in s.sources.values() {
+        if source.origin != "file" || source.evidence_truncated {
+            continue;
+        }
+        let (Some(path), Some(start), Some(end)) =
+            (source.path.as_deref(), source.start_line, source.end_line)
+        else {
+            continue;
+        };
+        let Ok(resolved) = read_path(&s.project, path) else {
+            continue;
+        };
+        let current = versions
+            .entry(resolved.clone())
+            .or_insert_with(|| hash_file(&resolved).ok());
+        if current.as_deref() != source.hash.as_deref() {
+            continue;
+        }
+        // A cursor may begin or end in the middle of a line; such a line is
+        // navigation context, not an attested citation.
+        let start = if source.line_start_complete {
+            start
+        } else {
+            start.saturating_add(1)
+        };
+        let end = if source.line_end_complete {
+            end
+        } else {
+            end.saturating_sub(1)
+        };
+        if start <= end {
+            delivered.entry(resolved).or_default().push((start, end));
+        }
+    }
+    for ranges in delivered.values_mut() {
+        ranges.sort_unstable();
+    }
+    let mut missing = BTreeMap::<PathBuf, Vec<(usize, usize)>>::new();
+    let mut line_counts = BTreeMap::<PathBuf, usize>::new();
+    // The document is not evidence for itself: a self-citation would go
+    // unread again after every edit, so it is never owed a read.
+    let own = output.canonicalize().ok();
+    for citation in citation_spans(doc)? {
         let path = if citation.relative_link {
-            output_path(&s.project)?
+            output
                 .parent()
                 .unwrap()
                 .join(&citation.path)
@@ -737,50 +667,24 @@ pub(super) fn missing_citation_ranges(
         } else {
             citation.path
         };
-        let cited = read_path(&s.project, &path)?;
-        // `citation_spans` deliberately accepts the same compact syntax used
-        // by the structural audit, but verification must not treat a reversed
-        // range such as `file.rs:10-5` as an empty interval. Without this
-        // guard the coverage walk starts at 10, sees that it is already past
-        // the end 5, and reports no missing lines, allowing an invalid
-        // citation to be marked verified.
-        if citation.begin == 0 || citation.end < citation.begin {
-            bail!(
-                "invalid_citation_range: {} must use a 1-based range with start <= end",
-                citation.raw
-            );
+        let Ok(cited) = read_path(&s.project, &path) else {
+            continue;
+        };
+        if own.as_ref() == Some(&cited) {
+            continue;
         }
-        let mut ranges: Vec<_> = sources
-            .iter()
-            .filter(|source| {
-                source
-                    .path
-                    .as_deref()
-                    .is_some_and(|p| Path::new(p) == cited)
-            })
-            .filter_map(|source| {
-                // A cursor may begin or end in the middle of a line, and
-                // search/outline results may contain only a capped excerpt.
-                // Such observations identify navigation context but cannot
-                // attest the entire cited line range.
-                if source.evidence_truncated {
-                    return None;
-                }
-                let mut start = source.start_line?;
-                let mut end = source.end_line?;
-                if !source.line_start_complete {
-                    start = start.saturating_add(1);
-                }
-                if !source.line_end_complete {
-                    end = end.saturating_sub(1);
-                }
-                (start <= end).then_some((start, end))
-            })
-            .collect();
-        ranges.sort_unstable();
+        // A reversed range such as `file.rs:10-5` must not read as an empty,
+        // fully covered interval, and a range past the end of the file is
+        // not unread evidence; the citation check reports both.
+        let total = *line_counts
+            .entry(cited.clone())
+            .or_insert_with(|| read_text(&cited).map_or(0, |text| text.lines().count()));
+        if citation.begin == 0 || citation.end < citation.begin || citation.end > total {
+            continue;
+        }
         let mut next = citation.begin;
-        let gaps = missing.entry(cited).or_default();
-        for (start, end) in ranges {
+        let gaps = missing.entry(cited.clone()).or_default();
+        for &(start, end) in delivered.get(&cited).map(Vec::as_slice).unwrap_or(&[]) {
             if end < next {
                 continue;
             }
@@ -799,7 +703,8 @@ pub(super) fn missing_citation_ranges(
             gaps.push((next, citation.end));
         }
     }
-    let mut result = vec![];
+    let root = s.project.root.canonicalize()?;
+    let mut issues = vec![];
     for (path, mut gaps) in missing {
         gaps.sort_unstable();
         let mut merged: Vec<(usize, usize)> = vec![];
@@ -812,13 +717,21 @@ pub(super) fn missing_citation_ranges(
                 merged.push((start, end));
             }
         }
-        let root = s.project.root.canonicalize()?;
         let path = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
         for (start, end) in merged {
-            result.push(json!({"path":path,"start_line":start,"end_line":end}));
+            let mut issue = json!({"kind":"unread_citation","path":path,"start_line":start,"end_line":end,
+                "next":format!("file_read {path} with start_line {start} through line {end} (complete lines of the current file version), or narrow the citation to the lines already read")});
+            // A live run read 900 lines in pages because an opening cited a
+            // whole screen component as a pointer; offer the cheaper repair.
+            if end + 1 - start >= BROAD_CITATION_LINES {
+                issue["note"] = json!(
+                    "This range is long: if the citation only points at where a screen, component or feature lives, cite its entry lines (for example the declaration) instead of its whole span"
+                );
+            }
+            issues.push(issue);
         }
     }
-    Ok(result)
+    Ok(issues)
 }
 
 struct CitationFence {
@@ -1038,7 +951,17 @@ fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<
 
 pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Value> {
     let (checked, issues) = citation_issues(s, output, doc)?;
+    // The write already succeeded: a failed unread check is reported beside
+    // it, not as a failure of the save.
+    let (unread, unread_error) = match unread_citations(s, doc) {
+        Ok(unread) => (unread, None),
+        Err(error) => (vec![], Some(error.to_string())),
+    };
     Ok(
-        json!({"citations_checked":checked,"issue_count":issues.len(),"issues":issues.iter().take(8).collect::<Vec<_>>(),"semantic_verified":false,"guidance":"Fix citation or code-fence issues in the next section edit. Partial drafts may still lack investigation coverage."}),
+        json!({"citations_checked":checked,"issue_count":issues.len(),"issues":issues.iter().take(8).collect::<Vec<_>>(),
+        "unread_citation_count":unread.len(),"unread_citations":unread.iter().take(8).collect::<Vec<_>>(),
+        "unread_citation_error":unread_error,
+        "semantic_verified":false,
+        "guidance":"Fix citation or code-fence issues in the next section edit. unread_citations are cited ranges never delivered to you as complete lines of the current file version: file_read each listed range, or narrow the citation to the lines you read, before the final answer; the final audit treats them as unresolved evidence."}),
     )
 }

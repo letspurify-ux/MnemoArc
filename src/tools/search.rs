@@ -54,13 +54,33 @@ pub(super) fn execute(
         {
             object.remove("queries");
         }
+        // A literal query repeated inside queries asks for nothing new: a
+        // live run sent query:"표로 보기" with queries:["표로 보기"] six times.
+        if object.get("regex") != Some(&json!(true))
+            && let (Some(query), Some(queries)) = (
+                object.get("query").and_then(Value::as_str),
+                object.get("queries").and_then(Value::as_array),
+            )
+            && queries.iter().any(|term| term.as_str() == Some(query))
+        {
+            object.remove("query");
+        }
     }
     let args = &args;
     match (args.get("query").is_some(), args.get("queries").is_some()) {
         (false, false) => bail!("missing_argument: query or queries{}", pattern_hint(args)),
-        (true, true) => bail!(
-            "conflicting_arguments: supply exactly one of query (literal by default) or queries (literal OR)"
-        ),
+        (true, true) => {
+            // Name both values and the call that keeps every term, so the
+            // retry is not the same rejected pair.
+            let mut merged: Vec<Value> = args["queries"].as_array().cloned().unwrap_or_default();
+            merged.insert(0, args["query"].clone());
+            bail!(
+                "conflicting_arguments: received both query {} and queries {}; send only one. For a literal OR over all of them send queries:{} without query; for a regular expression send query alone with regex:true",
+                args["query"],
+                args["queries"],
+                Value::Array(merged)
+            )
+        }
         _ => {}
     }
     let query = args["query"].as_str().unwrap_or("");

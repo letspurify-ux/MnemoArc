@@ -342,7 +342,7 @@ impl MemoryStore {
         let key = self.get(ident)?.id.clone();
         if protected.contains(&key) {
             bail!(
-                "memory_referenced: memory {key} is still referenced by task_state memory_ids or an investigation item; remove that reference first, or use memory_manage action=replace to supersede it; nothing was deleted"
+                "memory_referenced: memory {key} is still referenced by task_state memory_ids; remove that reference first, or use memory_manage action=replace to supersede it; nothing was deleted"
             );
         }
         self.entries.remove(&key);

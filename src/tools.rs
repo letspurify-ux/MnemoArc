@@ -1,5 +1,4 @@
 mod arguments;
-mod batch;
 pub mod completion_review;
 mod coverage;
 mod document_format;
@@ -19,7 +18,7 @@ use crate::{
     config::Project,
     context::{self},
     memory::{MemoryInput, Source},
-    session::{Investigation, Session, TaskState},
+    session::{Session, TaskState},
 };
 use anyhow::{Result, bail};
 pub use coverage::record_delivered_read;
@@ -96,12 +95,6 @@ fn reject_project_write_in_source_document(s: &Session, name: &str) -> Result<()
     Ok(())
 }
 
-fn pending_verification_stall(s: &Session) -> bool {
-    s.document_written
-        && s.progress_recovery.closing.is_none()
-        && s.progress_recovery.rounds_since_best >= s.config.stall_round_limit
-        && s.investigations.iter().any(|item| !item.is_settled())
-}
 fn task_patch_schema() -> Value {
     let mut properties = serde_json::Map::new();
     for field in ["purpose", "scope"] {
@@ -229,7 +222,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "task_state",
-                description: "Read/update goals, constraints and completion criteria. Manage ordered work through task_plan; current/next/done and todos are not patch fields. State fields belong inside patch, e.g. {action:update,patch:{phase:verify}}. A new user task starts with a request-based completion condition; refine it into concrete checks before substantial work. The user selects task.workflow (answer or source_document) and it cannot be patched; for source_document START with completion criteria matching the user request. Use investigation upsert for evidence items. Do not send empty patches or completion:[]. Updates preserve omitted fields. Evidence requirements and explicit user constraints remain in force even when a plan item is removed.",
+                description: "Read/update goals, constraints and completion criteria. Manage ordered work through task_plan; current/next/done and todos are not patch fields. State fields belong inside patch, e.g. {action:update,patch:{phase:verify}}. A new user task starts with a request-based completion condition; refine it into concrete checks before substantial work. The user selects task.workflow (answer or source_document) and it cannot be patched; for source_document START with completion criteria matching the user request. Do not send empty patches or completion:[]. Updates preserve omitted fields. Evidence requirements and explicit user constraints remain in force even when a plan item is removed.",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -260,7 +253,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "checkpoint_complete",
-                description: "Finish a checkpoint and preserve the ordered task_plan in ONE call. Required progress is a concise checkpoint summary including current blockers, pending reads and retry instructions; it does not complete or replace plan items. Save new reusable knowledge in memory first. If knowledge is already saved or only progress changed, provide progress and no_save_reason without creating a progress memory. Evaluated after other calls in this batch. Continue the first unfinished plan item after cleanup.",
+                description: "Finish a checkpoint and preserve the ordered task_plan in ONE call. Required progress is a concise checkpoint summary including current blockers, pending reads and retry instructions; it does not complete or replace plan items. Saving memories is optional: write one only for a reusable finding that is not saved yet and later work needs; otherwise call this directly with progress (no_save_reason is optional). Evaluated after other calls in this batch. Continue the first unfinished plan item after cleanup.",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -340,7 +333,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_audit",
-                description: "Check output citations path:line[-line], source freshness, section coverage, pending investigations, Markdown tables/code fences and fenced Mermaid syntax in one call. format_check reports parser coverage and warnings for unchecked UI extensions. Structural checks do NOT prove semantic correctness or browser layout. Paginated errors; the first result returns revision, and offset > 0 requires expected_revision copied from that result. Restart from offset 0 when the revision changes.",
+                description: "Check output citations path:line[-line], cited ranges not yet read as complete lines of the current file version (unread_citation), Markdown tables/code fences and fenced Mermaid syntax in one call. format_check reports parser coverage and warnings for unchecked UI extensions. Structural checks do NOT prove semantic correctness or browser layout. Paginated errors; the first result returns revision, and offset > 0 requires expected_revision copied from that result. Restart from offset 0 when the revision changes.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -390,7 +383,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit",
-                description: "Edit ONLY configured Markdown output. Save one investigated section at a time. Inspect the outline and copy section_path when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition (a supplied hash is still checked). Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and also requires expected_section_hash; its text must retain the original full heading. Simple edits do not require investigation items; the source_document workflow enables investigation automatically from the user's selection; do not patch workflow or require_investigation. Returns measured lines and new hash",
+                description: "Edit ONLY configured Markdown output. Save one section at a time as its evidence is read. Inspect the outline and copy section_path when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition (a supplied hash is still checked). Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and also requires expected_section_hash; its text must retain the original full heading. In the source_document workflow every save returns citation_check with unread cited ranges; do not patch workflow. Returns measured lines and new hash",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -400,7 +393,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit_batch",
-                description: "Apply 1..32 related edits to the existing configured Markdown output in order using one base expected_hash. Each edit is write, append, insert_before, insert_after, insert_first_child, insert_last_child, patch, replace_text, delete_text, insert_before_text, insert_after_text or section and observes prior edits. Copy section_path from document_inspect for repeated headings. Sibling insertion uses a same-level section anchor; child insertion uses a parent section and a heading one level deeper. Text edits use an exact unique old_text anchor, optionally within section. If insertion text contains that exact old_text once, it is treated as a replacement to avoid duplication; prefer replace_text for rewrites. All edits are prepared in memory and persisted only if every operation succeeds. Use this for related corrections from one snapshot; save newly investigated sections as progress is made. section replaces descendants and requires expected_section_hash.",
+                description: "Apply 1..32 related edits to the existing configured Markdown output in order using one base expected_hash. Each edit is write, append, insert_before, insert_after, insert_first_child, insert_last_child, patch, replace_text, delete_text, insert_before_text, insert_after_text or section and observes prior edits. Copy section_path from document_inspect for repeated headings. Sibling insertion uses a same-level section anchor; child insertion uses a parent section and a heading one level deeper. Text edits use an exact unique old_text anchor, optionally within section. If insertion text contains that exact old_text once, it is treated as a replacement to avoid duplication; prefer replace_text for rewrites. All edits are prepared in memory and persisted only if every operation succeeds. Use this for related corrections from one snapshot; save new sections as their evidence is read. section replaces descendants and requires expected_section_hash.",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -408,56 +401,7 @@ impl ToolRegistry {
                     &["expected_hash", "edits"],
                 ),
             },
-            ToolSpec {
-                name: "investigation",
-                description: "Manage source documentation items. upsert creates or updates ONE item per call: new items require title; when id identifies an existing item, omitted title is preserved. Optional id/status/memory_ids/source_ids/section; items and verification_note are NOT accepted. To register several items, issue separate upsert calls. verify requires id, source_ids and verification_note. Both verify and verify_batch require existing written items. If not written, write the section and upsert with status=written and section first; source IDs alone do not mark an item written. list accepts only offset/limit; final_check accepts no other arguments. Only verify_batch accepts items; it verifies existing written items, never creates them. verify_batch items is an object keyed by item ID, each value {source_ids:[...],verification_note:string}; each is independently verified; summary groups failures by code and retry_ids identifies only failed items. Already verified items in verify_batch reuse their existing evidence after section/source/memory freshness checks; new supplied evidence is ignored for those items. Use single verify to explicitly replace evidence. Verification also uses complete lines already delivered in this session for the current file version, so a lost source ID needs no re-read; a project path may stand in for its delivered sources. After edits, verify only verification_required_ids returned by document_edit. Memory failures return memory_issues and reference_update: read changed claims, explicitly refresh retained IDs, and restore active evidence when ready=false. Reading/writing alone does not refresh references. Coverage failures return all missing_ranges together. Verification coverage counts only complete file lines; partial file_read boundaries, truncated search lines and code outlines are navigation context and require a full file_read. status uninvestigated/in_progress/written; verify compares document with source IDs and requires verification_note. status=written requires a non-empty section (supplied now or preserved from the existing item). For written items, upsert checks the current document and normalizes section to its section_path from document_inspect, including ancestors for nested headings. A unique title without # is accepted, including numbering. Planned sections may be registered before writing with status=in_progress.",
-                optional: true,
-                read_only: false,
-                parameters: schema(
-                    json!({"action":action(&["list","upsert","verify","verify_batch","final_check","mark_gap"]),"reason":{"type":"string","minLength":10,"maxLength":400,"description":"ONLY for action=mark_gap: why this item cannot be verified with the gathered evidence."},"id":{"type":"string","minLength":1},"title":{"type":"string","minLength":1,"description":"Non-empty title required for a NEW item. Omit when updating an existing id to preserve its title."},"status":action(&["uninvestigated","in_progress","written"]),"memory_ids":strings(),"source_ids":strings(),"section":string(),"verification_note":string(),"items":{"type":"object","description":"ONLY for action=verify_batch. Object keyed by existing investigation IDs; not an array and not used by upsert.","minProperties":1,"maxProperties":20,"additionalProperties":{"type":"object","properties":{"source_ids":strings(),"verification_note":string(),"section":string()},"required":["source_ids","verification_note"],"additionalProperties":false}},"offset":number(),"limit":number()}),
-                    &["action"],
-                ),
-            },
         ];
-        let spec = specs
-            .iter_mut()
-            .find(|spec| spec.name == "investigation")
-            .unwrap();
-        let fields = spec.parameters["properties"].as_object().unwrap();
-        let branches: Vec<Value> = [
-            "list",
-            "upsert",
-            "verify",
-            "verify_batch",
-            "final_check",
-            "mark_gap",
-        ]
-            .into_iter()
-            .map(|name| {
-                let (allowed, required, _) = investigation_contract(name, true).unwrap();
-                let mut properties = serde_json::Map::new();
-                for key in allowed {
-                    properties.insert((*key).into(), fields[*key].clone());
-                }
-                properties.insert("action".into(), json!({"const":name}));
-                let mut required = required.to_vec();
-                required.push("action");
-                let mut branch = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
-                if name == "upsert" {
-                    // The existing-item title omission is state-dependent and
-                    // therefore cannot be expressed as one unconditional
-                    // required field. Still reject the common new-item form
-                    // without an ID or title before it reaches execution;
-                    // an ID branch remains available for existing updates and
-                    // runtime validation handles an unknown new ID.
-                    branch["oneOf"] = json!([
-                        {"required":["title"],"not":{"required":["id"]}},
-                        {"required":["id"]}
-                    ]);
-                }
-                branch
-            }).collect();
-        spec.parameters["oneOf"] = json!(branches);
         let outline_fields = specs
             .iter()
             .find(|spec| spec.name == "code_outline")
@@ -502,9 +446,9 @@ impl ToolRegistry {
         ]
         .contains(&name)
     }
-    /// Re-verifying the unchanged rejected document is not repair (a live run
-    /// answered three times, re-verifying in between); verification follows
-    /// an edit, which ends repair_only. Closing keeps investigation for mark_gap.
+    /// Re-auditing the unchanged rejected document is not repair (a live run
+    /// answered three times, re-checking in between); a check follows an
+    /// edit, which ends repair_only.
     const REPAIR_TOOLS: &'static [&'static str] = &[
         "document_edit",
         "document_edit_batch",
@@ -512,9 +456,8 @@ impl ToolRegistry {
         "source_search",
         "symbol_read",
     ];
-    fn repair_allows(s: &Session, name: &str) -> bool {
+    fn repair_allows(name: &str) -> bool {
         Self::REPAIR_TOOLS.contains(&name)
-            || (name == "investigation" && s.progress_recovery.closing.is_some())
     }
     /// A final answer was rejected by a review whose findings the unchanged
     /// document still carries. The required tool call must be a repair step,
@@ -559,13 +502,8 @@ impl ToolRegistry {
         Self::CHECKPOINT_TOOLS.contains(&name)
     }
     fn workflow_required_tools(s: &Session) -> &'static [&'static str] {
-        if s.task.require_investigation || s.task.workflow == "source_document" {
-            &[
-                "investigation",
-                "document_edit",
-                "document_edit_batch",
-                "document_audit",
-            ]
+        if s.task.workflow == "source_document" {
+            &["document_edit", "document_edit_batch", "document_audit"]
         } else {
             &[]
         }
@@ -621,17 +559,17 @@ impl ToolRegistry {
     const ANSWER_DESCRIPTION_EDITS: &[(&str, &str, &str)] = &[
         (
             "document_edit",
-            " Save one investigated section at a time.",
+            " Save one section at a time as its evidence is read.",
             "",
         ),
         (
             "document_edit",
-            " Simple edits do not require investigation items; the source_document workflow enables investigation automatically from the user's selection; do not patch workflow or require_investigation.",
+            " In the source_document workflow every save returns citation_check with unread cited ranges; do not patch workflow.",
             "",
         ),
         (
             "document_edit_batch",
-            "; save newly investigated sections as progress is made.",
+            "; save new sections as their evidence is read.",
             ".",
         ),
         ("task_state", "patch:{phase:verify}", "patch:{phase:answer}"),
@@ -639,11 +577,6 @@ impl ToolRegistry {
             "task_state",
             "; for source_document START with completion criteria matching the user request.",
             ".",
-        ),
-        (
-            "task_state",
-            " Use investigation upsert for evidence items.",
-            "",
         ),
         (
             "task_state",
@@ -674,8 +607,6 @@ impl ToolRegistry {
             .copied()
             .unwrap_or(base)
     }
-    /// Offered only in closing mode, where it is accepted.
-    const MARK_GAP_GUIDANCE: &str = " mark_gap requires id and a specific reason; it settles an item whose claim cannot be verified with gathered evidence, and the final result lists it as unconfirmed. Qualify the related claim in its section; verifying the item later replaces the gap.";
     pub fn definitions(s: &Session) -> Vec<Value> {
         // Recovery focus steers an existing draft toward writing. Before any
         // document is saved, discovery is still required to find the sources.
@@ -700,14 +631,7 @@ impl ToolRegistry {
                     })
             })
             .filter(|t| !Self::closing_withholds(s, t.name))
-            .filter(|t| !Self::repair_only(s) || Self::repair_allows(s, t.name))
-            // Listing and auditing cannot settle an item. When a document
-            // stalls with pending verification, withhold those choices until
-            // the model advances an item or makes a substantive edit.
-            .filter(|t| {
-                !pending_verification_stall(s)
-                    || !matches!(t.name, "document_audit" | "task_plan")
-            })
+            .filter(|t| !Self::repair_only(s) || Self::repair_allows(t.name))
             // Second stage of the document progress ladder: after twice the
             // stall limit without a better result, stop broad discovery even
             // in the verify phase. Targeted file_read/symbol_read remain.
@@ -739,35 +663,6 @@ impl ToolRegistry {
                 }
                 let fields = t.parameters["properties"].clone();
                 // Keep offset for old clients, but offer the model only opaque continuation.
-                if t.name == "investigation" {
-                    if pending_verification_stall(s) {
-                        if let Some(actions) = t.parameters["properties"]["action"]["enum"].as_array_mut() {
-                            actions.retain(|action| action != "list" && action != "final_check");
-                        }
-                        if let Some(branches) = t.parameters["oneOf"].as_array_mut() {
-                            branches.retain(|branch| {
-                                branch["properties"]["action"]["const"] != "list"
-                                    && branch["properties"]["action"]["const"] != "final_check"
-                            });
-                        }
-                    }
-                    if s.progress_recovery.closing.is_some() {
-                        static CLOSING: std::sync::OnceLock<&'static str> =
-                            std::sync::OnceLock::new();
-                        let base = t.description;
-                        t.description = CLOSING.get_or_init(|| {
-                            format!("{base}{}", Self::MARK_GAP_GUIDANCE).leak()
-                        });
-                    } else {
-                        t.parameters["properties"].as_object_mut().unwrap().remove("reason");
-                        if let Some(actions) = t.parameters["properties"]["action"]["enum"].as_array_mut() {
-                            actions.retain(|action| action != "mark_gap");
-                        }
-                        if let Some(branches) = t.parameters["oneOf"].as_array_mut() {
-                            branches.retain(|branch| branch["properties"]["action"]["const"] != "mark_gap");
-                        }
-                    }
-                }
                 if t.name == "file_read" {
                     t.parameters["properties"].as_object_mut().unwrap().remove("offset");
                     t.parameters["oneOf"] = json!([
@@ -892,26 +787,15 @@ impl ToolRegistry {
         }
         if Self::closing_withholds(s, name) {
             bail!(if s.document_written {
-                "closing_mode: {name} is withheld while the document is finalized; use gathered evidence, file_read for one specific cited range, or investigation mark_gap"
+                "closing_mode: {name} is withheld while the document is finalized; use gathered evidence, or file_read one specific cited range reported as unread"
             } else {
                 "closing_mode: {name} is withheld until the document is saved; create it now with document_edit action=create from the evidence already gathered"
             }
             .replace("{name}", name));
         }
-        if pending_verification_stall(s)
-            && (matches!(name, "document_audit" | "task_plan")
-                || (name == "investigation"
-                    && matches!(args["action"].as_str(), Some("list" | "final_check"))))
-        {
-            let next = investigation_next_steps(s);
-            bail!(
-                "investigation_progress_required: read-only checks cannot settle the pending investigation items; advance the first next step now: {}",
-                next.first().unwrap_or(&Value::Null)["next"]
-            );
-        }
         // The offered list alone did not stop a live model from calling
         // document_audit in a forced repair step.
-        if Self::repair_only(s) && !Self::repair_allows(s, name) {
+        if Self::repair_only(s) && !Self::repair_allows(name) {
             bail!(
                 "review_repair_required: {name} is not a repair step; the reviewed document is unchanged, so edit it for document_review.issues with document_edit or document_edit_batch (read a cited source range first if needed)"
             );
@@ -940,9 +824,6 @@ impl ToolRegistry {
             );
         }
         let fields = spec.parameters["properties"].as_object().unwrap();
-        if name == "investigation" {
-            validate_investigation_arguments(s, args)?;
-        }
         for key in object.keys() {
             if !fields.contains_key(key) {
                 if name == "task_state" && task_patch_schema()["properties"].get(key).is_some() {
@@ -1075,7 +956,7 @@ fn validate_task_state_arguments(args: &Value) -> Result<()> {
                     "invalid_argument_value: patch.revision is program-owned; remove revision from patch and resend the other fields; state unchanged"
                 );
             }
-            if key == "workflow" || key == "require_investigation" {
+            if key == "workflow" {
                 bail!(
                     "workflow_selected_by_user: the user selects the workflow for this session (see task.workflow); omit {key} from the patch; state unchanged"
                 );
@@ -1370,37 +1251,16 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
             // attempt to reclassify it is rejected.
             // The same holds for the program-owned checkpoint summary echoed
             // back from the task state.
-            let (workflow, require_investigation) =
-                (json!(s.task.workflow), json!(s.task.require_investigation));
+            let workflow = json!(s.task.workflow);
             if let Some(patch) = args.get_mut("patch").and_then(Value::as_object_mut) {
                 for (key, current) in [
                     ("workflow", workflow),
-                    ("require_investigation", require_investigation),
                     ("checkpoint_summary", json!(s.task.checkpoint_summary)),
                 ] {
                     if patch.get(key) == Some(&current) {
                         patch.remove(key);
                     }
                 }
-            }
-        }
-        // The investigation schema is shared by every action; providers that
-        // fill every field send verification data with upsert and sources
-        // with mark_gap, neither of which those actions use.
-        "investigation" if args["action"] == "upsert" => {
-            if args["verification_note"].is_string()
-                && let Some(object) = args.as_object_mut()
-            {
-                object.remove("verification_note");
-            }
-        }
-        "investigation" if args["action"] == "mark_gap" => {
-            if args["source_ids"]
-                .as_array()
-                .is_some_and(|ids| ids.iter().all(Value::is_string))
-                && let Some(object) = args.as_object_mut()
-            {
-                object.remove("source_ids");
             }
         }
         "document_edit" => {
@@ -1515,26 +1375,6 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
             }
             object.insert("action".into(), json!("apply"));
             object.insert("operations".into(), json!([operation]));
-        }
-        "investigation" if args["action"] == "verify" => {
-            // verify compares the item's registered section; restating that
-            // same section is harmless, a different one is a real mistake.
-            let registered = args["id"]
-                .as_str()
-                .and_then(|id| s.investigations.iter().find(|item| item.id == id))
-                .map(|item| item.section.clone());
-            if let (Some(section), Some(registered)) = (args["section"].as_str(), registered) {
-                let section = section.trim();
-                let same = !section.is_empty()
-                    && (registered.trim() == section
-                        || registered
-                            .lines()
-                            .last()
-                            .is_some_and(|last| last.trim() == section));
-                if same {
-                    args.as_object_mut().unwrap().remove("section");
-                }
-            }
         }
         _ => {}
     }
@@ -2691,12 +2531,10 @@ fn persist_document_edit(
         s.document_review.best_issue_count = None;
         s.document_review.last_reviewed_section_count = 0;
         s.document_review.last_reviewed_content_lines = 0;
-        s.document_review.last_reviewed_verified_count = 0;
     }
     s.document_review.approved_hash = None;
     s.last_document_write = Some((path.to_path_buf(), hash(result.as_bytes())));
     revalidate(s)?;
-    let written_items = bind_written_sections(s, &result);
     let hash = hash(result.as_bytes());
     let bytes = result.len();
     let total_lines = result.lines().count();
@@ -2707,10 +2545,6 @@ fn persist_document_edit(
     let citation_check = documentation::citation_check(s, path, &result)?;
     let format_check = document_format::check(&result).write_result();
     Ok(json!({
-        "written_items":written_items,
-        "verification_required_ids":s.investigations.iter().filter(|i| !i.is_settled()).map(|i| &i.id).collect::<Vec<_>>(),
-        "preserved_verified_ids":s.investigations.iter().filter(|i| i.status == "verified").map(|i| &i.id).collect::<Vec<_>>(),
-        "verification_guidance":"Verify only verification_required_ids. Unchanged sections retain verification; do not resubmit all items after a local edit. If none remain, resolve any document_audit coverage/format issues before final completion and document review.",
         "path":path,
         "hash":hash,
         "bytes":bytes,
@@ -2874,147 +2708,6 @@ fn document_action_hint(action: &str, key: &str) -> String {
         _ => String::new(),
     }
 }
-type InvestigationContract = (
-    &'static [&'static str],
-    &'static [&'static str],
-    &'static str,
-);
-fn investigation_contract(action: &str, updating: bool) -> Option<InvestigationContract> {
-    Some(match action {
-        "upsert" => (
-            &[
-                "action",
-                "id",
-                "title",
-                "status",
-                "memory_ids",
-                "source_ids",
-                "section",
-            ],
-            if updating { &[] } else { &["title"] },
-            r##"{"action":"upsert","id":"overview","title":"Project overview","section":"# Overview"}"##,
-        ),
-        "verify" => (
-            &["action", "id", "source_ids", "verification_note", "section"],
-            &["id", "source_ids", "verification_note"],
-            r#"{"action":"verify","id":"existing-id","source_ids":["observed-source-id"],"verification_note":"Actual source/document comparison"}"#,
-        ),
-        "verify_batch" => (
-            &["action", "items"],
-            &["items"],
-            r#"{"action":"verify_batch","items":{"existing-id":{"source_ids":["observed-source-id"],"verification_note":"Actual comparison"}}}"#,
-        ),
-        "list" => (
-            &["action", "offset", "limit"],
-            &[],
-            r#"{"action":"list","offset":0,"limit":20}"#,
-        ),
-        "final_check" => (&["action"], &[], r#"{"action":"final_check"}"#),
-        "mark_gap" => (
-            &["action", "id", "reason"],
-            &["id", "reason"],
-            r#"{"action":"mark_gap","id":"existing-id","reason":"The retry bound is not visible in the delivered sources"}"#,
-        ),
-        _ => return None,
-    })
-}
-
-// Enforce the advertised action contract even when providers do not validate
-// conditional JSON Schema. New-item title checks additionally require state.
-fn validate_investigation_arguments(s: &Session, args: &Value) -> Result<()> {
-    let action = args["action"].as_str().unwrap_or("");
-    let updating = args["id"]
-        .as_str()
-        .is_some_and(|id| s.investigations.iter().any(|item| item.id == id));
-    let Some((allowed, required, example)) = investigation_contract(action, updating) else {
-        return Ok(());
-    };
-    if action == "upsert" && args.get("items").is_some() {
-        bail!(
-            "invalid_action_arguments: investigation upsert handles ONE item per call; new items require top-level title. items is only for verify_batch of existing written items. Issue separate upsert calls. Example: {example}"
-        );
-    }
-    for key in args.as_object().unwrap().keys() {
-        if !allowed.contains(&key.as_str()) {
-            // A misnamed field for this action ("note" for
-            // verification_note), or a field another action takes.
-            let owners: Vec<_> = [
-                "list",
-                "upsert",
-                "verify",
-                "verify_batch",
-                "final_check",
-                "mark_gap",
-            ]
-            .into_iter()
-            .filter(|other| {
-                *other != action
-                    && investigation_contract(other, true)
-                        .is_some_and(|(fields, _, _)| fields.contains(&key.as_str()))
-            })
-            .map(|other| format!("action={other}"))
-            .collect();
-            let hint = match suggest::field("investigation", "", key, allowed, args) {
-                Some(found) => found.text,
-                None if !owners.is_empty() => format!(
-                    "; {key} is used by {}: drop {key}, or send that action if it is what you meant",
-                    owners.join(", ")
-                ),
-                None => String::new(),
-            };
-            bail!(
-                "invalid_action_arguments: investigation action={action} does not accept {key}{hint}; allowed: {}. Example: {example}",
-                allowed.join(", ")
-            );
-        }
-    }
-    for key in required {
-        if args.get(*key).is_none() {
-            // An id that names no item makes upsert a creation.
-            let unknown_id = match (action, *key, args["id"].as_str()) {
-                ("upsert", "title", Some(id)) => {
-                    let existing: Vec<_> = s
-                        .investigations
-                        .iter()
-                        .filter(|item| item.status != "superseded")
-                        .map(|item| item.id.as_str())
-                        .take(20)
-                        .collect();
-                    format!(
-                        "; id {id:?} is not an existing item, so this upsert creates a new item and needs title (existing ids: {})",
-                        json!(existing)
-                    )
-                }
-                _ => String::new(),
-            };
-            bail!(
-                "missing_argument: {key} for investigation action={action}{unknown_id}. Example: {example}"
-            );
-        }
-        if args[*key]
-            .as_str()
-            .is_some_and(|value| value.trim().is_empty())
-        {
-            bail!(
-                "invalid_argument_value: {key} must not be empty for investigation action={action}. Example: {example}"
-            );
-        }
-    }
-    if action == "verify_batch" && !args["items"].is_object() {
-        bail!(
-            "invalid_argument_type: items for verify_batch must be an object keyed by existing item IDs, not an array. Example: {example}"
-        );
-    }
-    if action == "upsert"
-        && args["title"]
-            .as_str()
-            .is_some_and(|title| title.trim().is_empty())
-    {
-        bail!("invalid_argument_value: title must not be empty for investigation action=upsert");
-    }
-    Ok(())
-}
-
 fn text<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args[key]
         .as_str()
@@ -3155,13 +2848,25 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
             fields.retain(|key, value| {
                 let required =
                     required.is_some_and(|required| required.iter().any(|r| r == key.as_str()));
-                let blank_navigation_option = matches!(
-                    name,
-                    "file_list" | "source_search" | "file_read" | "document_inspect"
-                ) && matches!(
-                    key.as_str(),
-                    "path" | "path_glob" | "pattern" | "cursor" | "query"
-                ) && value.as_str() == Some("");
+                // An empty query is an exact empty-name filter for the
+                // symbol tools, so only their navigation tokens are dropped.
+                // A live run sent code_outline cursor:"" and document_inspect
+                // section:"" and repeated each rejected call.
+                let blank_navigation_option = value.as_str() == Some("")
+                    && match name {
+                        "file_list" | "source_search" | "file_read" => matches!(
+                            key.as_str(),
+                            "path" | "path_glob" | "pattern" | "cursor" | "query"
+                        ),
+                        "document_inspect" => matches!(
+                            key.as_str(),
+                            "path" | "path_glob" | "pattern" | "cursor" | "query" | "section"
+                        ),
+                        "code_outline" | "symbol_search" | "symbol_relations" | "symbol_read" => {
+                            matches!(key.as_str(), "path" | "path_glob" | "cursor")
+                        }
+                        _ => false,
+                    };
                 !spec.parameters["properties"]
                     .as_object()
                     .unwrap()
@@ -3180,13 +2885,11 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
             .unwrap_or("")
             .to_owned();
         fields.retain(|key, value| {
-            !matches!(
-                name,
-                "document_edit" | "document_edit_batch" | "investigation"
-            ) || !spec.parameters["properties"]
-                .as_object()
-                .unwrap()
-                .contains_key(key)
+            !matches!(name, "document_edit" | "document_edit_batch")
+                || !spec.parameters["properties"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key(key)
                 || !blank_placeholder(key, value)
                 || (name == "document_edit" && required_document_field(&action, key))
         });
@@ -3288,9 +2991,7 @@ pub fn envelope(result: Result<Value>) -> Value {
                 "error"
             };
             let mut result = json!({"status":status,"error":message,"recovery":recovery::describe(&message),"truncated":false,"next_cursor":null});
-            if let Some(coverage) = error.downcast_ref::<documentation::CoverageMissing>() {
-                result["data"] = json!({"item_id":coverage.item_id,"missing_ranges":coverage.missing_ranges,"missing_range_count":coverage.missing_ranges.len()});
-            } else if let Some(diagnostic) = error.downcast_ref::<recovery::DiagnosticError>() {
+            if let Some(diagnostic) = error.downcast_ref::<recovery::DiagnosticError>() {
                 result["data"] = diagnostic.data.clone();
             }
             result
@@ -3978,23 +3679,16 @@ pub(crate) fn same_source(a: &crate::memory::Source, b: &crate::memory::Source) 
 pub(crate) struct Revalidation {
     hashes: BTreeMap<String, Option<String>>,
     stale_memories: BTreeSet<String>,
-    stale_investigations: Vec<String>,
 }
 
 impl Revalidation {
     pub(crate) fn changed(&self) -> bool {
-        !self.stale_memories.is_empty() || !self.stale_investigations.is_empty()
+        !self.stale_memories.is_empty()
     }
 
     pub(crate) fn apply(&self, s: &mut Session) {
         for (path, hash) in &self.hashes {
             s.memory.stale_path(path, hash.as_deref());
-        }
-        for item in &mut s.investigations {
-            if self.stale_investigations.contains(&item.id) {
-                item.status = "written".into();
-                item.note = "Source, memory or document changed; verification required".into();
-            }
         }
     }
 }
@@ -4018,7 +3712,6 @@ pub(crate) fn inspect_freshness_with(
         .entries
         .values()
         .flat_map(|m| &m.sources)
-        .chain(s.investigations.iter().flat_map(|i| &i.sources))
         .filter_map(|source| source.path.as_deref())
         .collect();
     let mut hashes = BTreeMap::new();
@@ -4047,48 +3740,9 @@ pub(crate) fn inspect_freshness_with(
         .filter(|memory| memory.sources.iter().any(source_changed))
         .map(|memory| memory.id.clone())
         .collect();
-    let doc = (!s.investigations.is_empty())
-        .then(|| {
-            output_path(&s.project)
-                .ok()
-                .and_then(|p| read_text(&p).ok())
-        })
-        .flatten();
-    let index = doc.as_deref().map(documentation::HeadingIndex::new);
-    let mut stale_investigations = Vec::new();
-    for item in &s.investigations {
-        if cancel.is_cancelled() {
-            bail!("cancelled");
-        }
-        if item.status != "verified" {
-            continue;
-        }
-        let changed = item.sources.iter().any(source_changed)
-            || item.memory_refs.iter().any(|(id, rev)| {
-                s.memory.get(id).map_or(true, |m| {
-                    m.revision != *rev
-                        || m.status != crate::memory::MemoryStatus::Active
-                        || stale_memories.contains(&m.id)
-                })
-            });
-        let scope = doc.as_ref().zip(index.as_ref()).and_then(|(doc, index)| {
-            item_scope_text_indexed(doc, &s.investigations, item, index).ok()
-        });
-        // Sessions saved before scope_hash hashed the untrimmed scope.
-        let doc_changed = match (scope.as_deref(), item.document_hash.as_deref()) {
-            (Some(scope), Some(recorded)) => {
-                recorded != scope_hash(scope) && recorded != hash(scope.as_bytes())
-            }
-            (scope, recorded) => scope.is_some() || recorded.is_some(),
-        };
-        if changed || doc_changed {
-            stale_investigations.push(item.id.clone());
-        }
-    }
     Ok(Revalidation {
         hashes,
         stale_memories,
-        stale_investigations,
     })
 }
 
@@ -4205,222 +3859,6 @@ fn resolve_path_source_ids(
     Ok((out, resolved))
 }
 
-/// Mark unsettled items written once their section has body text. A section
-/// registered while planning often differs from the heading finally written;
-/// when it no longer resolves, rebind it to the heading found by
-/// [`planned_heading`], unless another item points at the same heading.
-fn bind_written_sections(s: &mut Session, doc: &str) -> Vec<String> {
-    let resolved: Vec<_> = s
-        .investigations
-        .iter()
-        .map(|item| {
-            (item.status != "superseded")
-                .then(|| resolved_section_path(doc, &item.section))
-                .flatten()
-        })
-        .collect();
-    let targets: Vec<_> = s
-        .investigations
-        .iter()
-        .zip(&resolved)
-        .map(|(item, resolved)| {
-            (!item.is_settled() && resolved.is_none())
-                .then(|| planned_heading(doc, &item.section, &item.title))
-                .flatten()
-        })
-        .collect();
-    let mut claims = BTreeMap::<&str, usize>::new();
-    for path in resolved.iter().chain(&targets).flatten() {
-        *claims.entry(path).or_default() += 1;
-    }
-    let targets: Vec<_> = targets
-        .iter()
-        .map(|target| target.clone().filter(|path| claims[path.as_str()] == 1))
-        .collect();
-    let mut written = Vec::new();
-    for (item, target) in s.investigations.iter_mut().zip(targets) {
-        if item.is_settled() {
-            continue;
-        }
-        if let Some(path) = target {
-            item.section = path;
-        } else if let Some(path) = resolved_section_path(doc, &item.section) {
-            // A short or level-free name that resolves is stored as the
-            // heading's full path, like every other bound section.
-            item.section = path;
-        }
-        if !item.section.trim().is_empty()
-            && section_text(doc, &item.section)
-                .is_ok_and(|text| text.lines().skip(1).any(|line| !line.trim().is_empty()))
-        {
-            item.status = "written".into();
-            written.push(item.id.clone());
-        }
-    }
-    written
-}
-
-/// The heading path an item names. An exact heading wins; otherwise the same
-/// safe fallback as planned sections applies (a unique level-free title or
-/// section number, such as the requested "1. …" for a written "## 1. …"),
-/// provided no other item uses that heading. Failing both, the original
-/// resolution error is returned.
-fn resolve_named_section(s: &Session, doc: &str, section: &str, id: &str) -> Result<String> {
-    match documentation::resolve_heading(doc, section) {
-        Ok(heading) => documentation::heading_path(doc, heading.start),
-        Err(error) => planned_heading(doc, section, "")
-            .filter(|path| {
-                !s.investigations.iter().any(|other| {
-                    other.status != "superseded"
-                        && other.id != id
-                        && resolved_section_path(doc, &other.section).as_ref() == Some(path)
-                })
-            })
-            .ok_or(error),
-    }
-}
-
-/// Verification may name the section of an item registered without one (or
-/// whose section no longer resolves), saving a separate upsert round. It
-/// never moves an item that already has a section, or takes another item's.
-fn bind_verify_section(s: &mut Session, id: &str, section: &str) -> Result<()> {
-    let doc = read_text(&output_path(&s.project)?)?;
-    let item = s
-        .investigations
-        .iter()
-        .find(|i| i.id == id)
-        .ok_or_else(|| investigation_not_found(&s.investigations, id))?;
-    let path = resolve_named_section(s, &doc, section, id)?;
-    let heading = documentation::resolve_heading(&doc, &path)?;
-    if let Some(current) = resolved_section_path(&doc, &item.section) {
-        if current == path {
-            return Ok(());
-        }
-        bail!(
-            "invalid_argument_value: item {id} is registered to section {current:?}, not {path:?}; verify compares its registered section. Omit section, or move the item with investigation upsert first"
-        );
-    }
-    if let Some(other) = s.investigations.iter().find(|other| {
-        other.id != id && resolved_section_path(&doc, &other.section).as_ref() == Some(&path)
-    }) {
-        bail!(
-            "invalid_argument_value: section {path:?} already belongs to item {}; choose this item's own section",
-            other.id
-        );
-    }
-    let written = doc[heading.start..heading.end]
-        .lines()
-        .skip(1)
-        .any(|line| !line.trim().is_empty());
-    let item = s.investigations.iter_mut().find(|i| i.id == id).unwrap();
-    item.section = path;
-    if written && !item.is_settled() {
-        item.status = "written".into();
-    }
-    Ok(())
-}
-
-fn resolved_section_path(doc: &str, section: &str) -> Option<String> {
-    if section.trim().is_empty() {
-        return None;
-    }
-    let heading = documentation::resolve_heading(doc, section).ok()?;
-    documentation::heading_path(doc, heading.start).ok()
-}
-
-/// The next call for each unsettled investigation item. A live run kept
-/// in_progress items it had already written about and, told only that items
-/// were unverified, listed them for 20 rounds instead of advancing them.
-pub fn investigation_next_steps(s: &Session) -> Vec<Value> {
-    let doc = output_path(&s.project)
-        .ok()
-        .and_then(|path| read_text(&path).ok())
-        .unwrap_or_default();
-    s.investigations
-        .iter()
-        .filter(|item| !item.is_settled())
-        .take(10)
-        .map(|item| {
-            if item.status == "written" {
-                // Never-verified items carry no IDs, and a checkpoint may have
-                // dropped the model's (a live run then looped): offer the
-                // section's cited project files, whose delivered evidence
-                // verify uses directly.
-                let cited = || {
-                    let mut paths: Vec<String> = item_scope_text(&doc, &s.investigations, item)
-                        .ok()
-                        .and_then(|section| documentation::citation_spans(&section).ok())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|citation| citation.path)
-                        .filter(|path| read_path(&s.project, path).is_ok_and(|p| p.is_file()))
-                        .collect();
-                    paths.sort();
-                    paths.dedup();
-                    paths
-                };
-                let source_ids = if item.sources.is_empty() {
-                    let paths = cited();
-                    if paths.is_empty() {
-                        json!(["<S-IDs from file_read/source_search, or the cited project file paths>"])
-                    } else {
-                        json!(paths)
-                    }
-                } else {
-                    json!(item.source_ids())
-                };
-                return json!({"id":item.id,"next":{"action":"verify","id":item.id,"source_ids":source_ids,"verification_note":"<how the section matches these sources>"}});
-            }
-            match resolved_section_path(&doc, &item.section)
-                .or_else(|| planned_heading(&doc, &item.section, &item.title))
-            {
-                Some(section) => json!({"id":item.id,"status":item.status,
-                    "next":{"action":"upsert","id":item.id,"status":"written","section":section},
-                    "then":"verify it with the S-IDs (or cited project file paths) of its evidence"}),
-                None => json!({"id":item.id,"status":item.status,
-                    "next":format!("write its section (\"{}\") with document_edit, then upsert status=written with that heading as section", item.title)}),
-            }
-        })
-        .collect()
-}
-
-/// The written heading a planned section most likely became: the item title,
-/// the planned title at any heading level, or the same leading section
-/// number such as `2.` in `## 2. Flow`. Each must match a single heading.
-fn planned_heading(doc: &str, section: &str, title: &str) -> Option<String> {
-    let planned = section
-        .lines()
-        .map(str::trim)
-        .rfind(|line| !line.is_empty())
-        .unwrap_or("");
-    let bare = planned.trim_start_matches('#').trim();
-    let headings = documentation::headings(doc);
-    let unique = |found: Vec<&documentation::Heading>| match found[..] {
-        [heading] => documentation::heading_path(doc, heading.start).ok(),
-        _ => None,
-    };
-    if let Ok(heading) = documentation::resolve_heading(doc, title) {
-        return documentation::heading_path(doc, heading.start).ok();
-    }
-    if !bare.is_empty()
-        && let Some(path) = unique(
-            headings
-                .iter()
-                .filter(|h| h.heading.trim_start_matches('#').trim() == bare)
-                .collect(),
-        )
-    {
-        return Some(path);
-    }
-    let number = section_number(bare).or_else(|| section_number(title))?;
-    unique(
-        headings
-            .iter()
-            .filter(|h| section_number(h.heading.trim_start_matches('#').trim()) == Some(number))
-            .collect(),
-    )
-}
-
 /// A leading `1.`, `2.3` or `4)` label, without its trailing punctuation.
 /// A bare number such as a year is not a label.
 fn section_number(title: &str) -> Option<&str> {
@@ -4439,72 +3877,6 @@ fn section_number(title: &str) -> Option<&str> {
     .then_some(label)
 }
 
-/// An unknown investigation ID names the IDs that do exist, so the model can
-/// copy one instead of guessing again (for example a section nickname).
-fn investigation_not_found(items: &[Investigation], id: &str) -> anyhow::Error {
-    const SHOWN: usize = 20;
-    let known: Vec<_> = items
-        .iter()
-        .take(SHOWN)
-        .map(|item| json!({"id":item.id,"title":item.title.chars().take(60).collect::<String>()}))
-        .collect();
-    let more = items.len().saturating_sub(SHOWN);
-    let rest = if more > 0 {
-        format!(" ({more} more; use investigation list with offset {SHOWN})")
-    } else {
-        String::new()
-    };
-    anyhow::anyhow!(
-        "item_not_found: investigation id {id:?} does not exist. Copy an existing id exactly: {}{rest}. To track new work, register it with investigation upsert and a title first",
-        json!(known)
-    )
-}
-
-/// Trailing blank lines are layout, not content: inserting the next section
-/// separates it with a blank line that must not invalidate a verified scope.
-fn scope_hash(scope: &str) -> String {
-    hash(scope.trim_end().as_bytes())
-}
-
-/// The part of the document an investigation item attests: its section minus
-/// descendant sections bound to other items, which verify their own claims.
-/// Without this an item on the title heading (the only handle for an opening)
-/// had to cover and re-verify every citation in the document; a live run
-/// spent 20 rounds reading whole files for it.
-fn item_scope_text(doc: &str, items: &[Investigation], item: &Investigation) -> Result<String> {
-    item_scope_text_indexed(doc, items, item, &documentation::HeadingIndex::new(doc))
-}
-
-fn item_scope_text_indexed(
-    doc: &str,
-    items: &[Investigation],
-    item: &Investigation,
-    index: &documentation::HeadingIndex,
-) -> Result<String> {
-    let own = index.resolve(&item.section)?;
-    let mut cuts: Vec<(usize, usize)> = items
-        .iter()
-        .filter(|other| {
-            other.status != "superseded" && other.id != item.id && !other.section.trim().is_empty()
-        })
-        .filter_map(|other| index.resolve(&other.section).ok())
-        .filter(|other| other.start > own.start && other.end <= own.end)
-        .map(|other| (other.start, other.end))
-        .collect();
-    cuts.sort_unstable();
-    let mut text = String::new();
-    let mut next = own.start;
-    for (start, end) in cuts {
-        if start > next {
-            text.push_str(&doc[next..start]);
-        }
-        next = next.max(end);
-    }
-    if next < own.end {
-        text.push_str(&doc[next..own.end]);
-    }
-    Ok(text)
-}
 /// `path:10` or `path:10-20` without its line range; anything else unchanged.
 fn strip_line_suffix(id: &str) -> &str {
     let Some((path, lines)) = id.rsplit_once(':') else {
@@ -4618,14 +3990,9 @@ fn execute_arguments(
         .map(|object| object.keys().cloned().collect::<Vec<_>>().join(", "))
         .unwrap_or_default();
     execute_repaired(s, name, args, cancel).map_err(|error| {
-        // Cancellation is matched exactly and coverage carries typed data.
+        // Cancellation is matched exactly.
         let message = error.to_string();
-        if message == "cancelled"
-            || message.starts_with("cancelled:")
-            || error
-                .downcast_ref::<documentation::CoverageMissing>()
-                .is_some()
-        {
+        if message == "cancelled" || message.starts_with("cancelled:") {
             return error;
         }
         let message = format!(
@@ -4714,13 +4081,13 @@ fn execute_repaired(
         .filter(|_| !ToolRegistry::checkpoint_allowed(name))
     {
         bail!(
-            "checkpoint_pending: {name} is withheld while checkpoint {} is pending; nothing was executed. Save needed findings with memory_write (or give no_save_reason), then call checkpoint_complete with this id and progress; {name} is available again afterwards. Allowed now: {}",
+            "checkpoint_pending: {name} is withheld while checkpoint {} is pending; nothing was executed. Call checkpoint_complete with this id and progress (memory_write first only for a reusable finding not saved yet); {name} is available again afterwards. Allowed now: {}",
             cp.id,
             ToolRegistry::CHECKPOINT_TOOLS.join(", ")
         );
     }
     if s.run_guidance["phase"] == "verify"
-        && !s.investigations.is_empty()
+        && s.document_written
         && ((name == "file_list"
             && args["cursor"].as_str().is_none()
             && !["path", "path_glob", "pattern"].iter().any(|key| {
@@ -4734,21 +4101,8 @@ fn execute_repaired(
                     args[*key].as_str().is_some_and(|path| {
                         !matches!(path.trim(), "" | "." | "./" | "*" | "**" | "**/*")
                     })
-                }))
-            || (name == "investigation"
-                && args["action"] == "upsert"
-                && args["section"]
-                    .as_str()
-                    .is_none_or(|section| section.trim().is_empty())
-                && args["id"]
-                    .as_str()
-                    .is_none_or(|id| !s.investigations.iter().any(|item| item.id == id))))
+                })))
     {
-        if name == "investigation" {
-            bail!(
-                "verification_reserve: a new investigation item needs a nonempty section naming the document heading it covers (for example \"## Settings\"); broad discovery is paused"
-            );
-        }
         bail!(
             "verification_reserve: use a targeted path_glob or nonempty symbol query for missing evidence; broad discovery is paused"
         );
@@ -4905,19 +4259,6 @@ fn execute_repaired(
                         .iter()
                         .map(|ident| s.canonical_memory_id(ident))
                         .collect::<Vec<_>>();
-                    // Older investigation records may also contain a memory
-                    // key instead of the canonical ID. Normalize those
-                    // references before the replacement removes old entries.
-                    let investigation_memory_refs = s
-                        .investigations
-                        .iter()
-                        .map(|item| {
-                            item.memory_refs
-                                .iter()
-                                .map(|(ident, revision)| (s.canonical_memory_id(ident), *revision))
-                                .collect::<BTreeMap<_, _>>()
-                        })
-                        .collect::<Vec<_>>();
                     let mut input: MemoryInput =
                         serde_json::from_value(args["replacement"].clone()).map_err(|error| {
                             anyhow::anyhow!(
@@ -4945,17 +4286,6 @@ fn execute_repaired(
                     s.task.memory_ids.sort();
                     s.task.memory_ids.dedup();
                     s.task.revision += 1;
-                    for (item, refs) in s.investigations.iter_mut().zip(investigation_memory_refs) {
-                        item.memory_refs = refs;
-                        let mut replaced = false;
-                        for id in &actual {
-                            replaced |= item.memory_refs.remove(id).is_some();
-                        }
-                        if replaced {
-                            item.memory_refs.insert(m.id.clone(), m.revision);
-                            item.status = "written".into();
-                        }
-                    }
                     let mut meta = json!(m);
                     if !resolved_paths.is_empty() {
                         meta["resolved_source_ids"] = Value::Object(resolved_paths);
@@ -5013,11 +4343,9 @@ fn execute_repaired(
                 }
                 // The user selects the workflow in the session window; the
                 // model fills in the task but cannot reclassify the request.
-                if next.workflow != s.task.workflow
-                    || next.require_investigation != s.task.require_investigation
-                {
+                if next.workflow != s.task.workflow {
                     bail!(
-                        "workflow_selected_by_user: the user selected workflow={} for this session; omit workflow and require_investigation from the patch",
+                        "workflow_selected_by_user: the user selected workflow={} for this session; omit workflow from the patch",
                         s.task.workflow
                     );
                 }
@@ -5212,14 +4540,6 @@ fn execute_repaired(
             if cp.failed {
                 bail!(
                     "checkpoint_has_failed_operations: an earlier operation in this batch failed; inspect its error and repair it on the next model request before checkpoint_complete. Successful writes are retained; do not repeat them. Completion cannot succeed in this failed batch"
-                );
-            }
-            let no_save = args["no_save_reason"]
-                .as_str()
-                .is_some_and(|x| !x.trim().is_empty());
-            if !no_save && s.memory.generation == cp.starting_memory_generation {
-                bail!(
-                    "checkpoint_memory_missing: save needed memories first, or provide no_save_reason when existing memories already preserve the facts"
                 );
             }
             let progress = text(&args, "progress")?;
@@ -5526,570 +4846,6 @@ fn execute_repaired(
                 json!({"base_hash":args["expected_hash"],"final_hash":final_hash,"atomic":true});
             Ok(result)
         }
-        "investigation" => match text(&args, "action")? {
-            "list" => {
-                revalidate(s)?;
-                let offset = n(&args, "offset", 0);
-                let limit = n(&args, "limit", 20).clamp(1, 100);
-                let next_steps = investigation_next_steps(s);
-                Ok(json!({
-                    "items":s.investigations.iter().skip(offset).take(limit).collect::<Vec<_>>(),
-                    "next_offset":(offset.saturating_add(limit)<s.investigations.len()).then_some(offset.saturating_add(limit)),
-                    "next_steps":next_steps,
-                    "guidance":if next_steps.is_empty() {
-                        "All investigation items are settled. Continue with document and completion review."
-                    } else {
-                        "Use the concrete next_steps to advance pending items. Repeated listing does not verify them."
-                    }
-                }))
-            }
-            "upsert" => {
-                if args["id"].as_str().is_some_and(|id| id.trim().is_empty()) {
-                    bail!(
-                        "invalid_argument_value: id must not be empty for investigation action=upsert"
-                    );
-                }
-                let id = args["id"]
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(crate::memory::id);
-                let previous = s.investigations.iter().find(|item| item.id == id).cloned();
-                if previous
-                    .as_ref()
-                    .is_some_and(|item| item.status == "superseded")
-                {
-                    bail!(
-                        "investigation_superseded: {id} was retired by an explicit user scope change. Keep its history; register a new ID only for work required by the current goal"
-                    );
-                }
-                // Re-registering a verified item without changing its section,
-                // sources or memories keeps it verified (a live run reset one
-                // to in_progress and had to verify it again).
-                if let Some(prev) = previous.as_ref().filter(|item| item.status == "verified") {
-                    let doc = output_path(&s.project)
-                        .ok()
-                        .and_then(|path| read_text(&path).ok())
-                        .unwrap_or_default();
-                    let same_section = args["section"].as_str().is_none_or(|section| {
-                        section == prev.section
-                            || resolved_section_path(&doc, section).is_some_and(|path| {
-                                resolved_section_path(&doc, &prev.section) == Some(path)
-                            })
-                    });
-                    let same_ids = |key: &str, current: Vec<String>| {
-                        args.get(key).is_none() || {
-                            let mut sent = list(&args, key);
-                            let mut current = current;
-                            sent.sort();
-                            current.sort();
-                            sent == current
-                        }
-                    };
-                    if same_section
-                        && same_ids(
-                            "source_ids",
-                            prev.sources
-                                .iter()
-                                .map(|source| source.id.clone())
-                                .collect(),
-                        )
-                        && same_ids("memory_ids", prev.memory_refs.keys().cloned().collect())
-                    {
-                        if let Some(title) = args["title"].as_str() {
-                            let item = s.investigations.iter_mut().find(|i| i.id == id).unwrap();
-                            item.title = title.to_owned();
-                        }
-                        return Ok(
-                            json!({"id":id,"status":"verified","section":prev.section,"unchanged":true,
-                            "guidance":"Already verified for its current section and sources, so the status is kept. Change the section or its sources to register new work; the next step is the final answer or the next unverified item."}),
-                        );
-                    }
-                }
-                if previous.is_none()
-                    && let Some(existing) = s.investigations.iter().find(|item| {
-                        item.status != "superseded"
-                            && item.title == args["title"].as_str().unwrap_or("")
-                    })
-                {
-                    bail!(
-                        "duplicate_investigation_title: item {:?} already has the title {:?}; update that item with {{\"action\":\"upsert\",\"id\":{:?}, ...}} instead of creating another, or choose a distinct title for new work",
-                        existing.id,
-                        existing.title,
-                        existing.id
-                    );
-                }
-                let refs = list(&args, "memory_ids")
-                    .into_iter()
-                    .map(|id| s.memory.get(&id).map(|m| (m.id.clone(), m.revision)))
-                    .collect::<Result<_>>()?;
-                let sources = s.source_refs(&list(&args, "source_ids"))?;
-                let mut item = Investigation {
-                    id: id.clone(),
-                    title: args["title"]
-                        .as_str()
-                        .map(str::to_owned)
-                        .or_else(|| previous.as_ref().map(|item| item.title.clone()))
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("missing_argument: title for new investigation")
-                        })?,
-                    status: args["status"]
-                        .as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| {
-                            previous
-                                .as_ref()
-                                .map(|i| {
-                                    if i.status == "verified" {
-                                        "written".into()
-                                    } else {
-                                        i.status.clone()
-                                    }
-                                })
-                                .unwrap_or("uninvestigated".into())
-                        }),
-                    memory_refs: if args.get("memory_ids").is_none() {
-                        previous
-                            .as_ref()
-                            .map(|i| i.memory_refs.clone())
-                            .unwrap_or(refs)
-                    } else {
-                        refs
-                    },
-                    sources: if args.get("source_ids").is_none() {
-                        previous
-                            .as_ref()
-                            .map(|i| i.sources.clone())
-                            .unwrap_or(sources)
-                    } else {
-                        sources
-                    },
-                    section: args["section"]
-                        .as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| {
-                            previous
-                                .as_ref()
-                                .map(|i| i.section.clone())
-                                .unwrap_or_default()
-                        }),
-                    document_hash: None,
-                    note: String::new(),
-                };
-                if item.status == "written" && item.section.trim().is_empty() {
-                    bail!(
-                        "investigation_section_required: status=written requires a non-empty section. Copy an exact heading from document_inspect and upsert this id with section and status=written together; existing item retained"
-                    );
-                }
-                if item.status == "written" {
-                    let output = output_path(&s.project)?;
-                    if !output.exists() {
-                        bail!(
-                            "document_missing: the output document does not exist yet; write this section with document_edit action=create first, then mark the item written; existing item retained"
-                        );
-                    }
-                    let doc = read_text(&output)?;
-                    // A planned section kept from before writing is rebound
-                    // the same way document edits rebind it.
-                    if args.get("section").is_none()
-                        && section_text(&doc, &item.section).is_err()
-                        && let Some(path) = planned_heading(&doc, &item.section, &item.title)
-                        && !s.investigations.iter().any(|other| {
-                            other.status != "superseded"
-                                && other.id != item.id
-                                && resolved_section_path(&doc, &other.section).as_ref()
-                                    == Some(&path)
-                        })
-                    {
-                        item.section = path;
-                    }
-                    item.section = resolve_named_section(s, &doc, &item.section, &id)?;
-                }
-                let registered = json!({"id":id,"status":item.status,"section":item.section});
-                if let Some(existing) = s.investigations.iter_mut().find(|i| i.id == id) {
-                    *existing = item
-                } else {
-                    s.investigations.push(item);
-                }
-                Ok(registered)
-            }
-            "verify_batch" => {
-                let items = args["items"].as_object().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid_argument_type: items must be an object keyed by investigation ID"
-                    )
-                })?;
-                if items.is_empty() || items.len() > 20 {
-                    bail!("invalid_argument_value: items requires 1..20 entries");
-                }
-                // One item's fields sent directly as items: explain the shape
-                // once instead of failing each field as an item ID.
-                if items.contains_key("source_ids") || items.contains_key("verification_note") {
-                    bail!(
-                        r#"invalid_argument_type: items must map each investigation ID to its fields, not hold the fields directly; for example {{"action":"verify_batch","items":{{"sec1":{{"source_ids":["S12"],"verification_note":"..."}}}}}}"#
-                    );
-                }
-                revalidate(s)?;
-                let mut reused_ids = vec![];
-                let results = batch::run_items(items, cancel, |id, entry| {
-                    let mut params = entry.clone();
-                    if !params.is_object() {
-                        return Err(arguments::failure(
-                            "investigation",
-                            &format!("items[{id:?}]"),
-                            "invalid_argument_type",
-                            json!("object with source_ids and verification_note"),
-                            arguments::value_type(entry),
-                            "must be an object",
-                        ));
-                    }
-                    const ITEM_FIELDS: [&str; 3] = ["source_ids", "verification_note", "section"];
-                    if let Some(key) = params
-                        .as_object()
-                        .unwrap()
-                        .keys()
-                        .find(|key| !ITEM_FIELDS.contains(&key.as_str()))
-                    {
-                        let hint =
-                            suggest::field("investigation", "items", key, &ITEM_FIELDS, &params)
-                                .map_or_else(String::new, |s| s.text);
-                        bail!(
-                            "invalid_action_arguments: verify_batch item does not accept {key}{hint}; allowed: source_ids, verification_note, section; ID belongs in the items key"
-                        );
-                    }
-                    // Validate each item before reuse or execution; a bad item
-                    // does not discard successful siblings.
-                    params["action"] = json!("verify");
-                    params["id"] = json!(id);
-                    ToolRegistry::validate(s, "investigation", &params)?;
-                    // Reuse only after checking section, source and memory freshness.
-                    // A redundant batch must not replace valid evidence with an incomplete list.
-                    if s.investigations
-                        .iter()
-                        .any(|i| i.id == id && i.status == "verified")
-                    {
-                        reused_ids.push(id.to_owned());
-                        return Ok(json!({"verified":id,"reused":true}));
-                    }
-                    execute_cancellable(s, "investigation", params, cancel)
-                });
-                let mut succeeded_ids = vec![];
-                let mut retry_ids = vec![];
-                let mut failures = std::collections::BTreeMap::<String, Vec<Value>>::new();
-                for entry in &results {
-                    if entry["result"]["status"] == "ok" {
-                        succeeded_ids.push(entry["id"].clone());
-                    } else {
-                        retry_ids.push(entry["id"].clone());
-                        let code = entry["result"]["recovery"]["code"]
-                            .as_str()
-                            .unwrap_or("tool_error");
-                        failures
-                            .entry(code.into())
-                            .or_default()
-                            .push(entry["id"].clone());
-                    }
-                }
-                let reasons: Vec<_> = failures
-                    .into_iter()
-                    .map(|(code, ids)| json!({"code":code,"count":ids.len(),"ids":ids}))
-                    .collect();
-                Ok(
-                    json!({"summary":{"total":results.len(),"succeeded":succeeded_ids.len(),"failed":retry_ids.len(),"failures_by_code":reasons},"succeeded_ids":succeeded_ids,"reused_ids":reused_ids,"retry_ids":retry_ids,"guidance":"Successful verification updates are retained; failed items are not marked verified. Inspect each failed item's recovery before retrying retry_ids; cancelled items require resuming the run first. Do not reverify successful items unless their section, sources or memory references change.","results":results,"semantic_verification":"agent attestation; not program proof"}),
-                )
-            }
-            "verify" => {
-                revalidate(s)?;
-                let id = text(&args, "id")?;
-                // A section written under a heading other than the planned one
-                // is rebound by title before the written-state check.
-                if s.investigations
-                    .iter()
-                    .any(|i| i.id == id && !i.is_settled())
-                    && let Ok(doc) = output_path(&s.project).and_then(|path| read_text(&path))
-                {
-                    bind_written_sections(s, &doc);
-                }
-                if let Some(section) = args["section"].as_str() {
-                    bind_verify_section(s, id, section)?;
-                }
-                let item = s
-                    .investigations
-                    .iter()
-                    .find(|i| i.id == id)
-                    .ok_or_else(|| investigation_not_found(&s.investigations, id))?;
-                if !(item.status == "written"
-                    || item.status == "verified"
-                    || (item.status == "gap" && !item.section.trim().is_empty()))
-                {
-                    bail!(
-                        "item_must_be_written_before_verification: id={}, status={}, section={:?}. Inspect the document section first; if its content is written and this item has no section yet, pass that exact heading as section in this verify (or verify_batch item), or use investigation upsert with this id, the section and status=written, then verify. Otherwise write the section before verifying.",
-                        item.id,
-                        item.status,
-                        item.section
-                    );
-                }
-                let note = text(&args, "verification_note")?;
-                if note.trim().is_empty() {
-                    bail!("missing_argument: verification_note must be non-empty");
-                }
-                // A project path in place of an ID names the file whose
-                // delivered evidence should be used; coverage supplements it.
-                // A document citation such as `path:10-20` names its file the
-                // same way (a live run passed citations as source_ids).
-                let mut ids = list(&args, "source_ids");
-                let path_hints = ids.len();
-                ids.retain(|id| {
-                    s.source_refs(std::slice::from_ref(id)).is_ok()
-                        || !(id.contains('/') || id.contains('.'))
-                        || read_path(&s.project, strip_line_suffix(id)).is_err()
-                });
-                let path_hints = path_hints - ids.len();
-                // A path left here names no readable project file; say so
-                // instead of the generic unknown-ID recovery.
-                if let Some(id) = ids.iter().find(|id| {
-                    id.contains('/') && s.source_refs(std::slice::from_ref(*id)).is_err()
-                }) {
-                    let path = strip_line_suffix(id);
-                    if path != id {
-                        bail!(
-                            "unknown_source: {id} is a citation, not a source ID, and {path} is not a readable project file; pass the S-IDs returned by file_read/source_search/symbol_read for the cited files (or an existing project path to use its delivered evidence)"
-                        );
-                    }
-                    bail!(
-                        "unknown_source: {path} is a path, not a source ID, and no readable project file has it; pass the S-IDs returned by file_read/source_search/symbol_read for the cited files (or an existing project path to use its delivered evidence)"
-                    );
-                }
-                let mut sources = s.source_refs(&ids)?;
-                // The user's request (origin=user) and memories are not file
-                // evidence. When file evidence remains, drop them and report it
-                // (a live run lost four items at once to a stray S1).
-                let mut ignored_source_ids = vec![];
-                if sources.iter().any(|source| source.origin == "file") || path_hints > 0 {
-                    sources.retain(|source| {
-                        let keep = source.origin == "file";
-                        if !keep {
-                            ignored_source_ids.push(source.id.clone());
-                        }
-                        keep
-                    });
-                }
-                // Name each ID without versioned file evidence so the caller
-                // drops only those. Blank lines can still cover cited ranges.
-                let rejected: Vec<String> = sources
-                    .iter()
-                    .filter_map(|source| {
-                        let reason = if source.origin != "file" {
-                            format!("origin={}", source.origin)
-                        } else if source.path.is_none() || source.hash.is_none() {
-                            "no file version".into()
-                        } else {
-                            return None;
-                        };
-                        Some(format!("{} ({reason})", source.id))
-                    })
-                    .collect();
-                if !rejected.is_empty() {
-                    bail!(
-                        "verification_sources_required: these source_ids are not file evidence: {}; remove them and keep the file source_ids returned by file_read/source_search/symbol_read",
-                        rejected.join(", ")
-                    );
-                }
-                if sources.is_empty() && path_hints == 0 {
-                    bail!(
-                        "verification_sources_required: pass non-empty observed file source_ids returned by file_read/source_search/symbol_read"
-                    );
-                }
-                let output = output_path(&s.project)
-                    .ok()
-                    .and_then(|path| path.canonicalize().ok());
-                for source in &sources {
-                    if let Some(recorded) = &source.path {
-                        let path = read_path(&s.project, recorded)?;
-                        if Some(hash_file(&path)?) != source.hash {
-                            // A read of the output document goes stale with
-                            // every edit and was never source evidence.
-                            if output.is_some() && output == path.canonicalize().ok() {
-                                bail!(
-                                    "source_changed: {} is a read of the output document {recorded}, which has changed since; the document is not source evidence, so remove it and pass file_read/source_search IDs of the cited project files",
-                                    source.id
-                                );
-                            }
-                            bail!(
-                                "source_changed: {} ({recorded}) changed since it was read; file_read it again and pass the new ID",
-                                source.id
-                            );
-                        }
-                    }
-                }
-                let doc = read_text(&output_path(&s.project)?)?;
-                memory_tools::check_references(s, item)?;
-                let scope = item_scope_text(&doc, &s.investigations, item)?;
-                let section = scope.as_str();
-                let mut missing = documentation::missing_citation_ranges(s, section, &sources)?;
-                // Evidence already delivered in this session at the current
-                // file version is not re-read just because its ID was lost to
-                // context cleanup. Add only sources that cover a missing range.
-                let mut supplemented = Vec::new();
-                if !missing.is_empty() {
-                    for source in delivered_sources_for(s, &missing, &sources)? {
-                        supplemented.push(source.id.clone());
-                        sources.push(source);
-                    }
-                    if !supplemented.is_empty() {
-                        missing = documentation::missing_citation_ranges(s, section, &sources)?;
-                    }
-                }
-                // Apply the content requirement to the combined evidence so
-                // supplied and supplemented blank lines behave the same on
-                // first verification and on re-verification. Blank lines can
-                // complete citation coverage, but cannot verify an item alone.
-                if !sources
-                    .iter()
-                    .any(|source| !source.excerpt.trim().is_empty())
-                {
-                    bail!(
-                        "verification_sources_required: pass non-empty observed file source_ids returned by file_read/source_search/symbol_read"
-                    );
-                }
-                if !missing.is_empty() {
-                    return Err(documentation::CoverageMissing {
-                        item_id: id.into(),
-                        missing_ranges: missing,
-                    }
-                    .into());
-                }
-                // Rereads and supplements repeat ranges; keep one of each.
-                let mut seen = std::collections::BTreeSet::new();
-                sources.retain(|source| {
-                    seen.insert((
-                        source.path.clone(),
-                        source.start_line,
-                        source.end_line,
-                        source.hash.clone(),
-                        source.line_start_complete,
-                        source.line_end_complete,
-                        source.evidence_truncated,
-                    ))
-                });
-                let item = s.investigations.iter_mut().find(|i| i.id == id).unwrap();
-                let fresh = item.status != "verified";
-                item.document_hash = Some(scope_hash(section));
-                item.sources = sources;
-                item.note = note.into();
-                item.status = "verified".into();
-                if fresh {
-                    s.progress_recovery.verification_events =
-                        s.progress_recovery.verification_events.saturating_add(1);
-                }
-                let mut result = json!({"verified":id});
-                if !supplemented.is_empty() {
-                    result["supplemented_source_ids"] = json!(supplemented);
-                }
-                if !ignored_source_ids.is_empty() {
-                    result["ignored_source_ids"] = json!(ignored_source_ids);
-                    result["ignored_note"] = json!(
-                        "These IDs are not file evidence (for example the user's request) and were not recorded; pass only file_read/source_search/symbol_read IDs."
-                    );
-                }
-                Ok(result)
-            }
-            "mark_gap" => {
-                if s.progress_recovery.closing.is_none() {
-                    bail!(
-                        "gap_requires_closing: mark_gap is available only in closing mode; verify the item with delivered source evidence instead"
-                    );
-                }
-                let id = text(&args, "id")?;
-                let reason = text(&args, "reason")?.trim().to_owned();
-                if !(10..=400).contains(&reason.chars().count()) {
-                    bail!("invalid_argument_value: reason requires 10..400 characters");
-                }
-                if !s.investigations.iter().any(|i| i.id == id) {
-                    return Err(investigation_not_found(&s.investigations, id));
-                }
-                let item = s
-                    .investigations
-                    .iter_mut()
-                    .find(|i| i.id == id)
-                    .expect("investigation checked above");
-                if item.status == "verified" {
-                    bail!("item_already_verified: {id} needs no gap");
-                }
-                item.status = "gap".into();
-                item.note = reason;
-                Ok(
-                    json!({"gap":id,"guidance":"Qualify the related claim in its section as unconfirmed. The final result lists this gap; do not describe it as verified."}),
-                )
-            }
-            "final_check" => {
-                if !s.task.require_investigation {
-                    s.task.require_investigation = true;
-                    s.task.revision = s.task.revision.saturating_add(1);
-                }
-                s.activate_workflow_tools();
-                revalidate(s)?;
-                if s.investigations.is_empty() || s.investigations.iter().any(|i| !i.is_settled()) {
-                    let mut result = json!({"complete":false,"incomplete":s.investigations.iter().filter(|i|!i.is_settled()).map(|i|json!({"id":i.id,"title":i.title,"status":i.status,"section":i.section,"previous_source_ids":i.source_ids()})).collect::<Vec<_>>(),"next_steps":investigation_next_steps(s),"review":s.reviews,"guidance":"Verify pending items first; incomplete preflight does not consume a document review. Follow next_steps: an item must be written, with its section, before it can be verified."});
-                    // Written items that lost verification to an edit keep
-                    // their sources: offer the call that re-verifies them.
-                    let items: serde_json::Map<String, Value> = s
-                        .investigations
-                        .iter()
-                        .filter(|i| i.status == "written" && !i.sources.is_empty())
-                        .take(20)
-                        .map(|i| (i.id.clone(), json!({"source_ids":i.source_ids(),"verification_note":"Compared the edited section with these sources"})))
-                        .collect();
-                    if !items.is_empty() {
-                        result["verify_batch_example"] =
-                            json!({"action":"verify_batch","items":items});
-                        result["guidance"] = json!(
-                            "Verify pending items first; incomplete preflight does not consume a document review. Items edited after verification keep their previous_source_ids: send verify_batch_example after checking each section against them (write your own verification_note), adding IDs for any new citation."
-                        );
-                    }
-                    return Ok(result);
-                }
-                let audit = documentation::execute(s, "document_audit", &json!({}), cancel)?;
-                if audit["structural_ok"] != true {
-                    return Ok(
-                        json!({"complete":false,"audit":audit,"review":s.reviews,"guidance":"Fix document format and structural evidence issues before final review."}),
-                    );
-                }
-                // This is a read-only structural preflight, not a model review
-                // allowance. Later edits must remain eligible for verification.
-                s.reviews = s.reviews.saturating_add(1);
-                revalidate(s)?;
-                let incomplete: Vec<_> = s
-                    .investigations
-                    .iter()
-                    .filter(|i| !i.is_settled())
-                    .map(|i| json!({"id":i.id,"title":i.title,"status":i.status}))
-                    .collect();
-                let complete = !s.investigations.is_empty() && incomplete.is_empty();
-                let mut result = json!({"complete":complete,"semantic_verified":false,"format_check":audit["format_check"],"completion_scope":"structural preflight; enabled source-document model review runs before task completion","incomplete":incomplete,"review":s.reviews,"output":s.project.output});
-                // A passing preflight is not the finish: say what is. A live
-                // run repeated final_check and list for rounds after passing.
-                if complete {
-                    let pending: Vec<_> = s
-                        .task
-                        .todos
-                        .iter()
-                        .filter(|item| !item.done)
-                        .map(|item| item.id.clone())
-                        .collect();
-                    result["next"] = json!(if pending.is_empty() {
-                        "Give the final answer now; the document review runs after it. Do not re-check or re-list."
-                            .to_owned()
-                    } else {
-                        format!(
-                            "Close the remaining to-dos {pending:?} in ONE task_plan apply with expected_revision={} (complete each with its result, or remove an obsolete one), then give the final answer; the document review runs after it.",
-                            s.task.plan_revision
-                        )
-                    });
-                }
-                Ok(result)
-            }
-            _ => unreachable!(),
-        },
         _ => bail!("unsupported_tool"),
     }
 }
@@ -6323,6 +5079,22 @@ fn read_file(
     Ok(
         json!({"path":path,"total_lines":contents.lines().count(),"hash":digest,"read_start":start,"read_offset":offset,"read_max_lines":lines,"content":content,"source":source,"next_line":next_line,"next_offset":if truncated{content["next_offset"].clone()}else{json!(0)}}),
     )
+}
+
+/// Machine-readable source citations in the configured output; zero when
+/// the document cannot be compared with any source.
+pub fn citation_count(s: &Session) -> usize {
+    output_path(&s.project)
+        .and_then(|path| read_text(&path))
+        .and_then(|doc| documentation::citation_spans(&doc))
+        .map_or(0, |citations| citations.len())
+}
+
+/// Cited ranges of the configured output never delivered to the model as
+/// complete lines of the current file version in this session.
+pub fn unread_citations(s: &Session) -> Result<Vec<Value>> {
+    let doc = read_text(&output_path(&s.project)?)?;
+    documentation::unread_citations(s, &doc)
 }
 
 pub fn audit_document(s: &mut Session) -> Result<Value> {
@@ -6939,52 +5711,6 @@ fn run_call_inner(
             .insert(call.id.clone(), (signature, output.clone()));
     }
     output
-}
-
-/// A written source document with no investigation item. Its final answer
-/// is refused and no review can run, yet nothing else named the step: two
-/// live runs wrote a whole manual, never registered an item and never
-/// answered. Lists the document's sections for one upsert each.
-pub fn unregistered_document(s: &Session) -> Option<Value> {
-    if s.checkpoint.is_some()
-        || !s.is_document_work()
-        || !s.document_written
-        || !s.task.require_investigation
-        || s.investigations
-            .iter()
-            .any(|item| item.status != "superseded")
-    {
-        return None;
-    }
-    let doc = read_text(&output_path(&s.project).ok()?).ok()?;
-    let headings = documentation::headings(&doc);
-    let paths = documentation::heading_paths(&headings);
-    // The sections a reader navigates: level-2 headings, else the top level.
-    let level = if headings.iter().any(|heading| heading.level == 2) {
-        2
-    } else {
-        headings.iter().map(|heading| heading.level).min()?
-    };
-    let sections: Vec<&String> = headings
-        .iter()
-        .zip(&paths)
-        .filter(|(heading, _)| heading.level == level)
-        .map(|(_, path)| path)
-        .collect();
-    let first = sections.first()?;
-    let title = first
-        .lines()
-        .last()
-        .unwrap_or(first)
-        .trim_start_matches('#')
-        .trim();
-    Some(json!({
-        "investigation_items":0,
-        "section_count":sections.len(),
-        "sections":sections.iter().take(12).collect::<Vec<_>>(),
-        "next":{"action":"upsert","title":title,"section":first,"status":"written"},
-        "guidance":"No investigation item is registered for this source document, so the final answer is refused and no document review can run. Register one item per section in sections with investigation upsert (a title, section copied exactly from sections, status=written), then verify them against sources already delivered with ONE verify_batch (source_ids and a verification_note comparing source and document); an item that cannot be verified is reported with mark_gap in closing mode. Then give the final answer."
-    }))
 }
 
 /// Stable source fingerprint for repeatable evaluation; output is excluded by caller settings.

@@ -839,7 +839,6 @@ async fn workflow_is_selected_at_creation_and_locked_for_the_session() {
     let running = get(&c, &url, &format!("/api/sessions/{id}")).await;
     assert_eq!(running["workflow_mode"], "answer");
     assert_eq!(running["task"]["workflow"], "answer");
-    assert_eq!(running["task"]["require_investigation"], false);
     assert_eq!(select("answer").await.unwrap().status(), 409);
     c.post(format!("{url}/api/sessions/{id}/cancel"))
         .header("x-mnemoarc-client", "web")

@@ -587,3 +587,42 @@ fn search_text_sent_as_pattern_is_named_as_a_file_glob() {
         "{found}"
     );
 }
+
+#[test]
+fn a_query_repeated_inside_queries_is_one_request_and_a_real_conflict_names_both() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.js"), "const x = 1;\nconst y = 2;\n").unwrap();
+    // The live shape: providers that fill every field repeat the query in
+    // queries; the literal OR alone is the request.
+    let found = search(
+        &mut s,
+        json!({"path":"a.js","query":"const x","queries":["const x","const y"],"regex":false}),
+    );
+    assert_eq!(
+        found["matches"].as_array().map(Vec::len),
+        Some(2),
+        "{found}"
+    );
+    // Distinct values are still a conflict, named with a call keeping both.
+    let error = tools::execute(
+        &mut s,
+        "source_search",
+        json!({"query":"one","queries":["two"]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains(r#"received both query "one" and queries ["two"]"#),
+        "{error}"
+    );
+    assert!(error.contains(r#"queries:["one","two"]"#), "{error}");
+    // A regular expression query is not dropped for its literal twin.
+    let error = tools::execute(
+        &mut s,
+        "source_search",
+        json!({"path":"a.js","query":"const x","queries":["const x"],"regex":true}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("conflicting_arguments:"), "{error}");
+}

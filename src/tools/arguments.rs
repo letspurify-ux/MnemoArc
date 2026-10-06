@@ -221,11 +221,6 @@ pub(super) fn validate_field(
         }
     }
     if let Some(object) = value.as_object() {
-        // Each investigation item is independently validated during execution;
-        // rejecting the entire object here would discard successful siblings.
-        if name == "investigation" && path == "items" {
-            return Ok(());
-        }
         for required in schema["required"]
             .as_array()
             .into_iter()

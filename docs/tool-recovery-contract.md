@@ -68,7 +68,7 @@ flowchart TD
 
 ## 파라미터와 실패 진단 보강 (2026-10-06)
 
-등록된 모든 도구의 파라미터를 공통 검증 경계에서 검사한다. 모델에 제공하는 필드 스키마를 사용해 타입·열거값·필수 필드·추가 필드와 숫자 범위, 문자열 길이, 배열·객체 크기를 검사한다. 중첩 객체, 배열 원소, DB 바인드 값도 포함한다. 액션별 허용 필드와 상태에 의존하는 선행조건은 기존 전용 검증기를 유지한다. `task_plan.operations`의 미적용 복구와 `investigation.verify_batch`의 항목별 검증도 유지하여 정상 항목까지 거절하지 않는다.
+등록된 모든 도구의 파라미터를 공통 검증 경계에서 검사한다. 모델에 제공하는 필드 스키마를 사용해 타입·열거값·필수 필드·추가 필드와 숫자 범위, 문자열 길이, 배열·객체 크기를 검사한다. 중첩 객체, 배열 원소, DB 바인드 값도 포함한다. 액션별 허용 필드와 상태에 의존하는 선행조건은 기존 전용 검증기를 유지한다. `task_plan.operations`의 미적용 복구와 `document_edit_batch`의 항목별 검증도 유지하여 정상 항목까지 거절하지 않는다.
 
 입력 오류는 사람이 읽는 `error`와 `recovery` 외에 다음과 같은 진단을 제공한다.
 
@@ -101,7 +101,6 @@ flowchart TD
 
 - 워커의 결과 예산과 에이전트의 배치 예산이 차례로 적용되어도 `input_error`의 필드·기대 형식·실제 타입·미실행 여부를 유지한다. 두 번째 축약도 같은 원본 history를 가리킨다.
 - 배치의 상세 결과가 history로 옮겨지면, 실제 항목들에서 계산한 `recovery.document_repairable`을 보존한다. 에이전트가 복구 정보를 다시 붙일 때 이 판단을 빈 배치로 덮어쓰지 않는다. 따라서 축약만으로 교정 가능한 문서 작업이 중단되지 않으며, 불확실한 쓰기는 계속 결과 확인을 요구한다. 이 값은 자동 재실행 허용이 아니다.
-- `investigation.verify_batch`에서 중도 취소가 발생하면 이미 완료된 항목의 성공·실패 결과를 유지하고, 시작하지 않은 항목은 `cancelled`와 `execution: not_started`로 표시한다. 취소 배치의 복구 행동은 `stop`이며, 성공한 항목을 재실행하도록 안내하지 않는다. 불확실한 결과도 포함된 경우에는 결과 확인을 우선한다.
 - 기억 입력의 추가 진단이 공통 검증 결과를 가리지 않도록 한다. 교체 내용 바깥의 `ids[0]` 오류나 음수 revision의 최소값 위반도 `invalid_fields`에 정확한 위치와 조건을 보존한다.
 - 문서 배치의 텍스트 편집 오류는 실제 요청한 action을 명시한다. DB 바인드 오류는 이름·인덱스를 유지하면서 오류 코드가 중복되는 문장을 제거한다.
 
@@ -134,12 +133,11 @@ flowchart TD
 
 - 오류 코드는 `:` 또는 `;` 앞까지로 읽는다(`recovery::error_code`). 전에는 `unsupported_binary_file; operation_index=0; ...`처럼 래퍼가 뒤에 붙인 단순 코드가 `tool_error`/미분류로 떨어졌다. 불확실 쓰기 판정도 같은 함수를 쓴다.
 - 이진·과대·특수 파일(`unsupported_binary_file`, `unsupported_large_file`, `unsupported_file_type`)은 도구 선택 대신 다른 파일 선택(`choose_allowed_path`)으로 안내한다. 경로와 이유도 메시지에 넣는다.
-- 기억: `memory_body_limit`은 실제 크기와 한도를 적고 `memory_write`를 권한다. `memory_not_found`, `memory_key_conflict`, `memory_find` 커서 오류도 구체적으로 안내한다. `memory_referenced`는 참조 위치(task_state, investigation)와 삭제되지 않았음을 적는다.
+- 기억: `memory_body_limit`은 실제 크기와 한도를 적고 `memory_write`를 권한다. `memory_not_found`, `memory_key_conflict`, `memory_find` 커서 오류도 구체적으로 안내한다. `memory_referenced`는 참조 위치(task_state)와 삭제되지 않았음을 적는다.
 - 상태: `task_state_limit`/`task_detail_limit`는 필요량과 한도를 적는다. `patch.revision`은 정확한 필드를 가리킨다.
 - `tool_not_active`는 그대로 보낼 수 있는 `tool_select` 인자를 보여 준다. `document_exists`는 현재 해시와 다음 편집 방법을 알리고, 복구 도구에 `document_edit`을 넣는다.
 - 경로: `path_outside_project`, `path_excluded`, `file_parent_not_directory`는 요청 경로, 실제 위치, 프로젝트 루트를 적는다.
 - `document_edit_batch` 실패는 `failed_edits`(index, action, code)와 `execution: rejected_without_changes`를 구조화해 돌려준다. 오래된 섹션 해시와 잘못된 old_text를 구별할 수 있다.
-- `gap_requires_closing`은 도구 선택이 아니라 증거 확인 도구(`investigation`, `source_lookup`, `file_read`)를 권한다.
 - DB 메시지는 필드를 앞에 둔다(`return_type is required for mode=function`, `sql must begin with SELECT or WITH for mode=query`). 따라서 필드 진단이 붙는다. `database_query_timeout`에는 조치를 적는다.
 - `task_plan list`를 끝 너머로 넘기면 `notice`로 알린다.
 
@@ -151,7 +149,7 @@ ling-3.0-flash 라이브 실행(`complete_with_gaps`)의 처리 로그에서 확
 - 섹션 밖 앵커: `section`을 지정한 텍스트 편집에서 `old_text`가 그 섹션에는 없지만 문서의 다른 곳에 있으면, 섹션 줄 범위, 실제 위치 줄, 그 줄을 포함하는 제목을 알려 준다. 그리고 `section`을 빼거나 그 제목을 지정하라고 안내한다. 단건 편집과 배치 모두 적용된다.
 - 거절된 시도의 사용량: HTTP 상태로 거절된 시도(429, 400, 5xx 응답, `http_*` 진단)는 생성을 시작하지 않았으므로 입력 토큰과 실행 예산에 추정치를 더하지 않는다. 스트림 중 오류, 시간 초과, 잘못된 출력은 토큰을 썼을 수 있으므로 계속 추정한다. 진단이 없는 실패는 이전처럼 모든 시도를 계산한다.
 - 같은 실패의 반복: 같은 이름·인자의 호출이 같은 이유로 다시 실패하면 `repeated_unchanged`(`count`, `guidance`)를 붙인다. 오류 결과는 `recovery`에, 적용되지 않은 `task_plan`은 `data`에 붙인다. 인자로 결정되는 실패(`invalid_input`, `missing_path`, `missing_evidence`, 미적용 계획)만 대상이다. 일시적이거나 결과가 불확실한 실패는 표시하지 않는다. 오류 문구는 바꾸지 않아 기존 동일 실패 감지와 충돌하지 않는다.
-- `checkpoint_pending`은 막힌 도구 이름, 체크포인트 ID, 다음 단계(memory_write 또는 no_save_reason 후 checkpoint_complete), 지금 허용되는 도구 목록을 알린다. 복구 도구는 `checkpoint_complete`, `memory_write`, `task_state`이다.
+- `checkpoint_pending`은 막힌 도구 이름, 체크포인트 ID, 다음 단계(checkpoint_complete; 아직 저장하지 않은 재사용 가능한 발견이 있을 때만 memory_write 먼저), 지금 허용되는 도구 목록을 알린다. 복구 도구는 `checkpoint_complete`, `memory_write`, `task_state`이다.
 - 리뷰어가 요청 키(`requirement_catalog` 등)를 응답 최상위에 되돌려 보내도, 기대 필드(`issues`, `decisions`, `checks`)가 있으면 그 필드만 읽는다. 이슈 `document` 안에 지적 요약 전용 표시(`quote_truncated`, `quote_in_document`)를 복사해 넣으면 이를 제거한 뒤 해석한다. 그 밖의 알 수 없는 필드는 계속 거절한다.
 - 문서만 보고 알 수 있는 결함용 `document` 지적 유형을 추가했다. 이전에는 리뷰어가 이런 결함을 소스 없는 사실 지적이나 `"path":"document"` 출처로 보내 모든 시도가 거절됐고, 결국 해당 줄이 미검토 구간이 됐다. 이제 이런 지적은 `document` 유형으로 정규화한다. 문서 구절은 문서 전체에서 대조하며, 프로젝트 파일 출처는 거절한다(`issues[i].sources[j] is a project file`). UI 라벨은 비운다. 근거 확인은 문서 원문만으로 판단한다.
 - `task_plan`의 `update`는 항목 문구만 바꾼다. 의미 있는 `result`(8자 이상)를 함께 보내면, `result`는 무시됐고 항목은 아직 미완료라는 `notices`와 `complete` 호출 예시를 돌려준다. 자리채움 빈 값은 이전처럼 조용히 버린다. `done` 필드는 `complete`를 안내하며 거절한다. 아무것도 바뀌지 않은 apply(`unchanged: true`)에는 "추가·변경·완료된 것이 없다"는 `guidance`를 붙인다. 같은 무변경 apply를 반복하면 `repeated_unchanged`로 표시한다. 라이브 실행에서 모델이 `update`+`result`로 완료를 5번 시도하다 정체 마감에 들어간 문제를 막는다.
@@ -162,21 +160,22 @@ ling-3.0-flash 라이브 실행(`complete_with_gaps`)의 처리 로그에서 확
 
 모든 도구에 흔한 잘못된 호출(다른 도구 관례의 인자 이름, 단수·복수, 대소문자, 철자 오류, 비슷한 열거값)을 보내 응답을 다시 점검했고, 다음을 보완했다.
 
-- 받지 않는 인자는 허용 목록과 함께 의도했을 인자를 제안한다(`src/tools/suggest.rs`). 최상위·중첩(`edits[0].new`, `operations[0].old_string`, `patch.todos`, `verify_batch` 항목, 행위별 검사기) 모두 같은 규칙을 쓴다. 메시지에 `did you mean path? send this value as path`를 넣고 `input_error.did_you_mean`에 대상 필드를 넣는다. 결과 축약 뒤에도 이 값은 유지된다. 값을 대신 옮기지는 않는다.
+- 받지 않는 인자는 허용 목록과 함께 의도했을 인자를 제안한다(`src/tools/suggest.rs`). 최상위·중첩(`edits[0].new`, `operations[0].old_string`, `patch.todos`, 행위별 검사기) 모두 같은 규칙을 쓴다. 메시지에 `did you mean path? send this value as path`를 넣고 `input_error.did_you_mean`에 대상 필드를 넣는다. 결과 축약 뒤에도 이 값은 유지된다. 값을 대신 옮기지는 않는다.
 - 제안은 도구가 실제로 받는 필드 중에서만 고른다. 보낸 값의 타입과 맞는 필드를 우선한다(`"querys":[...]` → `queries`). 이미 그 필드를 보냈다면 중복 인자를 빼라고 안내한다. 이름만 다른 경우가 아니면 따로 설명한다. `end_line`은 `max_lines = end_line - start_line + 1`과 계산값, `context`는 `before`/`after`, `ignore_case`는 반대 의미의 `case_sensitive:false`, 심볼 이름은 `symbol_search`로 `symbol_id`를 찾는 방법, 여러 경로는 호출 분리, `task_plan` 최상위 `texts`는 작업 객체 안에 넣는 방법을 알린다. 비슷한 것이 없으면 추측하지 않는다.
 - 허용되지 않는 열거값도 의도한 값을 제안한다(`kind:"fn"` → `function`, `relation:"callees"` → `calls`, `phase:"verification"` → `verify`, `memory_manage action:"list"` → `candidates`). `document_edit`의 `replace`·`insert`·`delete`는 함께 보낸 `old_text`·`section`에 따라 실제 액션을 고른다. 배치의 `create`는 먼저 문서를 만들라고 알린다. `match:"regex"`는 `source_search regex:true`로 안내한다. `task_plan` 동작명의 동의어(`done` → `complete`)는 작업이라고 알린다.
-- 다른 액션의 인자를 보내면 그 인자를 받는 액션을 알려 준다(`history action=search`의 `id` → `action=read`). 대상은 `history`, `task_state`, `memory_manage`, `document_edit`, `investigation`이다.
+- 다른 액션의 인자를 보내면 그 인자를 받는 액션을 알려 준다(`history action=search`의 `id` → `action=read`). 대상은 `history`, `task_state`, `memory_manage`, `document_edit`이다.
 - 인자 오류의 복구 도구 목록에는 실패한 도구를 항상 맨 앞에 둔다. 전에는 `memory_read`·`memory_find`가 `history`만 안내받았다. 경로를 고친 뒤 같은 도구로 다시 보내도록 `resolve_path`에도 그 도구를 넣는다.
 - 경로: `src/a.rs:12-20`, `#L12-L20`, `path:line:column`처럼 인용 형식을 `path`에 넣으면 파일 경로와 `start_line`/`max_lines` 값을 나눠 알려 준다. glob 문자가 든 `path`에는 `path_glob`을 안내한다. 찾지 못한 디렉터리는 같은 이름의 다른 위치 디렉터리를 제안한다.
 - `document_edit`과 배치 항목은 그 액션에 빠진 필드를 한 번에 모두 알린다(`text ...; old_text is also missing; action=replace_text needs text, old_text`). `file_patch` 작업 오류는 액션, 그 액션이 받는 필드, 필드가 속한 액션을 적는다. 이미 있는 파일에 `add`를 쓰면 `update`/`replace`를 안내한다.
 - 형식이 잘못된 `expected_hash`(도구가 발급하지 않은 값)는 해시가 없을 때처럼 편집 자체를 메모리에서 검사하고, 그 결과를 함께 알린다. `document_inspect`·`document_audit` 페이지 이어 읽기에서 그런 값은 "문서가 바뀌었다"가 아니라 해시·리비전 형식이 아니라고 알린다.
-- `investigation upsert`에서 없는 `id`를 보내고 `title`을 빠뜨리면 그 ID가 없어 새 항목이 된다는 사실과 기존 ID 목록을 알린다. 제목 중복은 기존 항목 ID와 수정 호출을 알린다. 형식은 맞지만 현재 파일에 없는 `symbol_id`, `db_query`의 `run`·`list` 인자 오류도 원인과 다음 호출을 적는다.
+- 형식은 맞지만 현재 파일에 없는 `symbol_id`, `db_query`의 `run`·`list` 인자 오류도 원인과 다음 호출을 적는다.
 
-`tests/tool_input_diagnostics.rs`의 제안·경로·누락 필드·해시·조사 항목 테스트와 `suggest.rs` 단위 테스트가 이를 검증한다.
+`tests/tool_input_diagnostics.rs`의 제안·경로·누락 필드·해시 테스트와 `suggest.rs` 단위 테스트가 이를 검증한다.
 
 라이브 실행(ling-3.0-flash, llm_agent UI 매뉴얼)에서 확인한 3건도 보완했다.
 
-- 문서를 저장했지만 조사 항목이 0개이면, 최종 답변이 거절되고 리뷰도 실행되지 않는다. 그런데 이 단계를 알려 주는 안내가 없어서, 두 번의 실행이 항목 등록과 최종 답변 없이 마감 한도로 끝났다. 이제 준비 상태 점검이 `run_guidance.unregistered_document`(문서 섹션 목록과 그대로 보낼 수 있는 upsert 예시)와 지시를 낸다. 마감 단계 지시도 섹션 목록을 포함해 등록 → verify_batch → mark_gap → 최종 답변 순서를 안내한다. 감사 결과의 `no_investigation_coverage`에도 해결 방법을 붙였다.
+- 문서를 저장했지만 인용한 범위를 읽지 않았으면 최종 답변이 거절된다. 저장 결과의 `citation_check.unread_citations`, `document_audit`의 `unread_citation`, `run_guidance.document_readiness`가 읽어야 할 범위와 `file_read` 호출 방법을 알린다. 이전의 조사 항목 등록 안내(`unregistered_document`)는 조사 도구와 함께 제거했다(2026-10-06).
+- 모든 선택 인자를 빈 값으로 채우는 공급자(gpt-6-luna)를 위해 읽기 전용 도구의 빈 문자열을 "보내지 않음"으로 처리하는 범위를 넓혔다. `document_inspect`의 `section:""`는 목차 조회가 되고, `code_outline`·`symbol_search`·`symbol_relations`·`symbol_read`의 `cursor`·`path`·`path_glob` 빈 값은 버린다(필수 인자는 유지). 심볼 도구의 `query:""`는 "정확히 빈 이름" 필터라 그대로 둔다. `source_search`에서 `query`가 `queries`에 이미 들어 있으면(정규식이 아닐 때) `query`를 버리고, 값이 다르면 두 값과 둘을 합친 `queries` 호출을 오류에 적는다. 라이브 실행에서 이 세 경우가 호출 35건 중 9건을 같은 호출의 반복 실패로 만들었다(2026-10-07).
 - `path`와 `path_glob`을 함께 보내면 둘을 합친 하나의 `path_glob`(예: `src/backend/**/*.css`)을 알려 준다. `path`가 파일이면 `path_glob`을 빼라고 안내한다. `file_list`, `source_search`, `symbol_search`에 적용된다. 디렉터리 이름은 glob 특수문자를 이스케이프한다.
 - 없는 도구 이름은 지금 제공되는 도구 중 의도했을 도구를 제안하고(`read` → `file_read`, `tool_plan` → `task_plan`), `data.did_you_mean`과 복구 도구 목록 맨 앞에 넣는다. 호출 표기가 섞인 이름은 앞부분 식별자로 찾는다. `run_guidance`는 도구가 아니라 요청에 포함된 상태라고 알린다.
 - 완료 리뷰 응답이 형식에 맞지 않으면 실패한 check마다 순서·기준 ID와 어긴 조건을 모두 알린다. 조건은 상태값(비슷한 값 제안 포함), 이유 길이, 근거 ID(공급된 ID 예시 포함), met의 근거·next_action, unmet/unverified의 next_action, 누락·중복·다른 페이지의 기준이다. 전에는 조건 10개를 한 문장으로 묶어 알려 라이브 실행에서 다섯 번 연속 실패했다. met check의 `none`, `n/a`, `-`, `없음` 같은 자리채움 next_action은 비운다.
@@ -188,8 +187,7 @@ ling-3.0-flash 라이브 실행(`complete_with_gaps`)의 처리 로그에서 확
 
 세션에서 발생한 반복 호출을 기준으로 다음 계약을 보강했다.
 
-- `investigation verify_batch`는 `data.summary`에 전체·성공·실패 수와 `failures_by_code`(코드, 개수, 항목 ID)를 반환한다. `succeeded_ids`는 유지된 성공, `retry_ids`는 수정 후 재시도할 실패 항목이다. 실패 항목이 있어도 성공한 검증은 유지된다. 이후 해당 섹션·출처·기억이 바뀌면 기존 재검증 규칙이 적용된다.
-- `verify`와 배치 내부 검증은 출처 조회보다 항목의 `written` 사전조건을 먼저 확인한다. 설명에도 문서 작성 → `upsert`로 섹션과 `written` 등록 → 검증 순서를 명시했다. `document_edit`가 이미 항목을 `written`으로 전환했다면 다시 등록할 필요는 없다.
+- `investigation`의 `verify`·`verify_batch` 계약은 2026-10-06에 조사 도구와 함께 제거했다. 인용 읽기 상태는 런타임이 계산하며 모델이 검증을 기록하지 않는다.
 - `source_coverage_missing`은 모든 인용에서 실제로 누락된 구간을 모아 `data.missing_ranges`에 `{path,start_line,end_line}` 배열로 반환한다. 이미 읽은 중간 구간을 제외하고 중복·겹침 구간을 합친다. 출처 최신성 검사는 그대로 유지한다. 결과 예산을 넘는 전체 내용은 기존 `history` 아카이브와 `next_cursor`로 조회한다.
 - `upsert`로 `written`을 등록할 때 현재 문서에 섹션이 존재하는지 확인하고, 고유한 일반 제목을 완전한 Markdown 제목으로 정규화한다. 잘못되거나 모호한 제목은 기존 항목을 변경하지 않고 거절한다. 문서 작성 전 계획은 `in_progress` 등으로 등록할 수 있다. 이것은 작성 위치 확인이며 내용 검증이나 해시 충돌 보호를 대체하지 않는다.
 - 조사 액션별 허용·필수 필드를 같은 계약에서 가져와 모델용 `oneOf` 스키마와 실행 전 검사에 사용한다. 배치 항목은 `source_ids`, `verification_note`만 받으며 잘못된 항목 때문에 정상 형제 항목을 버리지 않는다. `task_state`의 상태 필드는 `patch` 안에 넣도록 설명하고 잘못된 최상위 인자도 해당 위치로 안내한다.

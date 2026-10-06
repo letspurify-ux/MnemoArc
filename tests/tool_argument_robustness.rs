@@ -71,7 +71,6 @@ fn recovery_navigation_schemas_keep_a_provider_compatible_object_root() {
     let dir = tempfile::tempdir().unwrap();
     let mut current = session(dir.path());
     current.document_written = true;
-    current.task.require_investigation = true;
     current.run_guidance = json!({"phase":"verify","progress_recovery":{"active":true}});
     let definitions = ToolRegistry::definitions(&current);
     for name in ["file_list", "source_search"] {

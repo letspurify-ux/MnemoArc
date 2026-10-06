@@ -213,7 +213,7 @@ fn every_registered_tool_uses_common_failure_contract_without_mutation() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     for spec in ToolRegistry::specs() {
-        let before = json!({"task":s.task,"memories":s.memory.entries,"generation":s.memory.generation,"sources":s.sources,"ledger":s.ledger,"history":s.history.bundles,"active":s.active_tools,"pending":s.pending_tools,"investigations":s.investigations});
+        let before = json!({"task":s.task,"memories":s.memory.entries,"generation":s.memory.generation,"sources":s.sources,"ledger":s.ledger,"history":s.history.bundles,"active":s.active_tools,"pending":s.pending_tools});
         let call = ToolCall {
             id: format!("bad-{}", spec.name),
             name: spec.name.into(),
@@ -225,7 +225,7 @@ fn every_registered_tool_uses_common_failure_contract_without_mutation() {
         assert_eq!(result["recovery"]["action"], "correct_arguments");
         assert_eq!(result["recovery"]["automatic_retry"], false);
         assert_eq!(
-            json!({"task":s.task,"memories":s.memory.entries,"generation":s.memory.generation,"sources":s.sources,"ledger":s.ledger,"history":s.history.bundles,"active":s.active_tools,"pending":s.pending_tools,"investigations":s.investigations}),
+            json!({"task":s.task,"memories":s.memory.entries,"generation":s.memory.generation,"sources":s.sources,"ledger":s.ledger,"history":s.history.bundles,"active":s.active_tools,"pending":s.pending_tools}),
             before,
             "{} mutated before validation",
             spec.name
@@ -540,17 +540,12 @@ fn observed_state_and_path_errors_have_actionable_recovery() {
     );
     for (code, class, action) in [
         (
-            "item_must_be_written_before_verification",
-            "prerequisite",
-            "complete_prerequisite",
-        ),
-        (
             "cursor_arguments_conflict",
             "invalid_input",
             "correct_arguments",
         ),
         (
-            "source_coverage_missing",
+            "unknown_source",
             "missing_evidence",
             "lookup_observed_evidence",
         ),
@@ -741,132 +736,9 @@ fn document_offset_error_explains_heading_index_versus_line_number() {
 }
 
 #[test]
-fn written_items_require_a_section_without_mutating_existing_state() {
+fn state_fields_outside_patch_are_rejected_and_recovery_codes_are_classified() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
-    s.project.output = dir.path().join("out.md");
-    std::fs::write(&s.project.output, "# Draft\nbody\n").unwrap();
-    tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"draft","title":"Draft","status":"in_progress"}),
-    )
-    .unwrap();
-    let before = serde_json::to_value(&s.investigations).unwrap();
-    for section in [json!(null), json!(""), json!("  ")] {
-        let mut args = json!({"action":"upsert","id":"draft","status":"written"});
-        if !section.is_null() {
-            args["section"] = section;
-        }
-        let result = tools::run_call(
-            &mut s,
-            &ToolCall {
-                id: "invalid-written".into(),
-                name: "investigation".into(),
-                arguments: args.to_string(),
-            },
-        );
-        assert_eq!(result["recovery"]["code"], "investigation_section_required");
-        assert_eq!(result["recovery"]["tools"], json!(["document_inspect"]));
-        assert_eq!(serde_json::to_value(&s.investigations).unwrap(), before);
-    }
-    tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"draft","section":"# Draft","status":"written"}),
-    )
-    .unwrap();
-    tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"draft","title":"Updated"}),
-    )
-    .unwrap();
-    assert_eq!(s.investigations[0].section, "# Draft");
-    assert_eq!(s.investigations[0].status, "written");
-}
-
-#[test]
-fn failed_batch_items_expose_recovery_tools_and_preserve_successful_siblings() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = session(dir.path());
-    s.project.output = dir.path().join("out.md");
-    std::fs::write(&s.project.output, "# Done\na.rs:1\n").unwrap();
-    std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
-    let read = tools::execute(&mut s, "file_read", json!({"path":"a.rs"})).unwrap();
-    tools::execute(&mut s, "investigation", json!({"action":"upsert","id":"ready","title":"Ready","status":"written","section":"# Done"})).unwrap();
-    tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"draft","title":"Draft","status":"in_progress"}),
-    )
-    .unwrap();
-    let entry = json!({"source_ids":[read["source"]["id"]],"verification_note":"Compared source"});
-    let result = tools::run_call(
-        &mut s,
-        &ToolCall {
-            id: "mixed".into(),
-            name: "investigation".into(),
-            arguments: json!({"action":"verify_batch","items":{"draft":entry,"ready":entry}})
-                .to_string(),
-        },
-    );
-    assert_eq!(result["recovery"]["code"], "batch_partial_failure");
-    assert_eq!(
-        result["recovery"]["tools"],
-        json!(["document_inspect", "investigation", "document_edit"])
-    );
-    assert_eq!(result["data"]["summary"]["succeeded"], 1);
-    assert_eq!(result["data"]["summary"]["failed"], 1);
-    assert_eq!(result["data"]["retry_ids"], json!(["draft"]));
-    assert_eq!(result["data"]["succeeded_ids"], json!(["ready"]));
-    assert_eq!(
-        result["data"]["summary"]["failures_by_code"],
-        json!([{"code":"item_must_be_written_before_verification","count":1,"ids":["draft"]}])
-    );
-    let items = result["data"]["results"].as_array().unwrap();
-    let failed = &items.iter().find(|i| i["id"] == "draft").unwrap()["result"];
-    assert_eq!(failed["recovery"]["tools"], result["recovery"]["tools"]);
-    let success = &items.iter().find(|i| i["id"] == "ready").unwrap()["result"];
-    assert_eq!(success["status"], "ok");
-    assert!(success["recovery"].is_null());
-    assert_eq!(
-        s.investigations
-            .iter()
-            .find(|i| i.id == "ready")
-            .unwrap()
-            .status,
-        "verified"
-    );
-}
-
-#[test]
-fn tool_contract_exposes_action_fields_and_points_state_fields_to_patch() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = session(dir.path());
-    let definition = ToolRegistry::definitions(&s)
-        .into_iter()
-        .find(|d| d["function"]["name"] == "investigation")
-        .unwrap();
-    // Per-action unions are not offered to the model (a provider dropped
-    // arguments under them); execution enforces each action's fields.
-    assert!(definition["function"]["parameters"].get("oneOf").is_none());
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"x","items":{},"source_ids":[],"verification_note":"n"}),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("does not accept items"), "{error}");
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"verify_batch","source_ids":["S1"],"items":{"x":{"source_ids":[],"verification_note":"n"}}}),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("does not accept source_ids"), "{error}");
     let before = s.task.phase.clone();
     let err = tools::execute(
         &mut s,

@@ -3,7 +3,6 @@ use mnemoarc::{
     config::{Config, Project},
     context::ContextManager,
     llm::ToolCall,
-    memory::MemoryStatus,
     session::Session,
     tools::{self, ToolRegistry},
 };
@@ -52,12 +51,7 @@ fn fixture(root: &std::path::Path) -> (Session, Value, Value, String) {
             .to_owned();
     let input = json!({"key":"main-fact","title":"Entry point","summary":"main is declared","body":"main is an empty entry point","kind":"fact","source_ids":[source]});
     let memory = tools::execute(&mut s, "memory_write", input.clone()).unwrap();
-    tools::execute(&mut s, "investigation", json!({"action":"upsert","id":"main","title":"Main","status":"written","section":"# Main","memory_ids":[memory["id"]],"source_ids":[source]})).unwrap();
     (s, input, memory, source)
-}
-
-fn verify(source: &str) -> Value {
-    json!({"action":"verify","id":"main","source_ids":[source],"verification_note":"Compared the empty main declaration with the documented entry point"})
 }
 
 #[test]
@@ -170,7 +164,7 @@ fn recovered_arg_key_fields_keep_typed_diagnostics_if_a_required_field_is_still_
 fn replacement_fields_receive_the_same_validation_without_removing_memories() {
     let dir = tempfile::tempdir().unwrap();
     let (mut s, _, memory, _) = fixture(dir.path());
-    let before = json!({"memory":s.memory.entries,"task":s.task,"items":s.investigations});
+    let before = json!({"memory":s.memory.entries,"task":s.task});
     let result = run(
         &mut s,
         "bad-replace",
@@ -187,10 +181,7 @@ fn replacement_fields_receive_the_same_validation_without_removing_memories() {
         result["data"]["input_error"]["unknown_fields"],
         json!(["item"])
     );
-    assert_eq!(
-        before,
-        json!({"memory":s.memory.entries,"task":s.task,"items":s.investigations})
-    );
+    assert_eq!(before, json!({"memory":s.memory.entries,"task":s.task}));
 }
 
 #[test]
@@ -263,7 +254,8 @@ fn missing_and_stale_revisions_are_distinct_and_atomic_for_writes_and_replacemen
         let (mut s, mut input, memory, _) = fixture(dir.path());
         s.task.memory_ids = vec![memory["id"].as_str().unwrap().into()];
         input["body"] = json!("main has no parameters and an empty body");
-        let before = json!({"memory":s.memory.entries,"generation":s.memory.generation,"task":s.task,"items":s.investigations});
+        let before =
+            json!({"memory":s.memory.entries,"generation":s.memory.generation,"task":s.task});
         for (i, expected, code, action) in [
             (
                 0,
@@ -303,7 +295,7 @@ fn missing_and_stale_revisions_are_distinct_and_atomic_for_writes_and_replacemen
             assert_eq!(result["data"]["retry"]["review_required"], true);
             assert_eq!(
                 before,
-                json!({"memory":s.memory.entries,"generation":s.memory.generation,"task":s.task,"items":s.investigations})
+                json!({"memory":s.memory.entries,"generation":s.memory.generation,"task":s.task})
             );
             assert!(!s.ledger.contains_key(&format!("revision-{i}")));
         }
@@ -323,10 +315,6 @@ fn missing_and_stale_revisions_are_distinct_and_atomic_for_writes_and_replacemen
             assert_eq!(
                 s.task.memory_ids.as_slice(),
                 std::slice::from_ref(&current.id)
-            );
-            assert_eq!(
-                s.investigations[0].memory_refs.get(&current.id),
-                Some(&current.revision)
             );
         } else {
             assert_eq!(current.revision, 2);
@@ -358,231 +346,6 @@ fn argument_and_revision_hints_remain_available_inside_a_checkpoint() {
         assert!(!hints.contains(&json!("file_read")));
         assert!(!s.checkpoint.as_ref().unwrap().acknowledged);
     }
-}
-
-#[test]
-fn reading_a_changed_memory_does_not_refresh_references_but_explicit_upsert_does() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut s, mut input, memory, source) = fixture(dir.path());
-    let other = tools::execute(&mut s, "memory_write", json!({"key":"other","title":"Other fact","summary":"Also main","body":"Same observed empty declaration","kind":"fact","source_ids":[source]})).unwrap();
-    tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"main","memory_ids":[memory["id"],other["id"]]}),
-    )
-    .unwrap();
-    input["expected_revision"] = json!(1);
-    input["body"] = json!("main has no parameters and an empty body");
-    tools::execute(&mut s, "memory_write", input).unwrap();
-    let result = run(&mut s, "verify-stale", "investigation", verify(&source));
-    assert_eq!(
-        result["recovery"]["code"], "memory_reference_stale",
-        "{result}"
-    );
-    assert_eq!(result["recovery"]["action"], "repair_memory_references");
-    let issue = &result["data"]["memory_issues"][0];
-    assert_eq!(issue["id"], memory["id"]);
-    assert_eq!(issue["referenced_revision"], 1);
-    assert_eq!(issue["current_revision"], 2);
-    assert_eq!(issue["status"], "active");
-    assert_eq!(issue["cause"], "revision_mismatch");
-    assert_eq!(result["data"]["reference_update"]["ready"], true);
-    tools::execute(
-        &mut s,
-        "memory_read",
-        issue["read_call"]["arguments"].clone(),
-    )
-    .unwrap();
-    let still_stale = run(
-        &mut s,
-        "verify-after-read",
-        "investigation",
-        verify(&source),
-    );
-    assert_eq!(still_stale["recovery"]["code"], "memory_reference_stale");
-    assert_eq!(
-        s.investigations[0]
-            .memory_refs
-            .get(memory["id"].as_str().unwrap()),
-        Some(&1)
-    );
-    let update = &result["data"]["reference_update"]["arguments"];
-    assert_eq!(update["memory_ids"].as_array().unwrap().len(), 2);
-    tools::execute(&mut s, "investigation", update.clone()).unwrap();
-    let verified = run(&mut s, "verify-repaired", "investigation", verify(&source));
-    assert_eq!(verified["status"], "ok", "{verified}");
-    assert_eq!(s.investigations[0].status, "verified");
-    assert_eq!(s.investigations[0].memory_refs.len(), 2);
-}
-
-#[test]
-fn inferred_progress_cannot_verify_even_after_reference_refresh_and_needs_evidence_repair() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut s, mut input, memory, source) = fixture(dir.path());
-    input["expected_revision"] = json!(1);
-    input["inferred"] = json!(true);
-    input["source_ids"] = json!([]);
-    input["body"] = json!("Drafting chapter 5; verification remains");
-    tools::execute(&mut s, "memory_write", input.clone()).unwrap();
-    let result = run(&mut s, "verify-progress", "investigation", verify(&source));
-    assert_eq!(
-        result["recovery"]["code"], "memory_reference_unverified",
-        "{result}"
-    );
-    assert_eq!(result["data"]["memory_issues"][0]["cause"], "needs_review");
-    assert_eq!(result["data"]["reference_update"]["ready"], false);
-    tools::execute(
-        &mut s,
-        "investigation",
-        result["data"]["reference_update"]["arguments"].clone(),
-    )
-    .unwrap();
-    let still_unverified = run(
-        &mut s,
-        "verify-refreshed-progress",
-        "investigation",
-        verify(&source),
-    );
-    assert_eq!(
-        still_unverified["recovery"]["code"],
-        "memory_reference_unverified"
-    );
-    assert_eq!(s.investigations[0].memory_refs.len(), 1);
-    assert_ne!(s.investigations[0].status, "verified");
-    input["expected_revision"] = json!(2);
-    input["inferred"] = json!(false);
-    input["source_ids"] = json!([source]);
-    input["body"] = json!("main is an empty entry point");
-    tools::execute(&mut s, "memory_write", input).unwrap();
-    let repaired = run(&mut s, "verify-restored", "investigation", verify(&source));
-    assert_eq!(repaired["recovery"]["code"], "memory_reference_stale");
-    tools::execute(
-        &mut s,
-        "investigation",
-        repaired["data"]["reference_update"]["arguments"].clone(),
-    )
-    .unwrap();
-    assert_eq!(
-        run(&mut s, "verify-final", "investigation", verify(&source))["status"],
-        "ok"
-    );
-    assert_eq!(
-        s.investigations[0]
-            .memory_refs
-            .get(memory["id"].as_str().unwrap()),
-        Some(&3)
-    );
-}
-
-#[test]
-fn missing_and_superseded_references_have_distinct_details_without_automatic_detachment() {
-    for missing in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut s, _, memory, source) = fixture(dir.path());
-        let id = memory["id"].as_str().unwrap();
-        if missing {
-            s.memory.entries.remove(id);
-        } else {
-            s.memory.entries.get_mut(id).unwrap().status = MemoryStatus::Superseded;
-        }
-        let result = run(&mut s, "verify-invalid", "investigation", verify(&source));
-        assert_eq!(
-            result["recovery"]["code"],
-            if missing {
-                "memory_reference_missing"
-            } else {
-                "memory_reference_unverified"
-            }
-        );
-        assert_eq!(
-            result["data"]["memory_issues"][0]["cause"],
-            if missing { "not_found" } else { "superseded" }
-        );
-        assert_eq!(result["data"]["reference_update"]["ready"], false);
-        assert_eq!(s.investigations[0].memory_refs.get(id), Some(&1));
-        assert_eq!(s.investigations[0].status, "written");
-    }
-}
-
-#[test]
-fn mixed_reference_failures_report_all_causes_and_preserve_all_references() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut s, mut input, memory, source) = fixture(dir.path());
-    let inferred = tools::execute(&mut s, "memory_write", json!({"key":"inferred","title":"Inference","summary":"Unverified","body":"Hypothesis","kind":"fact","inferred":true})).unwrap();
-    tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"main","memory_ids":[memory["id"],inferred["id"]]}),
-    )
-    .unwrap();
-    s.investigations[0]
-        .memory_refs
-        .insert("deleted-memory".into(), 9);
-    input["expected_revision"] = json!(1);
-    input["body"] = json!("main has no parameters and an empty body");
-    tools::execute(&mut s, "memory_write", input).unwrap();
-    let refs = s.investigations[0].memory_refs.clone();
-    let result = run(&mut s, "mixed-refs", "investigation", verify(&source));
-    assert_eq!(result["recovery"]["code"], "memory_reference_mixed");
-    assert_eq!(result["data"]["memory_issue_count"], 3);
-    let issues = result["data"]["memory_issues"].as_array().unwrap();
-    for cause in ["revision_mismatch", "needs_review", "not_found"] {
-        assert!(issues.iter().any(|issue| issue["cause"] == cause));
-    }
-    assert_eq!(result["data"]["reference_update"]["ready"], false);
-    assert_eq!(
-        result["data"]["reference_update"]["arguments"]["memory_ids"]
-            .as_array()
-            .unwrap()
-            .len(),
-        3
-    );
-    assert_eq!(s.investigations[0].memory_refs, refs);
-}
-
-#[test]
-fn batch_reference_diagnostics_preserve_successful_siblings_and_identify_only_failed_items() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut s, mut input, memory, source) = fixture(dir.path());
-    tools::execute(&mut s, "investigation", json!({"action":"upsert","id":"other","title":"Other","status":"written","section":"# Other","source_ids":[source]})).unwrap();
-    input["expected_revision"] = json!(1);
-    input["body"] = json!("main has no parameters and an empty body");
-    tools::execute(&mut s, "memory_write", input).unwrap();
-    let entry = json!({"source_ids":[source],"verification_note":"Compared the declaration and cited statement"});
-    let result = run(
-        &mut s,
-        "batch",
-        "investigation",
-        json!({"action":"verify_batch","items":{"main":entry,"other":entry}}),
-    );
-    assert_eq!(result["recovery"]["code"], "batch_partial_failure");
-    assert_eq!(result["data"]["retry_ids"], json!(["main"]));
-    assert_eq!(result["data"]["succeeded_ids"], json!(["other"]));
-    let failed = &result["data"]["results"][0]["result"];
-    assert_eq!(failed["recovery"]["code"], "memory_reference_stale");
-    assert_eq!(failed["data"]["memory_issues"][0]["id"], memory["id"]);
-    assert!(
-        failed["recovery"]["tools"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("investigation"))
-    );
-    assert_eq!(
-        s.investigations
-            .iter()
-            .find(|i| i.id == "other")
-            .unwrap()
-            .status,
-        "verified"
-    );
-    assert_eq!(
-        s.investigations
-            .iter()
-            .find(|i| i.id == "main")
-            .unwrap()
-            .status,
-        "written"
-    );
 }
 
 #[test]
@@ -641,39 +404,6 @@ fn small_memory_results_keep_revision_and_argument_causes_with_full_recovery_in_
 }
 
 #[test]
-fn small_reference_results_preserve_the_item_and_stale_revision_cause() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut s, mut input, memory, source) = fixture(dir.path());
-    input["expected_revision"] = json!(1);
-    input["body"] = json!("main has no parameters and an empty body");
-    tools::execute(&mut s, "memory_write", input).unwrap();
-    s.config.result_tokens = 200;
-    let call = ToolCall {
-        id: "small-refs".into(),
-        name: "investigation".into(),
-        arguments: verify(&source).to_string(),
-    };
-    let result = tools::run_call(&mut s, &call);
-    assert_eq!(result["recovery"]["code"], "memory_reference_stale");
-    assert_eq!(result["data"]["item_id"], "main", "{result}");
-    let issue = &result["data"]["memory_issues"][0];
-    assert_eq!(issue["id"], memory["id"]);
-    assert_eq!(issue["referenced_revision"], 1);
-    assert_eq!(issue["current_revision"], 2);
-    assert_eq!(issue["status"], "active");
-    assert_eq!(issue["cause"], "revision_mismatch");
-    assert!(tools::result_tokens(&call, &result, &s.config.model) <= 200);
-    let archive = s
-        .history
-        .read(result["next_cursor"]["id"].as_u64().unwrap())
-        .unwrap();
-    assert_eq!(
-        archive.messages[0]["result"]["data"]["reference_update"]["ready"],
-        true
-    );
-}
-
-#[test]
 fn a_path_source_id_resolves_to_its_delivered_evidence() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("src")).unwrap();
@@ -724,139 +454,4 @@ fn a_path_source_id_resolves_to_its_delivered_evidence() {
             "{result}"
         );
     }
-}
-
-#[test]
-fn replacement_paths_keep_evidence_and_redirect_only_affected_references() {
-    for form in ["relative", "citation", "absolute"] {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut s, mut input, memory, source) = fixture(dir.path());
-        let other = tools::execute(&mut s, "memory_write", json!({"key":"other","title":"Other","summary":"Also main","body":"main is empty","kind":"fact","source_ids":[source]})).unwrap();
-        tools::execute(&mut s, "investigation", json!({"action":"upsert","id":"other","title":"Other","status":"written","section":"# Other","memory_ids":[other["id"]],"source_ids":[source]})).unwrap();
-        tools::execute(&mut s, "investigation", verify(&source)).unwrap();
-        let mut other_verify = verify(&source);
-        other_verify["id"] = json!("other");
-        tools::execute(&mut s, "investigation", other_verify).unwrap();
-        s.task.memory_ids = vec![
-            memory["id"].as_str().unwrap().into(),
-            "main-fact".into(),
-            other["id"].as_str().unwrap().into(),
-        ];
-        let untouched = json!({"memory":s.memory.get("other").unwrap(),"item":s.investigations.iter().find(|i| i.id == "other").unwrap()});
-        let path = match form {
-            "relative" => "a.rs".to_owned(),
-            "citation" => "a.rs:1".to_owned(),
-            _ => format!("{}:1", dir.path().join("a.rs").display()),
-        };
-        input["source_ids"] = json!([path]);
-        input["expected_revision"] = json!(1);
-        input["body"] = json!("main has no parameters and an empty body");
-        input["metadata"] = json!({"custom":["unchanged",{"count":3}]});
-        let generation = s.memory.generation;
-        let result = run(
-            &mut s,
-            "replace-path",
-            "memory_manage",
-            json!({"action":"replace","ids":[memory["id"], "main-fact"],"replacement":input}),
-        );
-        assert_eq!(result["status"], "ok", "{result}");
-        assert_eq!(
-            result["data"]["resolved_source_ids"][&path],
-            json!([source])
-        );
-        let replacement = s.memory.get("main-fact").unwrap();
-        assert_ne!(replacement.id, memory["id"].as_str().unwrap());
-        assert_eq!(replacement.sources.len(), 1);
-        assert_eq!(replacement.sources[0].id, source);
-        assert_eq!(replacement.status, MemoryStatus::Active);
-        assert_eq!(replacement.metadata, input["metadata"]);
-        assert_eq!(replacement.body, input["body"].as_str().unwrap());
-        assert_eq!(s.memory.entries.len(), 2);
-        assert_eq!(s.memory.generation, generation + 1);
-        assert!(s.memory.get(memory["id"].as_str().unwrap()).is_err());
-        assert_eq!(s.task.memory_ids.len(), 2);
-        assert!(s.task.memory_ids.contains(&replacement.id));
-        assert!(
-            s.task
-                .memory_ids
-                .contains(&other["id"].as_str().unwrap().to_owned())
-        );
-        let item = s.investigations.iter().find(|i| i.id == "main").unwrap();
-        assert_eq!(item.status, "written");
-        assert_eq!(item.memory_refs.len(), 1);
-        assert_eq!(
-            item.memory_refs.get(&replacement.id),
-            Some(&replacement.revision)
-        );
-        assert_eq!(
-            json!({"memory":s.memory.get("other").unwrap(),"item":s.investigations.iter().find(|i| i.id == "other").unwrap()}),
-            untouched
-        );
-    }
-}
-
-#[test]
-fn replacement_path_failures_preserve_memories_and_references() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut s, input, memory, source) = fixture(dir.path());
-    s.task.memory_ids = vec![memory["id"].as_str().unwrap().into()];
-    tools::execute(&mut s, "investigation", verify(&source)).unwrap();
-    std::fs::write(
-        dir.path().join("ranges.rs"),
-        "fn read() {}\nfn unread() {}\n",
-    )
-    .unwrap();
-    std::fs::write(dir.path().join("unread.rs"), "fn other() {}\n").unwrap();
-    tools::execute(
-        &mut s,
-        "file_read",
-        json!({"path":"ranges.rs","start_line":1,"max_lines":1}),
-    )
-    .unwrap();
-    let before = json!({"memory":s.memory.entries,"generation":s.memory.generation,"task":s.task,"items":s.investigations});
-    for (i, (sources, revision, code)) in [
-        (json!(["a.rs:1"]), Value::Null, "memory_revision_missing"),
-        (json!(["a.rs:1"]), json!(0), "revision_conflict"),
-        (json!(["ranges.rs:2"]), json!(1), "unknown_source"),
-        (json!(["unread.rs"]), json!(1), "unknown_source"),
-        (json!(["missing.rs"]), json!(1), "unknown_source"),
-        (json!(["S-nonexistent"]), json!(1), "unknown_source"),
-        (json!([]), json!(1), "memory_sources_required"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut replacement = input.clone();
-        replacement["source_ids"] = sources;
-        replacement["expected_revision"] = revision;
-        let result = run(
-            &mut s,
-            &format!("bad-replacement-{i}"),
-            "memory_manage",
-            json!({"action":"replace","ids":[memory["id"]],"replacement":replacement}),
-        );
-        assert_eq!(result["status"], "error", "{result}");
-        assert_eq!(result["recovery"]["code"], code, "{result}");
-        assert_eq!(
-            json!({"memory":s.memory.entries,"generation":s.memory.generation,"task":s.task,"items":s.investigations}),
-            before
-        );
-    }
-    // An old observation of this path cannot certify its new file version.
-    std::fs::write(dir.path().join("a.rs"), "fn changed() {}\n").unwrap();
-    let mut replacement = input;
-    replacement["source_ids"] = json!(["a.rs:1"]);
-    replacement["expected_revision"] = json!(1);
-    let result = run(
-        &mut s,
-        "stale-path",
-        "memory_manage",
-        json!({"action":"replace","ids":[memory["id"]],"replacement":replacement}),
-    );
-    assert_eq!(result["status"], "error", "{result}");
-    assert_eq!(result["recovery"]["code"], "unknown_source");
-    assert_eq!(
-        json!({"memory":s.memory.entries,"generation":s.memory.generation,"task":s.task,"items":s.investigations}),
-        before
-    );
 }

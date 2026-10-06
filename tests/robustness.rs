@@ -40,7 +40,7 @@ fn extreme_pagination_and_budget_inputs_do_not_panic() {
     s.select_workflow("source_document").unwrap();
     for (name, args) in [
         ("task_state", json!({"action":"details","offset":u64::MAX})),
-        ("investigation", json!({"action":"list","offset":u64::MAX})),
+        ("task_plan", json!({"action":"list","offset":u64::MAX})),
     ] {
         assert!(tools::execute(&mut s, name, args).is_ok());
     }

@@ -3,7 +3,7 @@ repetitions = 3
 [[cases]]
 name = "mini-service"
 root = "fixtures/mini-service"
-prompt = "Create a developer Markdown summary of this Rust project. Cover the entry point, Service::create validation, Store IDs and retention, get error handling, and the main-to-service-to-store flow. Cite source file paths and line ranges. Distinguish UTF-8 bytes from character count. Inspect all three source files, create investigation items, save useful memories and verify each document section against source before finishing. Do not modify source files."
+prompt = "Create a developer Markdown summary of this Rust project. Cover the entry point, Service::create validation, Store IDs and retention, get error handling, and the main-to-service-to-store flow. Cite source file paths and line ranges. Distinguish UTF-8 bytes from character count. Inspect all three source files, save useful memories and read every source range you cite before finishing. Do not modify source files."
 expected_topics = ["Service", "Store", "200", "UTF-8"]
 
 [[cases]]

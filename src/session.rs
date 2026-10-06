@@ -33,7 +33,6 @@ pub struct TaskAmendment {
     pub completion: Option<Vec<String>>,
     pub constraints: Option<Vec<String>>,
     pub deliverables: Option<Vec<String>>,
-    pub retire_investigation_ids: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,7 +56,6 @@ pub struct TaskState {
     pub deliverables: Vec<String>,
     pub constraints: Vec<String>,
     pub completion: Vec<String>,
-    pub require_investigation: bool,
     pub workflow: String,
     pub todos: Vec<TodoItem>,
     pub plan_revision: u64,
@@ -128,34 +126,6 @@ impl TaskState {
             let at = self.todos.iter().position(|item| item.done).unwrap();
             self.todos.remove(at);
         }
-    }
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Investigation {
-    pub id: String,
-    pub title: String,
-    pub status: String,
-    pub memory_refs: BTreeMap<String, u64>,
-    pub sources: Vec<Source>,
-    pub section: String,
-    pub document_hash: Option<String>,
-    pub note: String,
-}
-impl Investigation {
-    /// Source IDs this item was last verified with. After a document edit
-    /// the item returns to "written" but keeps them; a checkpoint may have
-    /// dropped them from the model's context (a live run looped 20 rounds).
-    pub fn source_ids(&self) -> Vec<String> {
-        self.sources
-            .iter()
-            .take(30)
-            .map(|source| source.id.clone())
-            .collect()
-    }
-    /// Verified items and closing-mode gaps are settled. A gap is reported to
-    /// the user as unconfirmed; it never counts as verified evidence.
-    pub fn is_settled(&self) -> bool {
-        matches!(self.status.as_str(), "verified" | "gap" | "superseded")
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -399,10 +369,6 @@ pub struct ProgressRecovery {
     /// Set when a document-work response hit the output limit: a whole
     /// document rewrite is withheld until a smaller edit succeeds.
     pub whole_write_withheld: bool,
-    /// Successful verifications of items that were not verified before the
-    /// call (a first verification or one after its section changed). Repair
-    /// work re-verifies sections, which the current verified count hides.
-    pub verification_events: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -497,7 +463,6 @@ pub struct Session {
     pub coverage_cursors: Shared<BTreeMap<String, String>>,
     pub active_tools: BTreeSet<String>,
     pub pending_tools: Option<BTreeSet<String>>,
-    pub investigations: Vec<Investigation>,
     pub checkpoint: Option<Checkpoint>,
     pub ledger: Shared<BTreeMap<String, (String, Value)>>,
     pub latest_request: String,
@@ -560,12 +525,8 @@ impl Session {
     /// Apply the user's workflow selection to the current task and enable its
     /// tools, including when the initial task is created.
     pub fn apply_workflow_mode(&mut self) {
-        let require_investigation = self.workflow_mode == "source_document";
-        if self.task.workflow != self.workflow_mode
-            || self.task.require_investigation != require_investigation
-        {
+        if self.task.workflow != self.workflow_mode {
             self.task.workflow = self.workflow_mode.clone();
-            self.task.require_investigation = require_investigation;
             self.task.revision = self.task.revision.saturating_add(1);
         }
         self.drop_forbidden_workflow_tools();
@@ -573,12 +534,10 @@ impl Session {
     }
 
     /// Optional tools the user's workflow selection excludes. Chat answers
-    /// do not track source-documentation items or run reviews, so
-    /// `investigation` (whose final_check would turn the task into document
-    /// work) and `document_audit` are withheld.
+    /// run no citation audit or review, so `document_audit` is withheld.
     pub fn workflow_forbidden_tools(&self) -> &'static [&'static str] {
         if self.workflow_mode == "answer" {
-            &["investigation", "document_audit"]
+            &["document_audit"]
         } else {
             &[]
         }
@@ -597,13 +556,8 @@ impl Session {
 
     /// Document workflows need their edit and verification tools active.
     pub fn activate_workflow_tools(&mut self) {
-        if self.task.require_investigation {
-            for name in [
-                "investigation",
-                "document_edit",
-                "document_edit_batch",
-                "document_audit",
-            ] {
+        if self.task.workflow == "source_document" {
+            for name in ["document_edit", "document_edit_batch", "document_audit"] {
                 self.active_tools.insert(name.into());
                 if let Some(pending) = &mut self.pending_tools {
                     pending.insert(name.into());
@@ -616,9 +570,7 @@ impl Session {
     /// verify phase and final document checks) governs this task. A document
     /// written in the answer workflow is a plain edit, not document work.
     pub fn is_document_work(&self) -> bool {
-        self.task.require_investigation
-            || self.task.workflow == "source_document"
-            || !self.investigations.is_empty()
+        self.task.workflow == "source_document"
     }
 
     pub fn can_resume(&self) -> bool {
@@ -632,8 +584,7 @@ impl Session {
             && (matches!(
                 status,
                 "blocked" | "partial" | "cancelled" | "complete_with_gaps"
-            ) || self.investigations.iter().any(|item| !item.is_settled())
-                || self.checkpoint.is_some()
+            ) || self.checkpoint.is_some()
                 || self.continuation.is_some()
                 || self.task.current_todo().is_some()
                 || self.document_review.pending
@@ -706,7 +657,6 @@ impl Session {
             current_request: String::new(),
             task_amendments: vec![],
             read_only_turn: false,
-            investigations: vec![],
             checkpoint: None,
             ledger: Shared::default(),
             latest_request: String::new(),
@@ -747,12 +697,6 @@ impl Session {
             // Resolve aliases here as well as at write time so older sessions
             // cannot delete a memory that is still pinned by its key.
             .map(|ident| self.canonical_memory_id(ident))
-            .chain(
-                self.investigations
-                    .iter()
-                    .flat_map(|i| i.memory_refs.keys())
-                    .map(|ident| self.canonical_memory_id(ident)),
-            )
             .collect()
     }
     /// Resolve both current IDs and legacy human-readable memory keys.
@@ -874,17 +818,6 @@ impl Session {
                 bail!("invalid_task_requirements: use at most 100 non-empty entries");
             }
         }
-        if let Some(ids) = &amendment.retire_investigation_ids
-            && (amendment.goal.is_none()
-                || ids.len() > 100
-                || ids
-                    .iter()
-                    .any(|id| !self.investigations.iter().any(|item| item.id == *id)))
-        {
-            bail!(
-                "invalid_task_requirements: retiring evidence items requires a changed goal and existing investigation IDs"
-            );
-        }
         let changed_requirements = amendment.goal.is_some();
         let explicit_requirements_changed = amendment.goal.is_some()
             || amendment.completion.is_some()
@@ -916,14 +849,6 @@ impl Session {
         if amendment.goal.is_some() && amendment.completion.is_none() {
             next.task.completion = next.initial_completion(&next.latest_request);
         }
-        if let Some(ids) = &amendment.retire_investigation_ids {
-            for item in &mut next.investigations {
-                if ids.contains(&item.id) {
-                    item.status = "superseded".into();
-                    item.note = format!("User changed the task scope: {}", question.text);
-                }
-            }
-        }
         next.task_amendments.push(amendment);
         next.answer_review_question = json!({
             "current_goal":next.latest_request,"initial_request":next.original_request,
@@ -949,7 +874,7 @@ impl Session {
         next.progress_recovery = Default::default();
         next.run_guidance = json!({});
         next.completion_gaps.clear();
-        // Keep artifacts, investigations and review history. Requirements hashes
+        // Keep artifacts and review history. Requirements hashes
         // invalidate old verdicts even when the document itself is unchanged.
         next.document_review.pending = false;
         next.document_review.approved_hash = None;
@@ -1056,9 +981,6 @@ impl Session {
                     revision,
                     ..Default::default()
                 };
-                // A new task no longer needs these slots. clear() keeps the
-                // previous task's peak allocation outside the metadata budget.
-                self.investigations = Vec::new();
                 self.reviews = 0;
                 self.document_review = Default::default();
                 self.document_written = false;
@@ -1149,7 +1071,6 @@ impl Session {
         serialized_bytes(&(
             &self.sources,
             &self.ledger,
-            &self.investigations,
             &self.task,
             &self.file_cursors,
             &self.read_coverage,
@@ -1235,74 +1156,6 @@ mod history_tests {
     use super::*;
 
     #[test]
-    fn removed_scope_keeps_history_without_requiring_its_deleted_section_or_stale_sources() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("input.txt"), "Kept content\n").unwrap();
-        std::fs::write(
-            dir.path().join("out.md"),
-            "# Kept\nKept content. input.txt:1-1\n",
-        )
-        .unwrap();
-        let mut s = Session::new(
-            Project {
-                root: dir.path().into(),
-                output: dir.path().join("out.md"),
-                ..Default::default()
-            },
-            Config::compact_test(),
-        );
-        s.select_workflow("source_document").unwrap();
-        s.receive_message("Write kept and removed chapters".into())
-            .unwrap();
-        let read = crate::tools::execute(&mut s, "file_read", json!({"path":"input.txt"})).unwrap();
-        crate::tools::execute(&mut s, "investigation", json!({"action":"upsert","id":"kept","title":"Kept","section":"# Kept","status":"written"})).unwrap();
-        crate::tools::execute(&mut s, "investigation", json!({"action":"verify","id":"kept","source_ids":[read["source"]["id"]],"verification_note":"Compared kept content with input.txt:1"})).unwrap();
-        let mut old_source = s
-            .source_refs(&[read["source"]["id"].as_str().unwrap().into()])
-            .unwrap()
-            .remove(0);
-        old_source.hash = Some("stale-removed-evidence".into());
-        s.investigations.push(Investigation {
-            id: "removed".into(),
-            title: "Removed".into(),
-            section: "# Removed".into(),
-            status: "written".into(),
-            sources: vec![old_source],
-            memory_refs: Default::default(),
-            document_hash: None,
-            note: String::new(),
-        });
-        s.receive_message("Remove the second chapter from the goal".into())
-            .unwrap();
-        s.accept_amendment(TaskAmendment {
-            goal: Some("Write the kept chapter".into()),
-            retire_investigation_ids: Some(vec!["removed".into()]),
-            ..Default::default()
-        })
-        .unwrap();
-        let audit = crate::tools::execute(&mut s, "document_audit", json!({})).unwrap();
-        assert_eq!(audit["structural_ok"], true, "{audit}");
-        assert_eq!(s.investigations[1].status, "superseded");
-        let error = crate::tools::execute(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":"removed","status":"written","section":"# Kept"}),
-        )
-        .unwrap_err();
-        assert!(error.to_string().starts_with("investigation_superseded"));
-        assert_eq!(s.investigations[1].status, "superseded");
-        s.receive_message("Reintroduce the removed chapter".into())
-            .unwrap();
-        s.accept_amendment(TaskAmendment {
-            goal: Some("Write the kept and reintroduced chapters".into()),
-            ..Default::default()
-        })
-        .unwrap();
-        crate::tools::execute(&mut s, "investigation", json!({"action":"upsert","id":"new-scope","title":"Removed","section":"# Reintroduced","status":"uninvestigated"})).unwrap();
-        assert_eq!(s.investigations.len(), 3);
-    }
-
-    #[test]
     fn explicit_changes_preserve_artifacts_and_unaffected_work_and_invalidate_old_reviews() {
         let mut s = Session::new(Project::default(), Config::compact_test());
         s.select_workflow("source_document").unwrap();
@@ -1314,16 +1167,6 @@ mod history_tests {
         s.document_review.issues = vec!["Old length requirement".into()];
         s.document_review.validation_log = vec![json!({"prior":"review"})];
         s.completion_review.approved = true;
-        s.investigations.push(Investigation {
-            id: "old-scope".into(),
-            title: "Removed chapter".into(),
-            status: "in_progress".into(),
-            memory_refs: Default::default(),
-            sources: vec![],
-            section: "# Removed".into(),
-            document_hash: None,
-            note: String::new(),
-        });
         let original = s.original_request.clone();
         let files = s.last_document_write.clone();
         let sources = s.sources.clone();
@@ -1332,7 +1175,6 @@ mod history_tests {
         s.accept_amendment(TaskAmendment {
             goal: Some("Write the first chapter, around 300 lines".into()),
             completion: Some(vec!["First chapter only, around 300 lines".into()]),
-            retire_investigation_ids: Some(vec!["old-scope".into()]),
             ..Default::default()
         })
         .unwrap();
@@ -1349,8 +1191,6 @@ mod history_tests {
         assert!(s.document_review.issues.is_empty());
         assert_eq!(s.document_review.validation_log.len(), 1);
         assert!(!s.completion_review.approved);
-        assert_eq!(s.investigations[0].status, "superseded");
-        assert!(s.investigations[0].is_settled());
         assert_eq!(s.task_amendments.len(), 1);
         assert_eq!(s.task.workflow, "source_document");
     }

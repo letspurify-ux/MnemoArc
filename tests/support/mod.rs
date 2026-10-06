@@ -22,6 +22,7 @@ pub fn compact_config() -> Config {
         request_timeout_secs: 180,
         run_timeout_secs: 1800,
         run_tokens: 500000,
+        completion_review_enabled: true,
         review_limit: 3,
         ..Config::default()
     }

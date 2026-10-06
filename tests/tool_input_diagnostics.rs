@@ -70,7 +70,7 @@ fn every_registered_parameter_rejects_wrong_types_with_recovery_before_execution
             };
             let mut s = session();
             let before = json!({"task":s.task,"sources":s.sources,"memory":s.memory.entries,
-                "active":s.active_tools,"pending":s.pending_tools,"investigations":s.investigations});
+                "active":s.active_tools,"pending":s.pending_tools});
             let result = tools::run_call(&mut s, &call(spec.name, args));
             assert_eq!(result["status"], "error", "{}.{key}: {result}", spec.name);
             assert_eq!(
@@ -88,12 +88,12 @@ fn every_registered_parameter_rejects_wrong_types_with_recovery_before_execution
             assert_eq!(
                 before,
                 json!({"task":s.task,"sources":s.sources,"memory":s.memory.entries,
-                "active":s.active_tools,"pending":s.pending_tools,"investigations":s.investigations})
+                "active":s.active_tools,"pending":s.pending_tools})
             );
             checked += 1;
         }
     }
-    assert!(checked > 140, "only {checked} parameters checked");
+    assert!(checked > 130, "only {checked} parameters checked");
 }
 
 #[test]
@@ -217,12 +217,6 @@ fn schema_bounds_report_the_bound_and_do_not_run_the_tool() {
             "args",
             json!({"maxItems":32}),
         ),
-        (
-            "investigation",
-            json!({"action":"verify_batch","items":{}}),
-            "items",
-            json!({"minProperties":1}),
-        ),
     ] {
         let result = tools::run_call(&mut session(), &call(name, args));
         assert_eq!(result["data"]["execution"], "not_started", "{result}");
@@ -337,7 +331,10 @@ fn repeated_result_limiting_keeps_the_input_diagnosis_and_original_archive() {
 #[test]
 fn archived_batches_keep_the_recovery_decision_after_reattachment() {
     let mut s = session();
-    let invocation = call("investigation", json!({"action":"verify_batch"}));
+    let invocation = call(
+        "document_edit_batch",
+        json!({"expected_hash":"h","edits":[]}),
+    );
     for (code, action, correctable) in [
         ("unknown_source", "repair_failed_items_only", true),
         (
@@ -397,7 +394,10 @@ fn empty_symbol_query_is_preserved_as_an_exact_filter() {
 #[test]
 fn batch_status_and_recovery_include_flat_and_nested_failures() {
     let s = session();
-    let invocation = call("investigation", json!({"action":"verify_batch"}));
+    let invocation = call(
+        "document_edit_batch",
+        json!({"expected_hash":"h","edits":[]}),
+    );
     for status in ["error", "cancelled", "unsupported"] {
         for nested in [false, true] {
             let failed = json!({"status":status,"error":"unknown_source: missing"});
@@ -900,10 +900,7 @@ fn file_memory_and_document_failures_name_the_cause_and_matching_remedy() {
             .contains("nothing was deleted"),
         "{result}"
     );
-    assert_eq!(
-        tools_of(&result),
-        json!(["task_state", "investigation", "memory_manage"])
-    );
+    assert_eq!(tools_of(&result), json!(["task_state", "memory_manage"]));
 
     let result = run(
         &mut s,
@@ -966,32 +963,6 @@ fn file_memory_and_document_failures_name_the_cause_and_matching_remedy() {
     assert_eq!(
         tools::hash(&std::fs::read(dir.path().join("summary.md")).unwrap()),
         current
-    );
-}
-
-#[test]
-fn a_gap_outside_closing_points_to_verification_not_tool_selection() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("summary.md"), "# Title\n\nBody.\n").unwrap();
-    let mut s = session();
-    s.project.root = dir.path().into();
-    s.project.output = dir.path().join("summary.md");
-    s.select_workflow("source_document").unwrap();
-    s.active_tools = ToolRegistry::optional_names();
-    let result = tools::run_call(
-        &mut s,
-        &call_id(
-            "investigation",
-            json!({"action":"mark_gap","id":"a","reason":"no evidence was found in the sources"}),
-        ),
-    );
-    assert_eq!(
-        result["recovery"]["code"], "gap_requires_closing",
-        "{result}"
-    );
-    assert_eq!(
-        result["recovery"]["tools"],
-        json!(["investigation", "source_lookup", "file_read"])
     );
 }
 
@@ -1417,12 +1388,6 @@ fn rejected_values_name_the_value_the_call_most_likely_meant() {
         "source_search with regex:true",
     );
     check(
-        "investigation",
-        json!({"action":"upsert","title":"T","status":"verified"}),
-        Some("written"),
-        "verify it with action=verify",
-    );
-    check(
         "history",
         json!({"action":"zebra"}),
         None,
@@ -1448,16 +1413,6 @@ fn a_field_of_another_action_names_that_action() {
             "memory_manage",
             json!({"action":"candidates","ids":["m1"]}),
             "ids is used by action=delete, action=replace",
-        ),
-        (
-            "investigation",
-            json!({"action":"list","status":"written"}),
-            "status is used by action=upsert",
-        ),
-        (
-            "investigation",
-            json!({"action":"verify","id":"I1","source_ids":["S1"],"note":"x"}),
-            "did you mean verification_note?",
         ),
     ] {
         let result = tools::run_call(&mut s, &call_id(name, args));
@@ -1633,45 +1588,6 @@ fn a_malformed_hash_is_not_reported_as_a_changed_document() {
 }
 
 #[test]
-fn investigation_items_named_by_id_or_title_explain_what_exists() {
-    let (_dir, mut s) = project_session();
-    let result = tools::run_call(
-        &mut s,
-        &call_id(
-            "investigation",
-            json!({"action":"upsert","id":"I9","status":"in_progress"}),
-        ),
-    );
-    assert!(
-        result["error"].as_str().unwrap().contains(
-            r#"id "I9" is not an existing item, so this upsert creates a new item and needs title (existing ids: [])"#
-        ),
-        "{result}"
-    );
-    let created = tools::run_call(
-        &mut s,
-        &call_id(
-            "investigation",
-            json!({"action":"upsert","title":"Overview"}),
-        ),
-    );
-    let id = created["data"]["id"].as_str().unwrap().to_owned();
-    let result = tools::run_call(
-        &mut s,
-        &call_id(
-            "investigation",
-            json!({"action":"upsert","title":"Overview"}),
-        ),
-    );
-    assert!(
-        result["error"].as_str().unwrap().contains(&format!(
-            r#"item "{id}" already has the title "Overview"; update that item with {{"action":"upsert","id":"{id}""#
-        )),
-        "{result}"
-    );
-}
-
-#[test]
 fn compacted_input_errors_keep_the_suggested_field() {
     let mut s = session();
     let invocation = call("file_read", json!({"file_path":"src/main.rs"}));
@@ -1758,22 +1674,25 @@ fn an_unknown_tool_name_names_the_offered_tool_it_most_likely_meant() {
 }
 
 #[test]
-fn an_audit_without_investigation_items_says_how_to_register_them() {
-    let (_dir, mut s) = project_session();
-    s.select_workflow("source_document").unwrap();
-    let result = tools::run_call(&mut s, &call_id("document_audit", json!({})));
-    let issue = result["data"]["issues"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|issue| issue["kind"] == "no_investigation_coverage")
-        .cloned()
-        .unwrap();
-    assert!(
-        issue["guidance"]
-            .as_str()
-            .unwrap()
-            .contains("Register one item per written section with investigation upsert"),
-        "{issue}"
-    );
+fn blank_symbol_cursors_and_paths_start_from_the_beginning() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn main() {}\nfn helper() {}\n").unwrap();
+    let mut s = session();
+    s.project.root = dir.path().into();
+    // The live shape: every optional string filled with "". The empty query
+    // stays an exact empty-name filter; the blank cursor is dropped.
+    let outline = tools::execute(
+        &mut s,
+        "code_outline",
+        json!({"path":"a.rs","query":"","match":"contains","case_sensitive":true,"kind":"function","container":"","max_depth":1,"view":"compact","cursor":"","limit":100}),
+    )
+    .unwrap();
+    assert!(outline.to_string().contains("helper"), "{outline}");
+    let found = tools::execute(
+        &mut s,
+        "symbol_search",
+        json!({"query":"helper","path":"","path_glob":"","cursor":""}),
+    )
+    .unwrap();
+    assert!(found.to_string().contains("helper"), "{found}");
 }

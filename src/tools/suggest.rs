@@ -207,7 +207,7 @@ const FIELD_ALIASES: &[(&str, &[&str])] = &[
     ("patch", &["changes", "update", "updates", "fields", "data", "state", "set", "values"]),
     ("names", &["tools", "tool_names", "tool", "name", "tool_name"]),
     ("id", &[
-        "item_id", "investigation_id", "query_id", "checkpoint_id", "history_id", "bundle_id",
+        "item_id", "query_id", "checkpoint_id", "history_id", "bundle_id",
         "source_id", "memory_id", "key", "name",
     ]),
     ("params", &[
@@ -413,13 +413,6 @@ const VALUE_ALIASES: &[(&str, &str, &[&str])] = &[
     ("action", "candidates", &["list", "candidate", "cleanup", "review", "find"]),
     ("action", "delete", &["remove", "del", "drop", "purge"]),
     ("action", "replace", &["merge", "update", "consolidate", "supersede", "set"]),
-    ("action", "upsert", &["add", "create", "new", "update", "register", "insert", "set", "save"]),
-    ("action", "verify", &["check", "validate", "confirm", "verify_item"]),
-    ("action", "verify_batch", &[
-        "batch_verify", "verify_all", "verify_many", "bulk_verify", "verify_items",
-    ]),
-    ("action", "final_check", &["final", "finalize", "check_all", "final_verify", "finish"]),
-    ("action", "mark_gap", &["gap", "add_gap", "unverifiable"]),
     ("action", "add", &["enable", "activate", "include", "select", "load"]),
     ("action", "remove", &["disable", "deactivate", "exclude", "drop", "unload"]),
     ("action", "run", &["execute", "exec", "query", "call", "invoke"]),
@@ -582,18 +575,6 @@ pub(crate) fn value(
             ),
         });
     }
-    if tool == "investigation"
-        && field == "status"
-        && matches!(
-            normalized.as_str(),
-            "verified" | "verify" | "checked" | "confirmed"
-        )
-    {
-        return Some(Suggestion {
-            target: Some("written".into()),
-            text: "; status only records writing progress: send status \"written\" for a written section, then verify it with action=verify".into(),
-        });
-    }
     let target = VALUE_ALIASES
         .iter()
         .find(|(name, target, aliases)| {
@@ -668,7 +649,6 @@ const TOOL_ALIASES: &[(&str, &[&str])] = &[
     ("memory_read", &["get_memory", "load_memory", "read_memory", "memory_get"]),
     ("history", &["search_history", "read_history", "get_history"]),
     ("checkpoint_complete", &["checkpoint", "complete_checkpoint", "finish_checkpoint"]),
-    ("investigation", &["investigate", "verify", "verify_batch", "register_investigation"]),
 ];
 
 /// Suggest the offered tool a call to the unknown tool `name` most likely

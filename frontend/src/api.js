@@ -67,7 +67,6 @@ export const toolLabels = {
   file_read: "파일 읽기",
   source_search: "소스 검색",
   document_edit: "문서 편집",
-  investigation: "조사·검증",
   memory_write: "기억 저장",
   memory_read: "기억 읽기",
   memory_find: "기억 검색",

@@ -148,7 +148,6 @@ async fn configured_model_resumes_readonly_investigation() {
         config,
     );
     session.task = serde_json::from_value(snapshot["task"].clone()).unwrap();
-    session.investigations = serde_json::from_value(snapshot["investigations"].clone()).unwrap();
     session.active_tools = serde_json::from_value(snapshot["active_tools"].clone()).unwrap();
     let latest = bundles
         .iter()
@@ -222,12 +221,6 @@ async fn configured_model_resumes_readonly_investigation() {
             }
         }
     }
-    for item in &session.investigations {
-        for s in &item.sources {
-            session.sources.insert(s.id.clone(), s.clone());
-        }
-    }
-    assert!(!session.sources.is_empty());
     let stable: Value = client.get(&url).send().await.unwrap().json().await.unwrap();
     assert_eq!(
         stable["revision"], snapshot["revision"],
@@ -259,24 +252,16 @@ async fn configured_model_resumes_readonly_investigation() {
     .await;
     drain.await.unwrap();
     eprintln!(
-        "RESULT status={}, checkpoints={}, memories={}, verified={}/{}, input={}, output={}, error={:?}",
+        "RESULT status={}, checkpoints={}, memories={}, input={}, output={}, error={:?}",
         result.status,
         result.checkpoints_completed,
         result.memory.entries.len(),
-        result
-            .investigations
-            .iter()
-            .filter(|i| i.status == "verified")
-            .count(),
-        result.investigations.len(),
         result.input_tokens,
         result.output_tokens,
         result.last_error
     );
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
     assert!(result.checkpoints_completed > 0);
-    assert!(!result.investigations.is_empty());
-    assert!(result.investigations.iter().all(|i| i.status == "verified"));
     assert!(
         mnemoarc::tools::output_path(&result.project)
             .unwrap()

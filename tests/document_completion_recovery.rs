@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 const RESULT: &str = "# Report\nThe requested document is saved and verified.\n";
 
 #[tokio::test]
-async fn uncovered_sections_receive_repair_guidance_instead_of_final_or_plan_closeout() {
+async fn unread_citations_receive_repair_guidance_instead_of_final_or_plan_closeout() {
     struct StopAfterGuidance(Arc<Mutex<usize>>);
     #[async_trait]
     impl LlmClient for StopAfterGuidance {
@@ -60,16 +60,7 @@ async fn uncovered_sections_receive_repair_guidance_instead_of_final_or_plan_clo
             json!({"action":"create","text":"# Manual\n## A\na.rs:1\n## B\na.rs:2\n"}),
         )
         .unwrap();
-        let source = tools::execute(&mut s, "file_read", json!({"path":"a.rs"})).unwrap()["source"]
-            ["id"]
-            .clone();
-        tools::execute(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":"A","title":"A","status":"written","section":"## A"}),
-        )
-        .unwrap();
-        tools::execute(&mut s,"investigation",json!({"action":"verify","id":"A","source_ids":[source],"verification_note":"Compared a.rs:1."})).unwrap();
+        // Neither cited range was read: the save already reported both.
         if with_todo {
             let revision = s.task.plan_revision;
             tools::execute(
@@ -102,7 +93,7 @@ async fn uncovered_sections_receive_repair_guidance_instead_of_final_or_plan_clo
             result.run_guidance["instruction"]
                 .as_str()
                 .unwrap()
-                .contains("register uncovered cited sections")
+                .contains("unread_citation")
         );
     }
 }
@@ -128,9 +119,6 @@ fn fixture() -> (tempfile::TempDir, Session) {
     );
     s.add_user("Write report.md with the requested document.".into());
     s.select_workflow("source_document").unwrap();
-    // Exercise the shared document-work recovery without the source-evidence
-    // requirement, which the investigation tests cover.
-    s.task.require_investigation = false;
     tools::execute(
         &mut s,
         "document_edit",

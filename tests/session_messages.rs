@@ -113,11 +113,12 @@ async fn follow_up_errors_keep_the_originating_calls_without_changing_saved_stat
             json!({"role":"assistant","tool_calls":[{"id":"reused","function":{"name":"memory_write","arguments":"{\"key\":\"old\"}"}}]}),
             json!({"role":"tool","tool_call_id":"reused","content":json!({"status":"error","error":"old memory failure"}).to_string()}),
         ], true);
-        let args = json!({"action":"upsert","id":"section","source_ids":["src/a.rs"]});
+        let args =
+            json!({"action":"replace","ids":["section"],"replacement":{"source_ids":["src/a.rs"]}});
         let error = json!({"status":"error","error":"unknown_source: src/a.rs","recovery":{"code":"unknown_source","tools":["source_lookup","history"]},"data":{"detail":"preserve the original error"}});
         let recent = s.history.push(vec![
             json!({"role":"assistant","tool_calls":[
-                {"id":"reused","function":{"name":"investigation","arguments":args.to_string()}},
+                {"id":"reused","function":{"name":"memory_manage","arguments":args.to_string()}},
                 {"id":"search","function":{"name":"source_search","arguments":"{\"after\":25}"}},
             ]}),
             json!({"role":"tool","tool_call_id":"search","content":json!({"status":"error","error":"invalid_argument_value: after"}).to_string()}),
@@ -145,8 +146,8 @@ async fn follow_up_errors_keep_the_originating_calls_without_changing_saved_stat
         let errors = snapshot["recent_tool_errors"].as_array().unwrap();
         assert_eq!(errors.len(), 4);
         assert_eq!(errors[0]["call"]["name"], "memory_read");
-        assert_eq!(errors[1]["call"]["name"], "investigation");
-        assert_eq!(errors[1]["call"]["action"], "upsert");
+        assert_eq!(errors[1]["call"]["name"], "memory_manage");
+        assert_eq!(errors[1]["call"]["action"], "replace");
         assert_eq!(errors[1]["call"]["bundle_id"], recent);
         assert_eq!(errors[1]["call"]["tool_call_id"], "reused");
         assert_eq!(
@@ -275,11 +276,7 @@ async fn general_follow_up_collects_files_and_remembers_evidence_without_reviews
                 && names.contains(&"document_inspect")
                 && names.contains(&"memory_write")
         );
-        assert!(
-            !names.contains(&"investigation")
-                && !names.contains(&"document_audit")
-                && !names.contains(&"document_edit")
-        );
+        assert!(!names.contains(&"document_audit") && !names.contains(&"document_edit"));
     }
     assert!(!s.document_review.pending && !s.completion_review.pending);
     assert_eq!(s.reviews, 0);

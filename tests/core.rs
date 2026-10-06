@@ -274,9 +274,7 @@ fn file_evidence_document_conflict_and_revalidation() {
         )
         .is_err()
     );
-    let item=tools::execute(&mut s,"investigation",json!({"action":"upsert","title":"entry","status":"written","memory_ids":[meta.id],"source_ids":[source_id],"section":"# Entry"})).unwrap();
-    tools::execute(&mut s,"investigation",json!({"action":"verify","id":item["id"],"source_ids":[source_id],"verification_note":"Compared main body with the Entry section"})).unwrap();
-    assert_eq!(s.investigations[0].status, "verified");
+    let _ = meta;
     let call = mnemoarc::llm::ToolCall {
         id: "append-1".into(),
         name: "document_edit".into(),
@@ -299,7 +297,6 @@ fn file_evidence_document_conflict_and_revalidation() {
         s.memory.get("entrypoint").unwrap().status,
         MemoryStatus::NeedsReview
     );
-    assert_eq!(s.investigations[0].status, "written");
 }
 #[test]
 fn source_pagination_and_boundaries() {
@@ -692,7 +689,7 @@ fn catalog_finds_spaced_tool_names_and_new_sessions_can_read() {
     assert!(s.active_tools.contains("document_inspect"));
     // Simple edits run in answer; source-document tools stay off.
     assert!(s.active_tools.contains("document_edit"));
-    assert!(!s.active_tools.contains("investigation"));
+    assert!(!s.active_tools.contains("document_audit"));
     std::fs::write(
         dir.path().join("nav.rs"),
         "fn target() { println!(\"found\"); }\n",
@@ -945,7 +942,7 @@ fn the_model_cannot_change_the_selected_workflow() {
     assert_eq!(s.task.workflow, "answer");
     for patch in [
         json!({"workflow":"source_document"}),
-        json!({"require_investigation":true}),
+        json!({"workflow":"source_document","scope":"UI"}),
     ] {
         let error = tools::execute(
             &mut s,
@@ -994,7 +991,8 @@ fn answer_workflow_runs_no_reviews_and_hides_review_tools() {
     s.task.deliverables = vec!["answer".into()];
     assert!(s.config.completion_review_enabled);
     assert!(!tools::completion_review::required(&s));
-    for name in ["investigation", "document_audit"] {
+    let name = "document_audit";
+    {
         assert!(!s.active_tools.contains(name), "{name}");
         assert!(
             !tools::ToolRegistry::definitions(&s)
@@ -1022,13 +1020,10 @@ fn answer_workflow_sends_no_review_or_verification_guidance() {
     let mut s = session(dir.path());
     s.add_user("Add a note to the summary".into());
     let review_terms = [
-        "verify_batch",
-        "final_check",
         "completion_review",
         "document_review",
-        "require_investigation",
-        "verification_required_ids",
-        "investigation upsert",
+        "unread_citation",
+        "citation_check",
     ];
     let request = ContextManager::request(&s, tools::ToolRegistry::definitions(&s)).unwrap();
     let text = request.to_string();
@@ -1036,12 +1031,7 @@ fn answer_workflow_sends_no_review_or_verification_guidance() {
         assert!(!text.contains(term), "{term}");
     }
     let state = ContextManager::state(&s).unwrap();
-    for key in [
-        "completion_review",
-        "document_review",
-        "pending_investigations",
-        "investigation_count",
-    ] {
+    for key in ["completion_review", "document_review"] {
         assert!(state.get(key).is_none(), "{key}");
     }
     let written = tools::execute(
@@ -1064,18 +1054,18 @@ fn answer_workflow_sends_no_review_or_verification_guidance() {
 }
 
 #[test]
-fn answer_workflow_withholds_investigation() {
+fn answer_workflow_withholds_document_audit() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     s.select_workflow("source_document").unwrap();
-    assert!(s.active_tools.contains("investigation"));
+    assert!(s.active_tools.contains("document_audit"));
     // Switching to answer drops it from the active and queued selections.
     s.pending_tools = Some(s.active_tools.clone());
     s.select_workflow("answer").unwrap();
-    assert!(!s.active_tools.contains("investigation"));
-    assert!(!s.pending_tools.as_ref().unwrap().contains("investigation"));
+    assert!(!s.active_tools.contains("document_audit"));
+    assert!(!s.pending_tools.as_ref().unwrap().contains("document_audit"));
     assert!(
-        tools::execute(&mut s, "investigation", json!({"action":"final_check"}))
+        tools::execute(&mut s, "document_audit", json!({}))
             .unwrap_err()
             .to_string()
             .starts_with("tool_not_active:")
@@ -1084,7 +1074,7 @@ fn answer_workflow_withholds_investigation() {
     let error = tools::execute(
         &mut s,
         "tool_select",
-        json!({"action":"add","names":["investigation"]}),
+        json!({"action":"add","names":["document_audit"]}),
     )
     .unwrap_err()
     .to_string();
@@ -1097,16 +1087,16 @@ fn answer_workflow_withholds_investigation() {
     .unwrap();
     let pending = selected["pending"].as_array().unwrap();
     assert!(pending.iter().any(|n| n == "document_edit"));
-    assert!(!pending.iter().any(|n| n == "investigation"));
+    assert!(!pending.iter().any(|n| n == "document_audit"));
     // A selection made under another workflow is filtered at the boundary.
     let mut names = tools::ToolRegistry::optional_names();
     assert!(tools::ToolRegistry::validate_tool_selection(&s, &names).is_err());
     names = tools::ToolRegistry::normalize_tool_selection(&s, &names);
-    assert!(!names.contains("investigation"));
+    assert!(!names.contains("document_audit"));
     // A new request keeps it withheld.
-    s.active_tools.insert("investigation".into());
+    s.active_tools.insert("document_audit".into());
     s.add_user("Explain main".into());
-    assert!(!s.active_tools.contains("investigation"));
+    assert!(!s.active_tools.contains("document_audit"));
 }
 
 #[test]
@@ -1358,65 +1348,6 @@ fn file_read_limit_alias_preserves_ranges_and_rejects_ambiguity() {
 }
 
 #[test]
-fn investigation_action_contracts_explain_invalid_calls_before_mutation() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = session(dir.path());
-    s.active_tools.insert("investigation".into());
-    for (args, expected) in [
-        (json!({"action":"upsert","items":[]}), "ONE item per call"),
-        (
-            json!({"action":"upsert","items":{"overview":{"source_ids":[],"verification_note":"note"}}}),
-            "ONE item per call",
-        ),
-        (
-            json!({"action":"upsert","id":"overview"}),
-            "missing_argument: title",
-        ),
-        (json!({"action":"upsert","title":"  "}), "must not be empty"),
-        (
-            json!({"action":"verify","id":"overview"}),
-            "missing_argument: source_ids",
-        ),
-        (
-            json!({"action":"verify_batch","items":[]}),
-            "object keyed by existing item IDs",
-        ),
-        (
-            json!({"action":"list","title":"overview"}),
-            "does not accept title",
-        ),
-        (
-            json!({"action":"final_check","source_ids":[]}),
-            "does not accept source_ids",
-        ),
-    ] {
-        let error = tools::execute(&mut s, "investigation", args)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains(expected), "{error}");
-        assert!(error.contains("Example:"), "{error}");
-        assert!(s.investigations.is_empty());
-        assert!(!s.task.require_investigation);
-    }
-    tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"overview","title":"Overview"}),
-    )
-    .unwrap();
-    tools::execute(&mut s, "investigation", json!({"action":"upsert","id":"overview","title":"Updated overview","status":"in_progress"})).unwrap();
-    assert_eq!(s.investigations.len(), 1);
-    assert_eq!(s.investigations[0].title, "Updated overview");
-    let list = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"list","limit":"1"}),
-    )
-    .unwrap();
-    assert_eq!(list["items"].as_array().unwrap().len(), 1);
-}
-
-#[test]
 fn checkpoint_source_lookup_returns_only_existing_matching_evidence() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.rs"), "fn entry() {}\n").unwrap();
@@ -1517,21 +1448,21 @@ fn leaked_native_tool_call_markup_is_split_into_arguments() {
     s.active_tools = tools::ToolRegistry::optional_names();
     let error = tools::execute(
         &mut s,
-        "investigation",
-        json!({"action":"upsert","section</arg_key> \"1. Start\"</arg_value><arg_key>status":"in_progress"}),
+        "symbol_relations",
+        json!({"path</arg_key> a.rs</arg_value><arg_key>relation":"callers"}),
     )
     .unwrap_err()
     .to_string();
-    assert!(error.starts_with("missing_argument: title"), "{error}");
+    assert!(error.starts_with("missing_argument: symbol_id"), "{error}");
     assert!(
-        error.contains("only these fields were received: action, section, status"),
+        error.contains("only these fields were received: path, relation"),
         "{error}"
     );
     // An ordinary failure without leaked markup carries no such note.
     let error = tools::execute(
         &mut s,
-        "investigation",
-        json!({"action":"upsert","section":"1. Start","status":"in_progress"}),
+        "symbol_relations",
+        json!({"path":"a.rs","relation":"callers"}),
     )
     .unwrap_err()
     .to_string();
@@ -1658,40 +1589,27 @@ fn no_tool_definition_offers_a_top_level_union() {
 }
 
 #[test]
-fn filled_shared_schema_fields_are_ignored_but_reclassification_is_not() {
+fn restating_the_workflow_is_ignored_but_reclassification_is_not() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
-    s.active_tools.insert("investigation".into());
-    // upsert does not verify; a filled verification_note is dropped.
-    let item = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"overview","title":"Overview","verification_note":"filled"}),
-    )
-    .unwrap();
-    assert_ne!(item["status"], "verified", "{item}");
-    let id = s.investigations[0].id.clone();
-    let err = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"mark_gap","id":id,"reason":"Not visible in the sources","source_ids":["S1"]}),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(!err.contains("does not accept source_ids"), "{err}");
     // Restating the current workflow selection is not a reclassification.
-    let (workflow, require) = (s.task.workflow.clone(), s.task.require_investigation);
+    let workflow = s.task.workflow.clone();
     tools::execute(
         &mut s,
         "task_state",
-        json!({"action":"update","patch":{"workflow":workflow,"require_investigation":require,"scope":"UI"}}),
+        json!({"action":"update","patch":{"workflow":workflow,"scope":"UI"}}),
     )
     .unwrap();
     assert_eq!(s.task.scope, "UI");
+    let other = if s.task.workflow == "answer" {
+        "source_document"
+    } else {
+        "answer"
+    };
     let err = tools::execute(
         &mut s,
         "task_state",
-        json!({"action":"update","patch":{"require_investigation":!require}}),
+        json!({"action":"update","patch":{"workflow":other}}),
     )
     .unwrap_err()
     .to_string();
@@ -1743,16 +1661,12 @@ fn written_before_the_output_exists_and_stray_checkpoint_ack_explain_the_next_st
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     s.project.output = dir.path().join("manual.md");
-    s.active_tools.insert("investigation".into());
-    let err = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","title":"Setup","section":"## Setup","status":"written"}),
-    )
-    .unwrap_err()
-    .to_string();
+    s.select_workflow("source_document").unwrap();
+    let err = tools::execute(&mut s, "document_audit", json!({}))
+        .unwrap_err()
+        .to_string();
     assert!(err.starts_with("document_missing:"), "{err}");
-    assert!(err.contains("action=create first"), "{err}");
+    assert!(err.contains("action=create"), "{err}");
     assert!(!err.contains("os error"), "{err}");
     let err = tools::execute(
         &mut s,
@@ -1763,4 +1677,26 @@ fn written_before_the_output_exists_and_stray_checkpoint_ack_explain_the_next_st
     .to_string();
     assert!(err.starts_with("no_checkpoint:"), "{err}");
     assert!(err.contains("CHECKPOINT CONTROL REQUEST"), "{err}");
+}
+
+#[test]
+fn checkpoint_completes_without_a_memory_write_or_no_save_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.add_user("a".into());
+    s.add_user("b".into());
+    ContextManager::prepare(&mut s, 60000).unwrap();
+    let cp = s.checkpoint.as_ref().unwrap().id.clone();
+    let generation = s.memory.generation;
+    // Saving a memory is optional: progress alone acknowledges the checkpoint.
+    tools::execute(
+        &mut s,
+        "checkpoint_complete",
+        json!({"id":cp,"progress":"Continue reading main.rs:20-40 for the retry bound"}),
+    )
+    .unwrap();
+    assert_eq!(s.memory.generation, generation);
+    ContextManager::commit(&mut s).unwrap();
+    assert!(s.checkpoint.is_none());
+    assert!(s.task.checkpoint_summary.contains("main.rs:20-40"));
 }

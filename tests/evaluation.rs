@@ -77,10 +77,9 @@ prompt = "Document main.rs with source evidence."
         )
         .unwrap();
         assert_eq!(state["task"]["workflow"], "source_document");
-        assert_eq!(state["task"]["require_investigation"], true);
         assert_eq!(state["memory_reuse_enabled"], index < 3);
         let tools = request["tools"].as_array().unwrap();
-        for name in ["investigation", "document_audit", "document_edit"] {
+        for name in ["document_audit", "document_edit"] {
             assert!(
                 tools.iter().any(|tool| tool["function"]["name"] == name),
                 "missing {name} in evaluation request {index}"

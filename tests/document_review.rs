@@ -35,20 +35,13 @@ fn fixture() -> (tempfile::TempDir, Session) {
     );
     s.select_workflow("source_document").unwrap();
     tools::execute(&mut s, "task_state", json!({"action":"update","patch":{"completion":["history normalization", "loop type and bounds"]}})).unwrap();
-    let read = tools::execute(&mut s, "file_read", json!({"path":"main.js"})).unwrap();
+    tools::execute(&mut s, "file_read", json!({"path":"main.js"})).unwrap();
     tools::execute(
         &mut s,
         "document_edit",
         json!({"action":"create","text":"# Flow\nA while loop runs work. main.js:4-5\n"}),
     )
     .unwrap();
-    tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"flow","title":"Flow","section":"# Flow","status":"written"}),
-    )
-    .unwrap();
-    tools::execute(&mut s,"investigation",json!({"action":"verify","id":"flow","source_ids":[read["source"]["id"]],"verification_note":"Compared body"})).unwrap();
     (dir, s)
 }
 
@@ -122,8 +115,8 @@ fn review_of_an_unprepared_request_does_not_use_agent_completion_checks() {
 #[test]
 fn source_workflow_activates_tools_and_schema_prevents_guessing() {
     let (_dir, mut s) = fixture();
-    assert!(s.task.require_investigation);
-    for name in ["investigation", "document_edit", "document_audit"] {
+    assert!(s.is_document_work());
+    for name in ["document_edit", "document_audit"] {
         assert!(s.active_tools.contains(name));
     }
     let specs = tools::ToolRegistry::specs();
@@ -172,7 +165,7 @@ fn source_workflow_activates_tools_and_schema_prevents_guessing() {
     s.workflow_mode = "answer".into();
     s.add_user("Now answer a question only.".into());
     assert_eq!(s.task.workflow, "answer");
-    assert!(!s.task.require_investigation);
+    assert!(!s.is_document_work());
 }
 
 #[test]
@@ -385,9 +378,8 @@ async fn unchanged_review_is_reused_until_closing_reports_its_findings() {
 }
 
 #[tokio::test]
-async fn required_document_before_investigations_is_not_forced_to_chat_answer() {
+async fn required_document_before_any_write_is_not_forced_to_chat_answer() {
     let (_dir, mut s) = fixture();
-    s.investigations.clear();
     s.document_written = false;
     s.last_document_write = None;
     s.task_rounds = 6;
@@ -1093,14 +1085,6 @@ async fn repair_interval_rechecks_and_a_changed_document_can_resume() {
         json!({"action":"replace_text","expected_hash":expected,"old_text":"A while loop runs work. main.js:4-5","text":"History is normalized before a bounded for loop runs work. main.js:2-5"}),
     )
     .unwrap();
-    let source = s
-        .sources
-        .values()
-        .find(|source| source.origin == "file")
-        .unwrap()
-        .id
-        .clone();
-    tools::execute(&mut s, "investigation", json!({"action":"verify","id":"flow","source_ids":[source],"verification_note":"Compared the corrected loop and history statement with the source"})).unwrap();
     assert!(!document_review::stalled_on_current_result(&s));
     s.add_user("계속".into());
     let s = run_repair_test(
@@ -1171,7 +1155,6 @@ fn first_issue_after_an_approved_document_gets_a_repair_chance() {
 struct ProgressiveDocumentRepair {
     calls: std::sync::Mutex<usize>,
     path: std::path::PathBuf,
-    source_id: String,
 }
 
 #[async_trait]
@@ -1227,8 +1210,8 @@ impl LlmClient for ProgressiveDocumentRepair {
             5 => Completion {
                 calls: vec![mnemoarc::llm::ToolCall {
                     id: "verify-flow".into(),
-                    name: "investigation".into(),
-                    arguments: json!({"action":"verify","id":"flow","source_ids":[self.source_id],"verification_note":"Compared the corrected history and loop statement with the source"}).to_string(),
+                    name: "document_audit".into(),
+                    arguments: json!({}).to_string(),
                 }],
                 ..Default::default()
             },
@@ -1251,19 +1234,14 @@ async fn progressive_document_repairs_reach_final_approval_past_both_intervals()
     let client = Arc::new(ProgressiveDocumentRepair {
         calls: std::sync::Mutex::new(0),
         path: s.project.output.clone(),
-        source_id: s
-            .sources
-            .values()
-            .find(|source| source.origin == "file")
-            .unwrap()
-            .id
-            .clone(),
     });
     let result = run_repair_test(s, client.clone()).await;
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
     assert_eq!(result.document_review.attempts, 3);
     assert!(document_review::approved(&result));
-    assert_eq!(*client.calls.lock().unwrap(), 7);
+    // The final answer that started the approving review is resumed; the
+    // model is not asked to answer a seventh time.
+    assert_eq!(*client.calls.lock().unwrap(), 6);
 }
 
 #[tokio::test]
@@ -1288,13 +1266,10 @@ async fn reads_and_verification_can_finish_even_at_the_edit_limit() {
                     .unwrap();
                 let state: Value = serde_json::from_str(content.split_once('\n').unwrap().1)?;
                 assert_eq!(state["document_review"]["repair_requests"], 2);
-                let name = ["file_read", "document_inspect", "investigation"][round % 3];
+                let name = ["file_read", "document_inspect", "document_audit"][round % 3];
                 let args = match name {
                     "file_read" => json!({"path":"main.js","force_read":true}),
-                    "document_inspect" => json!({}),
-                    _ => {
-                        json!({"action":"verify_batch","items":{"flow":{"source_ids":[],"verification_note":"Reuse unchanged attestation"}}})
-                    }
+                    _ => json!({}),
                 };
                 return Ok(Completion {
                     calls: vec![mnemoarc::llm::ToolCall {
@@ -1493,12 +1468,9 @@ fn structural_preflight_remains_available_after_review_limit() {
     let (_dir, mut s) = fixture();
     s.config.review_limit = 1;
     for _ in 0..12 {
-        let result =
-            tools::execute(&mut s, "investigation", json!({"action":"final_check"})).unwrap();
-        assert_eq!(result["complete"], true);
-        assert_eq!(result["semantic_verified"], false);
+        let result = tools::execute(&mut s, "document_audit", json!({})).unwrap();
+        assert_eq!(result["structural_ok"], true, "{result}");
     }
-    assert_eq!(s.reviews, 12);
     assert!(!document_review::approved(&s));
 }
 
@@ -1552,7 +1524,6 @@ fn review_retry_preserves_document_range_and_evidence_continuation() {
 async fn pending_document_review_setup_error_returns_to_repair_and_finishes() {
     struct RepairMissingCitation {
         path: std::path::PathBuf,
-        source_id: String,
         calls: std::sync::Mutex<usize>,
         reviews: std::sync::atomic::AtomicUsize,
     }
@@ -1627,10 +1598,7 @@ async fn pending_document_review_setup_error_returns_to_repair_and_finishes() {
                         "text":"# Flow\nHistory is normalized before a bounded for loop runs work. main.js:2-5\n"}),
                     )
                 }
-                2 => (
-                    "investigation",
-                    json!({"action":"verify","id":"flow","source_ids":[self.source_id],"verification_note":"Compared the normalized history and bounded for loop"}),
-                ),
+                2 => ("document_audit", json!({})),
                 _ => {
                     return Ok(Completion {
                         text: "Saved out.md".into(),
@@ -1649,13 +1617,6 @@ async fn pending_document_review_setup_error_returns_to_repair_and_finishes() {
         }
     }
     let (_dir, mut s) = fixture();
-    let source_id = s
-        .sources
-        .values()
-        .find(|source| source.origin == "file")
-        .unwrap()
-        .id
-        .clone();
     let hash = s.last_document_write.as_ref().unwrap().1.clone();
     tools::execute(
         &mut s,
@@ -1667,7 +1628,6 @@ async fn pending_document_review_setup_error_returns_to_repair_and_finishes() {
     s.document_review.pending = true;
     let client = Arc::new(RepairMissingCitation {
         path: s.project.output.clone(),
-        source_id,
         calls: std::sync::Mutex::new(0),
         reviews: std::sync::atomic::AtomicUsize::new(0),
     });
@@ -1685,7 +1645,6 @@ async fn pending_document_review_setup_error_returns_to_repair_and_finishes() {
 struct SlowCorrection {
     calls: std::sync::Mutex<usize>,
     path: std::path::PathBuf,
-    source_id: String,
     premature_finals: bool,
 }
 
@@ -1740,8 +1699,9 @@ impl LlmClient for SlowCorrection {
         // The verification sibling must execute even at the review interval.
         if *calls == 16 {
             tool_calls.push(mnemoarc::llm::ToolCall {
-                id: "verify-final-correction".into(), name: "investigation".into(),
-                arguments: json!({"action":"verify","id":"flow","source_ids":[self.source_id],"verification_note":"Compared normalization, for declaration and finite bound with source"}).to_string(),
+                id: "audit-final-correction".into(),
+                name: "document_audit".into(),
+                arguments: json!({}).to_string(),
             });
         }
         Ok(Completion {
@@ -1762,13 +1722,6 @@ async fn source_document_can_finish_after_stalled_reviews_or_many_rejected_final
         let client = Arc::new(SlowCorrection {
             calls: std::sync::Mutex::new(0),
             path: s.project.output.clone(),
-            source_id: s
-                .sources
-                .values()
-                .find(|source| source.origin == "file")
-                .unwrap()
-                .id
-                .clone(),
             premature_finals,
         });
         let s = run_repair_test(s, client).await;
@@ -1792,7 +1745,6 @@ async fn source_document_can_finish_after_stalled_reviews_or_many_rejected_final
         assert_eq!(s.status, "complete", "{:?}", s.last_error);
         assert!(document_review::approved(&s));
         assert!(s.completion_review.approved);
-        assert_eq!(s.investigations[0].status, "verified");
         assert_eq!(s.document_review.attempts, 16);
     }
 }
@@ -2041,8 +1993,7 @@ async fn truncated_review_retry_names_the_output_limit_not_tools() {
         json!({"action":"write","expected_hash":hash,"text":"# Flow\nHistory is normalized, then a for loop runs work five times. main.js:2-5\n"}),
     )
     .unwrap();
-    let read = tools::execute(&mut s, "file_read", json!({"path":"main.js"})).unwrap();
-    tools::execute(&mut s,"investigation",json!({"action":"verify","id":"flow","source_ids":[read["source"]["id"]],"verification_note":"Compared body"})).unwrap();
+    tools::execute(&mut s, "file_read", json!({"path":"main.js"})).unwrap();
     let client = Arc::new(TruncatedFirstReview {
         reviews: Default::default(),
     });
@@ -2116,8 +2067,7 @@ async fn a_persistently_invalid_page_is_skipped_without_losing_other_findings() 
             json!({"action":"write","expected_hash":hash,"text":format!("# Flow\n{doc}")}),
         )
         .unwrap();
-        let read = tools::execute(&mut s, "file_read", json!({"path":"main.js"})).unwrap();
-        tools::execute(&mut s,"investigation",json!({"action":"verify","id":"flow","source_ids":[read["source"]["id"]],"verification_note":"Compared body"})).unwrap();
+        tools::execute(&mut s, "file_read", json!({"path":"main.js"})).unwrap();
         let (tx, mut rx) = mpsc::channel(256);
         let drain = tokio::spawn(async move {
             let mut notices = Vec::new();
@@ -2258,4 +2208,92 @@ fn a_bare_issue_array_is_read_as_the_issue_list() {
     );
     support::document_review::finish(&mut s, "[]").unwrap();
     assert!(document_review::approved(&s));
+}
+
+/// Answers once; counts model requests apart from the two reviews.
+struct OneFinalAnswer {
+    model_calls: std::sync::atomic::AtomicUsize,
+    issues: bool,
+}
+
+#[async_trait]
+impl LlmClient for OneFinalAnswer {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        if let Some(review) = support::acceptance(&request) {
+            return Ok(review);
+        }
+        if request["messages"][1]["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("\"source_document_review\":true"))
+        {
+            let issues: Vec<&str> = if self.issues {
+                vec!["Flow: the loop is a for loop, not a while loop"]
+            } else {
+                vec![]
+            };
+            return Ok(Completion {
+                text: json!({"issues":issues}).to_string(),
+                ..Default::default()
+            });
+        }
+        let call = self
+            .model_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Completion {
+            text: format!("Saved out.md (answer {call})."),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_approved_review_resumes_the_final_answer_that_started_it() {
+    let (_dir, s) = fixture();
+    let client = Arc::new(OneFinalAnswer {
+        model_calls: Default::default(),
+        issues: false,
+    });
+    let result = run_repair_test(s, client.clone()).await;
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert!(document_review::approved(&result));
+    assert!(result.completion_review.approved);
+    // One model answer: the review approves it and the completion review
+    // checks that same answer, which is the one published.
+    assert_eq!(
+        client.model_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let published = result
+        .history
+        .bundles
+        .iter()
+        .flat_map(|bundle| bundle.messages.iter())
+        .rev()
+        .find(|message| message["role"] == "assistant")
+        .unwrap();
+    assert!(
+        published["content"].as_str().unwrap().contains("answer 0"),
+        "{published}"
+    );
+}
+
+#[tokio::test]
+async fn a_rejecting_review_still_returns_to_the_model() {
+    let (_dir, mut s) = fixture();
+    s.config.run_tokens = 300_000;
+    let client = Arc::new(OneFinalAnswer {
+        model_calls: Default::default(),
+        issues: true,
+    });
+    let result = run_repair_test(s, client.clone()).await;
+    // The unchanged rejected document is never approved, so every later
+    // answer comes from the model, not from the held one.
+    assert!(!document_review::approved(&result));
+    assert!(client.model_calls.load(std::sync::atomic::Ordering::SeqCst) > 1);
 }

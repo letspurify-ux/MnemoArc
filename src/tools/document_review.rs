@@ -32,7 +32,6 @@ pub struct ReviewState {
     pub best_issue_count: Option<usize>,
     pub last_reviewed_section_count: usize,
     pub last_reviewed_content_lines: usize,
-    pub last_reviewed_verified_count: usize,
     pub approved_hash: Option<String>,
     pub issues: Vec<String>,
     pub input_tokens: usize,
@@ -701,7 +700,7 @@ fn request_page(s: &mut Session) -> Result<Option<Value>> {
     let doc_lines: Vec<_> = doc.lines().collect();
     let start_line = s.document_review.document_offset.min(doc_lines.len());
     // Agent-authored task_state criteria include workflow checks (for example
-    // investigation bookkeeping). Only user requirements and caller criteria, including explicit user
+    // citation bookkeeping). Only user requirements and caller criteria, including explicit user
     // amendments, belong in a review of the document.
     let mut payload = json!({"source_document_review":true,"request":s.answer_review_question,
         "requirements":s.request_review_criteria.completion,
@@ -1204,11 +1203,6 @@ fn finish_review(s: &mut Session, digest: String) -> Result<()> {
     let doc = read_text(&output_path(&s.project)?)?;
     let length_issue = approximate_line_issue(effective_user_request(s), doc.lines().count());
     let (sections, content_lines) = document_content_shape(&s.project).unwrap_or((0, 0));
-    let verified = s
-        .investigations
-        .iter()
-        .filter(|i| i.status == "verified")
-        .count();
     let state = &mut s.document_review;
     findings::preserve_label_gaps(state);
     state.attempts += 1;
@@ -1276,13 +1270,11 @@ fn finish_review(s: &mut Session, digest: String) -> Result<()> {
             .iter()
             .any(|issue| issue.starts_with(LENGTH_ISSUE_PREFIX));
         let added_content = length_repair && content_lines > state.last_reviewed_content_lines;
-        let newly_verified = verified > state.last_reviewed_verified_count;
         if state.best_issue_count.is_none()
             || improved_count
             || resolved > 0
             || added_section
             || added_content
-            || newly_verified
         {
             state.stalled_attempts = 0;
         } else {
@@ -1296,7 +1288,6 @@ fn finish_review(s: &mut Session, digest: String) -> Result<()> {
     }
     state.last_reviewed_section_count = state.last_reviewed_section_count.max(sections);
     state.last_reviewed_content_lines = state.last_reviewed_content_lines.max(content_lines);
-    state.last_reviewed_verified_count = state.last_reviewed_verified_count.max(verified);
     state.findings = next_findings;
     state.issues = next_issues;
     state.reviewed_sections = section_hashes(&doc);

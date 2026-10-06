@@ -1510,10 +1510,6 @@ mod worker_wait_tests {
             let core = state.core.lock().await;
             assert_eq!(core.sessions[&id].workflow_mode, workflow);
             assert_eq!(core.sessions[&id].task.workflow, workflow);
-            assert_eq!(
-                core.sessions[&id].task.require_investigation,
-                workflow == "source_document"
-            );
             drop(core);
             let other = if workflow == "answer" {
                 "source_document"

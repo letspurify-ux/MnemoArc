@@ -92,14 +92,6 @@ impl LlmClient for Engine {
             *calls += 1;
             *calls
         };
-        let source = request["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .rev()
-            .filter(|message| message["role"] == "tool")
-            .filter_map(|message| serde_json::from_str::<Value>(message["content"].as_str()?).ok())
-            .find_map(|result| result["data"]["source"]["id"].as_str().map(str::to_owned));
         Ok(match step {
             1 => call(
                 "read-source",
@@ -111,17 +103,7 @@ impl LlmClient for Engine {
                 "document_edit",
                 json!({"action":"write","expected_hash":tools::hash(&std::fs::read(&self.output)?),"text":DOCUMENT}),
             ),
-            3 => call(
-                "chapter",
-                "investigation",
-                json!({"action":"upsert","id":"chapter","title":"count return value","section":"# 첫 장","status":"written","source_ids":[source.unwrap()]}),
-            ),
-            4 => call(
-                "verify-chapter",
-                "investigation",
-                json!({"action":"verify","id":"chapter","source_ids":[source.unwrap()],"verification_note":"Compared the count return value with sample.rs:1-1."}),
-            ),
-            5 => Completion {
+            3 => Completion {
                 text: "첫 장을 저장하고 소스와 대조했습니다.".into(),
                 ..Default::default()
             },
@@ -256,7 +238,6 @@ async fn cancelling_then_sending_a_changed_prompt_repairs_routing_and_finishes_t
     assert_eq!(finished["status"], "complete", "{}", finished["error"]);
     assert_eq!(finished["original_request"], ORIGINAL);
     assert_eq!(finished["task_amendments"].as_array().unwrap().len(), 1);
-    assert_eq!(finished["investigations"][0]["status"], "verified");
     assert_eq!(*engine.routing_attempts.lock().unwrap(), 2);
     assert_eq!(finished["run_history"][0]["reason"], "cancelled");
     assert_eq!(finished["run_history"][1]["workflow"], "source_document");

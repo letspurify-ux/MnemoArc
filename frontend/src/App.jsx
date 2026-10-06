@@ -1585,8 +1585,12 @@ function Inspector({
                 }
                 {" · 남은 실행 예산 "}
                 {session.run_guidance.remaining_tokens?.toLocaleString()} 토큰
-                {" · 미검증 "}
-                {session.run_guidance.pending_count}개
+                {session.workflow_mode === "source_document" && (
+                  <>
+                    {" · 읽지 않은 인용 "}
+                    {session.run_guidance.unread_citation_count ?? 0}개
+                  </>
+                )}
               </p>
             )}
             <section className="task-plan-section" aria-label="할 일 목록">
@@ -1756,23 +1760,6 @@ function Inspector({
                 </section>
               ),
             )}
-            {session.workflow_mode === "source_document" && <h4>조사 목록</h4>}
-            {session.investigations.map((item) => (
-              <div className="source-card" key={item.id}>
-                <strong>{displayPathText(item.title)}</strong>
-                <small>
-                  {{
-                    uninvestigated: "미조사",
-                    in_progress: "조사 중",
-                    written: "작성됨",
-                    verified: "검증됨",
-                    gap: "미확인",
-                    superseded: "변경된 범위에서 제외",
-                  }[item.status] || item.status}
-                </small>
-                <p>{displayPathText(item.note)}</p>
-              </div>
-            ))}
           </>
         )}
         {tab === "tools" && (
@@ -1832,15 +1819,6 @@ function Inspector({
                         시작 줄은 start_line, 읽을 줄 수는 max_lines입니다.
                         limit은 max_lines의 별칭이며 offset은 줄 번호가
                         아닙니다. 잘린 결과는 반환된 cursor로 이어 읽으세요.
-                      </small>
-                    )}
-                    {tool.name === "investigation" && (
-                      <small>
-                        upsert는 title을 포함해 항목 하나씩 등록합니다. 여러
-                        항목은 각각 호출하세요. verify는 id, source_ids,
-                        verification_note가 필요합니다. items는 기존 작성 항목의
-                        일괄 검증인 verify_batch에서만 사용하며, 항목 ID를 키로
-                        갖는 객체입니다.
                       </small>
                     )}
                     {tool.name === "document_inspect" && (

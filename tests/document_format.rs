@@ -242,33 +242,19 @@ fn serialized_carriage_returns_are_left_to_the_ui_instead_of_false_syntax_errors
     );
 }
 
-fn verify(s: &mut Session, source: &Value) {
-    run(
-        s,
-        "investigation",
-        json!({"action":"verify","id":"guide","source_ids":[source],"verification_note":"Compared the guide with source.rs:1"}),
-    );
-}
-
 #[test]
 fn format_errors_block_final_preflight_and_batch_repairs_clear_them() {
     let (dir, mut s) = setup();
     std::fs::write(dir.path().join("source.rs"), "fn source() {}\n").unwrap();
-    let source = run(&mut s, "file_read", json!({"path":"source.rs"}))["source"]["id"].clone();
+    run(&mut s, "file_read", json!({"path":"source.rs"}));
     let written = create(
         &mut s,
         "# Guide\nSee source.rs:1.\n\n| A | B |\n| --- | --- |\n| one |\n\n```mermaid\nflowchart LR\nA -->\n```\n",
     );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"guide","title":"Guide","section":"# Guide","status":"written"}),
-    );
-    verify(&mut s, &source);
-    let preflight = run(&mut s, "investigation", json!({"action":"final_check"}));
-    assert_eq!(preflight["complete"], false, "{preflight}");
-    assert_eq!(preflight["audit"]["issue_count"], 2);
-    assert_eq!(preflight["audit"]["format_check"]["ok"], false);
+    let preflight = run(&mut s, "document_audit", json!({}));
+    assert_eq!(preflight["structural_ok"], false, "{preflight}");
+    assert_eq!(preflight["issue_count"], 2);
+    assert_eq!(preflight["format_check"]["ok"], false);
     let edited = run(
         &mut s,
         "document_edit_batch",
@@ -278,9 +264,8 @@ fn format_errors_block_final_preflight_and_batch_repairs_clear_them() {
         ]}),
     );
     assert_eq!(edited["format_check"]["ok"], true, "{edited}");
-    verify(&mut s, &source);
-    let preflight = run(&mut s, "investigation", json!({"action":"final_check"}));
-    assert_eq!(preflight["complete"], true, "{preflight}");
+    let preflight = run(&mut s, "document_audit", json!({}));
+    assert_eq!(preflight["structural_ok"], true, "{preflight}");
 }
 
 #[test]

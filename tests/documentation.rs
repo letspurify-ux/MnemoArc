@@ -253,12 +253,6 @@ fn nested_outline_paths_select_repeated_titles_and_scope_text_edits() {
         "document_edit",
         json!({"action":"section","section":beta,"expected_hash":changed["hash"],"expected_section_hash":beta_page["section_hash"],"text":"### Shared\nbeta detail\nand more\n"}),
     );
-    let registered = run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","title":"Beta detail","status":"written","section":beta}),
-    );
-    assert_eq!(registered["section"], beta);
     assert_eq!(
         changed["hash"],
         tools::hash(std::fs::read(&s.project.output).unwrap().as_slice())
@@ -437,54 +431,6 @@ fn batch_partial_text_edits_are_ordered_and_atomic() {
 }
 
 #[test]
-fn investigation_updates_preserve_title_but_new_items_still_require_it() {
-    let (_dir, mut s) = setup();
-    std::fs::write(
-        &s.project.output,
-        "# Updated entry\nbody\n# New section\nbody\n",
-    )
-    .unwrap();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","title":"Entry point","section":"# Entry"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","status":"written","section":"# Updated entry"}),
-    );
-    assert_eq!(s.investigations.len(), 1);
-    assert_eq!(s.investigations[0].title, "Entry point");
-    assert_eq!(s.investigations[0].status, "written");
-    assert_eq!(s.investigations[0].section, "# Updated entry");
-    let before = serde_json::to_value(&s.investigations).unwrap();
-    for args in [
-        json!({"action":"upsert","id":"unknown","status":"written"}),
-        json!({"action":"upsert","status":"written"}),
-        json!({"action":"upsert","id":"entry","title":"  "}),
-        json!({"action":"upsert","id":"entry","title":null}),
-    ] {
-        assert!(tools::execute(&mut s, "investigation", args).is_err());
-        assert_eq!(serde_json::to_value(&s.investigations).unwrap(), before);
-    }
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","title":"Renamed"}),
-    );
-    assert_eq!(s.investigations[0].title, "Renamed");
-    // Editing a verified item must still invalidate its prior verification.
-    s.investigations[0].status = "verified".into();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","section":"# New section"}),
-    );
-    assert_eq!(s.investigations[0].status, "written");
-    assert!(s.investigations[0].document_hash.is_none());
-}
-#[test]
 fn outline_ignores_code_fences_and_section_edits_are_conflict_checked() {
     let (_dir, mut s) = setup();
     run(
@@ -566,63 +512,6 @@ fn symbols_page_and_expire_on_source_change() {
     assert!(tools::execute(&mut s, "symbol_search", json!({"cursor":p["next_cursor"]})).is_err());
 }
 #[test]
-fn batch_verification_reports_each_failure_and_source_changes_invalidate_success() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-    let source = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Entry\nmain.rs:1\n# Errors\nmain.rs:999\n"}),
-    );
-    for (id, section) in [("entry", "# Entry"), ("errors", "# Errors")] {
-        run(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":id,"title":id,"status":"written","section":section,"source_ids":[source]}),
-        );
-    }
-    for _ in 0..5 {
-        assert_eq!(
-            run(&mut s, "investigation", json!({"action":"final_check"}))["complete"],
-            false
-        );
-    }
-    assert_eq!(s.reviews, 0);
-    let r = run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify_batch","items":{"entry":{"source_ids":[source],"verification_note":"Compared main declaration with entry."},"errors":{"source_ids":[],"verification_note":"not read"}}}),
-    );
-    assert_eq!(r["results"][0]["result"]["status"], "ok");
-    assert_eq!(r["results"][1]["result"]["status"], "error");
-    let retry = run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify_batch","items":{"entry":{"source_ids":[source],"verification_note":"Retry after partial failure."}}}),
-    );
-    assert_eq!(retry["results"][0]["result"]["status"], "ok");
-    let audit = run(&mut s, "document_audit", json!({}));
-    assert_eq!(audit["citations_checked"], 2);
-    assert!(
-        audit["issues"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v["kind"] == "citation_range")
-    );
-    std::fs::write(dir.path().join("main.rs"), "fn changed() {}\n").unwrap();
-    let audit = run(&mut s, "document_audit", json!({}));
-    assert!(
-        audit["issues"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v["kind"] == "stale_source")
-    );
-    assert_eq!(s.investigations[0].status, "written");
-}
-#[test]
 fn documentation_tools_respect_permissions_and_reserve() {
     let (dir, mut s) = setup();
     std::fs::write(
@@ -638,11 +527,7 @@ fn documentation_tools_respect_permissions_and_reserve() {
             .iter()
             .any(|i| i["kind"] == "citation_path")
     );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","title":"Title","section":"# Title"}),
-    );
+    s.document_written = true;
     s.run_guidance = json!({"phase":"verify"});
     assert!(
         tools::execute(&mut s, "file_list", json!({}))
@@ -652,44 +537,6 @@ fn documentation_tools_respect_permissions_and_reserve() {
     );
     s.active_tools.remove("document_inspect");
     assert!(tools::execute(&mut s, "document_inspect", json!({})).is_err());
-}
-
-#[test]
-fn verification_recovery_can_locate_and_register_missing_required_coverage() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("helper.rs"), "fn normalize() {}\n").unwrap();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"existing","title":"Existing flow","section":"# Flow"}),
-    );
-    s.run_guidance = json!({"phase":"verify","progress_recovery":{"active":true}});
-    let definitions = tools::ToolRegistry::definitions(&s);
-    for name in ["file_list", "source_search", "code_outline"] {
-        assert!(
-            definitions
-                .iter()
-                .any(|definition| definition["function"]["name"] == name)
-        );
-    }
-    assert!(tools::execute(&mut s, "file_list", json!({})).is_err());
-    let found = run(
-        &mut s,
-        "file_list",
-        json!({"mode":"paths","path_glob":"**/helper.rs"}),
-    );
-    assert!(found.to_string().contains("helper.rs"));
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"missing","title":"Required normalization","section":"# Normalization"}),
-    );
-    assert_eq!(s.investigations.len(), 2);
-    assert!(
-        s.investigations
-            .iter()
-            .all(|item| item.status != "verified")
-    );
 }
 
 #[test]
@@ -781,213 +628,6 @@ fn audit_ignores_example_citations_inside_fenced_code() {
 }
 
 #[test]
-fn verify_drops_non_file_ids_beside_file_evidence() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-    s.select_workflow("source_document").unwrap();
-    s.add_user("Document main.rs".into());
-    let user = s
-        .sources
-        .values()
-        .find(|source| source.origin == "user")
-        .unwrap()
-        .id
-        .clone();
-    let file = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Entry\nmain.rs:1\n"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","title":"entry","status":"written","section":"# Entry"}),
-    );
-    // Alone, the request's ID is still named and refused.
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"entry","source_ids":[user],"verification_note":"Compared main.rs:1."}),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(
-        error.starts_with("verification_sources_required:"),
-        "{error}"
-    );
-    assert!(error.contains(&format!("{user} (origin=user)")), "{error}");
-    // Beside file evidence it is dropped and reported (the live shape).
-    let verified = run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"entry","source_ids":[file, user],"verification_note":"Compared main.rs:1."}),
-    );
-    assert_eq!(s.investigations[0].status, "verified", "{verified}");
-    assert_eq!(verified["ignored_source_ids"], json!([user]));
-    assert!(
-        s.investigations[0]
-            .sources
-            .iter()
-            .all(|source| source.origin == "file")
-    );
-}
-
-#[test]
-fn verify_batch_explains_fields_sent_as_items_and_paths_sent_as_ids() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Entry\nmain.rs:1\n"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","title":"entry","status":"written","section":"# Entry"}),
-    );
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"verify_batch","items":{"section":"# Entry","source_ids":["main.rs"],"verification_note":"Compared."}}),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("must map each investigation ID"), "{error}");
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"entry","source_ids":["src/missing.css"],"verification_note":"Compared."}),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(
-        error.starts_with("unknown_source: src/missing.css is a path"),
-        "{error}"
-    );
-}
-
-#[test]
-fn verify_accepts_a_citation_passed_as_a_source_id() {
-    let (dir, mut s) = setup();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/app.js"),
-        "let a = 1;\nlet b = 2;\nlet c = 3;\n",
-    )
-    .unwrap();
-    run(&mut s, "file_read", json!({"path":"src/app.js"}));
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Entry\nTwo values. src/app.js:1-2\n"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","title":"entry","status":"written","section":"# Entry"}),
-    );
-    // The live shape: the document's own citations sent as source_ids.
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"entry","source_ids":["src/missing.js:3"],"verification_note":"Compared."}),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(
-        error.starts_with("unknown_source: src/missing.js:3 is a citation, not a source ID, and src/missing.js is not a readable project file"),
-        "{error}"
-    );
-    let verified = run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"entry","source_ids":["src/app.js:1-2"],"verification_note":"Compared both lines."}),
-    );
-    assert_eq!(s.investigations[0].status, "verified", "{verified}");
-}
-
-#[test]
-fn a_title_item_attests_only_the_opening_not_sections_other_items_own() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
-    let body: String = (1..=200).map(|n| format!("let v{n} = {n};\n")).collect();
-    std::fs::write(dir.path().join("b.rs"), body).unwrap();
-    let first = run(&mut s, "file_read", json!({"path":"a.rs"}));
-    let again = run(&mut s, "file_read", json!({"path":"a.rs"}));
-    let created = run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Guide\nThe entry is a. a.rs:1\n## Values\nTwo hundred values. b.rs:1-200\n"}),
-    );
-    for (id, section) in [("intro", "# Guide"), ("values", "# Guide\n## Values")] {
-        run(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":id,"title":id,"status":"written","section":section}),
-        );
-    }
-    // The live shape: b.rs was never read, but its citation belongs to the
-    // Values item, so the opening verifies from a.rs alone.
-    let verified = run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"intro","source_ids":[first["source"]["id"], again["source"]["id"]],"verification_note":"Compared the entry."}),
-    );
-    assert_eq!(s.investigations[0].status, "verified", "{verified}");
-    assert_eq!(
-        s.investigations[0].sources.len(),
-        1,
-        "rereads are kept once"
-    );
-    // The Values item still owes its whole range, and the error offers
-    // narrowing a pointer-like citation instead of reading 200 lines.
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"values","source_ids":[first["source"]["id"]],"verification_note":"Compared."}),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.starts_with("source_coverage_missing:"), "{error}");
-    assert!(
-        error.contains("The widest range spans 200 lines"),
-        "{error}"
-    );
-    // Editing the Values section leaves the opening's verification intact.
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"replace_text","old_text":"Two hundred values.","text":"Many values.","expected_hash":created["hash"]}),
-    );
-    run(&mut s, "investigation", json!({"action":"list"}));
-    assert_eq!(s.investigations[0].status, "verified");
-    let current = run(&mut s, "document_inspect", json!({}));
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"replace_text","old_text":"The entry is a.","text":"The entry is fn a.","expected_hash":current["hash"]}),
-    );
-    run(&mut s, "investigation", json!({"action":"list"}));
-    assert_eq!(
-        s.investigations[0].status, "written",
-        "the opening itself changed"
-    );
-    // Without an item of its own, a subsection stays in the opening's scope.
-    s.investigations.retain(|item| item.id == "intro");
-    s.investigations[0].status = "written".into();
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"intro","source_ids":[first["source"]["id"]],"verification_note":"Compared."}),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("b.rs"), "{error}");
-}
-
-#[test]
 fn the_output_file_name_alone_names_the_output() {
     let (dir, mut s) = setup();
     // The live shape: the output lives outside the project root.
@@ -1006,37 +646,6 @@ fn the_output_file_name_alone_names_the_output() {
     std::fs::write(dir.path().join("generated.md"), "project copy\n").unwrap();
     let read = run(&mut s, "file_read", json!({"path":"generated.md"}));
     assert!(read.to_string().contains("project copy"), "{read}");
-}
-
-#[test]
-fn final_check_rejects_invalid_citations_even_after_agent_attestation() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-    let id = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Entry\nmain.rs:99\n"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","title":"entry","status":"written","section":"# Entry","source_ids":[id]}),
-    );
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"entry","source_ids":[id],"verification_note":"Agent claims comparison."}),
-    ).unwrap_err();
-    assert!(error.to_string().starts_with("source_coverage_missing:"));
-    // Even an injected legacy attestation cannot bypass final structural audit.
-    s.investigations[0].status = "verified".into();
-    s.investigations[0].document_hash = Some(tools::hash(b"# Entry\nmain.rs:99\n"));
-    assert_eq!(
-        run(&mut s, "investigation", json!({"action":"final_check"}))["complete"],
-        false
-    );
-    assert_eq!(s.reviews, 0);
 }
 
 #[test]
@@ -1070,53 +679,36 @@ fn out_of_range_read_is_empty_and_cannot_supply_verification_evidence() {
         "document_edit",
         json!({"action":"create","text":"# Entry\nmain.rs:2\n"}),
     );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","title":"entry","section":"# Entry","status":"written"}),
-    );
+    // The blank first line was delivered, but the cited second line was not.
     assert!(
-        tools::execute(
-            &mut s,
-            "investigation",
-            json!({"action":"verify","id":"entry","source_ids":[id],"verification_note":"blank"})
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("non-empty")
+        !blank["source"]["excerpt"]
+            .as_str()
+            .unwrap()
+            .trim()
+            .is_empty()
+            || id.is_string()
+    );
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert!(
+        audit["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["kind"] == "unread_citation"
+                && issue["path"] == "main.rs"
+                && issue["start_line"] == 2
+                && issue["end_line"] == 2),
+        "{audit}"
     );
 }
 
 #[test]
-fn settings_validate_reserves_and_patch_keeps_existing_references() {
-    let (dir, mut s) = setup();
-    std::fs::write(&s.project.output, "# Entry\nbody\n").unwrap();
+fn settings_validate_reserves() {
+    let (_dir, mut s) = setup();
     s.config.writing_reserve_ratio = 0.2;
     assert!(s.config.validate().is_err());
     s.config.writing_reserve_ratio = 0.5;
     assert!(s.config.validate().is_ok());
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-    let id = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","title":"entry","section":"# Entry","source_ids":[id]}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","title":"entry","status":"written"}),
-    );
-    assert_eq!(s.investigations[0].sources.len(), 1);
-    assert_eq!(s.investigations[0].section, "# Entry");
-    assert!(
-        tools::execute(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","title":"entry"})
-        )
-        .is_err()
-    );
 }
 
 #[test]
@@ -1862,266 +1454,6 @@ fn changed_file_between_execution_and_delivery_does_not_gain_coverage() {
 }
 
 #[test]
-fn persisted_sections_become_written_but_unrelated_evidence_cannot_verify_them() {
-    let (dir, mut s) = source_setup();
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-    std::fs::write(dir.path().join("other.rs"), "fn other() {}\n").unwrap();
-    for (id, section) in [("entry", "# Entry"), ("missing", "# Missing")] {
-        run(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":id,"title":id,"section":section}),
-        );
-    }
-    let write = run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Entry\nmain.rs:1\n"}),
-    );
-    assert_eq!(write["written_items"], json!(["entry"]));
-    assert_eq!(s.investigations[0].status, "written");
-    assert_eq!(s.investigations[1].status, "uninvestigated");
-    let wrong = run(&mut s, "file_read", json!({"path":"other.rs"}))["source"]["id"].clone();
-    assert!(tools::execute(&mut s,"investigation",json!({"action":"verify","id":"entry","source_ids":[wrong],"verification_note":"Claims a match"})).unwrap_err().to_string().starts_with("source_coverage_missing:"));
-    let right = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"entry","source_ids":[right],"verification_note":"Compared the entry"}),
-    );
-    assert_eq!(s.investigations[0].status, "verified");
-}
-
-#[test]
-fn verification_reports_all_gaps_and_one_repair_completes_verification() {
-    let (dir, mut s) = setup();
-    std::fs::write(
-        dir.path().join("a.rs"),
-        (1..=12)
-            .map(|n| format!("// line {n}\n"))
-            .collect::<String>(),
-    )
-    .unwrap();
-    std::fs::write(dir.path().join("b.rs"), "// one\n// two\n// three\n").unwrap();
-    // Repeated overlapping citations must not duplicate missing reads.
-    std::fs::write(&s.project.output, "# Gaps\na.rs:1-12 a.rs:3-9 b.rs:1-3\n").unwrap();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"gaps","title":"Gaps","status":"written","section":"Gaps"}),
-    );
-    let mut sources = vec![];
-    for (start, count) in [(2, 2), (6, 2), (10, 1)] {
-        sources.push(
-            run(
-                &mut s,
-                "file_read",
-                json!({"path":"a.rs","start_line":start,"max_lines":count}),
-            )["source"]["id"]
-                .clone(),
-        );
-    }
-    let result = tools::envelope(tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"gaps","source_ids":sources,"verification_note":"Compare both files"}),
-    ));
-    let expected = json!([
-        {"path":"a.rs","start_line":1,"end_line":1},
-        {"path":"a.rs","start_line":4,"end_line":5},
-        {"path":"a.rs","start_line":8,"end_line":9},
-        {"path":"a.rs","start_line":11,"end_line":12},
-        {"path":"b.rs","start_line":1,"end_line":3}
-    ]);
-    assert_eq!(result["data"]["missing_ranges"], expected);
-    assert_eq!(result["data"]["missing_range_count"], 5);
-    assert_eq!(s.investigations[0].status, "written");
-    for gap in expected.as_array().unwrap() {
-        sources.push(run(&mut s, "file_read", json!({"path":gap["path"],"start_line":gap["start_line"],"max_lines":gap["end_line"].as_u64().unwrap()-gap["start_line"].as_u64().unwrap()+1}))["source"]["id"].clone());
-    }
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"gaps","source_ids":sources,"verification_note":"Compared all cited ranges"}),
-    );
-    assert_eq!(s.investigations[0].status, "verified");
-}
-
-#[test]
-fn written_registration_resolves_headings_and_rejects_bad_updates_atomically() {
-    let (_dir, mut s) = setup();
-    // Planning a future section does not require a document.
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"chat","title":"Chat","status":"in_progress","section":"4. 채팅 흐름 (Chat.jsx)"}),
-    );
-    std::fs::write(
-        &s.project.output,
-        "## 4. 채팅 흐름 (Chat.jsx)\nbody\n# Duplicate\none\n## Duplicate\ntwo\n",
-    )
-    .unwrap();
-    let registered = run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"chat","status":"written"}),
-    );
-    assert_eq!(registered["section"], "## 4. 채팅 흐름 (Chat.jsx)");
-    let before = serde_json::to_value(&s.investigations).unwrap();
-    for (heading, code) in [
-        ("Missing", "section_not_found"),
-        ("Duplicate", "ambiguous_section"),
-    ] {
-        let err = tools::execute(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":"chat","section":heading}),
-        )
-        .unwrap_err();
-        assert!(err.to_string().starts_with(code));
-        assert_eq!(serde_json::to_value(&s.investigations).unwrap(), before);
-    }
-}
-
-#[test]
-fn verification_checks_written_prerequisite_before_sources_or_document() {
-    let (_dir, mut s) = setup();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"draft","title":"Draft"}),
-    );
-    for sources in [json!([]), json!(["unknown-source"])] {
-        let err = tools::execute(&mut s, "investigation", json!({"action":"verify","id":"draft","source_ids":sources,"verification_note":"Compare"})).unwrap_err();
-        assert!(
-            err.to_string()
-                .starts_with("item_must_be_written_before_verification:")
-        );
-    }
-}
-
-#[test]
-fn batch_item_contract_rejects_extra_fields_without_losing_siblings() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("a.rs"), "// source\n").unwrap();
-    std::fs::write(&s.project.output, "# A\na.rs:1\n").unwrap();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"ready","title":"Ready","section":"A","status":"written"}),
-    );
-    let source = run(&mut s, "file_read", json!({"path":"a.rs"}))["source"]["id"].clone();
-    let result = run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify_batch","items":{
-            "extra":{"id":"ready","source_ids":[source],"verification_note":"Compare"},
-            "malformed":false,
-            "ready":{"source_ids":[source],"verification_note":"Compared source"}
-        }}),
-    );
-    assert_eq!(result["retry_ids"], json!(["extra", "malformed"]));
-    assert_eq!(result["succeeded_ids"], json!(["ready"]));
-    assert_eq!(result["summary"]["failed"], 2);
-    assert_eq!(
-        result["summary"]["failures_by_code"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-    assert_eq!(s.investigations[0].status, "verified");
-}
-
-#[test]
-fn batch_reuse_still_requires_the_declared_item_fields() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("a.rs"), "// source\n").unwrap();
-    std::fs::write(&s.project.output, "# A\na.rs:1\n").unwrap();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"ready","title":"Ready","section":"A","status":"written"}),
-    );
-    let source = run(&mut s, "file_read", json!({"path":"a.rs"}))["source"]["id"].clone();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"ready","source_ids":[source],"verification_note":"Compared source"}),
-    );
-    let result = run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify_batch","items":{"ready":{}}}),
-    );
-    assert_eq!(result["reused_ids"], json!([]));
-    assert_eq!(result["retry_ids"], json!(["ready"]));
-    assert_eq!(
-        result["results"][0]["result"]["recovery"]["code"],
-        "missing_argument"
-    );
-}
-
-#[test]
-fn local_edit_preserves_unrelated_verification_and_batch_reuses_it() {
-    let (dir, mut s) = source_setup();
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-    let source = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
-    let doc = run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Entry\nEntry main.rs:1\n# Other\nOther main.rs:1\n"}),
-    );
-    for (id, section) in [("entry", "# Entry"), ("other", "# Other")] {
-        run(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":id,"title":id,"status":"written","section":section}),
-        );
-        run(
-            &mut s,
-            "investigation",
-            json!({"action":"verify","id":id,"source_ids":[source],"verification_note":"Compared source and section"}),
-        );
-    }
-    let original = serde_json::to_value(&s.investigations[0]).unwrap();
-    let edit = run(
-        &mut s,
-        "document_edit",
-        json!({"action":"patch","expected_hash":doc["hash"],"old_text":"Other main.rs:1","text":"Updated other main.rs:1"}),
-    );
-    assert_eq!(edit["verification_required_ids"], json!(["other"]));
-    assert_eq!(edit["preserved_verified_ids"], json!(["entry"]));
-    // A redundant request with missing evidence cannot destroy an unchanged attestation.
-    let result = run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify_batch","items":{
-            "entry":{"source_ids":["unknown"],"verification_note":"Redundant"},
-            "other":{"source_ids":[],"verification_note":"Missing evidence"}
-        }}),
-    );
-    assert_eq!(result["reused_ids"], json!(["entry"]));
-    assert_eq!(result["retry_ids"], json!(["other"]));
-    assert_eq!(
-        serde_json::to_value(&s.investigations[0]).unwrap(),
-        original
-    );
-    // A changed source must invalidate the cache and require real verification.
-    std::fs::write(dir.path().join("main.rs"), "fn changed() {}\n").unwrap();
-    let result = run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify_batch","items":{
-            "entry":{"source_ids":[source],"verification_note":"Stale source"}
-        }}),
-    );
-    assert_eq!(result["reused_ids"], json!([]));
-    assert_eq!(result["retry_ids"], json!(["entry"]));
-    assert_eq!(s.investigations[0].status, "written");
-}
-
-#[test]
 fn patch_inside_h2_handles_blockquote_and_two_line_text() {
     let (_dir, mut s) = setup();
     let document = run(
@@ -2667,357 +1999,6 @@ fn document_edits_reject_embedded_nul_bytes() {
     assert!(!s.project.output.exists());
 }
 
-fn numbered_source(lines: usize) -> String {
-    (1..=lines)
-        .map(|i| format!("let value_{i} = {i};\n"))
-        .collect()
-}
-
-#[test]
-fn verification_reuses_delivered_evidence_when_source_ids_are_lost() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("a.rs"), numbered_source(20)).unwrap();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# A\nValues are assigned in order. a.rs:1-20\n\n# B\nThe same values again. a.rs:1-20\n"}),
-    );
-    for (id, section) in [("a", "# A"), ("b", "# B")] {
-        run(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":id,"title":id,"section":section,"status":"written"}),
-        );
-    }
-    let first = run(
-        &mut s,
-        "file_read",
-        json!({"path":"a.rs","start_line":1,"max_lines":10}),
-    )["source"]["id"]
-        .clone();
-    let second = run(
-        &mut s,
-        "file_read",
-        json!({"path":"a.rs","start_line":11,"max_lines":10}),
-    )["source"]["id"]
-        .clone();
-    // Only one of the two delivered ranges is named: the other is added.
-    let result = run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"a","source_ids":[first],"verification_note":"Compared all twenty assignments with section A"}),
-    );
-    assert_eq!(result["supplemented_source_ids"], json!([second]));
-    let item = s.investigations.iter().find(|i| i.id == "a").unwrap();
-    assert_eq!(item.status, "verified");
-    assert_eq!(item.sources.len(), 2);
-    // A project path stands in for the evidence delivered from that file.
-    let result = run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"b","source_ids":["a.rs"],"verification_note":"Compared all twenty assignments with section B"}),
-    );
-    assert_eq!(result["verified"], "b");
-    assert_eq!(result["supplemented_source_ids"], json!([first, second]));
-}
-
-#[test]
-fn supplemented_blank_line_sources_survive_suggested_reverification() {
-    for (newline, blank_line) in [("\n", ""), ("\n", " \t"), ("\r\n", ""), ("\r\n", " \t")] {
-        let (dir, mut s) = source_setup();
-        std::fs::write(
-            dir.path().join("main.rs"),
-            format!("fn main() {{}}{newline}{blank_line}{newline}"),
-        )
-        .unwrap();
-        let content = run(
-            &mut s,
-            "file_read",
-            json!({"path":"main.rs","start_line":1,"max_lines":1}),
-        )["source"]["id"]
-            .clone();
-        let blank = run(
-            &mut s,
-            "file_read",
-            json!({"path":"main.rs","start_line":2,"max_lines":1}),
-        )["source"]["id"]
-            .clone();
-        run(
-            &mut s,
-            "document_edit",
-            json!({"action":"create","text":"# Entry\nmain.rs:1-2\n"}),
-        );
-        run(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":"entry","title":"entry","section":"# Entry","status":"written"}),
-        );
-        let verified = run(
-            &mut s,
-            "investigation",
-            json!({"action":"verify","id":"entry","source_ids":[content],"verification_note":"Compared both lines of main.rs."}),
-        );
-        assert_eq!(verified["supplemented_source_ids"], json!([blank]));
-        let expected_ids = json!([content, blank]);
-        assert_eq!(json!(s.investigations[0].source_ids()), expected_ids);
-
-        let doc = std::fs::read(&s.project.output).unwrap();
-        run(
-            &mut s,
-            "document_edit",
-            json!({"action":"write","expected_hash":tools::hash(&doc),"text":"# Entry\nThe entry point is main (main.rs:1-2).\n"}),
-        );
-        let check = run(&mut s, "investigation", json!({"action":"final_check"}));
-        assert_eq!(check["complete"], false);
-        assert_eq!(check["incomplete"][0]["previous_source_ids"], expected_ids);
-        let example = check["verify_batch_example"].clone();
-        assert_eq!(example["items"]["entry"]["source_ids"], expected_ids);
-        let reverified = run(&mut s, "investigation", example);
-        assert_eq!(s.investigations[0].status, "verified", "{reverified}");
-        assert_eq!(json!(s.investigations[0].source_ids()), expected_ids);
-    }
-}
-
-#[test]
-fn blank_only_evidence_cannot_verify_even_with_complete_citation_coverage() {
-    for blank_line in ["", " \t"] {
-        let (dir, mut s) = source_setup();
-        std::fs::write(dir.path().join("main.rs"), format!("{blank_line}\n")).unwrap();
-        let blank = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
-        run(
-            &mut s,
-            "document_edit",
-            json!({"action":"create","text":"# Entry\nmain.rs:1\n"}),
-        );
-        run(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":"entry","title":"entry","section":"# Entry","status":"written"}),
-        );
-        // Both an explicit ID and a path hint must enforce the same minimum
-        // content requirement, even though the observed line covers the cite.
-        for source_ids in [json!([blank]), json!(["main.rs"])] {
-            let error = tools::execute(
-                &mut s,
-                "investigation",
-                json!({"action":"verify","id":"entry","source_ids":source_ids,"verification_note":"Compared the cited range."}),
-            )
-            .unwrap_err()
-            .to_string();
-            assert!(
-                error.starts_with("verification_sources_required:"),
-                "{error}"
-            );
-            assert!(error.contains("non-empty"), "{error}");
-            assert_eq!(s.investigations[0].status, "written");
-            assert!(s.investigations[0].document_hash.is_none());
-            assert!(s.investigations[0].sources.is_empty());
-        }
-    }
-}
-
-#[test]
-fn explicitly_supplied_blank_line_evidence_still_requires_the_current_file_version() {
-    let (dir, mut s) = source_setup();
-    let path = dir.path().join("main.rs");
-    std::fs::write(&path, "fn main() {}\n\n").unwrap();
-    let blank = run(
-        &mut s,
-        "file_read",
-        json!({"path":"main.rs","start_line":2,"max_lines":1}),
-    )["source"]["id"]
-        .clone();
-    std::fs::write(&path, "fn main() {}\n \t\n").unwrap();
-    let content = run(
-        &mut s,
-        "file_read",
-        json!({"path":"main.rs","start_line":1,"max_lines":1}),
-    )["source"]["id"]
-        .clone();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Entry\nmain.rs:1-2\n"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","title":"entry","section":"# Entry","status":"written"}),
-    );
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"entry","source_ids":[content,blank],"verification_note":"Compared the cited range."}),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(
-        error.starts_with(&format!("source_changed: {} (", blank.as_str().unwrap())),
-        "{error}"
-    );
-    assert_eq!(s.investigations[0].status, "written");
-}
-
-#[test]
-fn delivered_evidence_of_an_older_file_version_is_not_reused() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("a.rs"), numbered_source(20)).unwrap();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# A\nValues are assigned in order. a.rs:1-20\n"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"a","title":"a","section":"# A","status":"written"}),
-    );
-    run(
-        &mut s,
-        "file_read",
-        json!({"path":"a.rs","start_line":1,"max_lines":20}),
-    );
-    std::fs::write(
-        dir.path().join("a.rs"),
-        format!("{}// changed\n", numbered_source(20)),
-    )
-    .unwrap();
-    let fresh = run(
-        &mut s,
-        "file_read",
-        json!({"path":"a.rs","start_line":1,"max_lines":10}),
-    )["source"]["id"]
-        .clone();
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"a","source_ids":[fresh],"verification_note":"Compared the assignments"}),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.starts_with("source_coverage_missing"), "{error}");
-    assert!(error.contains("\"start_line\":11"), "{error}");
-    assert_ne!(
-        s.investigations
-            .iter()
-            .find(|i| i.id == "a")
-            .unwrap()
-            .status,
-        "verified"
-    );
-}
-
-#[test]
-fn planned_section_names_rebind_to_the_written_heading_by_title() {
-    let (dir, mut s) = source_setup();
-    std::fs::write(dir.path().join("a.rs"), numbered_source(3)).unwrap();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"flow","title":"2. Agent branches and termination","section":"## 2. Agent branches","status":"in_progress"}),
-    );
-    let edit = run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Guide\n\n## 2. Agent branches and termination\nThree values are assigned. a.rs:1-3\n"}),
-    );
-    assert_eq!(edit["written_items"], json!(["flow"]));
-    let item = s.investigations.iter().find(|i| i.id == "flow").unwrap();
-    assert_eq!(item.status, "written");
-    assert_eq!(
-        item.section,
-        "# Guide\n## 2. Agent branches and termination"
-    );
-    let source = run(&mut s, "file_read", json!({"path":"a.rs"}))["source"]["id"].clone();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"flow","source_ids":[source],"verification_note":"Compared the three assignments"}),
-    );
-}
-
-#[test]
-fn planned_sections_rebind_by_level_free_title_or_section_number() {
-    let (dir, mut s) = source_setup();
-    std::fs::write(dir.path().join("a.rs"), numbered_source(3)).unwrap();
-    // The shapes from a live run: planned as level-1 headings, written as
-    // level-2 headings, and the first one also reworded.
-    for (id, title, section) in [
-        (
-            "first",
-            "Start screen",
-            "# 1. First screen, streaming progress and stop",
-        ),
-        ("second", "Reading answers", "# 2. Reading answers"),
-        ("dup_a", "Admin A", "# 3. Admin"),
-        ("dup_b", "Admin B", "# 3. Admin panel"),
-        ("year", "Release", "# 2024 release"),
-    ] {
-        run(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":id,"title":title,"section":section,"status":"in_progress"}),
-        );
-    }
-    let edit = run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Manual\n\n## 1. First screen, progress and stop\nBody a.rs:1\n\n## 2. Reading answers\nBody a.rs:2\n\n## 3. Admin settings\nBody a.rs:3\n\n## 2025 release\nBody\n"}),
-    );
-    assert_eq!(edit["written_items"], json!(["first", "second"]));
-    let section = |id: &str| {
-        s.investigations
-            .iter()
-            .find(|item| item.id == id)
-            .unwrap()
-            .section
-            .clone()
-    };
-    assert_eq!(
-        section("first"),
-        "# Manual\n## 1. First screen, progress and stop"
-    );
-    assert_eq!(section("second"), "# Manual\n## 2. Reading answers");
-    // Two items numbered 3 and a year are left for an explicit section.
-    assert_eq!(section("dup_a"), "# 3. Admin");
-    assert_eq!(section("dup_b"), "# 3. Admin panel");
-    assert_eq!(section("year"), "# 2024 release");
-
-    // Settling one duplicate by hand lets status=written alone bind nothing
-    // already claimed, and the reported error still lists the headings.
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"dup_a","section":"## 3. Admin settings","status":"written"}),
-    );
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"dup_b","status":"written"}),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.starts_with("section_not_found:"), "{error}");
-}
-
-#[test]
-fn written_status_alone_rebinds_a_planned_section() {
-    let (_dir, mut s) = setup();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"flow","title":"Flow","section":"# 4. Admin panel and binding edits","status":"in_progress"}),
-    );
-    // Written by hand so no document edit rebinds it first.
-    std::fs::write(&s.project.output, "# Manual\n## 4. Admin panel\nBody\n").unwrap();
-    let registered = run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"flow","status":"written"}),
-    );
-    assert_eq!(registered["section"], "# Manual\n## 4. Admin panel");
-}
-
 #[test]
 fn section_insert_errors_name_the_heading_that_breaks_the_rule() {
     let body = "# Manual\n## 1. Start\nBody\n";
@@ -3103,59 +2084,6 @@ fn section_insert_errors_name_the_heading_that_breaks_the_rule() {
 }
 
 #[test]
-fn audit_reports_cited_sections_without_an_investigation_item() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("a.rs"), numbered_source(6)).unwrap();
-    let doc = "# Manual\nIntro.\n## 1. Start\nBody a.rs:1-2\n## 2. Answers\nBody a.rs:3-4\n### 2-1. Tables\nMore a.rs:5\n## Notes\nNo citation here.\n";
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":doc}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"start","title":"Start","section":"## 1. Start","status":"written"}),
-    );
-    let source = run(&mut s, "file_read", json!({"path":"a.rs"}))["source"]["id"].clone();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"start","source_ids":[source],"verification_note":"Compared a.rs:1-2"}),
-    );
-    let uncovered = |s: &mut Session| -> Vec<Value> {
-        run(s, "document_audit", json!({}))["issues"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|issue| issue["kind"] == "uncovered_section")
-            .cloned()
-            .collect()
-    };
-    // Each cited section names its innermost heading; the uncited one is
-    // not reported, and every item being settled does not hide the gap.
-    let issues = uncovered(&mut s);
-    assert_eq!(issues.len(), 2, "{issues:?}");
-    assert_eq!(issues[0]["section"], "# Manual\n## 2. Answers");
-    assert_eq!(
-        issues[1]["section"],
-        "# Manual\n## 2. Answers\n### 2-1. Tables"
-    );
-    assert_eq!(issues[1]["citations"], 1);
-    let check = run(&mut s, "investigation", json!({"action":"final_check"}));
-    assert_eq!(check["complete"], false, "{check}");
-    assert_eq!(check["audit"]["structural_ok"], false);
-
-    // An item on the parent section covers its child as well.
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"answers","title":"Answers","section":"## 2. Answers","status":"written"}),
-    );
-    assert!(uncovered(&mut s).is_empty());
-}
-
-#[test]
 fn revision_conflict_names_a_malformed_hash() {
     for batch in [false, true] {
         let (_dir, mut s) = setup();
@@ -3223,55 +2151,6 @@ fn array_arguments_sent_as_json_text_are_decoded() {
 }
 
 #[test]
-fn source_changed_names_the_source_and_output_document_reads() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("a.rs"), numbered_source(3)).unwrap();
-    let created = run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Guide\nBody a.rs:1\n"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"guide","title":"Guide","section":"# Guide","status":"written"}),
-    );
-    // The live shape: a read of the output document passed as evidence
-    // after the document was edited again.
-    let doc_read = run(&mut s, "file_read", json!({"path":"summary.md"}))["source"]["id"].clone();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"replace_text","expected_hash":created["hash"],"old_text":"Body","text":"Text"}),
-    );
-    let verify = |s: &mut Session, id: &Value| {
-        tools::execute(
-            s,
-            "investigation",
-            json!({"action":"verify","id":"guide","source_ids":[id],"verification_note":"Compared a.rs:1"}),
-        )
-        .unwrap_err()
-        .to_string()
-    };
-    let error = verify(&mut s, &doc_read);
-    assert!(error.starts_with("source_changed:"), "{error}");
-    assert!(
-        error.contains("is a read of the output document"),
-        "{error}"
-    );
-    assert!(error.contains(doc_read.as_str().unwrap()), "{error}");
-    // A project file that changed names its ID and path.
-    let source = run(&mut s, "file_read", json!({"path":"a.rs"}))["source"]["id"].clone();
-    std::fs::write(dir.path().join("a.rs"), numbered_source(4)).unwrap();
-    let error = verify(&mut s, &source);
-    assert!(
-        error.starts_with(&format!("source_changed: {} (", source.as_str().unwrap())),
-        "{error}"
-    );
-    assert!(error.contains("a.rs) changed since it was read"), "{error}");
-}
-
-#[test]
 fn audit_flags_the_output_path_written_into_the_document() {
     let (_dir, mut s) = setup();
     let output = s
@@ -3306,117 +2185,6 @@ fn audit_flags_the_output_path_written_into_the_document() {
         !audit.to_string().contains("output_path_in_document"),
         "{audit}"
     );
-}
-
-#[test]
-fn verify_binds_the_section_of_an_item_registered_without_one() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("a.rs"), numbered_source(4)).unwrap();
-    // The live shape: items planned without a section, then verified with
-    // verify_batch right after writing.
-    for (id, title) in [
-        ("start", "Start"),
-        ("answers", "Answers"),
-        ("other", "Other"),
-    ] {
-        run(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":id,"title":title,"status":"in_progress"}),
-        );
-    }
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Manual\n## 1. 첫 화면\nBody a.rs:1-2\n## 2. 답변 읽기\nBody a.rs:3-4\n"}),
-    );
-    let source = run(&mut s, "file_read", json!({"path":"a.rs"}))["source"]["id"].clone();
-    let result = run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify_batch","items":{
-            "start":{"source_ids":[source],"verification_note":"Compared a.rs:1-2","section":"## 1. 첫 화면"},
-            "answers":{"source_ids":[source],"verification_note":"Compared a.rs:3-4","section":"## 2. 답변 읽기"}
-        }}),
-    );
-    assert_eq!(
-        result["succeeded_ids"],
-        json!(["answers", "start"]),
-        "{result}"
-    );
-    let item = |s: &Session, id: &str| {
-        s.investigations
-            .iter()
-            .find(|i| i.id == id)
-            .unwrap()
-            .clone()
-    };
-    assert_eq!(item(&s, "start").status, "verified");
-    assert_eq!(item(&s, "start").section, "# Manual\n## 1. 첫 화면");
-
-    // Another item's section is refused, and so is moving a bound item.
-    let verify = |s: &mut Session, id: &str, section: &str| {
-        tools::execute(
-            s,
-            "investigation",
-            json!({"action":"verify","id":id,"source_ids":[source],"verification_note":"Compared","section":section}),
-        )
-        .unwrap_err()
-        .to_string()
-    };
-    let error = verify(&mut s, "other", "## 1. 첫 화면");
-    assert!(error.contains("already belongs to item start"), "{error}");
-    assert!(item(&s, "other").section.is_empty());
-    let error = verify(&mut s, "start", "## 2. 답변 읽기");
-    assert!(error.contains("is registered to section"), "{error}");
-    assert_eq!(item(&s, "start").section, "# Manual\n## 1. 첫 화면");
-}
-
-#[test]
-fn a_named_section_falls_back_to_the_unique_numbered_heading() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("a.rs"), numbered_source(4)).unwrap();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Manual\n## 1. 첫 화면과 질문 입력·전송\nBody a.rs:1\n## 2. 답변 읽기\nBody a.rs:2\n"}),
-    );
-    // The live shape: the section named as in the request, not as written.
-    let registered = run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"one","title":"One","section":"1. 첫 화면과 질문 입력·전송, 스트리밍 중 진행 표시와 중단","status":"written"}),
-    );
-    assert_eq!(
-        registered["section"],
-        "# Manual\n## 1. 첫 화면과 질문 입력·전송"
-    );
-    // verify takes the same fallback for an item without a section.
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"two","title":"Two","status":"in_progress"}),
-    );
-    let source = run(&mut s, "file_read", json!({"path":"a.rs"}))["source"]["id"].clone();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"two","section":"2. 답변 읽기: 표와 차트","source_ids":[source],"verification_note":"Compared a.rs:2"}),
-    );
-    let two = s.investigations.iter().find(|i| i.id == "two").unwrap();
-    assert_eq!(
-        (two.status.as_str(), two.section.as_str()),
-        ("verified", "# Manual\n## 2. 답변 읽기")
-    );
-    // A heading already used by another item is not taken; the original error remains.
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"three","title":"Three","section":"1. 다른 이름","status":"written"}),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.starts_with("section_not_found"), "{error}");
 }
 
 #[test]
@@ -3494,15 +2262,6 @@ fn a_short_heading_name_resolves_only_when_unique() {
         let page = run(&mut s, "document_inspect", json!({"section":section}));
         assert_eq!(page["start_line"], 2, "{section}");
     }
-    let registered = run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"setup","title":"Setup","section":"처음 설정","status":"written"}),
-    );
-    assert_eq!(
-        registered["section"],
-        "# Manual\n## 1. 처음 설정: 모델 연결 정보 입력"
-    );
     // Two headings share the short title, or the section number disagrees.
     assert_eq!(
         run(&mut s, "document_inspect", json!({"section":"## 3. 채팅"}))["start_line"],
@@ -4111,29 +2870,6 @@ fn common_argument_aliases_are_accepted_and_conflicts_rejected() {
     // max_issues is the audit page size.
     let audit = run(&mut s, "document_audit", json!({"max_issues":1}));
     assert!(audit["issues"].as_array().unwrap().len() <= 1);
-    // verify ignores a restated registered section but rejects another one.
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"a","title":"A","section":"# A","status":"written"}),
-    );
-    let source = run(&mut s, "file_read", json!({"path":"a.rs"}))["source"]["id"].clone();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"a","section":"# A","source_ids":[source],"verification_note":"Compared the assignment"}),
-    );
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"a","section":"# Other","source_ids":[source],"verification_note":"Compared"}),
-    )
-    .unwrap_err()
-    .to_string();
-    // A section the item is not registered to is still refused (moving a
-    // registered item is covered by the verify section-binding test).
-    assert!(error.starts_with("section_not_found"), "{error}");
-    assert_eq!(s.investigations[0].section, "# A");
 }
 
 #[test]
@@ -4143,8 +2879,8 @@ fn a_user_selected_workflow_applies_to_each_request_and_is_locked() {
     s.workflow_mode = "source_document".into();
     s.add_user("Write the manual.".into());
     assert_eq!(s.task.workflow, "source_document");
-    assert!(s.task.require_investigation && s.is_document_work());
-    assert!(s.active_tools.contains("investigation") && s.active_tools.contains("document_edit"));
+    assert!(s.is_document_work());
+    assert!(s.active_tools.contains("document_audit") && s.active_tools.contains("document_edit"));
     // The model may fill in the task but not reclassify the request.
     let error = tools::execute(
         &mut s,
@@ -4163,225 +2899,7 @@ fn a_user_selected_workflow_applies_to_each_request_and_is_locked() {
     s.workflow_mode = "answer".into();
     s.add_user("What does main do?".into());
     assert_eq!(s.task.workflow, "answer");
-    assert!(!s.task.require_investigation && !s.is_document_work());
-}
-
-#[test]
-fn an_edit_after_verification_offers_the_reverify_call() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-    let file = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Entry\nmain.rs:1\n"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","title":"entry","status":"written","section":"# Entry"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"entry","source_ids":[file],"verification_note":"Compared main.rs:1."}),
-    );
-    // A later edit to the section returns the item to "written".
-    let doc = std::fs::read(&s.project.output).unwrap();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"write","expected_hash":tools::hash(&doc),"text":"# Entry\nThe entry point is main (main.rs:1).\n"}),
-    );
-    let check = run(&mut s, "investigation", json!({"action":"final_check"}));
-    assert_eq!(check["complete"], false);
-    assert_eq!(check["incomplete"][0]["previous_source_ids"], json!([file]));
-    // A stalled live run repeatedly listed these items after an edit. The
-    // list must offer the same actionable verification call as final_check.
-    let listed = run(&mut s, "investigation", json!({"action":"list"}));
-    assert_eq!(listed["next_steps"][0]["next"]["action"], "verify");
-    assert_eq!(listed["next_steps"][0]["next"]["source_ids"], json!([file]));
-    let example = check["verify_batch_example"].clone();
-    assert_eq!(example["items"]["entry"]["source_ids"], json!([file]));
-    // The offered call re-verifies the edited section as-is.
-    let verified = run(&mut s, "investigation", example);
-    assert_eq!(s.investigations[0].status, "verified", "{verified}");
-}
-
-#[test]
-fn stalled_pending_verification_withholds_read_only_check_loops() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-    let file = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Entry\nmain.rs:1\n"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","title":"entry","status":"written","section":"# Entry"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"entry","source_ids":[file],"verification_note":"Compared main.rs:1."}),
-    );
-    let doc = std::fs::read(&s.project.output).unwrap();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"write","expected_hash":tools::hash(&doc),"text":"# Entry\nThe entry is main (main.rs:1).\n"}),
-    );
-    s.progress_recovery.rounds_since_best = s.config.stall_round_limit;
-    let offered = tools::ToolRegistry::definitions(&s);
-    let investigation = offered
-        .iter()
-        .find(|tool| tool["function"]["name"] == "investigation")
-        .unwrap();
-    let names = investigation["function"]["parameters"]["properties"]["action"]["enum"]
-        .as_array()
-        .unwrap();
-    assert!(!names.contains(&json!("list")) && !names.contains(&json!("final_check")));
-    assert!(names.contains(&json!("verify")));
-    assert!(offered.iter().all(|tool| !matches!(
-        tool["function"]["name"].as_str(),
-        Some("document_audit" | "task_plan")
-    )));
-    let error = tools::ToolRegistry::validate(&s, "investigation", &json!({"action":"list"}))
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.starts_with("investigation_progress_required:"),
-        "{error}"
-    );
-    assert!(error.contains("verify"), "{error}");
-    let plan_error = tools::ToolRegistry::validate(&s, "task_plan", &json!({"action":"list"}))
-        .unwrap_err()
-        .to_string();
-    assert!(
-        plan_error.starts_with("investigation_progress_required:"),
-        "{plan_error}"
-    );
-    tools::ToolRegistry::validate(&s, "investigation", &json!({"action":"verify","id":"entry","source_ids":[file],"verification_note":"Rechecked the edit."})).unwrap();
-}
-
-#[test]
-fn unwritten_items_get_the_call_that_advances_them() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-    // The live shape: items registered before writing, with no section.
-    for title in ["Entry point", "Errors"] {
-        run(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","status":"in_progress","title":title}),
-        );
-    }
-    let file = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Guide\n## Entry point\nIt starts in main (main.rs:1).\n"}),
-    );
-    let check = run(&mut s, "investigation", json!({"action":"final_check"}));
-    let steps = check["next_steps"].as_array().unwrap();
-    // Writing the matching heading bound the first item; its next call is
-    // the verification. The other section must be written first.
-    let entry = steps
-        .iter()
-        .find(|step| step["next"]["action"] == "verify")
-        .unwrap_or_else(|| panic!("{check}"));
-    assert!(
-        steps.iter().any(|step| step["next"]
-            .as_str()
-            .is_some_and(|next| next.contains("\"Errors\""))),
-        "{check}"
-    );
-    let id = entry["id"].as_str().unwrap();
-    // The offered call names the section's cited file; it verifies as sent,
-    // using the evidence already delivered by the read.
-    assert_eq!(entry["next"]["source_ids"], json!(["main.rs"]));
-    assert!(file.is_string());
-    run(&mut s, "investigation", entry["next"].clone());
-    assert!(
-        s.investigations
-            .iter()
-            .any(|i| i.id == id && i.status == "verified")
-    );
-    // An in_progress item registered after its section was written gets the
-    // upsert that marks it written.
-    let doc = std::fs::read(&s.project.output).unwrap();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"write","expected_hash":tools::hash(&doc),"text":"# Guide\n## Entry point\nIt starts in main (main.rs:1).\n## Errors\nNone.\n## Limits\nNone.\n"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","status":"in_progress","title":"Limits"}),
-    );
-    let steps = run(&mut s, "investigation", json!({"action":"final_check"}))["next_steps"].clone();
-    let limits = steps
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|step| step["next"]["action"] == "upsert")
-        .unwrap_or_else(|| panic!("{steps}"));
-    assert_eq!(limits["next"]["status"], "written");
-    assert_eq!(limits["next"]["section"], "# Guide\n## Limits");
-}
-
-#[test]
-fn a_passing_final_check_says_what_finishes_the_task() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-    let file = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Entry\nmain.rs:1\n"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","title":"entry","status":"written","section":"# Entry"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"entry","source_ids":[file],"verification_note":"Compared main.rs:1."}),
-    );
-    let revision = s.task.plan_revision;
-    run(
-        &mut s,
-        "task_plan",
-        json!({"action":"apply","expected_revision":revision,"operations":[{"op":"insert","texts":["Write the entry section"]}]}),
-    );
-    // The live shape: passing preflights repeated while a to-do stayed open.
-    let check = run(&mut s, "investigation", json!({"action":"final_check"}));
-    assert_eq!(check["complete"], true, "{check}");
-    let next = check["next"].as_str().unwrap();
-    assert!(
-        next.contains("task_plan apply") && next.contains("final answer"),
-        "{next}"
-    );
-    let id = s.task.todos[0].id.clone();
-    let revision = s.task.plan_revision;
-    run(
-        &mut s,
-        "task_plan",
-        json!({"action":"apply","expected_revision":revision,"operations":[{"op":"complete","id":id,"result":"Entry section written and verified"}]}),
-    );
-    let check = run(&mut s, "investigation", json!({"action":"final_check"}));
-    assert!(
-        check["next"]
-            .as_str()
-            .unwrap()
-            .starts_with("Give the final answer now")
-    );
+    assert!(!s.is_document_work());
 }
 
 #[test]
@@ -4389,11 +2907,7 @@ fn a_directory_path_is_a_targeted_listing_while_verifying() {
     let (dir, mut s) = setup();
     std::fs::create_dir_all(dir.path().join("frontend/src")).unwrap();
     std::fs::write(dir.path().join("frontend/src/App.jsx"), "x\n").unwrap();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","title":"entry"}),
-    );
+    s.document_written = true;
     s.run_guidance["phase"] = json!("verify");
     // The live shape: a directory path refused as broad discovery.
     let listed = run(
@@ -4406,70 +2920,6 @@ fn a_directory_path_is_a_targeted_listing_while_verifying() {
         .unwrap_err()
         .to_string();
     assert!(error.starts_with("verification_reserve:"), "{error}");
-}
-
-#[test]
-fn a_new_investigation_while_verifying_is_told_to_name_its_section() {
-    let (_dir, mut s) = setup();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","title":"entry"}),
-    );
-    s.run_guidance["phase"] = json!("verify");
-    // Live run: the model retried without section after the generic message.
-    let error = tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"sec-docedit","status":"in_progress","title":"문서 편집 화면 사용법"}),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.starts_with("verification_reserve:"), "{error}");
-    assert!(error.contains("nonempty section"), "{error}");
-}
-
-#[test]
-fn an_unchanged_upsert_keeps_a_verified_item_verified() {
-    let (dir, mut s) = setup();
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}\nfn other() {}\n").unwrap();
-    let file = run(&mut s, "file_read", json!({"path":"main.rs"}))["source"]["id"].clone();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Guide\n## Entry\nmain.rs:1\n"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","title":"entry","status":"written","section":"## Entry"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"entry","source_ids":[file],"verification_note":"Compared main.rs:1."}),
-    );
-    // The live shape: the same section and sources re-sent with in_progress.
-    let kept = run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","status":"in_progress","section":"# Guide\n## Entry","source_ids":[file]}),
-    );
-    assert_eq!(kept["unchanged"], true, "{kept}");
-    assert_eq!(s.investigations[0].status, "verified");
-    // New sources are new work: the item needs verification again.
-    let other = run(
-        &mut s,
-        "file_read",
-        json!({"path":"main.rs","start_line":2,"max_lines":1}),
-    )["source"]["id"]
-        .clone();
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"entry","status":"written","source_ids":[file, other]}),
-    );
-    assert_eq!(s.investigations[0].status, "written");
 }
 
 #[test]
@@ -4613,21 +3063,11 @@ fn retyped_old_text_with_a_repeated_opening_shows_the_passage_to_copy() {
 fn inserted_sections_follow_blank_line_heading_spacing() {
     let (_dir, mut s) = setup();
     std::fs::write(s.project.root.join("main.js"), "function run() {}\n").unwrap();
-    let read = run(&mut s, "file_read", json!({"path":"main.js"}));
+    run(&mut s, "file_read", json!({"path":"main.js"}));
     let created = run(
         &mut s,
         "document_edit",
         json!({"action":"create","text":"# Guide\n\n## Overview\n\nStart. main.js:1\n\n## Errors\n\nFailures.\n"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"overview","title":"Overview","section":"## Overview","status":"written"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"overview","source_ids":[read["source"]["id"]],"verification_note":"Compared the overview"}),
     );
     let inserted = run(
         &mut s,
@@ -4643,9 +3083,10 @@ fn inserted_sections_follow_blank_line_heading_spacing() {
         std::fs::read_to_string(&s.project.output).unwrap(),
         "# Guide\n\n## Overview\n\nStart. main.js:1\n\n## Setup\n\nInstall.\n\n## Errors\n\nFailures.\n\n## Flow\n\nSteps.\n"
     );
-    // The blank line added after the verified section is layout only.
-    let listed = run(&mut s, "investigation", json!({"action":"list"}));
-    assert_eq!(listed["items"][0]["status"], "verified");
+    // The blank line added after the cited section is layout only: the
+    // citation stays read.
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert_eq!(audit["structural_ok"], true, "{audit}");
 }
 
 #[test]
@@ -4665,37 +3106,6 @@ fn replace_text_ignores_whitespace_around_old_text() {
         std::fs::read_to_string(&s.project.output).unwrap(),
         "# Guide\n- First part. Loading errors\n  appear at the top.\n"
     );
-}
-
-#[test]
-fn unknown_investigation_id_lists_existing_ids() {
-    let (_dir, mut s) = setup();
-    run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# Guide\n## Chat\nText.\n"}),
-    );
-    run(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"181f4537","title":"Chat screen","section":"## Chat","status":"written"}),
-    );
-    let error = tools::execute(&mut s, "investigation", json!({"action":"verify","id":"chat","source_ids":["S1"],"verification_note":"Compared the chat screen"}))
-        .unwrap_err()
-        .to_string();
-    assert!(error.starts_with("item_not_found:"), "{error}");
-    assert!(
-        error.contains("181f4537") && error.contains("Chat screen"),
-        "{error}"
-    );
-    let mut result = tools::envelope(Err(anyhow::anyhow!(error)));
-    let call = mnemoarc::llm::ToolCall {
-        id: "1".into(),
-        name: "investigation".into(),
-        arguments: "{}".into(),
-    };
-    tools::recovery::attach(&s, &call, &mut result);
-    assert_eq!(result["recovery"]["tools"], json!(["investigation"]));
 }
 
 #[test]
@@ -4871,4 +3281,121 @@ fn structural_inserts_given_old_text_name_the_passage_anchored_action() {
         "document_edit",
         json!({"action":"insert_after_text","old_text":"Install it.","text":" Then run it.","expected_hash":hash}),
     );
+}
+
+#[test]
+fn unread_citations_follow_delivered_lines_and_file_versions_and_merge_ranges() {
+    let (dir, mut s) = source_setup();
+    std::fs::write(
+        dir.path().join("a.rs"),
+        (1..=12).map(|n| format!("line {n}\n")).collect::<String>(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+    // Only a.rs:1-4 is delivered before the save.
+    run(
+        &mut s,
+        "file_read",
+        json!({"path":"a.rs","start_line":1,"max_lines":4}),
+    );
+    let written = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\nA. a.rs:2-3\nB. a.rs:5-6\nC. a.rs:7-8\nD. b.rs:1\n"}),
+    );
+    // The save reports what was cited without being read; adjacent gaps of
+    // one file merge into one range.
+    let check = &written["citation_check"];
+    assert_eq!(check["unread_citation_count"], 2, "{written}");
+    let unread = check["unread_citations"].as_array().unwrap();
+    assert!(unread.iter().any(|range| range["path"] == "a.rs"
+        && range["start_line"] == 5
+        && range["end_line"] == 8));
+    assert!(unread.iter().any(|range| range["path"] == "b.rs"
+        && range["start_line"] == 1
+        && range["end_line"] == 1));
+    // The audit blocks completion on the same ranges.
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert_eq!(audit["structural_ok"], false, "{audit}");
+    assert_eq!(
+        audit["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|issue| issue["kind"] == "unread_citation")
+            .count(),
+        2
+    );
+    // Reading the listed ranges resolves them without a bookkeeping call.
+    run(
+        &mut s,
+        "file_read",
+        json!({"path":"a.rs","start_line":5,"max_lines":4}),
+    );
+    run(&mut s, "file_read", json!({"path":"b.rs"}));
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert_eq!(audit["structural_ok"], true, "{audit}");
+    assert!(tools::unread_citations(&s).unwrap().is_empty());
+    // A changed file invalidates the earlier reads of that file only.
+    std::fs::write(dir.path().join("b.rs"), "fn b() { changed() }\n").unwrap();
+    let unread = tools::unread_citations(&s).unwrap();
+    assert_eq!(unread.len(), 1, "{unread:?}");
+    assert_eq!(unread[0]["path"], "b.rs");
+}
+
+#[test]
+fn a_long_unread_citation_suggests_citing_entry_lines() {
+    let (dir, mut s) = source_setup();
+    std::fs::write(
+        dir.path().join("App.jsx"),
+        (1..=130).map(|n| format!("row {n}\n")).collect::<String>(),
+    )
+    .unwrap();
+    let written = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Screen\nThe screen lives in App.jsx:1-130\n"}),
+    );
+    let unread = &written["citation_check"]["unread_citations"][0];
+    assert_eq!(unread["path"], "App.jsx");
+    assert!(
+        unread["note"].as_str().unwrap().contains("entry lines"),
+        "{written}"
+    );
+}
+
+#[test]
+fn a_self_citation_of_the_output_is_never_owed_a_read() {
+    let (dir, mut s) = source_setup();
+    std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+    run(&mut s, "file_read", json!({"path":"a.rs"}));
+    // The output cites itself beside a real source; only the source counts.
+    let written = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\nSee summary.md:1 and a.rs:1\n"}),
+    );
+    assert_eq!(
+        written["citation_check"]["unread_citation_count"], 0,
+        "{written}"
+    );
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert_eq!(audit["structural_ok"], true, "{audit}");
+}
+
+#[test]
+fn a_blank_section_reads_the_outline() {
+    let (_dir, mut s) = source_setup();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n## Start\nbody\n"}),
+    );
+    // The live shape: every optional field filled with an empty value.
+    let page = run(
+        &mut s,
+        "document_inspect",
+        json!({"path":"","section":"","offset":0,"limit":30,"coverage_offset":0,"expected_hash":"","expected_coverage_revision":""}),
+    );
+    assert_eq!(page["outline"].as_array().map(Vec::len), Some(2), "{page}");
 }

@@ -39,7 +39,6 @@ fn disabled_completion_review_does_not_gate_artifact_completion() {
     let mut s = session(dir.path());
     s.config.completion_review_enabled = false;
     s.task.workflow = "source_document".into();
-    s.task.require_investigation = true;
     s.document_written = true;
 
     assert!(!review::required(&s));
@@ -553,7 +552,7 @@ fn working_checks_cannot_add_requirements_or_weaken_caller_requirements() {
 }
 
 #[test]
-fn verified_manual_gets_a_fresh_review_without_a_document_edit() {
+fn reading_an_unread_citation_gets_a_fresh_review_without_a_document_edit() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("ui.js"), "export function openChat() {}\n").unwrap();
     let mut s = Session::new(
@@ -573,11 +572,10 @@ fn verified_manual_gets_a_fresh_review_without_a_document_edit() {
         &mut s,
         "task_state",
         json!({"action":"update","patch":{
-            "completion":["모든 조사 항목이 written 상태이며 감사로 구조/인용 오류가 없다"]
+            "completion":["모든 화면 절이 저장되고 감사로 구조/인용 오류가 없다"]
         }}),
     )
     .unwrap();
-    let read = tools::execute(&mut s, "file_read", json!({"path":"ui.js"})).unwrap();
     let body = (1..=7)
         .map(|i| format!("# Screen {i}\nOpen the chat screen. ui.js:1\n\n"))
         .collect::<String>();
@@ -587,19 +585,6 @@ fn verified_manual_gets_a_fresh_review_without_a_document_edit() {
         json!({"action":"create","text":body}),
     )
     .unwrap();
-    for i in 1..=7 {
-        tools::execute(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":format!("T{i}"),
-            "title":format!("Screen {i}"),"section":format!("# Screen {i}"),"status":"written"}),
-        )
-        .unwrap();
-        if i > 1 {
-            tools::execute(&mut s, "investigation", json!({"action":"verify","id":format!("T{i}"),
-                "source_ids":[read["source"]["id"]],"verification_note":"Compared the chat function"})).unwrap();
-        }
-    }
     let saved_hash = s.last_document_write.as_ref().unwrap().1.clone();
     // Match the live run: both review options are on, and document review has
     // already approved the unchanged manual before completion is retried.
@@ -618,11 +603,12 @@ fn verified_manual_gets_a_fresh_review_without_a_document_edit() {
         "Only the actual user request is a requirement"
     );
     assert_eq!(p["criteria"][0]["id"], "R0");
-    assert_eq!(p["evidence"][2]["items"][0]["status"], "written");
-    assert_eq!(p["evidence"][2]["items"][1]["status"], "verified");
+    assert_eq!(p["evidence"][2]["kind"], "runtime_citation_coverage", "{p}");
+    assert_eq!(p["evidence"][2]["unread_count"], 1, "{p}");
+    assert_eq!(p["evidence"][2]["unread_citations"][0]["path"], "ui.js");
     let mut response: Value = serde_json::from_str(&verdict(&p, false)).unwrap();
-    response["checks"][0]["reason"] = json!("T1 is still written; six other items are verified");
-    response["checks"][0]["next_action"] = json!("Verify T1 against the delivered source");
+    response["checks"][0]["reason"] = json!("ui.js:1 is cited but was never read");
+    response["checks"][0]["next_action"] = json!("Read ui.js:1");
     assert!(
         review::finish(&mut s, &response.to_string())
             .unwrap()
@@ -630,19 +616,10 @@ fn verified_manual_gets_a_fresh_review_without_a_document_edit() {
     );
     assert!(review::rejected_on_current_result(&s));
 
-    tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"verify","id":"T1",
-        "source_ids":[read["source"]["id"]],"verification_note":"Compared the chat function"}),
-    )
-    .unwrap();
+    // Reading the cited range changes the runtime evidence, not the file.
+    tools::execute(&mut s, "file_read", json!({"path":"ui.js"})).unwrap();
     assert_eq!(s.last_document_write.as_ref().unwrap().1, saved_hash);
-    assert!(
-        s.investigations
-            .iter()
-            .all(|item| item.status == "verified")
-    );
+    assert!(tools::unread_citations(&s).unwrap().is_empty());
     assert_eq!(
         review::current_verdict(&s),
         review::CurrentVerdict::Unreviewed
@@ -655,13 +632,7 @@ fn verified_manual_gets_a_fresh_review_without_a_document_edit() {
         Gate::Review
     );
     let p = payload(&review::request(&mut s).unwrap());
-    assert!(
-        p["evidence"][2]["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|item| item["status"] == "verified")
-    );
+    assert_eq!(p["evidence"][2]["unread_count"], 0, "{p}");
     assert_eq!(
         review::finish(&mut s, &verdict(&p, true))
             .unwrap()
@@ -1097,7 +1068,7 @@ fn runtime_write_log_and_saved_file_precede_newer_observations() {
         request["messages"][0]["content"]
             .as_str()
             .unwrap()
-            .contains("runtime_write_log and runtime_investigations are runtime records")
+            .contains("runtime_write_log and runtime_citation_coverage are runtime records")
     );
     let p = payload(&request);
     let evidence = p["evidence"].as_array().unwrap();
@@ -1107,7 +1078,7 @@ fn runtime_write_log_and_saved_file_precede_newer_observations() {
     assert!(written[0].as_str().unwrap().ends_with("result.txt"));
     // A read is an observation, not a write.
     assert!(!evidence[1].to_string().contains("source.rs"));
-    assert_eq!(evidence[2]["kind"], "runtime_investigations", "{p}");
+    assert_eq!(evidence[2]["kind"], "runtime_citation_coverage", "{p}");
     assert_eq!(evidence[3]["kind"], "current_file", "{p}");
     assert_eq!(evidence[4]["kind"], "tool_observation", "{p}");
 }
@@ -1216,26 +1187,6 @@ fn a_rejection_binds_only_the_result_it_reviewed() {
         json!({"action":"append","expected_hash":created["data"]["hash"],"text":"Example: shown\n"}),
     );
     assert!(!review::rejected_on_current_result(&s));
-}
-
-#[test]
-fn investigation_status_is_supplied_as_runtime_evidence() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = session(dir.path());
-    s.active_tools.insert("investigation".into());
-    tools::execute(
-        &mut s,
-        "investigation",
-        json!({"action":"upsert","id":"flow","title":"Main flow"}),
-    )
-    .unwrap();
-    write(&mut s, "Conclusion: done\nExample: shown\n");
-    review::begin(&mut s, "Saved result.txt").unwrap();
-    let p = payload(&review::request(&mut s).unwrap());
-    let items = &p["evidence"][2];
-    assert_eq!(items["kind"], "runtime_investigations", "{p}");
-    assert_eq!(items["items"][0]["id"], "flow");
-    assert_eq!(items["items"][0]["status"], s.investigations[0].status);
 }
 
 #[test]

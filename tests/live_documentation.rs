@@ -204,13 +204,13 @@ fn live_report_and_log_resolve_archived_batch_failure_details() {
         support::compact_config(),
     );
     let call = mnemoarc::llm::ToolCall {
-        id: "large-verification-batch".into(),
-        name: "investigation".into(),
-        arguments: json!({"action":"verify_batch","items":{}}).to_string(),
+        id: "large-edit-batch".into(),
+        name: "document_edit_batch".into(),
+        arguments: json!({"expected_hash":"h","edits":[]}).to_string(),
     };
     let original = tools::envelope(Ok(json!({"results":(0..6).map(|id| {
         json!({"id":format!("item-{id}"),"result":tools::envelope(Err(anyhow::anyhow!(
-            "source_coverage_missing: item-{id} {}", "missing source range ".repeat(100)
+            "patch_target_must_match_once: item-{id} {}", "missing anchor text ".repeat(100)
         )))})
     }).collect::<Vec<_>>()})));
     let bounded = tools::limit_result(&mut session, &call, original.clone(), 256);
@@ -731,23 +731,6 @@ async fn registered_source_documentation() {
                                 arguments.chars().take(200).collect::<String>()
                             );
                         }
-                        // Successful investigation calls hid a 20-round loop;
-                        // log what each one asked for.
-                        if message["role"] == "tool"
-                            && let Some(id) = message["tool_call_id"].as_str()
-                            && !seen_result_ids.contains(id)
-                            && let Some((name, arguments)) = call_signatures.get(id)
-                            && name == "investigation"
-                            && message["content"]
-                                .as_str()
-                                .and_then(|content| serde_json::from_str::<Value>(content).ok())
-                                .is_some_and(|result| result["status"] == "ok")
-                        {
-                            eprintln!(
-                                "[live] investigation ok args={}",
-                                arguments.chars().take(160).collect::<String>()
-                            );
-                        }
                         if message["role"] == "tool"
                             && let Some(id) = message["tool_call_id"].as_str()
                             && seen_result_ids.insert(id.to_owned())
@@ -805,19 +788,14 @@ async fn registered_source_documentation() {
                     }
                     if s.task_rounds > last_round {
                         last_round = s.task_rounds;
-                        let verified = s
-                            .investigations
-                            .iter()
-                            .filter(|item| item.status == "verified")
-                            .count();
+                        let unread = tools::unread_citations(&s).map_or(0, |unread| unread.len());
                         eprintln!(
-                            "[live] round={} input={} output={} document_written={} investigations={}/{} document_reviews={} finding_validations={} dismissed={} merged={} completion_reviews={} checkpoint={} ladder={}/{} best={} closing={} unrepaired_finals={}",
+                            "[live] round={} input={} output={} document_written={} unread_citations={} document_reviews={} finding_validations={} dismissed={} merged={} completion_reviews={} checkpoint={} ladder={}/{} best={} closing={} unrepaired_finals={}",
                             s.task_rounds,
                             s.input_tokens,
                             s.output_tokens,
                             s.document_written,
-                            verified,
-                            s.investigations.len(),
+                            unread,
                             s.document_review.attempts,
                             s.document_review.validation_rounds,
                             s.document_review.dismissed_findings,
@@ -881,7 +859,7 @@ async fn registered_source_documentation() {
         "elapsed_seconds":start.elapsed().as_secs_f64(),"input_tokens":result.input_tokens,"output_tokens":result.output_tokens,
         "usage_incomplete":result.usage_incomplete,"model_rounds":result.task_rounds,"first_write":first_write,"review_attempts":reviews,
         "tool_calls":calls,"tool_errors":errors,"document_review":result.document_review,"audit":audit,
-        "investigations":result.investigations,"source_unchanged":source_unchanged,"configured_output_unchanged":original_unchanged,
+        "unread_citations":tools::unread_citations(&result).unwrap_or_default(),"source_unchanged":source_unchanged,"configured_output_unchanged":original_unchanged,
         "document_lines":document.lines().count(),"document":document,"review_calls":*review_calls.lock().unwrap()});
     report.as_object_mut().unwrap().extend(
         report_diagnostics(&result, &audit)
@@ -946,12 +924,11 @@ async fn registered_source_documentation() {
             tools::completion_review::CurrentVerdict::Approved
         );
     }
-    let min_investigations = std::env::var("MNEMOARC_DOC_MIN_INVESTIGATIONS")
-        .map(|value| value.parse::<usize>().expect("minimum investigation count"))
-        .unwrap_or(4);
     assert!(
-        result.investigations.len() >= min_investigations
-            && result.investigations.iter().all(|i| i.status == "verified")
+        tools::unread_citations(&result)
+            .unwrap_or_default()
+            .is_empty(),
+        "cited ranges remain unread"
     );
     if let Ok(limit) = std::env::var("MNEMOARC_DOC_MAX_INPUT") {
         assert!(

@@ -70,16 +70,16 @@ impl LlmClient for Script {
         )?;
         if state["checkpoint"].is_object() {
             // Tool definitions can push this complete workflow across the
-            // cleanup watermark. All source facts are already in memory and
-            // the investigation; a final-answer-only mock cannot acknowledge it.
+            // cleanup watermark. All source facts are already in memory; a
+            // final-answer-only mock cannot acknowledge it.
             assert!(
-                *step >= 7,
+                *step >= 5,
                 "Unexpected cleanup before source verification: {step}"
             );
             return Ok(call(
                 "fixture-checkpoint",
                 "checkpoint_complete",
-                json!({"id":state["checkpoint"]["id"],"no_save_reason":"Entry source facts and document verification are already stored in memory and the investigation.","progress":"Source documentation and verification are finished; continue final acceptance."}),
+                json!({"id":state["checkpoint"]["id"],"no_save_reason":"Entry source facts are already stored in memory.","progress":"Source documentation and verification are finished; continue final acceptance."}),
             ));
         }
         let result = match *step {
@@ -127,29 +127,14 @@ impl LlmClient for Script {
                         .1,
                 )
                 .unwrap();
-                let memory_id = ["referenced_memories", "related_memories", "recent_memories"]
+                let _memory_id = ["referenced_memories", "related_memories", "recent_memories"]
                     .into_iter()
                     .flat_map(|bucket| state[bucket].as_array().unwrap())
                     .find(|memory| memory["key"] == "entry")
                     .expect("the saved entry remains available in the memory index")["id"]
                     .clone();
-                let source = source_id(&request);
-                call(
-                    "item",
-                    "investigation",
-                    json!({"action":"upsert","id":"entry-item","title":"Entry point","status":"written","memory_ids":[memory_id],"source_ids":[source],"section":"# Entry"}),
-                )
+                call("audit", "document_audit", json!({}))
             }
-            5 => call(
-                "verify",
-                "investigation",
-                json!({"action":"verify","id":"entry-item","source_ids":[source_id(&request)],"verification_note":"Compared main.rs line 1 with the generated Entry section; both state a single print"}),
-            ),
-            6 => call(
-                "final-check",
-                "investigation",
-                json!({"action":"final_check"}),
-            ),
             _ => Completion {
                 text: "Created docs/source-summary.md. Entry point verified; no unknowns.".into(),
                 ..Default::default()
@@ -158,20 +143,6 @@ impl LlmClient for Script {
         *step += 1;
         Ok(result)
     }
-}
-fn source_id(request: &Value) -> Value {
-    let result: Value = serde_json::from_str(
-        request["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|m| m["tool_call_id"] == "read")
-            .unwrap()["content"]
-            .as_str()
-            .unwrap(),
-    )
-    .unwrap();
-    result["data"]["source"]["id"].clone()
 }
 #[tokio::test]
 async fn source_documentation_full_loop_without_api() {
@@ -182,7 +153,7 @@ async fn source_documentation_full_loop_without_api() {
     )
     .unwrap();
     let mut session = s(dir.path());
-    // investigation is unavailable in the default answer workflow.
+    // document_audit is unavailable in the default answer workflow.
     session.select_workflow("source_document").unwrap();
     session.add_user("Document this project's entry point with source evidence".into());
     let (tx, mut rx) = mpsc::channel(128);
@@ -199,10 +170,9 @@ async fn source_documentation_full_loop_without_api() {
     reader.await.unwrap();
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
     assert_eq!(result.memory.entries.len(), 1);
-    assert_eq!(result.investigations[0].status, "verified");
     assert!(dir.path().join("docs/source-summary.md").exists());
     assert!(!dir.path().join("config.toml").exists());
-    assert_eq!(result.reviews, 1);
+    assert_eq!(result.document_review.attempts, 1);
 }
 struct Wait;
 #[async_trait]
@@ -316,7 +286,7 @@ async fn settings_apply_at_next_request_and_generic_tasks_work() {
     assert_eq!(result.config.output_tokens, 4000);
     assert_eq!(result.task.findings, ["compare documents"]);
     assert!(result.active_tools.contains("file_read"));
-    assert!(!result.active_tools.contains("investigation"));
+    assert!(!result.active_tools.contains("document_audit"));
     assert_eq!(result.status, "complete");
 }
 
@@ -731,9 +701,6 @@ async fn varied_reads_without_deliverable_progress_focus_on_writing_and_resume()
     session.task.deliverables = vec!["docs/source-summary.md".into()];
     session.active_tools.insert("document_edit".into());
     session.add_user("Save a summary of the source".into());
-    // Exercise the shared document-work recovery without the source-evidence
-    // requirement, which the investigation tests cover.
-    session.task.require_investigation = false;
     let (tx, mut rx) = mpsc::channel(128);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result = run_session(
@@ -759,9 +726,6 @@ async fn resumed_document_work_retains_no_progress_count() {
     session.task.deliverables = vec!["docs/source-summary.md".into()];
     session.active_tools.insert("document_edit".into());
     session.add_user("Save a summary of the source".into());
-    // Exercise the shared document-work recovery without the source-evidence
-    // requirement, which the investigation tests cover.
-    session.task.require_investigation = false;
     session.run_guidance =
         json!({"progress_recovery":{"rounds_without_progress":2,"repeated_read":false}});
     let (tx, mut rx) = mpsc::channel(128);
@@ -813,11 +777,20 @@ impl LlmClient for BudgetPhases {
                 ..Default::default()
             }
         } else {
-            let mut c = call(
-                &format!("state-{step}"),
-                "task_state",
-                json!({"action":"read"}),
-            );
+            // The drafting phase saves the document the final answer needs.
+            let mut c = if *step == 1 {
+                call(
+                    "draft",
+                    "document_edit",
+                    json!({"action":"create","text":"# Summary\nDraft.\n"}),
+                )
+            } else {
+                call(
+                    &format!("state-{step}"),
+                    "task_state",
+                    json!({"action":"read"}),
+                )
+            };
             c.usage = Some(mnemoarc::llm::Usage {
                 input: if *step == 0 { 260000 } else { 125000 },
                 output: 0,
@@ -836,7 +809,6 @@ async fn request_budget_transitions_to_writing_then_verification() {
     // The answer workflow presents every phase as answering; budget phases
     // belong to document work.
     session.select_workflow("source_document").unwrap();
-    session.task.require_investigation = false;
     let (tx, mut rx) = mpsc::channel(128);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result = run_session(
@@ -1086,7 +1058,6 @@ async fn summary_reads_share_budget_and_continue_without_history_or_writes() {
         assert_eq!(coverage.ranges[0].0, 0);
         assert!(coverage.ranges[0].1 > 0 && coverage.ranges[0].1 < text.chars().count());
     }
-    assert!(result.investigations.is_empty());
     assert!(result.memory.entries.is_empty());
     assert!(!dir.path().join("docs/source-summary.md").exists());
     for i in 0..4 {
@@ -1342,7 +1313,6 @@ async fn simple_summary_append_completes_without_investigation_retries() {
     let dir = tempfile::tempdir().unwrap();
     let mut session = s(dir.path());
     session.active_tools.insert("document_edit".into());
-    session.active_tools.insert("investigation".into());
     session.add_user("결과 파일에 전체 summary도 추가해줘".into());
     let original = "# Backend\nExisting description.\n";
     let output = dir.path().join("summary.md");
@@ -1366,7 +1336,6 @@ async fn simple_summary_append_completes_without_investigation_retries() {
     drain.await.unwrap();
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
     assert!(result.last_error.is_none());
-    assert!(result.investigations.is_empty());
     assert_eq!(*client.calls.lock().unwrap(), 1);
     assert!(
         std::fs::read_to_string(output)
@@ -1386,8 +1355,6 @@ async fn simple_edit_cannot_complete_if_saved_file_changes_or_disappears() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = s(dir.path());
         session.select_workflow(workflow).unwrap();
-        // Compare document-work closing without the evidence requirement.
-        session.task.require_investigation = false;
         session.active_tools.insert("document_edit".into());
         session.project.output = dir.path().join("summary.md");
         mnemoarc::tools::execute(
@@ -1442,79 +1409,6 @@ async fn simple_edit_cannot_complete_if_saved_file_changes_or_disappears() {
                 })
         );
     }
-}
-
-#[test]
-fn evidence_requirement_is_explicit_and_retained_on_resume() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut session = s(dir.path());
-    session.workflow_mode = "source_document".into();
-    session.add_user("소스 문서를 작성해줘".into());
-    assert!(session.task.require_investigation);
-    let error = mnemoarc::tools::execute(
-        &mut session,
-        "task_state",
-        json!({
-            "action":"update", "patch":{"require_investigation":false}
-        }),
-    )
-    .unwrap_err();
-    assert!(
-        error.to_string().contains("workflow_selected_by_user"),
-        "{error}"
-    );
-    session.add_user("계속 진행".into());
-    assert!(session.task.require_investigation);
-    // Simple edits run in answer, which neither requires nor offers
-    // investigation, so final_check cannot turn them into document work.
-    session.workflow_mode = "answer".into();
-    session.add_user("문서 제목만 바꿔줘".into());
-    assert!(!session.task.require_investigation);
-    assert!(!session.document_written);
-    let error = mnemoarc::tools::execute(
-        &mut session,
-        "investigation",
-        json!({"action":"final_check"}),
-    )
-    .unwrap_err();
-    assert!(error.to_string().starts_with("tool_not_active:"), "{error}");
-    assert!(!session.task.require_investigation);
-}
-
-#[tokio::test]
-async fn existing_unverified_investigation_still_blocks_completion() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut session = s(dir.path());
-    session.active_tools.insert("document_edit".into());
-    session.active_tools.insert("investigation".into());
-    mnemoarc::tools::execute(
-        &mut session,
-        "investigation",
-        json!({
-            "action":"upsert", "id":"pending", "title":"Source analysis"
-        }),
-    )
-    .unwrap();
-    assert!(!session.task.require_investigation);
-    let (tx, mut rx) = mpsc::channel(128);
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let result = run_session(
-        session,
-        Arc::new(PrematureFinal {
-            calls: Mutex::new(0),
-        }),
-        CancellationToken::new(),
-        tx,
-    )
-    .await;
-    drain.await.unwrap();
-    assert_eq!(result.status, "blocked");
-    assert!(
-        result.run_guidance["completion_error"]
-            .as_str()
-            .unwrap()
-            .contains("Unverified investigation")
-    );
 }
 
 struct RecoverUnknownSource {
@@ -1757,7 +1651,6 @@ fn document_checkpoint_session(dir: &std::path::Path) -> Session {
     session.config.source_document_review = false;
     session.add_user("Document this source code with evidence".into());
     session.task.workflow = "source_document".into();
-    session.task.require_investigation = true;
     session.checkpoint = Some(Checkpoint {
         id: "expected-checkpoint-id".into(),
         bundle_ids: vec![],
@@ -2040,4 +1933,96 @@ async fn document_edits_preserve_explicit_hash_and_recover_omitted_hash() {
             assert_eq!(tools[1]["data"]["batch_rebased"], true);
         }
     }
+}
+
+/// Reads seven single lines before saving, then reads one more line for a
+/// later section. Records the guidance seen after the save.
+struct LateSectionEvidence {
+    step: Mutex<usize>,
+    seen: Mutex<Vec<Value>>,
+}
+#[async_trait]
+impl LlmClient for LateSectionEvidence {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let state: Value = serde_json::from_str(
+            request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )?;
+        let mut step = self.step.lock().unwrap();
+        self.seen
+            .lock()
+            .unwrap()
+            .push(state["run_guidance"].clone());
+        let response = match *step {
+            0..=6 => call(
+                &format!("read-{step}"),
+                "file_read",
+                json!({"path":"main.rs","start_line":*step+1,"max_lines":1}),
+            ),
+            7 => call(
+                "write",
+                "document_edit",
+                json!({"action":"create","text":"# Summary\nThe first line. main.rs:1\n"}),
+            ),
+            8 => call(
+                "read-later",
+                "file_read",
+                json!({"path":"main.rs","start_line":10,"max_lines":1}),
+            ),
+            _ => Completion {
+                text: "Saved the summary.".into(),
+                ..Default::default()
+            },
+        };
+        *step += 1;
+        Ok(response)
+    }
+}
+
+#[tokio::test]
+async fn evidence_for_a_later_section_counts_after_the_first_save() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.rs"),
+        (1..=12).map(|n| format!("line {n}\n")).collect::<String>(),
+    )
+    .unwrap();
+    let mut session = s(dir.path());
+    session.config.context_tokens = 96000;
+    session.config.source_document_review = false;
+    session.config.completion_review_enabled = false;
+    session.select_workflow("source_document").unwrap();
+    session.task.deliverables = vec!["docs/source-summary.md".into()];
+    session.add_user("Save a summary of the source".into());
+    let client = Arc::new(LateSectionEvidence {
+        step: Mutex::new(0),
+        seen: Mutex::new(Vec::new()),
+    });
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(session, client.clone(), CancellationToken::new(), tx).await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    let seen = client.seen.lock().unwrap();
+    // Six rounds without a document steer the request toward drafting.
+    assert_eq!(seen[7]["phase"], "draft", "{}", seen[7]);
+    // After the save the nudge is gone: the run is investigating again, and
+    // the later section's new evidence resets the stall count.
+    assert_eq!(seen[8]["phase"], "investigate", "{}", seen[8]);
+    assert_eq!(
+        seen[9]["progress_recovery"]["rounds_since_progress"], 0,
+        "{}",
+        seen[9]
+    );
+    assert_ne!(result.task.phase, "draft");
 }

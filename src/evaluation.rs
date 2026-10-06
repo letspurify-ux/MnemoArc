@@ -47,8 +47,6 @@ pub struct RunReport {
     pub checkpoints: usize,
     pub memory_loads: usize,
     pub history_loads: usize,
-    pub investigation_count: usize,
-    pub verified_count: usize,
     pub topics_found: Vec<String>,
     pub topics_missing: Vec<String>,
     pub factual_errors: Option<usize>,
@@ -111,7 +109,7 @@ pub async fn run(config: Config, suite_path: &Path, output: &Path) -> Result<()>
                     .iter()
                     .cloned()
                     .partition(|topic| text.contains(&topic.to_lowercase()));
-                let report=RunReport{case:case.name.clone(),variant:variant.into(),repetition,model:session.config.model.clone(),source_sha256:fingerprint.clone(),source_unchanged:tools::project_fingerprint(&project)?==fingerprint,status:session.status,output:doc,elapsed_secs:started.elapsed().as_secs_f64(),input_tokens:session.input_tokens,output_tokens:session.output_tokens,cached_tokens:session.cached_tokens,usage_estimated_or_incomplete:session.usage_incomplete,checkpoints:session.checkpoints_completed,memory_loads:session.memory_loads,history_loads:session.history_loads,investigation_count:session.investigations.len(),verified_count:session.investigations.iter().filter(|i|i.status=="verified").count(),topics_found,topics_missing,factual_errors:None,evidence_accuracy:None,reviewer_notes:"Keyword coverage is only a screening metric. Independently review factual errors and source citations; verified_count is the agent's own recorded verification, not a ground-truth score.".into()};
+                let report=RunReport{case:case.name.clone(),variant:variant.into(),repetition,model:session.config.model.clone(),source_sha256:fingerprint.clone(),source_unchanged:tools::project_fingerprint(&project)?==fingerprint,status:session.status,output:doc,elapsed_secs:started.elapsed().as_secs_f64(),input_tokens:session.input_tokens,output_tokens:session.output_tokens,cached_tokens:session.cached_tokens,usage_estimated_or_incomplete:session.usage_incomplete,checkpoints:session.checkpoints_completed,memory_loads:session.memory_loads,history_loads:session.history_loads,topics_found,topics_missing,factual_errors:None,evidence_accuracy:None,reviewer_notes:"Keyword coverage is only a screening metric. Independently review factual errors and source citations; verified_count is the agent's own recorded verification, not a ground-truth score.".into()};
                 std::fs::write(&metrics, serde_json::to_string_pretty(&report)?)?;
                 if report.status == "cancelled" {
                     return Ok(());

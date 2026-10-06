@@ -222,7 +222,7 @@ fn a_missing_config_file_loads_the_live_tested_settings() {
         (600, 3600)
     );
     assert_eq!((config.run_tokens, config.review_limit), (10_000_000, 20));
-    assert!(config.source_document_review && config.completion_review_enabled);
+    assert!(config.source_document_review && !config.completion_review_enabled);
     config.runnable().unwrap();
 }
 

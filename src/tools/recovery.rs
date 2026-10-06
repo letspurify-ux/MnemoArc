@@ -82,8 +82,6 @@ pub fn describe(message: &str) -> Value {
         (Class::PartialFailure, "repair_failed_items_only")
     } else if code == "checkpoint_has_failed_operations" {
         (Class::Prerequisite, "repair_checkpoint_on_next_request")
-    } else if code == "checkpoint_memory_missing" {
-        (Class::Prerequisite, "repair_checkpoint_memory")
     } else if code == "no_checkpoint" {
         (Class::Prerequisite, "inspect_checkpoint_state")
     } else if matches!(
@@ -106,12 +104,7 @@ pub fn describe(message: &str) -> Value {
         (Class::StaleState, "repair_memory_references")
     } else if code == "verification_sources_required" {
         (Class::MissingEvidence, "lookup_observed_evidence")
-    } else if code == "investigation_progress_required" {
-        (Class::Prerequisite, "advance_investigation")
-    } else if code == "investigation_superseded" {
-        (Class::StaleState, "refresh_matching_state")
-    } else if code == "item_must_be_written_before_verification" || code == "review_repair_required"
-    {
+    } else if code == "review_repair_required" {
         (Class::Prerequisite, "complete_prerequisite")
     } else if code == "file_not_found" || code == "document_missing" {
         (Class::MissingPath, "resolve_path")
@@ -157,15 +150,9 @@ pub fn describe(message: &str) -> Value {
         (Class::InvalidInput, "choose_exact_section")
     } else if code == "invalid_citation_range" {
         (Class::InvalidInput, "repair_document_citation")
-    } else if matches!(
-        code,
-        "section_not_found" | "investigation_section_required" | "document_exists"
-    ) {
+    } else if matches!(code, "section_not_found" | "document_exists") {
         (Class::InvalidInput, "inspect_document_outline")
-    } else if matches!(
-        code,
-        "item_not_found" | "duplicate_investigation_title" | "patch_target_must_match_once"
-    ) {
+    } else if code == "patch_target_must_match_once" {
         (Class::InvalidInput, "correct_arguments")
     } else if matches!(
         code,
@@ -180,7 +167,7 @@ pub fn describe(message: &str) -> Value {
             | "ambiguous_file_read_range"
     ) {
         (Class::InvalidInput, "correct_arguments")
-    } else if code == "unknown_source" || code == "source_coverage_missing" {
+    } else if code == "unknown_source" {
         (Class::MissingEvidence, "lookup_observed_evidence")
     } else if code == "unknown_symbol" || code == "invalid_symbol_id" {
         (Class::InvalidInput, "copy_observed_symbol_id")
@@ -345,7 +332,6 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         result["recovery"] = describe(result["error"].as_str().unwrap_or("tool_error"));
     }
     let candidates: &[&str] = match result["recovery"]["action"].as_str().unwrap_or("") {
-        "advance_investigation" => &["investigation", "file_read", "document_edit"],
         "configure_database_in_settings" => &[],
         "select_enabled_database_query" => &["db_query"],
         "correct_arguments" if call.name == "db_query" => &["db_query"],
@@ -367,20 +353,13 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             "source_lookup",
             "file_read",
             "memory_write",
-            "investigation",
             "task_state",
             "history",
         ],
         "repair_checkpoint_on_next_request" => &["history", "checkpoint_complete"],
-        "repair_checkpoint_memory" => &[
-            "memory_write",
-            "task_state",
-            "history",
-            "checkpoint_complete",
-        ],
         "inspect_checkpoint_state" => &["history", "task_state"],
         "lookup_observed_evidence" => &["source_lookup", "history", "file_read"],
-        "complete_prerequisite" => &["document_inspect", "investigation", "document_edit"],
+        "complete_prerequisite" => &["document_inspect", "document_edit"],
         "resolve_path" if matches!(call.name.as_str(), "document_edit" | "document_edit_batch") => {
             &["document_inspect", "document_edit", "document_edit_batch"]
         }
@@ -414,12 +393,8 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             "code_outline",
         ],
         "inspect_outcome_before_retry" if call.name == "db_execute" => &["history", "db_query"],
-        // mark_gap waits for closing; the item still needs source evidence.
         "use_available_tools" if result["recovery"]["code"] == "checkpoint_pending" => {
             &["checkpoint_complete", "memory_write", "task_state"]
-        }
-        "use_available_tools" if result["recovery"]["code"] == "gap_requires_closing" => {
-            &["investigation", "source_lookup", "file_read"]
         }
         "inspect_outcome_before_retry" => &["history", "document_inspect", "file_read"],
         "use_available_tools" if result["recovery"]["code"] == "workflow_write_scope" => {
@@ -456,7 +431,6 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             &["memory_manage", "memory_read", "source_lookup", "history"]
         }
         "correct_arguments" if call.name == "task_plan" => &["task_plan"],
-        "correct_arguments" if call.name == "investigation" => &["investigation"],
         "correct_arguments" if call.name == "file_list" => &["file_list"],
         "correct_arguments" if call.name == "source_search" => &["source_search"],
         "correct_arguments" if call.name == "symbol_search" => &["symbol_search"],
@@ -478,7 +452,6 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
                 "memory_find",
                 "memory_read",
                 "memory_manage",
-                "investigation",
                 "task_state",
                 "source_lookup",
                 "history",
@@ -497,9 +470,6 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         }
         "refresh_matching_state" if call.name == "document_audit" => {
             &["document_audit", "document_inspect"]
-        }
-        "refresh_matching_state" if call.name == "investigation" => {
-            &["investigation", "source_lookup", "document_inspect"]
         }
         "refresh_matching_state" if call.name == "source_search" => &["source_search", "file_read"],
         "refresh_matching_state" if call.name == "file_list" => &["file_list"],
@@ -527,9 +497,9 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         {
             &["task_state", "memory_write"]
         }
-        // References live in task_state memory_ids and investigation items.
+        // References live in task_state memory_ids.
         "reduce_request_or_cleanup" if result["recovery"]["code"] == "memory_referenced" => {
-            &["task_state", "investigation", "memory_manage"]
+            &["task_state", "memory_manage"]
         }
         "reduce_request_or_cleanup" if call.name == "source_search" => &["source_search"],
         "reduce_request_or_cleanup" if call.name == "db_query" => &["db_query"],

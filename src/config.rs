@@ -183,7 +183,7 @@ impl Default for Config {
             document_repair_limit: 8,
             retired_source_answer_review: None,
             source_document_review: true,
-            completion_review_enabled: true,
+            completion_review_enabled: false,
             projects: vec![],
         }
     }
@@ -209,6 +209,7 @@ impl Config {
             run_timeout_secs: 1800,
             run_tokens: 500000,
             review_limit: 3,
+            completion_review_enabled: true,
             ..Self::default()
         }
     }

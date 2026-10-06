@@ -104,7 +104,7 @@ fn request(s: &Session) -> Value {
         "original_request":s.original_request,"current_goal":s.latest_request,"user_changes":s.task_amendments,"task_status":question.prior_status,
         "task_error":question.prior_error,"task":s.task,
         "document_review":s.document_review,"completion_review":s.completion_review,
-        "investigations":s.investigations,"completion_gaps":s.completion_gaps,
+        "completion_gaps":s.completion_gaps,
         "checkpoint":s.checkpoint,"run_guidance":s.run_guidance,
         "recent_runs":s.run_history.iter().rev().take(3).collect::<Vec<_>>(),
         "recent_tool_errors":recent_errors,"recent_questions":recent_questions,
@@ -112,9 +112,9 @@ fn request(s: &Session) -> Value {
         "context_note":"Lists are limited to 20 items and long strings are shortened. This is a saved snapshot; no files were reread. recent_tool_errors are historical failures, not necessarily current blockers. Their call metadata identifies the originating tool when its recorded call is available."
     });
     if s.task.workflow == "answer" {
-        // The answer workflow runs no reviews or investigations.
+        // The answer workflow runs no reviews.
         let fields = snapshot.as_object_mut().unwrap();
-        for key in ["document_review", "completion_review", "investigations"] {
+        for key in ["document_review", "completion_review"] {
             fields.remove(key);
         }
     }
@@ -322,9 +322,7 @@ async fn answer(
     let mut work = s.clone();
     work.read_only_turn = true;
     work.checkpoint = None;
-    work.task.require_investigation = false;
     work.task.workflow = "answer".into();
-    work.investigations.clear();
     work.document_review = Default::default();
     work.completion_review = Default::default();
     work.progress_recovery = Default::default();

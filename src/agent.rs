@@ -39,30 +39,28 @@ fn closing_stall_limit(config: &Config) -> usize {
     config.stall_round_limit.saturating_mul(3)
 }
 
-/// One monotonic measure of document progress: written/verified items, the
-/// best document shape, reduced review findings, met acceptance checks,
-/// distinct source evidence gathered while investigating, and fresh
-/// verifications (re-verifying a section after a repair edit counts again). Plan bookkeeping is
-/// excluded; completing and reopening the same to-do is not progress.
+/// One monotonic measure of document progress: the best document shape,
+/// reduced review findings, met acceptance checks, and distinct source
+/// evidence gathered while investigating or while cited ranges remain
+/// unread. Plan bookkeeping is excluded; completing and reopening the same
+/// to-do is not progress.
 fn progress_score(s: &Session) -> usize {
-    let items: usize = s
-        .investigations
-        .iter()
-        .map(|item| match item.status.as_str() {
-            "verified" | "gap" => 3,
-            "written" => 1,
-            _ => 0,
-        })
-        .sum();
-    items
-        + s.progress_recovery.best_document_section_count * 2
+    s.progress_recovery.best_document_section_count * 2
         + s.progress_recovery.best_document_content_lines
         + s.document_review
             .best_issue_count
             .map_or(0, |best| 12usize.saturating_sub(best))
         + s.completion_review.best_met * 2
         + s.progress_recovery.evidence_credit
-        + s.progress_recovery.verification_events * 2
+}
+
+/// Cited ranges of the saved document never delivered as complete lines of
+/// the current file version; zero before the document exists.
+fn unread_citation_count(s: &Session) -> usize {
+    if !s.is_document_work() || !s.document_written {
+        return 0;
+    }
+    tools::unread_citations(s).map_or(0, |unread| unread.len())
 }
 
 fn closing_instruction(s: &Session) -> String {
@@ -70,28 +68,12 @@ fn closing_instruction(s: &Session) -> String {
     let remaining = CLOSING_ROUND_LIMIT.saturating_sub(closing.map_or(0, |c| c.rounds));
     if !s.document_written {
         return format!(
-            "Closing mode: no document is saved yet and source reading is withheld. Create the requested document NOW with document_edit action=create (or document_edit_batch) from the evidence already gathered. Write every requested section; where a fact was not confirmed from delivered sources, say so in the text instead of guessing. Then register or update investigation items with their sections, verify what the delivered evidence supports, mark the rest with investigation action=mark_gap, and give a concise final answer. At most {remaining} requests remain; without a saved document the run stops unfinished."
-        );
-    }
-    if let Some(missing) = tools::unregistered_document(s) {
-        return format!(
-            "Closing mode: the document is saved but no investigation item is registered, so a final answer is refused and no review can run. NOW register one item per section ({} in total) with investigation upsert (title, section copied exactly from this list, status=written): {}. Verify the ones whose evidence was already delivered with ONE verify_batch, report each item that cannot be verified with investigation action=mark_gap and a specific reason, then give a concise final answer. Discovery tools are withheld. Example first call: {}. At most {remaining} requests remain; afterwards the runtime finishes the document and lists every unresolved item.",
-            missing["section_count"], missing["sections"], missing["next"]
+            "Closing mode: no document is saved yet and source reading is withheld. Create the requested document NOW with document_edit action=create (or document_edit_batch) from the evidence already gathered. Write every requested section; where a fact was not confirmed from delivered sources, say so in the text instead of guessing. Then give a concise final answer. At most {remaining} requests remain; without a saved document the run stops unfinished."
         );
     }
     format!(
-        "Closing mode: finish the requested document now from the evidence already gathered; discovery tools are withheld. 1) Write any missing requested section from gathered evidence, stating in the text when a fact is unconfirmed. 2) Verify written items whose evidence was already delivered (verify_batch). 3) For an item that cannot be verified with available evidence, call investigation action=mark_gap with its id and a specific reason, and qualify the related claim in its section. 4) Fix review findings confirmed for the current document or completion checks with targeted edits when possible; otherwise leave them, the runtime reports them as unresolved. 5) Complete or remove remaining to-dos with actual results, then give a concise final answer. At most {remaining} requests remain; afterwards the runtime finishes the document and lists every unresolved item. Do not invent evidence or describe gaps as verified."
+        "Closing mode: finish the requested document now from the evidence already gathered; discovery tools are withheld. 1) Write any missing requested section from gathered evidence, stating in the text when a fact is unconfirmed. 2) For a cited range reported as unread (citation_check or document_audit unread_citation), file_read that range or narrow the citation to the lines already read; qualify a claim that cannot be supported in its section instead of describing it as verified. 3) Fix review findings confirmed for the current document or completion checks with targeted edits when possible; otherwise leave them, the runtime reports them as unresolved. 4) Complete or remove remaining to-dos with actual results, then give a concise final answer. At most {remaining} requests remain; afterwards the runtime finishes the document and lists every unresolved item. Do not invent evidence."
     )
-}
-
-/// Settle every unfinished item as a reported gap. Used only when the run
-/// finishes with unresolved items; the note records why.
-fn settle_remaining(s: &mut Session, cause: &str) {
-    let _ = tools::revalidate(s);
-    for item in s.investigations.iter_mut().filter(|i| !i.is_settled()) {
-        item.note = format!("{cause}: {} 상태에서 검증을 마치지 못했습니다", item.status);
-        item.status = "gap".into();
-    }
 }
 
 /// Everything a complete_with_gaps result must disclose, derived from state.
@@ -100,25 +82,31 @@ fn collect_gaps(s: &mut Session, extra: &[String]) -> Vec<String> {
     if let Err(error) = tools::verify_document_write(s) {
         gaps.push(format!("문서 저장 확인 — {error}"));
     }
-    if s.task.require_investigation && s.investigations.is_empty() {
-        gaps.push("근거 조사 — 조사 항목이 등록되지 않았습니다.".into());
-    }
-    for item in s.investigations.iter().filter(|i| i.status == "gap") {
-        gaps.push(format!("근거 미확인 — {}: {}", item.title, item.note));
-    }
     for item in s.task.todos.iter().filter(|item| !item.done).take(10) {
         gaps.push(format!("미완료 할 일 — {}", item.text));
     }
-    if !s.investigations.is_empty() {
-        if let Ok(audit) = tools::audit_document(s)
-            && audit["structural_ok"] != true
-        {
+    if s.is_document_work() && s.document_written {
+        let unread = tools::unread_citations(s).unwrap_or_default();
+        for range in unread.iter().take(12) {
             gaps.push(format!(
-                "근거 점검 — 구조 문제 {}건이 남아 있습니다 (document_audit).",
-                audit["issue_count"]
+                "근거 미확인 — {}:{}-{} 범위를 읽지 않고 인용했습니다.",
+                range["path"].as_str().unwrap_or_default(),
+                range["start_line"],
+                range["end_line"]
             ));
         }
-        if s.document_written && s.config.source_document_review {
+        if let Ok(audit) = tools::audit_document(s)
+            && audit["structural_ok"] != true
+            && let Some(other) = audit["issue_count"]
+                .as_u64()
+                .map(|count| (count as usize).saturating_sub(unread.len()))
+            && other > 0
+        {
+            gaps.push(format!(
+                "근거 점검 — 구조 문제 {other}건이 남아 있습니다 (document_audit)."
+            ));
+        }
+        if s.document_written && s.config.source_document_review && tools::citation_count(s) > 0 {
             let ranges = tools::document_review::unavailable_ranges(s);
             match tools::document_review::current_verdict(s) {
                 tools::document_review::CurrentVerdict::Approved => {}
@@ -186,16 +174,16 @@ fn collect_gaps(s: &mut Session, extra: &[String]) -> Vec<String> {
     gaps
 }
 
-// Items are registered one section at a time, so "every registered item is
-// settled" also holds between sections; a live run read the old wording as
-// permission to remove the to-dos for unwritten sections.
-const PLAN_CLOSEOUT_INSTRUCTION: &str = "The document is written and every REGISTERED investigation item is settled, but the to-dos in plan_closeout are open and the final answer is refused while any is open. Settled items cover only work registered so far: a to-do whose work is not done yet, such as a requested section still missing from the document, is NOT obsolete. Do that work first: register its investigation item with its section, read the evidence, write and verify it. When the listed work is done, close them in ONE task_plan apply using plan_closeout.expected_revision: one operation per item in the listed order, complete with the actual observed result, or remove with a reason only when the item is genuinely obsolete, never merely unstarted. complete must follow list order, because only the current item can complete. Then give the final answer.";
+// A document whose citations are all read can still lack requested sections;
+// a live run read an older wording as permission to remove the to-dos for
+// unwritten sections.
+const PLAN_CLOSEOUT_INSTRUCTION: &str = "The document is written and its cited ranges are read, but the to-dos in plan_closeout are open and the final answer is refused while any is open. A to-do whose work is not done yet, such as a requested section still missing from the document, is NOT obsolete. Do that work first: read the evidence and write the section. When the listed work is done, close them in ONE task_plan apply using plan_closeout.expected_revision: one operation per item in the listed order, complete with the actual observed result, or remove with a reason only when the item is genuinely obsolete, never merely unstarted. complete must follow list order, because only the current item can complete. Then give the final answer.";
 
 const REVIEW_REPAIR_RESUME_INSTRUCTION: &str = "A checkpoint cleared the context during review repair, and the document is still UNCHANGED: every finding in review_repair.unrepaired_findings is still open. A final answer now is rejected again without a new review. Edit the document for these findings first.";
 
-const READY_FOR_FINAL_INSTRUCTION: &str = "Ready to finish: every investigation item is verified or reported, no to-do remains and no review finding is open for this document version. Give the concise final answer now (output path, verification scope, remaining limitations). The runtime then runs the document review and completion checks and returns any finding as a repair. Do not inspect, audit or re-verify again unless you change the document.";
+const READY_FOR_FINAL_INSTRUCTION: &str = "Ready to finish, provided every requested section is written: the document is saved, every cited range was read, no to-do remains and no review finding is open for this document version. If a requested section is still missing, write it first. Give the concise final answer now (output path, verification scope, remaining limitations). The runtime then runs the document review and completion checks and returns any finding as a repair. Do not inspect or audit again unless you change the document.";
 
-const REVIEW_REPAIR_INSTRUCTION: &str = "Review repair: fix ALL findings in document_review.issues before the next final answer. Read any source range a finding needs, then apply the corrections with as few document edits as possible: group non-overlapping corrections in one document_edit_batch whose single expected_hash is the top-level argument (never inside edits). Operations apply in order, so never target text that an earlier operation in the same batch replaces; when corrections touch the same passage, merge them into one operation or use a separate request. Then run ONE verify_batch for the returned verification_required_ids and give the final answer to start the re-review. Do not alternate single edits with document_audit or document_inspect. Fix findings in their original sections; do not add a review-notes section.";
+const REVIEW_REPAIR_INSTRUCTION: &str = "Review repair: fix ALL findings in document_review.issues before the next final answer. Read any source range a finding needs, then apply the corrections with as few document edits as possible: group non-overlapping corrections in one document_edit_batch whose single expected_hash is the top-level argument (never inside edits). Operations apply in order, so never target text that an earlier operation in the same batch replaces; when corrections touch the same passage, merge them into one operation or use a separate request. Then give the final answer to start the re-review. Do not alternate single edits with document_audit or document_inspect. Fix findings in their original sections; do not add a review-notes section.";
 
 /// A completed document review rejected the result and no re-review is
 /// running: the next work is repairing its findings.
@@ -243,17 +231,10 @@ fn ready_for_final(s: &mut Session) -> bool {
 fn ready_except_plan(s: &mut Session) -> bool {
     if let Some(guidance) = s.run_guidance.as_object_mut() {
         guidance.remove("document_readiness");
-        guidance.remove("unregistered_document");
-    }
-    if let Some(missing) = tools::unregistered_document(s) {
-        s.run_guidance["unregistered_document"] = missing;
-        return false;
     }
     let bookkeeping_ready = s.checkpoint.is_none()
         && s.is_document_work()
         && s.document_written
-        && !s.investigations.is_empty()
-        && s.investigations.iter().all(|item| item.is_settled())
         && !s.document_review.pending
         && !s.completion_review.pending
         && !tools::document_review::rejected_on_current_result(s)
@@ -262,8 +243,8 @@ fn ready_except_plan(s: &mut Session) -> bool {
     if !bookkeeping_ready {
         return false;
     }
-    // Settled registered items do not cover every cited section. Use the
-    // same audit as final acceptance, including its freshness revalidation.
+    // Every citation must be well-formed and read. Use the same audit as
+    // final acceptance, including its freshness revalidation.
     match tools::audit_document(s) {
         Ok(audit) if audit["structural_ok"] == true => true,
         Ok(mut audit) => {
@@ -325,7 +306,7 @@ fn suppress_unchanged_repeat(
     }
     json!({"status":"ok","data":{"unchanged":true,"suppressed":true,
         "hash":result["data"]["hash"],
-        "guidance":"Identical result is already in active context: the document and its evidence have not changed since. Use that result and act on it: edit, verify, or give the final answer. Do not repeat this check until something changes."}})
+        "guidance":"Identical result is already in active context: the document and its evidence have not changed since. Use that result and act on it: edit, read an unread cited range, or give the final answer. Do not repeat this check until something changes."}})
 }
 
 /// Abandon a pending review whose responses keep failing validation, for
@@ -397,7 +378,7 @@ fn note_document_review_verdict(s: &mut Session) {
     if s.document_review.stalled_attempts >= s.config.review_limit {
         recover_document(
             s,
-            "Document review still has unresolved findings. Correct the first finding in its original section, then verify that section; do not request another unchanged review.",
+            "Document review still has unresolved findings. Correct the first finding in its original section; do not request another unchanged review.",
         );
     }
 }
@@ -500,7 +481,6 @@ fn force_finish(s: &mut Session, cause: &str) -> Option<String> {
     }
     s.completion_review.pending = false;
     s.continuation = None;
-    settle_remaining(s, cause);
     s.completion_gaps = collect_gaps(s, &[]);
     s.status = if s.completion_gaps.is_empty() {
         "complete"
@@ -1235,6 +1215,11 @@ pub async fn run_session_controlled(
     let mut length_recoveries = 0usize;
     let mut empty_completions = 0usize;
     let mut review_response_failures = 0usize;
+    // The final answer that started the pending document review, with the
+    // output hash it was given for. An approval of that same document resumes
+    // it instead of asking the model to answer again: the repeated request
+    // cost a full-context round per approval (8% of a live run's input).
+    let mut held_final: Option<(String, Option<String>)> = None;
     // Consecutive provider outages and the requests they consumed.
     let mut provider_outages = 0usize;
     let mut provider_requests = 0usize;
@@ -1249,11 +1234,6 @@ pub async fn run_session_controlled(
         || s.run_guidance["progress_recovery"]["repeated_read"]
             .as_bool()
             .unwrap_or(false);
-    let mut verified_count = s
-        .investigations
-        .iter()
-        .filter(|i| i.status == "verified")
-        .count();
     if let Err(e) = s.config.runnable() {
         failure = Some(e.to_string());
     }
@@ -1358,20 +1338,23 @@ pub async fn run_session_controlled(
         // Chat explanations get a bounded investigation hint, not a forced finish:
         // missing evidence may still be read, while document workflows retain verification.
         if s.task_rounds >= 6
-            && !s.task.require_investigation
             && s.task.workflow != "source_document"
             && s.task.current_todo().is_none()
             && s.task.deliverables.is_empty()
-            && s.investigations.is_empty()
             && !s.document_written
         {
             phase = "answer".into();
         }
-        if s.task.require_investigation
+        // Six rounds without a saved document steer this request toward
+        // drafting. The nudge follows from state on every request and is not
+        // persisted: a persisted draft outlived the first save, so reading for
+        // later sections never counted as progress (a live run reached 15/24).
+        let undrafted_phase = phase.clone();
+        let drafting_nudge = s.task.workflow == "source_document"
             && !s.document_written
             && s.task_rounds >= 6
-            && phase != "verify"
-        {
+            && phase != "verify";
+        if drafting_nudge {
             phase = "draft".into();
         }
         let completion_rejected = tools::completion_review::rejected_on_current_result(&s);
@@ -1394,6 +1377,7 @@ pub async fn run_session_controlled(
         // One progress ladder for document work: focus (1x), narrowed tools
         // (2x), then closing mode (3x) or the closing budget reserve. Review
         // pages only count when their response had to be retried.
+        let unread_count = unread_citation_count(&s);
         let review_request =
             s.checkpoint.is_none() && (s.completion_review.pending || s.document_review.pending);
         let counts_as_round = std::mem::replace(&mut ladder_request_completed, true)
@@ -1403,14 +1387,18 @@ pub async fn run_session_controlled(
         let mut closing_round_counted = false;
         if s.checkpoint.is_none() {
             // Reading new sources is progress until the document exists, even
-            // after the budget or a required investigation switches the
+            // after the budget or the document workflow switches the
             // guidance to drafting; afterwards only result improvements count,
             // except while review findings are open: repairing them needs new
             // evidence, and a live run stalled out reading exactly that.
             let review_repair_open = (s.config.source_document_review
                 && tools::document_review::rejected_on_current_result(&s))
                 || completion_rejected;
-            if phase == "investigate" || !s.document_written || review_repair_open {
+            if phase == "investigate"
+                || !s.document_written
+                || review_repair_open
+                || unread_count > 0
+            {
                 s.progress_recovery.evidence_credit =
                     s.progress_recovery.evidence_credit.max(s.sources.len());
             }
@@ -1475,7 +1463,11 @@ pub async fn run_session_controlled(
         // Progress recovery steers only this request. Persisting its verify
         // would ratchet the task into verification for good: a live run was
         // left unable to register its next section after one early stall.
-        let persisted_phase = phase.clone();
+        let persisted_phase = if drafting_nudge && phase == "draft" {
+            undrafted_phase
+        } else {
+            phase.clone()
+        };
         let closing_active = s.progress_recovery.closing.is_some();
         if closing_active {
             phase = "verify".into();
@@ -1504,7 +1496,7 @@ pub async fn run_session_controlled(
                 || artifact_focus);
         if progress_recovery {
             phase = if document_work {
-                if phase == "verify" || s.document_written || !s.investigations.is_empty() {
+                if phase == "verify" || s.document_written {
                     "verify"
                 } else {
                     "draft"
@@ -1535,10 +1527,10 @@ pub async fn run_session_controlled(
         } else {
             DOCUMENT_FOCUSED_INSTRUCTION
         };
-        const DOCUMENT_FOCUSED_INSTRUCTION: &str = "Focused recovery: choose the first document_review issue, unmet completion check or current to-do and perform one concrete action that changes the requested result or verifies specific missing evidence. Read recovery_reason and the last tool's recovery contract; correct the cause or choose a different action before retrying. A task_plan applied=false or unchanged=true result did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, merely rewrite the plan, or save another summary. After a real edit, advance its to-do or verify the resulting section. If the original result already exists, verify it with the relevant tool, then complete only the actual remaining work. Document retry counts are recovery signals, not permission to stop or weaken requirements: continue to final verification within the remaining tokens and time.";
+        const DOCUMENT_FOCUSED_INSTRUCTION: &str = "Focused recovery: choose the first document_review issue, unmet completion check or current to-do and perform one concrete action that changes the requested result or verifies specific missing evidence. Read recovery_reason and the last tool's recovery contract; correct the cause or choose a different action before retrying. A task_plan applied=false or unchanged=true result did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, merely rewrite the plan, or save another summary. After a real edit, advance its to-do or read any cited range it left unread. If the original result already exists, check it once with document_audit, then complete only the actual remaining work. Document retry counts are recovery signals, not permission to stop or weaken requirements: continue to final verification within the remaining tokens and time.";
         const ANSWER_INVESTIGATE_INSTRUCTION: &str = "For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. For a requested document edit, inspect the target section and make a targeted edit. Answer once evidence is sufficient.";
         const ANSWER_FOCUSED_INSTRUCTION: &str = "Focused recovery: choose the current to-do, or the question itself, and perform one concrete action that changes the requested result. Read recovery_reason and the last tool's recovery contract; correct the cause or choose a different action before retrying. A task_plan applied=false or unchanged=true result did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, merely rewrite the plan, or save another summary. If the requested result already exists, complete only the actual remaining work, then answer.";
-        s.run_guidance = json!({"task_rounds":s.task_rounds,"run_rounds":s.run_rounds(),"finalization_attempts":finalization_attempts,"phase":phase,"remaining_tokens":remaining,"remaining_seconds":seconds_remaining,
+        s.run_guidance = json!({"task_rounds":s.task_rounds,"run_rounds":s.run_rounds(),"finalization_attempts":finalization_attempts,"phase":phase,"remaining_tokens":remaining,"remaining_seconds":seconds_remaining,"unread_citation_count":unread_count,
             "recovery_reason":s.progress_recovery.recovery_reason,"action_required":s.progress_recovery.action_required,
             "progress_recovery":{"active":progress_recovery,"focused":focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus,"rounds_without_progress":rounds_without_progress,"rounds_without_substantive_progress":s.progress_recovery.rounds_without_substantive_progress,"repeated_outcome_rounds":s.progress_recovery.repeated_outcome_rounds,"artifact_edits_without_milestone":s.progress_recovery.artifact_edits_without_milestone,"repeated_read":repeated_read_detected},
             "current_todo":s.task.current_todo(),
@@ -1550,9 +1542,8 @@ pub async fn run_session_controlled(
             "document_repair_limit":s.config.document_repair_limit,
             "document_repair_requests_used":s.document_review.repair_requests,
             "document_repair_requests_remaining":s.config.document_repair_limit.saturating_sub(s.document_review.repair_requests),
-            "pending_count":s.investigations.iter().filter(|i|!i.is_settled()).count(),
             "completion_error":if finalization_attempts > 0 || s.last_error.as_deref().is_some_and(|error| error.starts_with("task_plan_pending:") || error.starts_with("completion_review")) { s.last_error.as_deref() } else { None },
-            "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: repeated investigation has not changed the document or verified an item. Use the evidence already gathered to make one small, safe document_edit now, or verify an existing written item. Inspect the output hash if needed. Read only a specific missing source range that directly blocks that action. Do not gather more general evidence or save another memory first. If a claim cannot be supported, mark that gap in the relevant section and continue with supported work; do not invent evidence. A checkpoint remains the only exception for memory maintenance." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, batch targeted reads for missing evidence, then repair known issues in their original locations with targeted section or text edits when safe. Review findings are edit instructions, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Run verify_batch once after all edits, not after every small correction. Only requests containing document_edit or document_edit_batch advance the review interval (one per request, including failed edits); reads and verification do not. The runtime reviews after an executed edit batch reaches the interval, preserving all sibling calls. Unchanged rejected documents reuse their findings. This interval is not a total edit allowance: keep correcting the original requirements within the remaining run tokens and time. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, save each investigated section in a separate edit as soon as its evidence is ready. Check the current outline; use insert_before/insert_after for siblings and insert_first_child/insert_last_child for nested sections when that preserves the document flow. Copy section_path when headings repeat; preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>if answer_workflow { ANSWER_INVESTIGATE_INSTRUCTION } else { "For source documentation, investigate one section, save it, then move to the next. Create only a short opening with the first ready section; inspect the outline before each later addition, copy section_path when headings repeat, and use sibling or child insertion to place it within the hierarchy. For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. Answer once evidence is sufficient; no source audit or document write is required." }} }});
+            "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: repeated investigation has not changed the document or resolved an unread citation. Use the evidence already gathered to make one small, safe document_edit now, or file_read one cited range reported as unread. Inspect the output hash if needed. Read only a specific missing source range that directly blocks that action. Do not gather more general evidence or save another memory first. If a claim cannot be supported, mark that gap in the relevant section and continue with supported work; do not invent evidence. A checkpoint remains the only exception for memory maintenance." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, batch targeted reads for missing evidence, then repair known issues in their original locations with targeted section or text edits when safe. Review findings are edit instructions, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Only requests containing document_edit or document_edit_batch advance the review interval (one per request, including failed edits); reads and verification do not. The runtime reviews after an executed edit batch reaches the interval, preserving all sibling calls. Unchanged rejected documents reuse their findings. This interval is not a total edit allowance: keep correcting the original requirements within the remaining run tokens and time. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, save each investigated section in a separate edit as soon as its evidence is ready. Check the current outline; use insert_before/insert_after for siblings and insert_first_child/insert_last_child for nested sections when that preserves the document flow. Copy section_path when headings repeat; preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>if answer_workflow { ANSWER_INVESTIGATE_INSTRUCTION } else { "For source documentation, investigate one section, save it, then move to the next. Create only a short opening with the first ready section; inspect the outline before each later addition, copy section_path when headings repeat, and use sibling or child insertion to place it within the hierarchy. For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. Answer once evidence is sufficient; no source audit or document write is required." }} }});
         s.run_guidance["progress_recovery"]["rounds_since_progress"] = json!(stall_rounds);
         s.run_guidance["progress_recovery"]["closing_after"] =
             json!(closing_stall_limit(&s.config));
@@ -1595,20 +1586,10 @@ pub async fn run_session_controlled(
             s.run_guidance["plan_closeout"] = plan_closeout(&s);
             s.run_guidance["instruction"] = json!(PLAN_CLOSEOUT_INSTRUCTION);
         } else if s.progress_recovery.closing.is_none()
-            && s.run_guidance["unregistered_document"].is_object()
-        {
-            s.run_guidance["instruction"] = json!(format!(
-                "{} Example first call: {}",
-                s.run_guidance["unregistered_document"]["guidance"]
-                    .as_str()
-                    .unwrap_or_default(),
-                s.run_guidance["unregistered_document"]["next"]
-            ));
-        } else if s.progress_recovery.closing.is_none()
             && s.run_guidance["document_readiness"]["structural_ok"] == false
         {
             s.run_guidance["instruction"] = json!(
-                "The document is not ready for final acceptance. Resolve document_readiness.issues using their section paths and next actions: register uncovered cited sections and verify them against delivered sources, or repair the reported format/citation problem. Do not submit another final answer before those issues are resolved. For additional issues, use document_audit with offset=next_offset and expected_revision=revision from this audit."
+                "The document is not ready for final acceptance. Resolve document_readiness.issues using their next actions: file_read each unread_citation range (or narrow that citation to the lines already read), or repair the reported format/citation problem. Do not submit another final answer before those issues are resolved. For additional issues, use document_audit with offset=next_offset and expected_revision=revision from this audit."
             );
         } else if s.progress_recovery.closing.is_none() && review_repair_pending(&s) {
             s.run_guidance["review_repair"] = json!({"findings":s.document_review.issues.len()});
@@ -1641,18 +1622,6 @@ pub async fn run_session_controlled(
             } else {
                 closing_instruction(&s)
             });
-        } else if s.document_written
-            && stall_rounds >= s.config.stall_round_limit
-            && s.investigations.iter().any(|item| !item.is_settled())
-        {
-            let steps = tools::investigation_next_steps(&s);
-            if let Some(first) = steps.first() {
-                s.run_guidance["pending_investigation_next_steps"] = json!(steps);
-                s.run_guidance["instruction"] = json!(format!(
-                    "The document is written, but investigation items are pending. Advance the first pending item now using this concrete next call: {}. Replace the verification_note placeholder with your actual source/document comparison. Do not call investigation list, document_inspect or document_audit again before this action unless its cited source range is missing. Then advance the other pending items and review the document.",
-                    first["next"]
-                ));
-            }
         }
         let definitions = ToolRegistry::definitions(&s);
         let mut request = match ContextManager::request(&s, definitions.clone()) {
@@ -1717,6 +1686,11 @@ pub async fn run_session_controlled(
         let reviewing_completion = s.completion_review.pending && s.checkpoint.is_none();
         let reviewing_document =
             !reviewing_completion && s.document_review.pending && s.checkpoint.is_none();
+        // Any other request means the held answer no longer ends the run.
+        if !reviewing_document {
+            held_final = None;
+        }
+        let mut replaying_final = false;
         if reviewing_completion {
             request = match tools::completion_review::request(&mut s) {
                 Ok(request) => request,
@@ -1969,10 +1943,14 @@ pub async fn run_session_controlled(
                         && tokio::time::Instant::now() + wait < deadline
                     {
                         provider_outages += 1;
-                        // A request that never answered is not a checkpoint attempt.
+                        // A request that never answered is not a checkpoint
+                        // attempt, a task round or a progress-ladder round;
+                        // the resent request takes its place.
                         if let Some(cp) = &mut s.checkpoint {
                             cp.attempts = cp.attempts.saturating_sub(1);
                         }
+                        s.task_rounds = s.task_rounds.saturating_sub(1);
+                        ladder_request_completed = false;
                         emit(
                             &events,
                             AgentEvent::Notice {
@@ -2199,7 +2177,21 @@ pub async fn run_session_controlled(
             review_response_failures = 0;
             note_document_review_verdict(&mut s);
             snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
-            continue;
+            let held = held_final
+                .take()
+                .filter(|_| !s.document_review.pending && tools::document_review::approved(&s))
+                .filter(|(_, hash)| *hash == output_hash(&s));
+            let Some((text, _)) = held else {
+                continue;
+            };
+            // Re-enter the final-answer checks with the answer that started
+            // this review; a rejection there returns to the model as before.
+            completion.text = text;
+            completion.calls.clear();
+            completion.discarded_tool_calls = false;
+            completion.length_limited = false;
+            replaying_final = true;
+            s.last_error = None;
         }
         if !completion.length_limited
             && completion.calls.is_empty()
@@ -2371,7 +2363,7 @@ pub async fn run_session_controlled(
             }
             // Closing mode gives a rejected final one repair turn. The next
             // final is accepted and every unresolved item is reported instead.
-            let closing_attempt = if reviewing_completion {
+            let closing_attempt = if reviewing_completion || replaying_final {
                 s.progress_recovery
                     .closing
                     .as_ref()
@@ -2436,84 +2428,80 @@ pub async fn run_session_controlled(
             if let Err(error) = tools::verify_document_write(&s) {
                 s.status = "partial".into();
                 s.last_error = Some(error.to_string());
-            } else if s.task.require_investigation && s.investigations.is_empty() {
+            } else if s.is_document_work() && !s.document_written {
                 s.status = "partial".into();
-                s.last_error = Some("Required source-evidence coverage is missing: create investigation items with investigation action=upsert, then compare sources and document and verify them before finishing".into());
-            } else if !s.investigations.is_empty() {
+                s.last_error = Some("The requested source document has not been saved in this task: create it with document_edit (action=create) from the evidence already gathered before finishing".into());
+            } else if s.is_document_work() {
                 let _ = tools::revalidate(&mut s);
-                if s.investigations.iter().any(|i| !i.is_settled()) {
-                    s.status = "partial".into();
-                    s.last_error = Some(format!(
-                        "Unverified investigation items remain; document is partial. Next step for each: {}",
-                        json!(tools::investigation_next_steps(&s))
-                    ));
-                } else {
-                    match tools::audit_document(&mut s) {
-                        Ok(audit) if audit["structural_ok"] == true => {
-                            let closing_review_used = s
-                                .progress_recovery
-                                .closing
-                                .as_ref()
-                                .is_some_and(|c| c.document_review_used);
-                            if s.document_written
-                                && s.config.source_document_review
-                                && !tools::document_review::approved(&s)
-                                && !tools::document_review::unavailable_on_current(&s)
-                                && !closing_review_used
-                            {
-                                // Closing mode spends at most one review; its
-                                // unresolved findings are reported afterwards.
-                                if let Some(closing) = &mut s.progress_recovery.closing {
-                                    closing.document_review_used = true;
-                                }
-                                if tools::document_review::rejected_on_current_result(&s) {
-                                    s.status = "partial".into();
-                                    s.last_error = Some(format!(
-                                        "document_review: unchanged document still requires correction: {}",
-                                        s.document_review.issues.join("; ")
-                                    ));
-                                    // Repeating the final answer without editing the
-                                    // rejected document is not repair. After a second
-                                    // unchanged rejection, close instead of waiting for
-                                    // the stall ladder; the next final is accepted with
-                                    // the findings reported. One review stays available:
-                                    // an edit made while closing is reviewed again, an
-                                    // unchanged document reuses the rejection.
-                                    if s.progress_recovery.closing.is_none()
-                                        && note_unrepaired_final(&mut s) >= UNREPAIRED_FINAL_LIMIT
-                                    {
-                                        s.progress_recovery.closing =
-                                            Some(crate::session::Closing {
-                                                reason: "review_unrepaired".into(),
-                                                final_attempts: 1,
-                                                ..Default::default()
-                                            });
-                                        emit(&events, AgentEvent::Notice { session: s.id.clone(), text: "검토 지적을 반영하지 않은 채 최종 답변이 반복돼 마감 단계로 전환합니다. 남은 지적은 결과에 명시합니다.".into() }, &cancel, run_deadline(started, &s.config)).await;
-                                    }
-                                } else {
-                                    s.document_review.pending = true;
-                                    s.status = "running".into();
-                                    emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"Reviewing the document against source evidence and requested coverage.".into() }, &cancel, run_deadline(started, &s.config)).await;
-                                    continue;
+                match tools::audit_document(&mut s) {
+                    Ok(audit) if audit["structural_ok"] == true => {
+                        let closing_review_used = s
+                            .progress_recovery
+                            .closing
+                            .as_ref()
+                            .is_some_and(|c| c.document_review_used);
+                        // A document that cites no source has nothing
+                        // to compare; the review is skipped, not failed.
+                        if s.document_written
+                            && s.config.source_document_review
+                            && tools::citation_count(&s) > 0
+                            && !tools::document_review::approved(&s)
+                            && !tools::document_review::unavailable_on_current(&s)
+                            && !closing_review_used
+                        {
+                            // Closing mode spends at most one review; its
+                            // unresolved findings are reported afterwards.
+                            if let Some(closing) = &mut s.progress_recovery.closing {
+                                closing.document_review_used = true;
+                            }
+                            if tools::document_review::rejected_on_current_result(&s) {
+                                s.status = "partial".into();
+                                s.last_error = Some(format!(
+                                    "document_review: unchanged document still requires correction: {}",
+                                    s.document_review.issues.join("; ")
+                                ));
+                                // Repeating the final answer without editing the
+                                // rejected document is not repair. After a second
+                                // unchanged rejection, close instead of waiting for
+                                // the stall ladder; the next final is accepted with
+                                // the findings reported. One review stays available:
+                                // an edit made while closing is reviewed again, an
+                                // unchanged document reuses the rejection.
+                                if s.progress_recovery.closing.is_none()
+                                    && note_unrepaired_final(&mut s) >= UNREPAIRED_FINAL_LIMIT
+                                {
+                                    s.progress_recovery.closing = Some(crate::session::Closing {
+                                        reason: "review_unrepaired".into(),
+                                        final_attempts: 1,
+                                        ..Default::default()
+                                    });
+                                    emit(&events, AgentEvent::Notice { session: s.id.clone(), text: "검토 지적을 반영하지 않은 채 최종 답변이 반복돼 마감 단계로 전환합니다. 남은 지적은 결과에 명시합니다.".into() }, &cancel, run_deadline(started, &s.config)).await;
                                 }
                             } else {
-                                // Approved, or finishing without a further
-                                // review: collect_gaps reports the latter.
-                                s.status = "complete".into();
-                                s.last_error = None;
+                                s.document_review.pending = true;
+                                s.status = "running".into();
+                                held_final = (!continuing)
+                                    .then(|| (completion.text.clone(), output_hash(&s)));
+                                emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"Reviewing the document against source evidence and requested coverage.".into() }, &cancel, run_deadline(started, &s.config)).await;
+                                continue;
                             }
+                        } else {
+                            // Approved, or finishing without a further
+                            // review: collect_gaps reports the latter.
+                            s.status = "complete".into();
+                            s.last_error = None;
                         }
-                        Ok(audit) => {
-                            s.status = "partial".into();
-                            s.last_error = Some(format!(
-                                "Document format/evidence audit has {} issues; use document_audit",
-                                audit["issue_count"]
-                            ));
-                        }
-                        Err(error) => {
-                            s.status = "partial".into();
-                            s.last_error = Some(format!("Document audit failed: {error}"));
-                        }
+                    }
+                    Ok(audit) => {
+                        s.status = "partial".into();
+                        s.last_error = Some(format!(
+                            "Document format/evidence audit has {} issues; use document_audit",
+                            audit["issue_count"]
+                        ));
+                    }
+                    Err(error) => {
+                        s.status = "partial".into();
+                        s.last_error = Some(format!("Document audit failed: {error}"));
                     }
                 }
             } else {
@@ -2607,6 +2595,7 @@ pub async fn run_session_controlled(
                 s.document_review.pending = true;
                 s.status = "running".into();
                 s.last_error = None;
+                held_final = (!continuing).then(|| (completion.text.clone(), output_hash(&s)));
                 emit(
                     &events,
                     AgentEvent::Notice {
@@ -2624,7 +2613,6 @@ pub async fn run_session_controlled(
                 // everything unresolved rather than returning to repairs. Every
                 // partial cause is re-derived from state by collect_gaps.
                 s.last_error = None;
-                settle_remaining(&mut s, "closing");
                 s.status = "complete".into();
             }
             if s.status == "partial"
@@ -2647,9 +2635,6 @@ pub async fn run_session_controlled(
             }
             let mut final_text = completion.text.clone();
             if s.status == "complete" && s.is_document_work() {
-                if accept_gaps {
-                    settle_remaining(&mut s, "closing");
-                }
                 s.completion_gaps = collect_gaps(&mut s, &waived);
                 if !s.completion_gaps.is_empty() {
                     s.status = "complete_with_gaps".into();
@@ -2728,11 +2713,7 @@ pub async fn run_session_controlled(
         let mut seen_call_ids = std::collections::BTreeSet::new();
         let mut batch_document_hash: Option<String> = None;
         let prior_source_count = s.sources.len();
-        let prior_written_count = s
-            .investigations
-            .iter()
-            .filter(|i| i.status == "written")
-            .count();
+        let prior_unread = unread_citation_count(&s);
         let prior_current_todo = s.task.current_todo().map(|item| item.id.clone());
         let prior_pending_todos = s.task.todos.iter().filter(|item| !item.done).count();
         let checkpoint_batch = s.checkpoint.is_some();
@@ -3029,27 +3010,18 @@ pub async fn run_session_controlled(
             }
             i += group;
         }
-        let new_verified = s
-            .investigations
-            .iter()
-            .filter(|i| i.status == "verified")
-            .count();
-        if new_verified > verified_count {
+        // Reading a cited range the document still owed counts like a
+        // verification did: the saved result is better supported.
+        let verified_progress = unread_citation_count(&s) < prior_unread;
+        if verified_progress {
             repetitions.clear();
         }
         let new_source_evidence = s.sources.len() > prior_source_count;
-        let written_progress = s
-            .investigations
-            .iter()
-            .filter(|i| i.status == "written")
-            .count()
-            > prior_written_count;
         let pending_todos = s.task.todos.iter().filter(|item| !item.done).count();
         let plan_advanced = prior_current_todo.is_some()
             && pending_todos < prior_pending_todos
             && s.task.current_todo().map(|item| &item.id) != prior_current_todo.as_ref();
-        let verified_progress = new_verified > verified_count;
-        if verified_progress || written_progress || plan_advanced || artifact_milestone {
+        if verified_progress || plan_advanced || artifact_milestone {
             s.progress_recovery.artifact_edits_without_milestone = 0;
         } else if novel_artifact_change && !checkpoint_batch {
             s.progress_recovery.artifact_edits_without_milestone = s
@@ -3089,7 +3061,7 @@ pub async fn run_session_controlled(
                 .repeated_outcome_rounds
                 .saturating_add(1);
         }
-        if novel_artifact_change || verified_progress || written_progress || new_source_evidence {
+        if novel_artifact_change || verified_progress || new_source_evidence {
             s.progress_recovery.rounds_without_substantive_progress = 0;
         } else if !checkpoint_batch {
             s.progress_recovery.rounds_without_substantive_progress = s
@@ -3097,7 +3069,7 @@ pub async fn run_session_controlled(
                 .rounds_without_substantive_progress
                 .saturating_add(1);
         }
-        if verified_progress || artifact_milestone || written_progress || new_source_evidence {
+        if verified_progress || artifact_milestone || new_source_evidence {
             s.completion_review.repair_rounds = 0;
             s.completion_review.stalled_reviews = 0;
         }
@@ -3116,7 +3088,6 @@ pub async fn run_session_controlled(
             "artifact_edits_without_milestone":s.progress_recovery.artifact_edits_without_milestone,
             "repeated_read":repeated_read_detected
         });
-        verified_count = new_verified;
         if s.last_error
             .as_deref()
             .is_some_and(|error| error.starts_with("task_plan_pending:"))
@@ -3402,56 +3373,7 @@ mod review_gap_tests {
     use crate::config::{Project, Secret};
 
     #[test]
-    fn a_written_document_without_items_names_the_sections_to_register() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut s = Session::new(
-            Project {
-                root: dir.path().into(),
-                output: dir.path().join("out.md"),
-                ..Default::default()
-            },
-            Config {
-                model: "gpt-4o".into(),
-                ..Config::compact_test()
-            },
-        );
-        s.add_user("ui 매뉴얼 작성.".into());
-        s.select_workflow("source_document").unwrap();
-        tools::execute(
-            &mut s,
-            "document_edit",
-            json!({"action":"create","text":"# 매뉴얼\n\n## 1. 채팅 화면\n\nA.\n\n## 2. 관리자 화면\n\nB.\n"}),
-        )
-        .unwrap();
-        // Two live runs never registered an item and never answered: the
-        // readiness check now names the sections instead of a silent false.
-        assert!(!ready_except_plan(&mut s));
-        let missing = s.run_guidance["unregistered_document"].clone();
-        assert_eq!(missing["investigation_items"], 0, "{missing}");
-        assert_eq!(
-            missing["sections"],
-            json!(["# 매뉴얼\n## 1. 채팅 화면", "# 매뉴얼\n## 2. 관리자 화면"])
-        );
-        assert_eq!(
-            missing["next"],
-            json!({"action":"upsert","title":"1. 채팅 화면","section":"# 매뉴얼\n## 1. 채팅 화면","status":"written"})
-        );
-        // The suggested call is accepted as is.
-        tools::execute(&mut s, "investigation", missing["next"].clone()).unwrap();
-        assert!(tools::unregistered_document(&s).is_none());
-        // Closing names the sections in its own instruction.
-        s.investigations.clear();
-        s.progress_recovery.closing = Some(Default::default());
-        let instruction = closing_instruction(&s);
-        assert!(
-            instruction.contains("no investigation item is registered")
-                && instruction.contains("2. 관리자 화면"),
-            "{instruction}"
-        );
-    }
-
-    #[test]
-    fn uncovered_sections_block_readiness_even_when_registered_items_are_verified() {
+    fn unread_citations_block_readiness_until_their_ranges_are_read() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
         let mut s = Session::new(
@@ -3465,51 +3387,51 @@ mod review_gap_tests {
                 ..Config::compact_test()
             },
         );
-        s.add_user("Fix only section A in the existing document.".into());
+        s.add_user("Document a.rs.".into());
         s.select_workflow("source_document").unwrap();
-        tools::execute(
+        let written = tools::execute(
             &mut s,
             "document_edit",
             json!({"action":"create","text":"# Manual\n## A\na.rs:1\n## B\na.rs:2\n"}),
         )
         .unwrap();
-        let source = tools::execute(&mut s, "file_read", json!({"path":"a.rs"})).unwrap()["source"]
-            ["id"]
-            .clone();
-        tools::execute(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":"A","title":"A","section":"## A","status":"written"}),
-        )
-        .unwrap();
-        tools::execute(&mut s, "investigation", json!({"action":"verify","id":"A","source_ids":[source.clone()],"verification_note":"Compared a.rs:1."})).unwrap();
-        assert!(s.investigations.iter().all(|item| item.is_settled()));
+        // The save itself names what was cited without being read.
+        // Adjacent cited lines of one file merge into one unread range.
+        assert_eq!(
+            written["citation_check"]["unread_citation_count"], 1,
+            "{written}"
+        );
+        // Two live runs wrote a whole manual and never registered an item:
+        // readiness now depends only on the saved document and its reads.
         assert!(!ready_for_final(&mut s));
+        let issues = s.run_guidance["document_readiness"]["issues"].clone();
         assert!(
-            s.run_guidance["document_readiness"]["issues"]
+            issues
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|issue| issue["kind"] == "uncovered_section"
-                    && issue["section"] == "# Manual\n## B")
+                .any(|issue| issue["kind"] == "unread_citation"
+                    && issue["path"] == "a.rs"
+                    && issue["start_line"] == 1
+                    && issue["end_line"] == 2),
+            "{issues}"
         );
-        tools::execute(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":"B","title":"B","section":"## B","status":"written"}),
-        )
-        .unwrap();
-        tools::execute(&mut s, "investigation", json!({"action":"verify","id":"B","source_ids":[source],"verification_note":"Compared a.rs:2."})).unwrap();
+        // Closing mode asks for the same reads instead of bookkeeping.
+        s.progress_recovery.closing = Some(Default::default());
+        let instruction = closing_instruction(&s);
+        assert!(instruction.contains("unread"), "{instruction}");
+        s.progress_recovery.closing = None;
+        tools::execute(&mut s, "file_read", json!({"path":"a.rs"})).unwrap();
         assert!(ready_for_final(&mut s));
         assert!(s.run_guidance.get("document_readiness").is_none());
-        // A stale verified source must also block the ready instruction.
+        // A changed source makes the read stale and blocks the ready instruction.
         std::fs::write(dir.path().join("a.rs"), "fn changed() {}\nfn b() {}\n").unwrap();
         assert!(!ready_for_final(&mut s));
         assert_eq!(s.run_guidance["document_readiness"]["structural_ok"], false);
     }
 
     #[test]
-    fn completion_readiness_and_final_gaps_use_the_current_investigation_state() {
+    fn completion_readiness_and_final_gaps_use_the_current_result() {
         use tools::completion_review::{self as review, Gate};
 
         let dir = tempfile::tempdir().unwrap();
@@ -3528,19 +3450,12 @@ mod review_gap_tests {
         );
         s.add_user("ui 사용자 매뉴얼 만들어줘".into());
         s.select_workflow("source_document").unwrap();
-        let read = tools::execute(&mut s, "file_read", json!({"path":"ui.js"})).unwrap();
+        tools::execute(&mut s, "file_read", json!({"path":"ui.js"})).unwrap();
         tools::execute(
             &mut s,
             "document_edit",
             json!({"action":"create",
             "text":"# Chat\nOpen the chat screen. ui.js:1\n"}),
-        )
-        .unwrap();
-        tools::execute(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":"T1",
-            "title":"Chat","section":"# Chat","status":"written"}),
         )
         .unwrap();
         assert_eq!(
@@ -3551,7 +3466,7 @@ mod review_gap_tests {
         review::finish(
             &mut s,
             &json!({"checks":[{"id":"R0","status":"unverified",
-            "reason":"T1 is still written","evidence":["E2"],"next_action":"Verify T1"}]})
+            "reason":"The chat screen section is incomplete","evidence":["E2"],"next_action":"Complete the chat section"}]})
             .to_string(),
         )
         .unwrap();
@@ -3559,22 +3474,26 @@ mod review_gap_tests {
         assert!(
             collect_gaps(&mut s, &[])
                 .iter()
-                .any(|gap| gap.contains("T1 is still written"))
+                .any(|gap| gap.contains("The chat screen section is incomplete"))
         );
 
+        let expected = s.last_document_write.as_ref().unwrap().1.clone();
         tools::execute(
             &mut s,
-            "investigation",
-            json!({"action":"verify","id":"T1",
-            "source_ids":[read["source"]["id"]],"verification_note":"Compared the chat function"}),
+            "document_edit",
+            json!({"action":"replace_text","expected_hash":expected,"old_text":"Open the chat screen.","text":"Open the chat screen from the main window."}),
         )
         .unwrap();
         assert!(
             ready_for_final(&mut s),
-            "Verification must unblock the final answer that starts a new review"
+            "A changed result must unblock the final answer that starts a new review"
         );
         let gaps = collect_gaps(&mut s, &[]);
-        assert!(!gaps.iter().any(|gap| gap.contains("T1 is still written")));
+        assert!(
+            !gaps
+                .iter()
+                .any(|gap| gap.contains("The chat screen section is incomplete"))
+        );
         assert!(
             gaps.iter()
                 .any(|gap| gap == "완료 조건 검증 — 현재 결과를 마감 전에 검토하지 못했습니다.")
@@ -3620,26 +3539,13 @@ mod review_gap_tests {
         );
         s.add_user("Document the loop.".into());
         s.select_workflow("source_document").unwrap();
-        let read = tools::execute(&mut s, "file_read", json!({"path":"source.rs"})).unwrap();
+        tools::execute(&mut s, "file_read", json!({"path":"source.rs"})).unwrap();
         tools::execute(
             &mut s,
             "document_edit",
             json!({"action":"create","text":"# Flow\nA while loop runs five times. source.rs:1\n"}),
         )
         .unwrap();
-        tools::execute(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":"flow","title":"Flow","section":"# Flow","status":"written"}),
-        )
-        .unwrap();
-        tools::execute(
-            &mut s,
-            "investigation",
-            json!({"action":"verify","id":"flow","source_ids":[read["source"]["id"]],"verification_note":"Compared the loop"}),
-        )
-        .unwrap();
-
         tools::document_review::request(&mut s).unwrap();
         s.document_review.skipped_ranges.push((2, 2));
         tools::document_review::test_finish(
@@ -3720,26 +3626,13 @@ mod review_gap_tests {
         s.add_user(
             "source.rs의 run 함수에서 반복문 종류와 work 호출 횟수를 정확히 설명해줘.".into(),
         );
-        let read = tools::execute(&mut s, "file_read", json!({"path":"source.rs"})).unwrap();
+        tools::execute(&mut s, "file_read", json!({"path":"source.rs"})).unwrap();
         tools::execute(
             &mut s,
             "document_edit",
             json!({"action":"create","text":"# 실행 흐름\nrun은 while 반복문으로 work를 열 번 실행합니다. source.rs:1-5\n"}),
         )
         .unwrap();
-        tools::execute(
-            &mut s,
-            "investigation",
-            json!({"action":"upsert","id":"flow","title":"실행 흐름","section":"# 실행 흐름","status":"written"}),
-        )
-        .unwrap();
-        tools::execute(
-            &mut s,
-            "investigation",
-            json!({"action":"verify","id":"flow","source_ids":[read["source"]["id"]],"verification_note":"Compared the loop and its bound"}),
-        )
-        .unwrap();
-
         let request = tools::document_review::request(&mut s).unwrap();
         let request_tokens = context::count(&request, &s.config.model);
         assert!(
@@ -3800,12 +3693,6 @@ mod review_gap_tests {
             &mut s,
             "document_edit",
             json!({"action":"replace_text","expected_hash":expected,"old_text":"while 반복문으로 work를 열 번","text":"for 반복문으로 work를 다섯 번"}),
-        )
-        .unwrap();
-        tools::execute(
-            &mut s,
-            "investigation",
-            json!({"action":"verify","id":"flow","source_ids":[read["source"]["id"]],"verification_note":"Confirmed the corrected for loop and five calls"}),
         )
         .unwrap();
         let final_document_hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
@@ -4380,6 +4267,9 @@ mod provider_outage_tests {
         let (s, calls, notices) = run(2).await;
         assert_eq!(s.status, "complete", "{:?}", s.last_error);
         assert_eq!(calls, 3);
+        // Two unanswered requests are not rounds: only the answered one counts.
+        assert_eq!(s.task_rounds, 1);
+        assert_eq!(s.progress_recovery.rounds_since_best, 0);
         assert!(
             notices
                 .iter()
@@ -4566,15 +4456,13 @@ mod review_usage_tests {
         );
         session.select_workflow("source_document").unwrap();
         session.add_user("Write a source document".into());
-        let read = tools::execute(&mut session, "file_read", json!({"path":"main.rs"})).unwrap();
+        tools::execute(&mut session, "file_read", json!({"path":"main.rs"})).unwrap();
         tools::execute(
             &mut session,
             "document_edit",
             json!({"action":"create","text":"# Flow\nCode. main.rs:1\n"}),
         )
         .unwrap();
-        tools::execute(&mut session, "investigation", json!({"action":"upsert","id":"flow","title":"Flow","section":"# Flow","status":"written"})).unwrap();
-        tools::execute(&mut session, "investigation", json!({"action":"verify","id":"flow","source_ids":[read["source"]["id"]],"verification_note":"Fixture attestation"})).unwrap();
         if completion {
             assert_eq!(
                 tools::completion_review::begin_final(
