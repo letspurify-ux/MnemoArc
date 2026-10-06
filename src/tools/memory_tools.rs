@@ -134,8 +134,30 @@ pub(super) fn argument_error(error: anyhow::Error, name: &str, args: &Value) -> 
         || message.starts_with("missing_argument:")
         || message.starts_with("unknown_argument:")
         || message.starts_with("conflicting_arguments:"))
-        && let Some(diagnostic) = diagnostics(name, args)
+        && let Some(mut diagnostic) = diagnostics(name, args)
     {
+        // Keep the precise shared-schema violation, including errors outside
+        // replacement (e.g. ids[0]) and numeric bounds. The memory shape alone
+        // can be valid even though the surrounding call failed validation.
+        if (message.starts_with("invalid_argument_type:")
+            || message.starts_with("invalid_argument_value:"))
+            && let Some(details) = error.downcast_ref::<DiagnosticError>()
+            && !details.data["input_error"]["expected"].is_null()
+        {
+            let input = &details.data["input_error"];
+            let mut invalid = diagnostic["invalid_fields"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            invalid.retain(|field| field["field"] != input["field"]);
+            invalid.insert(
+                0,
+                json!({
+                    "field":input["field"],"expected":input["expected"],"received":input["received"]
+                }),
+            );
+            diagnostic["invalid_fields"] = json!(invalid);
+        }
         return argument_failure(name, args, message, diagnostic);
     }
     error

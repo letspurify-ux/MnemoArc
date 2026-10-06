@@ -18,7 +18,7 @@ fn displayed_line(line: usize, text: &str) -> Value {
 /// left a live run retrying the same call and then avoiding the tool.
 fn pattern_hint(args: &Value) -> String {
     let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
-        return String::new();
+        return "; send query as one nonempty search string, or queries as an array of 1 to 16 literal strings".into();
     };
     let shown: String = pattern.chars().take(80).collect();
     format!(

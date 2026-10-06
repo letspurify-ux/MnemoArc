@@ -30,7 +30,12 @@ fn empty_search_query_is_missing_not_conflicting() {
         let error = tools::execute(&mut s, "source_search", args)
             .unwrap_err()
             .to_string();
-        assert_eq!(error, "missing_argument: query or queries");
+        assert!(
+            error.starts_with(
+                "missing_argument: query or queries; send query as one nonempty search string"
+            ),
+            "{error}"
+        );
     }
     let error = tools::execute(
         &mut s,

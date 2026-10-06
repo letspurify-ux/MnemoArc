@@ -1057,7 +1057,9 @@ async fn read_parallel(
                     if error.to_string().starts_with("tool_worker_capacity:") {
                         anyhow::Error::from(error)
                     } else {
-                        anyhow::anyhow!("tool_worker_start_failed: {error}")
+                        anyhow::anyhow!(
+                            "tool_worker_start_failed: {error}; the tool did not start and nothing was executed"
+                        )
                     }
                 })?;
             tokio::select! {

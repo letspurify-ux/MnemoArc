@@ -1,3 +1,5 @@
+mod arguments;
+mod batch;
 pub mod completion_review;
 mod coverage;
 mod document_format;
@@ -153,7 +155,7 @@ impl ToolRegistry {
                 optional: false,
                 read_only: true,
                 parameters: schema(
-                    json!({"action":action(&["list","run"]),"id":string(),"params":{"type":"object","description":"Named bind values declared by the selected query; strings, numbers or null"}}),
+                    json!({"action":action(&["list","run"]),"id":string(),"params":{"type":"object","additionalProperties":{"type":["string","number","null"]},"description":"Named bind values declared by the selected query; strings, numbers or null"}}),
                     &["action"],
                 ),
             },
@@ -166,8 +168,8 @@ impl ToolRegistry {
                     json!({
                         "mode":action(&["query","statement","procedure","function"]),
                         "sql":string(),"name":string(),
-                        "params":{"type":"object","description":"Named SQL bind values: string, number, boolean or null"},
-                        "args":{"type":"array","items":{"type":"object","properties":{"name":string(),"direction":action(&["in","out","inout"]),"type":action(&["string","number","boolean","cursor"]),"value":{}},"required":["name"],"additionalProperties":false}},
+                        "params":{"type":"object","maxProperties":32,"additionalProperties":{"type":["string","number","boolean","null"]},"description":"Named SQL bind values: string, number, boolean or null"},
+                        "args":{"type":"array","maxItems":32,"items":{"type":"object","properties":{"name":string(),"direction":action(&["in","out","inout"]),"type":action(&["string","number","boolean","cursor"]),"value":{}},"required":["name"],"additionalProperties":false}},
                         "return_type":action(&["string","number","boolean","cursor"])
                     }),
                     &["mode"],
@@ -281,7 +283,7 @@ impl ToolRegistry {
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"query":string(),"queries":strings(),"path":string(),"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"whole_word":{"type":"boolean"},"mode":action(&["matches","files","count"]),"before":{"type":"integer","minimum":0,"maximum":20},"after":{"type":"integer","minimum":0,"maximum":20},"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number()}),
+                    json!({"query":string(),"queries":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1}},"path":string(),"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"whole_word":{"type":"boolean"},"mode":action(&["matches","files","count"]),"before":{"type":"integer","minimum":0,"maximum":20},"after":{"type":"integer","minimum":0,"maximum":20},"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number()}),
                     &[],
                 ),
             },
@@ -351,7 +353,7 @@ impl ToolRegistry {
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"path":{"type":"string","description":"File path: relative to project.root, or the absolute configured output path returned by document_inspect. Never infer the output path from its basename."},"cursor":string(),"start_line":number(),"max_lines":number(),"limit":{"type":"integer","minimum":0,"description":"Compatibility alias for max_lines (number of lines). Prefer max_lines; never use a different value alongside max_lines."},"offset":number(),"force_read":{"type":"boolean"}}),
+                    json!({"path":{"type":"string","description":"File path: relative to project.root, or the absolute configured output path returned by document_inspect. Never infer the output path from its basename."},"cursor":string(),"start_line":{"type":"integer","minimum":1},"max_lines":{"type":"integer","minimum":1,"maximum":2000},"limit":{"type":"integer","minimum":1,"maximum":2000,"description":"Compatibility alias for max_lines (number of lines). Prefer max_lines; never use a different value alongside max_lines."},"offset":number(),"force_read":{"type":"boolean"}}),
                     &[],
                 ),
             },
@@ -869,13 +871,21 @@ impl ToolRegistry {
             .collect()
     }
     pub fn validate(s: &Session, name: &str, args: &Value) -> Result<ToolSpec> {
+        Self::validate_inner(s, name, args).map_err(|error| arguments::annotate(error, name, args))
+    }
+
+    fn validate_inner(s: &Session, name: &str, args: &Value) -> Result<ToolSpec> {
         if s.read_only_turn && !Self::question_allows(name) {
             bail!("question_tools_not_allowed: {name} changes task state or files; task preserved");
         }
         let spec = Self::specs()
             .into_iter()
             .find(|t| t.name == name)
-            .ok_or_else(|| anyhow::anyhow!("unsupported_tool: {name}"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unsupported_tool: {name} is not a tool name; nothing was executed. Use an exact name from the offered tool list, or search with tool_catalog"
+                )
+            })?;
         reject_project_write_in_source_document(s, name)?;
         if spec.optional && !s.active_tools.contains(name) {
             bail!("tool_not_active: {name}");
@@ -910,7 +920,14 @@ impl ToolRegistry {
             bail!("unsupported: memory reuse disabled for evaluation");
         }
         let object = args.as_object().ok_or_else(|| {
-            anyhow::anyhow!("invalid_tool_arguments: arguments must be an object")
+            arguments::failure(
+                name,
+                "arguments",
+                "invalid_tool_arguments",
+                json!("object"),
+                arguments::value_type(args),
+                "must be an object",
+            )
         })?;
         if name == "db_query" && s.config.database.active_queries().next().is_none() {
             bail!(
@@ -933,10 +950,15 @@ impl ToolRegistry {
                         "unknown_argument: {key} belongs inside task_state patch; use {{\"action\":\"update\",\"patch\":{{\"{key}\":...}}}}; state unchanged"
                     );
                 }
-                bail!(
-                    "unknown_argument: {key} for {name}; allowed arguments: {}",
-                    fields.keys().cloned().collect::<Vec<_>>().join(", ")
-                );
+                let allowed: Vec<_> = fields.keys().collect();
+                return Err(arguments::failure(
+                    name,
+                    key,
+                    "unknown_argument",
+                    json!({"allowed_fields":allowed}),
+                    arguments::value_type(&object[key]),
+                    &format!("is not accepted; allowed arguments: {}", json!(allowed)),
+                ));
             }
         }
         for required in spec.parameters["required"].as_array().unwrap() {
@@ -949,7 +971,15 @@ impl ToolRegistry {
                 if name == "document_edit_batch" && !object.contains_key("expected_hash") {
                     bail!("missing_argument: {required}; expected_hash is also missing");
                 }
-                bail!("missing_argument: {required}");
+                let key = required.as_str().unwrap();
+                return Err(arguments::failure(
+                    name,
+                    key,
+                    "missing_argument",
+                    fields[key].clone(),
+                    "missing",
+                    "is required",
+                ));
             }
         }
         for (k, v) in object {
@@ -960,48 +990,11 @@ impl ToolRegistry {
                 continue;
             }
             let field = &fields[k];
-            let valid = match field["type"].as_str() {
-                Some("string") => v.is_string(),
-                Some("integer") => v.as_u64().is_some(),
-                Some("boolean") => v.is_boolean(),
-                Some("array") => v.as_array().is_some_and(|items| {
-                    (name == "document_edit_batch" && k == "edits")
-                        || (name == "file_patch" && k == "operations")
-                        || (name == "db_execute" && k == "args")
-                        || items.iter().all(Value::is_string)
-                }),
-                Some("object") => v.is_object(),
-                _ => true,
-            };
-            if !valid {
-                let expected = field["type"].as_str().unwrap_or("value");
-                let actual = match v {
-                    Value::Null => "null",
-                    Value::Bool(_) => "boolean",
-                    Value::Number(_) => "number",
-                    Value::String(_) => "string",
-                    Value::Array(_) => "array",
-                    Value::Object(_) => "object",
-                };
-                // Text that should have been structured JSON is the common
-                // case; name why it could not be taken as that value.
-                let hint = match (expected, v.as_str()) {
-                    ("array" | "object", Some(raw)) => match serde_json::from_str::<Value>(raw) {
-                        Err(error) => format!(
-                            "; send it as a JSON {expected}, not as text (the text is not valid JSON: {error}; object keys need double quotes)"
-                        ),
-                        Ok(_) => format!("; send it as a JSON {expected}, not as text"),
-                    },
-                    ("array", None) if actual == "array" => "; every item must be a string".into(),
-                    _ => String::new(),
-                };
-                bail!("invalid_argument_type: {k} must be {expected}, got {actual}{hint}");
+            if name == "task_state" && k == "patch" && v.is_object() {
+                // Retain user-owned workflow diagnostics before nested schema checks.
+                continue;
             }
-            if let Some(values) = field["enum"].as_array()
-                && !values.contains(v)
-            {
-                bail!("{}", enum_value_error(name, k, v, values));
-            }
+            arguments::validate_field(name, k, field, v)?;
         }
         if name == "task_state" {
             validate_task_state_arguments(args)?;
@@ -1058,27 +1051,11 @@ fn validate_task_state_arguments(args: &Value) -> Result<()> {
                 );
             }
             bail!(
-                "unknown_argument: {key} is not a task_state patch field; allowed patch fields: {}; state unchanged",
+                "unknown_argument: patch.{key} is not a task_state patch field; allowed patch fields: {}; state unchanged",
                 properties.keys().cloned().collect::<Vec<_>>().join(", ")
             );
         };
-        let valid = match field["type"].as_str() {
-            Some("string") => value.is_string(),
-            Some("boolean") => value.is_boolean(),
-            Some("array") => value.as_array().is_some_and(|items| {
-                field["items"]["type"] != "string" || items.iter().all(Value::is_string)
-            }),
-            Some("object") => value.is_object(),
-            _ => true,
-        };
-        if !valid {
-            bail!("invalid_argument_type: patch.{key}");
-        }
-        if let Some(values) = field["enum"].as_array()
-            && !values.contains(value)
-        {
-            bail!("invalid_argument_value: patch.{key}");
-        }
+        arguments::validate_field("task_state", &format!("patch.{key}"), field, value)?;
     }
     Ok(())
 }
@@ -1298,8 +1275,14 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
             if args["action"] != "details"
                 && let Some(object) = args.as_object_mut()
             {
-                object.remove("offset");
-                object.remove("limit");
+                for key in ["offset", "limit"] {
+                    if object
+                        .get(key)
+                        .is_some_and(|value| value.as_u64().is_some())
+                    {
+                        object.remove(key);
+                    }
+                }
             }
             // Restating the user's workflow selection changes nothing; only an
             // attempt to reclassify it is rejected.
@@ -1323,12 +1306,18 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
         // fill every field send verification data with upsert and sources
         // with mark_gap, neither of which those actions use.
         "investigation" if args["action"] == "upsert" => {
-            if let Some(object) = args.as_object_mut() {
+            if args["verification_note"].is_string()
+                && let Some(object) = args.as_object_mut()
+            {
                 object.remove("verification_note");
             }
         }
         "investigation" if args["action"] == "mark_gap" => {
-            if let Some(object) = args.as_object_mut() {
+            if args["source_ids"]
+                .as_array()
+                .is_some_and(|ids| ids.iter().all(Value::is_string))
+                && let Some(object) = args.as_object_mut()
+            {
                 object.remove("source_ids");
             }
         }
@@ -1338,7 +1327,10 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
                 drop_filled_delete_text(object);
                 // Appending to a document that does not exist yet is creating
                 // it; a live run spent rounds on hashes for a missing output.
+                // Without text the call stays an append, so its error names
+                // the action the model actually sent.
                 if object.get("action").and_then(Value::as_str) == Some("append")
+                    && object.contains_key("text")
                     && output_path(&s.project).is_ok_and(|path| !path.exists())
                 {
                     object.insert("action".into(), json!("create"));
@@ -1401,7 +1393,11 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
             };
             if let Some(object) = args.as_object_mut() {
                 for key in unused {
-                    object.remove(*key);
+                    if object.get(*key).is_some_and(|value| {
+                        value.is_null() || value == &json!(0) || value == &json!("")
+                    }) {
+                        object.remove(*key);
+                    }
                 }
             }
         }
@@ -1410,7 +1406,10 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
             if let Some(object) = args.as_object_mut() {
                 let schema = memory_input_schema();
                 object.retain(|key, value| {
-                    !value.is_null() || schema["properties"].get(key).is_none()
+                    !value.is_null()
+                        || schema["properties"].get(key).is_none()
+                        || schema["required"].as_array().unwrap().contains(&json!(key))
+                        || key == "metadata"
                 });
             }
         }
@@ -1606,7 +1605,7 @@ fn validate_document_edit_batch_edits(args: &Value) -> Result<()> {
                 for key in ["expected_section_hash"] {
                     if object.contains_key(key) {
                         bail!(
-                            "unknown_argument: edits[{index}].{key} is not valid for action=patch"
+                            "unknown_argument: edits[{index}].{key} is not valid for action={action}"
                         );
                     }
                 }
@@ -2864,7 +2863,12 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
                     key.as_str(),
                     "path" | "path_glob" | "pattern" | "cursor" | "query"
                 ) && value.as_str() == Some("");
-                required || !(value.is_null() || blank_navigation_option)
+                !spec.parameters["properties"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key(key)
+                    || required
+                    || !(value.is_null() || blank_navigation_option)
             });
         }
         // Function-call providers can fill optional fields with empty strings
@@ -2877,7 +2881,14 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
             .unwrap_or("")
             .to_owned();
         fields.retain(|key, value| {
-            !blank_placeholder(key, value)
+            !matches!(
+                name,
+                "document_edit" | "document_edit_batch" | "investigation"
+            ) || !spec.parameters["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key(key)
+                || !blank_placeholder(key, value)
                 || (name == "document_edit" && required_document_field(&action, key))
         });
         if name == "document_edit_batch"
@@ -2891,7 +2902,12 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
                         .unwrap_or("")
                         .to_owned();
                     fields.retain(|key, value| {
-                        !blank_placeholder(key, value) || required_document_field(&action, key)
+                        !spec.parameters["properties"]["edits"]["items"]["properties"]
+                            .as_object()
+                            .unwrap()
+                            .contains_key(key)
+                            || !blank_placeholder(key, value)
+                            || required_document_field(&action, key)
                     });
                 }
             }
@@ -2945,25 +2961,26 @@ pub fn envelope(result: Result<Value>) -> Value {
             let failed = data["results"].as_array().map_or(0, |items| {
                 items
                     .iter()
-                    .filter(|item| {
-                        item["status"] == "error"
-                            || item["result"]["status"] == "error"
-                            || item["result"]["status"] == "cancelled"
-                            || item["result"]["status"] == "unsupported"
-                    })
+                    .filter(|item| recovery::is_failure(recovery::batch_result(item)))
                     .count()
             });
             if failed > 0 {
+                let succeeded = data["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|item| recovery::batch_result(item)["status"] == "ok")
+                    .count();
                 let message = format!(
-                    "batch_partial_failure: {failed} items failed; inspect results and retry only failed items"
+                    "batch_partial_failure: {failed} items failed, {succeeded} succeeded; inspect each failure before retrying; successful items are retained"
                 );
-                json!({"status":"error","error":message,"recovery":recovery::describe(&message),"partial_success":true,"data":data,"truncated":false,"next_cursor":null})
+                json!({"status":"error","error":message,"recovery":recovery::describe(&message),"partial_success":succeeded > 0,"data":data,"truncated":false,"next_cursor":null})
             } else {
                 json!({"status":"ok","data":data,"truncated":false,"next_cursor":null})
             }
         }
         Err(error) => {
-            let message = error.to_string();
+            let message = format!("{error:#}");
             let status = if message == "cancelled" || message.starts_with("cancelled:") {
                 "cancelled"
             } else if message.starts_with("unsupported") {
@@ -4231,6 +4248,14 @@ fn execute_repaired(
 ) -> Result<Value> {
     normalize_integer_arguments(name, &mut args);
     normalize_argument_aliases(s, name, &mut args)?;
+    if name == "source_search"
+        && args["query"]
+            .as_str()
+            .is_some_and(|query| !query.is_empty())
+        && args["queries"].as_array().is_some_and(Vec::is_empty)
+    {
+        args.as_object_mut().unwrap().remove("queries");
+    }
     if name == "memory_manage"
         && args["action"] == "replace"
         && let Some(replacement) = args.get_mut("replacement")
@@ -4359,7 +4384,18 @@ fn execute_repaired(
                 } else if available.contains(&name) {
                     chosen.insert(name);
                 } else {
-                    bail!("unknown_optional_tool_or_basic_tool: {name}");
+                    let basic = ToolRegistry::specs()
+                        .iter()
+                        .any(|spec| spec.name == name && !spec.optional);
+                    bail!(
+                        "unknown_optional_tool_or_basic_tool: {name} {}; tool_select accepts only optional tool names or the source-docs group: {}",
+                        if basic {
+                            "is a basic tool that is always available and cannot be selected"
+                        } else {
+                            "is not a tool name"
+                        },
+                        available.iter().cloned().collect::<Vec<_>>().join(", ")
+                    );
                 }
             }
             let mut pending = s.pending_tools.clone().unwrap_or(s.active_tools.clone());
@@ -4708,11 +4744,26 @@ fn execute_repaired(
                 })
                 .collect();
             let next = offset.saturating_add(items.len());
-            Ok(
-                json!({"items":items,"total":matches.len(),"next_offset":(next < matches.len()).then_some(next),
+            // An empty lookup is not proof that the ID is valid or that the
+            // file has no content; name where evidence IDs come from.
+            let notice = if matches.is_empty() && (id.is_some() || !path.is_empty()) {
+                Some("No observed source matches this id/path. Source IDs are created only by delivered file_read, symbol_read, source_search or detailed code_outline results in this session; copy one exactly, or read the file to observe new evidence. Do not invent an ID.".to_owned())
+            } else if offset >= matches.len() && !matches.is_empty() {
+                Some(format!(
+                    "offset {offset} is past the {} matching sources; use offset 0 to {}",
+                    matches.len(),
+                    matches.len() - 1
+                ))
+            } else {
+                None
+            };
+            let mut page = json!({"items":items,"total":matches.len(),"next_offset":(next < matches.len()).then_some(next),
                     "checkpoint_lookup_remaining":s.checkpoint.as_ref().map(|cp| crate::context::CHECKPOINT_SOURCE_LOOKUP_LIMIT.saturating_sub(cp.source_lookup_calls)),
-                    "checkpoint_next_action":s.checkpoint.as_ref().map(|_| "Use delivered source IDs in memory_write, then call checkpoint_complete; repeated lookup does not preserve findings")}),
-            )
+                    "checkpoint_next_action":s.checkpoint.as_ref().map(|_| "Use delivered source IDs in memory_write, then call checkpoint_complete; repeated lookup does not preserve findings")});
+            if let Some(notice) = notice {
+                page["notice"] = json!(notice);
+            }
+            Ok(page)
         }
         "checkpoint_complete" => {
             let cp = s
@@ -5210,49 +5261,41 @@ fn execute_repaired(
                 }
                 revalidate(s)?;
                 let mut reused_ids = vec![];
-                let mut results = vec![];
-                // Preserve the original ID ordering even when a dependency
-                // enables serde_json's preserve_order feature globally.
-                let ordered_items: BTreeMap<_, _> = items.iter().collect();
-                for (id, entry) in ordered_items {
-                    if cancel.is_cancelled() {
-                        bail!("cancelled");
-                    }
+                let results = batch::run_items(items, cancel, |id, entry| {
                     let mut params = entry.clone();
                     if !params.is_object() {
-                        results.push(
-                            json!({"id":id,"result":envelope(Err(anyhow::anyhow!("invalid_argument_type: batch item must be an object with source_ids and verification_note")))}),
-                        );
-                        continue;
+                        return Err(arguments::failure(
+                            "investigation",
+                            &format!("items[{id:?}]"),
+                            "invalid_argument_type",
+                            json!("object with source_ids and verification_note"),
+                            arguments::value_type(entry),
+                            "must be an object",
+                        ));
                     }
                     if let Some(key) = params.as_object().unwrap().keys().find(|key| {
                         !["source_ids", "verification_note", "section"].contains(&key.as_str())
                     }) {
-                        results.push(json!({"id":id,"result":envelope(Err(anyhow::anyhow!("invalid_action_arguments: verify_batch item does not accept {key}; allowed: source_ids, verification_note, section; ID belongs in the items key")))}));
-                        continue;
+                        bail!(
+                            "invalid_action_arguments: verify_batch item does not accept {key}; allowed: source_ids, verification_note, section; ID belongs in the items key"
+                        );
                     }
-                    // Batch entries are not passed through the outer tool
-                    // schema, so validate required fields and their types
-                    // before either reusing or executing an item.
+                    // Validate each item before reuse or execution; a bad item
+                    // does not discard successful siblings.
                     params["action"] = json!("verify");
                     params["id"] = json!(id);
-                    if let Err(error) = ToolRegistry::validate(s, "investigation", &params) {
-                        results.push(json!({"id":id,"result":envelope(Err(error))}));
-                        continue;
-                    }
+                    ToolRegistry::validate(s, "investigation", &params)?;
                     // Reuse only after checking section, source and memory freshness.
                     // A redundant batch must not replace valid evidence with an incomplete list.
                     if s.investigations
                         .iter()
-                        .any(|i| i.id == *id && i.status == "verified")
+                        .any(|i| i.id == id && i.status == "verified")
                     {
-                        reused_ids.push(id.clone());
-                        results.push(json!({"id":id,"result":envelope(Ok(json!({"verified":id,"reused":true})))}));
-                        continue;
+                        reused_ids.push(id.to_owned());
+                        return Ok(json!({"verified":id,"reused":true}));
                     }
-                    let result = execute_cancellable(s, "investigation", params, cancel);
-                    results.push(json!({"id":id,"result":envelope(result)}));
-                }
+                    execute_cancellable(s, "investigation", params, cancel)
+                });
                 let mut succeeded_ids = vec![];
                 let mut retry_ids = vec![];
                 let mut failures = std::collections::BTreeMap::<String, Vec<Value>>::new();
@@ -5275,7 +5318,7 @@ fn execute_repaired(
                     .map(|(code, ids)| json!({"code":code,"count":ids.len(),"ids":ids}))
                     .collect();
                 Ok(
-                    json!({"summary":{"total":results.len(),"succeeded":succeeded_ids.len(),"failed":retry_ids.len(),"failures_by_code":reasons},"succeeded_ids":succeeded_ids,"reused_ids":reused_ids,"retry_ids":retry_ids,"guidance":"Successful verification updates are retained; failed items are not marked verified. Correct and retry only retry_ids. Do not reverify successful items unless their section, sources or memory references change.","results":results,"semantic_verification":"agent attestation; not program proof"}),
+                    json!({"summary":{"total":results.len(),"succeeded":succeeded_ids.len(),"failed":retry_ids.len(),"failures_by_code":reasons},"succeeded_ids":succeeded_ids,"reused_ids":reused_ids,"retry_ids":retry_ids,"guidance":"Successful verification updates are retained; failed items are not marked verified. Inspect each failed item's recovery before retrying retry_ids; cancelled items require resuming the run first. Do not reverify successful items unless their section, sources or memory references change.","results":results,"semantic_verification":"agent attestation; not program proof"}),
                 )
             }
             "verify" => {
@@ -5695,8 +5738,16 @@ fn read_file(
                 "invalid_offset: start_line {start} is beyond total_lines {total_lines}; start a new read without offset"
             );
         }
+        // An empty page is not empty content; say which range was requested.
+        let notice = if total_lines == 0 {
+            "The file is empty; there are no lines to read.".to_owned()
+        } else {
+            format!(
+                "start_line {start} is past the end of the file (total_lines {total_lines}); no lines were returned. Read with start_line between 1 and {total_lines}."
+            )
+        };
         return Ok(
-            json!({"path":path,"hash":digest,"total_lines":total_lines,"content":{"text":"","truncated":false,"next_offset":null},"source":null,"eof":true,"next_line":null,"next_offset":0}),
+            json!({"path":path,"hash":digest,"total_lines":total_lines,"content":{"text":"","truncated":false,"next_offset":null},"source":null,"eof":true,"next_line":null,"next_offset":0,"notice":notice}),
         );
     }
     let byte_start = contents
@@ -6269,6 +6320,9 @@ pub fn limit_result(
     if let Some(data) = memory_tools::compact_data(&call.name, &result["data"]) {
         compact["data"] = data;
     }
+    if let Some(data) = arguments::compact_data(&result["data"]) {
+        compact["data"] = data;
+    }
     if let Some(recovery) = result.get("recovery") {
         compact["recovery"] = recovery.clone();
         // Detailed recovery tools remain in the archive if the tiny result
@@ -6277,8 +6331,8 @@ pub fn limit_result(
             recovery.remove("tools");
         }
     }
-    if result["partial_success"] == true {
-        compact["partial_success"] = json!(true);
+    if result["partial_success"].is_boolean() {
+        compact["partial_success"] = result["partial_success"].clone();
     }
     // Archive fallback must not erase the cause of a failed operation.
     if let Some(error) = result["error"].as_str() {
@@ -6287,13 +6341,23 @@ pub fn limit_result(
     }
     if result_tokens(call, &compact, &s.config.model) > limit
         && (compact["data"]["conflict"].is_object()
-            || memory_tools::compact_data(&call.name, &result["data"]).is_some())
+            || memory_tools::compact_data(&call.name, &result["data"]).is_some()
+            || arguments::compact_data(&result["data"]).is_some())
     {
         // Structured causes take priority over duplicate prose at small
         // budgets. The full correction and examples remain in the archive.
         compact["data"].as_object_mut().unwrap().remove("reason");
         if let Some(error) = result["recovery"]["code"].as_str() {
             compact["error"] = json!(error);
+        }
+    }
+    if result_tokens(call, &compact, &s.config.model) > limit {
+        // Long enum/allowed-field lists belong in the archive, but retain the
+        // offending path and execution state before discarding the diagnosis.
+        if arguments::compact_data(&result["data"]).is_some()
+            && let Some(input) = compact["data"]["input_error"].as_object_mut()
+        {
+            input.remove("expected");
         }
     }
     if result_tokens(call, &compact, &s.config.model) > limit {
@@ -6363,13 +6427,34 @@ fn run_call_inner(
         return if stored == &signature {
             result.clone()
         } else {
-            envelope(Err(anyhow::anyhow!("call_id_collision")))
+            envelope(Err(anyhow::anyhow!(
+                "call_id_collision: call ID {:?} was already used for a different {} call in this session; this call was not executed. Resend it with a new unique call ID",
+                call.id.chars().take(80).collect::<String>(),
+                stored.split(':').next().unwrap_or("tool")
+            )))
         };
     }
-    let result = serde_json::from_str(&call.arguments)
-        .map_err(|e| anyhow::anyhow!("invalid_tool_arguments: {e}"))
+    // An empty argument string is a call with no arguments, as in llm.rs.
+    let arguments = if call.arguments.trim().is_empty() {
+        "{}"
+    } else {
+        call.arguments.as_str()
+    };
+    let result = serde_json::from_str(arguments)
+        .map_err(|e| recovery::DiagnosticError {
+            message: format!("invalid_tool_arguments: {e}; send one complete JSON object with double-quoted property names; no tool operation was executed"),
+            data: json!({"execution":"not_started","input_error":{
+                "tool":call.name,"field":"arguments","expected":"complete JSON object",
+                "received":"invalid JSON","line":e.line(),"column":e.column()
+            }}),
+        }.into())
         .and_then(|args| execute_cancellable(s, &call.name, args, cancel));
     let result = envelope(result);
+    // Attach recovery before the first archival pass so history retains the
+    // complete diagnosis, including failed batch items and available remedies.
+    if result["status"] != "ok" {
+        return result;
+    }
     let unapplied_plan = call.name == "task_plan" && result["data"]["applied"] == false;
     let output = limit_result(s, call, result, s.config.result_tokens);
     // Failed mutations are not cached, allowing deliberate recovery with corrected arguments.

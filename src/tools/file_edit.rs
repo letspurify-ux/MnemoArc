@@ -169,12 +169,20 @@ fn required<'a>(operation: &'a Value, key: &str) -> Result<&'a str> {
     operation
         .get(key)
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("missing_or_invalid_argument: {key}"))
+        .ok_or_else(|| match operation.get(key) {
+            None => anyhow::anyhow!("missing_argument: {key} is required"),
+            Some(value) => anyhow::anyhow!(
+                "invalid_argument_type: {key} must be string, got {}",
+                super::arguments::value_type(value)
+            ),
+        })
 }
 
 fn exact_replace(old: &str, needle: &str, replacement: &str, all: bool) -> Result<String> {
     if needle.is_empty() {
-        bail!("empty_old_text");
+        bail!(
+            "empty_old_text: old_text must not be empty; copy the exact text to replace from file_read"
+        );
     }
     let mut matches = 0;
     let mut cursor = 0;
@@ -184,7 +192,9 @@ fn exact_replace(old: &str, needle: &str, replacement: &str, all: bool) -> Resul
         cursor = start + old[start..].chars().next().unwrap().len_utf8();
     }
     if matches == 0 {
-        bail!("text_not_found");
+        bail!(
+            "text_not_found: old_text does not occur in the current file; copy it exactly (including indentation and line breaks) from a fresh file_read"
+        );
     }
     if matches > 1 && !all {
         bail!("ambiguous_text: {matches} matches; provide a longer old_text or replace_all=true");
@@ -227,7 +237,10 @@ fn load(
 
 fn check_hash(expected: &str, actual: &str) -> Result<()> {
     if expected != hash(actual.as_bytes()) {
-        bail!("file_revision_conflict: read the current file and retry");
+        bail!(
+            "file_revision_conflict: expected_hash {:?} does not match the current file; read the file again with file_read and copy its hash field exactly",
+            expected.chars().take(80).collect::<String>()
+        );
     }
     Ok(())
 }
@@ -560,7 +573,12 @@ pub(super) fn execute(
             let exists = path.exists();
             let content = required(args, "content")?;
             if exists {
-                let expected = required(args, "expected_hash")?;
+                let expected = args["expected_hash"].as_str().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "missing_argument: expected_hash is required because {} already exists; copy hash from file_read, or omit it only when creating a new file",
+                        required(args, "path").unwrap_or_default()
+                    )
+                })?;
                 let old = read_text(&path)?;
                 check_hash(expected, &old)?;
                 vec![
@@ -568,7 +586,9 @@ pub(super) fn execute(
                 ]
             } else {
                 if args.get("expected_hash").is_some() {
-                    bail!("file_not_found: expected_hash supplied for new file");
+                    bail!(
+                        "file_not_found: expected_hash was supplied but the file does not exist; omit expected_hash to create it, or correct the path"
+                    );
                 }
                 vec![json!({"action":"add","path":required(args,"path")?,"content":content})]
             }

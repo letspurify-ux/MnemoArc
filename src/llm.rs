@@ -652,12 +652,35 @@ impl OpenAiClient {
         // checked for IDs, names and complete JSON objects below before the
         // agent can use them.
         let mut ids = std::collections::BTreeSet::new();
-        for call in calls.values() {
-            if call.id.is_empty() || call.name.is_empty() || !ids.insert(call.id.clone()) {
-                bail!("malformed_tool_call");
+        for call in calls.values_mut() {
+            // Providers send "" for a call without arguments; that is an
+            // empty object, so the executor can name any required field.
+            if call.arguments.trim().is_empty() {
+                call.arguments = "{}".into();
             }
-            let _: serde_json::Map<String, Value> = serde_json::from_str(&call.arguments)
-                .map_err(|e| anyhow::anyhow!("invalid_tool_arguments: {e}"))?;
+            if call.id.is_empty() || call.name.is_empty() {
+                bail!(
+                    "malformed_tool_call: a tool call has an empty {}; every call needs a unique ID and an exact tool name",
+                    if call.id.is_empty() {
+                        "ID"
+                    } else {
+                        "tool name"
+                    }
+                );
+            }
+            if !ids.insert(call.id.clone()) {
+                bail!(
+                    "malformed_tool_call: call ID {:?} is used by more than one call in this response; call IDs must be unique",
+                    call.id
+                );
+            }
+            let _: serde_json::Map<String, Value> =
+                serde_json::from_str(&call.arguments).map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid_tool_arguments: {} arguments are not one complete JSON object ({e}); use double-quoted property names and close every string, array and object",
+                        call.name
+                    )
+                })?;
         }
         out.calls = calls.into_values().collect();
         validate_completion_bounds(&out)?;

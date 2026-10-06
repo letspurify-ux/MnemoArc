@@ -435,6 +435,10 @@ fn unknown_and_uncertain_errors_never_enable_automatic_replay() {
         ),
         ("cancelled", "cancelled"),
         ("invalid_tool_arguments: broken JSON", "invalid_input"),
+        (
+            "tool_worker_start_failed: no thread; the tool did not start",
+            "unavailable",
+        ),
     ] {
         let result = tools::envelope(Err(anyhow::anyhow!("{message}")));
         assert_eq!(result["recovery"]["class"], class);

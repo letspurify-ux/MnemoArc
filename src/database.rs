@@ -397,7 +397,13 @@ pub fn execute(
     let query = config
         .active_queries()
         .find(|q| q.id == id)
-        .ok_or_else(|| anyhow::anyhow!("database_query_disabled_or_unknown: {id}"))?;
+        .ok_or_else(|| {
+            let enabled: Vec<_> = config.active_queries().map(|q| q.id.as_str()).collect();
+            anyhow::anyhow!(
+                "database_query_disabled_or_unknown: {id:?} is not an enabled query; enabled ids: {}; use db_query action=list for descriptions and parameters",
+                serde_json::to_string(&enabled).unwrap()
+            )
+        })?;
     let empty = serde_json::Map::new();
     let supplied = match args.get("params") {
         None => &empty,
@@ -409,14 +415,19 @@ pub fn execute(
     if supplied.keys().any(|key| !names.contains(key.as_str()))
         || query.params.iter().any(|p| !supplied.contains_key(&p.name))
     {
+        let unknown: Vec<_> = supplied
+            .keys()
+            .filter(|key| !names.contains(key.as_str()))
+            .collect();
+        let missing: Vec<_> = names
+            .iter()
+            .filter(|name| !supplied.contains_key(**name))
+            .collect();
         bail!(
-            "invalid_database_query_arguments: parameters must match exactly: {}",
-            query
-                .params
-                .iter()
-                .map(|p| p.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            "invalid_database_query_arguments: params must contain exactly the parameters declared by {id}: {}; missing: {}; not declared: {}",
+            serde_json::to_string(&names).unwrap(),
+            serde_json::to_string(&missing).unwrap(),
+            serde_json::to_string(&unknown).unwrap()
         );
     }
     let values: Vec<QueryBind> = query

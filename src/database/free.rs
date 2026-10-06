@@ -13,6 +13,14 @@ fn bad(message: &str) -> anyhow::Error {
     anyhow::anyhow!("invalid_database_execution_arguments: {message}")
 }
 
+fn bad_at(field: &str, error: anyhow::Error) -> anyhow::Error {
+    let message = error.to_string();
+    let detail = message
+        .strip_prefix("invalid_database_execution_arguments: ")
+        .unwrap_or(&message);
+    bad(&format!("{field}: {detail}"))
+}
+
 fn safe_name(name: &str) -> bool {
     let pieces: Vec<_> = name.split('.').collect();
     (1..=3).contains(&pieces.len())
@@ -170,16 +178,17 @@ fn sql_binds(args: &Value) -> Result<Vec<(String, Input)>> {
     }
     let mut names = BTreeSet::new();
     params.iter().map(|(name, value)| {
-        if !identifier(name) { return Err(bad("bind names must begin with a letter and contain only letters, numbers or underscores")); }
+        if !identifier(name) { return Err(bad(&format!("params.{name}: bind names must begin with a letter and contain only letters, numbers or underscores"))); }
         if !names.insert(name.to_ascii_lowercase()) {
-            return Err(bad("bind names must be unique ignoring case"));
+            return Err(bad(&format!("params.{name}: bind names must be unique ignoring case")));
         }
         let kind = match value {
             Value::Bool(_) => "boolean",
             Value::Number(_) => "number",
             _ => "string",
         };
-        Ok((name.clone(), input(value, kind)?))
+        let value = input(value, kind).map_err(|error| bad_at(&format!("params.{name}"), error))?;
+        Ok((name.clone(), value))
     }).collect()
 }
 
@@ -210,65 +219,69 @@ fn call_args(args: &Value) -> Result<Vec<CallArg>> {
     }
     let mut names = BTreeSet::new();
     raw.iter()
-        .map(|entry| {
-            let entry = entry
-                .as_object()
-                .ok_or_else(|| bad("each args item must be an object"))?;
-            for key in entry.keys() {
-                if !["name", "direction", "type", "value"].contains(&key.as_str()) {
+        .enumerate()
+        .map(|(index, entry)| {
+            let parsed = (|| -> Result<CallArg> {
+                let entry = entry
+                    .as_object()
+                    .ok_or_else(|| bad("each args item must be an object"))?;
+                for key in entry.keys() {
+                    if !["name", "direction", "type", "value"].contains(&key.as_str()) {
+                        return Err(bad(
+                            "args items accept only name, direction, type and value",
+                        ));
+                    }
+                }
+                let name = entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| bad("each argument needs name"))?;
+                if !identifier(name)
+                    || name.eq_ignore_ascii_case("mnemoarc_result")
+                    || !names.insert(name.to_ascii_lowercase())
+                {
                     return Err(bad(
-                        "args items accept only name, direction, type and value",
+                        "argument names must be unique valid bind names and cannot be mnemoarc_result",
                     ));
                 }
-            }
-            let name = entry
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| bad("each argument needs name"))?;
-            if !identifier(name)
-                || name.eq_ignore_ascii_case("mnemoarc_result")
-                || !names.insert(name.to_ascii_lowercase())
-            {
-                return Err(bad(
-                    "argument names must be unique valid bind names and cannot be mnemoarc_result",
-                ));
-            }
-            let direction = match entry.get("direction") {
-                None => "in",
-                Some(value) => value
-                    .as_str()
-                    .ok_or_else(|| bad("direction must be a string: in, out or inout"))?,
-            };
-            if !["in", "out", "inout"].contains(&direction) {
-                return Err(bad("direction must be in, out or inout"));
-            }
-            let kind = match entry.get("type") {
-                None => "string",
-                Some(value) => value.as_str().ok_or_else(|| {
-                    bad("type must be a string: string, number, boolean or cursor")
-                })?,
-            };
-            output_type(kind)?;
-            if kind == "cursor" && direction != "out" {
-                return Err(bad("cursor is supported only as an OUT argument"));
-            }
-            if direction == "out" && entry.contains_key("value") {
-                return Err(bad("OUT arguments must omit value"));
-            }
-            if direction != "out" && !entry.contains_key("value") {
-                return Err(bad("IN and INOUT arguments need value (null is allowed)"));
-            }
-            let input = if direction == "out" {
-                Input::Text(None)
-            } else {
-                input(&entry["value"], kind)?
-            };
-            Ok(CallArg {
-                name: name.into(),
-                direction: direction.into(),
-                kind: kind.into(),
-                input,
-            })
+                let direction = match entry.get("direction") {
+                    None => "in",
+                    Some(value) => value
+                        .as_str()
+                        .ok_or_else(|| bad("direction must be a string: in, out or inout"))?,
+                };
+                if !["in", "out", "inout"].contains(&direction) {
+                    return Err(bad("direction must be in, out or inout"));
+                }
+                let kind = match entry.get("type") {
+                    None => "string",
+                    Some(value) => value.as_str().ok_or_else(|| {
+                        bad("type must be a string: string, number, boolean or cursor")
+                    })?,
+                };
+                output_type(kind)?;
+                if kind == "cursor" && direction != "out" {
+                    return Err(bad("cursor is supported only as an OUT argument"));
+                }
+                if direction == "out" && entry.contains_key("value") {
+                    return Err(bad("OUT arguments must omit value"));
+                }
+                if direction != "out" && !entry.contains_key("value") {
+                    return Err(bad("IN and INOUT arguments need value (null is allowed)"));
+                }
+                let input = if direction == "out" {
+                    Input::Text(None)
+                } else {
+                    input(&entry["value"], kind)?
+                };
+                Ok(CallArg {
+                    name: name.into(),
+                    direction: direction.into(),
+                    kind: kind.into(),
+                    input,
+                })
+            })();
+            parsed.map_err(|error| bad_at(&format!("args[{index}]"), error))
         })
         .collect()
 }

@@ -1577,10 +1577,11 @@ fn type_errors_name_the_expected_and_received_type() {
     let error = tools::execute(&mut s, "task_state", json!({"action":"update","patch":3}))
         .unwrap_err()
         .to_string();
-    assert_eq!(
-        error,
-        "invalid_argument_type: patch must be object, got number"
+    assert!(
+        error.starts_with("invalid_argument_type: patch must be object, got number"),
+        "{error}"
     );
+    assert!(error.contains("correct this field"), "{error}");
 }
 
 #[test]

@@ -1555,3 +1555,58 @@ async fn a_400_that_survives_dropping_the_format_does_not_disable_json_mode() {
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn empty_arguments_are_an_empty_object_and_rejected_calls_are_named() {
+    let empty = format!(
+        "{}data: [DONE]\n\n",
+        event(
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"source_lookup","arguments":""}}]},"finish_reason":"tool_calls"}]})
+        )
+    );
+    let duplicate = format!(
+        "{}data: [DONE]\n\n",
+        event(
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"same","function":{"name":"tool_catalog","arguments":"{}"}},{"index":1,"id":"same","function":{"name":"tool_catalog","arguments":"{}"}}]},"finish_reason":"tool_calls"}]})
+        )
+    );
+    let broken = format!(
+        "{}data: [DONE]\n\n",
+        event(
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"file_read","arguments":"{'path':'a'}"}}]},"finish_reason":"tool_calls"}]})
+        )
+    );
+    let run = |body: String| async move {
+        let (url, server) = server(body).await;
+        let config = Config {
+            base_url: url,
+            retries: 0,
+            ..support::compact_config()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = OpenAiClient
+            .complete(
+                json!({"messages":[]}),
+                &config,
+                CancellationToken::new(),
+                tx,
+            )
+            .await;
+        server.abort();
+        result
+    };
+    let out = run(empty).await.unwrap();
+    assert_eq!(out.calls[0].arguments, "{}");
+    let error = run(duplicate).await.unwrap_err().to_string();
+    assert!(
+        error.contains("malformed_tool_call: call ID \"same\" is used by more than one call"),
+        "{error}"
+    );
+    let error = run(broken).await.unwrap_err().to_string();
+    assert!(
+        error.contains(
+            "invalid_tool_arguments: file_read arguments are not one complete JSON object"
+        ),
+        "{error}"
+    );
+}

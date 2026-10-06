@@ -137,11 +137,11 @@ fn invalid_database_bind_arguments_are_rejected_before_connecting() {
             )
             .unwrap_err()
             .to_string();
+            assert!(error.starts_with("invalid_argument_type:"), "{error}");
             assert!(
-                error.starts_with("invalid_database_execution_arguments:"),
+                error.contains(&format!("args[0].{field} must be string")),
                 "{error}"
             );
-            assert!(error.contains(field), "{error}");
         }
     }
     let error = tools::execute(

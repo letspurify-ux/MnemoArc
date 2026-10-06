@@ -21,6 +21,19 @@ impl std::fmt::Display for DiagnosticError {
 
 impl std::error::Error for DiagnosticError {}
 
+pub(super) fn batch_result(item: &Value) -> &Value {
+    item.get("result")
+        .filter(|value| value.is_object())
+        .unwrap_or(item)
+}
+
+pub(super) fn is_failure(result: &Value) -> bool {
+    matches!(
+        result["status"].as_str(),
+        Some("error" | "cancelled" | "unsupported")
+    )
+}
+
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Class {
@@ -51,7 +64,8 @@ pub fn describe(message: &str) -> Value {
     };
     let (class, action) = if code == "cancelled" {
         (Class::Cancelled, "stop")
-    } else if code == "tool_worker_capacity" {
+    } else if matches!(code, "tool_worker_capacity" | "tool_worker_start_failed") {
+        // The worker thread never started, so the call did not run.
         (Class::Unavailable, "wait_for_tool_workers")
     } else if matches!(
         code,
@@ -86,6 +100,10 @@ pub fn describe(message: &str) -> Value {
         (Class::StaleState, "repair_memory_references")
     } else if code == "verification_sources_required" {
         (Class::MissingEvidence, "lookup_observed_evidence")
+    } else if code == "investigation_progress_required" {
+        (Class::Prerequisite, "advance_investigation")
+    } else if code == "investigation_superseded" {
+        (Class::StaleState, "refresh_matching_state")
     } else if code == "item_must_be_written_before_verification" || code == "review_repair_required"
     {
         (Class::Prerequisite, "complete_prerequisite")
@@ -156,12 +174,12 @@ pub fn describe(message: &str) -> Value {
         (Class::InvalidInput, "copy_observed_symbol_id")
     } else if matches!(
         code,
-        "verification_reserve"
-            | "database_disabled"
-            | "database_query_disabled_or_unknown"
-            | "database_password_missing"
-            | "database_execution_disabled"
+        "database_disabled" | "database_password_missing" | "database_execution_disabled"
     ) {
+        (Class::Prerequisite, "configure_database_in_settings")
+    } else if code == "database_query_disabled_or_unknown" {
+        (Class::InvalidInput, "select_enabled_database_query")
+    } else if code == "verification_reserve" {
         (Class::Prerequisite, "complete_prerequisite")
     } else if matches!(
         code,
@@ -180,6 +198,8 @@ pub fn describe(message: &str) -> Value {
     } else if matches!(
         code,
         "conflicting_path_filters"
+            | "file_symlink_not_allowed"
+            | "file_parent_not_directory"
             | "call_id_collision"
             | "malformed_tool_call"
             | "workflow_locked"
@@ -225,7 +245,8 @@ pub fn describe(message: &str) -> Value {
         (Class::Capacity, "reduce_request_or_cleanup")
     } else if matches!(
         code,
-        "checkpoint_pending"
+        "question_tools_not_allowed"
+            | "checkpoint_pending"
             | "tool_not_active"
             | "closing_mode"
             | "gap_requires_closing"
@@ -243,6 +264,7 @@ pub fn describe(message: &str) -> Value {
         || code == "conflicting_arguments"
         || code == "item_already_verified"
         || code == "whole_write_withheld"
+        || code == "completion_required"
     {
         (Class::InvalidInput, "correct_arguments")
     } else {
@@ -260,12 +282,35 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
     // Batch items need the same actionable, availability-filtered recovery
     // contract as standalone calls. Preserve successful siblings unchanged.
     if result["recovery"]["code"] == "batch_partial_failure" {
+        if !result["data"]["results"].is_array() {
+            // The worker may already have archived the detailed items. Keep
+            // its derived decision; missing detail is not a new empty batch.
+            let available = ToolRegistry::definitions(s);
+            if let Some(hints) = result
+                .get_mut("recovery")
+                .and_then(|recovery| recovery.get_mut("tools"))
+                .and_then(Value::as_array_mut)
+            {
+                hints.retain(|hint| available.iter().any(|d| d["function"]["name"] == *hint));
+            }
+            return;
+        }
         let mut hints = Vec::<Value>::new();
+        let mut uncertain = false;
+        let mut cancelled = false;
         if let Some(items) = result["data"]["results"].as_array_mut() {
             for item in items {
-                let nested = &mut item["result"];
-                if nested.is_object() && nested["status"] != "ok" {
+                let nested = if item.get("result").is_some_and(Value::is_object) {
+                    &mut item["result"]
+                } else {
+                    item
+                };
+                if is_failure(nested) {
                     attach(s, call, nested);
+                    uncertain |= nested["recovery"]["class"] == "outcome_unknown"
+                        || nested["recovery"]["action"] == "inspect_outcome_before_retry";
+                    cancelled |=
+                        nested["status"] == "cancelled" || nested["recovery"]["action"] == "stop";
                     for hint in nested["recovery"]["tools"].as_array().into_iter().flatten() {
                         if !hints.contains(hint) {
                             hints.push(hint.clone());
@@ -275,12 +320,28 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             }
         }
         result["recovery"]["tools"] = json!(hints);
+        result["recovery"]["document_repairable"] = json!(correctable_document_error(result));
+        if uncertain {
+            result["recovery"]["action"] = json!("inspect_outcome_before_retry");
+        } else if cancelled {
+            result["recovery"]["action"] = json!("stop");
+            result["recovery"]["tools"] = json!([]);
+        }
         return;
     }
     if result["recovery"].is_null() {
         result["recovery"] = describe(result["error"].as_str().unwrap_or("tool_error"));
     }
     let candidates: &[&str] = match result["recovery"]["action"].as_str().unwrap_or("") {
+        "advance_investigation" => &["investigation", "file_read", "document_edit"],
+        "configure_database_in_settings" => &[],
+        "select_enabled_database_query" => &["db_query"],
+        "correct_arguments" if call.name == "db_query" => &["db_query"],
+        "correct_arguments" if call.name == "db_execute" => &["db_execute"],
+        "correct_arguments" if call.name == "history" => &["history"],
+        "correct_arguments" if call.name == "source_lookup" => &["source_lookup"],
+        "correct_arguments" if call.name == "checkpoint_complete" => &["checkpoint_complete"],
+        "correct_arguments" if call.name == "tool_catalog" => &["tool_catalog"],
         "restore_memory_evidence" => &["memory_read", "source_lookup", "history"],
         "supply_memory_revision" => &[
             "memory_read",
@@ -336,6 +397,7 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             "source_search",
             "code_outline",
         ],
+        "inspect_outcome_before_retry" if call.name == "db_execute" => &["history", "db_query"],
         "inspect_outcome_before_retry" => &["history", "document_inspect", "file_read"],
         "use_available_tools" if result["recovery"]["code"] == "workflow_write_scope" => {
             &["document_inspect", "document_edit", "document_edit_batch"]
@@ -413,6 +475,9 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "refresh_matching_state" if call.name == "document_audit" => {
             &["document_audit", "document_inspect"]
         }
+        "refresh_matching_state" if call.name == "investigation" => {
+            &["investigation", "source_lookup", "document_inspect"]
+        }
         "refresh_matching_state" if call.name == "source_search" => &["source_search", "file_read"],
         "refresh_matching_state" if call.name == "file_list" => &["file_list"],
         "refresh_matching_state"
@@ -429,6 +494,8 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         }
         "refresh_matching_state" => &["code_outline", "file_read", "source_lookup", "history"],
         "reduce_request_or_cleanup" if call.name == "source_search" => &["source_search"],
+        "reduce_request_or_cleanup" if call.name == "db_query" => &["db_query"],
+        "reduce_request_or_cleanup" if call.name == "db_execute" => &["db_execute", "db_query"],
         "reduce_request_or_cleanup"
             if call.name == "file_list" && result["recovery"]["code"] == "file_scan_capacity" =>
         {
@@ -519,13 +586,22 @@ pub fn correctable_document_error(result: &Value) -> bool {
                     | "gap_requires_closing"
             )
         ),
-        Some("partial_failure") => result["data"]["results"].as_array().is_some_and(|items| {
-            !items.is_empty()
-                && items.iter().all(|item| {
-                    let result = item.get("result").unwrap_or(item);
-                    result["status"] == "ok" || correctable_document_error(result)
-                })
-        }),
+        Some("partial_failure") => result["data"]["results"].as_array().map_or_else(
+            || {
+                result["truncated"] == true
+                    && result["recovery"]["document_repairable"] == true
+                    && result["recovery"]["action"] == "repair_failed_items_only"
+            },
+            |items| {
+                !items.is_empty()
+                    && items.iter().all(|item| {
+                        let result = batch_result(item);
+                        result["status"] == "ok"
+                            || (result["status"] != "cancelled"
+                                && correctable_document_error(result))
+                    })
+            },
+        ),
         _ => false,
     }
 }

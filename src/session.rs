@@ -292,9 +292,15 @@ impl SessionHistory {
     }
     pub fn read(&self, id: u64) -> Result<&Bundle> {
         self.bundles.iter().find(|b| b.id == id).ok_or_else(|| {
+            let available = match (self.bundles.front(), self.bundles.back()) {
+                (Some(first), Some(last)) => format!("retained ids are {} to {}", first.id, last.id),
+                _ => "no history is retained".into(),
+            };
+            let pruned = self.pruned_through.map_or(String::new(), |id| {
+                format!("; ids up to {id} were pruned and cannot be restored")
+            });
             anyhow::anyhow!(
-                "history_unavailable: pruned_through={:?}",
-                self.pruned_through
+                "history_unavailable: history id {id} does not exist; {available}{pruned}. Copy an id from history action=search, or re-read the source with file_read"
             )
         })
     }
