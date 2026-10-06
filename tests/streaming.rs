@@ -1435,3 +1435,123 @@ async fn transient_error_events_in_a_stream_are_retried_and_others_are_not() {
         server.abort();
     }
 }
+
+/// Rejects the first `fail_all` requests whatever their format. With
+/// `fail_all == 0` it rejects every request that carries a response_format.
+async fn format_server(
+    fail_all: usize,
+) -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let formats = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = formats.clone();
+    let left = Arc::new(AtomicUsize::new(fail_all));
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let seen = seen.clone();
+            let left = left.clone();
+            async move {
+                let format = body["response_format"]["type"]
+                    .as_str()
+                    .unwrap_or("none")
+                    .to_owned();
+                seen.lock().unwrap().push(format.clone());
+                let failing = left
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok();
+                if failing || format != "none" && fail_all == 0 {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "model does not support feature: structured-outputs",
+                    )
+                        .into_response();
+                }
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    format!(
+                        "{}data: [DONE]\n\n",
+                        event(json!({"choices":[{"delta":{"content":"{\"issues\":[]}"},"finish_reason":"stop"}]}))
+                    ),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, formats, server)
+}
+
+#[tokio::test]
+async fn an_endpoint_rejecting_every_response_format_is_remembered() {
+    let (url, formats, server) = format_server(0).await;
+    let c = Config {
+        base_url: url,
+        model: "format-rejecting-test-model".into(),
+        retries: 0,
+        ..support::compact_config()
+    };
+    let request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let first = OpenAiClient
+        .complete(request.clone(), &c, CancellationToken::new(), tx)
+        .await
+        .unwrap();
+    assert_eq!(first.attempts, 3);
+    // A live run paid one rejected attempt on every later review call.
+    for _ in 0..2 {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let next = OpenAiClient
+            .complete(request.clone(), &c, CancellationToken::new(), tx)
+            .await
+            .unwrap();
+        assert_eq!(next.text, "{\"issues\":[]}");
+        assert_eq!(next.attempts, 1);
+        assert!(next.attempt_diagnostics.is_empty());
+    }
+    assert_eq!(
+        *formats.lock().unwrap(),
+        ["json_schema", "json_object", "none", "none", "none"]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_400_that_survives_dropping_the_format_does_not_disable_json_mode() {
+    // Every request fails at first, so dropping the format did not help:
+    // the 400 was not about the format and JSON mode stays in use.
+    let (url, formats, server) = format_server(2).await;
+    let c = Config {
+        base_url: url,
+        model: "unrelated-400-test-model".into(),
+        retries: 0,
+        ..support::compact_config()
+    };
+    let request = json!({"messages":[],"response_format":{"type":"json_object"}});
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    assert!(
+        OpenAiClient
+            .complete(request.clone(), &c, CancellationToken::new(), tx)
+            .await
+            .is_err()
+    );
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let next = OpenAiClient
+        .complete(request, &c, CancellationToken::new(), tx)
+        .await
+        .unwrap();
+    assert_eq!(next.attempts, 1);
+    assert_eq!(
+        *formats.lock().unwrap(),
+        ["json_object", "none", "json_object"]
+    );
+    server.abort();
+}

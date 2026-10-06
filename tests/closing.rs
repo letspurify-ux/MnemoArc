@@ -1078,11 +1078,14 @@ fn missing_paths_suggest_similar_project_files_and_directories_list_entries() {
     std::fs::write(dir.path().join("backend/src/server.js"), "listen();\n").unwrap();
     std::fs::write(dir.path().join("README.md"), "# App\n").unwrap();
     std::fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("backend/src/routes")).unwrap();
+    std::fs::write(dir.path().join("backend/src/routes/chat.js"), "route();\n").unwrap();
+    std::fs::write(dir.path().join("backend/src/app.credentials.json"), "{}\n").unwrap();
     let mut s = Session::new(
         Project {
             root: dir.path().into(),
             output: dir.path().join("out.md"),
-            exclude: vec![".env*".into()],
+            exclude: vec![".env*".into(), "*.credentials.json".into()],
             ..Default::default()
         },
         support::compact_config(),
@@ -1112,7 +1115,22 @@ fn missing_paths_suggest_similar_project_files_and_directories_list_entries() {
         .unwrap_err()
         .to_string();
     assert!(error.starts_with("path_is_directory"), "{error}");
-    assert!(error.contains("agent.js, server.js"), "{error}");
+    assert!(
+        error.contains("containing agent.js, routes/, server.js;"),
+        "{error}"
+    );
+    // Excluded files are not named either, whichever tool hit the directory.
+    s.active_tools = ToolRegistry::optional_names();
+    for (tool, args) in [
+        ("file_read", json!({"path":"backend/src"})),
+        ("document_inspect", json!({"path":"backend/src"})),
+        ("code_outline", json!({"path":"backend/src"})),
+    ] {
+        let error = tools::execute(&mut s, tool, args).unwrap_err().to_string();
+        assert!(error.starts_with("path_is_directory"), "{tool}: {error}");
+        assert!(error.contains("agent.js"), "{tool}: {error}");
+        assert!(!error.contains("credentials"), "{tool}: {error}");
+    }
 }
 
 #[test]
@@ -1894,4 +1912,126 @@ async fn repeated_empty_replies_without_a_document_report_creation_retry() {
         .expect("empty replies enter closing mode");
     assert!(notice.contains("문서 생성을 재시도"), "{notice}");
     assert!(!notice.contains("저장된 문서"), "{notice}");
+}
+
+/// Fills the history with complete groups a checkpoint may evict.
+fn pad_history(s: &mut Session, groups: usize) {
+    for i in 0..groups {
+        s.history.push(
+            vec![json!({"role":"user","content":format!("{i} {}", "context ".repeat(1000))})],
+            true,
+        );
+    }
+}
+
+#[test]
+fn closing_starts_a_checkpoint_only_when_the_request_no_longer_fits() {
+    use mnemoarc::context::ContextManager;
+    let (_dir, mut s) = verified_fixture();
+    pad_history(&mut s, 12);
+    let budget = ContextManager::input_budget(&s.config);
+    let above_high_water = (budget as f64 * (1.0 + s.config.high_water) / 2.0) as usize;
+    let mut steady = s.clone();
+    assert!(ContextManager::prepare(&mut steady, above_high_water).unwrap());
+    // Closing has a few bounded requests left; crossing high-water alone
+    // would spend them on cleanup the run may never use.
+    s.progress_recovery.closing = Some(Closing::default());
+    let mut closing = s.clone();
+    assert!(!ContextManager::prepare(&mut closing, above_high_water).unwrap());
+    assert!(closing.checkpoint.is_none());
+    assert!(ContextManager::prepare(&mut s, budget + 1).unwrap());
+}
+
+/// Spends the run budget on its first reply so closing starts, keeps working
+/// in closing, grows the context past the input budget on the request before
+/// the last, and answers once a request arrives after the checkpoint.
+struct ClosingCheckpoint {
+    pad_tokens: usize,
+    closing_rounds: Mutex<Vec<u64>>,
+    checkpoints: Mutex<usize>,
+}
+
+#[async_trait]
+impl LlmClient for ClosingCheckpoint {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let state: Value = request["messages"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .and_then(|message| message["content"].as_str())
+            .and_then(|content| content.split_once('\n'))
+            .and_then(|(_, json)| serde_json::from_str(json).ok())
+            .unwrap_or(Value::Null);
+        if let Some(id) = state["checkpoint"]["id"].as_str() {
+            *self.checkpoints.lock().unwrap() += 1;
+            return Ok(call(
+                &format!("ack-{id}"),
+                "checkpoint_complete",
+                json!({"id":id,"progress":"Finish the document","no_save_reason":"Nothing new to save"}),
+            ));
+        }
+        let closing = &state["run_guidance"]["closing"];
+        let Some(rounds) = closing["rounds"].as_u64() else {
+            let mut first = call("read-0", "file_read", json!({"path":"main.js"}));
+            first.usage = Some(Usage {
+                input: 9_200_000,
+                output: 0,
+                cached: None,
+            });
+            return Ok(first);
+        };
+        let mut seen = self.closing_rounds.lock().unwrap();
+        seen.push(rounds);
+        if *self.checkpoints.lock().unwrap() > 0 {
+            return Ok(Completion {
+                text: "Saved out.md".into(),
+                ..Default::default()
+            });
+        }
+        let limit = closing["round_limit"].as_u64().unwrap();
+        let line = 1 + seen.len() % 6;
+        // Document work keeps only the calls in history, so the context
+        // grows through a (rejected) argument rather than reply prose.
+        let mut args = json!({"path":"main.js","start_line":line,"max_lines":1});
+        if rounds + 1 == limit {
+            args["note"] = json!("notes ".repeat(self.pad_tokens));
+        }
+        Ok(call(&format!("read-{}", seen.len()), "file_read", args))
+    }
+}
+
+#[tokio::test]
+async fn a_checkpoint_on_the_last_closing_request_keeps_that_request() {
+    use mnemoarc::context::ContextManager;
+    let (_dir, mut s) = verified_fixture();
+    s.config.run_tokens = 10_000_000;
+    s.config.context_tokens = 128_000;
+    pad_history(&mut s, 4);
+    let budget = ContextManager::input_budget(&s.config);
+    let client = Arc::new(ClosingCheckpoint {
+        pad_tokens: budget,
+        closing_rounds: Mutex::new(vec![]),
+        checkpoints: Mutex::new(0),
+    });
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(s, client.clone(), CancellationToken::new(), tx).await;
+    drain.await.unwrap();
+    let rounds = client.closing_rounds.lock().unwrap().clone();
+    assert!(*client.checkpoints.lock().unwrap() > 0, "{rounds:?}");
+    // The checkpoint started on the last closing request. That request is
+    // sent after the checkpoint instead of being lost to it.
+    assert_eq!(
+        rounds.last().copied(),
+        Some(mnemoarc::agent::CLOSING_ROUND_LIMIT as u64),
+        "{rounds:?} {:?} {:?}",
+        result.completion_gaps,
+        result.last_error
+    );
+    assert_eq!(result.status, "complete", "{:?}", result.completion_gaps);
 }

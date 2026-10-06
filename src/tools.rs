@@ -1104,7 +1104,7 @@ fn reject_replacement_character(field: &str, text: &str) -> Result<()> {
 
 fn validate_document_edit_arguments(args: &Value) -> Result<()> {
     let action = args["action"].as_str().unwrap_or("");
-    validate_action_fields(
+    validate_action_fields_with(
         "document_edit",
         args,
         match action {
@@ -1125,6 +1125,7 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
             ][..],
             _ => &["action", "text"][..],
         },
+        document_action_hint,
     )?;
     let require = |key: &str| {
         if args.get(key).is_none() {
@@ -1653,7 +1654,8 @@ fn validate_document_edit_batch_edits(args: &Value) -> Result<()> {
                 for key in ["old_text", "expected_section_hash"] {
                     if object.contains_key(key) {
                         bail!(
-                            "unknown_argument: edits[{index}].{key} is not valid for action={action}"
+                            "unknown_argument: edits[{index}].{key} is not valid for action={action}{}",
+                            document_action_hint(action, key)
                         );
                     }
                 }
@@ -2597,17 +2599,43 @@ fn validate_history_arguments(args: &Value) -> Result<()> {
 }
 
 fn validate_action_fields(name: &str, args: &Value, allowed: &[&str]) -> Result<()> {
+    validate_action_fields_with(name, args, allowed, |_, _| String::new())
+}
+
+/// `hint(action, key)` may add the next step for a rejected argument.
+fn validate_action_fields_with(
+    name: &str,
+    args: &Value,
+    allowed: &[&str],
+    hint: impl Fn(&str, &str) -> String,
+) -> Result<()> {
     let object = args
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("invalid_tool_arguments: arguments must be an object"))?;
     if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
         let action = args["action"].as_str().unwrap_or("");
         bail!(
-            "invalid_action_arguments: {name} action={action} does not accept {key}; allowed: {}",
-            allowed.join(", ")
+            "invalid_action_arguments: {name} action={action} does not accept {key}; allowed: {}{}",
+            allowed.join(", "),
+            hint(action, key)
         );
     }
     Ok(())
+}
+
+/// Structural inserts anchor on the heading named by `section`; live runs
+/// sent them old_text meaning the passage-anchored inserts, and the bare
+/// "allowed:" list did not name those actions.
+fn document_action_hint(action: &str, key: &str) -> String {
+    match (action, key) {
+        ("insert_before" | "insert_after", "old_text") => format!(
+            "; {action} inserts a new section beside the heading named by section, so drop old_text and name that heading in section. To insert next to an exact passage instead, use action={action}_text with old_text"
+        ),
+        ("insert_first_child" | "insert_last_child", "old_text") => format!(
+            "; {action} inserts a child section under the heading named by section, so drop old_text. To insert next to an exact passage instead, use action=insert_before_text or insert_after_text with old_text"
+        ),
+        _ => String::new(),
+    }
 }
 type InvestigationContract = (
     &'static [&'static str],
@@ -3090,45 +3118,79 @@ fn similar_paths(p: &Project, missing: &Path) -> Vec<String> {
         .take(MAX_SUGGESTIONS)
         .collect()
 }
-/// Visible entries of a directory, for a read that named a directory.
-fn directory_entries(path: &Path) -> Vec<String> {
-    const MAX_ENTRIES: usize = 12;
-    let mut entries: Vec<String> = std::fs::read_dir(path)
-        .map(|read| {
-            read.flatten()
-                .filter_map(|entry| {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    let hidden = name.starts_with('.')
-                        || matches!(name.as_str(), "node_modules" | "target" | "dist" | "build");
-                    (!hidden).then(|| {
-                        if entry.path().is_dir() {
-                            format!("{name}/")
-                        } else {
-                            name
-                        }
-                    })
-                })
-                // These are examples for an error message. Stop before
-                // allocating names that the bounded diagnostic cannot show.
-                .take(MAX_ENTRIES)
-                .collect()
-        })
-        .unwrap_or_default();
-    entries.sort();
-    entries
+/// A file operation named a directory. File helpers do not know the
+/// project, so the tool layer adds the directory's entries under the
+/// project's ignore/include/exclude rules (see `directory_error`).
+#[derive(Debug)]
+pub(crate) struct DirectoryPath(PathBuf);
+
+impl std::fmt::Display for DirectoryPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "path_is_directory: {} is a directory; use file_list with path_glob (e.g. backend/**), then file_read with a file path",
+            self.0.display()
+        )
+    }
 }
+
+impl std::error::Error for DirectoryPath {}
+
+/// Entries of a directory a tool could read, as immediate children (`name`
+/// or `name/`). Built from the same scan as file_list, so ignored and
+/// excluded files are never named: a live run saw an excluded credentials
+/// file listed in this error.
+fn directory_entries(p: &Project, directory: &Path) -> (Vec<String>, usize) {
+    const MAX_ENTRIES: usize = 12;
+    let Ok(paths) = candidate_paths_bounded(
+        p,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+        Some(directory),
+        None,
+        FileScanLimits {
+            max_paths: 20_000,
+            max_path_bytes: 4 * 1024 * 1024,
+        },
+    ) else {
+        return (vec![], 0);
+    };
+    let mut entries = std::collections::BTreeSet::new();
+    for path in &paths {
+        let Ok(relative) = path.strip_prefix(directory) else {
+            continue;
+        };
+        let mut components = relative.components();
+        let Some(first) = components.next() else {
+            continue;
+        };
+        let name = first.as_os_str().to_string_lossy();
+        entries.insert(if components.next().is_some() {
+            format!("{name}/")
+        } else {
+            name.into_owned()
+        });
+    }
+    let total = entries.len();
+    (entries.into_iter().take(MAX_ENTRIES).collect(), total)
+}
+
+fn directory_error(p: &Project, directory: &DirectoryPath) -> anyhow::Error {
+    let (entries, total) = directory_entries(p, &directory.0);
+    let listing = match total.saturating_sub(entries.len()) {
+        _ if entries.is_empty() => String::new(),
+        0 => format!(" containing {}", entries.join(", ")),
+        more => format!(" containing {} and {more} more", entries.join(", ")),
+    };
+    anyhow::anyhow!(
+        "path_is_directory: {} is a directory{listing}; use file_list with path_glob (e.g. backend/**), then file_read with a file path",
+        directory.0.display()
+    )
+}
+
 fn regular_metadata(metadata: &std::fs::Metadata, path: &Path) -> Result<()> {
     if metadata.is_dir() {
-        let entries = directory_entries(path);
-        bail!(
-            "path_is_directory: {} is a directory{}; use file_list with path_glob (e.g. backend/**), then file_read with a file path",
-            path.display(),
-            if entries.is_empty() {
-                String::new()
-            } else {
-                format!(" containing {}", entries.join(", "))
-            }
-        );
+        return Err(DirectoryPath(path.to_path_buf()).into());
     }
     if !metadata.is_file() {
         bail!("unsupported_file_type: expected a regular text file");
@@ -4068,7 +4130,12 @@ pub fn execute_cancellable(
         bail!("question_tools_not_allowed: {name} changes task state or files; task preserved");
     }
     let _write = writes::acquire(name, cancel, &s.write_outcome_uncertain)?;
-    let result = execute_arguments(s, name, args, cancel);
+    let result = execute_arguments(s, name, args, cancel).map_err(|error| {
+        match error.downcast_ref::<DirectoryPath>() {
+            Some(directory) => directory_error(&s.project, directory),
+            None => error,
+        }
+    });
     // Publish an uncertain commit before releasing the gate; another session
     // must not start writing in the gap before the agent receives this result.
     if external_write(name)

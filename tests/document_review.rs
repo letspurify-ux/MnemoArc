@@ -2226,3 +2226,36 @@ fn a_skipped_page_blocks_approval_even_when_other_pages_are_clean() {
         document_review::PageSkip::NotApplicable
     );
 }
+
+#[test]
+fn a_bare_issue_array_is_read_as_the_issue_list() {
+    let (_dir, mut s) = fixture();
+    document_review::request(&mut s).unwrap();
+    // Models without structured output sent the list itself; serde read the
+    // array as the verdict's fields ("invalid type: map, expected a
+    // sequence") and the page was skipped on its last try.
+    support::document_review::finish(
+        &mut s,
+        "```json\n[\"Flow: for loop, not while; history omitted\"]\n```",
+    )
+    .unwrap();
+    assert!(!document_review::approved(&s));
+    assert!(
+        s.document_review
+            .issues
+            .iter()
+            .any(|issue| issue.contains("for loop, not while")),
+        "{:?}",
+        s.document_review.issues
+    );
+    document_review::request(&mut s).unwrap();
+    let error = support::document_review::finish(&mut s, "\"no issues\"")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "document_review_invalid: expected one JSON object {\"issues\":[...]}"
+    );
+    support::document_review::finish(&mut s, "[]").unwrap();
+    assert!(document_review::approved(&s));
+}

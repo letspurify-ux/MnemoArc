@@ -1058,8 +1058,7 @@ pub fn finish_verification(s: &mut Session, body: &str) -> Result<()> {
     struct Response {
         decisions: Vec<Decision>,
     }
-    let response: Response =
-        serde_json::from_str(body).map_err(|e| anyhow::anyhow!("document_review_invalid: {e}"))?;
+    let response: Response = super::parse_reply(body, "decisions", "document_review_invalid")?;
     let state = &s.document_review;
     let mut inferred = BTreeSet::new();
     let ids: BTreeSet<_> = response.decisions.iter().map(|d| d.id.clone()).collect();

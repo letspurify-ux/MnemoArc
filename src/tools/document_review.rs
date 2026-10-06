@@ -1072,6 +1072,25 @@ fn request_page(s: &mut Session) -> Result<Option<Value>> {
     Ok(Some(request))
 }
 
+/// Parse a review reply whose contract is one object holding the `field`
+/// list. A bare top-level array is that list: models without structured
+/// output sent one, and serde then read the array as the struct's fields in
+/// order ("invalid type: map, expected a sequence"), which skipped a page on
+/// its last try. Any other non-object reply names the expected shape.
+pub(crate) fn parse_reply<T: serde::de::DeserializeOwned>(
+    body: &str,
+    field: &str,
+    code: &str,
+) -> Result<T> {
+    let value: Value = serde_json::from_str(body).map_err(|e| anyhow::anyhow!("{code}: {e}"))?;
+    let value = match value {
+        Value::Array(items) => json!({ field: items }),
+        Value::Object(_) => value,
+        _ => bail!("{code}: expected one JSON object {{\"{field}\":[...]}}"),
+    };
+    serde_json::from_value(value).map_err(|e| anyhow::anyhow!("{code}: {e}"))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Verdict {
@@ -1145,8 +1164,7 @@ fn finish_response(s: &mut Session, text: &str, last_try: bool) -> Result<()> {
         }
         return finish_review(s, digest);
     }
-    let verdict: Verdict =
-        serde_json::from_str(body).map_err(|e| anyhow::anyhow!("document_review_invalid: {e}"))?;
+    let verdict: Verdict = parse_reply(body, "issues", "document_review_invalid")?;
     let doc_text = read_text(&output_path(&s.project)?)?;
     findings::collect(s, verdict.issues, &doc_text, last_try)?;
     let state = &mut s.document_review;

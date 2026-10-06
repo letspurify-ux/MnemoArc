@@ -21,7 +21,13 @@ fn structured(payload: &Value, text: &str) -> String {
     let Ok(mut value) = serde_json::from_str::<Value>(body) else {
         return text.into();
     };
-    let Some(issues) = value["issues"].as_array_mut() else {
+    // A bare array is the issue list itself; keep that shape for the runtime.
+    let issues = if value.is_array() {
+        value.as_array_mut()
+    } else {
+        value.get_mut("issues").and_then(Value::as_array_mut)
+    };
+    let Some(issues) = issues else {
         return text.into();
     };
     let line = payload["document_line_start"].as_u64().unwrap_or(1);

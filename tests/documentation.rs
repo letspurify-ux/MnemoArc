@@ -4808,3 +4808,67 @@ fn anchored_text_edits_accept_an_omitted_hash_but_check_a_supplied_one() {
         "# Guide\nstart line\nmiddle line\nlast line\n"
     );
 }
+
+#[test]
+fn structural_inserts_given_old_text_name_the_passage_anchored_action() {
+    let (_dir, mut s) = setup();
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n## Setup\nInstall it.\n"}),
+    );
+    let hash = created["hash"].as_str().unwrap().to_owned();
+    // A live run sent old_text to insert_before and later insert_after; the
+    // error listed allowed arguments but never named insert_*_text.
+    for action in ["insert_before", "insert_after"] {
+        let error = tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":action,"section":"# Guide\n## Setup","old_text":"Install it.","text":"Note.\n","expected_hash":hash}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with(&format!(
+                "invalid_action_arguments: document_edit action={action} does not accept old_text"
+            )),
+            "{error}"
+        );
+        assert!(
+            error.contains("drop old_text and name that heading in section"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("use action={action}_text with old_text")),
+            "{error}"
+        );
+    }
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_last_child","section":"# Guide","old_text":"Install it.","text":"## Use\n","expected_hash":hash}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("insert_before_text or insert_after_text"),
+        "{error}"
+    );
+    let error = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":hash,"edits":[{"action":"insert_after","section":"# Guide\n## Setup","old_text":"Install it.","text":"## Use\n"}]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("edits[0].old_text is not valid for action=insert_after; insert_after inserts a new section"),
+        "{error}"
+    );
+    // The named action accepts the same call.
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after_text","old_text":"Install it.","text":" Then run it.","expected_hash":hash}),
+    );
+}

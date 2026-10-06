@@ -648,6 +648,26 @@ async fn rejected_acceptance_does_not_stop_a_late_document_repair() {
     assert_eq!(deltas, ["Saved report.md"]);
 }
 
+#[test]
+fn a_bare_check_array_is_read_as_the_check_list() {
+    let (_dir, mut s) = fixture();
+    tools::completion_review::begin(&mut s, "Saved report.md").unwrap();
+    let request = tools::completion_review::request(&mut s).unwrap();
+    let payload: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    let checks: Vec<Value> = payload["criteria"].as_array().unwrap().iter().map(|criterion|
+        json!({"id":criterion["id"],"status":"unmet","reason":"Only a draft is saved", "evidence":[],"next_action":"Finish the requested document"})
+    ).collect();
+    // The list without its {"checks":...} wrapper is accepted as the verdict.
+    assert!(
+        tools::completion_review::finish(&mut s, &json!(checks).to_string())
+            .unwrap()
+            .is_none()
+    );
+    assert!(!s.completion_review.approved);
+    assert_eq!(s.completion_review.checks.len(), checks.len());
+}
+
 struct LateAcceptance {
     client: DocumentClient,
     reviews: Mutex<usize>,

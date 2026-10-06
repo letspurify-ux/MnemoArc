@@ -30,7 +30,7 @@ const REVIEW_RESPONSE_LIMIT: usize = 8;
 const REVIEW_UNAVAILABLE_LIMIT: usize = 3;
 /// Model requests available once closing mode starts. The runtime finishes
 /// the document itself when they are spent.
-const CLOSING_ROUND_LIMIT: usize = 12;
+pub const CLOSING_ROUND_LIMIT: usize = 12;
 const MAX_REPORTED_GAPS: usize = 30;
 
 /// Requests without a new best progress score before closing mode. Earlier
@@ -1386,6 +1386,9 @@ pub async fn run_session_controlled(
             s.checkpoint.is_none() && (s.completion_review.pending || s.document_review.pending);
         let counts_as_round = std::mem::replace(&mut ladder_request_completed, true)
             && (!review_request || review_response_failures > 0);
+        // A closing request counted here may still become a checkpoint
+        // request below; that request then returns its closing round.
+        let mut closing_round_counted = false;
         if s.checkpoint.is_none() {
             // Reading new sources is progress until the document exists, even
             // after the budget or a required investigation switches the
@@ -1442,6 +1445,7 @@ pub async fn run_session_controlled(
             if let Some(closing) = &mut s.progress_recovery.closing {
                 if counts_as_round {
                     closing.rounds = closing.rounds.saturating_add(1);
+                    closing_round_counted = true;
                 }
                 if closing.rounds > CLOSING_ROUND_LIMIT {
                     if let Some(text) = force_finish(&mut s, "closing_round_limit") {
@@ -1637,9 +1641,21 @@ pub async fn run_session_controlled(
             }
         };
         let estimate = context::count(&request, &s.config.model);
+        let checkpoint_was_open = s.checkpoint.is_some();
         if let Err(e) = ContextManager::prepare(&mut s, estimate) {
             failure = Some(e.to_string());
             break;
+        }
+        // Checkpoint requests do not count as closing rounds, so the one that
+        // just started must not spend the round counted above either:
+        // otherwise the last closing request becomes cleanup and the run is
+        // force-finished right after the checkpoint completes.
+        if closing_round_counted
+            && !checkpoint_was_open
+            && s.checkpoint.is_some()
+            && let Some(closing) = &mut s.progress_recovery.closing
+        {
+            closing.rounds = closing.rounds.saturating_sub(1);
         }
         if let Some(cp) = &mut s.checkpoint {
             let (max_requests, max_failures) = if document_work {

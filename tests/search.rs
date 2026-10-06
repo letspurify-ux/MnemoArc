@@ -546,3 +546,39 @@ fn an_empty_filled_alternative_to_query_is_not_a_conflict() {
     .to_string();
     assert!(err.starts_with("conflicting_arguments:"), "{err}");
 }
+
+#[test]
+fn search_text_sent_as_pattern_is_named_as_a_file_glob() {
+    let (dir, mut s) = setup();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+    // A live run sent its search text as pattern three times, then stopped
+    // using source_search: the error never said what pattern means.
+    let error = tools::execute(
+        &mut s,
+        "source_search",
+        json!({"path":"src","pattern":"fn main","mode":"matches"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("missing_argument: query or queries; pattern \"fn main\" is a file glob"),
+        "{error}"
+    );
+    assert!(error.contains("send the text as query"), "{error}");
+    assert!(
+        error.contains("drop pattern, since path already sets the scope"),
+        "{error}"
+    );
+    let error = tools::execute(&mut s, "source_search", json!({"pattern":"fn main"}))
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("drop pattern"), "{error}");
+    // Following the hint succeeds.
+    let found = search(&mut s, json!({"path":"src","query":"fn main"}));
+    assert_eq!(
+        found["matches"].as_array().map(Vec::len),
+        Some(1),
+        "{found}"
+    );
+}

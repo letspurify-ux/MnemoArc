@@ -252,6 +252,13 @@ static JSON_SCHEMA_STREAM_RECOVERED: std::sync::Mutex<SchemaCache> =
 static JSON_SCHEMA_STREAM_SUSPECTED: std::sync::Mutex<SchemaCache> =
     std::sync::Mutex::new(SchemaCache(VecDeque::new()));
 
+/// Endpoints (base URL and model) that rejected every response_format,
+/// strict schema and plain JSON mode alike. Recorded only after the same
+/// request then succeeded without one, so an unrelated 400 cannot disable
+/// JSON mode. A live run otherwise paid a failed attempt on every review call.
+static RESPONSE_FORMAT_REJECTED: std::sync::Mutex<SchemaCache> =
+    std::sync::Mutex::new(SchemaCache(VecDeque::new()));
+
 struct SchemaCache(VecDeque<[u8; 32]>);
 impl SchemaCache {
     const MAX_ENTRIES: usize = 128;
@@ -782,6 +789,13 @@ impl LlmClient for OpenAiClient {
         {
             downgrade_json_schema(&mut request);
         }
+        let format_rejected = request.get("response_format").is_some()
+            && RESPONSE_FORMAT_REJECTED
+                .lock()
+                .is_ok_and(|mut rejected| rejected.contains(&schema_endpoint(c)));
+        if format_rejected && let Some(fields) = request.as_object_mut() {
+            fields.remove("response_format");
+        }
         let emitted_text = Arc::new(AtomicBool::new(false));
         let mut attempt = 0usize;
         // The optional response-format fallback is a compatibility attempt,
@@ -790,7 +804,7 @@ impl LlmClient for OpenAiClient {
         // fallback cannot either consume all retries or make retries=0 loop
         // forever after a subsequent 429/5xx response.
         let mut transient_retries = 0usize;
-        let mut response_format_fallback = false;
+        let mut response_format_fallback = format_rejected;
         let mut schema_stream_fallback = false;
         let request_id = uuid::Uuid::new_v4().to_string();
         let mut attempt_diagnostics = Vec::new();
@@ -813,6 +827,13 @@ impl LlmClient for OpenAiClient {
                 Ok(mut r) => {
                     if let Some(key) = &schema_key {
                         note_schema_stream_result(key, &request, schema_stream_fallback);
+                    }
+                    // This request recovered by dropping a rejected format.
+                    if response_format_fallback
+                        && !format_rejected
+                        && let Ok(mut rejected) = RESPONSE_FORMAT_REJECTED.lock()
+                    {
+                        rejected.insert(schema_endpoint(c));
                     }
                     r.attempts = attempt.saturating_add(1);
                     r.attempt_diagnostics = attempt_diagnostics;

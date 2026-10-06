@@ -13,6 +13,24 @@ fn displayed_line(line: usize, text: &str) -> Value {
     json!({"line":line,"text":text.chars().take(500).collect::<String>(),"truncated":text.chars().count()>500})
 }
 
+/// Models often send the search text as `pattern`, which is the legacy
+/// file-glob alias of path_glob. Without this, a bare "missing query" error
+/// left a live run retrying the same call and then avoiding the tool.
+fn pattern_hint(args: &Value) -> String {
+    let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
+        return String::new();
+    };
+    let shown: String = pattern.chars().take(80).collect();
+    format!(
+        "; pattern {shown:?} is a file glob that filters paths (legacy alias of path_glob), not the text to find; send the text as query (literal by default, regex:true for a regular expression){}",
+        if args.get("path").is_some() {
+            " and drop pattern, since path already sets the scope"
+        } else {
+            ""
+        }
+    )
+}
+
 pub(super) fn execute(
     s: &mut Session,
     args: &Value,
@@ -39,7 +57,7 @@ pub(super) fn execute(
     }
     let args = &args;
     match (args.get("query").is_some(), args.get("queries").is_some()) {
-        (false, false) => bail!("missing_argument: query or queries"),
+        (false, false) => bail!("missing_argument: query or queries{}", pattern_hint(args)),
         (true, true) => bail!(
             "conflicting_arguments: supply exactly one of query (literal by default) or queries (literal OR)"
         ),
@@ -58,7 +76,7 @@ pub(super) fn execute(
             bail!("conflicting_arguments: queries is literal OR; use query for regex");
         }
     } else if query.is_empty() {
-        bail!("missing_argument: query or queries");
+        bail!("missing_argument: query or queries{}", pattern_hint(args));
     }
     if args.get("path").is_some()
         && (args.get("path_glob").is_some() || args.get("pattern").is_some())

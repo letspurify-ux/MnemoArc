@@ -745,8 +745,8 @@ pub fn finish(s: &mut Session, response: &str) -> Result<Option<String>> {
     {
         body = content.trim();
     }
-    let mut verdict: Verdict = serde_json::from_str(body)
-        .map_err(|e| anyhow::anyhow!("completion_review_invalid: {e}"))?;
+    let mut verdict: Verdict =
+        super::document_review::parse_reply(body, "checks", "completion_review_invalid")?;
     if fingerprint(&snapshot_unbounded(s, &s.completion_review.draft))
         != s.completion_review.fingerprint
     {

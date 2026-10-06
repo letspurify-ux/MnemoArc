@@ -536,7 +536,16 @@ impl ContextManager {
                 Self::input_budget(c).min(Self::input_budget(&s.config))
             }) as f64
             / Self::token_ratio(s)) as usize;
-        if request_tokens < (budget as f64 * s.config.high_water) as usize
+        // Closing mode has a few bounded requests left, and input_budget
+        // already reserves room for cleanup. A checkpoint there costs several
+        // requests that the run may never use, so only a request that no
+        // longer fits starts one; crossing high-water alone does not.
+        let threshold = if s.progress_recovery.closing.is_some() {
+            budget
+        } else {
+            (budget as f64 * s.config.high_water) as usize
+        };
+        if request_tokens < threshold
             && s.history.bytes()
                 < s.pending_config
                     .as_ref()
