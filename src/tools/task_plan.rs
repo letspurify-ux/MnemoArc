@@ -532,6 +532,34 @@ fn parse_operations(value: &Value) -> Result<Parsed> {
                 normalized = true;
             }
         }
+        if item["op"] == "update" {
+            let object = item.as_object_mut().unwrap();
+            let id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("the item")
+                .to_owned();
+            // A live model "completed" an item five times with update and a
+            // real result: the result was discarded as a schema placeholder
+            // and the reply only said unchanged, so the item stayed open.
+            if object.contains_key("done") {
+                return Err(operation_error(
+                    format!(
+                        "operations[{i}]: update has no done field and cannot finish an item; to finish {id} after doing its work, send {{\"op\":\"complete\",\"id\":\"{id}\",\"result\":\"<observed result>\"}}"
+                    ),
+                    json!({"code":"invalid_operations","operation_index":i,"operation":"update","target_id":id}),
+                ));
+            }
+            if object
+                .get("result")
+                .and_then(Value::as_str)
+                .is_some_and(|result| result.trim().chars().count() >= 8)
+            {
+                notices.push(format!(
+                    "operations[{i}]: update changes only an item's text, so result was ignored and {id} is still unfinished; to finish it after doing its work, send {{\"op\":\"complete\",\"id\":\"{id}\",\"result\":...}}"
+                ));
+            }
+        }
         if matches!(item["op"].as_str(), Some("remove" | "reopen")) {
             let object = item.as_object_mut().unwrap();
             // The mirror of complete: the shared schema also offers result,
@@ -665,7 +693,8 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
         && next.todos_completed_total == s.task.todos_completed_total
     {
         return Ok(with_notices(
-            json!({"applied":true,"unchanged":true,"input_normalized":normalized,"plan":view(&s.task, 0, DEFAULT_PAGE)}),
+            json!({"applied":true,"unchanged":true,"input_normalized":normalized,"plan":view(&s.task, 0, DEFAULT_PAGE),
+                "guidance":"Nothing changed: the plan already matched this request, so no item was added, updated or completed. Do not resend it; continue the current item's work, or use the operation that makes the intended change (complete finishes an item)."}),
             notices,
         ));
     }

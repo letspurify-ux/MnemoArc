@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 use axum::{Json, Router, http::StatusCode, routing::post};
 use mnemoarc::{
     config::{Config, Secret},

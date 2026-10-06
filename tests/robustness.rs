@@ -256,22 +256,33 @@ impl LlmClient for Panicking {
         panic!("injected model failure")
     }
 }
-struct LengthLimited(Notify);
+/// Answers once with a length-limited reply, then waits for cancellation.
+/// The second request proves length recovery inspected the FIFO output
+/// without blocking; holding it keeps the run alive until the test cancels,
+/// however fast the recovery rounds run.
+struct LengthLimited {
+    calls: std::sync::atomic::AtomicUsize,
+    recovered: Notify,
+}
 #[async_trait]
 impl LlmClient for LengthLimited {
     async fn complete(
         &self,
         _: Value,
         _: &Config,
-        _: CancellationToken,
+        cancel: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> anyhow::Result<Completion> {
-        self.0.notify_one();
-        Ok(Completion {
-            text: "partial answer".into(),
-            length_limited: true,
-            ..Default::default()
-        })
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Ok(Completion {
+                text: "partial answer".into(),
+                length_limited: true,
+                ..Default::default()
+            });
+        }
+        self.recovered.notify_one();
+        cancel.cancelled().await;
+        anyhow::bail!("cancelled")
     }
 }
 
@@ -295,34 +306,31 @@ async fn length_recovery_rejects_fifo_output_and_can_cancel() {
     s.config.source_document_review = false;
     s.config.completion_review_enabled = false;
     let cancel = CancellationToken::new();
-    let client = Arc::new(LengthLimited(Notify::new()));
+    let client = Arc::new(LengthLimited {
+        calls: Default::default(),
+        recovered: Notify::new(),
+    });
     let (tx, mut rx) = mpsc::channel(128);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let mut job = tokio::spawn(agent::run_session(s, client.clone(), cancel.clone(), tx));
-    tokio::time::timeout(Duration::from_secs(5), client.0.notified())
+    let job = tokio::spawn(agent::run_session(s, client.clone(), cancel.clone(), tx));
+    let recovered = tokio::time::timeout(Duration::from_secs(5), client.recovered.notified())
         .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+        .is_ok();
+    if !recovered {
+        // Release the FIFO reader so the test fails without leaving a blocked
+        // runtime thread behind.
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path);
+    }
     cancel.cancel();
-    let result = tokio::time::timeout(Duration::from_millis(900), &mut job).await;
-    let timely = result.is_ok();
-    let returned = match result {
-        Ok(result) => result.unwrap(),
-        Err(_) => {
-            // Release the FIFO reader if this regresses, so the test can fail
-            // without leaving a blocked runtime thread behind.
-            let _ = std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&path);
-            tokio::time::timeout(Duration::from_secs(3), job)
-                .await
-                .unwrap()
-                .unwrap()
-        }
-    };
+    let returned = tokio::time::timeout(Duration::from_secs(3), job)
+        .await
+        .unwrap()
+        .unwrap();
     drain.await.unwrap();
-    assert!(timely, "length recovery blocked on a FIFO output");
+    assert!(recovered, "length recovery blocked on a FIFO output");
     assert_eq!(returned.status, "cancelled");
 }
 struct RetainedSender(Mutex<Option<mpsc::Sender<String>>>);

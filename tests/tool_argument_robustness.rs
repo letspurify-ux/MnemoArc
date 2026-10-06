@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 use mnemoarc::{
     config::Project,
     llm::{MAX_TOOL_CALL_ID_BYTES, ToolCall},

@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;

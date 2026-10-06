@@ -1,5 +1,5 @@
 //! Explicit paid-model regressions. Oracles check facts, not prose keywords.
-mod support;
+use crate::support;
 use mnemoarc::{
     agent,
     config::{Config, Project, Secret},

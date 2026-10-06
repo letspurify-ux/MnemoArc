@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 use mnemoarc::{
     config::{Config, Project},
     session::Session,
@@ -2299,4 +2299,121 @@ fn echoed_request_keys_and_summary_markers_do_not_reject_a_review() {
     let (_dir, mut s) = fixture();
     review::request(&mut s).unwrap();
     assert!(review::finish(&mut s, r#"{"issues":["just text"]}"#).is_err());
+}
+
+#[test]
+fn a_defect_visible_in_the_document_alone_is_a_document_finding() {
+    // Live run 2026-10-06: the reviewer reported mixed-language text and a
+    // contradiction between two sections as factual with no sources or with
+    // "path":"document"; every attempt was rejected until the lines gapped.
+    let (_dir, mut s) = fixture();
+    let request = review::request(&mut s).unwrap();
+    assert!(
+        request.to_string().contains(r#""document"]"#),
+        "kind enum lists document"
+    );
+    assert!(
+        request["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("use document for a defect visible in the document text alone")
+    );
+    let mut garbled = proposal("한국어 문장에 다른 언어 문자가 섞였습니다.");
+    garbled["sources"] = json!([]);
+    garbled["ui_labels"] = json!(["삭제됩니다"]);
+    let mut contradiction = proposal("2행과 3행이 서로 다른 동작을 설명합니다.");
+    contradiction["document"] =
+        json!({"start_line":3,"end_line":3,"quote":"검색 결과가 없습니다."});
+    contradiction["sources"] = json!([{"path":"document","start_line":2,"end_line":2,
+        "quote":"키 지우기를 누르면 저장 시 등록한 키가 삭제됩니다."}]);
+    submit(&mut s, vec![garbled, contradiction]);
+    assert!(s.document_review.validating);
+    let validation = payload(review::request(&mut s).unwrap());
+    let candidates = validation["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2, "{validation}");
+    for candidate in candidates {
+        assert_eq!(candidate["kind"], "document", "{candidate}");
+        assert_eq!(candidate["ui_labels"], json!([]), "{candidate}");
+    }
+    let sources = &candidates[1]["observed_context"]["sources"];
+    assert_eq!(sources[0]["path"], "document", "{sources}");
+    assert!(
+        sources[0]["context"]
+            .as_str()
+            .unwrap()
+            .contains("키 지우기"),
+        "{sources}"
+    );
+    review::finish(
+        &mut s,
+        &json!({"decisions":[decision("F1", "confirmed"), decision("F2", "confirmed")]})
+            .to_string(),
+    )
+    .unwrap();
+    assert!(!review::approved(&s));
+    assert_eq!(
+        s.document_review.issues.len(),
+        2,
+        "{:?}",
+        s.document_review.issues
+    );
+}
+
+#[test]
+fn document_findings_cite_only_this_document_and_unverified_ones_leave_no_gap() {
+    // A project file makes the claim factual, not a document defect.
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let mut mixed = proposal("Document kind with a file");
+    mixed["kind"] = json!("document");
+    let error = review::finish(&mut s, &json!({"issues":[mixed]}).to_string()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("issues[0].sources[0] is a project file"),
+        "{error}"
+    );
+    // A document passage must exist in the document.
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let mut absent = proposal("Contradiction with an absent passage");
+    absent["sources"] = json!([{"path":"document","start_line":3,"end_line":3,"quote":"문서에 없는 반대 문장입니다."}]);
+    let error = review::finish(&mut s, &json!({"issues":[absent]}).to_string()).unwrap_err();
+    assert!(
+        error.to_string().contains("issues[0].sources[0] document:"),
+        "{error}"
+    );
+    // File evidence keeps a factual claim factual; document passages beside
+    // it are dropped rather than rejecting the issue.
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let mut factual = proposal("Factual with an extra document passage");
+    factual["sources"].as_array_mut().unwrap().push(
+        json!({"path":"document","start_line":3,"end_line":3,"quote":"검색 결과가 없습니다."}),
+    );
+    submit(&mut s, vec![factual]);
+    let validation = payload(review::request(&mut s).unwrap());
+    assert_eq!(validation["candidates"][0]["kind"], "factual");
+    assert_eq!(
+        validation["candidates"][0]["sources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // On a last try a sourceless issue is judged, not gapped; a document
+    // finding the validator cannot establish is dropped like a dismissal.
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let mut sourceless = proposal("Needs code evidence that was not supplied");
+    sourceless["sources"] = json!([]);
+    review::finish_last_try(&mut s, &json!({"issues":[sourceless]}).to_string()).unwrap();
+    assert!(
+        s.document_review.issue_drop_log.is_empty(),
+        "{:?}",
+        s.document_review.issue_drop_log
+    );
+    validate(&mut s, vec![decision("F1", "unverified")]);
+    assert!(review::unavailable_ranges(&s).is_empty());
+    assert!(review::approved(&s));
 }

@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 use async_trait::async_trait;
 use mnemoarc::{
     agent::{AgentEvent, run_session},

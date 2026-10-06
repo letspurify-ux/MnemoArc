@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Session-local memory agent for evidence-based source documentation"
 license = "MIT"
+autotests = false
 
 [dependencies]
 anyhow = "1"
@@ -49,3 +50,51 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+
+# Integration tests: see tests/suite.rs for why most files share one binary.
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
+
+[[test]]
+name = "concurrent_writes"
+path = "tests/concurrent_writes.rs"
+
+[[test]]
+name = "config_environment"
+path = "tests/config_environment.rs"
+
+[[test]]
+name = "live_checkpoint"
+path = "tests/live_checkpoint.rs"
+
+[[test]]
+name = "live_documentation"
+path = "tests/live_documentation.rs"
+
+[[test]]
+name = "live_message_recovery"
+path = "tests/live_message_recovery.rs"
+
+[[test]]
+name = "proxy"
+path = "tests/proxy.rs"
+
+[[test]]
+name = "robustness"
+path = "tests/robustness.rs"
+
+[[test]]
+name = "web_launcher"
+path = "tests/web_launcher.rs"
+
+# Dependencies (tiktoken, serde_json, tree-sitter, regex) do the per-round
+# work of agent scenario tests; unoptimized they made those tests 7-8x slower.
+# This crate stays unoptimized, so incremental rebuilds keep their speed.
+[profile.dev.package."*"]
+opt-level = 2
+
+# Line tables keep file:line in test panics while shrinking each test binary,
+# which shortens linking and the first-run scan of every rebuilt binary.
+[profile.test]
+debug = "line-tables-only"

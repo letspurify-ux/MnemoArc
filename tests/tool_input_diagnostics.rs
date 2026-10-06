@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 use mnemoarc::{
     database::SavedQuery,
     llm::ToolCall,
@@ -1104,4 +1104,17 @@ fn a_tool_withheld_by_a_checkpoint_names_itself_and_the_next_step() {
         result["recovery"]["tools"][0], "checkpoint_complete",
         "{result}"
     );
+}
+
+#[test]
+fn a_repeated_unchanged_plan_apply_is_marked() {
+    let mut tracker = tools::recovery::FailureTracker::default();
+    let args = r#"{"action":"apply","expected_revision":2}"#;
+    let unchanged = || json!({"status":"ok","data":{"applied":true,"unchanged":true}});
+    let mut first = unchanged();
+    tracker.mark_repeated_failure("task_plan", args, &mut first);
+    assert!(first["data"]["repeated_unchanged"].is_null());
+    let mut second = unchanged();
+    tracker.mark_repeated_failure("task_plan", args, &mut second);
+    assert_eq!(second["data"]["repeated_unchanged"]["count"], 2, "{second}");
 }

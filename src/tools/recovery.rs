@@ -719,9 +719,11 @@ impl FailureTracker {
     /// transient or uncertain failures may succeed on a later retry. The
     /// error text is left unchanged so other identical-failure checks hold.
     pub fn mark_repeated_failure(&mut self, tool: &str, arguments: &str, result: &mut Value) {
-        let unapplied_plan = tool == "task_plan" && result["data"]["applied"] == false;
+        // An unchanged apply is not a failure, but resending it is a no-op.
+        let unapplied_plan = tool == "task_plan"
+            && (result["data"]["applied"] == false || result["data"]["unchanged"] == true);
         let reason = if unapplied_plan {
-            result["data"]["reason"].as_str()
+            result["data"]["reason"].as_str().or(Some("unchanged"))
         } else if result["status"] != "ok"
             && matches!(
                 result["recovery"]["class"].as_str(),

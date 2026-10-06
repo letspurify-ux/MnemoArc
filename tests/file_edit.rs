@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 use mnemoarc::{config::Project, session::Session, tools};
 use serde_json::{Value, json};
 

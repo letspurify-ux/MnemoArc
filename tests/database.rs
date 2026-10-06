@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 use mnemoarc::{
     config::Config,
     database::{DatabaseConfig, QueryParam, SavedQuery},

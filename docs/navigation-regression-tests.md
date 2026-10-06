@@ -44,7 +44,7 @@
 일반 테스트는 유료 API를 호출하지 않는다.
 
 ```sh
-cargo test --test navigation_eval
+cargo test --test suite navigation_eval::
 ```
 
 명시적으로 유료 모델 평가를 실행하려면 저장된 설정과 인증 정보를 사용한다. 모델 응답 전문이나 세션 대화 전체 대신 최종 답변·도구 호출·판정 결과를 선택한 보고서 경로에 저장한다. 인증 정보는 보고서에 포함하지 않는다.
@@ -53,7 +53,7 @@ cargo test --test navigation_eval
 MNEMOARC_LIVE_TEST=1 \
 MNEMOARC_NAV_REPETITIONS=3 \
 MNEMOARC_NAV_REPORT=/tmp/mnemoarc-navigation-report.json \
-cargo test --test navigation_eval live_navigation_regressions -- --ignored --nocapture
+cargo test --test suite navigation_eval::live_navigation_regressions -- --ignored --nocapture
 ```
 
 `MNEMOARC_LIVE_CONFIG`로 설정 파일을 바꿀 수 있다. `MNEMOARC_NAV_CASES=semantics,recovery,java,branches`에서 원하는 항목을 고를 수 있으며 반복 수는 1~5다. 실제 프로젝트 소스가 바뀌면 기대 사실과 근거 위치를 다시 검토해야 한다. Java fixture는 Rust 테스트 코드에 포함되어 동일하게 재생성된다.

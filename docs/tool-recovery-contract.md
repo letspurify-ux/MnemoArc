@@ -153,6 +153,8 @@ ling-3.0-flash 라이브 실행(`complete_with_gaps`)의 처리 로그에서 확
 - 같은 실패의 반복: 같은 이름·인자의 호출이 같은 이유로 다시 실패하면 `repeated_unchanged`(`count`, `guidance`)를 붙인다. 오류 결과는 `recovery`에, 적용되지 않은 `task_plan`은 `data`에 붙인다. 인자로 결정되는 실패(`invalid_input`, `missing_path`, `missing_evidence`, 미적용 계획)만 대상이다. 일시적이거나 결과가 불확실한 실패는 표시하지 않는다. 오류 문구는 바꾸지 않아 기존 동일 실패 감지와 충돌하지 않는다.
 - `checkpoint_pending`은 막힌 도구 이름, 체크포인트 ID, 다음 단계(memory_write 또는 no_save_reason 후 checkpoint_complete), 지금 허용되는 도구 목록을 알린다. 복구 도구는 `checkpoint_complete`, `memory_write`, `task_state`이다.
 - 리뷰어가 요청 키(`requirement_catalog` 등)를 응답 최상위에 되돌려 보내도, 기대 필드(`issues`, `decisions`, `checks`)가 있으면 그 필드만 읽는다. 이슈 `document` 안에 지적 요약 전용 표시(`quote_truncated`, `quote_in_document`)를 복사해 넣으면 이를 제거한 뒤 해석한다. 그 밖의 알 수 없는 필드는 계속 거절한다.
+- 문서만 보고 알 수 있는 결함용 `document` 지적 유형을 추가했다. 이전에는 리뷰어가 이런 결함을 소스 없는 사실 지적이나 `"path":"document"` 출처로 보내 모든 시도가 거절됐고, 결국 해당 줄이 미검토 구간이 됐다. 이제 이런 지적은 `document` 유형으로 정규화한다. 문서 구절은 문서 전체에서 대조하며, 프로젝트 파일 출처는 거절한다(`issues[i].sources[j] is a project file`). UI 라벨은 비운다. 근거 확인은 문서 원문만으로 판단한다.
+- `task_plan`의 `update`는 항목 문구만 바꾼다. 의미 있는 `result`(8자 이상)를 함께 보내면, `result`는 무시됐고 항목은 아직 미완료라는 `notices`와 `complete` 호출 예시를 돌려준다. 자리채움 빈 값은 이전처럼 조용히 버린다. `done` 필드는 `complete`를 안내하며 거절한다. 아무것도 바뀌지 않은 apply(`unchanged: true`)에는 "추가·변경·완료된 것이 없다"는 `guidance`를 붙인다. 같은 무변경 apply를 반복하면 `repeated_unchanged`로 표시한다. 라이브 실행에서 모델이 `update`+`result`로 완료를 5번 시도하다 정체 마감에 들어간 문제를 막는다.
 
 ## 문서 검증 도구 개선 (2026-09-21)
 

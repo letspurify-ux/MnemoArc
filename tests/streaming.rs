@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 use axum::{Router, http::header, response::IntoResponse, routing::post};
 use mnemoarc::{
     config::Config,

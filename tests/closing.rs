@@ -1,6 +1,6 @@
 //! Closing mode: document work converges on a finished result, reporting
 //! unresolved items instead of repeating until the run budget is spent.
-mod support;
+use crate::support;
 use anyhow::Result;
 use async_trait::async_trait;
 use mnemoarc::{

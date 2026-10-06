@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 use anyhow::Result;
 use async_trait::async_trait;
 use mnemoarc::{
@@ -1360,4 +1360,59 @@ fn an_operation_name_sent_as_the_action_names_the_apply_call() {
         s.task.current_todo().map(|t| t.text.as_str()),
         Some("Write the guide")
     );
+}
+
+#[test]
+fn an_update_carrying_a_result_says_the_item_is_still_unfinished() {
+    // Live run 2026-10-06: the model sent update with an unchanged text and a
+    // real result five times; the reply only said unchanged, so it believed
+    // T1 was complete and stalled into closing without a review.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(
+        &mut s,
+        json!([{"op":"insert","texts":["Investigate the agent loop"]}]),
+    );
+    let result = apply(
+        &mut s,
+        json!([{"op":"update","id":"T1","text":"Investigate the agent loop","result":"Investigation finished: run_session loop documented"}]),
+    );
+    assert_eq!(result["unchanged"], true, "{result}");
+    assert!(
+        result["guidance"]
+            .as_str()
+            .unwrap()
+            .starts_with("Nothing changed"),
+        "{result}"
+    );
+    let notice = result["notices"][0].as_str().unwrap();
+    assert!(
+        notice.contains("result was ignored and T1 is still unfinished"),
+        "{notice}"
+    );
+    assert!(
+        notice.contains(r#"{"op":"complete","id":"T1","result":...}"#),
+        "{notice}"
+    );
+    assert!(!s.task.todos[0].done);
+    // A done flag on update is rejected with the same remedy.
+    let result = apply(
+        &mut s,
+        json!([{"op":"update","id":"T1","text":"Investigate","done":true}]),
+    );
+    assert_eq!(result["applied"], false, "{result}");
+    assert!(
+        result["reason"]
+            .as_str()
+            .unwrap()
+            .contains(r#"send {"op":"complete","id":"T1""#),
+        "{result}"
+    );
+    // A placeholder result from schema-filling providers stays silent.
+    let result = apply(
+        &mut s,
+        json!([{"op":"update","id":"T1","text":"Investigate the agent loop again","result":""}]),
+    );
+    assert_eq!(result["applied"], true, "{result}");
+    assert!(result["notices"].is_null(), "{result}");
 }

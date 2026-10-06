@@ -205,7 +205,7 @@ cargo run -- run --project /path/to/project --output docs/source-summary.md \
 
 예를 들어 `{"mode":"procedure","name":"MY_PACKAGE.FIND_ITEMS","args":[{"name":"p_id","value":42,"type":"number"},{"name":"p_rows","direction":"out","type":"cursor"}]}`처럼 호출할 수 있습니다. `statement`·프로시저·함수는 성공하면 커밋하고 실패하면 롤백을 시도합니다. Oracle DDL은 [자체적으로 커밋](https://docs.oracle.com/en/database/oracle/oracle-database/19/tdddg/committing-transactions.html)할 수 있으며 프로시저·함수 내부의 커밋도 되돌릴 수 없습니다. 자유 실행 권한을 켤 때는 이 동작을 고려하세요. 결과 행과 셀의 크기는 저장 쿼리와 같이 제한합니다.
 
-로컬 Oracle 테스트는 설치된 `gvenzl/oracle-free` 컨테이너의 `FREEPDB1` 서비스에서 `MNEMOARC_TEST_DB_PASSWORD=password cargo test --test database --test database_free`로 실행할 수 있습니다. 이 환경변수가 없으면 연결 테스트만 건너뜁니다.
+로컬 Oracle 테스트는 설치된 `gvenzl/oracle-free` 컨테이너의 `FREEPDB1` 서비스에서 `MNEMOARC_TEST_DB_PASSWORD=password cargo test --test suite database`로 실행할 수 있습니다. 이 환경변수가 없으면 연결 테스트만 건너뜁니다.
 
 ## 파일 조사와 검증
 
@@ -246,6 +246,8 @@ npm run test:ui # Chrome이 설치되어 있어야 합니다. 실제 Rust API + 
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+Rust 통합 테스트는 대부분 `tests/suite.rs` 한 바이너리로 묶여 있다. 파일 하나만 실행하려면 `cargo test --test suite document_review_findings::`처럼 파일 이름을 모듈로 지정한다(`core.rs`는 `core_tests::`). 환경 변수를 바꾸거나 자기 실행 파일을 다시 띄우는 테스트, 전역 쓰기 잠금 동시성 테스트, 실제 모델 테스트만 `Cargo.toml`의 별도 `[[test]]`로 둔다. 새 `tests/*.rs` 파일은 둘 중 한 곳에 등록해야 하며, 빠뜨리면 `every_integration_test_file_is_built` 테스트가 실패한다. 의존 라이브러리는 개발 빌드에서도 최적화(`opt-level = 2`)해 에이전트 시나리오 테스트를 7~8배 빠르게 실행한다.
 
 브라우저 테스트는 모든 설정의 UI 노출, 설정·키 저장, 채팅 렌더링·스트리밍, 세션 전환·취소·새로고침, 폴더 선택과 좁은 화면을 검증합니다. 모의 LLM, 로컬 SSE 서버, 임시 소스 fixture로 실행 흐름, 충돌·용량·참조, 컨텍스트 제외 반복, 실패 시 보존, 스트림 인자 조립·끊김, 원문 재조회와 소스 변경을 검증합니다. 외부 API 키 없이 실행됩니다.
 
