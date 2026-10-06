@@ -714,10 +714,13 @@ impl FailureTracker {
     const MAX_REPEATED_CALLS: usize = 32;
 
     /// Mark an identical call that fails again for the same reason: resending
-    /// it unchanged cannot succeed. Only failures decided by the arguments
-    /// (input, path or evidence errors and unapplied plan batches) qualify;
-    /// transient or uncertain failures may succeed on a later retry. The
-    /// error text is left unchanged so other identical-failure checks hold.
+    /// it unchanged gets the same result. Failures decided by the arguments or
+    /// by a state the call cannot change (input, path, evidence, stale state,
+    /// prerequisite, capacity, a tool withheld in closing or a checkpoint, and
+    /// unapplied plan batches) qualify. Transient, uncertain, cancelled and
+    /// unclassified failures, and waits for tool workers, may succeed on a
+    /// later retry. The error text is left unchanged so other identical-failure
+    /// checks hold.
     pub fn mark_repeated_failure(&mut self, tool: &str, arguments: &str, result: &mut Value) {
         // An unchanged apply is not a failure, but resending it is a no-op.
         let unapplied_plan = tool == "task_plan"
@@ -727,8 +730,17 @@ impl FailureTracker {
         } else if result["status"] != "ok"
             && matches!(
                 result["recovery"]["class"].as_str(),
-                Some("invalid_input" | "missing_path" | "missing_evidence")
+                Some(
+                    "invalid_input"
+                        | "missing_path"
+                        | "missing_evidence"
+                        | "stale_state"
+                        | "prerequisite"
+                        | "unavailable"
+                        | "capacity"
+                )
             )
+            && result["recovery"]["action"] != "wait_for_tool_workers"
         {
             result["error"].as_str()
         } else {
@@ -770,7 +782,7 @@ impl FailureTracker {
             return;
         }
         let note = json!({"count":count,"guidance":format!(
-            "This exact call already got this same result {} time(s); resending it unchanged cannot succeed. Change what the error or reason names before calling again.",
+            "This exact call already got this same result {} time(s); resending it unchanged gets it again. Change what the error or reason names, or use one of the recovery tools instead.",
             count - 1
         )});
         if unapplied_plan {

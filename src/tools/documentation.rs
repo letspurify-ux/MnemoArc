@@ -161,6 +161,37 @@ pub(super) fn heading_path(doc: &str, start: usize) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("section_not_found: heading position changed"))
 }
 
+/// Dice similarity of the character bigrams of two titles, ignoring case,
+/// spacing and punctuation, so Korean and English wording rank alike.
+fn title_similarity(a: &str, b: &str) -> f64 {
+    let bigrams = |text: &str| {
+        let chars: Vec<char> = text
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect();
+        chars
+            .windows(2)
+            .map(|pair| (pair[0], pair[1]))
+            .collect::<Vec<_>>()
+    };
+    let (a, mut b) = (bigrams(a), bigrams(b));
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let total = a.len() + b.len();
+    let shared = a
+        .iter()
+        .filter(|pair| {
+            b.iter()
+                .position(|other| other == *pair)
+                .map(|index| b.swap_remove(index))
+                .is_some()
+        })
+        .count();
+    (2 * shared) as f64 / total as f64
+}
+
 fn bare_heading_title(heading: &str) -> &str {
     let content = heading.trim_start_matches('#').trim_start();
     let without_closing = content.trim_end_matches('#');
@@ -267,23 +298,53 @@ impl HeadingIndex {
                 .collect();
         }
         if matching.len() != 1 {
+            const SHOWN: usize = 8;
             let candidate_indices: Vec<_> = if matching.is_empty() {
-                (0..headings.len()).take(8).collect()
+                // Only some headings fit: the closest titles help more than
+                // the first ones, which a live model then distrusted.
+                let target = bare_heading_title(requested_path.lines().last().unwrap_or(requested));
+                let mut indices: Vec<_> = (0..headings.len()).collect();
+                if indices.len() > SHOWN {
+                    let score: Vec<_> = headings
+                        .iter()
+                        .map(|h| title_similarity(target, bare_heading_title(&h.heading)))
+                        .collect();
+                    indices.sort_by(|a, b| score[*b].total_cmp(&score[*a]).then(a.cmp(b)));
+                    indices.truncate(SHOWN);
+                }
+                indices
             } else {
-                matching.iter().map(|(index, _)| *index).take(8).collect()
+                matching
+                    .iter()
+                    .map(|(index, _)| *index)
+                    .take(SHOWN)
+                    .collect()
             };
             let candidates: Vec<_> = candidate_indices
             .into_iter()
             .map(|index| json!({"heading":headings[index].heading,"section_path":paths[index],"start_line":headings[index].line}))
             .collect();
             if matching.is_empty() {
+                let listed = if headings.len() > SHOWN {
+                    format!(
+                        "The {SHOWN} closest of {} headings (partial list; document_inspect without section shows all)",
+                        headings.len()
+                    )
+                } else {
+                    "Headings".to_owned()
+                };
                 bail!(
-                    "section_not_found: {requested:?}; use document_inspect without section for the outline. Headings: {}",
+                    "section_not_found: {requested:?}; use document_inspect without section for the outline. {listed}: {}",
                     json!(candidates)
                 );
             }
+            let listed = if matching.len() > SHOWN {
+                format!("First {SHOWN} matches")
+            } else {
+                "Matches".to_owned()
+            };
             bail!(
-                "ambiguous_section: {requested:?} matches {} headings; copy section_path from the document_inspect outline to distinguish nested headings. If the full paths also repeat, use a unique text anchor for editing. Matches: {}",
+                "ambiguous_section: {requested:?} matches {} headings; copy section_path from the document_inspect outline to distinguish nested headings. If the full paths also repeat, use a unique text anchor for editing. {listed}: {}",
                 matching.len(),
                 json!(candidates)
             );

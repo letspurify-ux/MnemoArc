@@ -1118,3 +1118,79 @@ fn a_repeated_unchanged_plan_apply_is_marked() {
     tracker.mark_repeated_failure("task_plan", args, &mut second);
     assert_eq!(second["data"]["repeated_unchanged"]["count"], 2, "{second}");
 }
+
+#[test]
+fn a_missing_section_lists_the_closest_headings_and_says_the_list_is_partial() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = String::from("# 개발자 매뉴얼\n\n");
+    for title in [
+        "설치",
+        "실행 흐름",
+        "설정 파일",
+        "기억 저장소",
+        "도구 목록",
+        "웹 API",
+        "검토 단계",
+        "완료 조건",
+        "오류 처리와 복구",
+        "테스트",
+        "배포",
+        "부록",
+    ] {
+        doc.push_str(&format!("## {title}\n\n내용.\n\n"));
+    }
+    std::fs::write(dir.path().join("summary.md"), &doc).unwrap();
+    let mut s = session();
+    s.project.root = dir.path().into();
+    s.project.output = dir.path().join("summary.md");
+    let result = tools::run_call(
+        &mut s,
+        &call_id(
+            "document_inspect",
+            json!({"section":"## 오류 처리 및 복구"}),
+        ),
+    );
+    let error = result["error"].as_str().unwrap();
+    assert!(
+        error.starts_with(r###"section_not_found: "## 오류 처리 및 복구""###),
+        "{error}"
+    );
+    assert!(
+        error.contains("The 8 closest of 13 headings (partial list; document_inspect without section shows all)"),
+        "{error}"
+    );
+    let listed = error.split_once("shows all): ").unwrap().1;
+    let candidates: Value = serde_json::from_str(listed).unwrap();
+    assert_eq!(candidates.as_array().unwrap().len(), 8);
+    assert_eq!(
+        candidates[0]["heading"], "## 오류 처리와 복구",
+        "{candidates}"
+    );
+}
+
+#[test]
+fn a_refusal_repeated_while_its_condition_holds_is_marked() {
+    let mut tracker = tools::recovery::FailureTracker::default();
+    let withheld = || {
+        tools::envelope(Err(anyhow::anyhow!(
+            "closing_mode: memory_read is withheld while the document is finalized"
+        )))
+    };
+    let mut first = withheld();
+    tracker.mark_repeated_failure("memory_read", r#"{"id":"m1"}"#, &mut first);
+    let mut second = withheld();
+    tracker.mark_repeated_failure("memory_read", r#"{"id":"m1"}"#, &mut second);
+    assert_eq!(second["recovery"]["class"], "unavailable");
+    assert_eq!(
+        second["recovery"]["repeated_unchanged"]["count"], 2,
+        "{second}"
+    );
+    // Waiting for tool workers can succeed on a later retry.
+    for _ in 0..2 {
+        let mut busy = tools::envelope(Err(anyhow::anyhow!(
+            "tool_worker_capacity: previous tool threads are still running"
+        )));
+        tracker.mark_repeated_failure("file_read", "{}", &mut busy);
+        assert!(busy["recovery"]["repeated_unchanged"].is_null(), "{busy}");
+    }
+}
