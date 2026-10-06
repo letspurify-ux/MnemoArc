@@ -747,7 +747,18 @@ fn normalize_document_kind(s: &Session, proposal: &mut Proposal) -> bool {
         .filter(|source| !document_source(s, &source.path))
         .count();
     let mut changed = false;
-    if proposal.kind != "document" && files == 0 {
+    if proposal.kind == "document" && files > 0 {
+        // The mirror of a sourceless factual claim: a document finding that
+        // cites a project file was checked against source evidence, so it is
+        // factual. A live reviewer sent one and it was dropped on its last
+        // try. The document passages beside the file are the quote's
+        // surroundings, as for a mixed factual claim below.
+        proposal.kind = "factual".into();
+        proposal
+            .sources
+            .retain(|source| !document_source(s, &source.path));
+        changed = true;
+    } else if proposal.kind != "document" && files == 0 {
         proposal.kind = "document".into();
         changed = true;
     } else if proposal.kind != "document" && files < proposal.sources.len() {
@@ -799,31 +810,38 @@ fn collect_one(
             "document_review_invalid: kind must be factual, citation, requirement, scope or document; problem/correction must be nonempty and at most 1500 characters; at most 4 sources and 12 UI labels"
         );
     }
+    // Name the keys the reviewer can copy: a live reviewer sent scope
+    // findings with a null id twice and both were dropped.
+    let keys = || {
+        format!(
+            "{} (R/C/K/D ids are request requirements; audience or purpose for an audience or detail-level issue)",
+            json!(catalog.keys().collect::<Vec<_>>())
+        )
+    };
     if let Some(id) = &proposal.requirement_id
         && !catalog.contains_key(id)
     {
-        bail!("document_review_invalid: unknown requirement id {id}");
+        let keys_list: Vec<Value> = catalog.keys().map(|key| json!(key)).collect();
+        let hint = crate::tools::suggest_value("document_review", "requirement_id", id, &keys_list);
+        bail!(
+            "document_review_invalid: issues[{issue_index}].requirement_id {id:?} is not a requirement_catalog key{hint}; use one of {}",
+            keys()
+        );
     }
     if matches!(proposal.kind.as_str(), "requirement" | "scope")
         && proposal.requirement_id.is_none()
     {
-        bail!("document_review_invalid: requirement/scope finding needs a current requirement id");
+        bail!(
+            "document_review_invalid: issues[{issue_index}] kind {} needs requirement_id, a requirement_catalog key: {}",
+            proposal.kind,
+            keys()
+        );
     }
     if matches!(proposal.kind.as_str(), "factual" | "citation" | "document")
         && proposal.document.is_none()
     {
         bail!(
             "document_review_invalid: issues[{issue_index}] needs a current document quote; factual/citation findings also need source evidence, and a defect visible in the document alone uses kind document"
-        );
-    }
-    if proposal.kind == "document"
-        && let Some(index) = proposal
-            .sources
-            .iter()
-            .position(|source| source.path != "document")
-    {
-        bail!(
-            "document_review_invalid: issues[{issue_index}].sources[{index}] is a project file; kind document cites only passages of this document (path \"document\"); use kind factual for a claim checked against source files"
         );
     }
     let document_context = if let Some(p) = &mut proposal.document {

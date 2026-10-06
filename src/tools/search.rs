@@ -82,7 +82,8 @@ pub(super) fn execute(
         && (args.get("path_glob").is_some() || args.get("pattern").is_some())
     {
         bail!(
-            "conflicting_arguments: use path for one exact file OR path_glob/pattern for a file glob"
+            "conflicting_arguments: use path for one exact file or directory OR path_glob/pattern for a file glob{}",
+            super::path_glob_conflict_hint(s, args)
         );
     }
     let mut exact_path = args["path"]

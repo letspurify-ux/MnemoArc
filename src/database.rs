@@ -386,16 +386,21 @@ pub fn execute(
     }
     if args["action"] == "list" {
         if args.get("id").is_some() || args.get("params").is_some() {
-            bail!("invalid_database_query_arguments: list accepts only action");
+            bail!(
+                "invalid_database_query_arguments: list accepts only action; to execute a query send action=run with its id and params"
+            );
         }
         return Ok(config.catalog());
     }
     if args["action"] != "run" {
         bail!("invalid_database_query_arguments: action must be list or run");
     }
-    let id = args["id"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("invalid_database_query_arguments: run requires id"))?;
+    let id = args["id"].as_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid_database_query_arguments: run requires id, one of the enabled query ids {:?}; use action=list for their parameters",
+            config.active_queries().map(|q| q.id.as_str()).collect::<Vec<_>>()
+        )
+    })?;
     let query = config
         .active_queries()
         .find(|q| q.id == id)

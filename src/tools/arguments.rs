@@ -45,9 +45,86 @@ fn matches_type(value: &Value, kind: &str) -> bool {
     }
 }
 
+/// An argument the schema does not accept, with the accepted name the call
+/// most likely meant (`suggest::field`). `path` is the full argument path and
+/// `siblings` the object holding it.
+pub(super) fn unknown_field(
+    name: &str,
+    path: &str,
+    value: &Value,
+    properties: &Value,
+    siblings: &Value,
+) -> anyhow::Error {
+    let (scope, key) = match path.rsplit_once('.') {
+        Some((parent, key)) => (scope_name(parent), key),
+        None => ("", path),
+    };
+    let fields = properties.as_object();
+    let allowed: Vec<&str> = fields
+        .into_iter()
+        .flat_map(|fields| fields.keys())
+        .map(String::as_str)
+        .collect();
+    // Prefer a field whose type accepts the value sent ("querys":[...]
+    // means queries, not query).
+    let compatible: Vec<&str> = fields
+        .into_iter()
+        .flatten()
+        .filter(|(_, schema)| accepts_type(schema, value))
+        .map(|(key, _)| key.as_str())
+        .collect();
+    let allowed = &allowed[..];
+    let suggestion = suggest::field(name, scope, key, &compatible, siblings)
+        .or_else(|| suggest::field(name, scope, key, allowed, siblings));
+    let noun = if scope.is_empty() {
+        "arguments"
+    } else {
+        "fields"
+    };
+    let mut data = json!({"execution":"not_started","input_error":{
+        "tool":name,"field":path,"expected":{"allowed_fields":allowed},"received":value_type(value)
+    }});
+    if let Some(target) = suggestion.as_ref().and_then(|s| s.target.as_ref()) {
+        data["input_error"]["did_you_mean"] = json!(target);
+    }
+    recovery::DiagnosticError {
+        message: format!(
+            "unknown_argument: {path} is not accepted{}; allowed {noun}: {} for {name}; correct this field and resend the intended call",
+            suggestion.map_or_else(String::new, |s| s.text),
+            json!(allowed)
+        ),
+        data,
+    }
+    .into()
+}
+
+fn accepts_type(schema: &Value, value: &Value) -> bool {
+    match &schema["type"] {
+        Value::String(kind) => matches_type(value, kind),
+        Value::Array(kinds) => kinds
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|kind| matches_type(value, kind)),
+        _ => true,
+    }
+}
+
+/// The argument a nested path belongs to: "edits[2]" -> "edits".
+fn scope_name(parent: &str) -> &str {
+    parent.split(['[', '.']).next().unwrap_or(parent)
+}
+
 /// Only the vocabulary used by ToolRegistry field schemas is evaluated here.
-/// Action unions are checked by their tool-specific validators.
-pub(super) fn validate_field(name: &str, path: &str, schema: &Value, value: &Value) -> Result<()> {
+/// Action unions are checked by their tool-specific validators. `parent` is
+/// the value holding this field (the whole arguments at the top level); it
+/// lets a rejected value be compared with its sibling arguments.
+pub(super) fn validate_field(
+    name: &str,
+    path: &str,
+    schema: &Value,
+    value: &Value,
+    parent: &Value,
+) -> Result<()> {
     let kinds: Vec<_> = match &schema["type"] {
         Value::String(kind) => vec![kind.as_str()],
         Value::Array(kinds) => kinds.iter().filter_map(Value::as_str).collect(),
@@ -72,13 +149,14 @@ pub(super) fn validate_field(name: &str, path: &str, schema: &Value, value: &Val
     if let Some(allowed) = schema["enum"].as_array()
         && !allowed.contains(value)
     {
-        return Err(recovery::DiagnosticError {
-            message: enum_value_error(name, path, value, allowed),
-            data: json!({"execution":"not_started","input_error":{
-                "tool":name,"field":path,"expected":{"enum":allowed},"received":value_type(value)
-            }}),
+        let (message, target) = enum_value_error(name, path, value, allowed, parent);
+        let mut data = json!({"execution":"not_started","input_error":{
+            "tool":name,"field":path,"expected":{"enum":allowed},"received":value_type(value)
+        }});
+        if let Some(target) = target {
+            data["input_error"]["did_you_mean"] = json!(target);
         }
-        .into());
+        return Err(recovery::DiagnosticError { message, data }.into());
     }
     let integer = value
         .as_i64()
@@ -133,7 +211,13 @@ pub(super) fn validate_field(name: &str, path: &str, schema: &Value, value: &Val
     }
     if let Some(items) = value.as_array() {
         for (index, item) in items.iter().enumerate() {
-            validate_field(name, &format!("{path}[{index}]"), &schema["items"], item)?;
+            validate_field(
+                name,
+                &format!("{path}[{index}]"),
+                &schema["items"],
+                item,
+                value,
+            )?;
         }
     }
     if let Some(object) = value.as_object() {
@@ -171,8 +255,23 @@ pub(super) fn validate_field(name: &str, path: &str, schema: &Value, value: &Val
                         "is required",
                     ));
                 }
-                let rename = match unknown.as_slice() {
-                    [only] => format!("; if {only} carries this value, send it as {required}"),
+                // One unaccepted field, or the one whose name means this
+                // required field, likely carries its value.
+                let accepted: Vec<&str> = schema["properties"]
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|p| p.keys())
+                    .map(String::as_str)
+                    .collect();
+                let meant = unknown.iter().find(|key| {
+                    suggest::field(name, scope_name(path), key, &accepted, value)
+                        .and_then(|s| s.target)
+                        .is_some_and(|target| target == required)
+                });
+                let rename = match (meant, unknown.as_slice()) {
+                    (Some(only), _) | (None, [only]) => {
+                        format!("; if {only} carries this value, send it as {required}")
+                    }
                     _ => String::new(),
                 };
                 return Err(recovery::DiagnosticError {
@@ -191,23 +290,23 @@ pub(super) fn validate_field(name: &str, path: &str, schema: &Value, value: &Val
         for (key, item) in object {
             let child_path = format!("{path}.{key}");
             if let Some(field) = schema["properties"].get(key) {
-                validate_field(name, &child_path, field, item)?;
+                validate_field(name, &child_path, field, item, value)?;
             } else if schema["additionalProperties"] == false {
-                let allowed: Vec<_> = schema["properties"]
-                    .as_object()
-                    .into_iter()
-                    .flat_map(|p| p.keys())
-                    .collect();
-                return Err(failure(
+                return Err(unknown_field(
                     name,
                     &child_path,
-                    "unknown_argument",
-                    json!({"allowed_fields":allowed}),
-                    value_type(item),
-                    &format!("is not accepted; allowed fields: {}", json!(allowed)),
+                    item,
+                    &schema["properties"],
+                    value,
                 ));
             } else if schema["additionalProperties"].is_object() {
-                validate_field(name, &child_path, &schema["additionalProperties"], item)?;
+                validate_field(
+                    name,
+                    &child_path,
+                    &schema["additionalProperties"],
+                    item,
+                    value,
+                )?;
             }
         }
     }
@@ -371,6 +470,9 @@ pub(super) fn compact_data(data: &Value) -> Option<Value> {
         }
         if !input["expected"].is_null() {
             compact["input_error"]["expected"] = input["expected"].clone();
+        }
+        if input["did_you_mean"].is_string() {
+            compact["input_error"]["did_you_mean"] = input["did_you_mean"].clone();
         }
         compact
     })

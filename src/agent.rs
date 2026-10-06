@@ -73,6 +73,12 @@ fn closing_instruction(s: &Session) -> String {
             "Closing mode: no document is saved yet and source reading is withheld. Create the requested document NOW with document_edit action=create (or document_edit_batch) from the evidence already gathered. Write every requested section; where a fact was not confirmed from delivered sources, say so in the text instead of guessing. Then register or update investigation items with their sections, verify what the delivered evidence supports, mark the rest with investigation action=mark_gap, and give a concise final answer. At most {remaining} requests remain; without a saved document the run stops unfinished."
         );
     }
+    if let Some(missing) = tools::unregistered_document(s) {
+        return format!(
+            "Closing mode: the document is saved but no investigation item is registered, so a final answer is refused and no review can run. NOW register one item per section ({} in total) with investigation upsert (title, section copied exactly from this list, status=written): {}. Verify the ones whose evidence was already delivered with ONE verify_batch, report each item that cannot be verified with investigation action=mark_gap and a specific reason, then give a concise final answer. Discovery tools are withheld. Example first call: {}. At most {remaining} requests remain; afterwards the runtime finishes the document and lists every unresolved item.",
+            missing["section_count"], missing["sections"], missing["next"]
+        );
+    }
     format!(
         "Closing mode: finish the requested document now from the evidence already gathered; discovery tools are withheld. 1) Write any missing requested section from gathered evidence, stating in the text when a fact is unconfirmed. 2) Verify written items whose evidence was already delivered (verify_batch). 3) For an item that cannot be verified with available evidence, call investigation action=mark_gap with its id and a specific reason, and qualify the related claim in its section. 4) Fix review findings confirmed for the current document or completion checks with targeted edits when possible; otherwise leave them, the runtime reports them as unresolved. 5) Complete or remove remaining to-dos with actual results, then give a concise final answer. At most {remaining} requests remain; afterwards the runtime finishes the document and lists every unresolved item. Do not invent evidence or describe gaps as verified."
     )
@@ -237,6 +243,11 @@ fn ready_for_final(s: &mut Session) -> bool {
 fn ready_except_plan(s: &mut Session) -> bool {
     if let Some(guidance) = s.run_guidance.as_object_mut() {
         guidance.remove("document_readiness");
+        guidance.remove("unregistered_document");
+    }
+    if let Some(missing) = tools::unregistered_document(s) {
+        s.run_guidance["unregistered_document"] = missing;
+        return false;
     }
     let bookkeeping_ready = s.checkpoint.is_none()
         && s.is_document_work()
@@ -1583,6 +1594,16 @@ pub async fn run_session_controlled(
         {
             s.run_guidance["plan_closeout"] = plan_closeout(&s);
             s.run_guidance["instruction"] = json!(PLAN_CLOSEOUT_INSTRUCTION);
+        } else if s.progress_recovery.closing.is_none()
+            && s.run_guidance["unregistered_document"].is_object()
+        {
+            s.run_guidance["instruction"] = json!(format!(
+                "{} Example first call: {}",
+                s.run_guidance["unregistered_document"]["guidance"]
+                    .as_str()
+                    .unwrap_or_default(),
+                s.run_guidance["unregistered_document"]["next"]
+            ));
         } else if s.progress_recovery.closing.is_none()
             && s.run_guidance["document_readiness"]["structural_ok"] == false
         {
@@ -3379,6 +3400,55 @@ pub fn apply_config(s: &mut Session, config: Config) -> Result<()> {
 mod review_gap_tests {
     use super::*;
     use crate::config::{Project, Secret};
+
+    #[test]
+    fn a_written_document_without_items_names_the_sections_to_register() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            Config {
+                model: "gpt-4o".into(),
+                ..Config::compact_test()
+            },
+        );
+        s.add_user("ui 매뉴얼 작성.".into());
+        s.select_workflow("source_document").unwrap();
+        tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"create","text":"# 매뉴얼\n\n## 1. 채팅 화면\n\nA.\n\n## 2. 관리자 화면\n\nB.\n"}),
+        )
+        .unwrap();
+        // Two live runs never registered an item and never answered: the
+        // readiness check now names the sections instead of a silent false.
+        assert!(!ready_except_plan(&mut s));
+        let missing = s.run_guidance["unregistered_document"].clone();
+        assert_eq!(missing["investigation_items"], 0, "{missing}");
+        assert_eq!(
+            missing["sections"],
+            json!(["# 매뉴얼\n## 1. 채팅 화면", "# 매뉴얼\n## 2. 관리자 화면"])
+        );
+        assert_eq!(
+            missing["next"],
+            json!({"action":"upsert","title":"1. 채팅 화면","section":"# 매뉴얼\n## 1. 채팅 화면","status":"written"})
+        );
+        // The suggested call is accepted as is.
+        tools::execute(&mut s, "investigation", missing["next"].clone()).unwrap();
+        assert!(tools::unregistered_document(&s).is_none());
+        // Closing names the sections in its own instruction.
+        s.investigations.clear();
+        s.progress_recovery.closing = Some(Default::default());
+        let instruction = closing_instruction(&s);
+        assert!(
+            instruction.contains("no investigation item is registered")
+                && instruction.contains("2. 관리자 화면"),
+            "{instruction}"
+        );
+    }
 
     #[test]
     fn uncovered_sections_block_readiness_even_when_registered_items_are_verified() {

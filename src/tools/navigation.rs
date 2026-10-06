@@ -40,7 +40,10 @@ impl Workspace {
         };
         let mut paths = if let Some(path) = exact {
             if path_glob(args)?.is_some() {
-                bail!("conflicting_path_filters: pass path or path_glob, not both");
+                bail!(
+                    "conflicting_path_filters: pass path or path_glob, not both{}",
+                    super::path_glob_conflict_hint(s, args)
+                );
             }
             let path = read_path(&s.project, path)?;
             if path.is_dir() {

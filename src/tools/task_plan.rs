@@ -592,14 +592,42 @@ fn parse_operations(value: &Value) -> Result<Parsed> {
         }
         let operation_name = item["op"].clone();
         let target_id = item.get("id").cloned();
+        let shape = item.clone();
         let operation = serde_json::from_value(item).map_err(|error| {
             let detail: String = error.to_string().chars().take(240).collect();
-            operation_error(format!("operations[{i}]: {detail}"),
+            let hint = operation_hint(&detail, &shape, allowed);
+            operation_error(format!("operations[{i}]: {detail}{hint}"),
                 json!({"code":"invalid_operations","operation_index":i,"operation":operation_name,"target_id":target_id}))
         })?;
         operations.push(operation);
     }
     Ok((operations, normalized, notices))
+}
+
+/// The operation or field a rejected plan operation most likely meant
+/// ("add" for insert, "items" for texts).
+fn operation_hint(detail: &str, operation: &Value, allowed: &[&str]) -> String {
+    let named = |marker: &str| {
+        let rest = detail.split_once(marker)?.1;
+        rest.split_once('`').map(|(name, _)| name.to_owned())
+    };
+    if let Some(sent) = named("unknown variant `") {
+        let ops: Vec<Value> = [
+            "insert", "update", "split", "move", "remove", "complete", "reopen",
+        ]
+        .iter()
+        .map(|op| json!(op))
+        .collect();
+        return super::suggest::value("task_plan", "op", &json!(sent), &ops, operation)
+            .map_or_else(String::new, |s| s.text);
+    }
+    if let Some(field) = named("unknown field `") {
+        let mut fields = vec!["op"];
+        fields.extend_from_slice(allowed);
+        return super::suggest::field("task_plan", "operations", &field, &fields, operation)
+            .map_or_else(String::new, |s| s.text);
+    }
+    String::new()
 }
 
 pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {

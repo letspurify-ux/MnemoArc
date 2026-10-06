@@ -2361,17 +2361,28 @@ fn a_defect_visible_in_the_document_alone_is_a_document_finding() {
 
 #[test]
 fn document_findings_cite_only_this_document_and_unverified_ones_leave_no_gap() {
-    // A project file makes the claim factual, not a document defect.
+    // A project file makes the claim factual, not a document defect: a live
+    // reviewer sent this and the issue was dropped on its last try.
     let (_dir, mut s) = fixture();
     review::request(&mut s).unwrap();
     let mut mixed = proposal("Document kind with a file");
     mixed["kind"] = json!("document");
-    let error = review::finish(&mut s, &json!({"issues":[mixed]}).to_string()).unwrap_err();
+    mixed["sources"].as_array_mut().unwrap().push(
+        json!({"path":"document","start_line":3,"end_line":3,"quote":"검색 결과가 없습니다."}),
+    );
+    submit(&mut s, vec![mixed]);
+    let validation = payload(review::request(&mut s).unwrap());
+    assert_eq!(
+        validation["candidates"][0]["kind"], "factual",
+        "{validation}"
+    );
     assert!(
-        error
-            .to_string()
-            .contains("issues[0].sources[0] is a project file"),
-        "{error}"
+        validation["candidates"][0]["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|source| source["path"] != "document"),
+        "{validation}"
     );
     // A document passage must exist in the document.
     let (_dir, mut s) = fixture();
@@ -2416,4 +2427,35 @@ fn document_findings_cite_only_this_document_and_unverified_ones_leave_no_gap() 
     validate(&mut s, vec![decision("F1", "unverified")]);
     assert!(review::unavailable_ranges(&s).is_empty());
     assert!(review::approved(&s));
+}
+
+#[test]
+fn a_requirement_or_scope_finding_without_a_catalog_key_names_the_keys() {
+    // A live reviewer sent two scope findings with a null requirement_id;
+    // the error did not say which keys exist and both were dropped.
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let mut scope = proposal("Internal identifiers in an end-user manual");
+    scope["kind"] = json!("scope");
+    scope["sources"] = json!([]);
+    let error = review::finish(&mut s, &json!({"issues":[scope.clone()]}).to_string())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("issues[0] kind scope needs requirement_id, a requirement_catalog key: [")
+            && error.contains("\"audience\"")
+            && error.contains("\"R0\"")
+            && error.contains("audience or purpose for an audience or detail-level issue"),
+        "{error}"
+    );
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    scope["requirement_id"] = json!("Audience");
+    let error = review::finish(&mut s, &json!({"issues":[scope]}).to_string())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(r#"issues[0].requirement_id "Audience" is not a requirement_catalog key; did you mean "audience"?"#),
+        "{error}"
+    );
 }

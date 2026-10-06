@@ -1346,7 +1346,23 @@ fn an_operation_name_sent_as_the_action_names_the_apply_call() {
         .to_string();
     assert_eq!(
         error,
-        "invalid_argument_value: action \"show\" is not one of: list, apply"
+        "invalid_argument_value: action \"show\" is not one of: list, apply; did you mean \"list\"?"
+    );
+    // A synonym of an operation is named as that operation.
+    let error = tools::execute(&mut s, "task_plan", json!({"action":"done"}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("\"complete\" is an operation, not an action"),
+        "{error}"
+    );
+    // Something unrelated is not guessed.
+    let error = tools::execute(&mut s, "task_plan", json!({"action":"zebra"}))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "invalid_argument_value: action \"zebra\" is not one of: list, apply"
     );
     // The named call succeeds.
     let revision = s.task.plan_revision;

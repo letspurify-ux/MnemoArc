@@ -1105,7 +1105,10 @@ fn missing_paths_suggest_similar_project_files_and_directories_list_entries() {
     let error = tools::execute(&mut s, "file_read", json!({"path":"main.py"}))
         .unwrap_err()
         .to_string();
-    assert!(error.contains("No project file has this name"), "{error}");
+    assert!(
+        error.contains("No project file or directory has this name"),
+        "{error}"
+    );
     let error = tools::execute(&mut s, "file_read", json!({"path":"config/.env"}))
         .unwrap_err()
         .to_string();

@@ -697,7 +697,11 @@ pub(super) fn execute(
         let symbol = symbols
             .iter()
             .find(|item| item["symbol_id"] == id)
-            .ok_or_else(|| anyhow::anyhow!("unknown_symbol: copy symbol_id from code_outline"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown_symbol: no declaration in this version of the file has symbol_id {id:?}; the ID must be copied whole, including its byte range, from code_outline or symbol_search for this path"
+                )
+            })?;
         let start = symbol["start_line"].as_u64().unwrap();
         let end = symbol["end_line"].as_u64().unwrap();
         let start = args["start_line"].as_u64().unwrap_or(start);

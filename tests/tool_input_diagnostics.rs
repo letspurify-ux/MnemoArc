@@ -1194,3 +1194,586 @@ fn a_refusal_repeated_while_its_condition_holds_is_marked() {
         assert!(busy["recovery"]["repeated_unchanged"].is_null(), "{busy}");
     }
 }
+
+/// A project with one source file and an existing output document.
+fn project_session() -> (tempfile::TempDir, Session) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src/backend")).unwrap();
+    std::fs::write(
+        dir.path().join("src/main.rs"),
+        "fn run() {\n    helper();\n}\n\nfn helper() {}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("src/backend/api.rs"), "fn api() {}\n").unwrap();
+    std::fs::write(
+        dir.path().join("summary.md"),
+        "# Title\n\nBody.\n\n## Part\n\nMore.\n",
+    )
+    .unwrap();
+    let mut s = session();
+    s.project.root = dir.path().into();
+    s.project.output = dir.path().join("summary.md");
+    (dir, s)
+}
+
+#[test]
+fn unaccepted_fields_name_the_field_the_call_most_likely_meant() {
+    let (_dir, mut s) = project_session();
+    let mut check = |name: &str, args: Value, field: &str, meant: Option<&str>, says: &str| {
+        let result = tools::run_call(&mut s, &call_id(name, args));
+        let error = result["error"].as_str().unwrap();
+        assert!(error.starts_with("unknown_argument: "), "{error}");
+        assert!(error.contains(says), "{name}: {error}");
+        assert_eq!(result["data"]["input_error"]["field"], field, "{result}");
+        assert_eq!(
+            result["data"]["input_error"]["did_you_mean"].as_str(),
+            meant,
+            "{result}"
+        );
+        assert_eq!(result["data"]["execution"], "not_started");
+    };
+    check(
+        "file_read",
+        json!({"file_path":"src/main.rs"}),
+        "file_path",
+        Some("path"),
+        "did you mean path? send this value as path",
+    );
+    // The line count is computed from the sibling start_line.
+    check(
+        "file_read",
+        json!({"path":"src/main.rs","start_line":2,"end_line":4}),
+        "end_line",
+        Some("max_lines"),
+        "(here max_lines: 3)",
+    );
+    // An array value means the array-typed queries, not query.
+    check(
+        "source_search",
+        json!({"querys":["helper"]}),
+        "querys",
+        Some("queries"),
+        "did you mean queries?",
+    );
+    check(
+        "source_search",
+        json!({"query":"helper","context":3}),
+        "context",
+        None,
+        "send before and after",
+    );
+    check(
+        "source_search",
+        json!({"query":"helper","ignore_case":true}),
+        "ignore_case",
+        Some("case_sensitive"),
+        "case_sensitive:false",
+    );
+    check(
+        "file_edit",
+        json!({"path":"src/main.rs","old_string":"a","new_text":"b","expected_hash":"x"}),
+        "old_string",
+        Some("old_text"),
+        "did you mean old_text?",
+    );
+    check(
+        "symbol_read",
+        json!({"path":"src/main.rs","name":"helper"}),
+        "name",
+        None,
+        r#"symbol_search {"query":"helper","match":"exact"}"#,
+    );
+    check(
+        "document_edit_batch",
+        json!({"expected_hash":"x","edits":[{"action":"replace_text","old_text":"Body.","new":"X"}]}),
+        "edits[0].new",
+        Some("text"),
+        "did you mean text?",
+    );
+    // A name already supplied is not suggested twice.
+    check(
+        "source_search",
+        json!({"query":"helper","q":"helper"}),
+        "q",
+        Some("query"),
+        "query is already supplied, so drop q",
+    );
+    // Nothing similar: the allowed list stands alone.
+    check(
+        "file_read",
+        json!({"path":"src/main.rs","zebra":1}),
+        "zebra",
+        None,
+        "zebra is not accepted; allowed arguments:",
+    );
+
+    // A misnamed field beside a missing required one is named as its carrier.
+    let result = tools::run_call(
+        &mut s,
+        &call_id(
+            "file_patch",
+            json!({"operations":[{"action":"update","path":"src/main.rs","old_string":"a","new_text":"b","to":"x"}]}),
+        ),
+    );
+    assert!(result["error"].is_string(), "{result}");
+
+    let result = tools::run_call(
+        &mut s,
+        &call_id(
+            "task_state",
+            json!({"action":"update","patch":{"todos":["x"]}}),
+        ),
+    );
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("managed by task_plan"),
+        "{result}"
+    );
+    let result = tools::run_call(
+        &mut s,
+        &call_id(
+            "task_plan",
+            json!({"action":"apply","expected_revision":0,"texts":["x"]}),
+        ),
+    );
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("texts belongs inside one plan operation"),
+        "{result}"
+    );
+}
+
+#[test]
+fn rejected_values_name_the_value_the_call_most_likely_meant() {
+    let (_dir, mut s) = project_session();
+    let mut check = |name: &str, args: Value, meant: Option<&str>, says: &str| {
+        let result = tools::run_call(&mut s, &call_id(name, args));
+        let error = result["error"].as_str().unwrap();
+        assert!(error.starts_with("invalid_argument_value: "), "{error}");
+        assert!(error.contains(says), "{name}: {error}");
+        assert_eq!(
+            result["data"]["input_error"]["did_you_mean"].as_str(),
+            meant,
+            "{result}"
+        );
+    };
+    check(
+        "code_outline",
+        json!({"path":"src/main.rs","kind":"fn"}),
+        Some("function"),
+        r#"did you mean "function"?"#,
+    );
+    check(
+        "symbol_relations",
+        json!({"path":"src/main.rs","symbol_id":"x","relation":"callees"}),
+        Some("calls"),
+        r#"did you mean "calls"?"#,
+    );
+    check(
+        "task_state",
+        json!({"action":"update","patch":{"phase":"verification"}}),
+        Some("verify"),
+        r#"did you mean "verify"?"#,
+    );
+    check(
+        "memory_manage",
+        json!({"action":"list"}),
+        Some("candidates"),
+        r#"did you mean "candidates"?"#,
+    );
+    check(
+        "file_patch",
+        json!({"operations":[{"action":"create","path":"new.txt","content":"x"}]}),
+        Some("add"),
+        r#"did you mean "add"?"#,
+    );
+    // Document actions follow the anchor arguments sent with them.
+    check(
+        "document_edit",
+        json!({"action":"replace","old_text":"Body.","text":"X"}),
+        Some("replace_text"),
+        r#"did you mean "replace_text"?"#,
+    );
+    check(
+        "document_edit",
+        json!({"action":"replace","section":"## Part","text":"## Part\n\nX\n"}),
+        Some("section"),
+        "needs expected_section_hash",
+    );
+    check(
+        "document_edit_batch",
+        json!({"expected_hash":"x","edits":[{"action":"create","text":"X"}]}),
+        None,
+        "create it first with document_edit action=create",
+    );
+    check(
+        "code_outline",
+        json!({"path":"src/main.rs","match":"regex","query":"h.*"}),
+        None,
+        "source_search with regex:true",
+    );
+    check(
+        "investigation",
+        json!({"action":"upsert","title":"T","status":"verified"}),
+        Some("written"),
+        "verify it with action=verify",
+    );
+    check(
+        "history",
+        json!({"action":"zebra"}),
+        None,
+        "one of: search, read",
+    );
+}
+
+#[test]
+fn a_field_of_another_action_names_that_action() {
+    let (_dir, mut s) = project_session();
+    for (name, args, says) in [
+        (
+            "history",
+            json!({"action":"search","query":"x","id":3}),
+            "id is used by action=read",
+        ),
+        (
+            "task_state",
+            json!({"action":"read","patch":{"phase":"verify"}}),
+            "patch is used by action=update",
+        ),
+        (
+            "memory_manage",
+            json!({"action":"candidates","ids":["m1"]}),
+            "ids is used by action=delete, action=replace",
+        ),
+        (
+            "investigation",
+            json!({"action":"list","status":"written"}),
+            "status is used by action=upsert",
+        ),
+        (
+            "investigation",
+            json!({"action":"verify","id":"I1","source_ids":["S1"],"note":"x"}),
+            "did you mean verification_note?",
+        ),
+    ] {
+        let result = tools::run_call(&mut s, &call_id(name, args));
+        let error = result["error"].as_str().unwrap();
+        assert!(error.starts_with("invalid_action_arguments: "), "{error}");
+        assert!(error.contains(says), "{error}");
+    }
+}
+
+#[test]
+fn argument_errors_list_the_failing_tool_first_among_recovery_tools() {
+    let (_dir, mut s) = project_session();
+    s.config.memory_reuse = true;
+    // memory_read and memory_find once received only "history".
+    for (name, args) in [
+        ("memory_read", json!({"key":"m1"})),
+        ("memory_find", json!({"q":"x"})),
+        ("tool_catalog", json!({"name":"file"})),
+    ] {
+        let result = tools::run_call(&mut s, &call_id(name, args));
+        assert_eq!(result["recovery"]["action"], "correct_arguments");
+        assert_eq!(result["recovery"]["tools"][0], name, "{result}");
+    }
+    // A corrected path is resent to the same tool.
+    let result = tools::run_call(&mut s, &call_id("file_read", json!({"path":"src/mian.rs"})));
+    assert!(
+        result["recovery"]["tools"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("file_read")),
+        "{result}"
+    );
+}
+
+#[test]
+fn a_path_holding_a_citation_glob_or_misplaced_directory_says_so() {
+    let (_dir, mut s) = project_session();
+    let error = |s: &mut Session, name: &str, args: Value| {
+        tools::run_call(s, &call_id(name, args))["error"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    for path in ["src/main.rs:2-4", "src/main.rs#L2-L4", "src/main.rs:2-4:7"] {
+        let message = error(&mut s, "file_read", json!({"path":path}));
+        assert!(
+            message.contains(
+                r#"send only the file path "src/main.rs" in path and the lines separately (file_read: start_line=2, max_lines=3). "src/main.rs" exists."#
+            ),
+            "{path}: {message}"
+        );
+    }
+    let message = error(
+        &mut s,
+        "source_search",
+        json!({"query":"helper","path":"src/*.rs"}),
+    );
+    assert!(
+        message.contains(r#"send path_glob:"src/*.rs" instead"#),
+        "{message}"
+    );
+    // A directory named at the wrong level is found by its name.
+    let message = error(&mut s, "file_list", json!({"path":"backend"}));
+    assert!(
+        message.contains("similar name: src/backend/. Copy one exactly"),
+        "{message}"
+    );
+}
+
+#[test]
+fn every_missing_field_of_an_edit_action_is_named_together() {
+    let (_dir, mut s) = project_session();
+    let result = tools::run_call(
+        &mut s,
+        &call_id("document_edit", json!({"action":"replace_text"})),
+    );
+    assert_eq!(
+        result["error"],
+        "missing_argument: text for document_edit action=replace_text; old_text is also missing; action=replace_text needs text, old_text"
+    );
+    assert_eq!(result["data"]["input_error"]["field"], "text");
+    let result = tools::run_call(
+        &mut s,
+        &call_id(
+            "document_edit_batch",
+            json!({"expected_hash":"x","edits":[{"action":"section","text":"## Part\n"}]}),
+        ),
+    );
+    assert_eq!(
+        result["error"],
+        "missing_argument: edits[0].section is required for action=section; expected_section_hash is also missing; action=section needs text, section, expected_section_hash"
+    );
+
+    // file_patch operations name the action and where a field belongs.
+    for (operation, says) in [
+        (
+            json!({"action":"add","path":"new.txt","content":"x","old_text":"y"}),
+            "old_text is not accepted by action=add, which takes path, content; old_text/new_text belong to action=update",
+        ),
+        (
+            json!({"action":"add","path":"new.txt"}),
+            "missing_argument: content is required for action=add",
+        ),
+        (
+            json!({"action":"add","path":"src/main.rs","content":"x"}),
+            "already exists and action=add only creates new files; to change it use update",
+        ),
+    ] {
+        let result = tools::run_call(
+            &mut s,
+            &call_id("file_patch", json!({"operations":[operation]})),
+        );
+        let error = result["error"].as_str().unwrap();
+        assert!(error.contains(says), "{error}");
+        assert!(error.ends_with("no changes persisted"), "{error}");
+    }
+}
+
+#[test]
+fn a_malformed_hash_is_not_reported_as_a_changed_document() {
+    let (dir, mut s) = project_session();
+    let before = std::fs::read(dir.path().join("summary.md")).unwrap();
+    // The edit's own problem comes with the hash error, as for a missing hash.
+    let result = tools::run_call(
+        &mut s,
+        &call_id(
+            "document_edit",
+            json!({"action":"insert_after","section":"## Nope","text":"## New\n\nx\n","expected_hash":"abc"}),
+        ),
+    );
+    let error = result["error"].as_str().unwrap();
+    assert!(
+        error.contains("expected_hash is not a document hash"),
+        "{error}"
+    );
+    assert!(
+        error.contains(
+            "the edit was also checked against the current document and failed: section_not_found"
+        ),
+        "{error}"
+    );
+    assert!(error.ends_with("nothing was written"), "{error}");
+    let result = tools::run_call(
+        &mut s,
+        &call_id(
+            "document_edit_batch",
+            json!({"expected_hash":"abc","edits":[{"action":"replace_text","old_text":"Missing","text":"x"}]}),
+        ),
+    );
+    let error = result["error"].as_str().unwrap();
+    assert!(
+        error.contains("its edits were also checked against the current document and 1 failed: [index=0; action=replace_text; cause=patch_target_must_match_once"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("summary.md")).unwrap(),
+        before
+    );
+    // Paging with a value no tool issued does not claim the document changed.
+    let result = tools::run_call(
+        &mut s,
+        &call_id(
+            "document_inspect",
+            json!({"offset":1,"expected_hash":"bad"}),
+        ),
+    );
+    let error = result["error"].as_str().unwrap();
+    assert!(
+        error.contains("expected_hash is not a document hash"),
+        "{error}"
+    );
+    assert!(!error.contains("changed"), "{error}");
+}
+
+#[test]
+fn investigation_items_named_by_id_or_title_explain_what_exists() {
+    let (_dir, mut s) = project_session();
+    let result = tools::run_call(
+        &mut s,
+        &call_id(
+            "investigation",
+            json!({"action":"upsert","id":"I9","status":"in_progress"}),
+        ),
+    );
+    assert!(
+        result["error"].as_str().unwrap().contains(
+            r#"id "I9" is not an existing item, so this upsert creates a new item and needs title (existing ids: [])"#
+        ),
+        "{result}"
+    );
+    let created = tools::run_call(
+        &mut s,
+        &call_id(
+            "investigation",
+            json!({"action":"upsert","title":"Overview"}),
+        ),
+    );
+    let id = created["data"]["id"].as_str().unwrap().to_owned();
+    let result = tools::run_call(
+        &mut s,
+        &call_id(
+            "investigation",
+            json!({"action":"upsert","title":"Overview"}),
+        ),
+    );
+    assert!(
+        result["error"].as_str().unwrap().contains(&format!(
+            r#"item "{id}" already has the title "Overview"; update that item with {{"action":"upsert","id":"{id}""#
+        )),
+        "{result}"
+    );
+}
+
+#[test]
+fn compacted_input_errors_keep_the_suggested_field() {
+    let mut s = session();
+    let invocation = call("file_read", json!({"file_path":"src/main.rs"}));
+    let mut result = tools::run_call(&mut s, &invocation);
+    result["error"] = json!(format!("unknown_argument: {}", "details ".repeat(1000)));
+    let limited = tools::limit_result(&mut s, &invocation, result, 200);
+    assert_eq!(
+        limited["data"]["input_error"]["did_you_mean"], "path",
+        "{limited}"
+    );
+}
+
+#[test]
+fn a_directory_path_with_a_glob_names_the_one_glob_that_means_both() {
+    let (dir, mut s) = project_session();
+    std::fs::write(dir.path().join("src/backend/style.css"), "a {}\n").unwrap();
+    let absolute = dir.path().join("src/backend").display().to_string();
+    // A live run resent this file_list five times without the combined form.
+    for (name, args, says) in [
+        (
+            "file_list",
+            json!({"path":absolute,"path_glob":"*.css"}),
+            r#"send only path_glob:"src/backend/**/*.css""#,
+        ),
+        (
+            "source_search",
+            json!({"query":"a","path":"src","pattern":"backend/*.rs"}),
+            r#"send only path_glob:"src/backend/*.rs""#,
+        ),
+        (
+            "symbol_search",
+            json!({"query":"api","path":"src","path_glob":"*.rs"}),
+            r#"send only path_glob:"src/**/*.rs""#,
+        ),
+        (
+            "source_search",
+            json!({"query":"a","path":"src/main.rs","path_glob":"*.rs"}),
+            "path already names one file, so drop path_glob",
+        ),
+    ] {
+        let result = tools::run_call(&mut s, &call_id(name, args));
+        let error = result["error"].as_str().unwrap();
+        assert!(error.contains(says), "{name}: {error}");
+    }
+    // The suggested glob works.
+    let result = tools::run_call(
+        &mut s,
+        &call_id("file_list", json!({"path_glob":"src/backend/**/*.css"})),
+    );
+    assert_eq!(
+        result["data"]["paths"],
+        json!(["src/backend/style.css"]),
+        "{result}"
+    );
+}
+
+#[test]
+fn an_unknown_tool_name_names_the_offered_tool_it_most_likely_meant() {
+    let (_dir, mut s) = project_session();
+    for (name, meant, says) in [
+        ("read", Some("file_read"), "did you mean file_read?"),
+        ("tool_plan", Some("task_plan"), "did you mean task_plan?"),
+        (
+            "read_result_key>main.jsx</arg_value>",
+            Some("file_read"),
+            "carries extra text or call markup",
+        ),
+        ("run_guidance", None, "run_guidance is program state"),
+        (
+            "zebra",
+            None,
+            "zebra is not a tool name; nothing was executed. Use",
+        ),
+    ] {
+        let result = tools::run_call(&mut s, &call_id(name, json!({"path":"src/main.rs"})));
+        assert_eq!(result["recovery"]["code"], "unsupported_tool", "{result}");
+        let error = result["error"].as_str().unwrap();
+        assert!(error.contains(says), "{name}: {error}");
+        assert_eq!(result["data"]["did_you_mean"].as_str(), meant, "{result}");
+        if let Some(meant) = meant {
+            assert_eq!(result["recovery"]["tools"][0], meant, "{result}");
+        }
+    }
+}
+
+#[test]
+fn an_audit_without_investigation_items_says_how_to_register_them() {
+    let (_dir, mut s) = project_session();
+    s.select_workflow("source_document").unwrap();
+    let result = tools::run_call(&mut s, &call_id("document_audit", json!({})));
+    let issue = result["data"]["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|issue| issue["kind"] == "no_investigation_coverage")
+        .cloned()
+        .unwrap();
+    assert!(
+        issue["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("Register one item per written section with investigation upsert"),
+        "{issue}"
+    );
+}

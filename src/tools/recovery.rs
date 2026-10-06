@@ -565,15 +565,33 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         .collect();
     let mut available = available;
     // Typed-but-invalid arguments are recoverable by correcting and resending
-    // the same call. Keep this fallback availability-filtered so checkpoints
+    // the same call, so that tool leads the list (memory_read and memory_find
+    // once got only "history"). Keep it availability-filtered so checkpoints
     // and inactive optional tools never receive an impossible hint.
-    if available.is_empty()
-        && result["recovery"]["action"] == "correct_arguments"
+    // An unknown tool name leads with the offered tool it most likely meant.
+    if result["recovery"]["code"] == "unsupported_tool"
+        && let Some(meant) = result["data"]["did_you_mean"].as_str()
+        && !available.contains(&meant)
+        && definitions
+            .iter()
+            .any(|definition| definition["function"]["name"] == meant)
+    {
+        available.insert(0, meant);
+    }
+    // A corrected path is resent to the same tool as well.
+    if matches!(
+        result["recovery"]["action"].as_str(),
+        Some("correct_arguments" | "resolve_path")
+    ) && !available.contains(&call.name.as_str())
         && definitions
             .iter()
             .any(|definition| definition["function"]["name"] == call.name)
     {
-        available.push(call.name.as_str());
+        if result["recovery"]["action"] == "correct_arguments" {
+            available.insert(0, call.name.as_str());
+        } else {
+            available.push(call.name.as_str());
+        }
     }
     result["recovery"]["tools"] = json!(available);
 }

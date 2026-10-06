@@ -179,7 +179,12 @@ fn required<'a>(operation: &'a Value, key: &str) -> Result<&'a str> {
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| match operation.get(key) {
-            None => anyhow::anyhow!("missing_argument: {key} is required"),
+            None => match operation["action"].as_str() {
+                Some(action) if key != "action" => {
+                    anyhow::anyhow!("missing_argument: {key} is required for action={action}")
+                }
+                _ => anyhow::anyhow!("missing_argument: {key} is required"),
+            },
             Some(value) => anyhow::anyhow!(
                 "invalid_argument_type: {key} must be string, got {}",
                 super::arguments::value_type(value)
@@ -301,7 +306,23 @@ fn operation(
     };
     for key in obj.keys() {
         if !allowed.contains(&key.as_str()) {
-            bail!("invalid_operation_field: {key} for {action}");
+            let owner = match key.as_str() {
+                "old_text" | "new_text" | "replace_all" => {
+                    "; old_text/new_text belong to action=update, which edits part of an existing file"
+                }
+                "content" => {
+                    "; content belongs to action=add (new file) or replace (whole existing file)"
+                }
+                "to_path" => "; to_path belongs to action=move",
+                "expected_hash" => {
+                    "; action=add creates a new file, so it has no hash; use update or replace to change an existing file"
+                }
+                _ => "",
+            };
+            bail!(
+                "invalid_operation_field: {key} is not accepted by action={action}, which takes {}{owner}",
+                allowed[1..].join(", ")
+            );
         }
     }
     match action {
@@ -309,7 +330,10 @@ fn operation(
             let text = required(op, "content")?;
             content(text)?;
             if load(&path, state, originals, permissions)?.is_some() {
-                bail!("file_exists: {}", path.display());
+                bail!(
+                    "file_exists: {} already exists and action=add only creates new files; to change it use update (old_text/new_text) or replace (content), each with expected_hash from file_read",
+                    path.display()
+                );
             }
             if originals[&path].is_some() {
                 replaced_paths.insert(path.clone());
@@ -348,7 +372,15 @@ fn operation(
             check_operation_hash(op, &path, &old, checked)?;
             let destination = project_path(s, required(op, "to_path")?)?;
             if destination == path || load(&destination, state, originals, permissions)?.is_some() {
-                bail!("file_exists: {}", destination.display());
+                bail!(
+                    "file_exists: to_path {} {}; move only to a path that does not exist yet",
+                    destination.display(),
+                    if destination == path {
+                        "is the same as path"
+                    } else {
+                        "already exists"
+                    }
+                );
             }
             if originals[&destination].is_some() {
                 replaced_paths.insert(destination.clone());

@@ -158,6 +158,32 @@ ling-3.0-flash 라이브 실행(`complete_with_gaps`)의 처리 로그에서 확
 - `section_not_found`는 제목이 8개를 넘으면 앞쪽 8개 대신 요청한 제목과 가장 비슷한 8개를 보여 준다. 유사도는 대소문자·공백·문장부호를 뺀 글자 2-gram 기준이라 한국어에도 맞는다. 전체 제목 수와 일부 목록이라는 사실, 전체 개요를 보는 방법도 함께 알린다. `ambiguous_section`도 일치가 8개를 넘으면 앞 8개만 보인다고 밝힌다.
 - `repeated_unchanged` 표시는 같은 호출을 바꾸지 않고 다시 보내면 같은 결과가 나는 경우 모두에 붙는다. 대상은 오래된 상태, 선행 조건, 용량, 마감·체크포인트 중 차단(`unavailable`)까지 넓혔다. 일시 오류, 결과 불확실, 취소, 미분류 오류, 도구 작업자 대기는 다시 시도하면 성공할 수 있으므로 표시하지 않는다.
 
+### 의도한 인자·값 제안과 남은 모호한 오류 (4차)
+
+모든 도구에 흔한 잘못된 호출(다른 도구 관례의 인자 이름, 단수·복수, 대소문자, 철자 오류, 비슷한 열거값)을 보내 응답을 다시 점검했고, 다음을 보완했다.
+
+- 받지 않는 인자는 허용 목록과 함께 의도했을 인자를 제안한다(`src/tools/suggest.rs`). 최상위·중첩(`edits[0].new`, `operations[0].old_string`, `patch.todos`, `verify_batch` 항목, 행위별 검사기) 모두 같은 규칙을 쓴다. 메시지에 `did you mean path? send this value as path`를 넣고 `input_error.did_you_mean`에 대상 필드를 넣는다. 결과 축약 뒤에도 이 값은 유지된다. 값을 대신 옮기지는 않는다.
+- 제안은 도구가 실제로 받는 필드 중에서만 고른다. 보낸 값의 타입과 맞는 필드를 우선한다(`"querys":[...]` → `queries`). 이미 그 필드를 보냈다면 중복 인자를 빼라고 안내한다. 이름만 다른 경우가 아니면 따로 설명한다. `end_line`은 `max_lines = end_line - start_line + 1`과 계산값, `context`는 `before`/`after`, `ignore_case`는 반대 의미의 `case_sensitive:false`, 심볼 이름은 `symbol_search`로 `symbol_id`를 찾는 방법, 여러 경로는 호출 분리, `task_plan` 최상위 `texts`는 작업 객체 안에 넣는 방법을 알린다. 비슷한 것이 없으면 추측하지 않는다.
+- 허용되지 않는 열거값도 의도한 값을 제안한다(`kind:"fn"` → `function`, `relation:"callees"` → `calls`, `phase:"verification"` → `verify`, `memory_manage action:"list"` → `candidates`). `document_edit`의 `replace`·`insert`·`delete`는 함께 보낸 `old_text`·`section`에 따라 실제 액션을 고른다. 배치의 `create`는 먼저 문서를 만들라고 알린다. `match:"regex"`는 `source_search regex:true`로 안내한다. `task_plan` 동작명의 동의어(`done` → `complete`)는 작업이라고 알린다.
+- 다른 액션의 인자를 보내면 그 인자를 받는 액션을 알려 준다(`history action=search`의 `id` → `action=read`). 대상은 `history`, `task_state`, `memory_manage`, `document_edit`, `investigation`이다.
+- 인자 오류의 복구 도구 목록에는 실패한 도구를 항상 맨 앞에 둔다. 전에는 `memory_read`·`memory_find`가 `history`만 안내받았다. 경로를 고친 뒤 같은 도구로 다시 보내도록 `resolve_path`에도 그 도구를 넣는다.
+- 경로: `src/a.rs:12-20`, `#L12-L20`, `path:line:column`처럼 인용 형식을 `path`에 넣으면 파일 경로와 `start_line`/`max_lines` 값을 나눠 알려 준다. glob 문자가 든 `path`에는 `path_glob`을 안내한다. 찾지 못한 디렉터리는 같은 이름의 다른 위치 디렉터리를 제안한다.
+- `document_edit`과 배치 항목은 그 액션에 빠진 필드를 한 번에 모두 알린다(`text ...; old_text is also missing; action=replace_text needs text, old_text`). `file_patch` 작업 오류는 액션, 그 액션이 받는 필드, 필드가 속한 액션을 적는다. 이미 있는 파일에 `add`를 쓰면 `update`/`replace`를 안내한다.
+- 형식이 잘못된 `expected_hash`(도구가 발급하지 않은 값)는 해시가 없을 때처럼 편집 자체를 메모리에서 검사하고, 그 결과를 함께 알린다. `document_inspect`·`document_audit` 페이지 이어 읽기에서 그런 값은 "문서가 바뀌었다"가 아니라 해시·리비전 형식이 아니라고 알린다.
+- `investigation upsert`에서 없는 `id`를 보내고 `title`을 빠뜨리면 그 ID가 없어 새 항목이 된다는 사실과 기존 ID 목록을 알린다. 제목 중복은 기존 항목 ID와 수정 호출을 알린다. 형식은 맞지만 현재 파일에 없는 `symbol_id`, `db_query`의 `run`·`list` 인자 오류도 원인과 다음 호출을 적는다.
+
+`tests/tool_input_diagnostics.rs`의 제안·경로·누락 필드·해시·조사 항목 테스트와 `suggest.rs` 단위 테스트가 이를 검증한다.
+
+라이브 실행(ling-3.0-flash, llm_agent UI 매뉴얼)에서 확인한 3건도 보완했다.
+
+- 문서를 저장했지만 조사 항목이 0개이면, 최종 답변이 거절되고 리뷰도 실행되지 않는다. 그런데 이 단계를 알려 주는 안내가 없어서, 두 번의 실행이 항목 등록과 최종 답변 없이 마감 한도로 끝났다. 이제 준비 상태 점검이 `run_guidance.unregistered_document`(문서 섹션 목록과 그대로 보낼 수 있는 upsert 예시)와 지시를 낸다. 마감 단계 지시도 섹션 목록을 포함해 등록 → verify_batch → mark_gap → 최종 답변 순서를 안내한다. 감사 결과의 `no_investigation_coverage`에도 해결 방법을 붙였다.
+- `path`와 `path_glob`을 함께 보내면 둘을 합친 하나의 `path_glob`(예: `src/backend/**/*.css`)을 알려 준다. `path`가 파일이면 `path_glob`을 빼라고 안내한다. `file_list`, `source_search`, `symbol_search`에 적용된다. 디렉터리 이름은 glob 특수문자를 이스케이프한다.
+- 없는 도구 이름은 지금 제공되는 도구 중 의도했을 도구를 제안하고(`read` → `file_read`, `tool_plan` → `task_plan`), `data.did_you_mean`과 복구 도구 목록 맨 앞에 넣는다. 호출 표기가 섞인 이름은 앞부분 식별자로 찾는다. `run_guidance`는 도구가 아니라 요청에 포함된 상태라고 알린다.
+- 완료 리뷰 응답이 형식에 맞지 않으면 실패한 check마다 순서·기준 ID와 어긴 조건을 모두 알린다. 조건은 상태값(비슷한 값 제안 포함), 이유 길이, 근거 ID(공급된 ID 예시 포함), met의 근거·next_action, unmet/unverified의 next_action, 누락·중복·다른 페이지의 기준이다. 전에는 조건 10개를 한 문장으로 묶어 알려 라이브 실행에서 다섯 번 연속 실패했다. met check의 `none`, `n/a`, `-`, `없음` 같은 자리채움 next_action은 비운다.
+- 문서 리뷰의 requirement·scope 지적에 requirement_id가 없거나 목록에 없으면, 쓸 수 있는 requirement_catalog 키와 용도(요청 요구사항 R/C/K/D, 독자 수준은 audience·purpose)를 알리고 비슷한 키를 제안한다. 리뷰어 지침에도 이 규칙을 적었다.
+- `document` 유형 지적이 프로젝트 파일을 근거로 들면 거절하지 않고 `factual` 지적으로 읽는다. 함께 보낸 문서 구절 근거는 뺀다. 근거 파일 없는 사실 지적을 `document`로 읽는 규칙의 반대 방향이다.
+
+
 ## 문서 검증 도구 개선 (2026-09-21)
 
 세션에서 발생한 반복 호출을 기준으로 다음 계약을 보강했다.

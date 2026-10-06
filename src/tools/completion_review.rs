@@ -732,6 +732,140 @@ pub fn request(s: &mut Session) -> Result<Value> {
     )
 }
 
+const MAX_REPORTED_PROBLEMS: usize = 8;
+
+/// "none", "n/a", "-" and the like in a met check's next_action.
+fn placeholder_action(action: &str) -> bool {
+    let action = action.trim().trim_end_matches('.').to_lowercase();
+    matches!(
+        action.as_str(),
+        "" | "none"
+            | "n/a"
+            | "na"
+            | "-"
+            | "—"
+            | "null"
+            | "nil"
+            | "nothing"
+            | "no action"
+            | "no action needed"
+            | "no action required"
+            | "not applicable"
+            | "없음"
+            | "해당 없음"
+            | "해당없음"
+            | "조치 없음"
+            | "필요 없음"
+    )
+}
+
+/// Every reason a page's checks are rejected, each naming the check by
+/// index and criterion ID and the exact condition it breaks.
+fn check_problems(checks: &[Check], expected: &[&str], evidence: &BTreeSet<&str>) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut seen = BTreeSet::new();
+    let statuses = [json!("met"), json!("unmet"), json!("unverified")];
+    for (index, check) in checks.iter().enumerate() {
+        let at = format!("checks[{index}] (id {:?})", check.id);
+        if !expected.contains(&check.id.as_str()) {
+            problems.push(format!(
+                "{at}: not a criterion on this page; use the criterion ids {}",
+                json!(expected)
+            ));
+            continue;
+        }
+        if !seen.insert(check.id.as_str()) {
+            problems.push(format!(
+                "{at}: a second check for this criterion; send exactly one"
+            ));
+            continue;
+        }
+        if !["met", "unmet", "unverified"].contains(&check.status.as_str()) {
+            problems.push(format!(
+                "{at}: status {:?} is not one of met, unmet, unverified{}",
+                check.status,
+                crate::tools::suggest_value(
+                    "completion_review",
+                    "status",
+                    &check.status,
+                    &statuses
+                )
+            ));
+        }
+        let reason = check.reason.trim().chars().count();
+        if reason == 0 {
+            problems.push(format!(
+                "{at}: reason is empty; give the specific observed reason"
+            ));
+        } else if check.reason.chars().count() > 300 {
+            problems.push(format!(
+                "{at}: reason has {} characters; at most 300",
+                check.reason.chars().count()
+            ));
+        }
+        if check.evidence.len() > 8 {
+            problems.push(format!(
+                "{at}: {} evidence IDs; at most 8",
+                check.evidence.len()
+            ));
+        }
+        let unknown: Vec<_> = check
+            .evidence
+            .iter()
+            .filter(|id| !evidence.contains(id.as_str()))
+            .collect();
+        if !unknown.is_empty() {
+            let supplied: Vec<_> = evidence.iter().take(12).collect();
+            problems.push(format!(
+                "{at}: evidence {} are not supplied evidence IDs; copy ids from evidence[].id, e.g. {}{}",
+                json!(unknown),
+                json!(supplied),
+                if evidence.len() > supplied.len() {
+                    format!(" (first {} of {})", supplied.len(), evidence.len())
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        match check.status.as_str() {
+            "met" => {
+                if check.evidence.is_empty() {
+                    problems.push(format!(
+                        "{at}: met needs at least one supplied evidence ID; when no supplied evidence shows the criterion is satisfied use unverified"
+                    ));
+                }
+                if !check.next_action.trim().is_empty() {
+                    problems.push(format!(
+                        "{at}: met takes an empty next_action; if work remains, use unmet or unverified with that action"
+                    ));
+                }
+            }
+            "unmet" | "unverified" => {
+                let action = check.next_action.trim().chars().count();
+                if action == 0 {
+                    problems.push(format!(
+                        "{at}: {} needs one concrete next_action (at most 160 characters)",
+                        check.status
+                    ));
+                } else if action > 160 {
+                    problems.push(format!(
+                        "{at}: next_action has {action} characters; at most 160"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    let missing: Vec<_> = expected.iter().filter(|id| !seen.contains(*id)).collect();
+    if !missing.is_empty() {
+        problems.push(format!(
+            "no check for criteria {}; every criterion on this page requires exactly one check",
+            json!(missing)
+        ));
+    }
+    problems
+}
+
 /// Returns the held answer only after every criterion page has passed. The
 /// caller still runs document/citation checks before publishing this answer.
 pub fn finish(s: &mut Session, response: &str) -> Result<Option<String>> {
@@ -769,30 +903,27 @@ pub fn finish(s: &mut Session, response: &str) -> Result<Option<String>> {
         .iter()
         .map(|v| v["id"].as_str().unwrap())
         .collect();
-    let mut seen = BTreeSet::new();
-    if verdict.checks.len() != expected.len() {
-        bail!("completion_review_invalid: every criterion on this page requires exactly one check");
-    }
-    for check in &verdict.checks {
-        if !expected.contains(&check.id.as_str())
-            || !seen.insert(check.id.as_str())
-            || !["met", "unmet", "unverified"].contains(&check.status.as_str())
-            || check.reason.trim().is_empty()
-            || check.reason.chars().count() > 300
-            || check.evidence.len() > 8
-            || check
-                .evidence
-                .iter()
-                .any(|id| !evidence.contains(id.as_str()))
-            || (check.status == "met"
-                && (check.evidence.is_empty() || !check.next_action.is_empty()))
-            || (check.status != "met"
-                && (check.next_action.trim().is_empty() || check.next_action.chars().count() > 160))
-        {
-            bail!(
-                "completion_review_invalid: invalid criterion, status, reason, evidence ID or next_action"
-            );
+    // A met check needs no action; providers that fill every field send a
+    // placeholder such as "none", which carries nothing to execute.
+    for check in &mut verdict.checks {
+        if check.status == "met" && placeholder_action(&check.next_action) {
+            check.next_action.clear();
         }
+    }
+    let problems = check_problems(&verdict.checks, &expected, &evidence);
+    if !problems.is_empty() {
+        // Name every failing check and condition: one combined sentence for
+        // ten conditions left a live run failing five reviews in a row.
+        bail!(
+            "completion_review_invalid: {} problem(s), fix each and resend every check of this page: {}",
+            problems.len(),
+            problems
+                .iter()
+                .take(MAX_REPORTED_PROBLEMS)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
     }
     if state.payload["artifact_work"] == true
         && verdict

@@ -11,6 +11,7 @@ mod navigation;
 pub mod recovery;
 mod search;
 mod structure;
+mod suggest;
 mod writes;
 pub(crate) use writes::{external_write, uncertain_write_error};
 pub mod task_plan;
@@ -882,11 +883,7 @@ impl ToolRegistry {
         let spec = Self::specs()
             .into_iter()
             .find(|t| t.name == name)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unsupported_tool: {name} is not a tool name; nothing was executed. Use an exact name from the offered tool list, or search with tool_catalog"
-                )
-            })?;
+            .ok_or_else(|| unsupported_tool(s, name))?;
         reject_project_write_in_source_document(s, name)?;
         if spec.optional && !s.active_tools.contains(name) {
             bail!(
@@ -953,14 +950,12 @@ impl ToolRegistry {
                         "unknown_argument: {key} belongs inside task_state patch; use {{\"action\":\"update\",\"patch\":{{\"{key}\":...}}}}; state unchanged"
                     );
                 }
-                let allowed: Vec<_> = fields.keys().collect();
-                return Err(arguments::failure(
+                return Err(arguments::unknown_field(
                     name,
                     key,
-                    "unknown_argument",
-                    json!({"allowed_fields":allowed}),
-                    arguments::value_type(&object[key]),
-                    &format!("is not accepted; allowed arguments: {}", json!(allowed)),
+                    &object[key],
+                    &spec.parameters["properties"],
+                    args,
                 ));
             }
         }
@@ -997,7 +992,7 @@ impl ToolRegistry {
                 // Retain user-owned workflow diagnostics before nested schema checks.
                 continue;
             }
-            arguments::validate_field(name, k, field, v)?;
+            arguments::validate_field(name, k, field, v, args)?;
         }
         if name == "task_state" {
             validate_task_state_arguments(args)?;
@@ -1014,17 +1009,47 @@ impl ToolRegistry {
     }
 }
 
+/// " ; did you mean ..." for a rejected value of `field`, or "".
+pub(crate) fn suggest_value(tool: &str, field: &str, received: &str, allowed: &[Value]) -> String {
+    suggest::value(tool, field, &json!(received), allowed, &Value::Null)
+        .map_or_else(String::new, |s| s.text)
+}
+
+/// A tool name that does not exist, with the offered tool the call most
+/// likely meant: live runs called read, tool_plan and run_guidance.
+fn unsupported_tool(s: &Session, name: &str) -> anyhow::Error {
+    let offered: Vec<String> = ToolRegistry::definitions(s)
+        .iter()
+        .filter_map(|definition| definition["function"]["name"].as_str().map(str::to_owned))
+        .collect();
+    let offered: Vec<&str> = offered.iter().map(String::as_str).collect();
+    let suggestion = suggest::tool(name, &offered);
+    let mut data = json!({"execution":"not_started"});
+    if let Some(target) = suggestion.as_ref().and_then(|s| s.target.as_ref()) {
+        data["did_you_mean"] = json!(target);
+    }
+    recovery::DiagnosticError {
+        message: format!(
+            "unsupported_tool: {} is not a tool name; nothing was executed{}. Use an exact name from the offered tool list, or search with tool_catalog",
+            name.chars().take(80).collect::<String>(),
+            suggestion.map_or_else(String::new, |s| s.text)
+        ),
+        data,
+    }
+    .into()
+}
+
 fn validate_task_state_arguments(args: &Value) -> Result<()> {
     let action = args["action"].as_str().unwrap_or("");
     validate_action_fields(
         "task_state",
         args,
-        match action {
-            "read" => &["action"][..],
+        |action| match action {
             "details" => &["action", "offset", "limit"][..],
             "update" => &["action", "patch"][..],
             _ => &["action"][..],
         },
+        &["read", "update", "details"],
     )?;
     if action != "update" {
         return Ok(());
@@ -1055,12 +1080,15 @@ fn validate_task_state_arguments(args: &Value) -> Result<()> {
                     "workflow_selected_by_user: the user selects the workflow for this session (see task.workflow); omit {key} from the patch; state unchanged"
                 );
             }
+            let allowed: Vec<&str> = properties.keys().map(String::as_str).collect();
+            let hint = suggest::field("task_state", "patch", key, &allowed, patch)
+                .map_or_else(String::new, |s| s.text);
             bail!(
-                "unknown_argument: patch.{key} is not a task_state patch field; allowed patch fields: {}; state unchanged",
-                properties.keys().cloned().collect::<Vec<_>>().join(", ")
+                "unknown_argument: patch.{key} is not a task_state patch field{hint}; allowed patch fields: {}; state unchanged",
+                allowed.join(", ")
             );
         };
-        arguments::validate_field("task_state", &format!("patch.{key}"), field, value)?;
+        arguments::validate_field("task_state", &format!("patch.{key}"), field, value, patch)?;
     }
     Ok(())
 }
@@ -1089,7 +1117,7 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
     validate_action_fields_with(
         "document_edit",
         args,
-        match action {
+        |action| match action {
             "create" | "write" | "append" => &["action", "text", "expected_hash"][..],
             "patch" | "replace_text" | "insert_before_text" | "insert_after_text" => {
                 &["action", "text", "expected_hash", "old_text", "section"][..]
@@ -1107,6 +1135,21 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
             ][..],
             _ => &["action", "text"][..],
         },
+        &[
+            "create",
+            "write",
+            "append",
+            "insert_before",
+            "insert_after",
+            "insert_first_child",
+            "insert_last_child",
+            "patch",
+            "replace_text",
+            "delete_text",
+            "insert_before_text",
+            "insert_after_text",
+            "section",
+        ],
         document_action_hint,
     )?;
     let require = |key: &str| {
@@ -1140,9 +1183,19 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
         }
     };
     let require = |key: &str| require(key).map_err(also_hash);
-    if action != "delete_text" && args.get("text").is_none() {
+    // Name every missing field of this action at once; a live model fixed
+    // text and then failed again on the missing old_text.
+    let needed = document_edit_needs(action);
+    let missing: Vec<&str> = needed
+        .iter()
+        .copied()
+        .filter(|key| args.get(*key).is_none())
+        .collect();
+    if let [first, rest @ ..] = missing.as_slice() {
         return Err(also_hash(anyhow::anyhow!(
-            "missing_argument: text for document_edit action={action}"
+            "missing_argument: {first} for document_edit action={action}{}; action={action} needs {}",
+            also_missing(rest),
+            needed.join(", ")
         )));
     }
     if let Some(text) = args["text"].as_str() {
@@ -1179,6 +1232,30 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// Fields a document edit action needs besides action and expected_hash,
+/// text first (the order errors have always used).
+fn document_edit_needs(action: &str) -> &'static [&'static str] {
+    match action {
+        "patch" | "replace_text" | "insert_before_text" | "insert_after_text" => {
+            &["text", "old_text"]
+        }
+        "delete_text" => &["old_text"],
+        "insert_before" | "insert_after" | "insert_first_child" | "insert_last_child" => {
+            &["text", "section"]
+        }
+        "section" => &["text", "section", "expected_section_hash"],
+        _ => &["text"],
+    }
+}
+
+fn also_missing(rest: &[&str]) -> String {
+    match rest {
+        [] => String::new(),
+        [one] => format!("; {one} is also missing"),
+        more => format!("; {} are also missing", more.join(", ")),
+    }
 }
 
 /// Some providers leak a model's native `<arg_key>k</arg_key><arg_value>v</arg_value>`
@@ -1576,6 +1653,19 @@ fn validate_document_edit_batch_edits(args: &Value) -> Result<()> {
         {
             bail!("invalid_argument_value: edits[{index}].action is not a supported document edit");
         }
+        let needed = document_edit_needs(action);
+        let missing: Vec<&str> = needed
+            .iter()
+            .copied()
+            .filter(|key| !object.contains_key(*key))
+            .collect();
+        if let [first, rest @ ..] = missing.as_slice() {
+            bail!(
+                "missing_argument: edits[{index}].{first} is required for action={action}{}; action={action} needs {}",
+                also_missing(rest),
+                needed.join(", ")
+            );
+        }
         if action != "delete_text" {
             let text_value = object
                 .get("text")
@@ -1724,12 +1814,11 @@ fn batch_target_hint(states: &[String], applied: &[usize], edit: &Value, error: 
     String::new()
 }
 
-/// A missing hash is found only after the edit was checked against the
-/// current document in memory, so the error also names the edit's own
-/// problems (`failures`; a batch lists each failing operation) and one retry
-/// fixes both.
-fn missing_document_hash(target: &str, batch: bool, failures: &[String]) -> anyhow::Error {
-    let checked = match (batch, failures) {
+/// What checking an edit against the current document in memory found, for
+/// an error that stops it before writing (`failures`; a batch lists each
+/// failing operation), so one retry fixes everything.
+fn checked_clause(batch: bool, failures: &[String]) -> String {
+    match (batch, failures) {
         (false, []) => {
             "the edit was checked against the current document and has no other problem".to_owned()
         }
@@ -1750,22 +1839,39 @@ fn missing_document_hash(target: &str, batch: bool, failures: &[String]) -> anyh
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-    };
+    }
+}
+
+/// A missing hash is found only after the edit was checked against the
+/// current document in memory, so the error also names the edit's own
+/// problems and one retry fixes both.
+fn missing_document_hash(target: &str, batch: bool, failures: &[String]) -> anyhow::Error {
     anyhow::anyhow!(
-        "document_hash_required: {target} on an existing document requires expected_hash; copy hash from the latest document_inspect or document_edit result; {checked}; nothing was written"
+        "document_hash_required: {target} on an existing document requires expected_hash; copy hash from the latest document_inspect or document_edit result; {}; nothing was written",
+        checked_clause(batch, failures)
     )
+}
+
+/// A SHA-256 hex digest, the only form tools issue.
+fn is_document_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// A stale hash means the document changed; a malformed one was never issued
 /// by a tool, so rereading alone would not tell the model what went wrong.
-fn revision_conflict(args: &Value, current: &str) -> anyhow::Error {
+/// Like a missing hash, a malformed one comes with what checking the edit
+/// against the current document found (`checked`).
+fn revision_conflict(args: &Value, current: &str, checked: Option<String>) -> anyhow::Error {
     let expected = args["expected_hash"].as_str().unwrap_or("");
-    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+    let checked = checked.map_or_else(String::new, |checked| {
+        format!("; {checked}; nothing was written")
+    });
+    if !is_document_hash(expected) {
         // A copy that lost a span of the current hash keeps failing when the
         // model reuses it; name the exact loss instead of asking for a reread.
         if let Some(dropped) = dropped_span(current, expected) {
             return anyhow::anyhow!(
-                "document_revision_conflict: expected_hash is the current hash with {dropped:?} missing after its first {} characters; use the current hash exactly: {current}",
+                "document_revision_conflict: expected_hash is the current hash with {dropped:?} missing after its first {} characters; use the current hash exactly: {current}{checked}",
                 expected
                     .bytes()
                     .zip(current.bytes())
@@ -1774,7 +1880,7 @@ fn revision_conflict(args: &Value, current: &str) -> anyhow::Error {
             );
         }
         return anyhow::anyhow!(
-            "document_revision_conflict: expected_hash is not a document hash (a SHA-256 hash is 64 hex characters; got {}); copy the hash field exactly from the latest document_inspect or document_edit result instead of retyping it",
+            "document_revision_conflict: expected_hash is not a document hash (a SHA-256 hash is 64 hex characters; got {}); copy the hash field exactly from the latest document_inspect or document_edit result instead of retyping it{checked}",
             expected.chars().count()
         );
     }
@@ -2619,12 +2725,12 @@ fn validate_memory_manage_arguments(args: &Value) -> Result<()> {
     validate_action_fields(
         "memory_manage",
         args,
-        match action {
-            "candidates" => &["action"][..],
+        |action| match action {
             "delete" => &["action", "ids"][..],
             "replace" => &["action", "ids", "replacement"][..],
             _ => &["action"][..],
         },
+        &["candidates", "delete", "replace"],
     )?;
     if matches!(action, "delete" | "replace") && args["ids"].as_array().is_none_or(Vec::is_empty) {
         bail!("missing_argument: ids for memory_manage action={action}");
@@ -2636,15 +2742,15 @@ fn validate_memory_manage_arguments(args: &Value) -> Result<()> {
 }
 
 fn validate_history_arguments(args: &Value) -> Result<()> {
-    let action = args["action"].as_str().unwrap_or("");
     validate_action_fields(
         "history",
         args,
-        match action {
+        |action| match action {
             "search" => &["action", "query", "after", "limit"][..],
             "read" => &["action", "id", "offset"][..],
             _ => &["action"][..],
         },
+        &["search", "read"],
     )?;
     if args["action"] == "read" && args.get("id").is_none() {
         bail!("missing_argument: id for history action=read");
@@ -2654,50 +2760,101 @@ fn validate_history_arguments(args: &Value) -> Result<()> {
 
 /// An argument outside its schema enum. Naming only the field left a live
 /// run resending task_plan action="insert" three times; say what arrived,
-/// what is allowed and, for a plan operation name, where it belongs.
-fn enum_value_error(name: &str, key: &str, value: &Value, allowed: &[Value]) -> String {
+/// what is allowed and the allowed value the call most likely meant. Returns
+/// the message and that value. `siblings` is the object holding the field.
+fn enum_value_error(
+    name: &str,
+    key: &str,
+    value: &Value,
+    allowed: &[Value],
+    siblings: &Value,
+) -> (String, Option<String>) {
     let shown = match value.as_str() {
         Some(text) => format!("{:?}", text.chars().take(80).collect::<String>()),
         None => value.to_string().chars().take(80).collect(),
     };
-    let allowed = allowed
+    let listed = allowed
         .iter()
         .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned))
         .collect::<Vec<_>>()
         .join(", ");
-    let hint = match (name, key, value.as_str()) {
-        (
-            "task_plan",
-            "action",
-            Some(op @ ("insert" | "update" | "split" | "move" | "remove" | "complete" | "reopen")),
-        ) => format!(
-            "; {op:?} is an operation, not an action: send action \"apply\" with expected_revision and operations [{{\"op\":{op:?}, ...}}]"
+    let leaf = key.rsplit('.').next().unwrap_or(key);
+    let leaf = leaf.split('[').next().unwrap_or(leaf);
+    let plan_ops = [
+        "insert", "update", "split", "move", "remove", "complete", "reopen",
+    ];
+    // A plan operation sent as the action, by name or by a common synonym.
+    let operation = (name == "task_plan" && key == "action")
+        .then(|| value.as_str())
+        .flatten()
+        .and_then(|sent| {
+            plan_ops
+                .contains(&sent)
+                .then_some(sent.to_owned())
+                .or_else(|| {
+                    let ops: Vec<Value> = plan_ops.iter().map(|op| json!(op)).collect();
+                    suggest::value(name, "op", value, &ops, siblings).and_then(|s| s.target)
+                })
+        });
+    let (hint, target) = match operation {
+        Some(op) => (
+            format!(
+                "; {op:?} is an operation, not an action: send action \"apply\" with expected_revision and operations [{{\"op\":{op:?}, ...}}]"
+            ),
+            Some("apply".to_owned()),
         ),
-        _ => String::new(),
+        None => suggest::value(name, leaf, value, allowed, siblings)
+            .map_or((String::new(), None), |s| (s.text, s.target)),
     };
-    format!("invalid_argument_value: {key} {shown} is not one of: {allowed}{hint}")
+    (
+        format!("invalid_argument_value: {key} {shown} is not one of: {listed}{hint}"),
+        target,
+    )
 }
 
-fn validate_action_fields(name: &str, args: &Value, allowed: &[&str]) -> Result<()> {
-    validate_action_fields_with(name, args, allowed, |_, _| String::new())
+type ActionFields = fn(&str) -> &'static [&'static str];
+
+fn validate_action_fields(
+    name: &str,
+    args: &Value,
+    fields: ActionFields,
+    actions: &[&str],
+) -> Result<()> {
+    validate_action_fields_with(name, args, fields, actions, |_, _| String::new())
 }
 
-/// `hint(action, key)` may add the next step for a rejected argument.
+/// `fields(action)` lists the arguments an action accepts. A rejected
+/// argument names the other `actions` that accept it (history action=search
+/// with id: id is used by action=read). `hint(action, key)` may add the next
+/// step instead.
 fn validate_action_fields_with(
     name: &str,
     args: &Value,
-    allowed: &[&str],
+    fields: ActionFields,
+    actions: &[&str],
     hint: impl Fn(&str, &str) -> String,
 ) -> Result<()> {
     let object = args
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("invalid_tool_arguments: arguments must be an object"))?;
+    let action = args["action"].as_str().unwrap_or("");
+    let allowed = fields(action);
     if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        let action = args["action"].as_str().unwrap_or("");
+        let mut next = hint(action, key);
+        let owners: Vec<_> = actions
+            .iter()
+            .filter(|other| **other != action && fields(other).contains(&key.as_str()))
+            .map(|other| format!("action={other}"))
+            .collect();
+        if next.is_empty() && !owners.is_empty() {
+            next = format!(
+                "; {key} is used by {}: drop {key}, or send that action if it is what you meant",
+                owners.join(", ")
+            );
+        }
         bail!(
-            "invalid_action_arguments: {name} action={action} does not accept {key}; allowed: {}{}",
-            allowed.join(", "),
-            hint(action, key)
+            "invalid_action_arguments: {name} action={action} does not accept {key}; allowed: {}{next}",
+            allowed.join(", ")
         );
     }
     Ok(())
@@ -2779,15 +2936,60 @@ fn validate_investigation_arguments(s: &Session, args: &Value) -> Result<()> {
     }
     for key in args.as_object().unwrap().keys() {
         if !allowed.contains(&key.as_str()) {
+            // A misnamed field for this action ("note" for
+            // verification_note), or a field another action takes.
+            let owners: Vec<_> = [
+                "list",
+                "upsert",
+                "verify",
+                "verify_batch",
+                "final_check",
+                "mark_gap",
+            ]
+            .into_iter()
+            .filter(|other| {
+                *other != action
+                    && investigation_contract(other, true)
+                        .is_some_and(|(fields, _, _)| fields.contains(&key.as_str()))
+            })
+            .map(|other| format!("action={other}"))
+            .collect();
+            let hint = match suggest::field("investigation", "", key, allowed, args) {
+                Some(found) => found.text,
+                None if !owners.is_empty() => format!(
+                    "; {key} is used by {}: drop {key}, or send that action if it is what you meant",
+                    owners.join(", ")
+                ),
+                None => String::new(),
+            };
             bail!(
-                "invalid_action_arguments: investigation action={action} does not accept {key}; allowed: {}. Example: {example}",
+                "invalid_action_arguments: investigation action={action} does not accept {key}{hint}; allowed: {}. Example: {example}",
                 allowed.join(", ")
             );
         }
     }
     for key in required {
         if args.get(*key).is_none() {
-            bail!("missing_argument: {key} for investigation action={action}. Example: {example}");
+            // An id that names no item makes upsert a creation.
+            let unknown_id = match (action, *key, args["id"].as_str()) {
+                ("upsert", "title", Some(id)) => {
+                    let existing: Vec<_> = s
+                        .investigations
+                        .iter()
+                        .filter(|item| item.status != "superseded")
+                        .map(|item| item.id.as_str())
+                        .take(20)
+                        .collect();
+                    format!(
+                        "; id {id:?} is not an existing item, so this upsert creates a new item and needs title (existing ids: {})",
+                        json!(existing)
+                    )
+                }
+                _ => String::new(),
+            };
+            bail!(
+                "missing_argument: {key} for investigation action={action}{unknown_id}. Example: {example}"
+            );
         }
         if args[*key]
             .as_str()
@@ -2851,6 +3053,48 @@ fn path_glob(args: &Value) -> Result<Option<&str>> {
     }
     Ok(value)
 }
+/// path is literal (a directory may be named `[slug]`), so it is never
+/// joined with path_glob silently. Name the one glob that means both: a live
+/// run resent `path` + `path_glob:"*.css"` five times without it.
+fn path_glob_conflict_hint(s: &Session, args: &Value) -> String {
+    let glob = args["path_glob"]
+        .as_str()
+        .or_else(|| args["pattern"].as_str())
+        .unwrap_or("")
+        .trim_start_matches("./");
+    let (Some(path), Ok(root)) = (args["path"].as_str(), s.project.root.canonicalize()) else {
+        return String::new();
+    };
+    let Ok(resolved) = read_path(&s.project, path) else {
+        return String::new();
+    };
+    if resolved.is_file() {
+        return format!("; path already names one file, so drop path_glob {glob:?}");
+    }
+    let Some(relative) = resolved
+        .strip_prefix(&root)
+        .ok()
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+    else {
+        return String::new();
+    };
+    // A bare file pattern matches at any depth below the directory, as path
+    // alone lists everything below it.
+    let below = if glob.contains('/') {
+        glob.to_owned()
+    } else {
+        format!("**/{glob}")
+    };
+    let combined = if relative.is_empty() {
+        below
+    } else {
+        format!("{}/{below}", globset::escape(&relative))
+    };
+    format!(
+        "; to match {glob:?} below {path}, send only path_glob:{combined:?} (relative to project.root; ** includes subdirectories)"
+    )
+}
+
 fn n(args: &Value, key: &str, default: usize) -> usize {
     args[key].as_u64().map_or(default, |n| n as usize)
 }
@@ -3130,9 +3374,13 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
         let hint = if e.kind() == std::io::ErrorKind::NotFound && is_output {
             " The configured output does not exist yet: nothing has been written to it. Create it with document_edit action=create (or document_edit_batch) before reading or auditing it.".to_owned()
         } else if e.kind() == std::io::ErrorKind::NotFound {
-            match similar_paths(p, &candidate).as_slice() {
-                [] => " No project file has this name; list files with file_list mode=paths and path_glob before reading.".to_owned(),
-                similar => format!(" Existing project files with a similar name: {}. Copy one exactly.", similar.join(", ")),
+            if let Some(shape) = path_shape_hint(&root, path) {
+                shape
+            } else {
+                match similar_paths(p, &candidate).as_slice() {
+                    [] => " No project file or directory has this name; list files with file_list mode=paths and path_glob before reading.".to_owned(),
+                    similar => format!(" Existing project paths with a similar name: {}. Copy one exactly.", similar.join(", ")),
+                }
             }
         } else {
             String::new()
@@ -3173,9 +3421,66 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
     }
     Ok(canonical)
 }
+/// A missing path that is a citation or a glob rather than a file name.
+/// Documents cite `path:line-line`, and models copy that (or `#L12-L20`)
+/// into path; a glob in path is never expanded.
+fn path_shape_hint(root: &Path, path: &str) -> Option<String> {
+    let lines = |range: &str| -> Option<(u64, u64)> {
+        let range = range.replace(['L', 'l'], "");
+        let (start, end) = range.split_once('-').unwrap_or((&range, &range));
+        let (start, end) = (start.trim().parse().ok()?, end.trim().parse().ok()?);
+        (start >= 1 && end >= start).then_some((start, end))
+    };
+    let exists = |base: &str| {
+        if Path::new(base).is_absolute() {
+            Path::new(base).exists()
+        } else {
+            root.join(base).exists()
+        }
+    };
+    let reference = path
+        .rsplit_once("#L")
+        .or_else(|| path.rsplit_once('#'))
+        .and_then(|(base, range)| Some((base, lines(range)?)))
+        .or_else(|| {
+            // path:12, path:12-20, or path:12:5 (line:column), where the
+            // earlier number is the line: prefer the split whose file exists.
+            let last = path
+                .rsplit_once(':')
+                .and_then(|(base, range)| Some((base, lines(range)?)));
+            let earlier = last.and_then(|(base, _)| {
+                let (base, range) = base.rsplit_once(':')?;
+                Some((base, lines(range)?))
+            });
+            match (last, earlier) {
+                (Some(last), _) if exists(last.0) => Some(last),
+                (_, Some(earlier)) => Some(earlier),
+                (last, None) => last,
+            }
+            .filter(|(base, _)| !base.is_empty())
+        });
+    if let Some((base, (start, end))) = reference {
+        let exists = exists(base);
+        let base_note = if exists {
+            format!(" {base:?} exists.")
+        } else {
+            String::new()
+        };
+        return Some(format!(
+            " path contains a line reference {:?}; send only the file path {base:?} in path and the lines separately (file_read: start_line={start}, max_lines={}).{base_note}",
+            &path[base.len()..],
+            end - start + 1
+        ));
+    }
+    path.contains(['*', '?', '[', '{']).then(|| format!(
+        " path takes one exact file or directory and does not expand globs; to match files by pattern send path_glob:{path:?} instead (file_list, source_search and symbol_search accept path_glob)."
+    ))
+}
+
 /// Project files whose name matches a missing path: the same file name
-/// first, then the same stem with another extension (agent.py -> agent.js).
-/// Ignore and exclude rules apply, so hidden files are never suggested.
+/// first, then the same stem with another extension (agent.py -> agent.js),
+/// then directories of that name. Ignore and exclude rules apply, so hidden
+/// files are never suggested.
 fn similar_paths(p: &Project, missing: &Path) -> Vec<String> {
     const MAX_SUGGESTIONS: usize = 5;
     const MAX_SCANNED: usize = 20_000;
@@ -3197,10 +3502,26 @@ fn similar_paths(p: &Project, missing: &Path) -> Vec<String> {
     };
     let mut exact = vec![];
     let mut same_stem = vec![];
+    let mut directories = std::collections::BTreeSet::new();
     for path in paths.iter().take(MAX_SCANNED) {
         let Ok(relative) = path.strip_prefix(&root) else {
             continue;
         };
+        // A missing directory (file_list or source_search path) matches a
+        // directory of the same name elsewhere in the project.
+        if let Some(parent) = relative.parent() {
+            for ancestor in parent.ancestors() {
+                if ancestor
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().to_lowercase() == name)
+                {
+                    directories.insert(format!(
+                        "{}/",
+                        ancestor.to_string_lossy().replace('\\', "/")
+                    ));
+                }
+            }
+        }
         let relative = relative.to_string_lossy().replace('\\', "/");
         let file = path
             .file_name()
@@ -3218,9 +3539,12 @@ fn similar_paths(p: &Project, missing: &Path) -> Vec<String> {
     }
     exact.sort_by_key(|path| (path.len(), path.clone()));
     same_stem.sort_by_key(|path| (path.len(), path.clone()));
+    let mut directories: Vec<_> = directories.into_iter().collect();
+    directories.sort_by_key(|path| (path.len(), path.clone()));
     exact
         .into_iter()
         .chain(same_stem)
+        .chain(directories)
         .take(MAX_SUGGESTIONS)
         .collect()
 }
@@ -4948,7 +5272,8 @@ fn execute_repaired(
             let directory = if let Some(path) = args.get("path").and_then(Value::as_str) {
                 if args.get("path_glob").is_some() || args.get("pattern").is_some() {
                     bail!(
-                        "conflicting_arguments: use path for one directory OR path_glob/pattern for a file glob"
+                        "conflicting_arguments: use path for one directory OR path_glob/pattern for a file glob{}",
+                        path_glob_conflict_hint(s, &args)
                     );
                 }
                 let dir = read_path(&s.project, path)?;
@@ -5070,7 +5395,18 @@ fn execute_repaired(
                 && !(anchored && omitted)
                 && args["expected_hash"].as_str() != Some(digest.as_str())
             {
-                return Err(revision_conflict(&args, &digest));
+                let checked = args["expected_hash"]
+                    .as_str()
+                    .is_some_and(|expected| !is_document_hash(expected))
+                    .then(|| {
+                        let failures: Vec<String> = apply_document_edit_operation(&old, &args)
+                            .err()
+                            .map(|error| error.to_string())
+                            .into_iter()
+                            .collect();
+                        checked_clause(false, &failures)
+                    });
+                return Err(revision_conflict(&args, &digest, checked));
             }
             if !exists && action != "create" && action != "write" {
                 bail!(
@@ -5093,8 +5429,16 @@ fn execute_repaired(
             // A missing hash still lets the edits be checked in memory, so
             // the error names every other problem too.
             let hash_missing = args["expected_hash"].as_str().is_none();
-            if !hash_missing && args["expected_hash"].as_str() != Some(digest.as_str()) {
-                return Err(revision_conflict(&args, &digest));
+            // So does a malformed hash, which no tool issued; a stale one
+            // means the document changed and must be read again first.
+            let hash_malformed = args["expected_hash"]
+                .as_str()
+                .is_some_and(|expected| !is_document_hash(expected));
+            if !hash_missing
+                && !hash_malformed
+                && args["expected_hash"].as_str() != Some(digest.as_str())
+            {
+                return Err(revision_conflict(&args, &digest, None));
             }
             let edits = args["edits"].as_array().expect("validated edits array");
             let mut current = old.clone();
@@ -5141,6 +5485,13 @@ fn execute_repaired(
                     "document_edit_batch",
                     true,
                     &failures,
+                ));
+            }
+            if hash_malformed {
+                return Err(revision_conflict(
+                    &args,
+                    &digest,
+                    Some(checked_clause(true, &failures)),
                 ));
             }
             if let Some((first, rest)) = failures.split_first() {
@@ -5255,12 +5606,17 @@ fn execute_repaired(
                     }
                 }
                 if previous.is_none()
-                    && s.investigations.iter().any(|item| {
+                    && let Some(existing) = s.investigations.iter().find(|item| {
                         item.status != "superseded"
                             && item.title == args["title"].as_str().unwrap_or("")
                     })
                 {
-                    bail!("duplicate_investigation_title: list and update the existing item by ID");
+                    bail!(
+                        "duplicate_investigation_title: item {:?} already has the title {:?}; update that item with {{\"action\":\"upsert\",\"id\":{:?}, ...}} instead of creating another, or choose a distinct title for new work",
+                        existing.id,
+                        existing.title,
+                        existing.id
+                    );
                 }
                 let refs = list(&args, "memory_ids")
                     .into_iter()
@@ -5386,11 +5742,18 @@ fn execute_repaired(
                             "must be an object",
                         ));
                     }
-                    if let Some(key) = params.as_object().unwrap().keys().find(|key| {
-                        !["source_ids", "verification_note", "section"].contains(&key.as_str())
-                    }) {
+                    const ITEM_FIELDS: [&str; 3] = ["source_ids", "verification_note", "section"];
+                    if let Some(key) = params
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .find(|key| !ITEM_FIELDS.contains(&key.as_str()))
+                    {
+                        let hint =
+                            suggest::field("investigation", "items", key, &ITEM_FIELDS, &params)
+                                .map_or_else(String::new, |s| s.text);
                         bail!(
-                            "invalid_action_arguments: verify_batch item does not accept {key}; allowed: source_ids, verification_note, section; ID belongs in the items key"
+                            "invalid_action_arguments: verify_batch item does not accept {key}{hint}; allowed: source_ids, verification_note, section; ID belongs in the items key"
                         );
                     }
                     // Validate each item before reuse or execution; a bad item
@@ -6576,6 +6939,52 @@ fn run_call_inner(
             .insert(call.id.clone(), (signature, output.clone()));
     }
     output
+}
+
+/// A written source document with no investigation item. Its final answer
+/// is refused and no review can run, yet nothing else named the step: two
+/// live runs wrote a whole manual, never registered an item and never
+/// answered. Lists the document's sections for one upsert each.
+pub fn unregistered_document(s: &Session) -> Option<Value> {
+    if s.checkpoint.is_some()
+        || !s.is_document_work()
+        || !s.document_written
+        || !s.task.require_investigation
+        || s.investigations
+            .iter()
+            .any(|item| item.status != "superseded")
+    {
+        return None;
+    }
+    let doc = read_text(&output_path(&s.project).ok()?).ok()?;
+    let headings = documentation::headings(&doc);
+    let paths = documentation::heading_paths(&headings);
+    // The sections a reader navigates: level-2 headings, else the top level.
+    let level = if headings.iter().any(|heading| heading.level == 2) {
+        2
+    } else {
+        headings.iter().map(|heading| heading.level).min()?
+    };
+    let sections: Vec<&String> = headings
+        .iter()
+        .zip(&paths)
+        .filter(|(heading, _)| heading.level == level)
+        .map(|(_, path)| path)
+        .collect();
+    let first = sections.first()?;
+    let title = first
+        .lines()
+        .last()
+        .unwrap_or(first)
+        .trim_start_matches('#')
+        .trim();
+    Some(json!({
+        "investigation_items":0,
+        "section_count":sections.len(),
+        "sections":sections.iter().take(12).collect::<Vec<_>>(),
+        "next":{"action":"upsert","title":title,"section":first,"status":"written"},
+        "guidance":"No investigation item is registered for this source document, so the final answer is refused and no document review can run. Register one item per section in sections with investigation upsert (a title, section copied exactly from sections, status=written), then verify them against sources already delivered with ONE verify_batch (source_ids and a verification_note comparing source and document); an item that cannot be verified is reported with mark_gap in closing mode. Then give the final answer."
+    }))
 }
 
 /// Stable source fingerprint for repeatable evaluation; output is excluded by caller settings.

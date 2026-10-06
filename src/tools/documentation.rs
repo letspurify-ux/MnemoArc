@@ -390,6 +390,14 @@ pub(super) fn execute(
                 && (document_offset > 0 || coverage_offset > 0)
                 && expected != digest
             {
+                // Saying the document changed would be false for a value no
+                // tool issued.
+                if !super::is_document_hash(expected) {
+                    bail!(
+                        "document_revision_conflict: expected_hash is not a document hash (a SHA-256 hash is 64 hex characters; got {}); copy hash from the first document_inspect result or its next_cursor arguments exactly, or restart with offset 0 and coverage_offset 0",
+                        expected.chars().count()
+                    );
+                }
                 bail!(
                     "document_revision_conflict: document changed during paged read; restart document_inspect with offset 0 and use its new hash"
                 );
@@ -520,7 +528,8 @@ pub(super) fn execute(
                 .iter()
                 .all(|item| item.status == "superseded")
             {
-                issues.push(json!({"kind":"no_investigation_coverage"}));
+                issues.push(json!({"kind":"no_investigation_coverage",
+                    "guidance":"No investigation item covers this document. Register one item per written section with investigation upsert (title, section copied from the document_inspect outline, status=written), then verify them against delivered sources with verify_batch before the final answer."}));
             }
             // The output's own absolute path in its text is a run report
             // (where it was written), which belongs in the final answer.
@@ -576,6 +585,12 @@ pub(super) fn execute(
                     )
                 })?;
                 if expected != revision {
+                    if !super::is_document_hash(expected) {
+                        bail!(
+                            "document_audit_revision_conflict: expected_revision is not an audit revision (64 hex characters; got {}); copy revision from the first document_audit result exactly, or restart at offset 0",
+                            expected.chars().count()
+                        );
+                    }
                     bail!(
                         "document_audit_revision_conflict: audit inputs changed during pagination; restart document_audit at offset 0"
                     );

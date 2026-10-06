@@ -1237,3 +1237,90 @@ fn investigation_status_is_supplied_as_runtime_evidence() {
     assert_eq!(items["items"][0]["id"], "flow");
     assert_eq!(items["items"][0]["status"], s.investigations[0].status);
 }
+
+#[test]
+fn a_rejected_page_names_every_failing_check_and_condition() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Conclusion");
+    review::begin(&mut s, "Done").unwrap();
+    let p = payload(&review::request(&mut s).unwrap());
+    let valid: Value = serde_json::from_str(&verdict(&p, true)).unwrap();
+    let ids: Vec<String> = p["criteria"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(ids.len() >= 2, "{p}");
+    // A live run failed five reviews in a row on one sentence that named
+    // ten conditions at once. Each problem now names its check and cause.
+    let mut bad = valid.clone();
+    bad["checks"][0]["status"] = json!("pass");
+    bad["checks"][0]["evidence"] = json!(["E999"]);
+    bad["checks"][1]["status"] = json!("unmet");
+    bad["checks"][1]["next_action"] = json!("");
+    bad["checks"][1]["reason"] = json!("x".repeat(301));
+    let error = review::finish(&mut s, &bad.to_string())
+        .unwrap_err()
+        .to_string();
+    for part in [
+        format!(
+            r#"checks[0] (id "{}"): status "pass" is not one of met, unmet, unverified; did you mean "met"?"#,
+            ids[0]
+        ),
+        format!(
+            r#"checks[0] (id "{}"): evidence ["E999"] are not supplied evidence IDs; copy ids from evidence[].id"#,
+            ids[0]
+        ),
+        format!(
+            r#"checks[1] (id "{}"): reason has 301 characters; at most 300"#,
+            ids[1]
+        ),
+        format!(
+            r#"checks[1] (id "{}"): unmet needs one concrete next_action"#,
+            ids[1]
+        ),
+    ] {
+        assert!(error.contains(&part), "{part}\n{error}");
+    }
+    assert!(
+        error.starts_with("completion_review_invalid: 4 problem(s)"),
+        "{error}"
+    );
+    // Missing and unexpected criteria are named by ID.
+    let mut wrong = valid.clone();
+    wrong["checks"][0]["id"] = json!("R99");
+    let error = review::finish(&mut s, &wrong.to_string())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(r#"checks[0] (id "R99"): not a criterion on this page"#),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!(r#"no check for criteria ["{}"]"#, ids[0])),
+        "{error}"
+    );
+    let mut met_with_action = valid.clone();
+    met_with_action["checks"][0]["next_action"] = json!("Re-read the file");
+    let error = review::finish(&mut s, &met_with_action.to_string())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("met takes an empty next_action"), "{error}");
+    assert!(!s.completion_review.approved);
+    // A placeholder action on a met check is not an action to execute.
+    let mut placeholder = valid;
+    for check in placeholder["checks"].as_array_mut().unwrap() {
+        check["next_action"] = json!("None");
+    }
+    review::finish(&mut s, &placeholder.to_string()).unwrap();
+    assert!(
+        s.completion_review
+            .checks
+            .iter()
+            .all(|check| check.next_action.is_empty()),
+        "{:?}",
+        s.completion_review.checks
+    );
+}
