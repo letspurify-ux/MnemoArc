@@ -4173,10 +4173,11 @@ pub fn execute_cancellable(
         bail!("question_tools_not_allowed: {name} changes task state or files; task preserved");
     }
     let _write = writes::acquire(name, cancel, &s.write_outcome_uncertain)?;
+    let shape = arguments::shape(&args);
     let result = execute_arguments(s, name, args, cancel).map_err(|error| {
         match error.downcast_ref::<DirectoryPath>() {
             Some(directory) => directory_error(&s.project, directory),
-            None => error,
+            None => arguments::annotate_runtime(error, name, &shape),
         }
     });
     // Publish an uncertain commit before releasing the gate; another session

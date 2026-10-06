@@ -200,19 +200,40 @@ fn a_large_related_preview_can_borrow_unused_recent_space() {
     s.memory.entries.get_mut(&important).unwrap().tags = vec![long; 4];
     s.latest_request = "authentication".into();
     s.config.related_count = 1;
-    s.config.recent_count = 0;
-    s.config.index_tokens = 288;
-    assert_eq!(
-        ContextManager::state(&s).unwrap()["related_memories"][0]["id"],
-        important
-    );
     save(&mut s, "ui", "layout", "Details", "Details");
+    // Memory IDs are random UUIDs that take a varying number of tokens, so a
+    // fixed budget made this test flaky. Measure both previews and give the
+    // index room for them, but no less than validate() accepts for one
+    // recent entry (128 + 160).
+    s.config.index_tokens = 20_000;
+    let measure =
+        |s: &Session| context::count(&index(&ContextManager::state(s).unwrap()), "gpt-4o");
+    s.config.recent_count = 0;
+    let alone = measure(&s);
     s.config.recent_count = 1;
+    let both = measure(&s);
+    let empty = context::count(
+        &json!({"recent_memories":[],"related_memories":[],"referenced_memories":[]}),
+        "gpt-4o",
+    );
+    s.config.index_tokens = both.max(128 + 160);
     s.config.validate().unwrap();
+    // The related preview must exceed its 70% share; otherwise this test
+    // would not exercise borrowing from the recent bucket.
+    assert!(
+        alone > empty + (s.config.index_tokens - empty) * 7 / 10,
+        "alone={alone} both={both}"
+    );
+    s.config.recent_count = 0;
     assert_eq!(
         ContextManager::state(&s).unwrap()["related_memories"][0]["id"],
         important
     );
+    s.config.recent_count = 1;
+    let state = ContextManager::state(&s).unwrap();
+    assert_eq!(state["related_memories"][0]["id"], important);
+    assert_eq!(state["recent_memories"].as_array().unwrap().len(), 1);
+    assert!(context::count(&index(&state), "gpt-4o") <= s.config.index_tokens);
 }
 
 #[test]

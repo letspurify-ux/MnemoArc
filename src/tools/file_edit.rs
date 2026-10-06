@@ -575,7 +575,7 @@ pub(super) fn execute(
             if exists {
                 let expected = args["expected_hash"].as_str().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "missing_argument: expected_hash is required because {} already exists; copy hash from file_read, or omit it only when creating a new file",
+                        "missing_argument: expected_hash is required because {} already exists; copy hash from file_read, or omit it only when creating a new file; no changes persisted",
                         required(args, "path").unwrap_or_default()
                     )
                 })?;

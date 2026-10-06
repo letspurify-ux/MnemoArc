@@ -1396,3 +1396,80 @@ async fn oversized_batch_before_any_workflow_is_retried_not_fatal() {
     assert_eq!(*client.calls.lock().unwrap(), 3);
     assert!(!s.ledger.contains_key("action-1"));
 }
+
+/// Answers with `rejections` consecutive malformed responses, then one
+/// executed call, then the final answer.
+struct EarlyMalformedCalls {
+    calls: Mutex<usize>,
+    rejections: usize,
+}
+
+#[async_trait]
+impl LlmClient for EarlyMalformedCalls {
+    async fn complete(
+        &self,
+        request: Value,
+        _config: &Config,
+        _cancel: CancellationToken,
+        _tx: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let count = {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        if count <= self.rejections {
+            anyhow::bail!(
+                "invalid_tool_arguments: file_list arguments are not one complete JSON object (EOF while parsing an object at line 1 column 9)"
+            );
+        }
+        let content = request["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        let state: Value = serde_json::from_str(content.split_once('\n').unwrap().1)?;
+        if count == self.rejections + 1 {
+            let reason = state["run_guidance"]["recovery_reason"].as_str().unwrap();
+            assert!(reason.contains("file_list arguments are not one complete JSON object"));
+            assert!(reason.contains("none of this batch executed"));
+            return Ok(call(1, "file_list", json!({"mode":"paths"})));
+        }
+        assert!(state["run_guidance"]["recovery_reason"].is_null());
+        Ok(Completion {
+            text: "Answer.".into(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn malformed_calls_before_any_workflow_get_one_guided_retry() {
+    for (rejections, status) in [(1, "complete"), (2, "blocked")] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("report.md"),
+                ..Default::default()
+            },
+            Config {
+                model: "gpt-4o".into(),
+                model_context: Some(128_000),
+                completion_review_enabled: false,
+                ..support::compact_config()
+            },
+        );
+        s.add_user("List the project files.".into());
+        assert!(!s.is_document_work());
+        let client = Arc::new(EarlyMalformedCalls {
+            calls: Mutex::new(0),
+            rejections,
+        });
+        let (s, _) = run(s, client.clone()).await;
+        assert_eq!(s.status, status, "{rejections}: {:?}", s.last_error);
+        if rejections == 2 {
+            // A second consecutive rejection is not retried again.
+            assert_eq!(*client.calls.lock().unwrap(), 2);
+            assert!(s.last_error.unwrap().starts_with("invalid_tool_arguments:"));
+        }
+    }
+}

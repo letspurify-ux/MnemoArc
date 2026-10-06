@@ -716,3 +716,99 @@ fn call_id(name: &str, args: Value) -> ToolCall {
         arguments: args.to_string(),
     }
 }
+
+#[test]
+fn a_missing_field_beside_an_unaccepted_one_suggests_the_rename() {
+    let mut s = session();
+    let result = tools::run_call(
+        &mut s,
+        &call_id(
+            "file_patch",
+            json!({"operations":[{"op":"update","path":"main.rs"}]}),
+        ),
+    );
+    let error = result["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("missing_argument: operations[0].action is required"),
+        "{error}"
+    );
+    assert!(
+        error.contains("if op carries this value, send it as action"),
+        "{error}"
+    );
+    assert_eq!(
+        result["data"]["input_error"]["unknown_fields"],
+        json!(["op"])
+    );
+    assert_eq!(result["data"]["execution"], "not_started");
+}
+
+#[test]
+fn runtime_input_errors_name_the_field_and_claim_no_change_only_with_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.rs"), "fn run() {}\n").unwrap();
+    let mut s = session();
+    s.project.root = dir.path().into();
+    s.project.output = dir.path().join("summary.md");
+    // Read-only tool: a rejection cannot have changed anything.
+    let result = tools::run_call(
+        &mut s,
+        &call_id("symbol_read", json!({"path":"main.rs","symbol_id":"bogus"})),
+    );
+    assert_eq!(
+        result["data"]["input_error"]["field"], "symbol_id",
+        "{result}"
+    );
+    assert_eq!(result["data"]["input_error"]["received"], "string");
+    assert_eq!(result["data"]["execution"], "rejected_without_changes");
+    // A write tool that states nothing was persisted.
+    let result = tools::run_call(
+        &mut s,
+        &call_id("file_write", json!({"path":"main.rs","content":"x"})),
+    );
+    assert_eq!(
+        result["data"]["input_error"]["field"], "expected_hash",
+        "{result}"
+    );
+    assert_eq!(result["data"]["input_error"]["received"], "missing");
+    assert_eq!(result["data"]["input_error"]["expected"]["type"], "string");
+    assert_eq!(result["data"]["execution"], "rejected_without_changes");
+    // A write tool without that statement gets no execution claim.
+    let invocation = call_id("db_execute", json!({"mode":"query"}));
+    let result = tools::run_call(&mut s, &invocation);
+    assert_eq!(result["data"]["input_error"]["field"], "sql", "{result}");
+    assert!(result["data"]["execution"].is_null(), "{result}");
+    // "query mode requires ..." mentions a word, not the rejected field.
+    let result = tools::run_call(
+        &mut s,
+        &call_id("db_execute", json!({"mode":"query","sql":"DELETE FROM t"})),
+    );
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("query mode requires"),
+        "{result}"
+    );
+    assert!(result["data"]["input_error"].is_null(), "{result}");
+    // The diagnosis survives repeated budgets; without an execution claim the
+    // compact form keeps the tool name as its marker.
+    let mut big = tools::run_call(&mut s, &call_id("db_execute", json!({"mode":"query"})));
+    big["error"] = json!(format!(
+        "invalid_database_execution_arguments: sql {}",
+        "x ".repeat(1000)
+    ));
+    let first = tools::limit_result(&mut s, &invocation, big, 600);
+    assert!(
+        tools::result_tokens(&invocation, &first, &s.config.model) > 200,
+        "{first}"
+    );
+    let second = tools::limit_result(&mut s, &invocation, first, 200);
+    assert_eq!(second["data"]["input_error"]["field"], "sql", "{second}");
+    assert_eq!(
+        second["data"]["input_error"]["tool"], "db_execute",
+        "{second}"
+    );
+    assert!(second["data"]["execution"].is_null());
+    assert!(tools::result_tokens(&invocation, &second, &s.config.model) <= 200);
+}

@@ -149,14 +149,43 @@ pub(super) fn validate_field(name: &str, path: &str, schema: &Value, value: &Val
             .filter_map(Value::as_str)
         {
             if !object.contains_key(required) {
-                return Err(failure(
-                    name,
-                    &format!("{path}.{required}"),
-                    "missing_argument",
-                    schema["properties"][required].clone(),
-                    "missing",
-                    "is required",
-                ));
+                let field = format!("{path}.{required}");
+                // A missing field next to an unaccepted one is usually a
+                // misnamed field (file_patch "op" for "action"); name both.
+                let unknown: Vec<_> = if schema["additionalProperties"] == false {
+                    object
+                        .keys()
+                        .filter(|key| schema["properties"].get(key.as_str()).is_none())
+                        .take(8)
+                        .collect()
+                } else {
+                    vec![]
+                };
+                if unknown.is_empty() {
+                    return Err(failure(
+                        name,
+                        &field,
+                        "missing_argument",
+                        schema["properties"][required].clone(),
+                        "missing",
+                        "is required",
+                    ));
+                }
+                let rename = match unknown.as_slice() {
+                    [only] => format!("; if {only} carries this value, send it as {required}"),
+                    _ => String::new(),
+                };
+                return Err(recovery::DiagnosticError {
+                    message: format!(
+                        "missing_argument: {field} is required for {name}; {path} also has fields that are not accepted: {}{rename}; correct the field names and resend the intended call",
+                        json!(unknown)
+                    ),
+                    data: json!({"execution":"not_started","input_error":{
+                        "tool":name,"field":field,"expected":schema["properties"][required],
+                        "received":"missing","unknown_fields":unknown
+                    }}),
+                }
+                .into());
             }
         }
         for (key, item) in object {
@@ -227,34 +256,86 @@ pub(super) fn annotate(error: anyhow::Error, name: &str, args: &Value) -> anyhow
     recovery::DiagnosticError { message, data }.into()
 }
 
-/// Name the field a prose validator rejected ("missing_argument: ids for ...")
-/// when it is a declared or received argument path. Otherwise the whole
-/// argument object stays the subject; a guessed field would mislead repair.
+/// Name the field a prose error is about ("missing_argument: ids for ...")
+/// when it is a declared or received argument path and the sentence treats it
+/// as the subject. Otherwise the whole argument object stays the subject; a
+/// guessed field ("query mode requires ...") would mislead repair.
 fn named_field(message: &str, parameters: &Value, args: &Value) -> (String, Option<Value>) {
     let (code, rest) = message.split_once(':').unwrap_or((message, ""));
+    let rest = rest.trim_start();
     let token: String = rest
-        .trim_start()
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '[' | ']'))
         .collect();
     let token = token.trim_end_matches('.');
+    let follower = &rest[token.len()..];
+    let subject = follower.is_empty()
+        || [":", ";", " is ", " must ", " for ", " \""]
+            .iter()
+            .any(|next| follower.starts_with(next));
     let top = token.split(['.', '[']).next().unwrap_or("");
     let known =
         !top.is_empty() && (parameters["properties"].get(top).is_some() || args.get(top).is_some());
-    if !matches!(
-        code,
-        "missing_argument"
-            | "unknown_argument"
-            | "invalid_argument_value"
-            | "invalid_argument_type"
-    ) || !known
-    {
+    if !subject || !known {
         return ("arguments".into(), None);
     }
     let expected = (code == "missing_argument" && token == top)
         .then(|| parameters["properties"].get(top).cloned())
         .flatten();
     (token.to_owned(), expected)
+}
+
+/// Field structure without string contents, so the arguments can be moved
+/// into the tool and a runtime input error can still name the field type.
+pub(super) fn shape(value: &Value) -> Value {
+    match value {
+        Value::String(_) => json!(""),
+        Value::Array(items) => Value::Array(items.iter().take(32).map(shape).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .take(64)
+                .map(|(key, value)| (key.clone(), shape(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Input errors found while a tool runs keep their prose and gain the field
+/// diagnosis validator errors carry. They are not labelled unexecuted: only a
+/// read-only tool or an explicit "no changes" statement proves nothing changed.
+pub(super) fn annotate_runtime(error: anyhow::Error, name: &str, shape: &Value) -> anyhow::Error {
+    let message = format!("{error:#}");
+    if error.downcast_ref::<recovery::DiagnosticError>().is_some()
+        || recovery::describe(&message)["class"] != "invalid_input"
+    {
+        return error;
+    }
+    let Some(spec) = ToolRegistry::specs()
+        .into_iter()
+        .find(|spec| spec.name == name)
+    else {
+        return error;
+    };
+    let (field, expected) = named_field(&message, &spec.parameters, shape);
+    if field == "arguments" {
+        return error;
+    }
+    let mut data = json!({"input_error":{
+        "tool":name,"field":field,"received":lookup(shape, &field).map_or("missing", value_type)
+    }});
+    if let Some(expected) = expected {
+        data["input_error"]["expected"] = expected;
+    }
+    if spec.read_only
+        || ["no changes persisted", "state unchanged", "task preserved"]
+            .iter()
+            .any(|claim| message.contains(claim))
+    {
+        data["execution"] = json!("rejected_without_changes");
+    }
+    recovery::DiagnosticError { message, data }.into()
 }
 
 fn lookup<'a>(args: &'a Value, path: &str) -> Option<&'a Value> {
@@ -273,12 +354,21 @@ fn lookup<'a>(args: &'a Value, path: &str) -> Option<&'a Value> {
 
 pub(super) fn compact_data(data: &Value) -> Option<Value> {
     let input = &data["input_error"];
-    // The compact form deliberately omits the tool name. Recognize it again
-    // when the agent applies its smaller per-batch budget to the same result.
-    (data["execution"] == "not_started" && input["field"].is_string()).then(|| {
-        let mut compact = json!({"execution":"not_started","input_error":{
+    // The compact form drops the tool name when the execution state already
+    // marks an input diagnosis; recognize either form on a later, smaller
+    // budget. Ordinary results that only describe input (task_plan) carry
+    // neither marker and keep their own data.
+    let execution = data["execution"].as_str();
+    let marked = matches!(execution, Some("not_started" | "rejected_without_changes"))
+        || input["tool"].is_string();
+    (marked && input["field"].is_string()).then(|| {
+        let mut compact = json!({"input_error":{
             "field":input["field"],"received":input["received"]
         }});
+        match execution {
+            Some(state) => compact["execution"] = json!(state),
+            None => compact["input_error"]["tool"] = input["tool"].clone(),
+        }
         if !input["expected"].is_null() {
             compact["input_error"]["expected"] = input["expected"].clone();
         }

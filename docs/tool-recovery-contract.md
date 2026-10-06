@@ -120,6 +120,14 @@ flowchart TD
 - 제공자가 인자 없는 호출에 보내는 빈 문자열은 `{}`로 취급한다. 따라서 응답 전체를 거절하지 않고 필수 필드 진단을 돌려준다. 응답 수준의 거절(`malformed_tool_call`, `invalid_tool_arguments`)은 문제의 호출 ID나 도구 이름과 원인을 적는다.
 - `tool_worker_start_failed`는 작업자가 시작하지 않은 경우이므로 미분류 대신 `unavailable`로 분류한다.
 
+### 실행 중 입력 오류, 필드 이름 오류, 미실행 응답 재시도
+
+- 도구 실행 중에 발견한 입력 오류(`invalid_input` 분류)에도 산문을 유지한 채 `input_error.field/received/expected`를 붙인다. 메시지 첫 단어가 선언되었거나 실제로 받은 인자이고, 그 뒤가 `:`, ` is`, ` must`, ` for`, 따옴표처럼 그 단어를 주어로 다룰 때만 필드로 인정한다. `query mode requires ...`처럼 단어만 언급한 경우는 필드를 추측하지 않는다.
+- 실행 상태는 근거가 있을 때만 적는다. 검증기 거절은 `not_started`이다. 읽기 전용 도구의 거절이나 "no changes persisted", "state unchanged"를 명시한 거절은 `rejected_without_changes`이다. 근거가 없는 쓰기 도구의 거절에는 실행 상태를 적지 않는다. 축약 시 실행 상태가 없으면 도구 이름을 표식으로 남겨, 반복 축약에서도 진단이 유지된다.
+- 중첩 객체에서 필수 필드가 빠졌고 같은 객체에 허용되지 않은 필드가 있으면 둘을 함께 알린다. 그런 필드가 하나뿐이면 이름 변경을 제안한다(예: `file_patch`의 `op` → `action`). `input_error.unknown_fields`에도 넣는다. 값을 조용히 옮기지는 않는다.
+- 문서 작업 전이나 일반 답변에서도, 실행되지 않은 응답 거절(`invalid_tool_arguments`, `malformed_tool_call`, `tool_call_batch_limit`, `response_size_limit`)에는 안내와 함께 한 번 재시도할 기회를 준다. 연속 거절은 여전히 실행을 멈춘다. 안내는 다음 실행 배치 뒤에 지워지므로 무한 반복은 생기지 않는다.
+- `memory_retrieval`의 `a_large_related_preview_can_borrow_unused_recent_space`가 가끔 실패하던 원인은 무작위 UUID 기억 ID였다. 실제 토크나이저에서 ID 하나가 19~31토큰으로 달라지는데, 288토큰 고정 예산의 여유는 몇 토큰뿐이었다. 테스트가 실제 미리보기 크기를 재고, 검증이 허용하는 최소 예산 이상으로 예산을 잡는다. 관련 미리보기가 70% 몫을 넘어 최근 몫을 빌려야 한다는 전제도 검사한다.
+
 ## 문서 검증 도구 개선 (2026-09-21)
 
 세션에서 발생한 반복 호출을 기준으로 다음 계약을 보강했다.

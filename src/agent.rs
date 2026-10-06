@@ -608,12 +608,11 @@ fn recover_unexecuted_batch(s: &mut Session, reason: &str) -> bool {
     ) {
         return false;
     }
-    // Before document work, retry only an oversized batch, once in a row: the
-    // reason clears after the next executed batch (a live run ended here
-    // after 32 rounds), while repeated malformed output still stops the run.
-    if !s.is_document_work()
-        && (code != "tool_call_batch_limit" || s.progress_recovery.recovery_reason.is_some())
-    {
+    // Nothing in a rejected response ran, so outside document work it gets
+    // one guided retry too. Only once in a row: the reason clears after the
+    // next executed batch (a live run ended here after 32 rounds), so a
+    // second consecutive rejection still stops the run.
+    if !s.is_document_work() && s.progress_recovery.recovery_reason.is_some() {
         return false;
     }
     // The provider parser and completion validator reject the whole response
