@@ -649,8 +649,10 @@ impl LlmClient for VariedReadsThenWrites {
                 json!({"path":"main.rs","start_line":*step+1,"max_lines":1}),
             )
         } else if *step == 3 {
-            assert_eq!(state["run_guidance"]["progress_recovery"]["active"], true);
-            assert_eq!(state["run_guidance"]["phase"], "draft");
+            // Three requests that each read new lines are progress, not a
+            // stall: nothing steers the model toward writing.
+            assert_eq!(state["run_guidance"]["progress_recovery"]["active"], false);
+            assert_eq!(state["run_guidance"]["phase"], "investigate");
             let tools = request["tools"].as_array().unwrap();
             assert!(
                 tools
@@ -662,9 +664,8 @@ impl LlmClient for VariedReadsThenWrites {
                     .iter()
                     .any(|tool| tool["function"]["name"] == "file_read")
             );
-            // Focus steers toward writing through guidance. Before any
-            // document exists, discovery stays available: hiding it left a
-            // model that had not found its sources guessing file paths.
+            // Before any document exists, discovery stays available: hiding
+            // it left a model that had not found its sources guessing paths.
             assert!(
                 tools
                     .iter()
@@ -688,7 +689,7 @@ impl LlmClient for VariedReadsThenWrites {
 }
 
 #[tokio::test]
-async fn varied_reads_without_deliverable_progress_focus_on_writing_and_resume() {
+async fn varied_new_reads_before_the_first_save_are_not_a_stall() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("main.rs"), "one\ntwo\nthree\n").unwrap();
     let mut session = s(dir.path());
@@ -717,33 +718,6 @@ async fn varied_reads_without_deliverable_progress_focus_on_writing_and_resume()
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
     assert_eq!(result.task_rounds, 6); // includes independent acceptance review
     assert!(dir.path().join("docs/source-summary.md").exists());
-}
-
-#[tokio::test]
-async fn resumed_document_work_retains_no_progress_count() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("main.rs"), "one\ntwo\nthree\n").unwrap();
-    let mut session = s(dir.path());
-    session.config.stall_round_limit = 3;
-    session.config.source_document_review = false;
-    session.workflow_mode = "source_document".into();
-    session.task.deliverables = vec!["docs/source-summary.md".into()];
-    session.active_tools.insert("document_edit".into());
-    session.add_user("Save a summary of the source".into());
-    session.run_guidance =
-        json!({"progress_recovery":{"rounds_without_progress":2,"repeated_read":false}});
-    let (tx, mut rx) = mpsc::channel(128);
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let result = run_session(
-        session,
-        Arc::new(VariedReadsThenWrites(Mutex::new(2))),
-        CancellationToken::new(),
-        tx,
-    )
-    .await;
-    drain.await.unwrap();
-    assert_eq!(result.status, "complete", "{:?}", result.last_error);
-    assert_eq!(result.task_rounds, 4); // includes independent acceptance review
 }
 
 struct BudgetPhases {

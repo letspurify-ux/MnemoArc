@@ -336,7 +336,6 @@ pub struct ProgressRecovery {
     pub repair_step: bool,
     /// Recovery thresholds change the approach; document work retains its budget.
     pub recovery_reason: Option<String>,
-    pub rounds_without_progress: usize,
     /// New navigation pages alone cannot keep a stalled task alive forever.
     pub rounds_without_substantive_progress: usize,
     pub repeated_read: bool,

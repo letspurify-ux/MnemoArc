@@ -747,8 +747,9 @@ impl LlmClient for EmptyPlanChurn {
         let mut step = self.0.lock().unwrap();
         if *step == 3 {
             assert_eq!(state["run_guidance"]["progress_recovery"]["active"], true);
+            // Plan churn without work is the same outcome repeated.
             assert_eq!(
-                state["run_guidance"]["progress_recovery"]["rounds_without_progress"],
+                state["run_guidance"]["progress_recovery"]["repeated_outcome_rounds"],
                 3
             );
             return Ok(Completion {

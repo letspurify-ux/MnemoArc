@@ -1386,11 +1386,6 @@ pub async fn run_session_controlled(
     let mut provider_requests = 0usize;
     let mut tool_failures = tools::recovery::FailureTracker::default();
     let mut repetitions = std::collections::BTreeMap::<String, usize>::new();
-    let mut rounds_without_progress = s.progress_recovery.rounds_without_progress.max(
-        s.run_guidance["progress_recovery"]["rounds_without_progress"]
-            .as_u64()
-            .unwrap_or(0) as usize,
-    );
     let mut repeated_read_detected = s.progress_recovery.repeated_read
         || s.run_guidance["progress_recovery"]["repeated_read"]
             .as_bool()
@@ -1568,19 +1563,13 @@ pub async fn run_session_controlled(
             // guidance to drafting; afterwards only result improvements count,
             // except while review findings are open: repairing them needs new
             // evidence, and a live run stalled out reading exactly that.
-            let review_repair_open = (s.config.source_document_review
-                && tools::document_review::rejected_on_current_result(&s))
-                || completion_repair_open;
-            // A model can declare its own draft phase through task_state.
-            // While the budget still allows investigation, reading for the
-            // next section stays progress: a live run declared draft before
-            // its first save and its reads stopped counting (ladder 2 to 10).
-            let investigating =
-                phase == "investigate" || (budget_phase == "investigate" && phase == "draft");
-            if investigating || !s.document_written || review_repair_open || unread_count > 0 {
-                s.progress_recovery.evidence_credit =
-                    s.progress_recovery.evidence_credit.max(s.sources.len());
-            }
+            // New source evidence is always progress, in every phase and
+            // after the first save: reading more of the project is how a
+            // document gets complete. Only investigation, an unsaved
+            // document, open repairs or unread citations used to count it,
+            // so further reading late in a run looked like a stall.
+            s.progress_recovery.evidence_credit =
+                s.progress_recovery.evidence_credit.max(s.sources.len());
             let score = progress_score(&s);
             if score > s.progress_recovery.best_score {
                 s.progress_recovery.best_score = score;
@@ -1674,7 +1663,6 @@ pub async fn run_session_controlled(
         let progress_recovery = s.checkpoint.is_none()
             && (repeated_read_detected
                 || (document_work && stall_rounds >= s.config.stall_round_limit)
-                || rounds_without_progress >= s.config.stall_round_limit
                 || focused_repair
                 || repeated_outcome_focus
                 || substantive_focus
@@ -1717,7 +1705,7 @@ pub async fn run_session_controlled(
         const ANSWER_FOCUSED_INSTRUCTION: &str = "Focused recovery: choose the current to-do, or the question itself, and perform one concrete action that changes the requested result. Read recovery_reason and the last tool's recovery contract; correct the cause or choose a different action before retrying. A task_plan applied=false or unchanged=true result did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, repeat an unchanged plan, or save another summary. If the requested result already exists, complete only the actual remaining work, then answer.";
         s.run_guidance = json!({"task_rounds":s.task_rounds,"run_rounds":s.run_rounds(),"finalization_attempts":finalization_attempts,"phase":phase,"remaining_tokens":remaining,"remaining_seconds":seconds_remaining,"unread_citation_count":unread_count,
             "recovery_reason":s.progress_recovery.recovery_reason,"action_required":s.progress_recovery.action_required,
-            "progress_recovery":{"active":progress_recovery,"focused":focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus,"rounds_without_progress":rounds_without_progress,"rounds_without_substantive_progress":s.progress_recovery.rounds_without_substantive_progress,"repeated_outcome_rounds":s.progress_recovery.repeated_outcome_rounds,"artifact_edits_without_milestone":s.progress_recovery.artifact_edits_without_milestone,"repeated_read":repeated_read_detected},
+            "progress_recovery":{"active":progress_recovery,"focused":focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus,"rounds_without_substantive_progress":s.progress_recovery.rounds_without_substantive_progress,"repeated_outcome_rounds":s.progress_recovery.repeated_outcome_rounds,"artifact_edits_without_milestone":s.progress_recovery.artifact_edits_without_milestone,"repeated_read":repeated_read_detected},
             "current_todo":s.task.current_todo(),
             "max_tool_calls":32.min(if s.checkpoint.is_some() { ContextManager::cleanup_result_budget(&s.config) } else { s.config.batch_tokens } / 200),
             "plan_pending_count":s.task.todos.iter().filter(|item| !item.done).count(),
@@ -2340,11 +2328,9 @@ pub async fn run_session_controlled(
                             s.completion_review.stalled_reviews = 0;
                             s.completion_review.repair_rounds = 0;
                             s.progress_recovery.repeated_outcome_rounds = 0;
-                            s.progress_recovery.rounds_without_progress = 0;
                             s.progress_recovery.rounds_without_substantive_progress = 0;
                             s.progress_recovery.artifact_edits_without_milestone = 0;
                             s.progress_recovery.repeated_read = false;
-                            rounds_without_progress = 0;
                             repeated_read_detected = false;
                             repetitions.clear();
                             finalization_attempts = 0;
@@ -2737,18 +2723,16 @@ pub async fn run_session_controlled(
                 // A premature answer is a request to continue the plan, not a
                 // failed evidence review. Do not spend the finalization retry
                 // allowance or stop the task for unfinished plan bookkeeping.
-                rounds_without_progress = rounds_without_progress.saturating_add(1);
-                s.progress_recovery.rounds_without_progress = rounds_without_progress;
                 s.progress_recovery.repeated_outcome_rounds = s
                     .progress_recovery
                     .repeated_outcome_rounds
                     .saturating_add(1);
-                s.run_guidance["progress_recovery"]["rounds_without_progress"] =
-                    json!(rounds_without_progress);
                 s.run_guidance["progress_recovery"]["repeated_outcome_rounds"] =
                     json!(s.progress_recovery.repeated_outcome_rounds);
                 s.run_guidance["progress_recovery"]["active"] = json!(
-                    repeated_read_detected || rounds_without_progress >= s.config.stall_round_limit
+                    repeated_read_detected
+                        || s.progress_recovery.repeated_outcome_rounds
+                            >= s.config.stall_round_limit
                 );
                 if s.is_document_work() {
                     s.progress_recovery.action_required = true;
@@ -3388,7 +3372,9 @@ pub async fn run_session_controlled(
         let plan_advanced = prior_current_todo.is_some()
             && pending_todos < prior_pending_todos
             && s.task.current_todo().map(|item| &item.id) != prior_current_todo.as_ref();
-        if verified_progress || plan_advanced || artifact_milestone {
+        // Edits grounded in newly read sources are progress too, even when
+        // they refine a section without adding lines.
+        if verified_progress || plan_advanced || artifact_milestone || new_source_evidence {
             s.progress_recovery.artifact_edits_without_milestone = 0;
         } else if novel_artifact_change && !checkpoint_batch {
             s.progress_recovery.artifact_edits_without_milestone = s
@@ -3401,19 +3387,16 @@ pub async fn run_session_controlled(
             // Outside document work the reason only explains the rejected batch.
             s.progress_recovery.recovery_reason = None;
         }
+        // No separate count of requests without an edit or a resolved
+        // citation: reading new sources is progress too, and that count sent
+        // a live run toward writing after eight requests of new reads. The
+        // progress ladder, repeated-outcome and repeated-read checks catch
+        // real stalls.
         if novel_artifact_change || verified_progress {
             s.progress_recovery.recovery_reason = None;
-            rounds_without_progress = 0;
             repeated_read_detected = false;
             finalization_attempts = 0;
             s.progress_recovery.finalization_attempts = 0;
-        } else if !checkpoint_batch {
-            rounds_without_progress = rounds_without_progress.saturating_add(1);
-            if rounds_without_progress == s.config.stall_round_limit {
-                // Say what happened, not "Work is repeating": live models
-                // reached this while still reading a new file every request.
-                emit(&events, AgentEvent::Notice { session:s.id.clone(), text:format!("결과물 변경이나 새 검증 없이 요청 {}번이 이어져, 다음 요청부터 결과물 작성과 검증에 집중합니다.", s.config.stall_round_limit) }, &cancel, run_deadline(started, &s.config)).await;
-            }
         }
         if novel_artifact_change
             || verified_progress
@@ -3442,16 +3425,13 @@ pub async fn run_session_controlled(
             s.completion_review.repair_rounds = 0;
             s.completion_review.stalled_reviews = 0;
         }
-        s.progress_recovery.rounds_without_progress = rounds_without_progress;
         s.progress_recovery.repeated_read = repeated_read_detected;
         s.run_guidance["progress_recovery"] = json!({
             "active":s.checkpoint.is_none() && (repeated_read_detected
-                || rounds_without_progress >= s.config.stall_round_limit
                 || s.progress_recovery.repeated_outcome_rounds >= s.config.stall_round_limit),
             "focused":s.progress_recovery.repeated_outcome_rounds >= s.config.stall_round_limit
                 || s.progress_recovery.rounds_without_substantive_progress >= artifact_focus_limit(&s.config)
                 || s.progress_recovery.artifact_edits_without_milestone >= artifact_focus_limit(&s.config),
-            "rounds_without_progress":rounds_without_progress,
             "rounds_without_substantive_progress":s.progress_recovery.rounds_without_substantive_progress,
             "repeated_outcome_rounds":s.progress_recovery.repeated_outcome_rounds,
             "artifact_edits_without_milestone":s.progress_recovery.artifact_edits_without_milestone,

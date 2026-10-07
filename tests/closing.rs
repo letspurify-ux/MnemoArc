@@ -979,8 +979,14 @@ async fn reading_new_sources_before_the_first_write_is_progress() {
         "{:?}",
         guidance.iter().map(|g| &g["closing"]).collect::<Vec<_>>()
     );
-    // The guidance still moved to drafting; only closing was not triggered.
-    assert!(guidance.iter().any(|g| g["phase"] == "draft"));
+    // Nor did the reads move the guidance to drafting or stall recovery.
+    assert!(guidance.iter().take(13).all(|g| g["phase"] != "draft"));
+    assert!(
+        guidance
+            .iter()
+            .take(13)
+            .all(|g| g["progress_recovery"]["active"] == false)
+    );
 }
 
 fn numbered(lines: usize) -> String {
@@ -1857,10 +1863,10 @@ async fn repeated_empty_replies_without_a_document_report_creation_retry() {
 }
 
 #[tokio::test]
-async fn reading_new_sources_before_the_first_save_is_not_called_repetition() {
-    // Requests without an output change switch the run to a result focus.
-    // The notice said "Work is repeating" while a live model was still
-    // reading a new file in each of those requests.
+async fn reading_new_sources_before_the_first_save_is_not_a_stall() {
+    // Requests without an output change used to switch the run to a result
+    // focus with a stall notice, while a live model was still reading a new
+    // file in each of those requests.
     let dir = tempfile::tempdir().unwrap();
     let mut s = Session::new(
         Project {
@@ -1894,15 +1900,94 @@ async fn reading_new_sources_before_the_first_save_is_not_called_repetition() {
         })
         .collect();
     let (_, notices) = run_scripted_notices(s, steps).await;
-    let notice = notices
-        .iter()
-        .find(|n| n.contains(&format!("요청 {limit}번")))
-        .unwrap_or_else(|| panic!("no result-focus notice: {notices:?}"));
-    assert!(notice.contains("결과물 변경이나 새 검증 없이"), "{notice}");
     assert!(
-        !notices.iter().any(|n| n.contains("repeating")),
+        !notices
+            .iter()
+            .any(|n| n.contains(&format!("요청 {limit}번")) || n.contains("repeating")),
         "{notices:?}"
     );
+}
+
+#[tokio::test]
+async fn new_sources_are_progress_after_the_first_save_in_any_phase() {
+    // New reads counted only while investigating, before the first save,
+    // during a repair or while citations were unread. Reading more of the
+    // project in the verify phase of a saved document looked like a stall.
+    let (dir, mut s) = verified_fixture();
+    s.task.phase = "verify".into();
+    let steps = (0..4)
+        .map(|i| {
+            std::fs::write(
+                dir.path().join(format!("more{i}.js")),
+                format!("export const more{i} = {i};\n"),
+            )
+            .unwrap();
+            call(
+                &format!("read-{i}"),
+                "file_read",
+                json!({"path":format!("more{i}.js")}),
+            )
+        })
+        .collect();
+    let (result, guidance) = run_scripted(s, steps).await;
+    assert!(result.document_written);
+    assert_eq!(guidance[0]["phase"], "verify", "{}", guidance[0]);
+    assert_eq!(guidance[0]["unread_citation_count"], 0, "{}", guidance[0]);
+    for g in &guidance[1..4] {
+        assert_eq!(g["progress_recovery"]["rounds_since_progress"], 0, "{g}");
+    }
+}
+
+#[tokio::test]
+async fn edits_grounded_in_new_sources_are_not_edits_without_progress() {
+    // Same-length refinements counted as edits without progress unless they
+    // added a section or lines, even right after reading a new source; the
+    // sixteenth sent the run into focused recovery.
+    let (dir, mut s) = verified_fixture();
+    // Room for eighteen read-and-edit requests without a checkpoint.
+    s.config.model_context = Some(400_000);
+    s.config.context_tokens = 300_000;
+    let output = s.project.output.clone();
+    let hash = tools::hash(&std::fs::read(&output).unwrap());
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":hash,"text":"\nVersion 0.\n"}),
+    )
+    .unwrap();
+    let mut doc = std::fs::read_to_string(&output).unwrap();
+    let mut steps = Vec::new();
+    for i in 1..=18 {
+        std::fs::write(
+            dir.path().join(format!("more{i}.js")),
+            format!("export const more{i} = {i};\n"),
+        )
+        .unwrap();
+        let hash = tools::hash(doc.as_bytes());
+        let mut step = call(
+            &format!("read-{i}"),
+            "file_read",
+            json!({"path":format!("more{i}.js")}),
+        );
+        step.calls.push(mnemoarc::llm::ToolCall {
+            id: format!("refine-{i}"),
+            name: "document_edit".into(),
+            arguments: json!({"action":"replace_text","expected_hash":hash,
+                "old_text":format!("Version {}.", i - 1),"text":format!("Version {i}.")})
+            .to_string(),
+        });
+        steps.push(step);
+        doc = doc.replace(&format!("Version {}.", i - 1), &format!("Version {i}."));
+    }
+    let (_, guidance) = run_scripted(s, steps).await;
+    assert!(guidance.len() > 17, "{}", guidance.len());
+    for g in &guidance {
+        assert_eq!(
+            g["progress_recovery"]["artifact_edits_without_milestone"], 0,
+            "{g}"
+        );
+        assert_eq!(g["progress_recovery"]["focused"], false, "{g}");
+    }
 }
 
 /// Fills the history with complete groups a checkpoint may evict.
