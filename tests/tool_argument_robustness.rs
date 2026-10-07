@@ -89,6 +89,68 @@ fn empty_optional_navigation_strings_are_omitted() {
 }
 
 #[test]
+fn empty_fields_of_another_action_are_omitted() {
+    // A provider that fills every field sent task_state action=read with
+    // patch:{} and was refused; an empty value gives the action nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let mut current = session(dir.path());
+    tools::execute(
+        &mut current,
+        "task_state",
+        json!({"action":"read","patch":{},"offset":0,"limit":20}),
+    )
+    .unwrap();
+    tools::execute(
+        &mut current,
+        "memory_manage",
+        json!({"action":"candidates","ids":[],"replacement":{}}),
+    )
+    .unwrap();
+    // A filled field of another action is still refused.
+    let error = tools::execute(
+        &mut current,
+        "task_state",
+        json!({"action":"read","patch":{"phase":"verify"}}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("invalid_action_arguments:"), "{error}");
+}
+
+#[test]
+fn a_task_state_call_sent_whole_as_its_patch_is_that_call() {
+    // A live model sent {"patch":"{\"action\": \"update\", \"patch\": {...}}"}
+    // and was refused for a missing action.
+    let dir = tempfile::tempdir().unwrap();
+    let mut current = session(dir.path());
+    let whole = json!({"action":"update","patch":{"purpose":"UI manual"}});
+    tools::execute(
+        &mut current,
+        "task_state",
+        json!({"patch":whole.to_string()}),
+    )
+    .unwrap();
+    assert_eq!(current.task.purpose, "UI manual");
+    tools::execute(
+        &mut current,
+        "task_state",
+        json!({"action":"update","patch":{"action":"update","patch":{"scope":"frontend"}}}),
+    )
+    .unwrap();
+    assert_eq!(current.task.scope, "frontend");
+    // A different outer action is not overridden.
+    let error = tools::execute(
+        &mut current,
+        "task_state",
+        json!({"action":"read","patch":{"action":"update","patch":{"scope":"x"}}}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("invalid_action_arguments:"), "{error}");
+    assert_eq!(current.task.scope, "frontend");
+}
+
+#[test]
 fn recovery_navigation_schemas_keep_a_provider_compatible_object_root() {
     let dir = tempfile::tempdir().unwrap();
     let mut current = session(dir.path());

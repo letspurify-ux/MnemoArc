@@ -1716,6 +1716,29 @@ fn a_directory_given_to_a_file_tool_names_that_tool_for_the_next_call() {
 }
 
 #[test]
+fn a_directory_given_to_document_inspect_says_to_omit_the_path() {
+    // A live model sent document_inspect the project root and was told to
+    // find a file with file_list; the configured output needs no path.
+    let (dir, mut s) = project_session();
+    let error = tools::execute(
+        &mut s,
+        "document_inspect",
+        json!({"path":dir.path().display().to_string()}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("path_is_directory"), "{error}");
+    assert!(
+        error.contains(&format!(
+            "document_inspect without path inspects the configured output {}",
+            s.project.output.display()
+        )),
+        "{error}"
+    );
+    assert!(!error.contains("file_list"), "{error}");
+}
+
+#[test]
 fn an_unknown_tool_name_names_the_offered_tool_it_most_likely_meant() {
     let (_dir, mut s) = project_session();
     for (name, meant, says) in [

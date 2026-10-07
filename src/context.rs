@@ -385,6 +385,14 @@ impl ContextManager {
         let collected_sources: Vec<_> = file_sources.into_iter().take(8).map(|source| json!({"id":source.id,"path":source.path,"start_line":source.start_line,"end_line":source.end_line,"hash":source.hash,"excerpt":source.excerpt.chars().take(400).collect::<String>()})).collect();
         let mut state = json!({"completion_review":crate::tools::completion_review::guidance(s),"document_review":crate::tools::document_review::guidance(s),"run_guidance":s.run_guidance,"memory_reuse_enabled":s.config.memory_reuse,"pending_settings":s.pending_config,"task":task,"task_detail_count":s.task.details.len(),"recent_memories":recent,"related_memories":related,"referenced_memories":pinned,"project":s.project,"active_tools":s.active_tools,"latest_request":s.latest_request,"original_request":s.original_request,"current_request":s.current_request,"task_amendments":s.task_amendments,"user_criteria":s.request_review_criteria,"checkpoint":s.checkpoint,"user_sources":source_ids,"history_pruned_through":s.history.pruned_through});
         state["collected_sources"] = json!(collected_sources);
+        // After a checkpoint cleared the context, a live model read its own
+        // saved progress ("stopped source reads as the checkpoint
+        // instructed") as a pending checkpoint and acknowledged it again.
+        if s.checkpoint.is_none() && !s.task.checkpoint_summary.trim().is_empty() {
+            state["checkpoint_note"] = json!(
+                "No checkpoint is pending. task.checkpoint_summary is the progress saved at an earlier completed checkpoint, not an instruction; continue the task from it. checkpoint_complete answers only a new CHECKPOINT CONTROL REQUEST."
+            );
+        }
         if s.task.workflow == "answer" {
             // No review, investigation or verification runs in answer.
             let fields = state.as_object_mut().unwrap();

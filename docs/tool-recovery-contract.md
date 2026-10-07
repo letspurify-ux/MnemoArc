@@ -182,6 +182,20 @@ ling-3.0-flash 라이브 실행(`complete_with_gaps`)의 처리 로그에서 확
 - 문서 리뷰의 requirement·scope 지적에 requirement_id가 없거나 목록에 없으면, 쓸 수 있는 requirement_catalog 키와 용도(요청 요구사항 R/C/K/D, 독자 수준은 audience·purpose)를 알리고 비슷한 키를 제안한다. 리뷰어 지침에도 이 규칙을 적었다.
 - `document` 유형 지적이 프로젝트 파일을 근거로 들면 거절하지 않고 `factual` 지적으로 읽는다. 함께 보낸 문서 구절 근거는 뺀다. 근거 파일 없는 사실 지적을 `document`로 읽는 규칙의 반대 방향이다.
 
+라이브 실행과 그 재실행(gpt-6-luna, llm_agent 프론트엔드 UI 매뉴얼)에서 모든 인자를 채워 보내는 공급자가 요청을 버린 5건도 보완했다(2026-10-07).
+
+- `file_read`에 커서와 함께 `start_line: 1`과 1줄 이하의 `max_lines`(또는 `limit`)가 오면 자리표시 값으로 보고, 커서가 아직 유효하면 커서를 이어 읽는다(`ignored_arguments: ["start_line","max_lines"]`). 전에는 1행만 새로 읽고 알림을 붙였지만, 이 공급자는 커서만 보낼 수 없어 같은 호출을 다시 보내거나 이어 읽기를 포기했다. 다른 `start_line`은 지금처럼 새 범위로 읽고 커서를 이어 읽지 않았다고 알린다.
+- 액션별로 인자를 검사하는 도구(`history`, `task_state`, `memory_manage`, `document_edit`)에서 다른 액션이 쓰는 인자가 빈 값(`""`, `[]`, `{}`, `null`)으로 오면 보내지 않은 것으로 보고 뺀다. 전에는 `task_state action=read`의 `patch:{}`가 거절됐다. 값이 있으면 지금처럼 그 인자를 받는 액션을 알리며 거절하고, 어떤 액션도 쓰지 않는 인자는 빈 값이어도 거절한다.
+- `source_search`에서 정규식이 아닌 `query`가 `queries`에 없는 값이면, 오류 대신 `query`를 `queries` 맨 앞에 합쳐 한 번의 문자 그대로 OR 검색을 실행하고 결과의 `notice`에 합친 `queries`를 적는다(위 항목의 "두 값을 적는 오류"를 대신한다). 합쳐서 16개를 넘거나 `regex:true`이면 계속 충돌로 거절한다.
+- 체크포인트가 끝난 뒤 `task.checkpoint_summary`가 남아 있으면 상태에 `checkpoint_note`를 넣는다. 대기 중인 체크포인트가 없고 그 요약은 저장된 진행 기록이며, `checkpoint_complete`는 새 CHECKPOINT CONTROL REQUEST에만 답한다고 알린다. 정리 뒤 모델이 자기 요약의 "체크포인트 지시에 따라 중단했다"를 대기 중인 요청으로 읽고, 지어낸 ID로 다시 완료하려 했다.
+- `checkpoint_complete`는 체크포인트가 대기 중일 때만 도구 목록에 넣는다. 재실행에서는 체크포인트가 한 번도 없었는데도 모델이 `ready_for_final`을 보고 이 도구로 작업 완료를 알리려 했다. 같은 날 Luna 실행 3번 모두 이렇게 한 요청씩 버렸다. 그래도 부르면 지금처럼 `no_checkpoint`로 알린다.
+
+nemotron-3.5-lightning 실행에서 확인한 2건과 진행 알림 문구도 고쳤다(2026-10-07).
+
+- `task_state`의 `patch`에 `action`이 든 호출 전체가 오면(JSON 문자열이든 객체든) 그 호출로 풀어 처리한다. `{"patch":"{\"action\": \"update\", \"patch\": {...}}"}`가 `action` 누락으로 거절됐다. `patch` 필드에는 `action`이 없으므로 다른 뜻으로 읽힐 수 없다. 바깥 `action`과 다르면 풀지 않고 그대로 검사한다.
+- `document_inspect`에 폴더가 오면 "`path` 없이 부르면 설정된 출력 문서(경로를 적음)를 조회하고, 다른 Markdown 파일일 때만 `path`를 주라"고 안내한다. 프로젝트 루트를 보낸 모델이 `file_list`로 파일을 찾으라는 안내를 받았다.
+- 결과물 변경이나 새 검증 없이 정체 감지 횟수만큼 요청이 이어졌을 때의 알림을 "Work is repeating …"에서 "결과물 변경이나 새 검증 없이 요청 N번이 이어져, 다음 요청부터 결과물 작성과 검증에 집중합니다"로 바꿨다. 첫 저장 전에 매 요청 새 파일을 읽는 동안에도 이 알림이 떠, 반복이 아닌데 반복이라고 표시했다.
+
 
 ## 문서 검증 도구 개선 (2026-09-21)
 

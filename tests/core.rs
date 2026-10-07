@@ -1338,9 +1338,8 @@ fn a_whole_next_cursor_sent_as_the_cursor_continues_the_read() {
 
 #[test]
 fn a_cursor_dropped_for_a_start_line_is_reported_with_its_continuation() {
-    // A provider that fills every field sent its cursor with a placeholder
-    // start_line 1: line 1 came back with no sign that the cursor was not
-    // continued, and the range was read again in another request.
+    // A start_line beside a cursor reads a new range. The result says that
+    // the cursor was not continued and where it would have continued.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pages.md");
     std::fs::write(&path, "긴 문서와 정확한 위치😀\n".repeat(200)).unwrap();
@@ -1358,15 +1357,15 @@ fn a_cursor_dropped_for_a_start_line_is_reported_with_its_continuation() {
         .as_u64()
         .unwrap();
     assert!(next > 1);
-    let placeholder = tools::execute(
+    let new_range = tools::execute(
         &mut s,
         "file_read",
-        json!({"path":"pages.md","cursor":cursor,"start_line":1,"max_lines":1,"limit":1,"force_read":false}),
+        json!({"path":"pages.md","cursor":cursor,"start_line":2,"max_lines":3}),
     )
     .unwrap();
-    assert_eq!(placeholder["read_start"], 1);
-    assert_eq!(placeholder["ignored_arguments"], json!(["cursor"]));
-    let note = placeholder["ignored_note"].as_str().unwrap();
+    assert_eq!(new_range["read_start"], 2);
+    assert_eq!(new_range["ignored_arguments"], json!(["cursor"]));
+    let note = new_range["ignored_note"].as_str().unwrap();
     assert!(
         note.contains(&format!("{cursor} continues at line {next}"))
             && note.contains(&format!("{{\"cursor\":\"{cursor}\"}}")),
@@ -1396,6 +1395,57 @@ fn a_cursor_dropped_for_a_start_line_is_reported_with_its_continuation() {
             .contains("its file changed after it was issued"),
         "{changed}"
     );
+}
+
+#[test]
+fn a_cursor_beside_a_placeholder_first_line_is_continued() {
+    // A provider that fills every field sends each continuation as its
+    // cursor beside start_line 1 and a one-line page. Read as a new range,
+    // that returned line 1 alone: a live run sent the same call again and
+    // gave up on another cursor.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("pages.md"),
+        "긴 문서와 정확한 위치😀\n".repeat(200),
+    )
+    .unwrap();
+    let mut s = session(dir.path());
+    s.config.result_tokens = 1000;
+    let call = mnemoarc::llm::ToolCall {
+        id: "initial".into(),
+        name: "file_read".into(),
+        arguments: json!({"path":"pages.md","max_lines":200}).to_string(),
+    };
+    let result = tools::run_call(&mut s, &call);
+    let cursor = result["next_cursor"]["cursor"].as_str().unwrap().to_owned();
+    let continued = tools::execute(
+        &mut s,
+        "file_read",
+        json!({"path":"pages.md","cursor":cursor,"start_line":1,"max_lines":1,"limit":1,"force_read":false}),
+    )
+    .unwrap();
+    let alone = tools::execute(&mut s, "file_read", json!({"cursor":cursor})).unwrap();
+    assert_eq!(continued["content"], alone["content"], "{continued}");
+    let next = continued["content"]["line_start"].as_u64().unwrap();
+    assert!(next > 1, "{continued}");
+    assert_eq!(
+        continued["ignored_arguments"],
+        json!(["start_line", "max_lines"])
+    );
+    let note = continued["ignored_note"].as_str().unwrap();
+    assert!(
+        note.contains(&format!("{cursor} was continued from line {next}")),
+        "{note}"
+    );
+    // A one-line read of any other line is a real new range.
+    let line = tools::execute(
+        &mut s,
+        "file_read",
+        json!({"path":"pages.md","cursor":cursor,"start_line":5,"max_lines":1}),
+    )
+    .unwrap();
+    assert_eq!(line["read_start"], 5);
+    assert_eq!(line["ignored_arguments"], json!(["cursor"]));
 }
 
 #[test]
@@ -1798,4 +1848,64 @@ fn checkpoint_completes_without_a_memory_write_or_no_save_reason() {
     ContextManager::commit(&mut s).unwrap();
     assert!(s.checkpoint.is_none());
     assert!(s.task.checkpoint_summary.contains("main.rs:20-40"));
+}
+
+#[test]
+fn saved_checkpoint_progress_is_not_shown_as_a_pending_checkpoint() {
+    // After a checkpoint cleared the context, a live model read its own
+    // progress ("stopped source reads as the checkpoint instructed") as a
+    // pending checkpoint and acknowledged it again under an invented id.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.add_user("a".into());
+    s.add_user("b".into());
+    ContextManager::prepare(&mut s, 60000).unwrap();
+    let cp = s.checkpoint.as_ref().unwrap().id.clone();
+    tools::execute(
+        &mut s,
+        "checkpoint_complete",
+        json!({"id":cp,"progress":"Stopped source reads as the checkpoint instructed; next audit the output"}),
+    )
+    .unwrap();
+    // A pending checkpoint is named by its control request instead.
+    let pending = ContextManager::state(&s).unwrap();
+    assert!(pending.get("checkpoint_note").is_none(), "{pending}");
+    ContextManager::commit(&mut s).unwrap();
+    let request = ContextManager::request(&s, vec![]).unwrap();
+    let state = request["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        state.contains("No checkpoint is pending")
+            && state.contains("task.checkpoint_summary is the progress saved"),
+        "{state}"
+    );
+}
+
+#[test]
+fn checkpoint_complete_is_offered_only_while_a_checkpoint_is_pending() {
+    // Offered on every request, it was called to announce a finished task
+    // with no checkpoint pending, once in each of three live runs.
+    fn offered(s: &Session) -> bool {
+        tools::ToolRegistry::definitions(s)
+            .iter()
+            .any(|t| t["function"]["name"] == "checkpoint_complete")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    assert!(!offered(&s));
+    s.add_user("a".into());
+    s.add_user("b".into());
+    ContextManager::prepare(&mut s, 60000).unwrap();
+    assert!(offered(&s));
+    let cp = s.checkpoint.as_ref().unwrap().id.clone();
+    tools::execute(
+        &mut s,
+        "checkpoint_complete",
+        json!({"id":cp,"progress":"Continue with the next plan item"}),
+    )
+    .unwrap();
+    ContextManager::commit(&mut s).unwrap();
+    assert!(!offered(&s));
 }

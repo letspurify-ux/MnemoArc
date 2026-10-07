@@ -40,7 +40,7 @@ fn empty_search_query_is_missing_not_conflicting() {
     let error = tools::execute(
         &mut s,
         "source_search",
-        json!({"query":"one","queries":["two"]}),
+        json!({"query":"one","queries":["two"],"regex":true}),
     )
     .unwrap_err()
     .to_string();
@@ -437,7 +437,7 @@ fn literal_alternatives_preserve_punctuation_and_cursor_identity() {
     assert!(tools::execute(&mut s, "source_search", next).is_err());
     for invalid in [
         json!({}),
-        json!({"query":"a","queries":["b"]}),
+        json!({"query":"a","queries":["b"],"regex":true}),
         json!({"queries":[]}),
         json!({"queries":[""]}),
         json!({"queries":["a"],"regex":true}),
@@ -545,7 +545,7 @@ fn an_empty_filled_alternative_to_query_is_not_a_conflict() {
     let err = tools::execute(
         &mut s,
         "source_search",
-        json!({"path":"a.js","query":"hint","queries":["const"]}),
+        json!({"path":"a.js","query":"hint","queries":["const"],"regex":true}),
     )
     .unwrap_err()
     .to_string();
@@ -589,7 +589,7 @@ fn search_text_sent_as_pattern_is_named_as_a_file_glob() {
 }
 
 #[test]
-fn a_query_repeated_inside_queries_is_one_request_and_a_real_conflict_names_both() {
+fn a_literal_query_beside_queries_is_searched_with_them() {
     let (dir, mut s) = setup();
     std::fs::write(dir.path().join("a.js"), "const x = 1;\nconst y = 2;\n").unwrap();
     // The live shape: providers that fill every field repeat the query in
@@ -603,19 +603,36 @@ fn a_query_repeated_inside_queries_is_one_request_and_a_real_conflict_names_both
         Some(2),
         "{found}"
     );
-    // Distinct values are still a conflict, named with a call keeping both.
+    assert!(found.get("notice").is_none(), "{found}");
+    // A different literal query is one more alternative: a live run's query
+    // "chat" beside four other queries was refused and cost a request.
+    let joined = search(
+        &mut s,
+        json!({"path":"a.js","query":"const y","queries":["const x"],"regex":false}),
+    );
+    assert_eq!(
+        joined["matches"].as_array().map(Vec::len),
+        Some(2),
+        "{joined}"
+    );
+    let notice = joined["notice"].as_str().unwrap();
+    assert!(
+        notice.contains(r#"queries:["const y","const x"]"#),
+        "{notice}"
+    );
+    // Beyond the 16 terms one call holds, both values are still named.
+    let many: Vec<String> = (0..16).map(|i| format!("term{i}")).collect();
     let error = tools::execute(
         &mut s,
         "source_search",
-        json!({"query":"one","queries":["two"]}),
+        json!({"query":"one","queries":many}),
     )
     .unwrap_err()
     .to_string();
     assert!(
-        error.contains(r#"received both query "one" and queries ["two"]"#),
+        error.contains(r#"received both query "one" and queries ["term0""#),
         "{error}"
     );
-    assert!(error.contains(r#"queries:["one","two"]"#), "{error}");
     // A regular expression query is not dropped for its literal twin.
     let error = tools::execute(
         &mut s,

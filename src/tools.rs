@@ -624,6 +624,10 @@ impl ToolRegistry {
             })
             .filter(|t| s.config.memory_reuse || !["memory_read", "memory_find"].contains(&t.name))
             .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
+            // Only a pending checkpoint can be acknowledged. Offered on every
+            // request, it was called to announce a finished task with no
+            // checkpoint pending, once in each of three live runs.
+            .filter(|t| t.name != "checkpoint_complete" || s.checkpoint.is_some())
             .filter(|t| {
                 t.name != "source_lookup"
                     || s.checkpoint.as_ref().is_none_or(|cp| {
@@ -920,18 +924,19 @@ fn unsupported_tool(s: &Session, name: &str) -> anyhow::Error {
     .into()
 }
 
+const TASK_STATE_ACTIONS: &[&str] = &["read", "update", "details"];
+
+fn task_state_fields(action: &str) -> &'static [&'static str] {
+    match action {
+        "details" => &["action", "offset", "limit"][..],
+        "update" => &["action", "patch"][..],
+        _ => &["action"][..],
+    }
+}
+
 fn validate_task_state_arguments(args: &Value) -> Result<()> {
     let action = args["action"].as_str().unwrap_or("");
-    validate_action_fields(
-        "task_state",
-        args,
-        |action| match action {
-            "details" => &["action", "offset", "limit"][..],
-            "update" => &["action", "patch"][..],
-            _ => &["action"][..],
-        },
-        &["read", "update", "details"],
-    )?;
+    validate_action_fields("task_state", args, task_state_fields, TASK_STATE_ACTIONS)?;
     if action != "update" {
         return Ok(());
     }
@@ -993,44 +998,50 @@ fn reject_replacement_character(field: &str, text: &str) -> Result<()> {
     );
 }
 
+const DOCUMENT_EDIT_ACTIONS: &[&str] = &[
+    "create",
+    "write",
+    "append",
+    "insert_before",
+    "insert_after",
+    "insert_first_child",
+    "insert_last_child",
+    "patch",
+    "replace_text",
+    "delete_text",
+    "insert_before_text",
+    "insert_after_text",
+    "section",
+];
+
+fn document_edit_fields(action: &str) -> &'static [&'static str] {
+    match action {
+        "create" | "write" | "append" => &["action", "text", "expected_hash"][..],
+        "patch" | "replace_text" | "insert_before_text" | "insert_after_text" => {
+            &["action", "text", "expected_hash", "old_text", "section"][..]
+        }
+        "delete_text" => &["action", "expected_hash", "old_text", "section"][..],
+        "insert_before" | "insert_after" | "insert_first_child" | "insert_last_child" => {
+            &["action", "text", "expected_hash", "section"][..]
+        }
+        "section" => &[
+            "action",
+            "text",
+            "expected_hash",
+            "section",
+            "expected_section_hash",
+        ][..],
+        _ => &["action", "text"][..],
+    }
+}
+
 fn validate_document_edit_arguments(args: &Value) -> Result<()> {
     let action = args["action"].as_str().unwrap_or("");
     validate_action_fields_with(
         "document_edit",
         args,
-        |action| match action {
-            "create" | "write" | "append" => &["action", "text", "expected_hash"][..],
-            "patch" | "replace_text" | "insert_before_text" | "insert_after_text" => {
-                &["action", "text", "expected_hash", "old_text", "section"][..]
-            }
-            "delete_text" => &["action", "expected_hash", "old_text", "section"][..],
-            "insert_before" | "insert_after" | "insert_first_child" | "insert_last_child" => {
-                &["action", "text", "expected_hash", "section"][..]
-            }
-            "section" => &[
-                "action",
-                "text",
-                "expected_hash",
-                "section",
-                "expected_section_hash",
-            ][..],
-            _ => &["action", "text"][..],
-        },
-        &[
-            "create",
-            "write",
-            "append",
-            "insert_before",
-            "insert_after",
-            "insert_first_child",
-            "insert_last_child",
-            "patch",
-            "replace_text",
-            "delete_text",
-            "insert_before_text",
-            "insert_after_text",
-            "section",
-        ],
+        document_edit_fields,
+        DOCUMENT_EDIT_ACTIONS,
         document_action_hint,
     )?;
     let require = |key: &str| {
@@ -1262,6 +1273,38 @@ fn unwrap_continuation_cursor(name: &str, args: &mut Value) {
             fields.insert(key, value);
         }
     }
+}
+
+/// A live model sent task_state its whole call as the patch, as JSON text
+/// ({"patch":"{\"action\":\"update\",\"patch\":{...}}"}), and was refused for
+/// a missing action. No patch field is called action, so a patch naming one
+/// is that call; one that contradicts the outer action is left to validation.
+fn unwrap_task_state_call(name: &str, args: &mut Value) {
+    if name != "task_state" {
+        return;
+    }
+    let Some(fields) = args.as_object_mut() else {
+        return;
+    };
+    let call = match fields.get("patch") {
+        Some(Value::String(text)) => serde_json::from_str::<Value>(text.trim()).ok(),
+        Some(call @ Value::Object(_)) => Some(call.clone()),
+        _ => None,
+    };
+    let Some(Value::Object(call)) = call else {
+        return;
+    };
+    let Some(action) = call.get("action").and_then(Value::as_str) else {
+        return;
+    };
+    if fields
+        .get("action")
+        .is_some_and(|outer| outer.as_str() != Some(action))
+    {
+        return;
+    }
+    fields.remove("patch");
+    fields.extend(call);
 }
 
 /// Whether a path argument names the project root directory itself.
@@ -2650,17 +2693,23 @@ fn persist_document_edit(
     }))
 }
 
+const MEMORY_MANAGE_ACTIONS: &[&str] = &["candidates", "delete", "replace"];
+
+fn memory_manage_fields(action: &str) -> &'static [&'static str] {
+    match action {
+        "delete" => &["action", "ids"][..],
+        "replace" => &["action", "ids", "replacement"][..],
+        _ => &["action"][..],
+    }
+}
+
 fn validate_memory_manage_arguments(args: &Value) -> Result<()> {
     let action = args["action"].as_str().unwrap_or("");
     validate_action_fields(
         "memory_manage",
         args,
-        |action| match action {
-            "delete" => &["action", "ids"][..],
-            "replace" => &["action", "ids", "replacement"][..],
-            _ => &["action"][..],
-        },
-        &["candidates", "delete", "replace"],
+        memory_manage_fields,
+        MEMORY_MANAGE_ACTIONS,
     )?;
     if matches!(action, "delete" | "replace") && args["ids"].as_array().is_none_or(Vec::is_empty) {
         bail!("missing_argument: ids for memory_manage action={action}");
@@ -2671,17 +2720,18 @@ fn validate_memory_manage_arguments(args: &Value) -> Result<()> {
     Ok(())
 }
 
+const HISTORY_ACTIONS: &[&str] = &["search", "read"];
+
+fn history_fields(action: &str) -> &'static [&'static str] {
+    match action {
+        "search" => &["action", "query", "after", "limit"][..],
+        "read" => &["action", "id", "offset"][..],
+        _ => &["action"][..],
+    }
+}
+
 fn validate_history_arguments(args: &Value) -> Result<()> {
-    validate_action_fields(
-        "history",
-        args,
-        |action| match action {
-            "search" => &["action", "query", "after", "limit"][..],
-            "read" => &["action", "id", "offset"][..],
-            _ => &["action"][..],
-        },
-        &["search", "read"],
-    )?;
+    validate_action_fields("history", args, history_fields, HISTORY_ACTIONS)?;
     if args["action"] == "read" && args.get("id").is_none() {
         bail!("missing_argument: id for history action=read");
     }
@@ -2743,6 +2793,43 @@ fn enum_value_error(
 }
 
 type ActionFields = fn(&str) -> &'static [&'static str];
+
+/// The arguments each action of a tool accepts and the tool's actions, for
+/// tools whose fields depend on the action.
+fn action_fields(name: &str) -> Option<(ActionFields, &'static [&'static str])> {
+    Some(match name {
+        "task_state" => (task_state_fields, TASK_STATE_ACTIONS),
+        "document_edit" => (document_edit_fields, DOCUMENT_EDIT_ACTIONS),
+        "memory_manage" => (memory_manage_fields, MEMORY_MANAGE_ACTIONS),
+        "history" => (history_fields, HISTORY_ACTIONS),
+        _ => return None,
+    })
+}
+
+/// A provider that fills every field sends the fields of other actions with
+/// empty values: a live run's task_state action=read with patch:{} was
+/// refused. An empty value ("", [], {} or null) of a field another action
+/// uses gives this action nothing, so it counts as omitted. A filled one is
+/// still refused, and so is any field no action uses (a misspelled name).
+fn drop_empty_unaccepted_fields(name: &str, args: &mut Value) {
+    let Some((fields, actions)) = action_fields(name) else {
+        return;
+    };
+    let Some(object) = args.as_object_mut() else {
+        return;
+    };
+    let allowed = fields(object.get("action").and_then(Value::as_str).unwrap_or(""));
+    object.retain(|key, value| {
+        let key = key.as_str();
+        let empty = value.is_null()
+            || value.as_str().is_some_and(str::is_empty)
+            || value.as_array().is_some_and(Vec::is_empty)
+            || value.as_object().is_some_and(serde_json::Map::is_empty);
+        allowed.contains(&key)
+            || !empty
+            || !actions.iter().any(|action| fields(action).contains(&key))
+    });
+}
 
 fn validate_action_fields(
     name: &str,
@@ -3417,7 +3504,13 @@ fn directory_error(p: &Project, directory: &DirectoryPath, tool: &str) -> anyhow
     // The next call is the same tool on one file: a live model sent
     // code_outline the project root twice and was told to use file_read.
     let next = match tool {
-        "code_outline" | "symbol_read" | "symbol_relations" | "document_inspect" | "file_read" => {
+        // The output needs no path: a live model sent document_inspect the
+        // project root and was told to find a file with file_list.
+        "document_inspect" => format!(
+            "document_inspect without path inspects the configured output {}; pass path only for another Markdown file",
+            p.output.display()
+        ),
+        "code_outline" | "symbol_read" | "symbol_relations" | "file_read" => {
             format!(
                 "{tool} reads one file: find it with file_list and path_glob (e.g. backend/**), then call {tool} with that file path"
             )
@@ -4128,9 +4221,11 @@ fn execute_repaired(
     mut args: Value,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value> {
+    unwrap_task_state_call(name, &mut args);
     normalize_integer_arguments(name, &mut args);
     unwrap_continuation_cursor(name, &mut args);
     normalize_argument_aliases(s, name, &mut args)?;
+    drop_empty_unaccepted_fields(name, &mut args);
     if name == "source_search"
         && args["query"]
             .as_str()
@@ -4765,6 +4860,27 @@ fn execute_repaired(
         }
         "source_search" => search::execute(s, &args, cancel),
         "file_read" => {
+            // A provider that fills every field sends each continuation as
+            // its cursor beside start_line 1 and a one-line page. Read as a
+            // new range, that returned line 1 alone, and even with the note
+            // below a live run sent the same call again and gave up on
+            // another cursor. Line 1 alone is never what a cursor continues,
+            // so those values are placeholders while the cursor still holds.
+            let placeholder_range = args["cursor"]
+                .as_str()
+                .filter(|_| {
+                    args["start_line"].as_u64().is_some_and(|line| line <= 1)
+                        && args["max_lines"].as_u64().is_some_and(|lines| lines <= 1)
+                        && args.get("offset").is_none()
+                })
+                .and_then(|id| {
+                    Some((id.to_owned(), cursor_next_line(s, s.file_cursors.get(id)?)?))
+                });
+            if placeholder_range.is_some() {
+                let fields = args.as_object_mut().unwrap();
+                fields.remove("start_line");
+                fields.remove("max_lines");
+            }
             // A cursor continues its original range, so a page size sent with
             // it changes nothing. Ignore it rather than reject a correct
             // continuation; new-range arguments with a cursor still conflict.
@@ -4778,16 +4894,20 @@ fn execute_repaired(
                 args.as_object_mut().unwrap().remove("max_lines");
             }
             // read_file reads an explicit start_line as a new range and drops
-            // the cursor. A provider that fills every field sent its cursor
-            // with a placeholder start_line 1, got line 1 back with no sign
-            // that nothing was continued, and re-read the range in another
-            // request (all 4 such continuations in two live runs).
+            // the cursor. Without a word about it, a live model took that
+            // range for the continuation and re-read it in another request.
             let dropped_cursor = args["cursor"]
                 .as_str()
                 .filter(|_| args.get("start_line").is_some())
                 .and_then(|id| Some((id.to_owned(), s.file_cursors.get(id)?.clone())));
             let start = n(&args, "start_line", 1).max(1);
             let mut result = read_file(s, &mut args, cancel)?;
+            if let Some((id, next)) = placeholder_range {
+                result["ignored_arguments"] = json!(["start_line", "max_lines"]);
+                result["ignored_note"] = json!(format!(
+                    "start_line 1 with a one-line page beside cursor {id} was taken as unfilled placeholders, so {id} was continued from line {next}. For a new range, send start_line and max_lines without cursor."
+                ));
+            }
             if ignored_page_size {
                 result["ignored_arguments"] = json!(["max_lines"]);
                 result["ignored_note"] = json!(

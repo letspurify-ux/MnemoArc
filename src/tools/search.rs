@@ -39,6 +39,7 @@ pub(super) fn execute(
     // Providers that fill every field send an empty queries list or query
     // string beside the real one; an empty alternative is not a conflict.
     let mut args = args.clone();
+    let mut joined = None;
     if let Some(object) = args.as_object_mut() {
         if object
             .get("query")
@@ -64,6 +65,27 @@ pub(super) fn execute(
             && queries.iter().any(|term| term.as_str() == Some(query))
         {
             object.remove("query");
+        }
+        // A different literal query is one more alternative of the literal
+        // OR, the call the conflict error asked for: a live run's query
+        // "chat" beside four other queries was refused and cost a request.
+        if object.get("regex") != Some(&json!(true))
+            && let (Some(query), Some(queries)) = (
+                object.get("query").and_then(Value::as_str),
+                object.get("queries").and_then(Value::as_array),
+            )
+            && !query.is_empty()
+            && (1..16).contains(&queries.len())
+            && queries
+                .iter()
+                .all(|term| term.as_str().is_some_and(|term| !term.is_empty()))
+        {
+            let terms: Vec<Value> = std::iter::once(json!(query))
+                .chain(queries.iter().cloned())
+                .collect();
+            object.insert("queries".into(), json!(terms));
+            object.remove("query");
+            joined = Some(Value::Array(terms));
         }
     }
     let args = &args;
@@ -261,6 +283,11 @@ pub(super) fn execute(
         "matching_files":matching_file_count,"total_matching_lines":total_matching_lines,
         "next_cursor":(end<total).then(||format!("{fingerprint}:{end}"))
     });
+    if let Some(terms) = joined {
+        output["notice"] = json!(format!(
+            "query and queries were searched together as one literal OR, queries:{terms}. Send several literal terms in queries alone, or query alone with regex:true for a regular expression."
+        ));
+    }
     if total == 0 {
         output["empty_reason"] = json!(if matched_files == 0 {
             "no_searchable_files"

@@ -1851,6 +1851,55 @@ async fn repeated_empty_replies_without_a_document_report_creation_retry() {
     assert!(!notice.contains("저장된 문서"), "{notice}");
 }
 
+#[tokio::test]
+async fn reading_new_sources_before_the_first_save_is_not_called_repetition() {
+    // Requests without an output change switch the run to a result focus.
+    // The notice said "Work is repeating" while a live model was still
+    // reading a new file in each of those requests.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128_000),
+            ..support::compact_config()
+        },
+    );
+    s.add_user("Write a source manual.".into());
+    s.select_workflow("source_document").unwrap();
+    // Below the compact context, where a checkpoint starts after six reads.
+    s.config.stall_round_limit = 3;
+    let limit = s.config.stall_round_limit;
+    let steps = (0..limit)
+        .map(|i| {
+            std::fs::write(
+                dir.path().join(format!("f{i}.rs")),
+                format!("fn f{i}() {{}}\n"),
+            )
+            .unwrap();
+            call(
+                &format!("read-{i}"),
+                "file_read",
+                json!({"path":format!("f{i}.rs")}),
+            )
+        })
+        .collect();
+    let (_, notices) = run_scripted_notices(s, steps).await;
+    let notice = notices
+        .iter()
+        .find(|n| n.contains(&format!("요청 {limit}번")))
+        .unwrap_or_else(|| panic!("no result-focus notice: {notices:?}"));
+    assert!(notice.contains("결과물 변경이나 새 검증 없이"), "{notice}");
+    assert!(
+        !notices.iter().any(|n| n.contains("repeating")),
+        "{notices:?}"
+    );
+}
+
 /// Fills the history with complete groups a checkpoint may evict.
 fn pad_history(s: &mut Session, groups: usize) {
     for i in 0..groups {

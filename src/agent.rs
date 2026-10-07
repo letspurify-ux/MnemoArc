@@ -3321,7 +3321,9 @@ pub async fn run_session_controlled(
         } else if !checkpoint_batch {
             rounds_without_progress = rounds_without_progress.saturating_add(1);
             if rounds_without_progress == s.config.stall_round_limit {
-                emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"Work is repeating without an output change or new verification; focusing the next request on the current outcome.".into() }, &cancel, run_deadline(started, &s.config)).await;
+                // Say what happened, not "Work is repeating": live models
+                // reached this while still reading a new file every request.
+                emit(&events, AgentEvent::Notice { session:s.id.clone(), text:format!("결과물 변경이나 새 검증 없이 요청 {}번이 이어져, 다음 요청부터 결과물 작성과 검증에 집중합니다.", s.config.stall_round_limit) }, &cancel, run_deadline(started, &s.config)).await;
             }
         }
         if novel_artifact_change
