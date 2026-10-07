@@ -2023,11 +2023,11 @@ async fn evidence_for_a_later_section_counts_after_the_first_save() {
     drain.await.unwrap();
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
     let seen = client.seen.lock().unwrap();
-    // Six rounds without a document steer the request toward drafting.
-    assert_eq!(seen[7]["phase"], "draft", "{}", seen[7]);
-    // After the save the nudge is gone: the run is investigating again, and
-    // the later section's new evidence resets the stall count.
+    // No round count steers the request toward drafting: the model decides
+    // when to write, before and after the first save.
+    assert_eq!(seen[7]["phase"], "investigate", "{}", seen[7]);
     assert_eq!(seen[8]["phase"], "investigate", "{}", seen[8]);
+    // The later section's new evidence resets the stall count.
     assert_eq!(
         seen[9]["progress_recovery"]["rounds_since_progress"], 0,
         "{}",

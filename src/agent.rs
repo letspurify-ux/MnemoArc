@@ -224,13 +224,15 @@ fn collect_gaps(s: &mut Session, extra: &[String]) -> Vec<String> {
 // A document whose citations are all read can still lack requested sections;
 // a live run read an older wording as permission to remove the to-dos for
 // unwritten sections.
-const PLAN_CLOSEOUT_INSTRUCTION: &str = "The document is written and its cited ranges are read, but the to-dos in plan_closeout are open and the final answer is refused while any is open. A to-do whose work is not done yet, such as a requested section still missing from the document, is NOT obsolete. Do that work first: read the evidence and write the section. When the listed work is done, close them in ONE task_plan apply using plan_closeout.expected_revision: one operation per item in the listed order, complete with the actual observed result, or remove with a reason only when the item is genuinely obsolete, never merely unstarted. complete must follow list order, because only the current item can complete. Then give the final answer.";
+const PLAN_CLOSEOUT_INSTRUCTION: &str = "The document is written and its cited ranges are read, but the to-dos in plan_closeout are open and the final answer is refused while any is open. A to-do whose work is not done yet, such as a requested section still missing from the document, is NOT obsolete. Do that work first: read the evidence and write the section. When the listed work is done, close them in ONE task_plan apply using plan_closeout.expected_revision: one operation per item in the listed order, complete with the actual observed result, or remove with a reason only when the item is genuinely obsolete, never merely unstarted. complete must follow list order, because only the current item can complete. Give the final answer only when the requested document is complete.";
 
 const REVIEW_REPAIR_RESUME_INSTRUCTION: &str = "A checkpoint cleared the context during review repair, and the document is still UNCHANGED: every finding in review_repair.unrepaired_findings is still open. A final answer now is rejected again without a new review. Edit the document for these findings first.";
 
 /// The final answer of a source document that cites no project source.
 const DOCUMENT_CITATIONS_MISSING: &str = "document_citations_missing: the saved document cites no project source as path:start-end (for example backend/src/server.js:12-30), so it cannot be checked against the source and the final answer is refused. Cite the sources next to the claims they support, from ranges you have read (file_read a range first if needed), then give the final answer.";
 
+/// Closing mode only: the runtime is ending the run and nothing is left to
+/// repair. Outside closing the model judges when the document is complete.
 const READY_FOR_FINAL_INSTRUCTION: &str = "Ready to finish, provided every requested section is written: the document is saved, every cited range was read, no to-do remains and no review finding is open for this document version. If a requested section is still missing, write it first. Give the concise final answer now (output path, verification scope, remaining limitations). The runtime then runs the document review and completion checks and returns any finding as a repair. Do not inspect or audit again unless you change the document.";
 
 const REVIEW_REPAIR_INSTRUCTION: &str = "Review repair: fix ALL findings in document_review.issues before the next final answer. Read any source range a finding needs, then apply the corrections with as few document edits as possible: group non-overlapping corrections in one document_edit_batch whose single expected_hash is the top-level argument (never inside edits). Operations apply in order, so never target text that an earlier operation in the same batch replaces; when corrections touch the same passage, merge them into one operation or use a separate request. Then give the final answer to start the re-review. Do not alternate single edits with document_audit or document_inspect. Fix findings in their original sections; do not add a review-notes section.";
@@ -1520,18 +1522,6 @@ pub async fn run_session_controlled(
         {
             phase = "answer".into();
         }
-        // Six rounds without a saved document steer this request toward
-        // drafting. The nudge follows from state on every request and is not
-        // persisted: a persisted draft outlived the first save, so reading for
-        // later sections never counted as progress (a live run reached 15/24).
-        let undrafted_phase = phase.clone();
-        let drafting_nudge = s.task.workflow == "source_document"
-            && !s.document_written
-            && s.task_rounds >= 6
-            && phase != "verify";
-        if drafting_nudge {
-            phase = "draft".into();
-        }
         // A completion repair stays open from a rejection until the next
         // review, even after repair work changes the result: a live run's
         // first repair read dropped the unmet checks, the repair guidance
@@ -1662,11 +1652,7 @@ pub async fn run_session_controlled(
         // Progress recovery steers only this request. Persisting its verify
         // would ratchet the task into verification for good: a live run was
         // left unable to register its next section after one early stall.
-        let persisted_phase = if drafting_nudge && phase == "draft" {
-            undrafted_phase
-        } else {
-            phase.clone()
-        };
+        let persisted_phase = phase.clone();
         let closing_active = s.progress_recovery.closing.is_some();
         if closing_active {
             phase = "verify".into();
@@ -1726,23 +1712,23 @@ pub async fn run_session_controlled(
         } else {
             DOCUMENT_FOCUSED_INSTRUCTION
         };
-        const DOCUMENT_FOCUSED_INSTRUCTION: &str = "Focused recovery: choose the first document_review issue, unmet completion check or current to-do and perform one concrete action that changes the requested result or verifies specific missing evidence. Read recovery_reason and the last tool's recovery contract; correct the cause or choose a different action before retrying. A task_plan applied=false or unchanged=true result did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, merely rewrite the plan, or save another summary. After a real edit, advance its to-do or read any cited range it left unread. If the original result already exists, check it once with document_audit, then complete only the actual remaining work. Document retry counts are recovery signals, not permission to stop or weaken requirements: continue to final verification within the remaining tokens and time.";
+        const DOCUMENT_FOCUSED_INSTRUCTION: &str = "Focused recovery: choose the first document_review issue, unmet completion check or current to-do and perform one concrete action that changes the requested result or verifies specific missing evidence. Read recovery_reason and the last tool's recovery contract; correct the cause or choose a different action before retrying. A task_plan applied=false or unchanged=true result did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, repeat an unchanged plan, or save another summary. After a real edit, advance its to-do or read any cited range it left unread. If the original result already exists, check it once with document_audit, then complete only the actual remaining work. Document retry counts are recovery signals, not permission to stop or weaken requirements: continue to final verification within the remaining tokens and time.";
         const ANSWER_INVESTIGATE_INSTRUCTION: &str = "For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. For a requested document edit, inspect the target section and make a targeted edit. Answer once evidence is sufficient.";
-        const ANSWER_FOCUSED_INSTRUCTION: &str = "Focused recovery: choose the current to-do, or the question itself, and perform one concrete action that changes the requested result. Read recovery_reason and the last tool's recovery contract; correct the cause or choose a different action before retrying. A task_plan applied=false or unchanged=true result did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, merely rewrite the plan, or save another summary. If the requested result already exists, complete only the actual remaining work, then answer.";
+        const ANSWER_FOCUSED_INSTRUCTION: &str = "Focused recovery: choose the current to-do, or the question itself, and perform one concrete action that changes the requested result. Read recovery_reason and the last tool's recovery contract; correct the cause or choose a different action before retrying. A task_plan applied=false or unchanged=true result did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, repeat an unchanged plan, or save another summary. If the requested result already exists, complete only the actual remaining work, then answer.";
         s.run_guidance = json!({"task_rounds":s.task_rounds,"run_rounds":s.run_rounds(),"finalization_attempts":finalization_attempts,"phase":phase,"remaining_tokens":remaining,"remaining_seconds":seconds_remaining,"unread_citation_count":unread_count,
             "recovery_reason":s.progress_recovery.recovery_reason,"action_required":s.progress_recovery.action_required,
             "progress_recovery":{"active":progress_recovery,"focused":focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus,"rounds_without_progress":rounds_without_progress,"rounds_without_substantive_progress":s.progress_recovery.rounds_without_substantive_progress,"repeated_outcome_rounds":s.progress_recovery.repeated_outcome_rounds,"artifact_edits_without_milestone":s.progress_recovery.artifact_edits_without_milestone,"repeated_read":repeated_read_detected},
             "current_todo":s.task.current_todo(),
             "max_tool_calls":32.min(if s.checkpoint.is_some() { ContextManager::cleanup_result_budget(&s.config) } else { s.config.batch_tokens } / 200),
             "plan_pending_count":s.task.todos.iter().filter(|item| !item.done).count(),
-            "plan_instruction":"Execute current_todo before later items. Insert a concrete prerequisite before it when needed, or split a broad pending item into ordered smaller outcomes while preserving its goal. Complete the current item through task_plan with the observed result; plan edits do not reset no-progress recovery. If the plan is full, finish the current item or remove obsolete pending items; do not stop the task.",
+            "plan_instruction":"Execute current_todo before later items. Insert a concrete prerequisite before it when needed, or split a broad pending item into ordered smaller outcomes while preserving its goal. Complete the current item through task_plan with the observed result. If the plan is full, finish the current item or remove obsolete pending items; do not stop the task.",
             "writing_reserve_tokens":(s.config.run_tokens as f64*s.config.writing_reserve_ratio) as usize,
             "verification_reserve_tokens":(s.config.run_tokens as f64*s.config.verification_reserve_ratio) as usize,
             "document_repair_limit":s.config.document_repair_limit,
             "document_repair_requests_used":s.document_review.repair_requests,
             "document_repair_requests_remaining":s.config.document_repair_limit.saturating_sub(s.document_review.repair_requests),
             "completion_error":s.last_error.as_deref().filter(|error| finalization_attempts > 0 || error.starts_with("task_plan_pending:") || error.starts_with("completion_review")).or((completion_repair_open && s.checkpoint.is_none()).then_some(tools::completion_review::UNMET_ERROR)),
-            "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: repeated investigation has not changed the document or resolved an unread citation. Use the evidence already gathered to make one small, safe document_edit now, or file_read one cited range reported as unread. Inspect the output hash if needed. Read only a specific missing source range that directly blocks that action. Do not gather more general evidence or save another memory first. If a claim cannot be supported, mark that gap in the relevant section and continue with supported work; do not invent evidence. A checkpoint remains the only exception for memory maintenance." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"Stop expanding scope. For source documentation, batch targeted reads for missing evidence, then repair known issues in their original locations with targeted section or text edits when safe. Review findings are edit instructions, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Only requests containing document_edit or document_edit_batch advance the review interval (one per request, including failed edits); reads and verification do not. The runtime reviews after an executed edit batch reaches the interval, preserving all sibling calls. Unchanged rejected documents reuse their findings. This interval is not a total edit allowance: keep correcting the original requirements within the remaining run tokens and time. For questions or existing-document summaries, answer from the content already read and report any missing coverage.","draft"=>"For source documentation, save each investigated section in a separate edit as soon as its evidence is ready. Check the current outline; use insert_before/insert_after for siblings and insert_first_child/insert_last_child for nested sections when that preserves the document flow. Copy section_path when headings repeat; preserve verification budget. For questions or existing-document summaries, finish the chat answer using targeted reads only.",_=>if answer_workflow { ANSWER_INVESTIGATE_INSTRUCTION } else { "For source documentation, investigate one section, save it, then move to the next. Create only a short opening with the first ready section; inspect the outline before each later addition, copy section_path when headings repeat, and use sibling or child insertion to place it within the hierarchy. For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. Answer once evidence is sufficient; no source audit or document write is required." }} }});
+            "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: the last requests produced no new evidence, document change or resolved citation. Change approach instead of repeating them: read sources the document still needs and has not read, write or correct a section, or file_read a cited range reported as unread. Do not repeat an unchanged read, plan rewrite or memory save. If a claim cannot be supported, mark that gap in the relevant section and continue with supported work; do not invent evidence." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"For source documentation, batch reads for missing evidence, then repair known issues in their original locations with targeted section or text edits when safe. Review findings are edit instructions, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Only requests containing document_edit or document_edit_batch advance the review interval (one per request, including failed edits); reads and verification do not. The runtime reviews after an executed edit batch reaches the interval, preserving all sibling calls. Unchanged rejected documents reuse their findings. This interval is not a total edit allowance: keep correcting the original requirements within the remaining run tokens and time.","draft"=>"Half of the run budget is spent: plan the remaining reading and writing so the requested document is complete and verified within remaining_tokens and remaining_seconds. Save sections in separate edits; check the current outline, use insert_before/insert_after for siblings and insert_first_child/insert_last_child for nested sections when that preserves the document flow, and copy section_path when headings repeat.",_=>if answer_workflow { ANSWER_INVESTIGATE_INSTRUCTION } else { "For source documentation, judge from the request and the evidence how much to read, when to write and when the document is complete. Save sections in separate edits rather than one full-file write; inspect the outline before each addition, copy section_path when headings repeat, and use sibling or child insertion to place it within the hierarchy. Batch independent searches or reads together instead of paying a model round per file." }} }});
         s.run_guidance["progress_recovery"]["rounds_since_progress"] = json!(stall_rounds);
         s.run_guidance["progress_recovery"]["closing_after"] =
             json!(closing_stall_limit(&s.config));
@@ -1764,35 +1750,21 @@ pub async fn run_session_controlled(
                 .unwrap()
                 .remove("closing_after");
         }
-        if s.progress_recovery.closing.is_none() && ready_for_final(&mut s) {
-            s.run_guidance["ready_for_final"] = json!(true);
-            let previous = if s.config.source_document_review {
-                s.document_review.issues.len()
-            } else {
-                0
-            };
-            let mut instruction = if previous > 0 {
-                format!(
-                    "{READY_FOR_FINAL_INSTRUCTION} document_review.issues contains {previous} findings from a previous document version. They are repair context, not confirmed defects in the current version. The next review will check the current document after your final answer."
-                )
-            } else {
-                READY_FOR_FINAL_INSTRUCTION.to_owned()
-            };
-            // Closing the repair to-dos makes the run ready again; a live run
-            // then answered without having repaired anything, and the next
-            // review rejected the unchanged outcome.
-            if let Some(prior) = tools::completion_review::prior_rejection(&s) {
-                instruction.push_str(&format!(
-                    " completion_review.last_review lists {} unmet check(s) from the completion review of an earlier version. If the current result does not address one of them yet, repair it first; state a check that cannot be met as a limitation in the final answer.",
-                    prior.checks.len()
+        // Outside closing mode the model judges when the document is
+        // complete: a "ready to finish" instruction as soon as the saved
+        // document's citations were read and its to-dos closed let concise
+        // models stop after the first sections. Readiness is still checked
+        // here for its document_readiness problems and the to-do closeout.
+        let ready = s.progress_recovery.closing.is_none() && ready_except_plan(&mut s);
+        if ready && s.task.current_todo().is_none() && s.config.source_document_review {
+            let previous = s.document_review.issues.len();
+            if previous > 0 {
+                s.run_guidance["document_review_note"] = json!(format!(
+                    "document_review.issues contains {previous} findings from a previous document version. They are repair context, not confirmed defects in the current version. The next review checks the current document after your final answer."
                 ));
             }
-            settle_completion_error(&mut s);
-            s.run_guidance["instruction"] = json!(instruction);
-        } else if s.progress_recovery.closing.is_none()
-            && s.task.current_todo().is_some()
-            && ready_except_plan(&mut s)
-        {
+        }
+        if ready && s.task.current_todo().is_some() {
             s.run_guidance["plan_closeout"] = plan_closeout(&s);
             s.run_guidance["instruction"] = json!(PLAN_CLOSEOUT_INSTRUCTION);
         } else if s.progress_recovery.closing.is_none()
@@ -3557,7 +3529,7 @@ pub async fn run_session_controlled(
                 >= substantive_progress_limit(&s.config)
             && !recover_document(
                 &mut s,
-                "Navigation and bookkeeping are not completing the document. Write the current section from available evidence or read only its specific missing source range.",
+                "Navigation and bookkeeping alone have not advanced the document for many requests. Read the sources the document still needs, or write or correct a section.",
             )
         {
             s.status = "partial".into();

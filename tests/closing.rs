@@ -642,7 +642,10 @@ async fn unchanged_outline_repeat_returns_a_short_marker() {
 }
 
 #[tokio::test]
-async fn finished_bookkeeping_asks_for_the_final_answer() {
+async fn finished_bookkeeping_leaves_the_final_answer_to_the_model() {
+    // A "ready to finish" instruction as soon as the citations were read and
+    // the to-dos closed let concise models stop after their first sections.
+    // Outside closing the model judges when the document is complete.
     let (_dir, s) = verified_fixture();
     let (result, guidance) = run_scripted(
         s,
@@ -653,12 +656,12 @@ async fn finished_bookkeeping_asks_for_the_final_answer() {
     )
     .await;
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
-    assert_eq!(guidance[0]["ready_for_final"], true);
+    assert!(guidance[0]["ready_for_final"].is_null());
+    let instruction = guidance[0]["instruction"].as_str().unwrap();
+    assert!(!instruction.contains("Ready to finish"), "{instruction}");
     assert!(
-        guidance[0]["instruction"]
-            .as_str()
-            .unwrap()
-            .starts_with("Ready to finish")
+        instruction.contains("when the document is complete"),
+        "{instruction}"
     );
 
     // A cited range that was never read keeps the ordinary guidance.
@@ -723,8 +726,9 @@ async fn open_todos_on_a_finished_document_are_closed_in_one_batch() {
     // Settled items cover only registered work; an unstarted to-do such as a
     // missing section must not be removed as obsolete.
     assert!(instruction.contains("NOT obsolete"), "{instruction}");
-    // One batched update was enough: the next request is ready to finish.
-    assert_eq!(guidance[1]["ready_for_final"], true);
+    // One batched update was enough; the model then answers on its own.
+    assert!(guidance[1]["ready_for_final"].is_null());
+    assert!(guidance[1]["plan_closeout"].is_null());
     assert!(result.task.current_todo().is_none());
 }
 
@@ -831,12 +835,13 @@ async fn rejected_review_asks_for_one_batched_repair() {
             ],
         )
         .await;
-        assert_eq!(guidance[0]["ready_for_final"], true);
+        // Findings of an earlier version are named as repair context, with
+        // no instruction to finish.
+        assert!(guidance[0]["ready_for_final"].is_null());
         assert_eq!(
-            guidance[0]["instruction"]
+            guidance[0]["document_review_note"]
                 .as_str()
-                .unwrap()
-                .contains("1 findings from a previous document version"),
+                .is_some_and(|note| note.contains("1 findings from a previous document version")),
             !legacy_policy
         );
     }
@@ -2093,17 +2098,16 @@ async fn completion_repair_reads_count_until_the_next_review() {
             && snapshot.last_error.is_none()
     }));
     // The last review's open checks still qualify that readiness.
-    let ready = guidance.pop().unwrap();
-    assert_eq!(ready["ready_for_final"], true, "{ready}");
+    // With the repair to-do closed nothing tells the model to finish; the
+    // repair stays open until the next review.
+    let closed = guidance.pop().unwrap();
+    assert!(closed["ready_for_final"].is_null(), "{closed}");
     assert!(
-        ready["instruction"]
+        closed["completion_error"]
             .as_str()
-            .unwrap()
-            .contains("completion_review.last_review lists 1 unmet check(s)"),
-        "{ready}"
+            .is_some_and(|error| error.starts_with("completion_review_unmet:")),
+        "{closed}"
     );
-    // The repair error no longer contradicts that instruction.
-    assert!(ready["completion_error"].is_null(), "{ready}");
     assert_eq!(result.last_error.as_deref(), Some("script_exhausted"));
     // Requests after the rejection: one before and one after each read.
     let repair = &guidance[2..];

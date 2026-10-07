@@ -455,7 +455,9 @@ async fn required_document_before_any_write_is_not_forced_to_chat_answer() {
         s,
         Arc::new(Reviewer {
             issues: false,
-            phase: Some("draft"),
+            // Neither a chat answer nor a drafting nudge: the model decides
+            // when to write.
+            phase: Some("investigate"),
         }),
         CancellationToken::new(),
         tx,
