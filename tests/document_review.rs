@@ -2297,3 +2297,50 @@ async fn a_rejecting_review_still_returns_to_the_model() {
     assert!(!document_review::approved(&result));
     assert!(client.model_calls.load(std::sync::atomic::Ordering::SeqCst) > 1);
 }
+
+#[test]
+fn a_shrunk_review_page_covers_fewer_lines_and_evidence_chunks() {
+    // A reasoning model ran out of its full output allowance on a page; an
+    // identical retry tends to fail the same way, so the page is halved.
+    let (dir, mut s) = fixture();
+    let source = (1..=400)
+        .map(|i| format!("const LINE_{i} = {i};\n"))
+        .collect::<String>();
+    std::fs::write(dir.path().join("main.js"), source).unwrap();
+    let doc = (1..=150)
+        .map(|i| format!("Claim {i}. main.js:{}-{}\n", i * 2, i * 2 + 1))
+        .collect::<String>();
+    std::fs::write(&s.project.output, &doc).unwrap();
+    let page = |s: &mut Session| {
+        let request = document_review::request(s).unwrap();
+        let payload: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        (
+            payload["document_line_end"].as_u64().unwrap(),
+            payload["evidence"].as_array().unwrap().len(),
+        )
+    };
+    let (full_end, full_evidence) = page(&mut s);
+    assert!(full_end > 50, "{full_end}");
+    assert!(document_review::shrink_page(&mut s));
+    let (half_end, half_evidence) = page(&mut s);
+    assert!(
+        half_end <= 50 && half_end < full_end,
+        "{half_end} vs {full_end}"
+    );
+    assert!(half_evidence >= 1 && half_evidence <= full_evidence);
+    assert!(document_review::shrink_page(&mut s));
+    let (quarter_end, quarter_evidence) = page(&mut s);
+    assert!(quarter_end <= 25, "{quarter_end}");
+    assert!(quarter_evidence >= 1 && quarter_evidence <= half_evidence);
+    assert!(
+        !document_review::shrink_page(&mut s),
+        "at most two halvings"
+    );
+    assert_eq!(s.document_review.page_shrink, 2);
+    // Another model has its own capacity: it starts from full pages again.
+    s.config.model = "gpt-4o-mini".into();
+    let (other_end, _) = page(&mut s);
+    assert_eq!(s.document_review.page_shrink, 0);
+    assert_eq!(other_end, full_end);
+}

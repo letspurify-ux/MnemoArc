@@ -2271,3 +2271,479 @@ async fn checkpoint_requests_carry_no_repair_message() {
         guidance[1]
     );
 }
+
+/// Scripted replies with a delay each, recording every request's
+/// run_guidance and output allowance, and the run's notices.
+struct Paced {
+    steps: Mutex<Vec<(std::time::Duration, Completion)>>,
+    guidance: Mutex<Vec<Value>>,
+    output_tokens: Mutex<Vec<usize>>,
+}
+
+#[async_trait]
+impl LlmClient for Paced {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let state: Value = request["messages"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .and_then(|message| message["content"].as_str())
+            .and_then(|content| content.split_once('\n'))
+            .and_then(|(_, json)| serde_json::from_str(json).ok())
+            .unwrap_or(Value::Null);
+        self.guidance
+            .lock()
+            .unwrap()
+            .push(state["run_guidance"].clone());
+        self.output_tokens
+            .lock()
+            .unwrap()
+            .push(config.output_tokens);
+        let step = {
+            let mut steps = self.steps.lock().unwrap();
+            if steps.is_empty() {
+                anyhow::bail!("script_exhausted");
+            }
+            steps.remove(0)
+        };
+        tokio::time::sleep(step.0).await;
+        Ok(step.1)
+    }
+}
+
+async fn run_paced(
+    s: Session,
+    steps: Vec<(std::time::Duration, Completion)>,
+) -> (Session, Vec<Value>, Vec<usize>, Vec<String>) {
+    let client = Arc::new(Paced {
+        steps: Mutex::new(steps),
+        guidance: Mutex::new(vec![]),
+        output_tokens: Mutex::new(vec![]),
+    });
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move {
+        let mut notices = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::Notice { text, .. } = event {
+                notices.push(text);
+            }
+        }
+        notices
+    });
+    let result = run_session(s, client.clone(), CancellationToken::new(), tx).await;
+    let notices = drain.await.unwrap();
+    let guidance = client.guidance.lock().unwrap().clone();
+    let output_tokens = client.output_tokens.lock().unwrap().clone();
+    (result, guidance, output_tokens, notices)
+}
+
+fn text(reply: &str) -> Completion {
+    Completion {
+        text: reply.into(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn a_deadline_inside_a_request_finishes_with_the_gap_report() {
+    // Live run 2026-10-07: the deadline fell while a slow model's request
+    // ran, and the run ended blocked with no gap report for its saved doc.
+    let (_dir, mut s, _) = fixture();
+    s.config.completion_review_enabled = false;
+    s.config.run_timeout_secs = 2;
+    let steps = vec![(
+        std::time::Duration::from_secs(4),
+        call("read", "file_read", json!({"path":"main.js"})),
+    )];
+    let (result, guidance, _, _) = run_paced(s, steps).await;
+    assert_eq!(guidance.len(), 1);
+    assert_eq!(
+        result.status, "complete_with_gaps",
+        "{:?}",
+        result.last_error
+    );
+    assert_eq!(result.run_history.back().unwrap().reason, "run_timeout");
+    assert!(
+        result
+            .completion_gaps
+            .iter()
+            .any(|gap| gap.starts_with("문서 검토")),
+        "{:?}",
+        result.completion_gaps
+    );
+}
+
+#[tokio::test]
+async fn a_slow_model_closes_early_and_skips_a_request_that_cannot_end() {
+    // Six requests at this run's pace (15 s) exceed the 10% reserve (0.6 s),
+    // so closing can start after the first request, but never before the
+    // verification share of the run: 25% here keeps it (1.5 s), 90% lets it
+    // start. With half a request's time left, either run finishes instead of
+    // sending a request the deadline would cut.
+    let slow_run = |verification_reserve_ratio: f64| {
+        let (dir, mut s, _) = fixture();
+        s.config.source_document_review = false;
+        s.config.completion_review_enabled = false;
+        s.config.run_timeout_secs = 6;
+        s.config.verification_reserve_ratio = verification_reserve_ratio;
+        s.config.writing_reserve_ratio = s.config.writing_reserve_ratio.max(0.95);
+        std::fs::write(dir.path().join("a.js"), "export const a = 1;\n").unwrap();
+        std::fs::write(dir.path().join("b.js"), "export const b = 2;\n").unwrap();
+        let pace = std::time::Duration::from_millis(2500);
+        let steps = vec![
+            (pace, call("a", "file_read", json!({"path":"a.js"}))),
+            (pace, call("b", "file_read", json!({"path":"b.js"}))),
+            (pace, call("c", "file_read", json!({"path":"main.js"}))),
+        ];
+        async move {
+            let result = run_paced(s, steps).await;
+            drop(dir);
+            result
+        }
+    };
+    let ((capped, capped_guidance, _, _), (open, open_guidance, _, _)) =
+        tokio::join!(slow_run(0.25), slow_run(0.9));
+    assert!(
+        capped_guidance[1]["closing"].is_null(),
+        "{}",
+        capped_guidance[1]
+    );
+    assert_eq!(
+        open_guidance[1]["closing"]["active"], true,
+        "{}",
+        open_guidance[1]
+    );
+    assert_eq!(open_guidance[1]["closing"]["reason"], "budget");
+    for (result, guidance) in [(capped, capped_guidance), (open, open_guidance)] {
+        assert_eq!(guidance.len(), 2, "{guidance:?}");
+        assert_ne!(result.status, "blocked", "{:?}", result.last_error);
+        assert_eq!(result.run_history.back().unwrap().reason, "run_timeout");
+    }
+}
+
+#[tokio::test]
+async fn failed_review_responses_neither_stall_nor_need_another_answer() {
+    // Live run 2026-10-07: retried review responses climbed the stall
+    // ladder from 4 to 18 while the review was progressing.
+    let (_dir, mut s, _) = fixture();
+    s.config.completion_review_enabled = false;
+    let steps = vec![
+        text("Saved out.md."),
+        text("not json"),
+        text("still not json"),
+        text("no"),
+    ];
+    let (result, guidance) = run_scripted(s, steps).await;
+    // The page was skipped after three invalid responses and the review is
+    // unavailable: the answer that started it is accepted, not asked again.
+    assert_eq!(guidance.len(), 4, "{guidance:?}");
+    assert_eq!(
+        result.status, "complete_with_gaps",
+        "{:?}",
+        result.last_error
+    );
+    assert!(
+        result
+            .completion_gaps
+            .iter()
+            .any(|gap| gap.starts_with("문서 검토")),
+        "{:?}",
+        result.completion_gaps
+    );
+    assert_eq!(result.progress_recovery.rounds_since_best, 0);
+}
+
+#[tokio::test]
+async fn an_abandoned_completion_review_accepts_the_answer_that_started_it() {
+    // In closing a live run was asked for the answer again, kept repairing
+    // and hit the deadline.
+    let (_dir, mut s, _) = fixture();
+    s.config.source_document_review = false;
+    let steps = vec![
+        text("Saved out.md."),
+        text("not json"),
+        text("not json"),
+        text("not json"),
+    ];
+    let (result, guidance) = run_scripted(s, steps).await;
+    assert_eq!(guidance.len(), 4, "{guidance:?}");
+    assert_eq!(
+        result.status, "complete_with_gaps",
+        "{:?}",
+        result.last_error
+    );
+    assert!(
+        result
+            .completion_gaps
+            .iter()
+            .any(|gap| gap == "완료 조건 검증 — 검토 응답 오류로 검증을 마치지 못했습니다."),
+        "{:?}",
+        result.completion_gaps
+    );
+}
+
+#[tokio::test]
+async fn review_pages_learn_the_output_need_and_shrink_after_a_full_cutoff() {
+    // Live run 2026-10-07: 4 of 24 review requests used up the short first
+    // allowance, and later pages started short again.
+    let (_dir, mut s, _) = fixture();
+    s.config.completion_review_enabled = false;
+    let doc = (1..=150)
+        .map(|i| format!("Claim {i}. main.js:1-6\n"))
+        .collect::<String>();
+    let hash = s.last_document_write.as_ref().unwrap().1.clone();
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","expected_hash":hash,"text":doc}),
+    )
+    .unwrap();
+    let cut = || Completion {
+        length_limited: true,
+        ..Default::default()
+    };
+    let none = std::time::Duration::ZERO;
+    let mut steps = vec![(none, text("Saved out.md.")), (none, cut()), (none, cut())];
+    steps.extend((0..6).map(|_| (none, text(r#"{"issues":[]}"#))));
+    let (result, _, output_tokens, notices) = run_paced(s, steps).await;
+    let full = 8000;
+    assert_eq!(output_tokens[1], 4096, "{output_tokens:?}");
+    assert_eq!(output_tokens[2], full, "{output_tokens:?}");
+    // The full allowance was cut too: the page is halved, and every later
+    // page starts with the allowance this model needs.
+    assert_eq!(result.document_review.page_shrink, 1);
+    assert!(
+        notices.iter().any(|notice| notice.contains("더 작은 범위")),
+        "{notices:?}"
+    );
+    assert!(output_tokens.len() >= 6, "{output_tokens:?}");
+    assert!(
+        output_tokens[4..].iter().all(|&tokens| tokens == full),
+        "{output_tokens:?}"
+    );
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+}
+
+#[tokio::test]
+async fn reads_after_a_declared_draft_phase_still_count_as_progress() {
+    // Live run 2026-10-07: the model declared phase draft before its first
+    // save, and its reads for later sections stopped counting (2 to 10).
+    let (dir, mut s, _) = fixture();
+    s.config.source_document_review = false;
+    s.config.completion_review_enabled = false;
+    for name in ["a.js", "b.js", "c.js"] {
+        std::fs::write(
+            dir.path().join(name),
+            format!("export const x = '{name}';\n"),
+        )
+        .unwrap();
+    }
+    let steps = vec![
+        call(
+            "draft",
+            "task_state",
+            json!({"action":"update","patch":{"phase":"draft"}}),
+        ),
+        call("a", "file_read", json!({"path":"a.js"})),
+        call("b", "file_read", json!({"path":"b.js"})),
+        call("c", "file_read", json!({"path":"c.js"})),
+    ];
+    let (_, guidance) = run_scripted(s, steps).await;
+    assert_eq!(guidance[2]["phase"], "draft", "{}", guidance[2]);
+    for g in &guidance[2..] {
+        assert_eq!(g["progress_recovery"]["rounds_since_progress"], 0, "{g}");
+    }
+}
+
+#[tokio::test]
+async fn the_single_closing_review_gets_the_full_output_allowance() {
+    // Closing allows one review response; a short first attempt that a
+    // reasoning model fills with its reasoning would end the review there.
+    let (_dir, mut s, _) = fixture();
+    s.config.completion_review_enabled = false;
+    s.config.run_tokens = 1_000_000;
+    let none = std::time::Duration::ZERO;
+    let mut into_closing = call("state", "task_state", json!({"action":"read"}));
+    into_closing.usage = Some(Usage {
+        input: 905_000,
+        output: 10,
+        cached: None,
+    });
+    let steps = vec![
+        (none, into_closing),
+        (none, text("Saved out.md.")),
+        (none, text(r#"{"issues":[]}"#)),
+    ];
+    let (result, guidance, output_tokens, _) = run_paced(s, steps).await;
+    assert_eq!(guidance[1]["closing"]["active"], true, "{}", guidance[1]);
+    assert_eq!(output_tokens.len(), 3, "{output_tokens:?}");
+    assert_eq!(output_tokens[2], 8000, "{output_tokens:?}");
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+}
+
+#[tokio::test]
+async fn review_responses_rejected_before_parsing_end_reviews_like_invalid_ones() {
+    // A review response with a malformed tool call is rejected before its
+    // JSON is read. It was retried without notice, and an abandoned review
+    // asked for the answer again instead of accepting it unreviewed.
+    let malformed = || call("x", &"n".repeat(200), json!({}));
+    let none = std::time::Duration::ZERO;
+    for completion_review in [false, true] {
+        let (_dir, mut s, _) = fixture();
+        s.config.source_document_review = !completion_review;
+        s.config.completion_review_enabled = completion_review;
+        let steps = vec![
+            (none, text("Saved out.md.")),
+            (none, malformed()),
+            (none, malformed()),
+            (none, malformed()),
+        ];
+        let (result, guidance, _, notices) = run_paced(s, steps).await;
+        assert_eq!(guidance.len(), 4, "{guidance:?}");
+        assert_eq!(
+            result.status, "complete_with_gaps",
+            "{:?}",
+            result.last_error
+        );
+        assert!(
+            notices.iter().any(|notice| notice.contains("검토를 생략")),
+            "{notices:?}"
+        );
+    }
+}
+
+/// Switches the run to another model, as a settings change during a run
+/// does, while the request with this index runs.
+struct SwitchModel {
+    inner: Arc<Paced>,
+    at: usize,
+    requests: Mutex<usize>,
+    switch: Mutex<Option<(mpsc::Sender<mnemoarc::agent::RunCommand>, Config)>>,
+}
+
+#[async_trait]
+impl LlmClient for SwitchModel {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &Config,
+        cancel: CancellationToken,
+        tx: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let index = {
+            let mut requests = self.requests.lock().unwrap();
+            *requests += 1;
+            *requests
+        };
+        if index == self.at
+            && let Some((commands, next)) = self.switch.lock().unwrap().take()
+        {
+            commands
+                .try_send(mnemoarc::agent::RunCommand::Configure(Box::new(next)))
+                .unwrap();
+        }
+        self.inner.complete(request, config, cancel, tx).await
+    }
+}
+
+async fn run_switching(
+    s: Session,
+    steps: Vec<(std::time::Duration, Completion)>,
+    at: usize,
+) -> (Session, Vec<Value>, Vec<usize>) {
+    let mut next = s.config.clone();
+    next.model = "gpt-4o-mini".into();
+    let (commands, receiver) = mpsc::channel(4);
+    let paced = Arc::new(Paced {
+        steps: Mutex::new(steps),
+        guidance: Mutex::new(vec![]),
+        output_tokens: Mutex::new(vec![]),
+    });
+    let client = Arc::new(SwitchModel {
+        inner: paced.clone(),
+        at,
+        requests: Mutex::new(0),
+        switch: Mutex::new(Some((commands, next))),
+    });
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = mnemoarc::agent::run_session_controlled(
+        s,
+        Arc::new(support::document_review::Client(client)),
+        CancellationToken::new(),
+        tx,
+        receiver,
+    )
+    .await;
+    drain.await.unwrap();
+    let guidance = paced.guidance.lock().unwrap().clone();
+    let output_tokens = paced.output_tokens.lock().unwrap().clone();
+    (result, guidance, output_tokens)
+}
+
+#[tokio::test]
+async fn a_model_switched_mid_run_learns_its_own_pace() {
+    // The first model's 2.5 s requests would start closing at once (as in
+    // a_slow_model_closes_early...); the model that replaced it has shown
+    // no pace yet, so the ratio reserve alone decides.
+    let (dir, mut s, _) = fixture();
+    s.config.source_document_review = false;
+    s.config.completion_review_enabled = false;
+    s.config.run_timeout_secs = 6;
+    s.config.verification_reserve_ratio = 0.9;
+    s.config.writing_reserve_ratio = s.config.writing_reserve_ratio.max(0.95);
+    std::fs::write(dir.path().join("a.js"), "export const a = 1;\n").unwrap();
+    let steps = vec![
+        (
+            std::time::Duration::from_millis(2500),
+            call("a", "file_read", json!({"path":"a.js"})),
+        ),
+        (std::time::Duration::ZERO, text("Saved out.md.")),
+    ];
+    let (result, guidance, _) = run_switching(s, steps, 1).await;
+    assert_eq!(result.config.model, "gpt-4o-mini");
+    assert!(guidance[1]["closing"].is_null(), "{}", guidance[1]);
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+}
+
+#[tokio::test]
+async fn a_model_switched_mid_run_starts_review_pages_with_the_short_allowance() {
+    // The first model needed the full review allowance; the next one has
+    // not shown that need, so its first page attempt is bounded again.
+    let (_dir, mut s, _) = fixture();
+    s.config.completion_review_enabled = false;
+    let doc = (1..=150)
+        .map(|i| format!("Claim {i}. main.js:1-6\n"))
+        .collect::<String>();
+    let hash = s.last_document_write.as_ref().unwrap().1.clone();
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","expected_hash":hash,"text":doc}),
+    )
+    .unwrap();
+    let cut = Completion {
+        length_limited: true,
+        ..Default::default()
+    };
+    let none = std::time::Duration::ZERO;
+    let mut steps = vec![
+        (none, text("Saved out.md.")),
+        (none, cut),
+        (none, text(r#"{"issues":[]}"#)),
+    ];
+    steps.extend((0..6).map(|_| (none, text(r#"{"issues":[]}"#))));
+    // The switch arrives while the successful retry runs; the review then
+    // restarts for the new model's layout.
+    let (result, _, output_tokens) = run_switching(s, steps, 3).await;
+    assert_eq!(result.config.model, "gpt-4o-mini");
+    assert_eq!(output_tokens[1], 4096, "{output_tokens:?}");
+    assert_eq!(output_tokens[2], 8000, "{output_tokens:?}");
+    assert_eq!(output_tokens[3], 4096, "{output_tokens:?}");
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+}

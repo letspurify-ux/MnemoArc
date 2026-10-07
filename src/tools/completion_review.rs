@@ -820,6 +820,28 @@ pub fn request(s: &mut Session) -> Result<Value> {
 }
 
 const MAX_REPORTED_PROBLEMS: usize = 8;
+const MAX_REASON_CHARS: usize = 300;
+const MAX_ACTION_CHARS: usize = 160;
+const MAX_EVIDENCE_IDS: usize = 8;
+
+/// A field cut to its limit, marked with an ellipsis.
+fn clip(text: &str, limit: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= limit {
+        return text.into();
+    }
+    let mut clipped: String = text.chars().take(limit - 1).collect();
+    clipped.push('…');
+    clipped
+}
+
+/// The final answer that started the current or last review. When the
+/// review is abandoned, this answer is accepted as unchecked rather than
+/// asked for again.
+pub fn held_answer(s: &Session) -> Option<String> {
+    let draft = &s.completion_review.draft;
+    (!draft.is_empty()).then(|| draft.clone())
+}
 
 /// "none", "n/a", "-" and the like in a met check's next_action.
 fn placeholder_action(action: &str) -> bool {
@@ -879,21 +901,9 @@ fn check_problems(checks: &[Check], expected: &[&str], evidence: &BTreeSet<&str>
                 )
             ));
         }
-        let reason = check.reason.trim().chars().count();
-        if reason == 0 {
+        if check.reason.trim().is_empty() {
             problems.push(format!(
                 "{at}: reason is empty; give the specific observed reason"
-            ));
-        } else if check.reason.chars().count() > 300 {
-            problems.push(format!(
-                "{at}: reason has {} characters; at most 300",
-                check.reason.chars().count()
-            ));
-        }
-        if check.evidence.len() > 8 {
-            problems.push(format!(
-                "{at}: {} evidence IDs; at most 8",
-                check.evidence.len()
             ));
         }
         let unknown: Vec<_> = check
@@ -928,15 +938,10 @@ fn check_problems(checks: &[Check], expected: &[&str], evidence: &BTreeSet<&str>
                 }
             }
             "unmet" | "unverified" => {
-                let action = check.next_action.trim().chars().count();
-                if action == 0 {
+                if check.next_action.trim().is_empty() {
                     problems.push(format!(
-                        "{at}: {} needs one concrete next_action (at most 160 characters)",
+                        "{at}: {} needs one concrete next_action (at most {MAX_ACTION_CHARS} characters)",
                         check.status
-                    ));
-                } else if action > 160 {
-                    problems.push(format!(
-                        "{at}: next_action has {action} characters; at most 160"
                     ));
                 }
             }
@@ -992,10 +997,15 @@ pub fn finish(s: &mut Session, response: &str) -> Result<Option<String>> {
         .collect();
     // A met check needs no action; providers that fill every field send a
     // placeholder such as "none", which carries nothing to execute.
+    // Length limits keep checks concise but do not make a verdict invalid:
+    // a live closing review lost its only verdict to a 441-character reason.
     for check in &mut verdict.checks {
         if check.status == "met" && placeholder_action(&check.next_action) {
             check.next_action.clear();
         }
+        check.reason = clip(&check.reason, MAX_REASON_CHARS);
+        check.next_action = clip(&check.next_action, MAX_ACTION_CHARS);
+        check.evidence.truncate(MAX_EVIDENCE_IDS);
     }
     let problems = check_problems(&verdict.checks, &expected, &evidence);
     if !problems.is_empty() {

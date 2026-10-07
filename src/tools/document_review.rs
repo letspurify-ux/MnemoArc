@@ -98,6 +98,13 @@ pub struct ReviewState {
     /// Model requests containing document_edit since the last failed review.
     /// Counts attempted edit batches once; reads and verification are excluded.
     pub repair_requests: usize,
+    /// How often page requests are halved (0-2) after a response ran out of
+    /// output even with the full allowance. A model capacity, so it outlives
+    /// stale-page resets and later reviews of the task, but not a change of
+    /// model or input budget (the layout it was learned with).
+    pub page_shrink: u8,
+    #[serde(skip)]
+    shrink_layout: Option<String>,
     /// Fingerprint of the review instructions that produced this state.
     /// A policy change also invalidates findings and partial page verdicts.
     #[serde(skip)]
@@ -134,6 +141,8 @@ impl ReviewState {
             released_id_log: old.released_id_log,
             unavailable_failure: old.unavailable_failure,
             policy_hash: old.policy_hash,
+            page_shrink: old.page_shrink,
+            shrink_layout: old.shrink_layout,
             ..Default::default()
         };
     }
@@ -256,6 +265,8 @@ pub(crate) fn refresh_policy(s: &mut Session) {
         output_tokens: state.output_tokens,
         unavailable_failure: state.unavailable_failure.take(),
         policy_hash: Some(policy_hash().to_owned()),
+        page_shrink: state.page_shrink,
+        shrink_layout: state.shrink_layout.take(),
         ..Default::default()
     };
 }
@@ -676,6 +687,22 @@ pub fn defer_for_repair(s: &mut Session) {
 }
 
 const MAX_REVIEW_RESTARTS: usize = 8;
+/// Document lines per review page before halving.
+const PAGE_LINES: usize = 100;
+const MAX_PAGE_SHRINK: u8 = 2;
+
+/// Halve later page requests after a response ran out of output with the
+/// full allowance: retrying the identical page used to fail the same way.
+/// False at the limit, or while findings are being validated.
+pub fn shrink_page(s: &mut Session) -> bool {
+    let state = &mut s.document_review;
+    if state.validating || state.page_shrink >= MAX_PAGE_SHRINK {
+        return false;
+    }
+    state.page_shrink += 1;
+    state.shrink_layout = state.target_layout.clone();
+    true
+}
 const RETRY_FEEDBACK_TOKENS: usize = 512;
 
 pub fn request(s: &mut Session) -> Result<Value> {
@@ -705,6 +732,13 @@ fn request_page(s: &mut Session) -> Result<Option<Value>> {
         .min(context::ContextManager::input_budget(&s.config))
         .saturating_sub(512);
     let layout = format!("{}:{ceiling}", s.config.model);
+    // Another model or input budget has its own output capacity.
+    if s.document_review.page_shrink > 0
+        && s.document_review.shrink_layout.as_deref() != Some(layout.as_str())
+    {
+        s.document_review.page_shrink = 0;
+        s.document_review.shrink_layout = None;
+    }
     if s.document_review.target_requirements.as_deref() != Some(requirement_hash.as_str())
         || s.document_review.target_layout.as_deref() != Some(layout.as_str())
     {
@@ -811,10 +845,11 @@ fn request_page(s: &mut Session) -> Result<Option<Value>> {
     } else {
         start_line
     };
+    let span = PAGE_LINES >> s.document_review.page_shrink;
     let mut high = if continuing_evidence {
         low
     } else {
-        (start_line + 100).min(doc_lines.len())
+        (start_line + span).min(doc_lines.len())
     };
     while low < high {
         let mid = (low + high).div_ceil(2);
@@ -842,7 +877,7 @@ fn request_page(s: &mut Session) -> Result<Option<Value>> {
         if let Some(boundary) = documentation::headings(&doc)
             .iter()
             .map(|heading| heading.line - 1)
-            .filter(|&line| line >= start_line + 20 && line <= next_document_offset)
+            .filter(|&line| line >= start_line + (span / 5).max(5) && line <= next_document_offset)
             .max()
         {
             next_document_offset = boundary;
@@ -1068,6 +1103,11 @@ fn request_page(s: &mut Session) -> Result<Option<Value>> {
         next += 1;
     }
     drop(loaded_source);
+    // A smaller page keeps the chunk boundaries and takes fewer chunks.
+    let fitted = next - start;
+    let kept = (fitted >> state.page_shrink).max(1).min(fitted);
+    evidence.truncate(kept);
+    next = start + kept;
     if next == start && start < ordered.len() {
         bail!(
             "document_review_budget: one evidence chunk cannot fit alongside the document; narrow citations or split the document"

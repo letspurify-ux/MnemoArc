@@ -1211,6 +1211,7 @@ fn a_rejected_page_names_every_failing_check_and_condition() {
     bad["checks"][0]["evidence"] = json!(["E999"]);
     bad["checks"][1]["status"] = json!("unmet");
     bad["checks"][1]["next_action"] = json!("");
+    // An over-long reason is clipped, not a problem of its own.
     bad["checks"][1]["reason"] = json!("x".repeat(301));
     let error = review::finish(&mut s, &bad.to_string())
         .unwrap_err()
@@ -1225,18 +1226,15 @@ fn a_rejected_page_names_every_failing_check_and_condition() {
             ids[0]
         ),
         format!(
-            r#"checks[1] (id "{}"): reason has 301 characters; at most 300"#,
-            ids[1]
-        ),
-        format!(
             r#"checks[1] (id "{}"): unmet needs one concrete next_action"#,
             ids[1]
         ),
     ] {
         assert!(error.contains(&part), "{part}\n{error}");
     }
+    assert!(!error.contains("characters; at most"), "{error}");
     assert!(
-        error.starts_with("completion_review_invalid: 4 problem(s)"),
+        error.starts_with("completion_review_invalid: 3 problem(s)"),
         "{error}"
     );
     // Missing and unexpected criteria are named by ID.
@@ -1347,4 +1345,32 @@ fn a_rejection_stays_the_repair_target_until_the_next_review() {
     assert_eq!(finish(&mut s, true).as_deref(), Some("Done"));
     assert!(!review::repair_open(&s));
     assert!(review::prior_rejection(&s).is_none());
+}
+
+#[test]
+fn over_long_check_fields_are_clipped_instead_of_rejected() {
+    // Live run 2026-10-07: the single closing completion review was lost
+    // because one valid R0 verdict gave a 441-character reason.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    write(&mut s, "Conclusion only\n");
+    review::begin(&mut s, "Done").unwrap();
+    let p = payload(&review::request(&mut s).unwrap());
+    let mut response: Value = serde_json::from_str(&verdict(&p, false)).unwrap();
+    let evidence = response["checks"][0]["evidence"][0].clone();
+    response["checks"][0]["reason"] = json!("근거 없음 ".repeat(90));
+    response["checks"][0]["next_action"] = json!("예시를 추가 ".repeat(40));
+    response["checks"][0]["evidence"] = json!(vec![evidence; 11]);
+    assert!(
+        review::finish(&mut s, &response.to_string())
+            .unwrap()
+            .is_none()
+    );
+    let check = &s.completion_review.checks[0];
+    assert_eq!(check.status, "unmet");
+    assert_eq!(check.reason.chars().count(), 300, "{}", check.reason);
+    assert!(check.reason.ends_with('…'));
+    assert_eq!(check.next_action.chars().count(), 160);
+    assert_eq!(check.evidence.len(), 8);
+    assert!(review::rejected_on_current_result(&s));
 }

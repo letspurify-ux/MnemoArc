@@ -2459,3 +2459,54 @@ fn a_requirement_or_scope_finding_without_a_catalog_key_names_the_keys() {
         "{error}"
     );
 }
+
+#[test]
+fn document_quotes_of_rendered_markdown_are_grounded_to_the_lines() {
+    // Live run 2026-10-07: four findings were dropped, and their ranges left
+    // unreviewed, because the reviewer quoted the rendered text: without
+    // `**`, without backticks, or with a passage's lines joined by spaces.
+    for (doc, quote, (first, last), canonical) in [
+        (
+            "# 설정\n**핵심 특징** (ui.js:2 참조):\n검색 결과가 없습니다. ui.js:1\n",
+            "핵심 특징 (ui.js:2 참조)",
+            (2, 2),
+            "**핵심 특징** (ui.js:2 참조):",
+        ),
+        (
+            "# 설정\n- `clearKey`가 있으면 키를 지웁니다. ui.js:2\n- 저장 후 창이 닫힙니다.\n",
+            "- clearKey가 있으면 키를 지웁니다. ui.js:2  - 저장 후 창이 닫힙니다.",
+            (2, 3),
+            "- `clearKey`가 있으면 키를 지웁니다. ui.js:2\n- 저장 후 창이 닫힙니다.",
+        ),
+    ] {
+        let (_dir, mut s) = fixture();
+        std::fs::write(&s.project.output, doc).unwrap();
+        review::request(&mut s).unwrap();
+        let mut issue = proposal("Check deletion timing");
+        issue["document"] = json!({"start_line":first,"end_line":last,"quote":quote});
+        submit(&mut s, vec![issue]);
+        let p = payload(review::request(&mut s).unwrap());
+        let actual = &p["candidates"][0]["document"];
+        assert_eq!(actual["start_line"], first, "{p}");
+        assert_eq!(actual["end_line"], last, "{p}");
+        assert_eq!(actual["quote"], canonical, "{p}");
+        assert_eq!(s.document_review.anchor_corrections, 1);
+    }
+}
+
+#[test]
+fn source_quotes_keep_exact_matching_where_markers_are_code() {
+    let (dir, mut s) = fixture();
+    std::fs::write(
+        dir.path().join("ui.js"),
+        "const total = base ** 2;\nfunction save() { if (clearKey) deleteKey(); }\n",
+    )
+    .unwrap();
+    review::request(&mut s).unwrap();
+    let mut issue = proposal("The total is not squared");
+    issue["sources"] = json!([{"path":"ui.js","start_line":1,"end_line":1,
+        "quote":"const total = base 2;"}]);
+    reject(&mut s, vec![issue]);
+    let error = s.last_error.clone().unwrap();
+    assert!(error.contains("quote is absent"), "{error}");
+}

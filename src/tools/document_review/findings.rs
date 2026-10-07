@@ -143,6 +143,40 @@ fn normalize(text: &str) -> String {
     text.lines().map(str::trim).collect::<Vec<_>>().join("\n")
 }
 
+/// Document text as a reviewer may quote it from rendered Markdown: `**`,
+/// `__` and backticks dropped, every whitespace run (line breaks included)
+/// one space. Single `*` and `_` stay, so identifiers keep their meaning.
+/// The map gives each output byte's offset in `text`.
+fn loose(text: &str) -> (String, Vec<usize>) {
+    let mut out = String::new();
+    let mut map = Vec::new();
+    let mut space = None;
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        if c == '`' {
+            continue;
+        }
+        if matches!(c, '*' | '_') && chars.peek().is_some_and(|&(_, next)| next == c) {
+            chars.next();
+            continue;
+        }
+        if c.is_whitespace() {
+            if !out.is_empty() && space.is_none() {
+                space = Some(at);
+            }
+            continue;
+        }
+        if let Some(at) = space.take() {
+            out.push(' ');
+            map.push(at);
+        }
+        let before = out.len();
+        out.push(c);
+        map.extend(std::iter::repeat_n(at, out.len() - before));
+    }
+    (out, map)
+}
+
 /// Whether a source line tail is only string-literal punctuation, such as the
 /// `\n\` that ends each line of a Rust or C string continuation.
 fn literal_tail(rest: &str) -> bool {
@@ -191,7 +225,12 @@ fn continuation_matches(lines: &[(&str, usize)], needle: &str) -> Vec<(usize, us
         .collect()
 }
 
-fn ground(text: &str, passage: &mut Passage, allowed: &BTreeSet<usize>) -> Result<(String, bool)> {
+fn ground(
+    text: &str,
+    passage: &mut Passage,
+    allowed: &BTreeSet<usize>,
+    markdown: bool,
+) -> Result<(String, bool)> {
     if passage.start_line == 0
         || passage.end_line < passage.start_line
         || passage.quote.trim().is_empty()
@@ -245,6 +284,32 @@ fn ground(text: &str, passage: &mut Passage, allowed: &BTreeSet<usize>) -> Resul
                 .map(|(l, (_, n))| (l, *n))
                 .collect();
             matches.extend(continuation_matches(&lines, &needle));
+        }
+    }
+    // Reviewers quote the document as rendered: a live run lost four
+    // findings, and left their ranges unreviewed, to quotes without `**`
+    // and to passages whose lines were joined with spaces. Compare without
+    // inline Markdown markers and with whitespace collapsed; the matched
+    // lines still become the canonical quote below. Source code keeps exact
+    // matching, where `**` or backticks are code.
+    if matches.is_empty() && markdown {
+        let (loose_needle, _) = loose(&passage.quote);
+        if !loose_needle.is_empty() {
+            for (text, offsets) in &blocks {
+                let (loose_text, map) = loose(text);
+                let line_at = |byte: usize| {
+                    offsets
+                        .iter()
+                        .rev()
+                        .find(|(start, _)| *start <= byte)
+                        .unwrap()
+                        .1
+                };
+                for (offset, _) in loose_text.match_indices(&loose_needle) {
+                    let end = offset + loose_needle.len() - 1;
+                    matches.push((line_at(map[offset]), line_at(map[end])));
+                }
+            }
         }
     }
     let hinted: Vec<_> = matches
@@ -846,7 +911,7 @@ fn collect_one(
     }
     let document_context = if let Some(p) = &mut proposal.document {
         let allowed = (state.document_offset + 1..=state.next_document_offset).collect();
-        let (context, corrected) = ground(doc, p, &allowed).map_err(|e| {
+        let (context, corrected) = ground(doc, p, &allowed, true).map_err(|e| {
             anyhow::anyhow!("document_review_invalid: issues[{issue_index}].document: {e}")
         })?;
         corrections += usize::from(corrected);
@@ -862,7 +927,7 @@ fn collect_one(
             // Another passage of this document, for example the other side of
             // a contradiction; it may lie outside the reviewed page.
             let allowed = (1..=doc.lines().count()).collect();
-            let (surrounding, corrected) = ground(doc, &mut source.passage, &allowed)
+            let (surrounding, corrected) = ground(doc, &mut source.passage, &allowed, true)
                 .map_err(|e| {
                     anyhow::anyhow!(
                         "document_review_invalid: issues[{issue_index}].sources[{source_index}] document: {e}"
@@ -902,8 +967,13 @@ fn collect_one(
         let source_text = read_text(&source_path)?;
         let allowed = observed.keys().copied().collect();
         let hinted_range = source.passage.start_line..=source.passage.end_line;
-        let (surrounding,corrected)=ground(&source_text,&mut source.passage,&allowed)
-            .map_err(|e|anyhow::anyhow!("document_review_invalid: issues[{issue_index}].sources[{source_index}] {}: {e}",source.path))?;
+        let (surrounding, corrected) = ground(&source_text, &mut source.passage, &allowed, false)
+            .map_err(|e| {
+            anyhow::anyhow!(
+                "document_review_invalid: issues[{issue_index}].sources[{source_index}] {}: {e}",
+                source.path
+            )
+        })?;
         corrections += usize::from(corrected);
         // Quote normalization locates the anchor, not the complete proof.
         // Preserve original bounded chunks covering the anchor and any
