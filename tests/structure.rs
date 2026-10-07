@@ -58,6 +58,32 @@ fn rust_structure_tracks_impl_methods_multiline_signatures_and_exact_body() {
 }
 
 #[test]
+fn a_whole_next_cursor_sent_as_the_cursor_continues_the_outline() {
+    // A live model sent a next_cursor object as the cursor string. The
+    // object carries the outline's path and filters, which the call omitted.
+    let (dir, mut s) = setup();
+    let source: String = (0..40)
+        .map(|i| format!("fn target_{i:03}() {{}}\n"))
+        .collect();
+    std::fs::write(dir.path().join("many.rs"), source).unwrap();
+    let call = mnemoarc::llm::ToolCall {
+        id: "outline".into(),
+        name: "code_outline".into(),
+        arguments: json!({"path":"many.rs","query":"target","limit":10}).to_string(),
+    };
+    let raw = tools::run_call(&mut s, &call);
+    let page = tools::limit_result(&mut s, &call, raw, 4000);
+    let next = page["next_cursor"].clone();
+    assert_eq!(next["tool"], "code_outline", "{page}");
+    let mut args = next.clone();
+    args.as_object_mut().unwrap().remove("tool");
+    let expected = run(&mut s, "code_outline", args);
+    let wrapped = run(&mut s, "code_outline", json!({"cursor":next.to_string()}));
+    assert_eq!(wrapped["symbols"], expected["symbols"]);
+    assert_ne!(wrapped["symbols"][0], page["data"]["symbols"][0]);
+}
+
+#[test]
 fn unknown_symbol_means_current_hash_but_no_matching_symbol_id() {
     let (dir, mut s) = setup();
     std::fs::write(dir.path().join("a.rs"), "fn real() {}\n").unwrap();

@@ -1219,6 +1219,51 @@ fn drop_filled_delete_text(object: &mut serde_json::Map<String, Value>) {
     }
 }
 
+/// A next_cursor object is the continuation call itself, for example
+/// {"tool":"file_read","cursor":"R2"}. A live model sent the whole object as
+/// the cursor string and the read failed as an invalid cursor. When cursor
+/// holds such an object for this tool (as JSON text or as an object), take
+/// its cursor and the arguments the call left out or sent blank. No cursor a
+/// tool issues is JSON text, so a real cursor never matches.
+fn unwrap_continuation_cursor(name: &str, args: &mut Value) {
+    let Some(fields) = args.as_object_mut() else {
+        return;
+    };
+    let continuation = match fields.get("cursor") {
+        Some(Value::String(text)) if text.trim_start().starts_with('{') => {
+            serde_json::from_str::<Value>(text.trim()).ok()
+        }
+        Some(object @ Value::Object(_)) => Some(object.clone()),
+        _ => None,
+    };
+    let Some(Value::Object(mut continuation)) = continuation else {
+        return;
+    };
+    let names_this_tool = match continuation.remove("tool") {
+        Some(tool) => tool == name,
+        None => continuation.contains_key("cursor"),
+    };
+    let Some(spec) = ToolRegistry::specs().into_iter().find(|t| t.name == name) else {
+        return;
+    };
+    if !names_this_tool {
+        return;
+    }
+    fields.remove("cursor");
+    for (key, value) in continuation {
+        let accepted = spec.parameters["properties"]
+            .as_object()
+            .is_some_and(|properties| properties.contains_key(&key));
+        if accepted
+            && fields
+                .get(&key)
+                .is_none_or(|current| current.is_null() || current == "")
+        {
+            fields.insert(key, value);
+        }
+    }
+}
+
 fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Result<()> {
     fn rename(
         object: &mut serde_json::Map<String, Value>,
@@ -1333,6 +1378,20 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
         "document_audit" => {
             if let Some(object) = args.as_object_mut() {
                 rename(object, "max_issues", "limit", "")?;
+                // The audit always reads the configured output. A live model
+                // named that output in path and was refused as an unknown
+                // argument; any other path is still refused.
+                let names_output = object
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| {
+                        path.is_empty()
+                            || output_path(&s.project)
+                                .is_ok_and(|output| documentation::names_output(s, path, &output))
+                    });
+                if names_output {
+                    object.remove("path");
+                }
             }
         }
         // Shared-schema placeholders: search does not use a history id or
@@ -4036,6 +4095,7 @@ fn execute_repaired(
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value> {
     normalize_integer_arguments(name, &mut args);
+    unwrap_continuation_cursor(name, &mut args);
     normalize_argument_aliases(s, name, &mut args)?;
     if name == "source_search"
         && args["query"]

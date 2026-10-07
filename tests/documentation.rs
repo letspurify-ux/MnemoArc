@@ -649,6 +649,65 @@ fn the_output_file_name_alone_names_the_output() {
 }
 
 #[test]
+fn an_audit_given_the_output_path_audits_the_output() {
+    // A live model named the configured output in document_audit's path and
+    // was refused as an unknown argument.
+    let (dir, mut s) = source_setup();
+    let outside = tempfile::tempdir().unwrap();
+    s.project.output = outside.path().join("generated.md");
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\nText.\n"}),
+    );
+    let output = s.project.output.display().to_string();
+    // The same file through a symlinked directory (/var is /private/var on
+    // macOS) counts too.
+    let real = s
+        .project
+        .output
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    for path in [output.as_str(), real.as_str(), "generated.md", ""] {
+        let audit = run(&mut s, "document_audit", json!({"path":path}));
+        assert_eq!(audit["structural_ok"], true, "{path}: {audit}");
+    }
+    // Another path is still not something the audit reads.
+    std::fs::write(dir.path().join("other.md"), "# Other\n").unwrap();
+    let error = tools::execute(&mut s, "document_audit", json!({"path":"other.md"}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("unknown_argument"), "{error}");
+}
+
+#[test]
+fn inspecting_the_output_by_path_before_the_first_write_reports_it_missing() {
+    // A live model named the configured output's path before writing it and
+    // got file_not_found, while a call without a path reports exists:false.
+    let (dir, mut s) = setup();
+    let outside = tempfile::tempdir().unwrap();
+    s.project.output = outside.path().join("generated.md");
+    let output = s.project.output.display().to_string();
+    for path in [output.as_str(), "generated.md"] {
+        let inspected = run(&mut s, "document_inspect", json!({"path":path}));
+        assert_eq!(inspected["exists"], false, "{path}: {inspected}");
+    }
+    // An output inside the project, named relative to its root.
+    s.project.output = dir.path().join("docs/manual.md");
+    let inspected = run(&mut s, "document_inspect", json!({"path":"docs/manual.md"}));
+    assert_eq!(inspected["exists"], false, "{inspected}");
+    // Any other missing path is still an error.
+    assert!(
+        tools::execute(&mut s, "document_inspect", json!({"path":"missing.md"}))
+            .unwrap_err()
+            .to_string()
+            .contains("file_not_found")
+    );
+}
+
+#[test]
 fn out_of_range_read_is_empty_and_cannot_supply_verification_evidence() {
     let (dir, mut s) = setup();
     std::fs::write(dir.path().join("main.rs"), "\nfn main() {}\n").unwrap();
@@ -2785,17 +2844,24 @@ fn reading_the_output_before_it_exists_says_to_create_it() {
     let (_dir, mut s) = setup();
     // The live shape: reads and an audit of the output before any write.
     let output = s.project.output.display().to_string();
-    for (tool, args) in [
-        ("file_read", json!({"path":output,"max_lines":10})),
-        ("document_inspect", json!({"path":output})),
-    ] {
-        let error = tools::execute(&mut s, tool, args).unwrap_err().to_string();
-        assert!(error.starts_with("file_not_found"), "{tool}: {error}");
-        assert!(
-            error.contains("The configured output does not exist yet"),
-            "{tool}: {error}"
-        );
-    }
+    let error = tools::execute(&mut s, "file_read", json!({"path":output,"max_lines":10}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("file_not_found"), "{error}");
+    assert!(
+        error.contains("The configured output does not exist yet"),
+        "{error}"
+    );
+    // document_inspect reports the missing output as a call without a path
+    // does, with the same advice.
+    let inspected = run(&mut s, "document_inspect", json!({"path":output}));
+    assert_eq!(inspected["exists"], false, "{inspected}");
+    assert!(
+        inspected["guidance"]
+            .as_str()
+            .is_some_and(|text| text.contains("document_edit action=create")),
+        "{inspected}"
+    );
     let error = tools::execute(&mut s, "document_audit", json!({}))
         .unwrap_err()
         .to_string();

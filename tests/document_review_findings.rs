@@ -575,6 +575,45 @@ fn a_last_try_drops_only_the_issue_with_an_unproven_label() {
 }
 
 #[test]
+fn a_reply_with_raw_control_characters_is_judged_issue_by_issue() {
+    // Live run 2026-10-07: on its last try a reviewer wrapped a quoted label
+    // in ANSI color codes. Strict JSON rejected the whole reply, and the page
+    // went unreviewed.
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    let mut colored = proposal("Wrong empty-result message");
+    colored["document"] = json!({"start_line":3,"end_line":3,
+        "quote":"\u{1b}[32m검색 결과가 없습니다.\u{1b}[0m"});
+    colored["sources"] = json!([{"path":"ui.js","start_line":1,"end_line":1,
+        "quote":"const message = '검색 결과가 없습니다.';"}]);
+    let mut tabbed = proposal("Other defect");
+    tabbed["correction"] = json!("저장할 때\t삭제된다고 설명하세요.");
+    // Serialized JSON escapes control characters; send them raw, as the
+    // reviewer did.
+    let body = json!({"issues":[tabbed, colored]})
+        .to_string()
+        .replace("\\u001b", "\u{1b}")
+        .replace("\\t", "\t");
+    assert!(serde_json::from_str::<Value>(&body).is_err());
+    review::finish_last_try(&mut s, &body).unwrap();
+    assert!(s.document_review.skip_log.is_empty());
+    assert!(
+        s.document_review.issue_drop_log.is_empty(),
+        "{:?}",
+        s.document_review.issue_drop_log
+    );
+    validate(
+        &mut s,
+        vec![decision("F1", "confirmed"), decision("F2", "confirmed")],
+    );
+    let findings = &s.document_review.findings;
+    assert_eq!(findings.len(), 2);
+    let colored = findings[1].proposal.document.as_ref().unwrap();
+    assert_eq!(colored.start_line, 3);
+    assert!(!colored.quote.contains('\u{1b}'), "{}", colored.quote);
+}
+
+#[test]
 fn missing_or_unknown_validation_cannot_approve_or_partially_commit() {
     for decisions in [
         vec![],

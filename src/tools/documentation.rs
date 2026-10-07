@@ -353,6 +353,28 @@ impl HeadingIndex {
     }
 }
 
+/// Whether a path argument names the configured output: its own path, that
+/// path relative to project.root, or its bare file name when no project file
+/// has that name (read_path's rule for an output outside the root). An
+/// existing output also matches through symlinks, such as /var and
+/// /private/var.
+pub(super) fn names_output(s: &Session, path: &str, output: &Path) -> bool {
+    let given = Path::new(path);
+    // Joining an absolute path yields that path.
+    let candidate = s.project.root.join(given);
+    candidate == output
+        || s.project
+            .root
+            .canonicalize()
+            .is_ok_and(|root| root.join(given) == output)
+        || (given.components().count() == 1
+            && !candidate.exists()
+            && output.file_name() == Some(given.as_os_str()))
+        || output
+            .canonicalize()
+            .is_ok_and(|real| candidate.canonicalize().is_ok_and(|named| named == real))
+}
+
 pub(super) fn resolve_heading(doc: &str, requested: &str) -> Result<Heading> {
     HeadingIndex::new(doc).resolve(requested).cloned()
 }
@@ -365,13 +387,21 @@ pub(super) fn execute(
 ) -> Result<Value> {
     match name {
         "document_inspect" => {
-            let path = if let Some(path) = args["path"].as_str() {
-                read_path(&s.project, path)?
-            } else {
-                output_path(&s.project)?
+            let output = output_path(&s.project);
+            let path = match (args["path"].as_str(), &output) {
+                // Before the first write the configured output has nothing
+                // to resolve. Named by its path, it is reported missing as a
+                // call without a path is, not as file_not_found (a live model
+                // asked for it that way first).
+                (Some(path), Ok(output)) if !output.exists() && names_output(s, path, output) => {
+                    output.clone()
+                }
+                (Some(path), _) => read_path(&s.project, path)?,
+                (None, _) => output?,
             };
             if !path.exists() {
-                return Ok(json!({"exists":false,"path":path,"total_lines":0}));
+                return Ok(json!({"exists":false,"path":path,"total_lines":0,
+                    "guidance":"Nothing has been written to the configured output yet. Create it with document_edit action=create (or document_edit_batch) before reading or auditing it."}));
             }
             let doc = read_text(&path)?;
             let digest = hash(doc.as_bytes());

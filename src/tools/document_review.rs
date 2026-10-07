@@ -1170,7 +1170,14 @@ pub(crate) fn parse_reply<T: serde::de::DeserializeOwned>(
     field: &str,
     code: &str,
 ) -> Result<T> {
-    let value: Value = serde_json::from_str(body).map_err(|e| anyhow::anyhow!("{code}: {e}"))?;
+    let value: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        // Only a reply strict JSON rejects is repaired, and only if the
+        // repair parses; otherwise the strict error names the fault.
+        Err(error) => escape_string_controls(body)
+            .and_then(|repaired| serde_json::from_str(&repaired).ok())
+            .ok_or_else(|| anyhow::anyhow!("{code}: {error}"))?,
+    };
     let value = match value {
         Value::Array(items) => json!({ field: items }),
         // Reviewers echo request keys (requirement_catalog) beside the
@@ -1191,6 +1198,63 @@ struct Verdict {
     // Parse each proposal independently so a malformed sibling cannot erase
     // a candidate whose quotes and evidence can still be checked exactly.
     issues: Vec<Value>,
+}
+
+/// Strict JSON forbids raw control characters inside strings. Reviewers put
+/// raw newlines and tabs into quotes, and a live reviewer wrapped quoted
+/// labels in ANSI color codes; the whole reply was rejected, and on its last
+/// try the page went unreviewed. Escape such characters inside strings and
+/// drop ANSI escape sequences, so each quote is judged on its own: one that
+/// is not in the document fails alone. None when there is nothing to repair.
+fn escape_string_controls(body: &str) -> Option<String> {
+    let mut repaired = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    let (mut in_string, mut escaped, mut changed) = (false, false, false);
+    while let Some(c) = chars.next() {
+        if !in_string || escaped {
+            in_string |= c == '"' && !escaped;
+            escaped = false;
+            repaired.push(c);
+            continue;
+        }
+        match c {
+            '\\' => {
+                escaped = true;
+                repaired.push(c);
+            }
+            '"' => {
+                in_string = false;
+                repaired.push(c);
+            }
+            '\u{1b}' => {
+                changed = true;
+                // A CSI sequence such as ESC[32m: parameter bytes, then one
+                // ASCII letter. Anything else ends it unconsumed.
+                if chars.next_if_eq(&'[').is_some() {
+                    while chars.next_if(|next| ('0'..='?').contains(next)).is_some() {}
+                    chars.next_if(char::is_ascii_alphabetic);
+                }
+            }
+            '\n' => {
+                changed = true;
+                repaired.push_str("\\n");
+            }
+            '\r' => {
+                changed = true;
+                repaired.push_str("\\r");
+            }
+            '\t' => {
+                changed = true;
+                repaired.push_str("\\t");
+            }
+            c if u32::from(c) < 0x20 => {
+                changed = true;
+                repaired.push_str(&format!("\\u{:04x}", u32::from(c)));
+            }
+            c => repaired.push(c),
+        }
+    }
+    changed.then_some(repaired)
 }
 
 pub fn finish(s: &mut Session, text: &str) -> Result<()> {
@@ -1626,6 +1690,36 @@ mod tests {
             Value::Null,
         );
         assert!(retained - s.document_review.retained_bytes() >= context.to_string().len() - 4);
+    }
+
+    #[test]
+    fn replies_with_raw_control_characters_in_strings_are_repaired() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Reply {
+            issues: Vec<Value>,
+        }
+        // A live reviewer wrapped quoted labels in ANSI color codes; raw
+        // newlines and tabs inside strings are the common case.
+        let body = "{\"issues\":[{\"quote\":\"\u{1b}[32m작업 중\u{1b}[0m\",\"problem\":\"one\ntwo\tthree\u{7}\"}]}";
+        let reply: Reply = parse_reply(body, "issues", "document_review_invalid").unwrap();
+        assert_eq!(reply.issues[0]["quote"], "작업 중");
+        assert_eq!(reply.issues[0]["problem"], "one\ntwo\tthree\u{7}");
+        // Valid JSON is parsed as it is: escapes and the newlines of pretty
+        // printing between tokens stay what they were.
+        let pretty = "{\n  \"issues\": [\n    {\"quote\": \"a\\nb \\u001b[0m\"}\n  ]\n}";
+        assert!(escape_string_controls(pretty).is_none());
+        let reply: Reply = parse_reply(pretty, "issues", "document_review_invalid").unwrap();
+        assert_eq!(reply.issues[0]["quote"], "a\nb \u{1b}[0m");
+        // A reply that is broken otherwise keeps the strict parser's error.
+        let error = parse_reply::<Reply>(
+            "{\"issues\":[{\"quote\":\"a\nb\"}",
+            "issues",
+            "document_review_invalid",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.starts_with("document_review_invalid: "), "{error}");
+        assert!(error.contains("control character"), "{error}");
     }
 
     #[test]

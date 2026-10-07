@@ -523,9 +523,11 @@ fn observed_state_and_path_errors_have_actionable_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     s.project.output = dir.path().parent().unwrap().join("external-summary.md");
+    // document_inspect reports a missing output as exists:false; a read of
+    // it is the path error.
     let call = ToolCall {
         id: "path".into(),
-        name: "document_inspect".into(),
+        name: "file_read".into(),
         arguments: json!({"path":"external-summary.md"}).to_string(),
     };
     let result = tools::run_call(&mut s, &call);

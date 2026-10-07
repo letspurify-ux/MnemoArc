@@ -1300,6 +1300,43 @@ fn file_cursors_reject_mixed_ranges_changed_files_and_other_sessions() {
 }
 
 #[test]
+fn a_whole_next_cursor_sent_as_the_cursor_continues_the_read() {
+    // A live model sent the whole next_cursor object as the cursor string
+    // and the read failed as an invalid cursor.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("pages.md"),
+        "긴 문서와 정확한 위치😀\n".repeat(200),
+    )
+    .unwrap();
+    let mut s = session(dir.path());
+    s.config.result_tokens = 1000;
+    let call = mnemoarc::llm::ToolCall {
+        id: "initial".into(),
+        name: "file_read".into(),
+        arguments: json!({"path":"pages.md","max_lines":200}).to_string(),
+    };
+    let result = tools::run_call(&mut s, &call);
+    let next = result["next_cursor"].clone();
+    let cursor = next["cursor"].as_str().unwrap().to_owned();
+    let expected = tools::execute(&mut s, "file_read", json!({"cursor":cursor})).unwrap();
+    // As JSON text and as an object.
+    for wrapped in [json!(next.to_string()), next.clone()] {
+        let continued = tools::execute(&mut s, "file_read", json!({"cursor":wrapped})).unwrap();
+        assert_eq!(continued["read_offset"], expected["read_offset"]);
+        assert_eq!(continued["content"], expected["content"]);
+    }
+    // Another tool's continuation is not this read's cursor.
+    let other = json!({"tool":"code_outline","path":"pages.md","cursor":cursor}).to_string();
+    assert!(
+        tools::execute(&mut s, "file_read", json!({"cursor":other}))
+            .unwrap_err()
+            .to_string()
+            .contains("invalid_file_cursor")
+    );
+}
+
+#[test]
 fn a_cursor_dropped_for_a_start_line_is_reported_with_its_continuation() {
     // A provider that fills every field sent its cursor with a placeholder
     // start_line 1: line 1 came back with no sign that the cursor was not
