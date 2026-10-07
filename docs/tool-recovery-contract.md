@@ -139,7 +139,7 @@ flowchart TD
 - 경로: `path_outside_project`, `path_excluded`, `file_parent_not_directory`는 요청 경로, 실제 위치, 프로젝트 루트를 적는다.
 - `document_edit_batch` 실패는 `failed_edits`(index, action, code)와 `execution: rejected_without_changes`를 구조화해 돌려준다. 오래된 섹션 해시와 잘못된 old_text를 구별할 수 있다.
 - DB 메시지는 필드를 앞에 둔다(`return_type is required for mode=function`, `sql must begin with SELECT or WITH for mode=query`). 따라서 필드 진단이 붙는다. `database_query_timeout`에는 조치를 적는다.
-- `task_plan list`를 끝 너머로 넘기면 `notice`로 알린다.
+- `task_plan list`를 끝 너머로 넘기면 `notice`로 알린다. `list`에 실제 변경을 담은 `operations`가 오면 적용하지 않았다는 점과 `action "apply"`·현재 `expected_revision`으로 다시 보내라는 안내를 `notices`로 돌려준다. 그 연산이 쓰는 내용 필드(insert·split의 `texts`, update의 `text`, complete의 `result`, remove·reopen의 `reason`, move의 `before`)가 `x`·빈 값 같은 채움값인 연산은 실제 항목 ID가 들어 있어도 조용히 넘어간다. 그런 경우까지 안내하면 `complete T1`을 결과 `x`로 적용하라고 부추길 수 있다(라이브 실행에서 실제 수정이 담긴 `list` 호출이 아무 안내 없이 버려졌다).
 
 ### 라이브 실행에서 확인한 5건 보완 (2026-10-06)
 
@@ -175,7 +175,7 @@ ling-3.0-flash 라이브 실행(`complete_with_gaps`)의 처리 로그에서 확
 라이브 실행(ling-3.0-flash, llm_agent UI 매뉴얼)에서 확인한 3건도 보완했다.
 
 - 문서를 저장했지만 인용한 범위를 읽지 않았으면 최종 답변이 거절된다. 저장 결과의 `citation_check.unread_citations`, `document_audit`의 `unread_citation`, `run_guidance.document_readiness`가 읽어야 할 범위와 `file_read` 호출 방법을 알린다. 이전의 조사 항목 등록 안내(`unregistered_document`)는 조사 도구와 함께 제거했다(2026-10-06).
-- 모든 선택 인자를 빈 값으로 채우는 공급자(gpt-6-luna)를 위해 읽기 전용 도구의 빈 문자열을 "보내지 않음"으로 처리하는 범위를 넓혔다. `document_inspect`의 `section:""`는 목차 조회가 되고, `code_outline`·`symbol_search`·`symbol_relations`·`symbol_read`의 `cursor`·`path`·`path_glob` 빈 값은 버린다(필수 인자는 유지). 심볼 도구의 `query:""`는 "정확히 빈 이름" 필터라 그대로 둔다. `source_search`에서 `query`가 `queries`에 이미 들어 있으면(정규식이 아닐 때) `query`를 버리고, 값이 다르면 두 값과 둘을 합친 `queries` 호출을 오류에 적는다. 라이브 실행에서 이 세 경우가 호출 35건 중 9건을 같은 호출의 반복 실패로 만들었다(2026-10-07).
+- 모든 선택 인자를 빈 값으로 채우는 공급자(gpt-6-luna)를 위해 읽기 전용 도구의 빈 문자열을 "보내지 않음"으로 처리하는 범위를 넓혔다. `document_inspect`의 `section:""`는 목차 조회가 되고, `code_outline`·`symbol_search`·`symbol_relations`·`symbol_read`의 `cursor`·`path`·`path_glob`·`pattern`(`path_glob`의 옛 별칭) 빈 값은 버린다(필수 인자는 유지). `symbol_search`에 `path_glob`과 `pattern:""`가 함께 오면 두 필터의 충돌로 거절되던 문제도 이것으로 없앴다. 심볼 도구의 `query:""`는 "정확히 빈 이름" 필터라 그대로 둔다. `source_search`에서 `query`가 `queries`에 이미 들어 있으면(정규식이 아닐 때) `query`를 버리고, 값이 다르면 두 값과 둘을 합친 `queries` 호출을 오류에 적는다. 라이브 실행에서 이 세 경우가 호출 35건 중 9건을 같은 호출의 반복 실패로 만들었다(2026-10-07).
 - `path`와 `path_glob`을 함께 보내면 둘을 합친 하나의 `path_glob`(예: `src/backend/**/*.css`)을 알려 준다. `path`가 파일이면 `path_glob`을 빼라고 안내한다. `file_list`, `source_search`, `symbol_search`에 적용된다. 디렉터리 이름은 glob 특수문자를 이스케이프한다.
 - 없는 도구 이름은 지금 제공되는 도구 중 의도했을 도구를 제안하고(`read` → `file_read`, `tool_plan` → `task_plan`), `data.did_you_mean`과 복구 도구 목록 맨 앞에 넣는다. 호출 표기가 섞인 이름은 앞부분 식별자로 찾는다. `run_guidance`는 도구가 아니라 요청에 포함된 상태라고 알린다.
 - 완료 리뷰 응답이 형식에 맞지 않으면 실패한 check마다 순서·기준 ID와 어긴 조건을 모두 알린다. 조건은 상태값(비슷한 값 제안 포함), 이유 길이, 근거 ID(공급된 ID 예시 포함), met의 근거·next_action, unmet/unverified의 next_action, 누락·중복·다른 페이지의 기준이다. 전에는 조건 10개를 한 문장으로 묶어 알려 라이브 실행에서 다섯 번 연속 실패했다. met check의 `none`, `n/a`, `-`, `없음` 같은 자리채움 next_action은 비운다.

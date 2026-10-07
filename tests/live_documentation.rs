@@ -270,6 +270,12 @@ fn report_diagnostics(result: &Session, audit: &Value) -> Value {
         tools::completion_review::CurrentVerdict::Approved => "approved",
         tools::completion_review::CurrentVerdict::Rejected(_) => "rejected_current",
         tools::completion_review::CurrentVerdict::Unavailable => "unavailable_current",
+        // An earlier version was rejected and nothing has been reviewed since.
+        tools::completion_review::CurrentVerdict::Unreviewed
+            if tools::completion_review::prior_rejection(result).is_some() =>
+        {
+            "unreviewed_after_rejection"
+        }
         tools::completion_review::CurrentVerdict::Unreviewed => "unreviewed",
     };
     json!({

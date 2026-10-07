@@ -630,13 +630,72 @@ fn operation_hint(detail: &str, operation: &Value, allowed: &[&str]) -> String {
     String::new()
 }
 
+/// A value a schema-filling provider sends for a field it does not use.
+fn filler(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => matches!(text.trim(), "" | "x" | "X" | "..." | "…" | "string"),
+        Value::Array(items) => items.iter().all(filler),
+        _ => false,
+    }
+}
+
+/// Operations that name an actual change. Some providers fill every field
+/// of the shared operation schema with "x" on each list call, often with
+/// the current item's real id; those carry nothing to apply and need no
+/// notice, which could prompt applying a completion with an "x" result.
+fn intended_operations(value: &Value) -> bool {
+    let decoded;
+    let value = match value.as_str() {
+        Some(text) => match serde_json::from_str(text) {
+            Ok(parsed) => {
+                decoded = parsed;
+                &decoded
+            }
+            Err(_) => return !filler(value),
+        },
+        None => value,
+    };
+    // Only the content the operation itself uses: a provider can copy a real
+    // item id into any filled field, such as before of an update.
+    let names_change = |item: &Value| {
+        let fields: &[&str] = match item["op"].as_str() {
+            Some("insert" | "split") => &["texts"],
+            Some("update") => &["text"],
+            Some("move") => &["before"],
+            Some("complete") => &["result"],
+            Some("remove" | "reopen") => &["reason"],
+            _ => &["texts", "text", "result", "reason", "before"],
+        };
+        fields
+            .iter()
+            .any(|key| item.get(*key).is_some_and(|value| !filler(value)))
+    };
+    match value {
+        Value::Array(items) => items.iter().any(names_change),
+        Value::Object(_) => names_change(value),
+        _ => false,
+    }
+}
+
 pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
     if args["action"] == "list" {
-        return Ok(view(
+        let page = view(
             &s.task,
             n(args, "offset", 0),
             n(args, "limit", DEFAULT_PAGE),
-        ));
+        );
+        // A live run sent a real update with action=list; it was dropped
+        // without a word and the model had to guess why nothing changed.
+        let notices = if intended_operations(&args["operations"]) {
+            vec![format!(
+                "action list only reads the plan, so these operations were not applied and the plan is still at revision {}; to make the change, send the operations with action \"apply\" and expected_revision {}",
+                s.task.plan_revision, s.task.plan_revision
+            )]
+        } else {
+            vec![]
+        };
+        return Ok(with_notices(page, notices));
     }
     let expected_revision = args["expected_revision"].as_u64();
     if expected_revision != Some(s.task.plan_revision) {

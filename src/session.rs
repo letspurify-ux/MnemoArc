@@ -345,6 +345,14 @@ pub struct ProgressRecovery {
     pub finalization_attempts: usize,
     pub best_document_section_count: usize,
     pub best_document_content_lines: usize,
+    /// Document-review progress banked from review cycles closed by an edit
+    /// after an approval (see document_review::progress).
+    pub review_credit: usize,
+    /// Credit of the current review cycle's first review, which is no
+    /// progress by itself. The first cycle of a task counts from zero.
+    pub review_cycle_base: usize,
+    /// A new review cycle waits for its first review to set that base.
+    pub review_cycle_unbased: bool,
     pub seen_artifact_versions: VecDeque<String>,
     pub seen_artifact_paths: VecDeque<String>,
     pub seen_navigation_results: VecDeque<String>,

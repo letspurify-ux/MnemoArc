@@ -1695,4 +1695,13 @@ fn blank_symbol_cursors_and_paths_start_from_the_beginning() {
     )
     .unwrap();
     assert!(found.to_string().contains("helper"), "{found}");
+    // A live run scoped the search with path_glob and filled the legacy
+    // pattern alias with "": that is no second filter.
+    let scoped = tools::execute(
+        &mut s,
+        "symbol_search",
+        json!({"query":"helper","path_glob":"a.rs","pattern":"","cursor":"","limit":30,"path":"","match":"exact","case_sensitive":true,"kind":"function","container":"","max_depth":2}),
+    )
+    .unwrap();
+    assert!(scoped.to_string().contains("helper"), "{scoped}");
 }

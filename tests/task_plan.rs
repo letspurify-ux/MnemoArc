@@ -1432,3 +1432,59 @@ fn an_update_carrying_a_result_says_the_item_is_still_unfinished() {
     assert_eq!(result["applied"], true, "{result}");
     assert!(result["notices"].is_null(), "{result}");
 }
+
+#[test]
+fn list_with_a_real_operation_says_it_was_not_applied() {
+    // Live run 2026-10-07: action=list carried an update with real text and
+    // returned only the plan page; nine other list calls carried "x" filler.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(
+        &mut s,
+        json!([{"op":"insert","texts":["Check the UI entry point","Write the manual"]}]),
+    );
+    let before = json!(s.task);
+    let list = |s: &mut Session, operations: Value| {
+        tools::execute(
+            s,
+            "task_plan",
+            json!({"action":"list","offset":0,"limit":10,"expected_revision":1,"operations":operations}),
+        )
+        .unwrap()
+    };
+    let result = list(
+        &mut s,
+        json!([{"op":"update","texts":["x"],"before":"x","id":"T1","text":"Check the UI entry route and list its screens","result":"x","reason":"x"}]),
+    );
+    assert_eq!(json!(s.task), before, "list never changes the plan");
+    assert_eq!(result["revision"], 1, "{result}");
+    let notice = result["notices"][0].as_str().unwrap();
+    assert!(notice.contains("were not applied"), "{notice}");
+    assert!(
+        notice.contains(r#"action "apply" and expected_revision 1"#),
+        "{notice}"
+    );
+    // Operations sent as JSON text name the change just the same.
+    let result = list(
+        &mut s,
+        json!(json!([{"op":"move","id":"T2","before":"T1"}]).to_string()),
+    );
+    assert!(result["notices"][0].is_string(), "{result}");
+    // Schema filler is not an intended change and stays silent, even with
+    // the current item's real id: a notice could prompt completing T1 with
+    // the result "x".
+    for filler in [
+        json!([{"op":"update","texts":["x"],"before":"x","id":"x","text":"x","result":"x","reason":"x"}]),
+        json!([{"op":"complete","texts":["x"],"before":"x","id":"T1","text":"x","result":"x","reason":"x"}]),
+        // A real id in a field this operation does not use is filler too.
+        json!([{"op":"update","texts":["x"],"before":"T2","id":"T1","text":"x","result":"x","reason":"x"}]),
+        json!([{"op":"complete","texts":[""],"before":"","id":"","text":"","result":"","reason":""}]),
+        json!([]),
+        Value::Null,
+    ] {
+        let result = list(&mut s, filler.clone());
+        assert!(result["notices"].is_null(), "{filler}: {result}");
+        assert_eq!(result["revision"], 1, "{result}");
+    }
+    assert_eq!(json!(s.task), before);
+}

@@ -2527,6 +2527,7 @@ fn persist_document_edit(
     if s.document_review.approved_hash.is_some() {
         // A later edit starts a new review cycle. An earlier approval's zero
         // issues must not make the first new finding look like a stalled review.
+        document_review::close_cycle(s);
         s.document_review.stalled_attempts = 0;
         s.document_review.best_issue_count = None;
         s.document_review.last_reviewed_section_count = 0;
@@ -2851,7 +2852,9 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
                 // An empty query is an exact empty-name filter for the
                 // symbol tools, so only their navigation tokens are dropped.
                 // A live run sent code_outline cursor:"" and document_inspect
-                // section:"" and repeated each rejected call.
+                // section:"" and repeated each rejected call; another sent
+                // symbol_search path_glob with pattern:"" (its legacy alias),
+                // which was rejected as two conflicting filters.
                 let blank_navigation_option = value.as_str() == Some("")
                     && match name {
                         "file_list" | "source_search" | "file_read" => matches!(
@@ -2863,7 +2866,7 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
                             "path" | "path_glob" | "pattern" | "cursor" | "query" | "section"
                         ),
                         "code_outline" | "symbol_search" | "symbol_relations" | "symbol_read" => {
-                            matches!(key.as_str(), "path" | "path_glob" | "cursor")
+                            matches!(key.as_str(), "path" | "path_glob" | "pattern" | "cursor")
                         }
                         _ => false,
                     };

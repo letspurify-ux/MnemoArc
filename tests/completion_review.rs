@@ -1275,3 +1275,76 @@ fn a_rejected_page_names_every_failing_check_and_condition() {
         s.completion_review.checks
     );
 }
+
+#[test]
+fn a_rejection_stays_the_repair_target_until_the_next_review() {
+    // Live run 2026-10-07: the first repair read after a rejection changed
+    // the reviewed version, so guidance dropped the unmet checks and the run
+    // spent 30 rounds on bookkeeping before the next final answer.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    std::fs::write(dir.path().join("notes.txt"), "Example: shown\n").unwrap();
+    write(&mut s, "Conclusion only\n");
+    s.task.unresolved = vec!["The example source was not read".into()];
+    assert_eq!(review::begin(&mut s, "Done").unwrap(), Gate::Review);
+    assert!(finish(&mut s, false).is_none());
+    assert!(review::rejected_on_current_result(&s));
+    assert!(review::repair_open(&s));
+    assert!(review::prior_rejection(&s).is_none(), "a current verdict");
+    let guidance = review::guidance(&s);
+    assert_eq!(guidance["remaining"], 4, "{guidance}");
+    assert!(guidance["last_review"].is_null(), "{guidance}");
+
+    // Reading evidence changes the reviewed version, not the open repair.
+    let read = ToolCall {
+        id: "read".into(),
+        name: "file_read".into(),
+        arguments: json!({"path":"notes.txt"}).to_string(),
+    };
+    let result = tools::run_call(&mut s, &read);
+    assert_eq!(result["status"], "ok", "{result}");
+    review::observe(&mut s, &read, &result);
+    assert!(!review::rejected_on_current_result(&s));
+    assert!(review::repair_open(&s));
+    assert!(review::reviewed_files_unchanged(&s));
+    let guidance = review::guidance(&s);
+    assert_eq!(guidance["checks"], json!([]), "no verdict on this version");
+    let last = &guidance["last_review"];
+    assert_eq!(last["result_changed"], true, "{guidance}");
+    assert_eq!(last["remaining"], 4, "{guidance}");
+    assert_eq!(last["checks"][0]["id"], "R0");
+    assert_eq!(
+        last["checks"][0]["next_action"],
+        "Add the requested example to result.txt"
+    );
+    assert!(last["note"].as_str().unwrap().contains("repair targets"));
+    // A review switched off since then asks for no repair.
+    s.config.completion_review_enabled = false;
+    assert!(!review::repair_open(&s));
+    assert!(review::guidance(&s)["last_review"].is_null());
+    s.config.completion_review_enabled = true;
+
+    // Clearing the unresolved list settles only the runtime's own check.
+    s.task.unresolved.clear();
+    let prior = review::prior_rejection(&s).unwrap();
+    assert_eq!(
+        prior
+            .checks
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        ["R0", "C1", "C2"]
+    );
+    // A repaired file is still the same open repair, now with changed files.
+    write(&mut s, "Conclusion\nExample: shown\n");
+    assert!(review::repair_open(&s));
+    assert!(!review::reviewed_files_unchanged(&s));
+
+    // The next review replaces it, and its approval closes it.
+    assert_eq!(review::begin(&mut s, "Done").unwrap(), Gate::Review);
+    assert!(!review::repair_open(&s));
+    assert!(review::guidance(&s)["last_review"].is_null());
+    assert_eq!(finish(&mut s, true).as_deref(), Some("Done"));
+    assert!(!review::repair_open(&s));
+    assert!(review::prior_rejection(&s).is_none());
+}

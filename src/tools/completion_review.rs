@@ -576,6 +576,87 @@ pub fn rejected_on_current_result(s: &Session) -> bool {
     matches!(current_verdict(s), CurrentVerdict::Rejected(_))
 }
 
+/// The unmet checks of the last completed review after the result changed
+/// and before any new review. They are no verdict on the current result,
+/// but they remain the open repair: a live run's first repair read hid them
+/// from guidance, and its repair reads stopped counting as progress.
+pub struct PriorRejection<'a> {
+    pub checks: Vec<&'a Check>,
+}
+
+pub fn prior_rejection(s: &Session) -> Option<PriorRejection<'_>> {
+    prior_for(s, &current_verdict(s))
+}
+
+/// Which result an open completion repair concerns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenRepair {
+    /// The current result itself was rejected.
+    Current,
+    /// An earlier version was rejected and nothing has been reviewed since.
+    Prior,
+}
+
+/// A repair is open from a rejection until the next review replaces it,
+/// whether or not repair work has changed the result since.
+pub fn open_repair(s: &Session) -> Option<OpenRepair> {
+    let verdict = current_verdict(s);
+    if matches!(verdict, CurrentVerdict::Rejected(_)) {
+        Some(OpenRepair::Current)
+    } else {
+        prior_for(s, &verdict).map(|_| OpenRepair::Prior)
+    }
+}
+
+pub fn repair_open(s: &Session) -> bool {
+    open_repair(s).is_some()
+}
+
+fn prior_for<'a>(s: &'a Session, verdict: &CurrentVerdict<'_>) -> Option<PriorRejection<'a>> {
+    let state = &s.completion_review;
+    // A review switched off since then no longer asks for its repairs.
+    if !s.config.completion_review_enabled
+        || state.pending
+        || state.reviewed_fingerprint.is_empty()
+        || !matches!(verdict, CurrentVerdict::Unreviewed)
+    {
+        return None;
+    }
+    let checks: Vec<&Check> = state
+        .checks
+        .iter()
+        .filter(|check| check.status != "met")
+        // The runtime adds this check for task_state.unresolved, which is
+        // reported from the current state; once it is empty nothing is left.
+        .filter(|check| check.id != "unresolved" || !s.task.unresolved.is_empty())
+        .collect();
+    (!checks.is_empty()).then_some(PriorRejection { checks })
+}
+
+/// Every file of the last reviewed version still has the reviewed content
+/// and nothing was written outside it, so only evidence or task records
+/// changed since that review.
+pub fn reviewed_files_unchanged(s: &Session) -> bool {
+    let Some(reviewed) = s.completion_review.payload["file_versions"].as_object() else {
+        return false;
+    };
+    let output = s
+        .last_document_write
+        .as_ref()
+        .map(|(path, _)| path.display().to_string());
+    s.completion_review
+        .written_paths
+        .iter()
+        .chain(output.as_ref())
+        .all(|path| reviewed.contains_key(path))
+        && reviewed.iter().all(|(path, digest)| {
+            let current = read_path(&s.project, path)
+                .and_then(|p| read_text(&p))
+                .map_or_else(|_| "unavailable".to_owned(), |text| hash(text.as_bytes()));
+            digest.as_str() == Some(current.as_str())
+        })
+}
+
 pub fn response_format() -> Value {
     json!({"type":"json_schema","json_schema":{"name":"completion_review","strict":true,"schema":{
         "type":"object","properties":{"checks":{"type":"array","items":{"type":"object","properties":{
@@ -1056,8 +1137,14 @@ pub fn schedule_repairs(s: &mut Session) {
             s.completion_review.repair_todos.insert(check_id, id);
         }
     }
-    s.last_error = Some("completion_review_unmet: follow completion_review.checks; execute the repair to-dos against actual results. Do not repeat plan completion or an unchanged final answer. Preserve current user requirements and explicit amendments.".into());
+    s.last_error = Some(UNMET_ERROR.into());
 }
+
+/// Model guidance while a completion repair is open. It is the session error
+/// only while the current result itself is rejected.
+pub const UNMET_ERROR: &str = "completion_review_unmet: follow completion_review.checks (completion_review.last_review.checks once the result has changed); execute the repair to-dos against actual results. Do not repeat plan completion or an unchanged final answer. Preserve current user requirements and explicit amendments.";
+
+const LAST_REVIEW_NOTE: &str = "Unmet checks from the last completion review. The result changed after that review, so they are not a verdict on the current result, but they remain the repair targets: resolve each with a concrete edit or targeted evidence, then give the final answer, which starts the next review. Plan completion or task_state changes alone resolve none of them.";
 
 /// Keep model context bounded; full checks remain available in the progress UI.
 pub fn guidance(s: &Session) -> Value {
@@ -1068,11 +1155,17 @@ pub fn guidance(s: &Session) -> Value {
         CurrentVerdict::Rejected(checks) => checks,
         _ => &[],
     };
-    json!({"required":required,"pending":state.pending,"approved":matches!(verdict,CurrentVerdict::Approved),
+    let mut value = json!({"required":required,"pending":state.pending,"approved":matches!(verdict,CurrentVerdict::Approved),
         "needs_review":required && matches!(verdict,CurrentVerdict::Unreviewed) && !state.pending,
         "stalled_reviews":state.stalled_reviews,"repair_rounds":state.repair_rounds,
         "checks":checks.iter().filter(|c| c.status != "met").take(8).collect::<Vec<_>>(),
-        "remaining":checks.iter().filter(|c| c.status != "met").count()})
+        "remaining":checks.iter().filter(|c| c.status != "met").count()});
+    if let Some(prior) = prior_for(s, &verdict) {
+        value["last_review"] = json!({"result_changed":true,
+            "checks":prior.checks.iter().take(8).collect::<Vec<_>>(),
+            "remaining":prior.checks.len(),"note":LAST_REVIEW_NOTE});
+    }
+    value
 }
 
 /// API presentation keeps usage/history counters, while making stale verdicts

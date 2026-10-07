@@ -238,10 +238,15 @@ fn policy_hash() -> &'static str {
 /// Refresh before exposing repair guidance as well as before reviewing. Old
 /// findings must not steer document edits after the instructions change.
 pub(crate) fn refresh_policy(s: &mut Session) {
-    let state = &mut s.document_review;
-    if state.policy_hash.as_deref() == Some(policy_hash()) {
+    if s.document_review.policy_hash.as_deref() == Some(policy_hash()) {
         return;
     }
+    // Findings judged under the old instructions end their cycle; keep the
+    // progress they made. A task without a review has nothing to bank.
+    if s.document_review.best_issue_count.is_some() {
+        close_cycle(s);
+    }
+    let state = &mut s.document_review;
     // Keep actual usage and scheduling; every policy-dependent verdict,
     // repair counter and continuation starts over under the new instructions.
     *state = ReviewState {
@@ -289,6 +294,37 @@ fn effective_user_request(s: &Session) -> &str {
 
 pub fn approved(s: &Session) -> bool {
     matches!(current_verdict(s), CurrentVerdict::Approved)
+}
+
+/// Credit of a review cycle: it grows as its fewest open findings shrink
+/// and peaks at an approval.
+fn cycle_credit(best_issue_count: Option<usize>) -> usize {
+    const MAX_CREDIT: usize = 12;
+    best_issue_count.map_or(0, |best| MAX_CREDIT.saturating_sub(best))
+}
+
+/// The document review's share of run progress: fewer open findings. The
+/// first cycle of a task counts its whole credit. An edit after an approval
+/// starts a new cycle at zero findings reviewed; banking the closed cycles
+/// keeps that restart from undoing their progress, and a later cycle counts
+/// only the findings it removes after its own first review, so re-approving
+/// a re-edited document is not progress by itself.
+pub fn progress(s: &Session) -> usize {
+    let recovery = &s.progress_recovery;
+    let cycle = if recovery.review_cycle_unbased {
+        0
+    } else {
+        cycle_credit(s.document_review.best_issue_count).saturating_sub(recovery.review_cycle_base)
+    };
+    recovery.review_credit + cycle
+}
+
+/// Bank the current cycle before an edit after an approval restarts it; a
+/// live run's repair edits after an approval counted as no progress at all.
+pub(crate) fn close_cycle(s: &mut Session) {
+    s.progress_recovery.review_credit = progress(s);
+    s.progress_recovery.review_cycle_base = 0;
+    s.progress_recovery.review_cycle_unbased = true;
 }
 
 /// Reuse a complete rejection only for exactly the same document, sources and
@@ -1286,6 +1322,12 @@ fn finish_review(s: &mut Session, digest: String) -> Result<()> {
                 .map_or(remaining, |best| best.min(remaining)),
         );
     }
+    // The first review of a new cycle sets its base: new findings on a
+    // re-edited document are not progress, removing them afterwards is.
+    if s.progress_recovery.review_cycle_unbased {
+        s.progress_recovery.review_cycle_base = cycle_credit(state.best_issue_count);
+        s.progress_recovery.review_cycle_unbased = false;
+    }
     state.last_reviewed_section_count = state.last_reviewed_section_count.max(sections);
     state.last_reviewed_content_lines = state.last_reviewed_content_lines.max(content_lines);
     state.findings = next_findings;
@@ -1424,7 +1466,13 @@ mod tests {
                     .starts_with("document_review_stale")
             );
             // The run loop refreshes before it can expose stale repair advice.
+            let banked = progress(&s);
             refresh_policy(&mut s);
+            assert_eq!(
+                progress(&s),
+                banked,
+                "{verdict}: progress survives the reset"
+            );
             assert!(s.document_review.issues.is_empty());
             assert!(s.document_review.findings.is_empty());
             assert!(s.document_review.reviewed_sections.is_empty());
@@ -1444,6 +1492,10 @@ mod tests {
             test_finish(&mut s, r#"{"issues":[]}"#).unwrap();
             assert!(approved(&s));
             assert_eq!(s.document_review.attempts, attempts + 1);
+            // A cycle reviewed under the old policy is banked, and the new
+            // cycle's first review is its base; without one, it counts fully.
+            let expected = if verdict == "unavailable" { 12 } else { banked };
+            assert_eq!(progress(&s), expected, "{verdict}");
         }
     }
 

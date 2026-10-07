@@ -562,6 +562,32 @@ async fn run_scripted_tools(
     (result, guidance, tools)
 }
 
+/// Also returns every session snapshot the run published.
+async fn run_scripted_snapshots(
+    s: Session,
+    steps: Vec<Completion>,
+) -> (Session, Vec<Value>, Vec<Session>) {
+    let client = Arc::new(Scripted {
+        steps: Mutex::new(steps),
+        guidance: Mutex::new(vec![]),
+        tools: Mutex::new(vec![]),
+    });
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move {
+        let mut snapshots = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::Snapshot(session) = event {
+                snapshots.push(*session);
+            }
+        }
+        snapshots
+    });
+    let result = run_session(s, client.clone(), CancellationToken::new(), tx).await;
+    let snapshots = drain.await.unwrap();
+    let guidance = client.guidance.lock().unwrap().clone();
+    (result, guidance, snapshots)
+}
+
 async fn run_scripted_notices(s: Session, steps: Vec<Completion>) -> (Session, Vec<String>) {
     let client = Arc::new(Scripted {
         steps: Mutex::new(steps),
@@ -1942,4 +1968,306 @@ async fn a_checkpoint_on_the_last_closing_request_keeps_that_request() {
         result.last_error
     );
     assert_eq!(result.status, "complete", "{:?}", result.completion_gaps);
+}
+
+#[tokio::test]
+async fn completion_repair_reads_count_until_the_next_review() {
+    use tools::completion_review as review;
+    // Live run 2026-10-07: after a completion rejection, the first repair
+    // read changed the reviewed version. completion_review_unmet vanished and
+    // later repair reads no longer counted, so the ladder reached closing.
+    let (dir, mut s, _) = fixture();
+    s.config.source_document_review = false;
+    let files = ["a.js", "b.js", "c.js"];
+    for (i, name) in files.iter().enumerate() {
+        std::fs::write(dir.path().join(name), format!("export const v{i} = {i};\n")).unwrap();
+    }
+    let verdict = json!({"checks":[{"id":"R0","status":"unverified",
+        "reason":"The exported values are not documented","evidence":[],
+        "next_action":"Read a.js, b.js and c.js and document their values"}]});
+    let mut steps = vec![
+        Completion {
+            text: "Saved out.md with the loop and history sections.".into(),
+            ..Default::default()
+        },
+        Completion {
+            text: verdict.to_string(),
+            ..Default::default()
+        },
+    ];
+    for (i, name) in files.iter().enumerate() {
+        steps.push(call(
+            &format!("read-{i}"),
+            "file_read",
+            json!({"path":name}),
+        ));
+    }
+    // Closing the repair to-do makes the run ready to answer again.
+    steps.push(call(
+        "close",
+        "task_plan",
+        json!({"action":"apply","expected_revision":1,"operations":[{"op":"complete","id":"T1","result":"Read a.js, b.js and c.js for their values"}]}),
+    ));
+    let (result, mut guidance, snapshots) = run_scripted_snapshots(s, steps).await;
+    assert_eq!(
+        result.completion_review.attempts, 1,
+        "{:?}",
+        result.last_error
+    );
+    // The session error is shown to the user: it ends with the rejection of
+    // the current result, cleared by the request after the repair changed
+    // it, instead of lasting for the whole repair.
+    let unmet = |snapshot: &Session| {
+        snapshot
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("completion_review_unmet:"))
+    };
+    let changed = snapshots
+        .iter()
+        .find(|snapshot| review::prior_rejection(snapshot).is_some())
+        .map(|snapshot| snapshot.task_rounds)
+        .expect("the repair changed the reviewed result");
+    for snapshot in snapshots.iter().filter(|snapshot| unmet(snapshot)) {
+        assert!(
+            review::rejected_on_current_result(snapshot) || snapshot.task_rounds == changed,
+            "round {}",
+            snapshot.task_rounds
+        );
+    }
+    assert!(snapshots.iter().any(|snapshot| {
+        snapshot.task_rounds > changed
+            && review::prior_rejection(snapshot).is_some()
+            && snapshot.last_error.is_none()
+    }));
+    // The last review's open checks still qualify that readiness.
+    let ready = guidance.pop().unwrap();
+    assert_eq!(ready["ready_for_final"], true, "{ready}");
+    assert!(
+        ready["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("completion_review.last_review lists 1 unmet check(s)"),
+        "{ready}"
+    );
+    // The repair error no longer contradicts that instruction.
+    assert!(ready["completion_error"].is_null(), "{ready}");
+    assert_eq!(result.last_error.as_deref(), Some("script_exhausted"));
+    // Requests after the rejection: one before and one after each read.
+    let repair = &guidance[2..];
+    assert_eq!(repair.len(), files.len() + 1, "{guidance:?}");
+    for g in repair {
+        assert!(
+            g["completion_error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("completion_review_unmet:")),
+            "{g}"
+        );
+        assert_eq!(g["phase"], "verify", "{g}");
+    }
+    // Each new source read for the repair is progress (the rejected final
+    // answer before them was not).
+    for g in &repair[1..] {
+        assert_eq!(g["progress_recovery"]["rounds_since_progress"], 0, "{g}");
+    }
+}
+
+#[tokio::test]
+async fn an_edit_after_an_approved_review_is_progress() {
+    // Live run 2026-10-07: the next edit after an approval restarted the
+    // review cycle and took back its credit, so repair edits that added a
+    // section counted as no progress until the following approval.
+    let (_dir, mut s, _) = fixture();
+    s.config.completion_review_enabled = false;
+    document_review::request(&mut s).unwrap();
+    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    assert!(document_review::approved(&s));
+    // Score only the edit: it must not schedule another review here.
+    s.config.source_document_review = false;
+    s.progress_recovery.best_document_section_count = 2;
+    s.progress_recovery.best_document_content_lines = 4;
+    let hash = s.last_document_write.as_ref().unwrap().1.clone();
+    let steps = vec![call(
+        "append",
+        "document_edit",
+        json!({"action":"append","expected_hash":hash,
+            "text":"\n# Notes\nThe loop always runs work five times. main.js:3-5\n"}),
+    )];
+    let (result, guidance) = run_scripted(s, steps).await;
+    assert_eq!(result.progress_recovery.best_document_section_count, 3);
+    assert_eq!(guidance.len(), 2, "{guidance:?}");
+    assert_eq!(
+        guidance[1]["progress_recovery"]["rounds_since_progress"], 0,
+        "{}",
+        guidance[1]
+    );
+}
+
+#[test]
+fn later_review_cycles_count_only_the_findings_they_reduce() {
+    let (_dir, mut s, _) = fixture();
+    let edit = |s: &mut Session, old: &str, new: &str| {
+        let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+        tools::execute(
+            s,
+            "document_edit",
+            json!({"action":"replace_text","expected_hash":hash,"old_text":old,"text":new}),
+        )
+        .unwrap();
+    };
+    let review = |s: &mut Session, issues: Value| {
+        document_review::request(s).unwrap();
+        support::document_review::finish(s, &json!({"issues":issues}).to_string()).unwrap();
+    };
+    // The first cycle counts in full: a finding, then its repair.
+    review(&mut s, json!(["Flow: name the loop bound"]));
+    assert_eq!(document_review::progress(&s), 11);
+    edit(&mut s, "five times.", "five times (i < 5).");
+    review(&mut s, json!([]));
+    assert!(document_review::approved(&s));
+    assert_eq!(document_review::progress(&s), 12);
+    // An edit after the approval opens a second cycle without losing it.
+    edit(&mut s, "first.", "first by normalize().");
+    assert_eq!(document_review::progress(&s), 12);
+    // New findings on the re-edited document are no progress by themselves,
+    review(
+        &mut s,
+        json!(["History: cite the helper", "Flow: name the counter"]),
+    );
+    assert_eq!(s.document_review.best_issue_count, Some(2));
+    assert_eq!(document_review::progress(&s), 12);
+    // but each one the cycle removes afterwards is.
+    edit(&mut s, "normalize().", "normalize() (main.js:2).");
+    review(&mut s, json!(["Flow: name the counter"]));
+    assert_eq!(document_review::progress(&s), 13);
+    edit(&mut s, "(i < 5)", "(counter i < 5)");
+    review(&mut s, json!([]));
+    assert_eq!(document_review::progress(&s), 14);
+    // A cycle approved at its first review adds nothing.
+    edit(&mut s, "# History", "# History handling");
+    review(&mut s, json!([]));
+    assert!(document_review::approved(&s));
+    assert_eq!(document_review::progress(&s), 14);
+}
+
+#[tokio::test]
+async fn closing_drops_the_unmet_error_of_an_earlier_version() {
+    // The unmet error says not to answer again; closing asks for the answer.
+    let (_dir, mut s, _) = fixture();
+    s.config.source_document_review = false;
+    s.config.run_tokens = 1_000_000;
+    let hash = s.last_document_write.as_ref().unwrap().1.clone();
+    let used = |input: usize, mut step: Completion| {
+        step.usage = Some(Usage {
+            input,
+            output: 10,
+            cached: None,
+        });
+        step
+    };
+    let verdict = json!({"checks":[{"id":"R0","status":"unmet",
+        "reason":"The history section does not name its helper","evidence":[],
+        "next_action":"Name the helper that normalizes history"}]});
+    let steps = vec![
+        used(
+            10_000,
+            Completion {
+                text: "Saved out.md.".into(),
+                ..Default::default()
+            },
+        ),
+        used(
+            1_000,
+            Completion {
+                text: verdict.to_string(),
+                ..Default::default()
+            },
+        ),
+        used(
+            10_000,
+            call(
+                "repair",
+                "document_edit",
+                json!({"action":"append","expected_hash":hash,
+                    "text":"\n# Helper\nHistory goes through normalize(). main.js:2-2\n"}),
+            ),
+        ),
+        // Spend into the 10% closing reserve while the repair to-do is open.
+        used(
+            880_000,
+            call("state", "task_state", json!({"action":"read"})),
+        ),
+    ];
+    let (_, guidance) = run_scripted(s, steps).await;
+    let repairing = &guidance[guidance.len() - 2];
+    assert!(repairing["closing"].is_null(), "{repairing}");
+    assert!(
+        repairing["completion_error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("completion_review_unmet:")),
+        "{repairing}"
+    );
+    let closing = guidance.last().unwrap();
+    assert_eq!(closing["closing"]["active"], true, "{closing}");
+    assert!(closing["completion_error"].is_null(), "{closing}");
+}
+
+#[tokio::test]
+async fn checkpoint_requests_carry_no_repair_message() {
+    // Cleanup requests offer maintenance tools only; the message of an open
+    // completion repair would pull the model toward work they refuse.
+    use mnemoarc::context::ContextManager;
+    use tools::completion_review as review;
+    let (dir, mut s, _) = fixture();
+    s.config.source_document_review = false;
+    std::fs::write(dir.path().join("a.js"), "export const a = 1;\n").unwrap();
+    assert_eq!(
+        review::begin(&mut s, "Saved out.md.").unwrap(),
+        review::Gate::Review
+    );
+    review::request(&mut s).unwrap();
+    review::finish(
+        &mut s,
+        &json!({"checks":[{"id":"R0","status":"unmet",
+            "reason":"The exported value is not documented","evidence":[],
+            "next_action":"Document the value exported by a.js"}]})
+        .to_string(),
+    )
+    .unwrap();
+    review::schedule_repairs(&mut s);
+    // A repair read changes the reviewed version; the repair stays open.
+    let read = ToolCall {
+        id: "read".into(),
+        name: "file_read".into(),
+        arguments: json!({"path":"a.js"}).to_string(),
+    };
+    let result = tools::run_call(&mut s, &read);
+    review::observe(&mut s, &read, &result);
+    assert!(review::prior_rejection(&s).is_some());
+    for i in 0..6 {
+        s.history.push(
+            vec![json!({"role":"user","content":format!("{i} {}", "context ".repeat(2500))})],
+            true,
+        );
+    }
+    let budget = ContextManager::input_budget(&s.config);
+    assert!(ContextManager::prepare(&mut s, budget).unwrap());
+    let id = s.checkpoint.as_ref().unwrap().id.clone();
+    let steps = vec![
+        call(
+            "ack",
+            "checkpoint_complete",
+            json!({"id":id,"progress":"Document the value exported by a.js next"}),
+        ),
+        call("state", "task_state", json!({"action":"read"})),
+    ];
+    let (_, guidance) = run_scripted(s, steps).await;
+    assert!(guidance[0]["completion_error"].is_null(), "{}", guidance[0]);
+    assert!(
+        guidance[1]["completion_error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("completion_review_unmet:")),
+        "{}",
+        guidance[1]
+    );
 }
