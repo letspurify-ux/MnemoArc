@@ -79,7 +79,7 @@ fn closing_instruction(s: &Session) -> String {
         );
     }
     format!(
-        "Closing mode: finish the requested document now from the evidence already gathered; discovery tools are withheld. 1) Write any missing requested section from gathered evidence, stating in the text when a fact is unconfirmed. 2) For a cited range reported as unread (citation_check or document_audit unread_citation), file_read that range or narrow the citation to the lines already read; qualify a claim that cannot be supported in its section instead of describing it as verified. 3) Fix review findings confirmed for the current document or completion checks with targeted edits when possible; otherwise leave them, the runtime reports them as unresolved. 4) Complete or remove remaining to-dos with actual results, then give a concise final answer. At most {remaining} requests remain; afterwards the runtime finishes the document and lists every unresolved item. Do not invent evidence."
+        "Closing mode: finish the requested document now from the evidence already gathered; discovery tools are withheld. 1) Write any missing requested section from gathered evidence, stating in the text when a fact is unconfirmed. 2) For a cited range reported as unread (citation_check or document_audit unread_citation), file_read that range or narrow the citation to the lines already read; qualify a claim that cannot be supported in its section instead of describing it as verified. If the document cites no project source at all, cite the sources of its claims as path:start-end from ranges already read. 3) Fix review findings confirmed for the current document or completion checks with targeted edits when possible; otherwise leave them, the runtime reports them as unresolved. 4) Complete or remove remaining to-dos with actual results, then give a concise final answer. At most {remaining} requests remain; afterwards the runtime finishes the document and lists every unresolved item. Do not invent evidence."
     )
 }
 
@@ -113,7 +113,14 @@ fn collect_gaps(s: &mut Session, extra: &[String]) -> Vec<String> {
                 "근거 점검 — 구조 문제 {other}건이 남아 있습니다 (document_audit)."
             ));
         }
-        if s.document_written && s.config.source_document_review && tools::citation_count(s) > 0 {
+        let cited = tools::citation_count(s) > 0;
+        if !cited {
+            gaps.push(
+                "소스 인용 — 문서에 경로:줄 형식의 소스 인용이 없어 소스와 대조하지 못했습니다."
+                    .into(),
+            );
+        }
+        if s.document_written && s.config.source_document_review && cited {
             let ranges = tools::document_review::unavailable_ranges(s);
             match tools::document_review::current_verdict(s) {
                 tools::document_review::CurrentVerdict::Approved => {}
@@ -209,6 +216,9 @@ const PLAN_CLOSEOUT_INSTRUCTION: &str = "The document is written and its cited r
 
 const REVIEW_REPAIR_RESUME_INSTRUCTION: &str = "A checkpoint cleared the context during review repair, and the document is still UNCHANGED: every finding in review_repair.unrepaired_findings is still open. A final answer now is rejected again without a new review. Edit the document for these findings first.";
 
+/// The final answer of a source document that cites no project source.
+const DOCUMENT_CITATIONS_MISSING: &str = "document_citations_missing: the saved document cites no project source as path:start-end (for example backend/src/server.js:12-30), so it cannot be checked against the source and the final answer is refused. Cite the sources next to the claims they support, from ranges you have read (file_read a range first if needed), then give the final answer.";
+
 const READY_FOR_FINAL_INSTRUCTION: &str = "Ready to finish, provided every requested section is written: the document is saved, every cited range was read, no to-do remains and no review finding is open for this document version. If a requested section is still missing, write it first. Give the concise final answer now (output path, verification scope, remaining limitations). The runtime then runs the document review and completion checks and returns any finding as a repair. Do not inspect or audit again unless you change the document.";
 
 const REVIEW_REPAIR_INSTRUCTION: &str = "Review repair: fix ALL findings in document_review.issues before the next final answer. Read any source range a finding needs, then apply the corrections with as few document edits as possible: group non-overlapping corrections in one document_edit_batch whose single expected_hash is the top-level argument (never inside edits). Operations apply in order, so never target text that an earlier operation in the same batch replaces; when corrections touch the same passage, merge them into one operation or use a separate request. Then give the final answer to start the re-review. Do not alternate single edits with document_audit or document_inspect. Fix findings in their original sections; do not add a review-notes section.";
@@ -288,6 +298,13 @@ fn ready_except_plan(s: &mut Session) -> bool {
     // Every citation must be well-formed and read. Use the same audit as
     // final acceptance, including its freshness revalidation.
     match tools::audit_document(s) {
+        // A document without citations has every cited range read trivially;
+        // its final answer is refused, so it is not ready either.
+        Ok(audit) if audit["structural_ok"] == true && tools::citation_count(s) == 0 => {
+            s.run_guidance["document_readiness"] = json!({"structural_ok":true,
+                "citations_checked":0,"error":DOCUMENT_CITATIONS_MISSING});
+            false
+        }
         Ok(audit) if audit["structural_ok"] == true => true,
         Ok(mut audit) => {
             if let Some(issues) = audit["issues"].as_array_mut() {
@@ -440,6 +457,9 @@ fn finalization_notice(error: Option<&str>) -> &'static str {
         }
         Some(error) if error.starts_with("The requested source document has not been saved") => {
             "The requested document is not saved yet; returning to write it within the remaining budget"
+        }
+        Some(error) if error.starts_with("document_citations_missing:") => {
+            "The document cites no source yet; returning to add source citations within the remaining budget"
         }
         _ => {
             "Completion checks failed; returning to pending evidence verification within the remaining budget"
@@ -2682,11 +2702,18 @@ pub async fn run_session_controlled(
                             .closing
                             .as_ref()
                             .is_some_and(|c| c.document_review_used);
-                        // A document that cites no source has nothing
-                        // to compare; the review is skipped, not failed.
-                        if s.document_written
+                        // A source document cites the sources of its claims.
+                        // Without a citation there is nothing to review: a
+                        // live run finished "complete" with no source check
+                        // and no reported gap. The final answer goes back to
+                        // work; closing accepts it and reports the omission.
+                        let cited = tools::citation_count(&s) > 0;
+                        if !cited && !accept_gaps {
+                            s.status = "partial".into();
+                            s.last_error = Some(DOCUMENT_CITATIONS_MISSING.into());
+                        } else if s.document_written
                             && s.config.source_document_review
-                            && tools::citation_count(&s) > 0
+                            && cited
                             && !tools::document_review::approved(&s)
                             && !tools::document_review::unavailable_on_current(&s)
                             && !closing_review_used

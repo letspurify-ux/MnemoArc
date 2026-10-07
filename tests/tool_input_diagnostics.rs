@@ -1645,6 +1645,77 @@ fn a_directory_path_with_a_glob_names_the_one_glob_that_means_both() {
 }
 
 #[test]
+fn a_path_naming_the_project_root_beside_a_glob_is_no_conflict() {
+    // A live model sent the root's absolute path with path_glob and was
+    // refused for conflicting filters; a glob is relative to the root.
+    let (dir, mut s) = project_session();
+    std::fs::write(dir.path().join("src/backend/style.css"), "a {}\n").unwrap();
+    let root = dir.path().display().to_string();
+    for path in [root.as_str(), ".", "./"] {
+        let result = tools::run_call(
+            &mut s,
+            &call_id(
+                "file_list",
+                json!({"path":path,"path_glob":"src/backend/*.css","mode":"paths"}),
+            ),
+        );
+        assert_eq!(
+            result["data"]["paths"],
+            json!(["src/backend/style.css"]),
+            "{path}: {result}"
+        );
+    }
+    for (name, args) in [
+        (
+            "source_search",
+            json!({"query":"fn api","path":root,"path_glob":"src/**/*.rs"}),
+        ),
+        (
+            "symbol_search",
+            json!({"query":"api","path":root,"path_glob":"src/**/*.rs"}),
+        ),
+    ] {
+        let result = tools::run_call(&mut s, &call_id(name, args));
+        assert_eq!(result["status"], "ok", "{name}: {result}");
+        assert!(
+            result.to_string().contains("src/backend/api.rs"),
+            "{name}: {result}"
+        );
+    }
+    // A subdirectory with a glob still names the one glob meaning both.
+    let result = tools::run_call(
+        &mut s,
+        &call_id("file_list", json!({"path":"src","path_glob":"*.css"})),
+    );
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("send only path_glob"),
+        "{result}"
+    );
+}
+
+#[test]
+fn a_directory_given_to_a_file_tool_names_that_tool_for_the_next_call() {
+    // A live model sent code_outline the project root twice and was told to
+    // use file_read.
+    let (dir, mut s) = project_session();
+    s.active_tools = ToolRegistry::optional_names();
+    let root = dir.path().display().to_string();
+    for tool in ["code_outline", "file_read"] {
+        let error = tools::execute(&mut s, tool, json!({"path":root}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("path_is_directory"), "{tool}: {error}");
+        assert!(
+            error.contains(&format!("then call {tool} with that file path")),
+            "{tool}: {error}"
+        );
+    }
+}
+
+#[test]
 fn an_unknown_tool_name_names_the_offered_tool_it_most_likely_meant() {
     let (_dir, mut s) = project_session();
     for (name, meant, says) in [

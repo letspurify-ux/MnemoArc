@@ -1264,7 +1264,30 @@ fn unwrap_continuation_cursor(name: &str, args: &mut Value) {
     }
 }
 
+/// Whether a path argument names the project root directory itself.
+fn names_project_root(s: &Session, path: &str) -> bool {
+    let path = path.trim();
+    matches!(path, "." | "./")
+        || s.project
+            .root
+            .canonicalize()
+            .is_ok_and(|root| read_path(&s.project, path).is_ok_and(|given| given == root))
+}
+
 fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Result<()> {
+    // A glob is relative to project.root already, so a path naming the root
+    // narrows nothing: a live model sent the root's absolute path with
+    // path_glob and was refused for conflicting filters.
+    if matches!(name, "file_list" | "source_search" | "symbol_search")
+        && let Some(fields) = args.as_object_mut()
+        && (fields.contains_key("path_glob") || fields.contains_key("pattern"))
+        && fields
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| names_project_root(s, path))
+    {
+        fields.remove("path");
+    }
     fn rename(
         object: &mut serde_json::Map<String, Value>,
         alias: &str,
@@ -3384,15 +3407,26 @@ fn directory_entries(p: &Project, directory: &Path) -> (Vec<String>, usize) {
     (entries.into_iter().take(MAX_ENTRIES).collect(), total)
 }
 
-fn directory_error(p: &Project, directory: &DirectoryPath) -> anyhow::Error {
+fn directory_error(p: &Project, directory: &DirectoryPath, tool: &str) -> anyhow::Error {
     let (entries, total) = directory_entries(p, &directory.0);
     let listing = match total.saturating_sub(entries.len()) {
         _ if entries.is_empty() => String::new(),
         0 => format!(" containing {}", entries.join(", ")),
         more => format!(" containing {} and {more} more", entries.join(", ")),
     };
+    // The next call is the same tool on one file: a live model sent
+    // code_outline the project root twice and was told to use file_read.
+    let next = match tool {
+        "code_outline" | "symbol_read" | "symbol_relations" | "document_inspect" | "file_read" => {
+            format!(
+                "{tool} reads one file: find it with file_list and path_glob (e.g. backend/**), then call {tool} with that file path"
+            )
+        }
+        _ => "use file_list with path_glob (e.g. backend/**), then file_read with a file path"
+            .to_owned(),
+    };
     anyhow::anyhow!(
-        "path_is_directory: {} is a directory{listing}; use file_list with path_glob (e.g. backend/**), then file_read with a file path",
+        "path_is_directory: {} is a directory{listing}; {next}",
         directory.0.display()
     )
 }
@@ -4028,7 +4062,7 @@ pub fn execute_cancellable(
     let shape = arguments::shape(&args);
     let result = execute_arguments(s, name, args, cancel).map_err(|error| {
         match error.downcast_ref::<DirectoryPath>() {
-            Some(directory) => directory_error(&s.project, directory),
+            Some(directory) => directory_error(&s.project, directory, name),
             None => arguments::annotate_runtime(error, name, &shape),
         }
     });

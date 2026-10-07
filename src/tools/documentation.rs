@@ -552,7 +552,7 @@ pub(super) fn execute(
                 }
             }
             if checked == 0 {
-                issues.push(json!({"kind":"no_machine_readable_citations","guidance":"Use relative/path.ext:start-end. Other citation formats require manual review."}));
+                issues.push(json!({"kind":"no_machine_readable_citations","guidance":NO_CITATIONS_GUIDANCE}));
             }
             // The output's own absolute path in its text is a run report
             // (where it was written), which belongs in the final answer.
@@ -1056,6 +1056,11 @@ fn project_file_for_link(s: &Session, target: &str) -> Option<String> {
         })
 }
 
+/// A source document without a machine-readable citation can be neither
+/// reviewed nor finished: say so on every save and audit, not only when the
+/// final answer is refused.
+const NO_CITATIONS_GUIDANCE: &str = "The document cites no project source as relative/path.ext:start-end. Cite the sources of its claims next to them (for example backend/src/server.js:12-30); the final answer is refused while the document cites no project source. Other citation formats require manual review.";
+
 pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Value> {
     let (checked, issues) = citation_issues(s, output, doc)?;
     // The write already succeeded: a failed unread check is reported beside
@@ -1064,11 +1069,13 @@ pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Va
         Ok(unread) => (unread, None),
         Err(error) => (vec![], Some(error.to_string())),
     };
-    Ok(
-        json!({"citations_checked":checked,"issue_count":issues.len(),"issues":issues.iter().take(8).collect::<Vec<_>>(),
+    let mut check = json!({"citations_checked":checked,"issue_count":issues.len(),"issues":issues.iter().take(8).collect::<Vec<_>>(),
         "unread_citation_count":unread.len(),"unread_citations":unread.iter().take(8).collect::<Vec<_>>(),
         "unread_citation_error":unread_error,
         "semantic_verified":false,
-        "guidance":"Fix citation or code-fence issues in the next section edit. unread_citations are cited ranges never delivered to you as complete lines of the current file version: file_read each listed range, or narrow the citation to the lines you read, before the final answer; the final audit treats them as unresolved evidence."}),
-    )
+        "guidance":"Fix citation or code-fence issues in the next section edit. unread_citations are cited ranges never delivered to you as complete lines of the current file version: file_read each listed range, or narrow the citation to the lines you read, before the final answer; the final audit treats them as unresolved evidence."});
+    if checked == 0 {
+        check["citations_required"] = json!(NO_CITATIONS_GUIDANCE);
+    }
+    Ok(check)
 }

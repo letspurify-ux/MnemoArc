@@ -16,7 +16,9 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-const RESULT: &str = "# Report\nThe requested document is saved and verified.\n";
+// A finished source document cites a source it read: the fixture reads
+// report.rs, and a document without citations is not accepted as final.
+const RESULT: &str = "# Report\nThe requested document is saved and verified. report.rs:1\n";
 
 #[tokio::test]
 async fn unread_citations_receive_repair_guidance_instead_of_final_or_plan_closeout() {
@@ -119,6 +121,8 @@ fn fixture() -> (tempfile::TempDir, Session) {
     );
     s.add_user("Write report.md with the requested document.".into());
     s.select_workflow("source_document").unwrap();
+    std::fs::write(dir.path().join("report.rs"), "fn report() {}\n").unwrap();
+    tools::execute(&mut s, "file_read", json!({"path":"report.rs"})).unwrap();
     tools::execute(
         &mut s,
         "document_edit",

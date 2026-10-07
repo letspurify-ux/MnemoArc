@@ -264,10 +264,13 @@ async fn closing_reserve_finishes_steady_work_before_the_budget() {
     s.add_user("Write out.md".into());
     s.active_tools = ToolRegistry::optional_names();
     s.select_workflow("source_document").unwrap();
+    // A finished source document cites a source it read.
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    tools::execute(&mut s, "file_read", json!({"path":"main.rs"})).unwrap();
     tools::execute(
         &mut s,
         "document_edit",
-        json!({"action":"create","text":"# Result\nIntro.\n"}),
+        json!({"action":"create","text":"# Result\nIntro. main.rs:1\n"}),
     )
     .unwrap();
     let client = Arc::new(BudgetWriter {
@@ -2746,4 +2749,167 @@ async fn a_model_switched_mid_run_starts_review_pages_with_the_short_allowance()
     assert_eq!(output_tokens[2], 8000, "{output_tokens:?}");
     assert_eq!(output_tokens[3], 4096, "{output_tokens:?}");
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
+}
+
+/// Gives the final answer until the run refuses an uncited document; then
+/// cites the read loop lines when `cite` is set.
+struct CiteOnRefusal {
+    calls: Mutex<usize>,
+    cite: bool,
+}
+
+#[async_trait]
+impl LlmClient for CiteOnRefusal {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        if let Some(review) = support::acceptance(&request) {
+            return Ok(review);
+        }
+        let state: Value = serde_json::from_str(
+            request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )?;
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        assert!(*calls < 20, "the run did not finish");
+        let refused = state["run_guidance"]["completion_error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("document_citations_missing:"));
+        if refused && self.cite {
+            return Ok(Completion {
+                calls: vec![ToolCall {
+                    id: format!("cite-{calls}"),
+                    name: "document_edit".into(),
+                    arguments: json!({"action":"replace_text","old_text":"A loop runs work.",
+                        "text":"A loop runs work. main.js:3-5"})
+                    .to_string(),
+                }],
+                ..Default::default()
+            });
+        }
+        Ok(Completion {
+            text: "Saved out.md.".into(),
+            ..Default::default()
+        })
+    }
+}
+
+/// The fixture with its document rewritten to cite nothing; the review is
+/// off because the citation requirement applies to source documents either way.
+fn uncited_fixture() -> (tempfile::TempDir, Session) {
+    let (dir, mut s, _) = fixture();
+    s.config.source_document_review = false;
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","expected_hash":hash,"text":"# Flow\nA loop runs work.\n"}),
+    )
+    .unwrap();
+    (dir, s)
+}
+
+async fn run_citing(s: Session, client: Arc<CiteOnRefusal>) -> Session {
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(s, client, CancellationToken::new(), tx).await;
+    drain.await.unwrap();
+    result
+}
+
+#[tokio::test]
+async fn a_source_document_finishes_only_once_it_cites_a_source() {
+    // Live run 2026-10-07: a document that cited nothing skipped the source
+    // review and finished "complete" with no reported gap.
+    let (_dir, s) = uncited_fixture();
+    let client = Arc::new(CiteOnRefusal {
+        calls: Mutex::new(0),
+        cite: true,
+    });
+    let result = run_citing(s, client.clone()).await;
+    assert_eq!(
+        result.status, "complete",
+        "{:?} {:?}",
+        result.last_error, result.completion_gaps
+    );
+    assert!(result.completion_gaps.is_empty());
+    assert!(
+        std::fs::read_to_string(&result.project.output)
+            .unwrap()
+            .contains("main.js:3-5")
+    );
+    // Refused final, the citing edit, the accepted final.
+    assert_eq!(*client.calls.lock().unwrap(), 3);
+}
+
+#[tokio::test]
+async fn closing_accepts_an_uncited_document_and_reports_it() {
+    // A model that never cites: refused finals stall the run into closing,
+    // whose second final is accepted with the omission reported.
+    let (_dir, mut s) = uncited_fixture();
+    s.config.stall_round_limit = 2;
+    let client = Arc::new(CiteOnRefusal {
+        calls: Mutex::new(0),
+        cite: false,
+    });
+    let result = run_citing(s, client.clone()).await;
+    assert_eq!(
+        result.status, "complete_with_gaps",
+        "{:?}",
+        result.last_error
+    );
+    assert!(result.progress_recovery.closing.is_some());
+    assert!(
+        result
+            .completion_gaps
+            .iter()
+            .any(|gap| gap.starts_with("소스 인용")),
+        "{:?}",
+        result.completion_gaps
+    );
+}
+
+#[test]
+fn an_uncited_save_says_the_final_answer_needs_a_citation() {
+    let (_dir, mut s, _) = fixture();
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    let saved = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","expected_hash":hash,"text":"# Flow\nA loop runs work.\n"}),
+    )
+    .unwrap();
+    let note = saved["citation_check"]["citations_required"]
+        .as_str()
+        .unwrap();
+    assert!(note.contains("final answer is refused"), "{note}");
+    let audit = tools::execute(&mut s, "document_audit", json!({})).unwrap();
+    assert_eq!(audit["structural_ok"], true, "{audit}");
+    assert!(
+        audit["issues"][0]["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("final answer is refused"),
+        "{audit}"
+    );
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    let cited = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","expected_hash":hash,"text":"# Flow\nA loop runs work. main.js:3-5\n"}),
+    )
+    .unwrap();
+    assert!(
+        cited["citation_check"].get("citations_required").is_none(),
+        "{cited}"
+    );
 }

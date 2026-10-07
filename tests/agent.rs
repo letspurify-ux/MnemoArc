@@ -673,7 +673,7 @@ impl LlmClient for VariedReadsThenWrites {
             call(
                 "write",
                 "document_edit",
-                json!({"action":"create","text":"# Summary\nThe requested summary is saved.\n"}),
+                json!({"action":"create","text":"# Summary\nThe requested summary is saved. main.rs:3\n"}),
             )
         } else {
             assert_eq!(state["run_guidance"]["progress_recovery"]["active"], false);
@@ -697,6 +697,9 @@ async fn varied_reads_without_deliverable_progress_focus_on_writing_and_resume()
     // watermark must not send a final-answer-only fixture into a checkpoint.
     session.config.context_tokens = 96000;
     session.config.stall_round_limit = 3;
+    // The scripted client answers no document review: these runs exercise
+    // progress recovery (its summary cites main.rs only to be finishable).
+    session.config.source_document_review = false;
     session.workflow_mode = "source_document".into();
     session.task.deliverables = vec!["docs/source-summary.md".into()];
     session.active_tools.insert("document_edit".into());
@@ -722,6 +725,7 @@ async fn resumed_document_work_retains_no_progress_count() {
     std::fs::write(dir.path().join("main.rs"), "one\ntwo\nthree\n").unwrap();
     let mut session = s(dir.path());
     session.config.stall_round_limit = 3;
+    session.config.source_document_review = false;
     session.workflow_mode = "source_document".into();
     session.task.deliverables = vec!["docs/source-summary.md".into()];
     session.active_tools.insert("document_edit".into());
@@ -782,7 +786,7 @@ impl LlmClient for BudgetPhases {
                 call(
                     "draft",
                     "document_edit",
-                    json!({"action":"create","text":"# Summary\nDraft.\n"}),
+                    json!({"action":"create","text":"# Summary\nDraft. main.rs:1\n"}),
                 )
             } else {
                 call(
@@ -809,6 +813,11 @@ async fn request_budget_transitions_to_writing_then_verification() {
     // The answer workflow presents every phase as answering; budget phases
     // belong to document work.
     session.select_workflow("source_document").unwrap();
+    // The draft cites a source read before the run; the scripted client
+    // answers no document review.
+    session.config.source_document_review = false;
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    mnemoarc::tools::execute(&mut session, "file_read", json!({"path":"main.rs"})).unwrap();
     let (tx, mut rx) = mpsc::channel(128);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result = run_session(
