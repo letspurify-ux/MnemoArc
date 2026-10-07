@@ -196,6 +196,11 @@ nemotron-3.5-lightning 실행에서 확인한 2건과 진행 알림 문구도 �
 - `document_inspect`에 폴더가 오면 "`path` 없이 부르면 설정된 출력 문서(경로를 적음)를 조회하고, 다른 Markdown 파일일 때만 `path`를 주라"고 안내한다. 프로젝트 루트를 보낸 모델이 `file_list`로 파일을 찾으라는 안내를 받았다.
 - 결과물 변경이나 새 검증 없이 정체 감지 횟수만큼 요청이 이어졌을 때의 알림을 "Work is repeating …"에서 "결과물 변경이나 새 검증 없이 요청 N번이 이어져, 다음 요청부터 결과물 작성과 검증에 집중합니다"로 바꿨다. 첫 저장 전에 매 요청 새 파일을 읽는 동안에도 이 알림이 떠, 반복이 아닌데 반복이라고 표시했다.
 
+GLM(z-ai/glm-5.3-flash) 실행에서 확인한 2건도 고쳤다(2026-10-07).
+
+- `section`으로 범위를 정한 텍스트 편집(`replace_text`·`delete_text`·`insert_*_text`·`patch`)은 `expected_section_hash`를 그 섹션이 읽은 버전 그대로인지 확인하는 조건으로 받는다. `document_edit`과 `document_edit_batch` 모두 같다. 해시가 다르면 `action=section`과 같은 `section_revision_conflict`를 내고, `section` 없이 해시만 오면 확인할 섹션이 없다고 거절한다. `document_edit`이 받지 않는 인자로 거절할 때는 빠진 필드도 함께 적는다. 해시를 붙이고 `text`를 빠뜨린 호출이 해시만 지적받았다.
+- `task_plan`에 `action` 없이 `operations`가 오면 `apply`로 처리한다.
+
 
 ## 문서 검증 도구 개선 (2026-09-21)
 

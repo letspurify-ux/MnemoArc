@@ -395,6 +395,106 @@ fn partial_text_edits_insert_replace_and_delete_without_rewriting_sections() {
 }
 
 #[test]
+fn a_section_hash_beside_a_scoped_text_edit_guards_that_section() {
+    // A live model sent replace_text with section and the section_hash it
+    // had read, and was refused: only action=section took a section hash.
+    let (_dir, mut s) = setup();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n\n## Input\n\nOne line box.\n\n## Output\n\nAnswers.\n"}),
+    );
+    let section_hash = |s: &mut Session| {
+        run(s, "document_inspect", json!({"section":"## Input"}))["section_hash"].clone()
+    };
+    let read = section_hash(&mut s);
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","section":"## Input","expected_section_hash":read,"old_text":"One line box.","text":"A box that grows."}),
+    );
+    // The hash read before that edit is stale now; nothing is written.
+    let before = std::fs::read_to_string(&s.project.output).unwrap();
+    assert!(before.contains("A box that grows."), "{before}");
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","section":"## Input","expected_section_hash":read,"old_text":"A box","text":"The box"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with(
+            "section_revision_conflict: expected_section_hash is not the current hash"
+        ),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), before);
+    // Batch edits take the same guard.
+    let current = section_hash(&mut s);
+    run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":tools::hash(before.as_bytes()),"edits":[{"action":"delete_text","section":"## Input","expected_section_hash":current,"old_text":" that grows"}]}),
+    );
+    assert!(
+        std::fs::read_to_string(&s.project.output)
+            .unwrap()
+            .contains("A box.")
+    );
+    // A blank one is an unfilled placeholder; without section there is no
+    // section for a filled one to check.
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","section":"## Input","expected_section_hash":"","old_text":"A box.","text":"The box."}),
+    );
+    let current = section_hash(&mut s);
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_section_hash":current,"old_text":"The box.","text":"A box."}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains(
+            "expected_section_hash of action=replace_text checks the section that section names"
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_unaccepted_edit_field_is_reported_with_the_fields_still_missing() {
+    // The live call also lacked text; its error named only the extra field,
+    // so one retry could fix one problem.
+    let (_dir, mut s) = setup();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n\n## Input\n\nBox.\n"}),
+    );
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after","section":"## Input","old_text":"Box."}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with(
+            "invalid_action_arguments: document_edit action=insert_after does not accept old_text"
+        ),
+        "{error}"
+    );
+    assert!(
+        error.contains("text is also missing; action=insert_after needs text, section"),
+        "{error}"
+    );
+}
+
+#[test]
 fn batch_partial_text_edits_are_ordered_and_atomic() {
     let (_dir, mut s) = setup();
     let created = run(

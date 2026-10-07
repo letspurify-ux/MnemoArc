@@ -38,6 +38,29 @@ fn apply(s: &mut Session, operations: Value) -> Value {
 }
 
 #[test]
+fn operations_sent_without_an_action_are_applied() {
+    // A live model sent {"expected_revision":0,"operations":"[...]"} with no
+    // action and was refused for the missing action; only apply takes
+    // operations.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let operations = json!([{"op":"insert","texts":["App.jsx 구조 파악"]}]).to_string();
+    let result = tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"expected_revision":0,"operations":operations}),
+    )
+    .unwrap();
+    assert_eq!(result["applied"], true, "{result}");
+    assert_eq!(s.task.todos.len(), 1);
+    // Without operations nothing says which action was meant.
+    let error = tools::execute(&mut s, "task_plan", json!({"expected_revision":1}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("action"), "{error}");
+}
+
+#[test]
 fn operation_encodings_are_normalized_and_replayed_without_duplicate_items() {
     let operation = json!({"op":"insert","texts":["조사한 섹션 저장"]});
     for operations in [

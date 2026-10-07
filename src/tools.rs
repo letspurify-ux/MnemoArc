@@ -1014,13 +1014,29 @@ const DOCUMENT_EDIT_ACTIONS: &[&str] = &[
     "section",
 ];
 
+/// A section hash guards a text edit only through the section it names.
+const SECTION_HASH_WITHOUT_SECTION: &str = "checks the section that section names; add section with the heading whose section_hash it is, or drop expected_section_hash";
+
 fn document_edit_fields(action: &str) -> &'static [&'static str] {
     match action {
         "create" | "write" | "append" => &["action", "text", "expected_hash"][..],
-        "patch" | "replace_text" | "insert_before_text" | "insert_after_text" => {
-            &["action", "text", "expected_hash", "old_text", "section"][..]
-        }
-        "delete_text" => &["action", "expected_hash", "old_text", "section"][..],
+        // A section-scoped text edit may also guard its section: a live model
+        // sent replace_text the section_hash it had read and was refused.
+        "patch" | "replace_text" | "insert_before_text" | "insert_after_text" => &[
+            "action",
+            "text",
+            "expected_hash",
+            "old_text",
+            "section",
+            "expected_section_hash",
+        ][..],
+        "delete_text" => &[
+            "action",
+            "expected_hash",
+            "old_text",
+            "section",
+            "expected_section_hash",
+        ][..],
         "insert_before" | "insert_after" | "insert_first_child" | "insert_last_child" => {
             &["action", "text", "expected_hash", "section"][..]
         }
@@ -1037,13 +1053,34 @@ fn document_edit_fields(action: &str) -> &'static [&'static str] {
 
 fn validate_document_edit_arguments(args: &Value) -> Result<()> {
     let action = args["action"].as_str().unwrap_or("");
+    // Name every missing field of this action at once; a live model fixed
+    // text and then failed again on the missing old_text.
+    let needed = document_edit_needs(action);
+    let missing: Vec<&str> = needed
+        .iter()
+        .copied()
+        .filter(|key| args.get(*key).is_none())
+        .collect();
     validate_action_fields_with(
         "document_edit",
         args,
         document_edit_fields,
         DOCUMENT_EDIT_ACTIONS,
         document_action_hint,
-    )?;
+    )
+    // A live call refused for an extra field also lacked text, which the
+    // error did not say.
+    .map_err(|error| {
+        if missing.is_empty() {
+            error
+        } else {
+            anyhow::anyhow!(
+                "{error}{}; action={action} needs {}",
+                also_missing(&missing),
+                needed.join(", ")
+            )
+        }
+    })?;
     let require = |key: &str| {
         if args.get(key).is_none() {
             return Err(anyhow::anyhow!(
@@ -1075,14 +1112,6 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
         }
     };
     let require = |key: &str| require(key).map_err(also_hash);
-    // Name every missing field of this action at once; a live model fixed
-    // text and then failed again on the missing old_text.
-    let needed = document_edit_needs(action);
-    let missing: Vec<&str> = needed
-        .iter()
-        .copied()
-        .filter(|key| args.get(*key).is_none())
-        .collect();
     if let [first, rest @ ..] = missing.as_slice() {
         let whole = if action == "section" && missing.contains(&"section") {
             WHOLE_DOCUMENT_HINT
@@ -1109,6 +1138,10 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
             require("old_text")?;
             if args.get("section").is_some() {
                 require("section")?;
+            } else if args.get("expected_section_hash").is_some() {
+                return Err(also_hash(anyhow::anyhow!(
+                    "invalid_argument_value: expected_section_hash of action={action} {SECTION_HASH_WITHOUT_SECTION}"
+                )));
             }
             if matches!(action, "insert_before_text" | "insert_after_text")
                 && args["text"].as_str().is_some_and(str::is_empty)
@@ -1490,6 +1523,21 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
                 });
             }
         }
+        // Only apply takes operations: a live model sent
+        // {"expected_revision":0,"operations":"[...]"} with no action and was
+        // refused for the missing action.
+        "task_plan"
+            if args.get("action").is_none()
+                && args.get("operations").is_some_and(|operations| {
+                    !(operations.is_null()
+                        || operations
+                            .as_str()
+                            .is_some_and(|text| text.trim().is_empty())
+                        || operations.as_array().is_some_and(Vec::is_empty))
+                }) =>
+        {
+            args["action"] = json!("apply");
+        }
         // One plan operation flattened into the call, e.g.
         // {action:"complete",id,result}, means an apply with that operation.
         "task_plan"
@@ -1675,12 +1723,10 @@ fn validate_document_edit_batch_edits(args: &Value) -> Result<()> {
                 {
                     bail!("invalid_argument_value: edits[{index}].section must not be empty");
                 }
-                for key in ["expected_section_hash"] {
-                    if object.contains_key(key) {
-                        bail!(
-                            "unknown_argument: edits[{index}].{key} is not valid for action={action}"
-                        );
-                    }
+                if object.contains_key("expected_section_hash") && !object.contains_key("section") {
+                    bail!(
+                        "invalid_argument_value: edits[{index}].expected_section_hash of action={action} {SECTION_HASH_WITHOUT_SECTION}"
+                    );
                 }
                 if action == "delete_text" && object.contains_key("text") {
                     bail!(
@@ -2250,6 +2296,22 @@ fn is_anchored_text_edit(action: &str) -> bool {
     )
 }
 
+/// A section edit, and a text edit scoped to a section, may only apply to the
+/// section version its expected_section_hash names.
+fn check_section_hash(section: &str, heading: &str, sent: &str) -> Result<()> {
+    if sent == hash(section.as_bytes()) {
+        return Ok(());
+    }
+    if sent.len() != 64 || !sent.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!(
+            "section_revision_conflict: expected_section_hash {sent:?} is not a section hash (64 hex characters); copy section_hash from document_inspect of {heading:?}, not an item ID or document hash"
+        );
+    }
+    bail!(
+        "section_revision_conflict: expected_section_hash is not the current hash of {heading:?}; read that section again with document_inspect and use its section_hash"
+    );
+}
+
 fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
     let action = text(args, "action")?;
     let new = if action == "delete_text" {
@@ -2402,19 +2464,11 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             let heading = text(args, "section")?;
             let resolved = documentation::resolve_heading(old, heading)?;
             let target = &old[resolved.start..resolved.end];
-            if args["expected_section_hash"].as_str() != Some(hash(target.as_bytes()).as_str()) {
-                let sent = args["expected_section_hash"].as_str().unwrap_or("");
-                if sent.len() != 64 || !sent.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    bail!(
-                        "section_revision_conflict: expected_section_hash {sent:?} is not a section hash (64 hex characters); copy section_hash from document_inspect of {:?}, not an item ID or document hash",
-                        resolved.heading
-                    );
-                }
-                bail!(
-                    "section_revision_conflict: expected_section_hash is not the current hash of {:?}; read that section again with document_inspect and use its section_hash",
-                    resolved.heading
-                );
-            }
+            check_section_hash(
+                target,
+                &resolved.heading,
+                args["expected_section_hash"].as_str().unwrap_or(""),
+            )?;
             if new.lines().next().map(str::trim) != target.lines().next().map(str::trim) {
                 bail!("invalid_argument_value: section replacement must retain its heading");
             }
@@ -2495,6 +2549,11 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                 .and_then(Value::as_str)
                 .map(|section| documentation::resolve_heading(old, section))
                 .transpose()?;
+            if let Some(heading) = &scoped
+                && let Some(expected) = args["expected_section_hash"].as_str()
+            {
+                check_section_hash(&old[heading.start..heading.end], &heading.heading, expected)?;
+            }
             let (base, scope) = scoped.as_ref().map_or((0, old), |heading| {
                 (heading.start, &old[heading.start..heading.end])
             });
