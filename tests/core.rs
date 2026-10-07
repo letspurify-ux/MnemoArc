@@ -1300,6 +1300,68 @@ fn file_cursors_reject_mixed_ranges_changed_files_and_other_sessions() {
 }
 
 #[test]
+fn a_cursor_dropped_for_a_start_line_is_reported_with_its_continuation() {
+    // A provider that fills every field sent its cursor with a placeholder
+    // start_line 1: line 1 came back with no sign that the cursor was not
+    // continued, and the range was read again in another request.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pages.md");
+    std::fs::write(&path, "긴 문서와 정확한 위치😀\n".repeat(200)).unwrap();
+    let mut s = session(dir.path());
+    s.config.result_tokens = 1000;
+    let call = mnemoarc::llm::ToolCall {
+        id: "initial".into(),
+        name: "file_read".into(),
+        arguments: json!({"path":"pages.md","max_lines":200}).to_string(),
+    };
+    let result = tools::run_call(&mut s, &call);
+    let cursor = result["next_cursor"]["cursor"].as_str().unwrap().to_owned();
+    let next = tools::execute(&mut s, "file_read", json!({"cursor":cursor})).unwrap()["content"]
+        ["line_start"]
+        .as_u64()
+        .unwrap();
+    assert!(next > 1);
+    let placeholder = tools::execute(
+        &mut s,
+        "file_read",
+        json!({"path":"pages.md","cursor":cursor,"start_line":1,"max_lines":1,"limit":1,"force_read":false}),
+    )
+    .unwrap();
+    assert_eq!(placeholder["read_start"], 1);
+    assert_eq!(placeholder["ignored_arguments"], json!(["cursor"]));
+    let note = placeholder["ignored_note"].as_str().unwrap();
+    assert!(
+        note.contains(&format!("{cursor} continues at line {next}"))
+            && note.contains(&format!("{{\"cursor\":\"{cursor}\"}}")),
+        "{note}"
+    );
+    // A new range from the line the cursor would continue at loses nothing.
+    let from_next = tools::execute(
+        &mut s,
+        "file_read",
+        json!({"cursor":cursor,"start_line":next,"max_lines":5}),
+    )
+    .unwrap();
+    assert!(from_next.get("ignored_arguments").is_none(), "{from_next}");
+    // The cursor of a changed file cannot be continued at all.
+    std::fs::write(&path, "changed\n".repeat(20)).unwrap();
+    let changed = tools::execute(
+        &mut s,
+        "file_read",
+        json!({"cursor":cursor,"start_line":3,"max_lines":2}),
+    )
+    .unwrap();
+    assert_eq!(changed["content"]["text"], "changed\nchanged");
+    assert!(
+        changed["ignored_note"]
+            .as_str()
+            .unwrap()
+            .contains("its file changed after it was issued"),
+        "{changed}"
+    );
+}
+
+#[test]
 fn file_read_limit_alias_preserves_ranges_and_rejects_ambiguity() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("read.md"), "one\ntwo\nthree\nfour\n").unwrap();

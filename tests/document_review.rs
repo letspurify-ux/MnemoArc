@@ -2298,6 +2298,112 @@ async fn a_rejecting_review_still_returns_to_the_model() {
     assert!(client.model_calls.load(std::sync::atomic::Ordering::SeqCst) > 1);
 }
 
+/// Answers once and returns no issue for any review page. With
+/// `fail_first_page`, every response for the first document page is
+/// invalid, so that page is skipped and the review ends unavailable.
+struct PagedReview {
+    model_calls: std::sync::atomic::AtomicUsize,
+    review_calls: std::sync::atomic::AtomicUsize,
+    fail_first_page: bool,
+}
+
+#[async_trait]
+impl LlmClient for PagedReview {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        if let Some(review) = support::acceptance(&request) {
+            return Ok(review);
+        }
+        let payload: Value = request["messages"][1]["content"]
+            .as_str()
+            .and_then(|text| serde_json::from_str(text).ok())
+            .unwrap_or(Value::Null);
+        if payload["source_document_review"] == true {
+            self.review_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let text = if self.fail_first_page && payload["document_line_start"] == 1 {
+                "The page looks fine.".to_owned()
+            } else {
+                json!({"issues":[]}).to_string()
+            };
+            return Ok(Completion {
+                text,
+                ..Default::default()
+            });
+        }
+        let call = self
+            .model_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Completion {
+            text: format!("Saved out.md (answer {call})."),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_review_of_several_requests_resumes_the_final_answer_that_started_it() {
+    // A live review of two evidence pages and a finding validation lost the
+    // held answer at its first page, and the model was asked for its final
+    // answer again after the approval (3.9% of the run's input).
+    for fail_first_page in [false, true] {
+        let (_dir, mut s) = fixture();
+        // More lines than one review page holds.
+        let doc = std::iter::once("# Flow\n".to_owned())
+            .chain((1..=150).map(|i| format!("Step {i} runs work in a for loop. main.js:3-5\n")))
+            .collect::<String>();
+        let expected = s.last_document_write.as_ref().unwrap().1.clone();
+        tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"write","expected_hash":expected,"text":doc}),
+        )
+        .unwrap();
+        let client = Arc::new(PagedReview {
+            model_calls: Default::default(),
+            review_calls: Default::default(),
+            fail_first_page,
+        });
+        let result = run_repair_test(s, client.clone()).await;
+        let review_calls = client
+            .review_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(review_calls >= 2, "{review_calls} review requests");
+        if fail_first_page {
+            // Every page was answered, but the skipped one blocks approval:
+            // the review ends unreviewed, and so does the held answer.
+            assert!(document_review::unavailable_on_current(&result));
+        } else {
+            assert!(document_review::approved(&result));
+        }
+        assert!(result.completion_review.approved, "{fail_first_page}");
+        assert_eq!(
+            client.model_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "fail_first_page={fail_first_page}: {:?} {:?}",
+            result.last_error,
+            result.completion_gaps
+        );
+        let published = result
+            .history
+            .bundles
+            .iter()
+            .flat_map(|bundle| bundle.messages.iter())
+            .rev()
+            .find(|message| message["role"] == "assistant")
+            .unwrap();
+        assert!(
+            published["content"].as_str().unwrap().contains("answer 0"),
+            "{published}"
+        );
+    }
+}
+
 #[test]
 fn a_shrunk_review_page_covers_fewer_lines_and_evidence_chunks() {
     // A reasoning model ran out of its full output allowance on a page; an

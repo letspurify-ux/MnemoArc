@@ -4667,12 +4667,38 @@ fn execute_repaired(
             if ignored_page_size {
                 args.as_object_mut().unwrap().remove("max_lines");
             }
+            // read_file reads an explicit start_line as a new range and drops
+            // the cursor. A provider that fills every field sent its cursor
+            // with a placeholder start_line 1, got line 1 back with no sign
+            // that nothing was continued, and re-read the range in another
+            // request (all 4 such continuations in two live runs).
+            let dropped_cursor = args["cursor"]
+                .as_str()
+                .filter(|_| args.get("start_line").is_some())
+                .and_then(|id| Some((id.to_owned(), s.file_cursors.get(id)?.clone())));
+            let start = n(&args, "start_line", 1).max(1);
             let mut result = read_file(s, &mut args, cancel)?;
             if ignored_page_size {
                 result["ignored_arguments"] = json!(["max_lines"]);
                 result["ignored_note"] = json!(
                     "A cursor continues its original range; max_lines was ignored. Pass only the cursor to continue."
                 );
+            }
+            if let Some((id, cursor)) = dropped_cursor {
+                let note = match cursor_next_line(s, &cursor) {
+                    // The new range already starts where the cursor would.
+                    Some(next) if next == start => None,
+                    Some(next) => Some(format!(
+                        "start_line was given, so this read is a new range from line {start} and cursor {id} was not continued. {id} continues at line {next}: send only {{\"cursor\":\"{id}\"}} (no path, start_line, max_lines or limit), or read from start_line {next}."
+                    )),
+                    None => Some(format!(
+                        "start_line was given, so this read is a new range from line {start} and cursor {id} was not continued. {id} no longer applies: its file changed after it was issued."
+                    )),
+                };
+                if let Some(note) = note {
+                    result["ignored_arguments"] = json!(["cursor"]);
+                    result["ignored_note"] = json!(note);
+                }
             }
             Ok(result)
         }
@@ -4913,6 +4939,24 @@ pub(crate) fn parallel_read_history(
         next_id: history.next_id,
         pruned_through: history.pruned_through,
     }
+}
+
+/// The line a file cursor continues from, while its file is unchanged. The
+/// cursor offset counts characters of its range, as read_file does.
+fn cursor_next_line(s: &Session, cursor: &crate::session::FileCursor) -> Option<usize> {
+    let contents = read_text(&read_path(&s.project, &cursor.path).ok()?).ok()?;
+    if hash(contents.as_bytes()) != cursor.hash {
+        return None;
+    }
+    let newlines = contents
+        .split_inclusive('\n')
+        .skip(cursor.start_line.saturating_sub(1))
+        .take(cursor.max_lines)
+        .flat_map(str::chars)
+        .take(cursor.offset)
+        .filter(|c| *c == '\n')
+        .count();
+    Some(cursor.start_line + newlines)
 }
 
 /// Shared line reader for explicit file reads and Tree-sitter symbol bodies.

@@ -466,6 +466,24 @@ fn output_hash(s: &Session) -> Option<String> {
         .ok()
 }
 
+/// The final answer that started a document review, once that review has
+/// ended for the same document without findings to repair: approved, or
+/// unavailable (finished as unreviewed). One review spans several requests
+/// (document and evidence pages, finding validation), and the answer stays
+/// held while it is pending: taking it at the first page lost it, and a live
+/// run asked the model for its final answer again after the approval (3.9%
+/// of the run's input). A rejection or a changed document drops it.
+fn resume_held_final(s: &Session, held: &mut Option<(String, Option<String>)>) -> Option<String> {
+    if s.document_review.pending {
+        return None;
+    }
+    let (text, hash) = held.take()?;
+    (hash == output_hash(s)
+        && (tools::document_review::approved(s)
+            || tools::document_review::unavailable_on_current(s)))
+    .then_some(text)
+}
+
 /// Count a final answer rejected because the reviewed document was not
 /// edited. An edit changes the document hash and restarts the count.
 fn note_unrepaired_final(s: &mut Session) -> usize {
@@ -1291,9 +1309,10 @@ pub async fn run_session_controlled(
     // The model the two values above were learned with.
     let mut learned_model = s.config.model.clone();
     // The final answer that started the pending document review, with the
-    // output hash it was given for. An approval of that same document resumes
-    // it instead of asking the model to answer again: the repeated request
-    // cost a full-context round per approval (8% of a live run's input).
+    // output hash it was given for. When that review ends for the same
+    // document without findings to repair, resume_held_final resumes it
+    // instead of asking the model to answer again: the repeated request cost
+    // a full-context round per approval (8% of a live run's input).
     let mut held_final: Option<(String, Option<String>)> = None;
     // Consecutive provider outages and the requests they consumed.
     let mut provider_outages = 0usize;
@@ -2363,15 +2382,9 @@ pub async fn run_session_controlled(
                     // started it: take that answer as unreviewed rather than
                     // asking for it again, which in closing left a live run
                     // repairing until the deadline. A page skip that keeps
-                    // reviewing, or a rejection, still returns to the model.
-                    if !s.document_review.pending
-                        && tools::document_review::unavailable_on_current(&s)
-                        && held_final
-                            .as_ref()
-                            .is_some_and(|(_, hash)| *hash == output_hash(&s))
-                    {
-                        unreviewed_final = held_final.take().map(|(text, _)| text);
-                    }
+                    // reviewing keeps the answer held for the next page; a
+                    // rejection still returns to the model.
+                    unreviewed_final = resume_held_final(&s, &mut held_final);
                     if unreviewed_final.is_none() {
                         continue;
                     }
@@ -2407,13 +2420,7 @@ pub async fn run_session_controlled(
                     review_response_failures = 0;
                     note_document_review_verdict(&mut s);
                     snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
-                    let held = held_final
-                        .take()
-                        .filter(|_| {
-                            !s.document_review.pending && tools::document_review::approved(&s)
-                        })
-                        .filter(|(_, hash)| *hash == output_hash(&s));
-                    let Some((text, _)) = held else {
+                    let Some(text) = resume_held_final(&s, &mut held_final) else {
                         continue;
                     };
                     text
