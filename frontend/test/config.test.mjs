@@ -48,10 +48,11 @@ test("every public Rust setting has a UI editor", async () => {
     "utf8",
   );
   const block = code.split("pub struct Config {")[1].split("\n}")[0];
-  const keys = [...block.matchAll(/pub (\w+):/g)]
-    .map((m) => m[1])
-    // Retired settings are only read for compatibility, never edited.
-    .filter((k) => k !== "api_key" && !k.startsWith("retired_"));
+  // Runtime-only fields (serde-skipped, such as the API key) are never
+  // stored or edited; retired settings are only read for compatibility.
+  const keys = [...block.matchAll(/(#\[serde\(skip\)\]\s*)?pub (\w+):/g)]
+    .filter((m) => !m[1] && !m[2].startsWith("retired_"))
+    .map((m) => m[2]);
   assert.deepEqual([...fieldKeys, "projects"].sort(), keys.sort());
   assert.equal(new Set(fieldKeys).size, fieldKeys.length);
 });

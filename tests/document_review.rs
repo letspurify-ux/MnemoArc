@@ -131,6 +131,38 @@ fn a_review_for_non_developers_lists_the_implementation_details_found() {
 }
 
 #[test]
+fn a_review_lists_the_citations_into_test_code() {
+    // A live reviewer approved a test's loop cited as how reviews repeat.
+    let (dir, mut s) = fixture();
+    std::fs::write(
+        dir.path().join("main.test.js"),
+        "it('runs', () => run([]));\n",
+    )
+    .unwrap();
+    tools::execute(&mut s, "file_read", json!({"path":"main.test.js"})).unwrap();
+    let current = tools::hash(&std::fs::read(dir.path().join("out.md")).unwrap());
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","expected_hash":current,"text":"# Flow\nWork runs in a loop. main.js:4-5\nRuns are checked. main.test.js:1\n"}),
+    )
+    .unwrap();
+    let request = document_review::request(&mut s).unwrap();
+    assert!(
+        request["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("test_code_citations, when present")
+    );
+    let payload: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        payload["test_code_citations"],
+        json!([{"line":3,"citation":"main.test.js:1"}])
+    );
+}
+
+#[test]
 fn review_of_an_unprepared_request_does_not_use_agent_completion_checks() {
     let (_dir, mut s) = fixture();
     let request = document_review::request(&mut s).unwrap();
@@ -311,7 +343,8 @@ impl LlmClient for Reviewer {
             .is_some_and(|s| s.contains("\"source_document_review\":true"));
         let text = if review {
             assert!(request.get("tools").is_none());
-            assert!(config.output_tokens <= 4096);
+            // A timed-out review is not retried as is; it is halved or skipped.
+            assert!(!config.retry_timeouts);
             if self.issues {
                 r#"{"issues":["Flow: incorrect loop type and missing history normalization"]}"#
             } else {
@@ -1968,7 +2001,7 @@ fn longer_repairs_count_as_progress_after_a_length_finding() {
 }
 
 /// The first review response is cut by the output limit mid-JSON, as when a
-/// reasoning model spends the bounded first-attempt allowance.
+/// reasoning model spends the output allowance on reasoning.
 struct TruncatedFirstReview {
     reviews: std::sync::Mutex<Vec<(usize, Value)>>,
 }
@@ -2036,9 +2069,10 @@ async fn truncated_review_retry_names_the_output_limit_not_tools() {
     drain.await.unwrap();
     let reviews = client.reviews.lock().unwrap();
     assert!(reviews.len() >= 2, "{reviews:?} {:?}", result.last_error);
-    assert_eq!(reviews[0].0, 4096);
+    // Both requests get the full allowance; the retry, on a halved page, is
+    // told why the JSON broke off.
+    assert_eq!(reviews[0].0, 8192);
     assert_eq!(reviews[0].1, Value::Null);
-    // The retry gets the full allowance and is told why the JSON broke off.
     assert_eq!(reviews[1].0, 8192);
     let error = reviews[1].1.as_str().unwrap();
     assert!(error.starts_with("document_review_incomplete:"), "{error}");
@@ -2193,7 +2227,7 @@ fn a_skipped_page_blocks_approval_even_when_other_pages_are_clean() {
     assert!(!document_review::approved(&s));
     assert!(document_review::unavailable_on_current(&s));
     assert_eq!(document_review::unavailable_ranges(&s), [(1, first_end)]);
-    // Validation is not a page: failing it still abandons the whole review.
+    // Validation that never built a request has no candidate batch to skip.
     let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
     tools::execute(
         &mut s,

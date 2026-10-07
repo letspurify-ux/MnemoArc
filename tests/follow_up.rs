@@ -292,6 +292,65 @@ async fn questions_preserve_unfinished_work_even_on_failure_or_cancellation() {
     }
 }
 
+/// The first follow-up request times out at the provider; the second is
+/// answered or times out too.
+struct Unanswered {
+    answer_second: bool,
+    requests: std::sync::Mutex<Vec<(Value, bool)>>,
+}
+#[async_trait]
+impl LlmClient for Unanswered {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> anyhow::Result<Completion> {
+        let mut requests = self.requests.lock().unwrap();
+        requests.push((request, config.retry_timeouts));
+        if requests.len() == 1 || !self.answer_second {
+            anyhow::bail!(
+                "provider_stream_error: {{\"code\":504,\"message\":\"Upstream idle timeout exceeded\"}}"
+            );
+        }
+        Ok(Completion {
+            text: "The budget was exhausted.".into(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_unanswered_question_is_asked_once_more_with_half_the_snapshot() {
+    for answer_second in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = fixture(dir.path());
+        s.completion_gaps.push("긴 미확인 항목. ".repeat(150));
+        let before = preserved(&s);
+        s.queue_question("Why did it stop?".into()).unwrap();
+        let client = Arc::new(Unanswered {
+            answer_second,
+            requests: Default::default(),
+        });
+        let result = run(s, client.clone()).await;
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        // The client does not wait out another timeout of the same request.
+        assert!(requests.iter().all(|(_, retry)| !retry));
+        let snapshot = |request: &Value| request["messages"][1]["content"].as_str().unwrap().len();
+        assert!(snapshot(&requests[1].0) < snapshot(&requests[0].0));
+        assert_eq!(preserved(&result), before);
+        let record = result.run_history.back().unwrap();
+        let expected = if answer_second {
+            "complete"
+        } else {
+            "question_unanswered"
+        };
+        assert_eq!(record.reason, expected);
+    }
+}
+
 struct Resume;
 #[async_trait]
 impl LlmClient for Resume {

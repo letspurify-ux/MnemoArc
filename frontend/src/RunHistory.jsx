@@ -17,6 +17,8 @@ const reasons = {
   checkpoint_retry_limit: "기억 정리 재시도 한도 도달",
   context_limit: "컨텍스트 한도 초과",
   message_routing_invalid: "요청 판별 실패",
+  message_routing_unanswered: "요청 판별 응답 없음",
+  question_unanswered: "질문 답변 응답 없음",
   message_routing_context_limit: "요청과 요구사항이 컨텍스트 한도 초과",
 };
 const stages = {

@@ -2797,6 +2797,11 @@ fn persist_document_edit(
     {
         saved["audience_check"] = check;
     }
+    if s.is_document_work()
+        && let Some(check) = documentation::test_code_check(s, path, &result)
+    {
+        saved["test_code_check"] = check;
+    }
     Ok(saved)
 }
 

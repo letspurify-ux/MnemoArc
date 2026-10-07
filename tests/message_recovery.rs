@@ -24,21 +24,28 @@ enum Reply {
     Text(Completion),
     Cancel,
     WorkReached,
+    /// The provider's idle timeout cut the request off.
+    Timeout,
 }
 struct Script {
     replies: Mutex<VecDeque<Reply>>,
     requests: Mutex<Vec<Value>>,
+    retry_timeouts: Mutex<Vec<bool>>,
 }
 #[async_trait]
 impl LlmClient for Script {
     async fn complete(
         &self,
         request: Value,
-        _: &Config,
+        config: &Config,
         cancel: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> anyhow::Result<Completion> {
         self.requests.lock().unwrap().push(request);
+        self.retry_timeouts
+            .lock()
+            .unwrap()
+            .push(config.retry_timeouts);
         match self
             .replies
             .lock()
@@ -54,6 +61,9 @@ impl LlmClient for Script {
             Reply::WorkReached => {
                 anyhow::bail!("work_reached: document execution received the amended task")
             }
+            Reply::Timeout => anyhow::bail!(
+                "provider_stream_error: {{\"code\":504,\"message\":\"Upstream idle timeout exceeded\"}}"
+            ),
         }
     }
 }
@@ -67,9 +77,14 @@ fn work(goal: &str) -> Reply {
     text(json!({"intent":"work","authorization_quote":"문서를 작성해줘","changes":{"goal":goal,"completion":["첫 장만 작성"]}}).to_string())
 }
 async fn execute(s: Session, replies: Vec<Reply>) -> (Session, Vec<Value>) {
+    execute_traced(s, replies).await.0
+}
+/// Also returns whether each request let the client retry timeouts.
+async fn execute_traced(s: Session, replies: Vec<Reply>) -> ((Session, Vec<Value>), Vec<bool>) {
     let client = Arc::new(Script {
         replies: Mutex::new(replies.into()),
         requests: Mutex::new(vec![]),
+        retry_timeouts: Mutex::new(vec![]),
     });
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(128);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -81,7 +96,8 @@ async fn execute(s: Session, replies: Vec<Reply>) -> (Session, Vec<Value>) {
         result.last_error
     );
     let requests = client.requests.lock().unwrap().clone();
-    (result, requests)
+    let retry_timeouts = client.retry_timeouts.lock().unwrap().clone();
+    ((result, requests), retry_timeouts)
 }
 async fn cancelled(root: &std::path::Path) -> Session {
     std::fs::write(root.join("sample.rs"), "pub fn count() -> usize { 7 }\n").unwrap();
@@ -205,6 +221,54 @@ async fn truncated_or_tool_bearing_classifications_are_corrected_without_executi
         assert_eq!(requests.len(), 3);
         assert_eq!(s.latest_request, GOAL);
         assert_eq!(std::fs::read(&s.project.output).unwrap(), saved);
+    }
+}
+
+#[tokio::test]
+async fn an_unanswered_classification_is_asked_once_more_with_half_the_context() {
+    // As with an unanswered review page: the request is not retried as is
+    // by the client, the next one carries half the optional context, and a
+    // second request without an answer gives up.
+    for answered in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = cancelled(dir.path()).await;
+        s.history.push(
+            vec![json!({"role":"assistant","content":"긴 이전 답변. ".repeat(400)})],
+            true,
+        );
+        let before = preserved(&s);
+        s.receive_message(CHANGE.into()).unwrap();
+        let second = if answered {
+            work(GOAL)
+        } else {
+            // The output ran out on reasoning before any JSON.
+            Reply::Text(Completion {
+                length_limited: true,
+                ..Default::default()
+            })
+        };
+        let mut replies = vec![Reply::Timeout, second];
+        if answered {
+            replies.push(Reply::WorkReached);
+        }
+        let ((s, requests), retry_timeouts) = execute_traced(s, replies).await;
+        assert_eq!(retry_timeouts[..2], [false, false]);
+        let context = |request: &Value| {
+            let payload: Value =
+                serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+            payload["optional_context"].to_string().len()
+        };
+        assert!(context(&requests[1]) < context(&requests[0]));
+        if answered {
+            assert_eq!(s.latest_request, GOAL);
+        } else {
+            assert_eq!(requests.len(), 2);
+            assert_eq!(preserved(&s), before);
+            assert_eq!(
+                s.run_history.back().unwrap().reason,
+                "message_routing_unanswered"
+            );
+        }
     }
 }
 
@@ -474,6 +538,7 @@ async fn an_expired_continuation_preserves_the_task_before_work_admission() {
     let client = Arc::new(Script {
         replies: Mutex::new(VecDeque::new()),
         requests: Mutex::new(vec![]),
+        retry_timeouts: Mutex::new(vec![]),
     });
     let (tx, _rx) = mpsc::channel(1);
     tx.send(AgentEvent::Notice {

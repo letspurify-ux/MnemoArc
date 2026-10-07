@@ -245,6 +245,50 @@ fn a_saved_candidate_keeps_original_source_chunks_for_semantic_validation() {
 }
 
 #[test]
+fn an_unanswered_validation_batch_is_halved_then_skipped_alone() {
+    // Validation follows the page ladder: half the candidates, then only
+    // that batch is skipped. Failing validation used to abandon the whole
+    // review, discarding findings that were confirmed or still to validate.
+    let (_dir, mut s) = fixture();
+    review::request(&mut s).unwrap();
+    s.document_review.pending = true;
+    let mut message = proposal("Search message wording");
+    message["document"] = json!({"start_line":3,"end_line":3,"quote":"검색 결과가 없습니다."});
+    message["sources"] = json!([{"path":"ui.js","start_line":1,"end_line":1,
+        "quote":"const message = '검색 결과가 없습니다.';"}]);
+    message["correction"] = json!("검색 결과가 없을 때 표시되는 문구를 그대로 적으세요.");
+    submit(&mut s, vec![proposal("Delete timing"), message]);
+    assert!(s.document_review.validating);
+    assert_eq!(candidate_ids(&mut s), ["F1", "F2"]);
+    // No answer: the next request validates half the candidates.
+    assert!(review::shrink_page(&mut s));
+    assert_eq!(candidate_ids(&mut s), ["F1"]);
+    // A single candidate cannot be halved further.
+    assert!(!review::shrink_page(&mut s));
+    // No answer again: only this batch is skipped.
+    s.last_error = Some(
+        "document_review_incomplete: the review request got no answer before a timeout".into(),
+    );
+    assert_eq!(
+        review::skip_failing_page(&mut s),
+        review::PageSkip::Continued
+    );
+    assert_eq!(candidate_ids(&mut s), ["F2"]);
+    review::finish(
+        &mut s,
+        &json!({"decisions":[decision("F2", "confirmed")]}).to_string(),
+    )
+    .unwrap();
+    assert!(!review::approved(&s));
+    assert!(matches!(
+        review::current_verdict(&s),
+        review::CurrentVerdict::Rejected(_)
+    ));
+    // The skipped candidate's passage is reported as unreviewed.
+    assert_eq!(review::unavailable_ranges(&s), [(2, 2)]);
+}
+
+#[test]
 fn skipping_a_bad_page_still_validates_its_grounded_candidates() {
     for paginated in [false, true] {
         for status in ["confirmed", "dismissed"] {

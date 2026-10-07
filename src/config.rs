@@ -83,6 +83,11 @@ pub struct Config {
     pub request_timeout_secs: u64,
     pub tool_timeout_secs: u64,
     pub retries: usize,
+    /// Runtime only: whether the client retries a request that timed out.
+    /// Review requests turn it off; an unanswered review page is halved or
+    /// skipped instead of waiting out another timeout.
+    #[serde(skip)]
+    pub retry_timeouts: bool,
     pub run_timeout_secs: u64,
     pub run_tokens: usize,
     /// Stalled document reviews before focused recovery (not a stop quota).
@@ -171,6 +176,7 @@ impl Default for Config {
             request_timeout_secs: 600,
             tool_timeout_secs: 30,
             retries: 2,
+            retry_timeouts: true,
             run_timeout_secs: 3600,
             run_tokens: 10_000_000,
             writing_reserve_ratio: 0.5,

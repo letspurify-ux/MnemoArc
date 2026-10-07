@@ -604,6 +604,11 @@ pub(super) fn execute(
             {
                 result["audience_check"] = check;
             }
+            if s.is_document_work()
+                && let Some(check) = test_code_check(s, &path, &doc)
+            {
+                result["test_code_check"] = check;
+            }
             Ok(result)
         }
         _ => bail!("unsupported_tool"),
@@ -945,6 +950,135 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
 
 pub(super) fn citation_spans(doc: &str) -> Result<Vec<Citation>> {
     Ok(scan_citations(doc)?.0)
+}
+
+const TEST_CODE_FLAG_LIMIT: usize = 12;
+const TEST_CODE_GUIDANCE: &str = "These citations point into test code. A test shows how a behavior is checked, not how the product behaves: cite the product code that implements the claim, or say in the text that the passage describes a test.";
+
+/// Citations into test code: files a test layout names (a tests, test or
+/// __tests__ directory; .test., .spec., _test, _spec, test_, tests or ...Test
+/// names) and Rust `#[cfg(test)]` modules. A live document cited a test's
+/// loop as how reviews repeat, and the document review approved it. Advice
+/// only; None when nothing is flagged.
+pub(super) fn test_code_check(s: &Session, output: &Path, doc: &str) -> Option<Value> {
+    let root = s.project.root.canonicalize().ok()?;
+    let citations = citation_spans(doc).ok()?;
+    let mut modules = BTreeMap::<PathBuf, Vec<(usize, usize)>>::new();
+    let mut items = Vec::new();
+    let mut total = 0usize;
+    for citation in citations {
+        let path = if citation.relative_link {
+            output
+                .parent()
+                .unwrap()
+                .join(&citation.path)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            citation.path.clone()
+        };
+        let Ok(resolved) = read_path(&s.project, &path) else {
+            continue;
+        };
+        let Ok(relative) = resolved.strip_prefix(&root) else {
+            continue;
+        };
+        let mut in_test_module = || {
+            resolved
+                .extension()
+                .is_some_and(|extension| extension == "rs")
+                && modules
+                    .entry(resolved.clone())
+                    .or_insert_with(|| {
+                        read_text(&resolved)
+                            .map(|text| rust_test_modules(&text))
+                            .unwrap_or_default()
+                    })
+                    .iter()
+                    .any(|(start, end)| citation.begin <= *end && citation.end >= *start)
+        };
+        if test_file(relative) || in_test_module() {
+            total += 1;
+            if items.len() < TEST_CODE_FLAG_LIMIT {
+                let range = if citation.begin == citation.end {
+                    citation.begin.to_string()
+                } else {
+                    format!("{}-{}", citation.begin, citation.end)
+                };
+                items.push(json!({"line":citation.document_line,"citation":format!("{}:{range}", citation.path)}));
+            }
+        }
+    }
+    (total > 0).then(|| json!({"flagged":total,"items":items,"guidance":TEST_CODE_GUIDANCE}))
+}
+
+/// A file whose directory or name marks it as tests.
+fn test_file(relative: &Path) -> bool {
+    let parts: Vec<String> = relative
+        .iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect();
+    let Some((name, directories)) = parts.split_last() else {
+        return false;
+    };
+    if directories.iter().any(|directory| {
+        matches!(
+            directory.to_lowercase().as_str(),
+            "tests" | "test" | "__tests__"
+        )
+    }) {
+        return true;
+    }
+    let lower = name.to_lowercase();
+    let stem = name.split('.').next().unwrap_or(name);
+    let stem_lower = stem.to_lowercase();
+    lower.contains(".test.")
+        || lower.contains(".spec.")
+        || stem_lower.starts_with("test_")
+        || matches!(stem_lower.as_str(), "test" | "tests")
+        || ["_test", "_tests", "_spec"]
+            .iter()
+            .any(|suffix| stem_lower.ends_with(suffix))
+        || (stem.len() > 5 && (stem.ends_with("Test") || stem.ends_with("Tests")))
+}
+
+/// One-based line ranges of Rust `#[cfg(test)]` modules: the attribute, the
+/// `mod name {` line after it and everything up to the closing brace at that
+/// line's indentation (rustfmt layout), or the end of the file.
+fn rust_test_modules(text: &str) -> Vec<(usize, usize)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let attribute = lines[index].trim();
+        if attribute == "#[cfg(test)]" || attribute.starts_with("#[cfg(all(test") {
+            let mut next = index + 1;
+            while next < lines.len() && {
+                let line = lines[next].trim_start();
+                line.is_empty() || line.starts_with("#[") || line.starts_with("//")
+            } {
+                next += 1;
+            }
+            if let Some(line) = lines.get(next) {
+                let trimmed = line.trim_start();
+                let declaration = trimmed
+                    .trim_start_matches("pub(crate) ")
+                    .trim_start_matches("pub(super) ")
+                    .trim_start_matches("pub ");
+                if declaration.starts_with("mod ") && trimmed.trim_end().ends_with('{') {
+                    let close = format!("{}}}", &line[..line.len() - trimmed.len()]);
+                    let end = (next + 1..lines.len())
+                        .find(|&i| lines[i].trim_end() == close)
+                        .unwrap_or(lines.len() - 1);
+                    ranges.push((index + 1, end + 1));
+                    index = end + 1;
+                    continue;
+                }
+            }
+        }
+        index += 1;
+    }
+    ranges
 }
 
 /// Readers an audience names who build or maintain the software may read its

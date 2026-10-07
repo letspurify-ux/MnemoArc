@@ -49,7 +49,8 @@ async fn finish_live_review(
         drain.await?;
         tools::document_review::finish(session, &response.text)?;
         followups.push(json!({"request":request,"response":response.text,"usage":response.usage,
-            "provider_attempts":response.attempts,"attempt_diagnostics":response.attempt_diagnostics}));
+            "provider_attempts":response.attempts,"attempt_diagnostics":response.attempt_diagnostics,
+            "provider":response.provider,"first_event_seconds":response.first_event_seconds}));
     }
     Ok(followups)
 }
@@ -78,6 +79,8 @@ impl LlmClient for ReviewTrace {
                 Ok(response) => json!({"input":payload,"response":response.text,
                     "usage":response.usage,"provider_attempts":response.attempts,
                     "attempt_diagnostics":response.attempt_diagnostics,
+                    "provider":response.provider,
+                    "first_event_seconds":response.first_event_seconds,
                     "elapsed_seconds":started.elapsed().as_secs_f64()}),
                 Err(error) => {
                     let provider = error.downcast_ref::<CompletionError>();

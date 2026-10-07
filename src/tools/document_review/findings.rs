@@ -1266,9 +1266,45 @@ pub fn verification_request(s: &mut Session, ceiling: usize) -> Result<Value> {
     if ids.is_empty() {
         bail!("document_review_budget: one finding and its evidence cannot fit validation input");
     }
+    // A halved request validates fewer candidates; the others follow.
+    let kept = (ids.len() >> s.document_review.page_shrink).max(1);
+    ids.truncate(kept);
+    payload["candidates"].as_array_mut().unwrap().truncate(kept);
     request["messages"][1]["content"] = json!(payload.to_string());
     s.document_review.validation_ids = ids;
     Ok(request)
+}
+
+/// Give up on the current validation batch only, as on a review page. Its
+/// candidates were neither confirmed nor dismissed, so their passages block
+/// approval as unreviewed ranges (the whole document for a candidate without
+/// a passage), and a confirmed finding they raised again does not count as
+/// repaired. The other candidates are still validated.
+pub(super) fn skip_validation_batch(state: &mut ReviewState, error: Option<String>) {
+    let ids = std::mem::take(&mut state.validation_ids);
+    let whole = (1, state.document_total);
+    for finding in state.page_findings.iter().filter(|f| ids.contains(&f.id)) {
+        let range = finding
+            .proposal
+            .document
+            .as_ref()
+            .map_or(whole, |p| (p.start_line, p.end_line));
+        if range.0 <= range.1 {
+            state.skipped_ranges.push(range);
+        }
+        for old in &state.findings {
+            if old.id == finding.id
+                || finding.released_from.as_ref() == Some(&old.id)
+                || same_subject(&old.proposal, &finding.proposal)
+            {
+                state.unverified_finding_ids.insert(old.id.clone());
+            }
+        }
+    }
+    state.page_findings.retain(|f| !ids.contains(&f.id));
+    merge_ranges(&mut state.skipped_ranges);
+    state.skip_log.push(json!({"findings":ids,"error":error}));
+    state.validating = state.page_findings.iter().any(|f| !f.confirmed);
 }
 
 pub fn finish_verification(s: &mut Session, body: &str) -> Result<()> {

@@ -71,6 +71,21 @@ pub struct ReviewState {
     repair_todos: BTreeMap<String, String>,
     #[serde(skip)]
     document_baseline: Option<document_changes::Baseline>,
+    /// Criteria per page after a page got no answer, with the model it was
+    /// learned for. Like a halved document review page, later pages and
+    /// reviews of the task keep it until the model changes.
+    #[serde(skip)]
+    page_limit: Option<(String, usize)>,
+    /// Criteria of the pending review whose page was skipped, with their
+    /// text, and the error that ended the last skipped page.
+    #[serde(skip)]
+    skipped: Vec<(String, String)>,
+    #[serde(skip)]
+    skip_reason: Option<String>,
+    /// Criteria the last review skipped while it judged others, reported
+    /// when the result finishes unchecked.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_criteria: Vec<(String, String)>,
 }
 
 impl ReviewState {
@@ -89,6 +104,8 @@ impl ReviewState {
         self.draft.clear();
         self.answer_prefix.clear();
         self.offset = 0;
+        self.skipped.clear();
+        self.unavailable_criteria.clear();
         self.stalled_reviews = 0;
         self.repair_rounds = 0;
         self.best_met = 0;
@@ -815,6 +832,8 @@ pub fn begin_final(s: &mut Session, draft: &str, continues_previous: bool) -> Re
     state.approved = false;
     state.offset = 0;
     state.checks.clear();
+    state.skipped.clear();
+    state.unavailable_criteria.clear();
     Ok(Gate::Review)
 }
 
@@ -835,16 +854,13 @@ pub fn request(s: &mut Session) -> Result<Value> {
         s.completion_review.approved = false;
         s.completion_review.offset = 0;
         s.completion_review.checks.clear();
+        s.completion_review.skipped.clear();
     }
+    let size = page_size(s);
     let state = &mut s.completion_review;
     let mut payload = state.payload.clone();
     let all = payload["criteria"].as_array().unwrap();
-    payload["criteria"] = json!(
-        all.iter()
-            .skip(state.offset)
-            .take(PAGE_SIZE)
-            .collect::<Vec<_>>()
-    );
+    payload["criteria"] = json!(all.iter().skip(state.offset).take(size).collect::<Vec<_>>());
     payload["previous_response_error"] = json!(
         s.last_error
             .as_deref()
@@ -1019,13 +1035,14 @@ pub fn finish(s: &mut Session, response: &str) -> Result<Option<String>> {
             "completion_review_invalid: evidence or requirements changed; retry against current result"
         );
     }
+    let size = page_size(s);
     let state = &mut s.completion_review;
     let expected: Vec<_> = state.payload["criteria"]
         .as_array()
         .unwrap()
         .iter()
         .skip(state.offset)
-        .take(PAGE_SIZE)
+        .take(size)
         .map(|v| v["id"].as_str().unwrap())
         .collect();
     let evidence: BTreeSet<_> = state.payload["evidence"]
@@ -1088,9 +1105,98 @@ pub fn finish(s: &mut Session, response: &str) -> Result<Option<String>> {
     if state.offset < state.payload["criteria"].as_array().unwrap().len() {
         return Ok(None);
     }
-    if !s.task.unresolved.is_empty() {
+    Ok(conclude(s))
+}
+
+/// Criteria per review page: halved after a page got no answer.
+fn page_size(s: &Session) -> usize {
+    match &s.completion_review.page_limit {
+        Some((model, size)) if *model == s.config.model => *size,
+        _ => PAGE_SIZE,
+    }
+}
+
+/// Halve the criteria per page after a page got no answer with the full
+/// output allowance, as a document review page is halved. False for a page
+/// of a single criterion.
+pub fn shrink_page(s: &mut Session) -> bool {
+    let size = page_size(s);
+    let state = &mut s.completion_review;
+    let total = state.payload["criteria"].as_array().map_or(0, Vec::len);
+    let current = size.min(total.saturating_sub(state.offset));
+    if !state.pending || current < 2 {
+        return false;
+    }
+    state.page_limit = Some((s.config.model.clone(), current / 2));
+    true
+}
+
+/// Give up on the current criteria page only, as on a document review page:
+/// its criteria are not judged and the other pages still are.
+pub fn skip_failing_page(s: &mut Session) -> super::document_review::PageSkip {
+    use super::document_review::PageSkip;
+    if !s.completion_review.pending {
+        return PageSkip::NotApplicable;
+    }
+    let size = page_size(s);
+    let state = &mut s.completion_review;
+    let all = state.payload["criteria"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let page: Vec<_> = all
+        .iter()
+        .skip(state.offset)
+        .take(size)
+        .map(|c| {
+            let text = |key: &str| c[key].as_str().unwrap_or_default().to_owned();
+            (text("id"), text("text"))
+        })
+        .collect();
+    if page.is_empty() {
+        return PageSkip::NotApplicable;
+    }
+    state.offset += page.len();
+    state.skipped.extend(page);
+    state.skip_reason.clone_from(&s.last_error);
+    if state.offset < all.len() {
+        return PageSkip::Continued;
+    }
+    // The last page: a rejection of the judged criteria still goes to
+    // repair; with none open the result finishes unchecked.
+    conclude(s);
+    if s.completion_review.unavailable {
+        PageSkip::Unavailable
+    } else {
+        PageSkip::Continued
+    }
+}
+
+/// Aggregate the page verdicts after the last page. Returns the held answer
+/// when the review approves it, or lets it finish unchecked: every judged
+/// criterion is met but some were skipped. A rejection goes to repair, and
+/// the next review judges every criterion again.
+fn conclude(s: &mut Session) -> Option<String> {
+    let unresolved = !s.task.unresolved.is_empty();
+    let state = &mut s.completion_review;
+    if unresolved {
         state.checks.push(Check { id: "unresolved".into(), criterion: "미확인 사항 해결".into(), status: "unverified".into(), reason: "미확인 사항이 남아 있습니다.".into(), evidence: vec![], next_action: "남아 있는 미확인 사항을 해결하고 실제 확인 결과로 task_state.unresolved를 갱신합니다.".into() });
     }
+    if !state.skipped.is_empty() && state.checks.iter().all(|c| c.status == "met") {
+        let skipped = std::mem::take(&mut state.skipped);
+        let total = state.payload["criteria"].as_array().map_or(0, Vec::len);
+        // The report says why the skipped page got no verdict.
+        let reason = state.skip_reason.take();
+        mark_unavailable(s, reason);
+        // Name the skipped criteria when others were judged; with none
+        // judged the whole review is simply unchecked.
+        if skipped.len() < total {
+            s.completion_review.unavailable_criteria = skipped;
+        }
+        return held_answer(s);
+    }
+    state.skipped.clear();
+    state.skip_reason = None;
     state.pending = false;
     state.approved = state.checks.iter().all(|c| c.status == "met");
     if state.approved {
@@ -1099,8 +1205,7 @@ pub fn finish(s: &mut Session, response: &str) -> Result<Option<String>> {
         state.best_met = state.checks.len();
     }
     state.reviewed_fingerprint = state.fingerprint.clone();
-    let approved = state.approved.then(|| state.draft.clone());
-    Ok(approved)
+    state.approved.then(|| state.draft.clone())
 }
 
 /// Use the existing plan mutator, respecting capacity, uniqueness and state

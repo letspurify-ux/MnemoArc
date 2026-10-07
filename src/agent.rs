@@ -34,11 +34,17 @@ pub const CLOSING_ROUND_LIMIT: usize = 12;
 /// Requests at this run's average duration that the closing time reserve
 /// keeps at least, so closing can still answer and review once.
 const CLOSING_REQUEST_RESERVE: f64 = 6.0;
-/// Output allowance of a review page's first request, before this run has
-/// shown that the model needs more.
-const REVIEW_FIRST_OUTPUT_TOKENS: usize = 4096;
+/// A review request the provider never answered: a gateway or idle timeout,
+/// or no data within the request timeout. A live reasoning model reasoned
+/// silently until the provider cut it off (504), and waiting out that
+/// "outage" and resending the same page stalled the run for 11 minutes.
+const REVIEW_NO_ANSWER: &str =
+    "document_review_incomplete: the review request got no answer before a timeout";
+const COMPLETION_REVIEW_NO_ANSWER: &str =
+    "completion_review_invalid: the review request got no answer before a timeout";
+const COMPLETION_REVIEW_TRUNCATED: &str = "completion_review_invalid: response reached the output token limit before the JSON closed; return one complete checks JSON object with shorter reasons";
 /// A review response that used up its output allowance before its JSON
-/// closed. A reasoning model can spend the short first allowance this way.
+/// closed. A reasoning model can spend the whole allowance on reasoning.
 const REVIEW_TRUNCATED: &str = "document_review_incomplete: response reached the output token limit before the JSON closed; return one complete issues JSON object with fewer, shorter issues and quotes";
 const MAX_REPORTED_GAPS: usize = 30;
 
@@ -172,7 +178,13 @@ fn collect_gaps(s: &mut Session, extra: &[String]) -> Vec<String> {
                 }
             }
             CurrentVerdict::Unavailable => {
-                gaps.push("완료 조건 검증 — 검토 응답 오류로 검증을 마치지 못했습니다.".into());
+                let skipped = &s.completion_review.unavailable_criteria;
+                if skipped.is_empty() {
+                    gaps.push("완료 조건 검증 — 검토 응답 오류로 검증을 마치지 못했습니다.".into());
+                }
+                for (id, criterion) in skipped.iter().take(12) {
+                    gaps.push(format!("완료 조건 {id} (검토 미완료) — {criterion}"));
+                }
             }
             // Only evidence or task records changed after the last review, so
             // its unmet checks still describe the saved result. A live run
@@ -368,6 +380,17 @@ fn suppress_unchanged_repeat(
         "guidance":"Identical result is already in active context: the document and its evidence have not changed since. Use that result and act on it: edit, read an unread cited range, or give the final answer. Do not repeat this check until something changes."}})
 }
 
+/// The notice of a review skipped because it got no answer, not because its
+/// answers had the wrong format.
+fn unanswered_notice(notice: &'static str) -> &'static str {
+    match notice {
+        REVIEW_PAGE_SKIPPED_NOTICE => REVIEW_UNANSWERED_SKIPPED_NOTICE,
+        REVIEW_UNAVAILABLE_NOTICE => REVIEW_UNANSWERED_UNAVAILABLE_NOTICE,
+        REVIEW_CLOSING_UNAVAILABLE_NOTICE => REVIEW_CLOSING_UNANSWERED_NOTICE,
+        other => other,
+    }
+}
+
 /// Abandon a pending review whose responses keep failing validation, for
 /// document work only. In closing mode the first failure is enough. The
 /// result then finishes without that review and reports it as unchecked.
@@ -395,6 +418,22 @@ fn abandon_failing_review(s: &mut Session, failures: usize) -> Option<&'static s
             }
             PageSkip::Unavailable => {
                 s.last_error = Some(DOCUMENT_REVIEW_UNAVAILABLE.into());
+                s.progress_recovery.action_required = false;
+                return Some(REVIEW_UNAVAILABLE_NOTICE);
+            }
+        }
+    }
+    if s.completion_review.pending && s.progress_recovery.closing.is_none() {
+        use tools::document_review::PageSkip;
+        match tools::completion_review::skip_failing_page(s) {
+            PageSkip::NotApplicable => {}
+            PageSkip::Continued => {
+                s.last_error = None;
+                s.progress_recovery.action_required = false;
+                return Some(REVIEW_PAGE_SKIPPED_NOTICE);
+            }
+            PageSkip::Unavailable => {
+                s.last_error = Some("completion_review_unavailable: some criteria got no valid review answer; give the final answer again and the result will be reported as unchecked".into());
                 s.progress_recovery.action_required = false;
                 return Some(REVIEW_UNAVAILABLE_NOTICE);
             }
@@ -521,8 +560,15 @@ fn note_unrepaired_final(s: &mut Session) -> usize {
 const REVIEW_UNAVAILABLE_NOTICE: &str = "검토 응답이 반복해서 형식에 맞지 않아 이 결과의 검토를 생략하고, 완료 보고에 미검토로 표시합니다.";
 const REVIEW_CLOSING_UNAVAILABLE_NOTICE: &str = "마감 단계의 검토 응답이 형식에 맞지 않아 이 결과의 검토를 생략하고, 완료 보고에 미검토로 표시합니다.";
 const DOCUMENT_REVIEW_UNAVAILABLE: &str = "document_review_unavailable: document review responses were invalid; give the final answer again and the document will be reported as unreviewed";
-const REVIEW_PAGE_SHRUNK_NOTICE: &str =
-    "검토 응답이 출력 한도를 다 써서, 이어지는 검토는 더 작은 범위로 나눠 진행합니다.";
+const REVIEW_PAGE_SHRUNK_NOTICE: &str = "검토 응답을 받지 못해(출력 한도 소진 또는 응답 시간 초과), 이 부분을 절반 범위로 다시 검토합니다.";
+const REVIEW_RETRY_NOTICE: &str =
+    "검토 응답을 받지 못해(출력 한도 소진 또는 응답 시간 초과), 검토를 한 번 더 요청합니다.";
+const REVIEW_UNANSWERED_SKIPPED_NOTICE: &str =
+    "검토 응답을 받지 못해 이 부분의 검토를 건너뛰고, 나머지 검토를 이어갑니다.";
+const REVIEW_UNANSWERED_UNAVAILABLE_NOTICE: &str =
+    "검토 응답을 받지 못해 이 결과의 검토를 생략하고, 완료 보고에 미검토로 표시합니다.";
+const REVIEW_CLOSING_UNANSWERED_NOTICE: &str =
+    "마감 단계의 검토 응답을 받지 못해 이 결과의 검토를 생략하고, 완료 보고에 미검토로 표시합니다.";
 const REVIEW_PAGE_SKIPPED_NOTICE: &str =
     "검토 응답이 반복해서 형식에 맞지 않아 이 부분의 검토를 건너뛰고, 나머지 검토를 이어갑니다.";
 
@@ -1319,10 +1365,9 @@ pub async fn run_session_controlled(
     let mut length_recoveries = 0usize;
     let mut empty_completions = 0usize;
     let mut review_response_failures = 0usize;
-    // Once a review page ran out of the short first-response allowance, this
-    // model needs more: later pages start with the full allowance instead of
-    // paying for another truncated attempt (a live run wasted 4 of 24).
-    let mut review_full_output = false;
+    // Requests of the pending review that got no answer: the output ran out
+    // or the request timed out. The second one skips the page or the review.
+    let mut review_unanswered = 0usize;
     // Smoothed duration of completed model requests in this run. A slow
     // model needs a larger closing reserve than a share of the time budget.
     let mut request_secs: Option<f64> = None;
@@ -1396,7 +1441,6 @@ pub async fn run_session_controlled(
         if s.config.model != learned_model {
             learned_model.clone_from(&s.config.model);
             request_secs = None;
-            review_full_output = false;
         }
         // Final answers, model errors and cancelled runs can bypass the tool
         // batch checks. Recheck before every request, including resumed runs.
@@ -1910,20 +1954,13 @@ pub async fn run_session_controlled(
         if s.checkpoint.is_some() {
             request_config.output_tokens = ContextManager::cleanup_output_tokens(&s.config);
         }
-        if reviewing_document {
-            // A short first response keeps ordinary review calls bounded. If
-            // the provider exhausts that allowance before emitting JSON, give
-            // the bounded recovery request the configured output allowance so
-            // reasoning tokens cannot starve the verdict itself.
-            // Closing allows one review response, so it gets the full
-            // allowance: a short first attempt would end the review there.
-            if review_response_failures == 0
-                && !review_full_output
-                && s.progress_recovery.closing.is_none()
-            {
-                request_config.output_tokens =
-                    request_config.output_tokens.min(REVIEW_FIRST_OUTPUT_TOKENS);
-            }
+        // A review asks with the configured output allowance at once: a
+        // reasoning model spent a short first allowance on reasoning alone.
+        // A timed-out review is not retried as is, since each retry waited
+        // out the provider's idle timeout again; it is asked once more,
+        // halved where it can be, and then skipped.
+        if s.is_document_work() && (reviewing_document || reviewing_completion) {
+            request_config.retry_timeouts = false;
         }
         if request_tokens
             .saturating_add(request_config.output_tokens)
@@ -2117,6 +2154,21 @@ pub async fn run_session_controlled(
                 rejected_review = s.last_error.clone();
                 crate::llm::Completion::default()
             }
+            Err(error)
+                if s.is_document_work()
+                    && (reviewing_completion || reviewing_document)
+                    && crate::llm::timeout_error(&error.to_string()) =>
+            {
+                rejected_review = Some(
+                    if reviewing_document {
+                        REVIEW_NO_ANSWER
+                    } else {
+                        COMPLETION_REVIEW_NO_ANSWER
+                    }
+                    .into(),
+                );
+                crate::llm::Completion::default()
+            }
             Err(error) => {
                 if recovered_batch {
                     continue;
@@ -2202,7 +2254,16 @@ pub async fn run_session_controlled(
                     "completion_review_invalid: return complete JSON without tool calls"
                 ))
             } else {
-                tools::completion_review::finish(&mut s, &completion.text)
+                match tools::completion_review::finish(&mut s, &completion.text) {
+                    // The output ran out before the JSON closed: no answer.
+                    Err(error)
+                        if completion.length_limited
+                            && error.to_string().starts_with("completion_review_invalid:") =>
+                    {
+                        Err(anyhow::anyhow!(COMPLETION_REVIEW_TRUNCATED))
+                    }
+                    other => other,
+                }
             };
             match result {
                 Err(error) => {
@@ -2215,6 +2276,17 @@ pub async fn run_session_controlled(
                         break;
                     }
                     review_response_failures += 1;
+                    // As with document review pages: unanswered, the page is
+                    // asked once more at half size, then skipped.
+                    let unanswered = reason == COMPLETION_REVIEW_NO_ANSWER
+                        || reason == COMPLETION_REVIEW_TRUNCATED;
+                    if unanswered {
+                        review_unanswered += 1;
+                        if review_unanswered >= 2 {
+                            review_response_failures =
+                                review_response_failures.max(REVIEW_UNAVAILABLE_LIMIT);
+                        }
+                    }
                     s.last_error = Some(reason);
                     let Some(notice) = abandon_failing_review(&mut s, review_response_failures)
                     else {
@@ -2224,10 +2296,33 @@ pub async fn run_session_controlled(
                             s.status = "partial".into();
                             break;
                         }
+                        if unanswered && review_unanswered == 1 {
+                            let notice = if tools::completion_review::shrink_page(&mut s) {
+                                REVIEW_PAGE_SHRUNK_NOTICE
+                            } else {
+                                REVIEW_RETRY_NOTICE
+                            };
+                            emit(
+                                &events,
+                                AgentEvent::Notice {
+                                    session: s.id.clone(),
+                                    text: notice.into(),
+                                },
+                                &cancel,
+                                run_deadline(started, &s.config),
+                            )
+                            .await;
+                        }
                         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
                         continue;
                     };
                     review_response_failures = 0;
+                    review_unanswered = 0;
+                    let notice = if unanswered {
+                        unanswered_notice(notice)
+                    } else {
+                        notice
+                    };
                     emit(
                         &events,
                         AgentEvent::Notice {
@@ -2260,6 +2355,7 @@ pub async fn run_session_controlled(
                 }
                 Ok(None) => {
                     review_response_failures = 0;
+                    review_unanswered = 0;
                     if !s.completion_review.pending {
                         let met = s
                             .completion_review
@@ -2305,6 +2401,7 @@ pub async fn run_session_controlled(
                 }
                 Ok(Some(answer)) => {
                     review_response_failures = 0;
+                    review_unanswered = 0;
                     completion.text = answer;
                     completion.length_limited = false;
                     s.last_error = None;
@@ -2317,9 +2414,9 @@ pub async fn run_session_controlled(
             // or report finish_reason=length even when the JSON object is
             // complete. The review request has no executable tools, so a
             // complete, hash-checked verdict is safe to accept in that case.
-            // A reasoning model can spend the bounded first-attempt allowance
-            // before the JSON closes. Name that cause instead of tool use, so
-            // the retry shortens its verdict rather than looking for tools.
+            // A reasoning model can spend the output allowance before the
+            // JSON closes. Name that cause instead of tool use, so the retry
+            // shortens its verdict rather than looking for tools.
             let truncated = || anyhow::anyhow!(REVIEW_TRUNCATED);
             let review_result = if let Some(error) = rejected_review.take() {
                 Err(anyhow::anyhow!(error))
@@ -2363,22 +2460,16 @@ pub async fn run_session_controlled(
                 let reason = error.to_string();
                 review_response_failures += 1;
                 s.last_error = Some(reason.clone());
-                if reason == REVIEW_TRUNCATED {
-                    if request_config.output_tokens < s.config.output_tokens {
-                        review_full_output = true;
-                    } else if tools::document_review::shrink_page(&mut s) {
-                        // The full allowance ran out too: an identical retry
-                        // tends to end the same way, so halve the page.
-                        emit(
-                            &events,
-                            AgentEvent::Notice {
-                                session: s.id.clone(),
-                                text: REVIEW_PAGE_SHRUNK_NOTICE.into(),
-                            },
-                            &cancel,
-                            run_deadline(started, &s.config),
-                        )
-                        .await;
+                // No answer with the full allowance: the output ran out or the
+                // request timed out. An identical retry tends to end the same
+                // way, so the page is asked once more at half size (below);
+                // unanswered again, it is skipped and the review goes on.
+                let unanswered = reason == REVIEW_TRUNCATED || reason == REVIEW_NO_ANSWER;
+                if unanswered {
+                    review_unanswered += 1;
+                    if review_unanswered >= 2 {
+                        review_response_failures =
+                            review_response_failures.max(REVIEW_UNAVAILABLE_LIMIT);
                     }
                 }
                 if (reason.starts_with("document_review_invalid:")
@@ -2387,6 +2478,12 @@ pub async fn run_session_controlled(
                     && let Some(notice) = abandon_failing_review(&mut s, review_response_failures)
                 {
                     review_response_failures = 0;
+                    review_unanswered = 0;
+                    let notice = if unanswered {
+                        unanswered_notice(notice)
+                    } else {
+                        notice
+                    };
                     emit(
                         &events,
                         AgentEvent::Notice {
@@ -2414,6 +2511,25 @@ pub async fn run_session_controlled(
                             || reason.starts_with("document_review_incomplete:")
                             || reason.starts_with("document_review_stale:"))
                     {
+                        if unanswered && review_unanswered == 1 {
+                            // A single validation candidate and an already
+                            // twice-halved page are asked again as they are.
+                            let notice = if tools::document_review::shrink_page(&mut s) {
+                                REVIEW_PAGE_SHRUNK_NOTICE
+                            } else {
+                                REVIEW_RETRY_NOTICE
+                            };
+                            emit(
+                                &events,
+                                AgentEvent::Notice {
+                                    session: s.id.clone(),
+                                    text: notice.into(),
+                                },
+                                &cancel,
+                                run_deadline(started, &s.config),
+                            )
+                            .await;
+                        }
                         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
                         continue;
                     }
@@ -2438,6 +2554,7 @@ pub async fn run_session_controlled(
                 Some(text) => text,
                 None => {
                     review_response_failures = 0;
+                    review_unanswered = 0;
                     note_document_review_verdict(&mut s);
                     snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
                     let Some(text) = resume_held_final(&s, &mut held_final) else {
@@ -4691,12 +4808,16 @@ mod review_usage_tests {
         Fatal,
         Malformed,
         InvalidCompletion(bool),
+        /// The provider's idle timeout cut off this many review requests.
+        Timeout(usize),
     }
 
     struct Reviewer {
         failure: Failure,
         requests: AtomicUsize,
         reserved_outputs: Mutex<Vec<usize>>,
+        /// Criteria per completion review request.
+        criteria: Mutex<Vec<usize>>,
     }
 
     #[async_trait::async_trait]
@@ -4726,7 +4847,24 @@ mod review_usage_tests {
                 });
             }
             let index = self.requests.fetch_add(1, Ordering::SeqCst);
+            assert!(!config.retry_timeouts);
+            if acceptance {
+                self.criteria
+                    .lock()
+                    .unwrap()
+                    .push(payload["criteria"].as_array().map_or(0, Vec::len));
+            }
             match self.failure {
+                Failure::Timeout(failures) if index < failures => {
+                    return Err(CompletionError::new(
+                        anyhow::anyhow!(
+                            "provider_stream_error: {{\"code\":504,\"message\":\"Upstream idle timeout exceeded\"}}"
+                        ),
+                        1,
+                        true,
+                    )
+                    .into());
+                }
                 Failure::Provider(failures) if index < failures => {
                     return Err(CompletionError::new(
                         anyhow::anyhow!("provider_stream_error: test outage"),
@@ -4860,6 +4998,7 @@ mod review_usage_tests {
             failure,
             requests: AtomicUsize::new(0),
             reserved_outputs: Mutex::new(Vec::new()),
+            criteria: Mutex::new(Vec::new()),
         });
         let (tx, mut rx) = mpsc::channel(128);
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -4959,6 +5098,76 @@ mod review_usage_tests {
             assert_eq!(session.status, "complete", "{:?}", session.last_error);
             assert_eq!(reviewer.requests.load(Ordering::SeqCst), 2);
             assert_eq!(review_usage(&session), (30, 28));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_review_is_halved_then_skipped() {
+        // A live reasoning model's review page timed out at the provider;
+        // waiting that out as an outage and resending the same page stalled
+        // the run for 11 minutes.
+        for completion in [false, true] {
+            let started = tokio::time::Instant::now();
+            let (session, reviewer) = run(completion, Failure::Timeout(usize::MAX)).await;
+            assert!(started.elapsed() < Duration::from_secs(10));
+            assert_eq!(
+                session.status, "complete_with_gaps",
+                "{:?}",
+                session.last_error
+            );
+            if completion {
+                // Both criteria, then one per page; a page of one criterion
+                // is asked once more as it is, then skipped.
+                assert_eq!(*reviewer.criteria.lock().unwrap(), [2, 1, 1, 1]);
+                assert!(session.completion_review.unavailable);
+            } else {
+                assert_eq!(reviewer.requests.load(Ordering::SeqCst), 2);
+                assert_eq!(session.document_review.page_shrink, 1);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_skipped_criterion_is_reported_while_the_others_are_judged() {
+        // Both criteria, then R0 alone got no answer: R0 is skipped, S1 met.
+        let (session, reviewer) = run(true, Failure::Timeout(2)).await;
+        assert_eq!(*reviewer.criteria.lock().unwrap(), [2, 1, 1]);
+        assert_eq!(
+            session.status, "complete_with_gaps",
+            "{:?}",
+            session.last_error
+        );
+        let skipped: Vec<_> = session
+            .completion_review
+            .unavailable_criteria
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(skipped, ["R0"]);
+        assert!(
+            session
+                .completion_gaps
+                .iter()
+                .any(|gap| gap.starts_with("완료 조건 R0 (검토 미완료) — ")),
+            "{:?}",
+            session.completion_gaps
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_review_answered_after_one_timeout_keeps_its_verdict() {
+        for completion in [false, true] {
+            let started = tokio::time::Instant::now();
+            let (session, reviewer) = run(completion, Failure::Timeout(1)).await;
+            assert!(started.elapsed() < Duration::from_secs(10));
+            assert_eq!(session.status, "complete", "{:?}", session.last_error);
+            if completion {
+                assert_eq!(*reviewer.criteria.lock().unwrap(), [2, 1, 1]);
+                assert!(session.completion_review.approved);
+            } else {
+                assert_eq!(reviewer.requests.load(Ordering::SeqCst), 2);
+                assert_eq!(session.document_review.page_shrink, 1);
+            }
         }
     }
 

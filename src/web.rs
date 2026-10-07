@@ -1673,10 +1673,13 @@ mod worker_wait_tests {
         assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(31)).await;
+        // Wait for the close on the real clock. A paused clock jumps ahead
+        // whenever the runtime idles on socket I/O, so under a loaded full
+        // test run this wait expired before the server's 408 arrived.
+        tokio::time::resume();
         let mut response = Vec::new();
         let closed =
-            tokio::time::timeout(Duration::from_secs(2), stalled.read_to_end(&mut response)).await;
-        tokio::time::resume();
+            tokio::time::timeout(Duration::from_secs(5), stalled.read_to_end(&mut response)).await;
         let client = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(3))

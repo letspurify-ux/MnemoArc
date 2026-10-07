@@ -2540,9 +2540,11 @@ async fn an_abandoned_completion_review_accepts_the_answer_that_started_it() {
 }
 
 #[tokio::test]
-async fn review_pages_learn_the_output_need_and_shrink_after_a_full_cutoff() {
-    // Live run 2026-10-07: 4 of 24 review requests used up the short first
-    // allowance, and later pages started short again.
+async fn a_review_page_without_an_answer_is_halved_then_skipped() {
+    // A reasoning model spent a short first allowance and then the full one
+    // on reasoning, and the halved page timed out at the provider until the
+    // run stalled. A review asks with the full allowance at once, halves an
+    // unanswered page once and then skips it.
     let (_dir, mut s, _) = fixture();
     s.config.completion_review_enabled = false;
     let doc = (1..=150)
@@ -2564,21 +2566,32 @@ async fn review_pages_learn_the_output_need_and_shrink_after_a_full_cutoff() {
     steps.extend((0..6).map(|_| (none, text(r#"{"issues":[]}"#))));
     let (result, _, output_tokens, notices) = run_paced(s, steps).await;
     let full = 8000;
-    assert_eq!(output_tokens[1], 4096, "{output_tokens:?}");
+    assert_eq!(output_tokens[1], full, "{output_tokens:?}");
     assert_eq!(output_tokens[2], full, "{output_tokens:?}");
-    // The full allowance was cut too: the page is halved, and every later
-    // page starts with the allowance this model needs.
     assert_eq!(result.document_review.page_shrink, 1);
-    assert!(
-        notices.iter().any(|notice| notice.contains("더 작은 범위")),
-        "{notices:?}"
+    for said in [
+        "절반 범위로 다시 검토",
+        "검토 응답을 받지 못해 이 부분의 검토를 건너뛰고",
+    ] {
+        assert!(
+            notices.iter().any(|notice| notice.contains(said)),
+            "{notices:?}"
+        );
+    }
+    // The other pages are reviewed; the skipped part is reported.
+    assert_eq!(
+        result.status, "complete_with_gaps",
+        "{:?}",
+        result.last_error
     );
-    assert!(output_tokens.len() >= 6, "{output_tokens:?}");
     assert!(
-        output_tokens[4..].iter().all(|&tokens| tokens == full),
-        "{output_tokens:?}"
+        result
+            .completion_gaps
+            .iter()
+            .any(|gap| gap == "문서 검토 — 1–50줄은 검토를 마치지 못했습니다."),
+        "{:?}",
+        result.completion_gaps
     );
-    assert_eq!(result.status, "complete", "{:?}", result.last_error);
 }
 
 #[tokio::test]
@@ -2614,7 +2627,7 @@ async fn reads_after_a_declared_draft_phase_still_count_as_progress() {
 
 #[tokio::test]
 async fn the_single_closing_review_gets_the_full_output_allowance() {
-    // Closing allows one review response; a short first attempt that a
+    // Closing allows one review response; a short allowance that a
     // reasoning model fills with its reasoning would end the review there.
     let (_dir, mut s, _) = fixture();
     s.config.completion_review_enabled = false;
@@ -2760,43 +2773,6 @@ async fn a_model_switched_mid_run_learns_its_own_pace() {
     let (result, guidance, _) = run_switching(s, steps, 1).await;
     assert_eq!(result.config.model, "gpt-4o-mini");
     assert!(guidance[1]["closing"].is_null(), "{}", guidance[1]);
-    assert_eq!(result.status, "complete", "{:?}", result.last_error);
-}
-
-#[tokio::test]
-async fn a_model_switched_mid_run_starts_review_pages_with_the_short_allowance() {
-    // The first model needed the full review allowance; the next one has
-    // not shown that need, so its first page attempt is bounded again.
-    let (_dir, mut s, _) = fixture();
-    s.config.completion_review_enabled = false;
-    let doc = (1..=150)
-        .map(|i| format!("Claim {i}. main.js:1-6\n"))
-        .collect::<String>();
-    let hash = s.last_document_write.as_ref().unwrap().1.clone();
-    tools::execute(
-        &mut s,
-        "document_edit",
-        json!({"action":"write","expected_hash":hash,"text":doc}),
-    )
-    .unwrap();
-    let cut = Completion {
-        length_limited: true,
-        ..Default::default()
-    };
-    let none = std::time::Duration::ZERO;
-    let mut steps = vec![
-        (none, text("Saved out.md.")),
-        (none, cut),
-        (none, text(r#"{"issues":[]}"#)),
-    ];
-    steps.extend((0..6).map(|_| (none, text(r#"{"issues":[]}"#))));
-    // The switch arrives while the successful retry runs; the review then
-    // restarts for the new model's layout.
-    let (result, _, output_tokens) = run_switching(s, steps, 3).await;
-    assert_eq!(result.config.model, "gpt-4o-mini");
-    assert_eq!(output_tokens[1], 4096, "{output_tokens:?}");
-    assert_eq!(output_tokens[2], 8000, "{output_tokens:?}");
-    assert_eq!(output_tokens[3], 4096, "{output_tokens:?}");
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
 }
 

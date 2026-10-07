@@ -491,6 +491,57 @@ fn lone_carriage_returns_in_document_text_are_saved_as_line_breaks() {
 }
 
 #[test]
+fn citations_into_test_code_are_named_on_save_and_audit() {
+    // A live document cited a test's loop as how reviews repeat, and the
+    // document review approved it.
+    let (dir, mut s) = source_setup();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+    std::fs::write(
+        dir.path().join("src/agent.rs"),
+        "fn run() {}\n\n#[cfg(test)]\nmod review_tests {\n    #[test]\n    fn loops() {}\n}\n\nfn after() {}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("tests/flow.rs"), "fn flow() {}\n").unwrap();
+    std::fs::write(dir.path().join("src/view.test.js"), "it('opens');\n").unwrap();
+    for path in ["src/agent.rs", "tests/flow.rs", "src/view.test.js"] {
+        run(&mut s, "file_read", json!({"path":path}));
+    }
+    let text = "# Flow\n\nRuns start here (src/agent.rs:1).\nReviews repeat (src/agent.rs:5-6).\nFlows are checked (tests/flow.rs:1).\nThe view opens (src/view.test.js:1).\nAfter runs (src/agent.rs:9).\n";
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":text}),
+    );
+    let check = &saved["test_code_check"];
+    let cited: Vec<_> = check["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            (
+                item["line"].as_u64().unwrap(),
+                item["citation"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        cited,
+        [
+            (4, "src/agent.rs:5-6"),
+            (5, "tests/flow.rs:1"),
+            (6, "src/view.test.js:1"),
+        ],
+        "{saved}"
+    );
+    assert_eq!(check["flagged"], 3);
+    // Advice only: the audit still passes and repeats it.
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert_eq!(audit["structural_ok"], true, "{audit}");
+    assert_eq!(audit["test_code_check"]["flagged"], 3, "{audit}");
+}
+
+#[test]
 fn identifiers_in_diagram_labels_are_flagged_for_non_developers() {
     // A live end-user document kept tool names in its flowchart nodes: the
     // check skipped Mermaid blocks entirely, and the reviewer let them stay.

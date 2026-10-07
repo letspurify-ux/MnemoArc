@@ -45,7 +45,14 @@ fn response_format() -> Value {
     }}})
 }
 
-fn request(s: &Session, feedback: Option<&str>, initial_tokens: usize) -> Result<Value> {
+/// `halved` after a request that got no answer: the optional context gets
+/// half the room.
+fn request(
+    s: &Session,
+    feedback: Option<&str>,
+    initial_tokens: usize,
+    halved: bool,
+) -> Result<Value> {
     let question = s.question.as_ref().unwrap();
     let mut payload = json!({
         "session_message_routing":true,"current_goal":s.latest_request,
@@ -109,11 +116,12 @@ fn request(s: &Session, feedback: Option<&str>, initial_tokens: usize) -> Result
         .collect();
     let optional = json!({"working_plan":s.task,"recent_conversation_reverse_order":recent});
     // Optional context gets a small share of input even in a very large window.
+    let shift = u32::from(halved);
     let ceiling = context_budget
         .min(run_budget)
-        .min(core_tokens.saturating_add(4000));
+        .min(core_tokens.saturating_add(4000 >> shift));
     for limit in [1600, 800, 400, 160] {
-        payload["optional_context"] = bounded(optional.clone(), limit);
+        payload["optional_context"] = bounded(optional.clone(), limit >> shift);
         request["messages"][1]["content"] = json!(payload.to_string());
         if context::count(&request, &s.config.model) <= ceiling {
             return Ok(request);
@@ -191,14 +199,44 @@ pub(super) async fn run(
         return Ok(Decision::Work);
     }
     let mut feedback = None;
+    let mut unanswered = 0usize;
     let started_at_ms = s.activity["started_at_ms"].clone();
     for attempt in 1..=MAX_ATTEMPTS {
         let deadline = control.boundary(s, cancel)?;
-        let request = request(s, feedback.as_deref(), initial_tokens)?;
+        let request = request(s, feedback.as_deref(), initial_tokens, unanswered > 0)?;
         s.activity = json!({"stage":"message_routing","started_at_ms":started_at_ms,"attempt":attempt,"round":s.run_rounds().saturating_add(1)});
         snapshot(s, events, cancel, deadline).await;
-        let completion = complete(s, client, request, cancel, deadline, initial_tokens).await?;
+        let completion = match complete(s, client, request, cancel, deadline, initial_tokens).await
+        {
+            Err(error) if crate::llm::timeout_error(&error.to_string()) => None,
+            other => Some(other?),
+        };
         check_turn(s, cancel, deadline)?;
+        // No answer: a timeout, or the output ran out before the JSON. Ask
+        // once more with half the optional context, then give up.
+        let Some(completion) = completion.filter(|c| {
+            c.discarded_tool_calls
+                || !c.calls.is_empty()
+                || !(c.text.trim().is_empty() || c.length_limited)
+        }) else {
+            unanswered += 1;
+            if unanswered >= 2 {
+                bail!(
+                    "message_routing_unanswered: the classification request got no answer twice (output limit or timeout); task preserved; retry this message"
+                );
+            }
+            emit(
+                events,
+                AgentEvent::Notice {
+                    session: s.id.clone(),
+                    text: super::SHRUNK_NOTICE.into(),
+                },
+                cancel,
+                deadline,
+            )
+            .await;
+            continue;
+        };
         match apply(s, completion) {
             Ok(decision) => return Ok(decision),
             Err(error) => feedback = Some(error.to_string()),
