@@ -1073,8 +1073,13 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
         .filter(|key| args.get(*key).is_none())
         .collect();
     if let [first, rest @ ..] = missing.as_slice() {
+        let whole = if action == "section" && missing.contains(&"section") {
+            WHOLE_DOCUMENT_HINT
+        } else {
+            ""
+        };
         return Err(also_hash(anyhow::anyhow!(
-            "missing_argument: {first} for document_edit action={action}{}; action={action} needs {}",
+            "missing_argument: {first} for document_edit action={action}{}; action={action} needs {}{whole}",
             also_missing(rest),
             needed.join(", ")
         )));
@@ -1103,7 +1108,7 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
             }
         }
         "section" => {
-            require("section")?;
+            require("section").map_err(|error| anyhow::anyhow!("{error}{WHOLE_DOCUMENT_HINT}"))?;
             require("expected_section_hash")?;
         }
         "insert_before" | "insert_after" | "insert_first_child" | "insert_last_child" => {
@@ -1114,6 +1119,11 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
     }
     Ok(())
 }
+
+/// action=section without a heading usually means the whole document: a
+/// live model sent its complete text that way, section "", and was told only
+/// that section must not be empty.
+const WHOLE_DOCUMENT_HINT: &str = "; action=section replaces the one section its section heading names (copy the heading from the document_inspect outline). To replace the whole document, use action=write with expected_hash and the complete text";
 
 /// Fields a document edit action needs besides action and expected_hash,
 /// text first (the order errors have always used).
@@ -1395,7 +1405,9 @@ fn fill_hash_of_own_write(s: &Session, object: &mut serde_json::Map<String, Valu
 
 /// A batch has one document hash. Models often repeat it inside each edit;
 /// accept that when every copy agrees, and supply a missing top-level value
-/// from them. Differing copies are a real conflict.
+/// from them. Differing copies are a real conflict. A blank copy is a filled
+/// placeholder and counts as none: hoisted, it was rejected as empty, and
+/// beside a real top-level hash it read as a conflict.
 fn hoist_batch_expected_hash(args: &mut Value) -> Result<()> {
     let Some(edits) = args.get_mut("edits").and_then(Value::as_array_mut) else {
         return Ok(());
@@ -1405,6 +1417,7 @@ fn hoist_batch_expected_hash(args: &mut Value) -> Result<()> {
         let Some(value) = edit
             .as_object_mut()
             .and_then(|object| object.remove("expected_hash"))
+            .filter(|value| value != "")
         else {
             continue;
         };
@@ -2834,7 +2847,10 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
                     | "section"
             ),
             "expected_section_hash" => action == "section",
-            "expected_hash" => !matches!(action, "create" | "write"),
+            // A blank expected_hash is a placeholder, read as omitted:
+            // anchored text edits need none, and the others report a
+            // missing hash with their dry-run result or take the model's own
+            // last-write hash. "must not be empty" helped no provider.
             _ => false,
         }
     }
@@ -4999,7 +5015,17 @@ fn read_file(
     } else {
         None
     };
-    let path = read_path(&s.project, text(args, "path")?)?;
+    // A provider that fills every field sent path "" (dropped as a blank
+    // placeholder) to read the output, and the bare missing-path error did
+    // not say how to read it.
+    let Some(path) = args["path"].as_str() else {
+        let output = output_path(&s.project).unwrap_or_else(|_| s.project.output.clone());
+        bail!(
+            "missing_argument: path; file_read reads a project file by path (relative to project.root) or continues a truncated read with cursor alone. To read the configured output document, call document_inspect with section set to a heading from its outline, or file_read with path {}",
+            output.display()
+        );
+    };
+    let path = read_path(&s.project, path)?;
     let contents = read_text(&path)?;
     let digest = hash(contents.as_bytes());
     if cursor.as_ref().is_some_and(|c| c.hash != digest) {

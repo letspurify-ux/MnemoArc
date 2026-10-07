@@ -66,9 +66,11 @@ impl LlmClient for ReviewTrace {
         let payload = request["messages"][1]["content"]
             .as_str()
             .and_then(|text| serde_json::from_str::<Value>(text).ok());
+        // Completion reviews too: their unmet checks explain the repair that
+        // follows them, and a live report had no record of one.
         let review = payload
             .as_ref()
-            .is_some_and(|p| p["source_document_review"] == true);
+            .is_some_and(|p| p["source_document_review"] == true || p["completion_review"] == true);
         let started = Instant::now();
         let result = OpenAiClient.complete(request, config, cancel, delta).await;
         if review {
@@ -140,9 +142,30 @@ async fn live_review_trace_preserves_retries_after_success_and_failure() {
             .await
             .is_err()
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    // A completion review is recorded as well; an ordinary model request is
+    // not a review.
+    for (content, review) in [
+        (json!({"completion_review":true}).to_string(), true),
+        ("Write the manual.".to_owned(), false),
+    ] {
+        let request = json!({"messages":[
+            {"role":"system","content":"Test"},
+            {"role":"user","content":content}
+        ]});
+        let before = records.lock().unwrap().len();
+        let (tx, _rx) = mpsc::channel(8);
+        assert!(
+            client
+                .complete(request, &config, CancellationToken::new(), tx)
+                .await
+                .is_err()
+        );
+        assert_eq!(records.lock().unwrap().len(), before + usize::from(review));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 8);
     let records = records.lock().unwrap();
-    assert_eq!(records.len(), 2);
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[2]["input"]["completion_review"], true);
     assert_eq!(records[0]["provider_attempts"], 2);
     assert_eq!(records[1]["provider_attempts"], 2);
     assert_eq!(

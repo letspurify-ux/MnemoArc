@@ -869,6 +869,90 @@ fn closed_list_item_fences_keep_example_citations_out_of_the_audit() {
 }
 
 #[test]
+fn a_link_target_error_names_its_folder_and_the_citation_to_write() {
+    // A live model copied a docs/ page's `../frontend/...#L` links into an
+    // output outside the project, was told that relative paths use
+    // project.root, and rewrote one link target six ways.
+    let (dir, mut s) = source_setup();
+    std::fs::create_dir_all(dir.path().join("frontend/src")).unwrap();
+    std::fs::write(dir.path().join("frontend/src/App.jsx"), "a\nb\nc\n").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    s.project.output = outside.path().join("generated.md");
+    let root = dir.path().canonicalize().unwrap();
+    let spelled = format!("../..{}/frontend/src/App.jsx#L2-L3", root.display());
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":format!(
+            "# Guide\nOpen. [App](../frontend/src/App.jsx#L1-L2)\nSend. [App](frontend/src/App.jsx#L3)\nRoot. [App]({spelled})\nGone. [Gone](../gone.jsx#L1)\nText. frontend/src/App.jsx:1-3\n"
+        )}),
+    );
+    let issues = saved["citation_check"]["issues"].as_array().unwrap();
+    assert_eq!(issues.len(), 4, "{issues:?}");
+    let error = |citation: &str| {
+        issues
+            .iter()
+            .find(|issue| issue["citation"] == citation)
+            .and_then(|issue| issue["error"].as_str())
+            .unwrap_or_else(|| panic!("{citation}: {issues:?}"))
+            .to_owned()
+    };
+    for (citation, instead) in [
+        (
+            "../frontend/src/App.jsx#L1-L2",
+            "cite it as frontend/src/App.jsx:1-2",
+        ),
+        (
+            "frontend/src/App.jsx#L3",
+            "cite it as frontend/src/App.jsx:3",
+        ),
+        (spelled.as_str(), "cite it as frontend/src/App.jsx:2-3"),
+        ("../gone.jsx#L1", "path:start-end relative to project.root"),
+    ] {
+        let error = error(citation);
+        assert!(
+            error.contains("resolves from the output document's folder")
+                && error.contains(instead)
+                && !error.contains("Relative paths use project.root"),
+            "{error}"
+        );
+    }
+    // The same link from an output inside the project resolves.
+    s.project.output = dir.path().join("docs/manual.md");
+    std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+    let inside = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\nOpen. [App](../frontend/src/App.jsx#L1-L2)\n"}),
+    );
+    assert_eq!(inside["citation_check"]["issue_count"], 0, "{inside}");
+}
+
+#[test]
+fn a_section_edit_without_a_heading_points_to_a_whole_document_write() {
+    // A live model sent its complete text as action=section with section ""
+    // and was told only that section must not be empty.
+    let (_dir, mut s) = setup();
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\nText.\n"}),
+    );
+    for args in [
+        json!({"action":"section","text":"# Guide\nNew.\n","expected_hash":created["hash"],"section":"","expected_section_hash":""}),
+        json!({"action":"section","text":"# Guide\nNew.\n","expected_hash":created["hash"]}),
+    ] {
+        let error = tools::execute(&mut s, "document_edit", args)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("To replace the whole document, use action=write"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn inline_code_comment_marker_does_not_hide_following_citation() {
     let (dir, mut s) = source_setup();
     std::fs::write(dir.path().join("source.rs"), "fn source() {}\n").unwrap();
@@ -3207,15 +3291,52 @@ fn anchored_text_edits_accept_an_omitted_hash_but_check_a_supplied_one() {
         conflict.contains("document_revision_conflict"),
         "{conflict}"
     );
-    for edit in [
-        json!({"action":"replace_text","expected_hash":"","old_text":"start line","text":"x"}),
-        json!({"action":"insert_after","section":"# Guide","text":"## More\n"}),
-    ] {
-        assert!(tools::execute(&mut s, "document_edit", edit).is_err());
-    }
+    // A blank hash is a filled placeholder and reads as omitted: a live
+    // provider sent expected_hash "" and was told it must not be empty. The
+    // anchored edit needs no hash; a structural edit and a batch, as with an
+    // omitted hash, take the hash of the model's own last write.
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":"","section":"","expected_section_hash":"","old_text":"start line","text":"opening line"}),
+    );
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_last_child","expected_hash":"","section":"# Guide","text":"## More\n"}),
+    );
+    run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":"","edits":[{"action":"replace_text","expected_hash":"","old_text":"opening line","text":"start line"}]}),
+    );
+    // Nor is a blank copy in an edit a conflict with a real top-level hash.
+    let current = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":current,"edits":[{"action":"replace_text","expected_hash":"","old_text":"middle line","text":"center line"}]}),
+    );
+    let saved = std::fs::read_to_string(&s.project.output).unwrap();
+    assert!(
+        saved.starts_with("# Guide\nstart line\ncenter line\nlast line\n")
+            && saved.contains("## More"),
+        "{saved}"
+    );
+    // After a change by someone else there is no own hash to take, and the
+    // blank hash is reported as missing, not as an empty value.
+    std::fs::write(&s.project.output, "# Guide\nedited elsewhere\n").unwrap();
+    let blank = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_last_child","expected_hash":"","section":"# Guide","text":"## Later\n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(blank.starts_with("document_hash_required"), "{blank}");
     assert_eq!(
         std::fs::read_to_string(&s.project.output).unwrap(),
-        "# Guide\nstart line\nmiddle line\nlast line\n"
+        "# Guide\nedited elsewhere\n"
     );
 }
 

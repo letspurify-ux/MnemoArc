@@ -21,6 +21,28 @@ fn session(root: &std::path::Path) -> Session {
 }
 
 #[test]
+fn a_blank_file_read_path_says_how_to_read_the_output() {
+    // A provider that fills every field sent path "" to read the output and
+    // got only "missing_argument: path".
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let mut current = session(dir.path());
+    current.project.output = outside.path().join("generated.md");
+    let error = tools::execute(
+        &mut current,
+        "file_read",
+        json!({"path":"","cursor":"","start_line":1,"max_lines":5,"limit":5,"force_read":false}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("missing_argument: path"), "{error}");
+    assert!(
+        error.contains("document_inspect") && error.contains("generated.md"),
+        "{error}"
+    );
+}
+
+#[test]
 fn empty_optional_navigation_strings_are_omitted() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("frontend/src")).unwrap();

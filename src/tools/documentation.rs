@@ -917,7 +917,7 @@ fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<
     let mut versions = std::collections::BTreeMap::new();
     for Citation {
         raw,
-        path,
+        path: cited,
         begin,
         end,
         relative_link,
@@ -928,11 +928,11 @@ fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<
             output
                 .parent()
                 .unwrap()
-                .join(path)
+                .join(cited)
                 .to_string_lossy()
                 .into_owned()
         } else {
-            path.clone()
+            cited.clone()
         };
         let check = versions.entry(path.clone()).or_insert_with(|| {
             read_path(&s.project, &path)
@@ -943,10 +943,87 @@ fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<
         match check {
             Ok(lines) if *begin > 0 && end >= begin && end <= lines => {}
             Ok(_) => issues.push(json!({"kind":"citation_range","citation":raw})),
+            Err(error) if *relative_link => {
+                let error = link_target_error(s, output, cited, *begin, *end, error);
+                issues.push(json!({"kind":"citation_path","citation":raw,"error":error}));
+            }
             Err(error) => issues.push(json!({"kind":"citation_path","citation":raw,"error":error})),
         }
     }
     Ok((spans.len(), issues))
+}
+
+/// A `path#Lx-Ly` link target resolves from the output document's folder,
+/// as Markdown links do, but read_path's error says relative paths use
+/// project.root. A live run copied a docs/ page's `../src/...#L` links into
+/// an output outside the project, rewrote one target six ways in 19
+/// requests, and recorded the check itself as broken. Name the folder, where
+/// the target landed, and the project-relative citation to write instead.
+fn link_target_error(
+    s: &Session,
+    output: &Path,
+    target: &str,
+    begin: usize,
+    end: usize,
+    error: &str,
+) -> String {
+    let code = error.split(':').next().unwrap_or("file_access_error");
+    let folder = output.parent().unwrap_or(output);
+    let mut resolved = PathBuf::new();
+    for part in folder.join(target).components() {
+        match part {
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            std::path::Component::CurDir => {}
+            part => resolved.push(part),
+        }
+    }
+    let range = if end > begin {
+        format!("{begin}-{end}")
+    } else {
+        begin.to_string()
+    };
+    let instead = match project_file_for_link(s, target) {
+        Some(relative) => format!("cite it as {relative}:{range}"),
+        None => "cite the project file as path:start-end relative to project.root".to_owned(),
+    };
+    format!(
+        "{code}: a #L link target resolves from the output document's folder {}, not from project.root, so {target} points to {}, which is not a readable project file. {instead} (as text, or as the link text) instead of a #L link target",
+        folder.display(),
+        resolved.display()
+    )
+}
+
+/// The project file a link target was most likely meant to name: the target
+/// without its leading `./` and `../` steps, read from project.root, or the
+/// part after the project root when the target spells out the root's path.
+fn project_file_for_link(s: &Session, target: &str) -> Option<String> {
+    let rest: PathBuf = Path::new(target)
+        .components()
+        .skip_while(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+        .collect();
+    let root = s.project.root.canonicalize().ok()?;
+    let below_root = Path::new("/")
+        .join(&rest)
+        .strip_prefix(&root)
+        .ok()
+        .map(Path::to_path_buf);
+    [Some(rest), below_root]
+        .into_iter()
+        .flatten()
+        .filter(|candidate| !candidate.as_os_str().is_empty())
+        .find_map(|candidate| {
+            let found = read_path(&s.project, &candidate.to_string_lossy()).ok()?;
+            let relative = found.strip_prefix(&root).ok()?;
+            (found.is_file() && !relative.as_os_str().is_empty())
+                .then(|| relative.to_string_lossy().into_owned())
+        })
 }
 
 pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Value> {
