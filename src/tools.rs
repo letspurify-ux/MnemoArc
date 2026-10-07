@@ -1308,6 +1308,46 @@ fn unwrap_continuation_cursor(name: &str, args: &mut Value) {
     }
 }
 
+/// A live model sent lone carriage returns as the line breaks of its document
+/// edits (19 to 40 each); saved, they showed as broken text that the review
+/// reported three times. A carriage return without a line feed is no
+/// Markdown line ending, so it is the line break the text meant. Old text
+/// gets the same treatment, so a passage copied from such an edit still
+/// matches what was saved; a CRLF pair stays as it is.
+fn normalize_lone_carriage_returns(name: &str, args: &mut Value) {
+    fn line_breaks(value: &mut Value) {
+        let Some(text) = value.as_str().filter(|text| text.contains('\r')) else {
+            return;
+        };
+        let mut fixed = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            fixed.push(if c == '\r' && chars.peek() != Some(&'\n') {
+                '\n'
+            } else {
+                c
+            });
+        }
+        *value = Value::String(fixed);
+    }
+    let edits: Vec<&mut Value> = match name {
+        "document_edit" => vec![args],
+        "document_edit_batch" => args
+            .get_mut("edits")
+            .and_then(Value::as_array_mut)
+            .map(|edits| edits.iter_mut().collect())
+            .unwrap_or_default(),
+        _ => return,
+    };
+    for edit in edits {
+        for key in ["text", "old_text"] {
+            if let Some(value) = edit.get_mut(key) {
+                line_breaks(value);
+            }
+        }
+    }
+}
+
 /// A live model sent task_state its whole call as the patch, as JSON text
 /// ({"patch":"{\"action\":\"update\",\"patch\":{...}}"}), and was refused for
 /// a missing action. No patch field is called action, so a patch naming one
@@ -2742,14 +2782,22 @@ fn persist_document_edit(
     }
     let citation_check = documentation::citation_check(s, path, &result)?;
     let format_check = document_format::check(&result).write_result();
-    Ok(json!({
+    let mut saved = json!({
         "path":path,
         "hash":hash,
         "bytes":bytes,
         "total_lines":total_lines,
         "citation_check":citation_check,
         "format_check":format_check
-    }))
+    });
+    // Each save says what a non-developer reader would not understand, while
+    // the passage is still fresh to the writer.
+    if s.is_document_work()
+        && let Some(check) = documentation::audience_check(&s.project.audience, &result)
+    {
+        saved["audience_check"] = check;
+    }
+    Ok(saved)
 }
 
 const MEMORY_MANAGE_ACTIONS: &[&str] = &["candidates", "delete", "replace"];
@@ -3766,6 +3814,21 @@ struct FileScanLimits {
     max_path_bytes: usize,
 }
 
+/// Directories no project walk enters: version control, dependencies and
+/// build output.
+const SKIPPED_DIRECTORIES: [&str; 10] = [
+    ".git",
+    ".hg",
+    ".svn",
+    "target",
+    "node_modules",
+    "vendor",
+    "dist",
+    "build",
+    ".venv",
+    "__pycache__",
+];
+
 fn candidate_paths_bounded(
     p: &Project,
     pattern: Option<&str>,
@@ -3804,19 +3867,7 @@ fn candidate_paths_bounded(
         .follow_links(false)
         .filter_entry(move |entry| {
             !entry.file_type().is_some_and(|t| t.is_dir())
-                || (![
-                    ".git",
-                    ".hg",
-                    ".svn",
-                    "target",
-                    "node_modules",
-                    "vendor",
-                    "dist",
-                    "build",
-                    ".venv",
-                    "__pycache__",
-                ]
-                .contains(&entry.file_name().to_string_lossy().as_ref())
+                || (!SKIPPED_DIRECTORIES.contains(&entry.file_name().to_string_lossy().as_ref())
                     && scope.as_ref().is_none_or(|scope| {
                         entry.path().starts_with(scope) || scope.starts_with(entry.path())
                     }))
@@ -4284,6 +4335,7 @@ fn execute_repaired(
     normalize_integer_arguments(name, &mut args);
     unwrap_continuation_cursor(name, &mut args);
     normalize_argument_aliases(s, name, &mut args)?;
+    normalize_lone_carriage_returns(name, &mut args);
     drop_empty_unaccepted_fields(name, &mut args);
     if name == "source_search"
         && args["query"]

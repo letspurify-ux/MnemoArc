@@ -466,6 +466,117 @@ fn a_section_hash_beside_a_scoped_text_edit_guards_that_section() {
 }
 
 #[test]
+fn lone_carriage_returns_in_document_text_are_saved_as_line_breaks() {
+    // A live model sent lone carriage returns as the line breaks of its
+    // edits (19 to 40 each); saved, they showed as broken text that the
+    // document review reported three times.
+    let (_dir, mut s) = setup();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\r\rFirst line.\rSecond line.\r\n"}),
+    );
+    let saved = std::fs::read_to_string(&s.project.output).unwrap();
+    assert_eq!(saved, "# Guide\n\nFirst line.\nSecond line.\r\n");
+    // An old_text copied from such text still finds the saved passage.
+    run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":tools::hash(saved.as_bytes()),"edits":[{"action":"replace_text","old_text":"First line.\rSecond","text":"One line.\rTwo"}]}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\n\nOne line.\nTwo line.\r\n"
+    );
+}
+
+#[test]
+fn identifiers_in_diagram_labels_are_flagged_for_non_developers() {
+    // A live end-user document kept tool names in its flowchart nodes: the
+    // check skipped Mermaid blocks entirely, and the reviewer let them stay.
+    let (_dir, mut s) = source_setup();
+    s.project.audience = "일반 사용자".into();
+    let text = "# 흐름\n\n```mermaid\nflowchart TD\n    A[사용자 요청] --> B[소스 탐색<br/>source_search / code_outline]\n    B -->|미독 인용 있음| C[document_edit 로 저장]\n    C --> D((\"documentation::execute\"))\n    D -.-> E{확인}\n```\n";
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":text}),
+    );
+    let flagged: Vec<_> = saved["audience_check"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            (
+                item["kind"].as_str().unwrap(),
+                item["text"].as_str().unwrap(),
+                item["line"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    // Node ids, the diagram type, arrows and <br/> are diagram syntax.
+    assert_eq!(
+        flagged,
+        [
+            ("diagram_label", "source_search", 5),
+            ("diagram_label", "code_outline", 5),
+            ("diagram_label", "document_edit", 6),
+            ("diagram_label", "documentation::execute", 7),
+        ],
+        "{saved}"
+    );
+}
+
+#[test]
+fn a_document_for_non_developers_names_its_implementation_details() {
+    // An end-user document quoted `documentation::execute`, `resolve_heading`
+    // and error codes, and both reviews approved it.
+    let (dir, mut s) = source_setup();
+    s.project.audience = "일반 사용자".into();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    run(&mut s, "file_read", json!({"path":"main.rs"}));
+    let text = "# 안내\n\n`documentation::execute`가 `resolve_heading`으로 섹션을 찾고 `document_hash_required`를 냅니다 (`main.rs:1`).\n\n화면의 `채팅으로` 버튼과 `Shift+Enter`, `config.toml`을 씁니다.\n\n```rust\nfn main() {}\n```\n\n```mermaid\nflowchart TD\n  A[저장 단계] --> B\n```\n\nmodule::path 호출.\n";
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":text}),
+    );
+    let check = &saved["audience_check"];
+    assert_eq!(check["flagged"], 5, "{saved}");
+    let flagged: Vec<_> = check["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            (
+                item["kind"].as_str().unwrap(),
+                item["text"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        flagged,
+        [
+            ("inline_code", "documentation::execute"),
+            ("inline_code", "resolve_heading"),
+            ("inline_code", "document_hash_required"),
+            ("code_block", "```rust"),
+            ("identifier", "module::path"),
+        ]
+    );
+    assert_eq!(check["items"][3]["line"], 7);
+    // The audit reports the same advice without making it a structural issue.
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert_eq!(audit["structural_ok"], true, "{audit}");
+    assert_eq!(audit["issue_count"], 0, "{audit}");
+    assert_eq!(audit["audience_check"]["flagged"], 5, "{audit}");
+    // Developers may read the internals.
+    s.project.audience = "신규 개발자".into();
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert!(audit.get("audience_check").is_none(), "{audit}");
+}
+
+#[test]
 fn an_unaccepted_edit_field_is_reported_with_the_fields_still_missing() {
     // The live call also lacked text; its error named only the extra field,
     // so one retry could fix one problem.

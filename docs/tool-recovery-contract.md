@@ -200,6 +200,7 @@ GLM(z-ai/glm-5.3-flash) 실행에서 확인한 2건도 고쳤다(2026-10-07).
 
 - `section`으로 범위를 정한 텍스트 편집(`replace_text`·`delete_text`·`insert_*_text`·`patch`)은 `expected_section_hash`를 그 섹션이 읽은 버전 그대로인지 확인하는 조건으로 받는다. `document_edit`과 `document_edit_batch` 모두 같다. 해시가 다르면 `action=section`과 같은 `section_revision_conflict`를 내고, `section` 없이 해시만 오면 확인할 섹션이 없다고 거절한다. `document_edit`이 받지 않는 인자로 거절할 때는 빠진 필드도 함께 적는다. 해시를 붙이고 `text`를 빠뜨린 호출이 해시만 지적받았다.
 - `task_plan`에 `action` 없이 `operations`가 오면 `apply`로 처리한다.
+- 문서 편집의 `text`·`old_text`에서 홀로 있는 `\r`은 줄바꿈으로 바꾼다. GLM이 줄바꿈 대신 `\r`을 보내 문서에 깨진 글자가 남았고, 문서 리뷰가 이를 세 번 지적하는 동안 여러 라운드를 썼다. `old_text`도 같이 바꾸므로 그런 편집에서 복사한 구절이 저장된 문서와 맞는다.
 
 
 ## 문서 검증 도구 개선 (2026-09-21)

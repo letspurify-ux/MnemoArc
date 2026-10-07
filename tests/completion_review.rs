@@ -597,18 +597,21 @@ fn reading_an_unread_citation_gets_a_fresh_review_without_a_document_edit() {
         Gate::Review
     );
     let p = payload(&review::request(&mut s).unwrap());
-    assert_eq!(
-        p["criteria"].as_array().unwrap().len(),
-        1,
-        "Only the actual user request is a requirement"
-    );
-    assert_eq!(p["criteria"][0]["id"], "R0");
+    // Only the actual user request and the runtime scope check are criteria.
+    let ids: Vec<_> = p["criteria"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["R0", "S1"]);
     assert_eq!(p["evidence"][2]["kind"], "runtime_citation_coverage", "{p}");
     assert_eq!(p["evidence"][2]["unread_count"], 1, "{p}");
     assert_eq!(p["evidence"][2]["unread_citations"][0]["path"], "ui.js");
     let mut response: Value = serde_json::from_str(&verdict(&p, false)).unwrap();
     response["checks"][0]["reason"] = json!("ui.js:1 is cited but was never read");
     response["checks"][0]["next_action"] = json!("Read ui.js:1");
+    response["checks"][1] = json!({"id":"S1","status":"met","reason":"The manual concerns the read screen only","evidence":[p["evidence"][1]["id"]],"next_action":""});
     assert!(
         review::finish(&mut s, &response.to_string())
             .unwrap()
@@ -1081,6 +1084,108 @@ fn runtime_write_log_and_saved_file_precede_newer_observations() {
     assert_eq!(evidence[2]["kind"], "runtime_citation_coverage", "{p}");
     assert_eq!(evidence[3]["kind"], "current_file", "{p}");
     assert_eq!(evidence[4]["kind"], "tool_observation", "{p}");
+}
+
+#[test]
+fn a_source_document_review_sees_the_project_map_and_judges_scope() {
+    // A live "documentation logic" document read one module of a 200-file
+    // project and both reviews approved it: the reviewer saw only what the
+    // writer had read, so nothing showed the areas it never opened.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src/tools")).unwrap();
+    std::fs::write(
+        dir.path().join("src/tools/documentation.rs"),
+        "fn audit() {}\nfn inspect() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/tools/document_review.rs"),
+        "fn review() {}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("src/agent.rs"), "fn run() {}\n").unwrap();
+    std::fs::write(dir.path().join("logo.png"), [0u8, 1, 2]).unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("manual.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128000),
+            ..support::compact_config()
+        },
+    );
+    s.add_user("Explain the documentation logic in detail".into());
+    s.select_workflow("source_document").unwrap();
+    s.active_tools = tools::ToolRegistry::optional_names();
+    document_step(
+        &mut s,
+        "file_read",
+        json!({"path":"src/tools/documentation.rs"}),
+    );
+    document_step(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Logic\n\nAudits run first (src/tools/documentation.rs:1).\n"}),
+    );
+    review::begin(&mut s, "Saved manual.md").unwrap();
+    let request = review::request(&mut s).unwrap();
+    assert!(
+        request["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("runtime_project_map is a runtime record")
+    );
+    let p = payload(&request);
+    let evidence = p["evidence"].as_array().unwrap();
+    let map = evidence
+        .iter()
+        .find(|e| e["kind"] == "runtime_project_map")
+        .expect("project map evidence");
+    // Binary files and the output itself are left out.
+    assert_eq!(map["files"], 3, "{map}");
+    assert_eq!(map["opened"], 1, "{map}");
+    assert_eq!(
+        map["directories"]["src/tools/"],
+        "document_review.rs documentation.rs[read 2 lines, cited]",
+        "{map}"
+    );
+    assert_eq!(map["directories"]["src/"], "agent.rs tools/", "{map}");
+    assert_eq!(map["directories"]["./"], "src/", "{map}");
+    // The map follows the saved document and precedes newer observations.
+    let position = |kind: &str| evidence.iter().position(|e| e["kind"] == kind).unwrap();
+    assert!(position("current_file") < position("runtime_project_map"));
+    assert!(position("runtime_project_map") < position("tool_observation"));
+    let scope = p["criteria"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "S1")
+        .expect("scope criterion");
+    assert!(
+        scope["text"]
+            .as_str()
+            .unwrap()
+            .contains("runtime_project_map"),
+        "{scope}"
+    );
+
+    // A chat answer is not a source document: no map and no scope criterion.
+    let other = tempfile::tempdir().unwrap();
+    let mut s = session(other.path());
+    write(&mut s, "Conclusion: done\nExample: shown\n");
+    review::begin(&mut s, "Saved result.txt").unwrap();
+    let p = payload(&review::request(&mut s).unwrap());
+    assert!(!p.to_string().contains("runtime_project_map"), "{p}");
+    assert!(
+        p["criteria"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["id"] != "S1")
+    );
 }
 
 #[test]

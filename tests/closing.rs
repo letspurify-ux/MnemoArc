@@ -2036,7 +2036,7 @@ async fn completion_repair_reads_count_until_the_next_review() {
     }
     let verdict = json!({"checks":[{"id":"R0","status":"unverified",
         "reason":"The exported values are not documented","evidence":[],
-        "next_action":"Read a.js, b.js and c.js and document their values"}]});
+        "next_action":"Read a.js, b.js and c.js and document their values"},{"id":"S1","status":"met","reason":"The request concerns only the parts already read","evidence":["E1"],"next_action":""}]});
     let mut steps = vec![
         Completion {
             text: "Saved out.md with the loop and history sections.".into(),
@@ -2219,7 +2219,7 @@ async fn closing_drops_the_unmet_error_of_an_earlier_version() {
     };
     let verdict = json!({"checks":[{"id":"R0","status":"unmet",
         "reason":"The history section does not name its helper","evidence":[],
-        "next_action":"Name the helper that normalizes history"}]});
+        "next_action":"Name the helper that normalizes history"},{"id":"S1","status":"met","reason":"The request concerns only the parts already read","evidence":["E1"],"next_action":""}]});
     let steps = vec![
         used(
             10_000,
@@ -2282,7 +2282,7 @@ async fn checkpoint_requests_carry_no_repair_message() {
         &mut s,
         &json!({"checks":[{"id":"R0","status":"unmet",
             "reason":"The exported value is not documented","evidence":[],
-            "next_action":"Document the value exported by a.js"}]})
+            "next_action":"Document the value exported by a.js"},{"id":"S1","status":"met","reason":"The request concerns only the parts already read","evidence":["E1"],"next_action":""}]})
         .to_string(),
     )
     .unwrap();

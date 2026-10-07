@@ -98,6 +98,39 @@ fn review_uses_caller_criteria_without_promoting_agent_workflow_checks() {
 }
 
 #[test]
+fn a_review_for_non_developers_lists_the_implementation_details_found() {
+    // The reviewer of an end-user document full of identifiers reported none.
+    let (dir, mut s) = fixture();
+    s.project.audience = "end users".into();
+    let current = tools::hash(&std::fs::read(dir.path().join("out.md")).unwrap());
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","expected_hash":current,"text":"# Flow\n`normalize_history` runs work. main.js:4-5\n"}),
+    )
+    .unwrap();
+    let request = document_review::request(&mut s).unwrap();
+    assert!(
+        request["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("audience_flags, when present, lists implementation details")
+    );
+    let payload: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        payload["audience_flags"],
+        json!([{"line":2,"kind":"inline_code","text":"normalize_history"}])
+    );
+    // A developer audience gets no flags.
+    s.project.audience = "maintainers".into();
+    let request = document_review::request(&mut s).unwrap();
+    let payload: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert!(payload.get("audience_flags").is_none(), "{payload}");
+}
+
+#[test]
 fn review_of_an_unprepared_request_does_not_use_agent_completion_checks() {
     let (_dir, mut s) = fixture();
     let request = document_review::request(&mut s).unwrap();

@@ -3746,7 +3746,7 @@ mod review_gap_tests {
         review::finish(
             &mut s,
             &json!({"checks":[{"id":"R0","status":"unverified",
-            "reason":"The chat screen section is incomplete","evidence":["E2"],"next_action":"Complete the chat section"}]})
+            "reason":"The chat screen section is incomplete","evidence":["E2"],"next_action":"Complete the chat section"},{"id":"S1","status":"met","reason":"The request concerns only the parts already read","evidence":["E1"],"next_action":""}]})
             .to_string(),
         )
         .unwrap();
@@ -3793,7 +3793,8 @@ mod review_gap_tests {
             .find(|e| e["kind"] == "current_file")
             .unwrap();
         review::finish(&mut s, &json!({"checks":[{"id":"R0","status":"met",
-            "reason":"Saved manual covers the chat screen","evidence":[file["id"]],"next_action":""}]}).to_string()).unwrap();
+            "reason":"Saved manual covers the chat screen","evidence":[file["id"]],"next_action":""},
+            {"id":"S1","status":"met","reason":"The request concerns only the chat screen","evidence":[file["id"]],"next_action":""}]}).to_string()).unwrap();
         assert!(collect_gaps(&mut s, &[]).is_empty());
         assert!(ready_for_final(&mut s));
     }
@@ -3865,7 +3866,7 @@ mod review_gap_tests {
         review::finish(
             &mut s,
             &json!({"checks":[{"id":"R0","status":"unmet",
-            "reason":"Only the chat screen is covered","evidence":["E2"],"next_action":"Document the remaining screens"}]})
+            "reason":"Only the chat screen is covered","evidence":["E2"],"next_action":"Document the remaining screens"},{"id":"S1","status":"met","reason":"The request concerns only the parts already read","evidence":["E1"],"next_action":""}]})
             .to_string(),
         )
         .unwrap();
