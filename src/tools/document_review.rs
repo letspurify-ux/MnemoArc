@@ -1234,8 +1234,29 @@ pub(crate) fn parse_reply<T: serde::de::DeserializeOwned>(
         // repair parses; otherwise the strict error names the fault.
         Err(error) => escape_string_controls(body)
             .and_then(|repaired| serde_json::from_str(&repaired).ok())
+            .or_else(|| doubled_wrapper(body, field))
             .ok_or_else(|| anyhow::anyhow!("{code}: {error}"))?,
     };
+    let mut value = value;
+    // The same doubled wrapper, closed: {"issues":[{"issues":[...]}]} or
+    // {"issues":{"issues":[...]}}. No list item has the field as its only key.
+    if let Some(map) = value.as_object_mut()
+        && let Some(inner) = map.get(field).and_then(|wrapped| {
+            let only_field = |item: &Value| {
+                item.as_object()
+                    .is_some_and(|object| object.len() == 1 && object.contains_key(field))
+            };
+            match wrapped {
+                Value::Array(items) if items.len() == 1 && only_field(&items[0]) => {
+                    Some(items[0][field].clone())
+                }
+                item if only_field(item) => Some(item[field].clone()),
+                _ => None,
+            }
+        })
+    {
+        map.insert(field.to_owned(), inner);
+    }
     let value = match value {
         Value::Array(items) => json!({ field: items }),
         // Reviewers echo request keys (requirement_catalog) beside the
@@ -1248,6 +1269,22 @@ pub(crate) fn parse_reply<T: serde::de::DeserializeOwned>(
         _ => bail!("{code}: expected one JSON object {{\"{field}\":[...]}}"),
     };
     serde_json::from_value(value).map_err(|e| anyhow::anyhow!("{code}: {e}"))
+}
+
+/// A reply that opened its wrapper twice and closed it once:
+/// `{"issues":[{"issues":[...]}` or `{"issues":{"issues":[]}`. A live
+/// reviewer did this in two runs; in closing mode the format error dropped
+/// the whole document review. The inner object is the whole answer.
+fn doubled_wrapper(body: &str, field: &str) -> Option<Value> {
+    let rest = body.trim_start().strip_prefix('{')?.trim_start();
+    let rest = rest
+        .strip_prefix(&format!("\"{field}\""))?
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
+    let rest = rest.strip_prefix('[').map_or(rest, str::trim_start);
+    let inner: Value = serde_json::from_str(rest).ok()?;
+    inner.get(field).is_some().then_some(inner)
 }
 
 #[derive(Deserialize)]

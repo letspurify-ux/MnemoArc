@@ -2668,6 +2668,17 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                 } else {
                     (target, new)
                 };
+            let recovered: (String, String);
+            let (target, new) = match (!scope.contains(target))
+                .then(|| recover_copied_text(old, scope, target, new))
+                .flatten()
+            {
+                Some(found) => {
+                    recovered = found;
+                    (recovered.0.as_str(), recovered.1.as_str())
+                }
+                None => (target, new),
+            };
             let (relative_start, relative_end) =
                 unique_document_text_span(scope, target).map_err(|error| {
                     scoped
@@ -2779,6 +2790,56 @@ fn inserted_sibling_sections(old: &str, new: &str, section: &str) -> Vec<String>
         })
         .map(|heading| heading.heading.clone())
         .collect()
+}
+
+/// Copying noise from numbered tool output. file_read shows a line as
+/// `N|text`, so a Markdown table row reads `57|| a | b |`, and a live model
+/// sent `|| a | b |` as old_text 21 times (12 on one row it never fixed).
+/// The JSON of a tool result shows a quote as `\"`, which was copied as
+/// well. When old_text is absent and the passage matches exactly once with
+/// only these artifacts removed, use that passage and remove the same
+/// artifacts from the new text. A `\"` is unescaped only when the document
+/// has none.
+fn recover_copied_text(
+    doc: &str,
+    scope: &str,
+    target: &str,
+    new: &str,
+) -> Option<(String, String)> {
+    let doubled_pipe = target
+        .split_inclusive('\n')
+        .any(|line| line.starts_with("||"));
+    let escaped_quote = target.contains("\\\"") && !doc.contains("\\\"");
+    for (pipes, quotes) in [(true, false), (false, true), (true, true)] {
+        if (pipes && !doubled_pipe) || (quotes && !escaped_quote) {
+            continue;
+        }
+        let clean = |text: &str| {
+            let text: String = if pipes {
+                text.split_inclusive('\n')
+                    .map(|line| {
+                        if line.starts_with("||") {
+                            &line[1..]
+                        } else {
+                            line
+                        }
+                    })
+                    .collect()
+            } else {
+                text.to_owned()
+            };
+            if quotes {
+                text.replace("\\\"", "\"")
+            } else {
+                text
+            }
+        };
+        let candidate = clean(target);
+        if !candidate.trim().is_empty() && scope.matches(candidate.as_str()).count() == 1 {
+            return Some((candidate, clean(new)));
+        }
+    }
+    None
 }
 
 fn persist_document_edit(

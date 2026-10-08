@@ -3626,6 +3626,51 @@ fn replace_text_ignores_whitespace_around_old_text() {
 }
 
 #[test]
+fn text_edits_recover_table_rows_copied_with_their_line_number_pipe() {
+    // Live run 2026-10-08: file_read shows a table row as `57|| a | b |`;
+    // the model sent `|| a | b |` as old_text, with the JSON's `\"` copied
+    // as a literal backslash, and failed 21 edits (12 on one row it never
+    // fixed).
+    let (_dir, mut s) = setup();
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n| Page | Shown |\n|---|---|\n| **settings** | `page === \"settings\"` |\n| **projects** | `page === \"projects\"` |\n"}),
+    );
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":created["hash"],"old_text":"|| **settings** | `page === \\\"settings\\\"` |","text":"|| **settings** | 설정 화면 |"}),
+    );
+    let saved = run(
+        &mut s,
+        "document_edit_batch",
+        json!({"edits":[{"action":"replace_text","old_text":"|| **projects** | `page === \"projects\"` |\n","text":"|| **projects** | 프로젝트 화면 |\n|| **chat** | 채팅 화면 |\n"}]}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\n| Page | Shown |\n|---|---|\n| **settings** | 설정 화면 |\n| **projects** | 프로젝트 화면 |\n| **chat** | 채팅 화면 |\n"
+    );
+    // A document that has `\"` keeps it: only an absent passage is
+    // recovered, and only as a single exact match.
+    let quoted = "# Guide\n```js\nconst a = \"x \\\"y\\\"\";\n```\n| **a** | \"b\" |\n";
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","expected_hash":saved["hash"],"text":quoted}),
+    );
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":saved["hash"],"old_text":"| **a** | \\\"b\\\" |","text":"| **a** | c |"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("patch_target_must_match_once"), "{error}");
+    assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), quoted);
+}
+
+#[test]
 fn appended_heading_follows_the_document_heading_spacing() {
     let cases = [
         // Spaced headings: one blank line whatever the document ends with.

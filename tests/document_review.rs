@@ -2279,6 +2279,46 @@ fn a_bare_issue_array_is_read_as_the_issue_list() {
     assert!(document_review::approved(&s));
 }
 
+#[test]
+fn a_reply_that_opens_its_wrapper_twice_is_read_as_the_inner_answer() {
+    // Live runs 2026-10-08: a reviewer answered {"issues":{ "issues": [] }
+    // and {"issues":[{"issues":[...]}; in closing mode the format error
+    // dropped the whole document review.
+    for reply in [
+        r#"{"issues":{ "issues": [] }"#,
+        r#"{"issues":[{"issues":[]}"#,
+        r#"{"issues":[{"issues":[]}]}"#,
+        r#"{"issues":{"issues":[]}}"#,
+    ] {
+        let (_dir, mut s) = fixture();
+        document_review::request(&mut s).unwrap();
+        support::document_review::finish(&mut s, reply).unwrap();
+        assert!(document_review::approved(&s), "{reply}");
+    }
+    let (_dir, mut s) = fixture();
+    document_review::request(&mut s).unwrap();
+    support::document_review::finish(
+        &mut s,
+        r##"{"issues":[{"issues":[{"previous_id":null,"kind":"scope","document":{"start_line":1,"end_line":1,"quote":"# Flow"},"requirement_id":"R0","sources":[],"problem":"Flow: for loop, not while; history omitted","correction":"Describe the for loop and history normalization.","ui_labels":[]}]}"##,
+    )
+    .unwrap();
+    assert!(!document_review::approved(&s));
+    assert!(
+        s.document_review
+            .issues
+            .iter()
+            .any(|issue| issue.contains("for loop, not while")),
+        "{:?}",
+        s.document_review.issues
+    );
+    // Anything else that does not parse is still rejected.
+    document_review::request(&mut s).unwrap();
+    let error = support::document_review::finish(&mut s, r#"{"issues":[{"issues":["#)
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("document_review_invalid: EOF"), "{error}");
+}
+
 /// Answers once; counts model requests apart from the two reviews.
 struct OneFinalAnswer {
     model_calls: std::sync::atomic::AtomicUsize,
