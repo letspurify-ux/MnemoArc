@@ -1578,6 +1578,22 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
         {
             args["action"] = json!("apply");
         }
+        // An operation name sent as the action next to an operations array,
+        // e.g. {action:"insert",operations:[{op:"insert",...}]}: the array
+        // says what to apply. A live run's first plan was refused this way
+        // and it then worked for 100 requests without a plan.
+        "task_plan"
+            if args["action"].as_str().is_some_and(|action| {
+                [
+                    "insert", "update", "split", "move", "remove", "complete", "reopen",
+                ]
+                .contains(&action)
+            }) && args.get("operations").is_some_and(|operations| {
+                operations.as_array().is_some_and(|ops| !ops.is_empty())
+            }) =>
+        {
+            args["action"] = json!("apply");
+        }
         // One plan operation flattened into the call, e.g.
         // {action:"complete",id,result}, means an apply with that operation.
         "task_plan"

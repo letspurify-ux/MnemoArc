@@ -358,6 +358,15 @@ impl HeadingIndex {
 /// has that name (read_path's rule for an output outside the root). An
 /// existing output also matches through symlinks, such as /var and
 /// /private/var.
+/// Whether two paths name the same file, resolving symlinks when both exist.
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (a.canonicalize(), b.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
 pub(super) fn names_output(s: &Session, path: &str, output: &Path) -> bool {
     let given = Path::new(path);
     // Joining an absolute path yields that path.
@@ -388,6 +397,7 @@ pub(super) fn execute(
     match name {
         "document_inspect" => {
             let output = output_path(&s.project);
+            let output_file = output.as_ref().ok().cloned();
             let path = match (args["path"].as_str(), &output) {
                 // Before the first write the configured output has nothing
                 // to resolve. Named by its path, it is reported missing as a
@@ -433,6 +443,20 @@ pub(super) fn execute(
                 );
             }
             let mut result = json!({"exists":true,"path":path,"hash":digest,"total_lines":doc.lines().count(),"bytes":doc.len()});
+            // Another document read by path is not the one the edit tools
+            // change. A live run inspected the project's own user manual,
+            // took its outdated links for its output's text, and spent its
+            // closing requests editing passages its output no longer had.
+            if let Some(output) = &output_file
+                && !same_file(&path, output)
+            {
+                result["configured_output"] = json!(false);
+                result["note"] = json!(format!(
+                    "This is {}, not the configured output {}. document_edit, document_edit_batch and document_audit change and check only the configured output; call document_inspect without path to read it.",
+                    path.display(),
+                    output.display()
+                ));
+            }
             if let Some(heading) = args["section"].as_str() {
                 let resolved = resolve_heading(&doc, heading)?;
                 let section = &doc[resolved.start..resolved.end];
@@ -1425,7 +1449,7 @@ fn project_file_for_link(s: &Session, target: &str) -> Option<String> {
 /// A source document without a machine-readable citation can be neither
 /// reviewed nor finished: say so on every save and audit, not only when the
 /// final answer is refused.
-const NO_CITATIONS_GUIDANCE: &str = "The document cites no project source as relative/path.ext:start-end. Cite the sources of its claims next to them (for example backend/src/server.js:12-30); the final answer is refused while the document cites no project source. Other citation formats require manual review.";
+const NO_CITATIONS_GUIDANCE: &str = "The document cites no project source as relative/path.ext:start-end. Cite the sources of its claims next to them (for example backend/src/server.js:12-30); the final answer is refused while the document cites no project source. memory_read returns the path and lines of each source saved with a memory. Other citation formats require manual review.";
 
 pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Value> {
     let (checked, issues) = citation_issues(s, output, doc)?;

@@ -376,6 +376,26 @@ pub struct ProgressRecovery {
     /// Set when a document-work response hit the output limit: a whole
     /// document rewrite is withheld until a smaller edit succeeds.
     pub whole_write_withheld: bool,
+    /// Plan states already pointed out in run_guidance.plan_check, so each
+    /// state is pointed out once even when another check comes in between.
+    #[serde(skip)]
+    pub plan_checks_shown: BTreeSet<String>,
+    /// The current to-do as the plan checks watch it.
+    #[serde(skip)]
+    pub todo_watch: Option<TodoWatch>,
+    /// Checkpoints completed when the plan was last checked.
+    #[serde(skip)]
+    pub plan_checkpoints_seen: usize,
+}
+
+/// The current to-do with the task round it became current, and the
+/// document section count and task round its next check counts from.
+#[derive(Clone, Debug, Default)]
+pub struct TodoWatch {
+    pub id: String,
+    pub since_round: usize,
+    pub sections: usize,
+    pub from_round: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

@@ -100,7 +100,7 @@ fn an_oversized_result_is_told_its_length() {
     let id = s.task.current_todo().unwrap().id.clone();
     // Live run: results carrying a full hash and audit dump were refused
     // four times in a row without saying how long they were.
-    let result = format!("현재 해시 {} 문서 audit 통과", "5".repeat(300));
+    let result = format!("현재 해시 {} 문서 audit 통과", "5".repeat(600));
     let refused = apply(&mut s, json!([{"op":"complete","id":id,"result":result}]));
     assert_eq!(refused["applied"], false, "{refused}");
     let reason = refused["reason"].as_str().unwrap();
@@ -109,6 +109,13 @@ fn an_oversized_result_is_told_its_length() {
         "{reason}"
     );
     assert!(!s.task.todos[0].done);
+    // A live model's 382-character result was refused and it wrote the
+    // result into the item text instead; results up to 500 are accepted.
+    let result = "조사 결과 ".repeat(70);
+    assert!(result.chars().count() > 240 && result.chars().count() <= 500);
+    let applied = apply(&mut s, json!([{"op":"complete","id":id,"result":result}]));
+    assert_eq!(applied["applied"], true, "{applied}");
+    assert!(s.task.todos[0].done);
 }
 
 #[test]
@@ -174,7 +181,7 @@ fn normalized_inputs_still_enforce_revision_order_bounds_and_atomicity() {
         json!(
             json!([
                 {"op":"remove","id":"T1","reason":"Do not commit part of a batch"},
-                {"op":"insert","texts":["Too long".repeat(30)]}
+                {"op":"insert","texts":["Too long".repeat(70)]}
             ])
             .to_string()
         ),
@@ -939,6 +946,33 @@ fn a_flattened_operation_is_applied_as_one_operation() {
 }
 
 #[test]
+fn a_first_plan_sent_with_an_operation_as_its_action_is_applied() {
+    // The live shape: action "insert" next to the operations, no revision,
+    // and an invented id. It was refused, and the run never made a plan.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let result = tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"insert","operations":[{"id":"p1","op":"insert","texts":["App.jsx 조사","Settings.jsx 조사"]}]}),
+    )
+    .unwrap();
+    assert_eq!(result["applied"], true, "{result}");
+    assert_eq!(s.task.todos.len(), 2);
+    assert_eq!(s.task.plan_revision, 1);
+    // A later apply still has to name the revision it changes.
+    let result = tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"insert","operations":[{"op":"insert","texts":["Chat.jsx 조사"]}]}),
+    )
+    .unwrap();
+    assert_eq!(result["applied"], false, "{result}");
+    assert_eq!(result["conflict"]["code"], "missing_revision", "{result}");
+    assert_eq!(s.task.todos.len(), 2);
+}
+
+#[test]
 fn a_failed_operation_in_a_batch_is_named_with_the_current_item() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
@@ -1352,12 +1386,22 @@ fn stale_revision_asks_for_one_apply_per_response() {
 fn an_operation_name_sent_as_the_action_names_the_apply_call() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
-    // A live run resent action="insert" three times: the error named only
-    // the field, never the allowed actions or where an op belongs.
-    let error = tools::execute(
+    // An operation name next to an operations array is an apply: the array
+    // says what to do.
+    let result = tools::execute(
         &mut s,
         "task_plan",
         json!({"action":"insert","operations":[{"op":"insert","texts":["Write the guide"]}]}),
+    )
+    .unwrap();
+    assert_eq!(result["applied"], true, "{result}");
+    // A live run resent action="insert" three times: the error named only
+    // the field, never the allowed actions or where an op belongs. Without
+    // an operations array the action is still refused with that hint.
+    let error = tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"insert","expected_revision":1,"operations":"insert Write the guide"}),
     )
     .unwrap_err()
     .to_string();
@@ -1388,14 +1432,6 @@ fn an_operation_name_sent_as_the_action_names_the_apply_call() {
         error,
         "invalid_argument_value: action \"zebra\" is not one of: list, apply"
     );
-    // The named call succeeds.
-    let revision = s.task.plan_revision;
-    tools::execute(
-        &mut s,
-        "task_plan",
-        json!({"action":"apply","expected_revision":revision,"operations":[{"op":"insert","texts":["Write the guide"]}]}),
-    )
-    .unwrap();
     assert_eq!(
         s.task.current_todo().map(|t| t.text.as_str()),
         Some("Write the guide")

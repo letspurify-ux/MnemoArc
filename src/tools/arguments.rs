@@ -132,10 +132,27 @@ pub(super) fn validate_field(
     };
     if !kinds.is_empty() && !kinds.iter().any(|kind| matches_type(value, kind)) {
         let expected = kinds.join(" or ");
-        let hint = if value.is_string() && (kinds.contains(&"array") || kinds.contains(&"object")) {
-            "; send structured JSON, not text containing JSON; object keys need double quotes"
-        } else {
-            ""
+        let hint = match value.as_str() {
+            Some(text) if kinds.contains(&"array") || kinds.contains(&"object") => {
+                // Text that decodes to the expected type was decoded before
+                // validation. Say why this one did not: a live model resent
+                // an edits text missing its closing ']' after a hint without
+                // the cause.
+                let text = text.trim();
+                let cause = match serde_json::from_str::<Value>(text) {
+                    Err(error) if text.starts_with(['[', '{']) => {
+                        format!("; the text is not valid JSON ({error})")
+                    }
+                    Ok(decoded) if !kinds.iter().any(|kind| matches_type(&decoded, kind)) => {
+                        format!("; the text decodes to {}", value_type(&decoded))
+                    }
+                    _ => String::new(),
+                };
+                format!(
+                    "{cause}; send structured JSON, not text containing JSON; object keys need double quotes"
+                )
+            }
+            _ => String::new(),
         };
         return Err(failure(
             name,

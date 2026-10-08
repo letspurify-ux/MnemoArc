@@ -1990,6 +1990,107 @@ async fn edits_grounded_in_new_sources_are_not_edits_without_progress() {
     }
 }
 
+/// Requests that read a new file each, after the given steps.
+fn new_file_reads(dir: &std::path::Path, from: usize, count: usize) -> Vec<Completion> {
+    (from..from + count)
+        .map(|i| {
+            std::fs::write(
+                dir.join(format!("extra{i}.js")),
+                format!("export const extra{i} = {i};\n"),
+            )
+            .unwrap();
+            call(
+                &format!("read-extra-{i}"),
+                "file_read",
+                json!({"path":format!("extra{i}.js")}),
+            )
+        })
+        .collect()
+}
+
+/// Indices of the requests whose run_guidance.plan_check starts with `text`.
+fn plan_checks(guidance: &[Value], text: &str) -> Vec<usize> {
+    guidance
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| {
+            g["plan_check"]
+                .as_str()
+                .is_some_and(|c| c.starts_with(text))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+#[tokio::test]
+async fn an_empty_plan_of_document_work_is_pointed_out_once() {
+    // A live run's first plan call was rejected and it worked for 100
+    // requests without a plan; nothing pointed that out.
+    let (dir, s) = verified_fixture();
+    let steps = new_file_reads(dir.path(), 0, 6);
+    let (_, guidance) = run_scripted(s, steps).await;
+    let shown = plan_checks(&guidance, "task_plan is empty");
+    assert_eq!(shown.len(), 1, "{guidance:?}");
+    assert!(shown[0] >= 2, "{shown:?}");
+}
+
+#[tokio::test]
+async fn a_plan_that_falls_behind_the_work_is_pointed_out_once_per_state() {
+    let (dir, s) = verified_fixture();
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    let mut steps = vec![
+        call(
+            "plan",
+            "task_plan",
+            json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Write the usage section","Verify the document"]}]}),
+        ),
+        call(
+            "usage",
+            "document_edit",
+            json!({"action":"append","expected_hash":hash,"text":"\n# Usage\nRun it with a history. main.js:1-1\n"}),
+        ),
+    ];
+    steps.extend(new_file_reads(dir.path(), 0, 2));
+    steps.push(call(
+        "close",
+        "task_plan",
+        json!({"action":"apply","expected_revision":1,"operations":[
+            {"op":"complete","id":"T1","result":"Saved the usage section"},
+            {"op":"complete","id":"T2","result":"Checked the saved document"}]}),
+    ));
+    steps.extend(new_file_reads(dir.path(), 2, 2));
+    let (_, guidance) = run_scripted(s, steps).await;
+    // The saved section left T1 open: pointed out once, not on every request.
+    let section = plan_checks(
+        &guidance,
+        "A section was saved while current_todo T1 stayed open",
+    );
+    assert_eq!(section, [2], "{guidance:?}");
+    // Every item done: the model judges whether something is missing.
+    let done = plan_checks(&guidance, "Every item in task_plan is done");
+    assert_eq!(done, [5], "{guidance:?}");
+}
+
+#[tokio::test]
+async fn a_to_do_that_stays_current_while_work_moves_on_is_pointed_out_once() {
+    let (dir, mut s) = verified_fixture();
+    s.config.stall_round_limit = 3;
+    let mut steps = vec![call(
+        "plan",
+        "task_plan",
+        json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Read the extra modules","Write their section"]}]}),
+    )];
+    steps.extend(new_file_reads(dir.path(), 0, 6));
+    let (_, guidance) = run_scripted(s, steps).await;
+    let stale = plan_checks(&guidance, "current_todo T1 has been current for 3 requests");
+    assert_eq!(stale.len(), 1, "{guidance:?}");
+    assert_eq!(
+        plan_checks(&guidance, "current_todo T1").len(),
+        1,
+        "{guidance:?}"
+    );
+}
+
 /// Fills the history with complete groups a checkpoint may evict.
 fn pad_history(s: &mut Session, groups: usize) {
     for i in 0..groups {
@@ -2668,6 +2769,83 @@ async fn a_review_page_without_an_answer_is_halved_then_skipped() {
         );
     }
     // The other pages are reviewed; the skipped part is reported.
+    assert_eq!(
+        result.status, "complete_with_gaps",
+        "{:?}",
+        result.last_error
+    );
+    assert!(
+        result
+            .completion_gaps
+            .iter()
+            .any(|gap| gap == "문서 검토 — 1–50줄은 검토를 마치지 못했습니다."),
+        "{:?}",
+        result.completion_gaps
+    );
+}
+
+#[tokio::test]
+async fn closing_halves_and_skips_an_unanswered_review_page_like_other_runs() {
+    // Live run 2026-10-08: the first closing review page ended in a provider
+    // idle timeout and the whole review was dropped with 9 of 12 closing
+    // requests left. Only answers that fail validation end a closing review
+    // at once.
+    let (_dir, mut s, _) = fixture();
+    s.config.completion_review_enabled = false;
+    s.config.run_tokens = 100_000;
+    s.config.closing_reserve_ratio = 0.8;
+    s.config.verification_reserve_ratio = 0.85;
+    s.config.writing_reserve_ratio = 0.9;
+    let doc = (1..=150)
+        .map(|i| format!("Claim {i}. main.js:1-6\n"))
+        .collect::<String>();
+    let hash = s.last_document_write.as_ref().unwrap().1.clone();
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","expected_hash":hash,"text":doc}),
+    )
+    .unwrap();
+    let cut = || Completion {
+        length_limited: true,
+        ..Default::default()
+    };
+    let none = std::time::Duration::ZERO;
+    // The final answer's usage starts closing before the review.
+    let mut steps = vec![
+        (
+            none,
+            Completion {
+                usage: Some(Usage {
+                    input: 30_000,
+                    output: 10,
+                    cached: None,
+                }),
+                ..text("Saved out.md.")
+            },
+        ),
+        (none, cut()),
+        (none, cut()),
+    ];
+    steps.extend((0..6).map(|_| (none, text(r#"{"issues":[]}"#))));
+    let (result, _, _, notices) = run_paced(s, steps).await;
+    assert!(result.progress_recovery.closing.is_some());
+    assert_eq!(result.document_review.page_shrink, 1);
+    for said in [
+        "절반 범위로 다시 검토",
+        "검토 응답을 받지 못해 이 부분의 검토를 건너뛰고",
+    ] {
+        assert!(
+            notices.iter().any(|notice| notice.contains(said)),
+            "{notices:?}"
+        );
+    }
+    assert!(
+        !notices
+            .iter()
+            .any(|n| n.starts_with("마감 단계의 검토 응답")),
+        "{notices:?}"
+    );
     assert_eq!(
         result.status, "complete_with_gaps",
         "{:?}",

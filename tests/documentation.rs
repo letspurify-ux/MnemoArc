@@ -890,6 +890,39 @@ fn audit_ignores_example_citations_inside_fenced_code() {
 }
 
 #[test]
+fn inspecting_another_document_says_it_is_not_the_configured_output() {
+    // A live run inspected the project's own user manual by path, took its
+    // outdated links for its output's text, and spent its closing requests
+    // editing passages its output no longer had.
+    let (dir, mut s) = setup();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\nText.\n"}),
+    );
+    std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+    std::fs::write(
+        dir.path().join("docs/user-manual.md"),
+        "# Manual\nOld link.\n",
+    )
+    .unwrap();
+    let other = run(
+        &mut s,
+        "document_inspect",
+        json!({"path":"docs/user-manual.md"}),
+    );
+    assert_eq!(other["configured_output"], false, "{other}");
+    assert!(
+        other["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("not the configured output")),
+        "{other}"
+    );
+    let own = run(&mut s, "document_inspect", json!({}));
+    assert!(own.get("configured_output").is_none(), "{own}");
+}
+
+#[test]
 fn the_output_file_name_alone_names_the_output() {
     let (dir, mut s) = setup();
     // The live shape: the output lives outside the project root.

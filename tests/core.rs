@@ -1654,6 +1654,33 @@ fn type_errors_name_the_expected_and_received_type() {
         "{error}"
     );
     assert!(error.contains("object keys need double quotes"), "{error}");
+    assert!(
+        error.contains("the text is not valid JSON (key must be a string"),
+        "{error}"
+    );
+    // Live run 2026-10-08: edits text missing its closing ']' was resent
+    // twice; the error now says where the text stops being JSON.
+    let error = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"edits":"[{\"action\":\"replace_text\",\"old_text\":\"a\",\"text\":\"b\"}"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains(
+            "edits must be array, got string; the text is not valid JSON (EOF while parsing a list"
+        ),
+        "{error}"
+    );
+    let error = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"edits":"{\"action\":\"replace_text\"}"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("; the text decodes to object;"), "{error}");
     let error = tools::execute(&mut s, "task_state", json!({"action":"update","patch":3}))
         .unwrap_err()
         .to_string();

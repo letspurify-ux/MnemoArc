@@ -702,6 +702,7 @@ async fn registered_source_documentation() {
         let mut first_write = None;
         let mut reviews = Vec::new();
         let mut last_round = 0;
+        let mut last_plan_check = String::new();
         let mut seen_call_ids = BTreeSet::new();
         let mut seen_result_ids = BTreeSet::new();
         let mut call_signatures = BTreeMap::<String, (String, String)>::new();
@@ -847,6 +848,13 @@ async fn registered_source_documentation() {
                             ),
                             s.progress_recovery.unrepaired_finals
                         );
+                    }
+                    // Plan checks are pointed out once per plan state.
+                    if let Some(check) = s.run_guidance["plan_check"].as_str()
+                        && check != last_plan_check
+                    {
+                        eprintln!("[live] plan_check={check}");
+                        check.clone_into(&mut last_plan_check);
                     }
                 }
                 _ => {}

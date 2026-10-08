@@ -8,8 +8,12 @@ pub const MAX_PENDING: usize = 100;
 pub const MAX_COMPLETED: usize = 5;
 const DEFAULT_PAGE: usize = 10;
 const MAX_PAGE: usize = 20;
-const MAX_TEXT_CHARS: usize = 160;
-const MAX_RESULT_CHARS: usize = 240;
+/// A plan item names one section or area with what to read and write; a
+/// live model wrote 237- and 244-character items and its plan was refused.
+const MAX_TEXT_CHARS: usize = 500;
+/// A live model's 382-character result was refused and it wrote the result
+/// into the item text instead of completing the item.
+const MAX_RESULT_CHARS: usize = 500;
 const MAX_OPERATIONS: usize = 16;
 const MAX_ENCODED_BYTES: usize = 128 * 1024;
 
@@ -697,7 +701,11 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
         };
         return Ok(with_notices(page, notices));
     }
-    let expected_revision = args["expected_revision"].as_u64();
+    // The first plan has nothing to conflict with, so a missing revision
+    // means 0; a later apply still has to name the revision it changes.
+    let expected_revision = args["expected_revision"]
+        .as_u64()
+        .or_else(|| (s.task.plan_revision == 0 && s.task.todos.is_empty()).then_some(0));
     if expected_revision != Some(s.task.plan_revision) {
         let revision = s.task.plan_revision;
         let mut reason = match args["expected_revision"].as_u64() {
