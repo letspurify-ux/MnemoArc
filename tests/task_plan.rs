@@ -1242,6 +1242,72 @@ fn live_out_of_order_batch_exposes_operation_and_blockers_without_committing_ear
 }
 
 #[test]
+fn a_batch_that_also_finishes_earlier_items_may_list_its_completes_in_any_order() {
+    // A live batch completed T6, T13, T7 and T14 while T7 came before T13 in
+    // the plan, and was refused for that order alone.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(
+        &mut s,
+        json!([{"op":"insert","texts":["Write section 1","Write section 2","Audit citations","Write section 4"]}]),
+    );
+    let result = apply(
+        &mut s,
+        json!([
+            {"op":"complete","id":"T3","result":"Audit found no citation issues"},
+            {"op":"complete","id":"T1","result":"Saved section 1"},
+            {"op":"remove","id":"T2","reason":"Section 2 merged into section 1"}
+        ]),
+    );
+    assert_eq!(result["applied"], true, "{result}");
+    let items: Vec<_> = s
+        .task
+        .todos
+        .iter()
+        .map(|item| (item.id.as_str(), item.done, item.result.as_str()))
+        .collect();
+    assert_eq!(
+        items,
+        [
+            ("T1", true, "Saved section 1"),
+            ("T3", true, "Audit found no citation issues"),
+            ("T4", false, "")
+        ]
+    );
+    assert_eq!(s.task.todos_completed_total, 2);
+    assert_eq!(s.task.current_todo().unwrap().id, "T4");
+}
+
+#[test]
+fn a_complete_still_blocked_when_the_batch_ends_is_refused() {
+    // T2 waits for T1, but the batch also inserts a new item before T2, so
+    // T2 is still blocked when the batch ends.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(
+        &mut s,
+        json!([{"op":"insert","texts":["Write section 1","Write section 2"]}]),
+    );
+    let before = json!(s.task);
+    let result = apply(
+        &mut s,
+        json!([
+            {"op":"complete","id":"T2","result":"Saved section 2"},
+            {"op":"insert","texts":["Check section 1 links"],"before":"T2"},
+            {"op":"complete","id":"T1","result":"Saved section 1"}
+        ]),
+    );
+    assert_eq!(result["applied"], false, "{result}");
+    let conflict = &result["conflict"];
+    assert_eq!(conflict["code"], "out_of_order", "{result}");
+    assert_eq!(conflict["operation_index"], 0);
+    assert_eq!(conflict["target_id"], "T2");
+    assert_eq!(conflict["blocking_ids"], json!(["T3"]));
+    assert_eq!(conflict["current_id"], "T3");
+    assert_eq!(json!(s.task), before);
+}
+
+#[test]
 fn structured_plan_revision_and_parse_conflicts_remain_nonterminal_and_atomic() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());

@@ -17,7 +17,7 @@ const MAX_RESULT_CHARS: usize = 500;
 const MAX_OPERATIONS: usize = 16;
 const MAX_ENCODED_BYTES: usize = 128 * 1024;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation {
     Insert {
@@ -314,7 +314,7 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
             }
             if task.current_todo().is_none_or(|item| item.id != id) {
                 // Name the unfinished items ahead of the target so the caller
-                // can complete or remove them in the same batch, in order.
+                // can complete or remove them in the same batch.
                 let ahead: Vec<&str> = task.todos[..at]
                     .iter()
                     .filter(|item| !item.done)
@@ -322,7 +322,7 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
                     .collect();
                 return Err(operation_error(
                     format!(
-                        "Complete the current item first, or insert/move its prerequisite before it; {id} can complete only after {} are completed or removed, in list order",
+                        "Complete the current item first, or insert/move its prerequisite before it; {id} can complete only after {} are completed or removed, in this batch or before it",
                         ahead.join(", ")
                     ),
                     json!({"code":"out_of_order","target_id":id,"blocking_ids":ahead,"blocking_count":ahead.len()}),
@@ -367,7 +367,7 @@ fn unchanged(
     }
     conflict["correction"] = json!(match conflict["code"].as_str() {
         Some("out_of_order") =>
-            "No operations were committed. Continue the blocking items' actual work first; after completing it, resend the whole batch in list order using current_revision. Remove only work that is actually obsolete, with a reason.",
+            "No operations were committed. Continue the blocking items' actual work first; after completing it, resend the whole batch with those items completed too, using current_revision. Remove only work that is actually obsolete, with a reason.",
         Some("missing_revision" | "revision_conflict") =>
             "Review the returned plan, copy current_revision into expected_revision, and combine necessary changes into one apply call.",
         Some("pending_limit" | "state_limit") =>
@@ -765,6 +765,31 @@ struct Rejection {
     input_error: Option<Value>,
 }
 
+/// The unfinished items ahead of a complete that was refused for its order.
+fn blocked_by(error: &anyhow::Error) -> Option<Vec<String>> {
+    let details = error_details(error, "");
+    (details["code"] == "out_of_order").then(|| {
+        details["blocking_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    })
+}
+
+fn out_of_order(result: &Result<()>) -> bool {
+    result
+        .as_ref()
+        .is_err_and(|error| blocked_by(error).is_some())
+}
+
+/// Whether an operation completes or removes the item.
+fn finishes(operation: &Operation, item: &str) -> bool {
+    matches!(operation, Operation::Complete { id, .. } | Operation::Remove { id, .. } if id == item)
+}
+
 /// The plan after applying every operation to a copy, whether the encoding
 /// was normalized, and notices; or why the batch cannot apply. Nothing is
 /// committed either way.
@@ -786,32 +811,69 @@ fn trial(
         })?;
     let mut next = task.clone();
     let count = operations.len();
-    for (index, operation) in operations.into_iter().enumerate() {
+    // Operations apply in order, so the plan the failing one saw can differ
+    // from the one the caller read. Name the operation and the item that was
+    // current at that point.
+    let failure = |index: usize, operation: &Operation, current: Option<String>, error| {
         let (operation_name, target_id) = operation.identity();
-        let target_id = target_id.map(str::to_owned);
+        let current_text = current.as_deref().unwrap_or("none");
+        let reason = if count > 1 {
+            format!(
+                "operations[{index}] failed: {error} (current item at that point: {current_text}). No operation in this batch was applied; earlier operations only take effect together with it"
+            )
+        } else {
+            format!("{error} (current item: {current_text})")
+        };
+        let mut conflict = error_details(&error, "invalid_operation");
+        conflict["operation_index"] = json!(index);
+        conflict["operation"] = json!(operation_name);
+        conflict["target_id"] = json!(target_id);
+        conflict["current_id"] = json!(current);
+        Box::new(Rejection {
+            reason,
+            conflict,
+            input_error: None,
+        })
+    };
+    // A live batch completed T6, T13, T7 and T14 while T7 came before T13 in
+    // the plan, and was refused for that order alone. A complete whose
+    // earlier unfinished items the same batch also completes or removes waits
+    // for them and applies right after them, as in plan order.
+    let mut waiting: Vec<(usize, &Operation)> = Vec::new();
+    for (index, operation) in operations.iter().enumerate() {
         let current = next.current_todo().map(|item| item.id.clone());
-        if let Err(error) = apply(&mut next, operation) {
-            // Operations apply in order, so the plan the failing one saw can
-            // differ from the one the caller read. Name the operation and the
-            // item that was current at that point.
-            let current_text = current.as_deref().unwrap_or("none");
-            let reason = if count > 1 {
-                format!(
-                    "operations[{index}] failed: {error} (current item at that point: {current_text}). No operation in this batch was applied; earlier operations only take effect together with it"
-                )
-            } else {
-                format!("{error} (current item: {current_text})")
-            };
-            let mut conflict = error_details(&error, "invalid_operation");
-            conflict["operation_index"] = json!(index);
-            conflict["operation"] = json!(operation_name);
-            conflict["target_id"] = json!(target_id);
-            conflict["current_id"] = json!(current);
-            return Err(Box::new(Rejection {
-                reason,
-                conflict,
-                input_error: None,
-            }));
+        match apply(&mut next, operation.clone()) {
+            Ok(()) => {
+                while let Some(at) = waiting.iter().position(|(_, waiting)| {
+                    !out_of_order(&apply(&mut next.clone(), (*waiting).clone()))
+                }) {
+                    let (waiting_index, waiting) = waiting.remove(at);
+                    let current = next.current_todo().map(|item| item.id.clone());
+                    if let Err(error) = apply(&mut next, waiting.clone()) {
+                        return Err(failure(waiting_index, waiting, current, error));
+                    }
+                }
+            }
+            Err(error)
+                if blocked_by(&error).is_some_and(|blockers| {
+                    blockers.iter().all(|id| {
+                        operations[index + 1..]
+                            .iter()
+                            .chain(waiting.iter().map(|(_, waiting)| *waiting))
+                            .any(|later| finishes(later, id))
+                    })
+                }) =>
+            {
+                waiting.push((index, operation));
+            }
+            Err(error) => return Err(failure(index, operation, current, error)),
+        }
+    }
+    // Whatever still waits names the items the batch left unfinished.
+    for (index, operation) in waiting {
+        let current = next.current_todo().map(|item| item.id.clone());
+        if let Err(error) = apply(&mut next, operation.clone()) {
+            return Err(failure(index, operation, current, error));
         }
     }
     let pending = next.todos.iter().filter(|item| !item.done).count();

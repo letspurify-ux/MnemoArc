@@ -8,7 +8,13 @@
 //! and reused between the reviews of a run; the rendering expands directories
 //! within a fixed entry budget, first along the paths to what was read, then
 //! the shallowest and largest, and summarizes every other directory by count.
+//!
+//! Code files the writer read in part, and unopened code files beside the
+//! ones it read, list their largest top-level declarations it did not read.
+//! A path alone did not tell a live reviewer that App.jsx held the project
+//! page and the detail panel of the UI a manual described.
 use super::*;
+use crate::tools::structure;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,6 +27,20 @@ const MAX_KEPT_PER_DIRECTORY: usize = 200;
 /// A monorepo is scanned partially rather than walked for long.
 const MAX_SCANNED_FILES: usize = 200_000;
 const MAX_SCAN_TIME: Duration = Duration::from_millis(1500);
+/// Read ranges one file mark lists; more are counted.
+const MAX_LISTED_RANGES: usize = 3;
+/// A file is mostly unread when more than half of it, and at least this
+/// many lines, never reached the writer. A live UI manual read 120 of
+/// App.jsx's 1921 lines; the map said "read 120 lines", so the file looked
+/// covered and the manual missed the sidebar, top bar and detail panel.
+const MOSTLY_UNREAD_LINES: usize = 100;
+/// Code files one map outlines, and the declarations one outline lists.
+const MAX_OUTLINED_FILES: usize = 12;
+const MAX_LISTED_DECLARATIONS: usize = 6;
+/// Shorter declarations (one-line constants) are counted, not listed.
+const MIN_LISTED_LINES: usize = 3;
+/// Time the outlines of one map may take; a file past it is not outlined.
+const MAX_OUTLINE_TIME: Duration = Duration::from_millis(1000);
 /// A scan is reused by a review's pages and by later reviews of the run.
 const SCAN_REUSE: Duration = Duration::from_secs(300);
 const BINARY_EXTENSIONS: &[&str] = &[
@@ -30,9 +50,9 @@ const BINARY_EXTENSIONS: &[&str] = &[
 ];
 
 pub(super) const SCOPE_CRITERION_ID: &str = "S1";
-pub(super) const SCOPE_CRITERION: &str = "The saved document covers the parts of this project that the request asks about. Judge this with runtime_project_map. First find the unopened files and directories whose names share the request's subject, including English names for the subject of a request written in another language; then decide for each whether the request asks about it. If such an area is clearly part of the request, this is unmet, and next_action names up to three of those files or directories to read and the document section they extend. When met, the reason names the closest unopened areas and why the request does not need them. Never ask for tests, unrelated areas or completeness beyond the request.";
+pub(super) const SCOPE_CRITERION: &str = "The saved document covers the parts of this project that the request asks about. Judge this with runtime_project_map. First find the unopened files and directories whose names share the request's subject, including English names for the subject of a request written in another language; the unread declarations the map lists whose names belong to that subject (for a UI manual, the screens, pages, panels and dialogs a user sees); and the files marked mostly unread that the document cites for that subject, whose unread lines are unopened areas too. Then decide for each whether the request asks about it. If such an area is clearly part of the request, this is unmet, and next_action names up to three of those files, declarations or directories, with their line ranges where the map gives them, to read and the document section they extend. When met, the reason names the closest unopened areas and why the request does not need them. Never ask for tests, unrelated areas or completeness beyond the request.";
 
-const NOTE: &str = "Recorded by the runtime, not the model. directories maps each expanded directory (paths relative to project_root, binary files left out) to its files, marked with the lines this session delivered to the writer and whether the document cites them, and to its subdirectories: name/ is expanded under its own key, name/(N files, M opened) is summarized by count, +K more counts names not shown. An unmarked file was never opened, so its content is unknown: judge files and directories only by their paths and never claim what they contain.";
+const NOTE: &str = "Recorded by the runtime, not the model. directories maps each expanded directory (paths relative to project_root, binary files left out) to its files, marked with the lines this session delivered to the writer (read N of M lines with the read ranges; mostly unread when more than half of the file, and at least 100 lines, never reached the writer) and whether the document cites them, and to its subdirectories: name/ is expanded under its own key, name/(N files, M opened) is summarized by count, +K more counts names not shown. Code files list their largest top-level declarations this session did not read as name first-last line, after the marks of a file read in part (unread: ...) and, for an unopened file beside read ones, after its line count (N lines: ...); these names come from a syntax outline, not from reading the code. An unmarked file was never opened, so its content is unknown: judge files, directories and listed declarations only by their paths and names, and never claim what their code does.";
 const TRUNCATED_NOTE: &str = "The scan stopped early: counts are lower bounds, and a top-level directory marked (not scanned) was never walked.";
 
 /// The project's files from one bounded walk, never persisted.
@@ -237,19 +257,224 @@ fn scan(p: &Project, key: String, max_files: usize, max_time: Duration) -> Optio
 /// What this session read of a file and whether the document cites it.
 #[derive(Default)]
 struct Mark {
-    lines: Option<usize>,
+    /// Line numbers delivered to the writer.
+    read: BTreeSet<usize>,
+    /// The file's current line count, when it could be read.
+    total: Option<usize>,
     cited: bool,
 }
 
-impl Mark {
+/// Top-level declarations of a code file this session did not read.
+#[derive(Debug, Default)]
+struct Outline {
+    /// The file's line count.
+    total: usize,
+    /// The largest unread declarations as (name, first line, last line), in
+    /// line order.
+    listed: Vec<(String, usize, usize)>,
+    /// Unread declarations not listed.
+    more: usize,
+}
+
+impl Outline {
+    fn text(&self) -> String {
+        let mut parts: Vec<String> = self
+            .listed
+            .iter()
+            .map(|(name, start, end)| format!("{name} {start}-{end}"))
+            .collect();
+        if self.more > 0 {
+            parts.push(format!("+{} more", self.more));
+        }
+        parts.join(", ")
+    }
+
+    /// An unopened file's label.
     fn label(&self, name: &str) -> String {
-        match (self.lines, self.cited) {
-            (Some(lines), true) => format!("{name}[read {lines} lines, cited]"),
-            (Some(lines), false) => format!("{name}[read {lines} lines]"),
-            (None, true) => format!("{name}[cited, not read]"),
-            (None, false) => name.to_owned(),
+        let lines = match self.total {
+            1 => "1 line".to_owned(),
+            total => format!("{total} lines"),
+        };
+        if self.listed.is_empty() {
+            format!("{name}({lines})")
+        } else {
+            format!("{name}({lines}: {})", self.text())
         }
     }
+}
+
+impl Mark {
+    fn label(&self, name: &str, outline: Option<&Outline>) -> String {
+        let cited = if self.cited { ", cited" } else { "" };
+        if self.read.is_empty() {
+            return if self.cited {
+                format!("{name}[cited, not read]")
+            } else {
+                name.to_owned()
+            };
+        }
+        let Some(total) = self.total else {
+            return format!("{name}[read {} lines{cited}]", self.read.len());
+        };
+        let read: Vec<usize> = self.read.range(1..=total).copied().collect();
+        if read.len() >= total {
+            return format!("{name}[read all {total} lines{cited}]");
+        }
+        let ranges = ranges(&read);
+        let shown = if ranges.len() <= MAX_LISTED_RANGES {
+            ranges.join(", ")
+        } else {
+            format!("in {} ranges", ranges.len())
+        };
+        let unread = total - read.len();
+        let mostly = if unread * 2 > total && unread >= MOSTLY_UNREAD_LINES {
+            ", mostly unread"
+        } else {
+            ""
+        };
+        let unread = outline
+            .filter(|outline| !outline.listed.is_empty())
+            .map_or_else(String::new, |outline| {
+                format!("; unread: {}", outline.text())
+            });
+        format!(
+            "{name}[read {} of {total} lines ({shown}){mostly}{cited}{unread}]",
+            read.len()
+        )
+    }
+}
+
+/// The top-level declarations of a code file that `read` covers less than
+/// half of, outside Rust test modules; None for a file without a syntax
+/// outline or one that cannot be parsed before the deadline.
+fn outline(path: &Path, read: &BTreeSet<usize>, deadline: Instant) -> Option<Outline> {
+    structure::language(path).ok()?;
+    let source = read_text(path).ok()?;
+    let total = source.lines().count();
+    let tests = if path.extension().is_some_and(|extension| extension == "rs") {
+        documentation::rust_test_modules(&source)
+    } else {
+        Vec::new()
+    };
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let file = structure::SyntaxFile::parse(path.to_path_buf(), source, &cancel, deadline).ok()?;
+    let (symbols, _) = file
+        .symbols(&json!({"max_depth":0}), None, &cancel, deadline)
+        .ok()?;
+    let mut unread: Vec<(String, usize, usize)> = symbols
+        .iter()
+        .filter_map(|symbol| {
+            let name: String = symbol["name"].as_str()?.chars().take(60).collect();
+            let start = symbol["start_line"].as_u64()? as usize;
+            let end = (symbol["end_line"].as_u64()? as usize).max(start);
+            let seen = read.range(start..=end).count();
+            let in_tests = tests
+                .iter()
+                .any(|(first, last)| (*first..=*last).contains(&start));
+            (seen * 2 < end - start + 1 && !in_tests).then_some((name, start, end))
+        })
+        .collect();
+    let count = unread.len();
+    unread.retain(|(_, start, end)| end - start + 1 >= MIN_LISTED_LINES);
+    unread.sort_by_key(|(_, start, end)| (std::cmp::Reverse(end - start), *start));
+    unread.truncate(MAX_LISTED_DECLARATIONS);
+    unread.sort_by_key(|(_, start, _)| *start);
+    Some(Outline {
+        total,
+        more: count - unread.len(),
+        listed: unread,
+    })
+}
+
+/// A directory's unmarked file names the map lists, in listing order.
+fn listed_unmarked<'a>(
+    directory: &'a Directory,
+    marked: &'a [String],
+) -> impl Iterator<Item = &'a String> {
+    directory
+        .names
+        .iter()
+        .filter(move |name| !marked.contains(name))
+        .take(MAX_LISTED_PER_DIRECTORY.saturating_sub(marked.len()))
+}
+
+/// The marked files' names in each directory that holds one.
+fn marked_by_directory(marks: &BTreeMap<String, Mark>) -> BTreeMap<String, Vec<String>> {
+    let mut directories = BTreeMap::<String, Vec<String>>::new();
+    for path in marks.keys() {
+        directories
+            .entry(parent_of(path))
+            .or_default()
+            .push(path.rsplit('/').next().unwrap_or(path).to_owned());
+    }
+    directories
+}
+
+/// Outlines of the code files a reviewer most needs to see into: files read
+/// in part with at least MOSTLY_UNREAD_LINES unread lines, most unread
+/// first, then the largest unopened files listed beside them. Test files are
+/// left out.
+fn outlines(root: &Path, scan: &Scan, marks: &BTreeMap<String, Mark>) -> BTreeMap<String, Outline> {
+    let mut partial: Vec<(usize, &String)> = marks
+        .iter()
+        .filter_map(|(path, mark)| {
+            let total = mark.total?;
+            let unread = total.saturating_sub(mark.read.range(1..=total).count());
+            (unread >= MOSTLY_UNREAD_LINES).then_some((unread, path))
+        })
+        .collect();
+    partial.sort_by_key(|(unread, path)| (std::cmp::Reverse(*unread), *path));
+    let mut unopened: Vec<(u64, String)> = Vec::new();
+    for (directory, marked) in marked_by_directory(marks) {
+        let Some(listing) = scan.directories.get(&directory) else {
+            continue;
+        };
+        for name in listed_unmarked(listing, &marked) {
+            let path = join(&directory, name);
+            let full = root.join(&path);
+            if structure::language(&full).is_ok()
+                && !documentation::test_file(Path::new(&path))
+                && let Ok(metadata) = std::fs::metadata(&full)
+            {
+                unopened.push((metadata.len(), path));
+            }
+        }
+    }
+    unopened.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let deadline = Instant::now() + MAX_OUTLINE_TIME;
+    let empty = BTreeSet::new();
+    partial
+        .into_iter()
+        .map(|(_, path)| (path.clone(), &marks[path].read))
+        .filter(|(path, _)| !documentation::test_file(Path::new(path)))
+        .chain(unopened.into_iter().map(|(_, path)| (path, &empty)))
+        .take(MAX_OUTLINED_FILES)
+        .filter_map(|(path, read)| {
+            let outline = outline(&root.join(&path), read, deadline)?;
+            Some((path, outline))
+        })
+        .collect()
+}
+
+/// Sorted line numbers as contiguous "start-end" ranges.
+fn ranges(lines: &[usize]) -> Vec<String> {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for &line in lines {
+        match ranges.last_mut() {
+            Some((_, end)) if *end + 1 == line => *end = line,
+            _ => ranges.push((line, line)),
+        }
+    }
+    ranges
+        .into_iter()
+        .map(|(start, end)| {
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect()
 }
 
 fn marks(s: &Session) -> BTreeMap<String, Mark> {
@@ -271,11 +496,15 @@ fn marks(s: &Session) -> BTreeMap<String, Mark> {
     }
     let mut marks: BTreeMap<String, Mark> = lines
         .into_iter()
-        .map(|(path, lines)| {
+        .map(|(path, read)| {
+            let total = read_text(&root.join(&path))
+                .ok()
+                .map(|text| text.lines().count());
             (
                 path,
                 Mark {
-                    lines: Some(lines.len()),
+                    read,
+                    total,
                     cited: false,
                 },
             )
@@ -312,10 +541,21 @@ pub(super) fn evidence(s: &Session) -> Option<Value> {
     }
     let scan = s.completion_review.project_scan.as_ref()?;
     let marks = marks(s);
-    Some(render(scan, &marks, MAX_MAP_ENTRIES))
+    let outlines = s
+        .project
+        .root
+        .canonicalize()
+        .map(|root| outlines(&root, scan, &marks))
+        .unwrap_or_default();
+    Some(render(scan, &marks, &outlines, MAX_MAP_ENTRIES))
 }
 
-fn render(scan: &Scan, marks: &BTreeMap<String, Mark>, budget: usize) -> Value {
+fn render(
+    scan: &Scan,
+    marks: &BTreeMap<String, Mark>,
+    outlines: &BTreeMap<String, Outline>,
+    budget: usize,
+) -> Value {
     let mut opened = BTreeMap::<String, usize>::new();
     for path in marks.keys() {
         let mut directory = parent_of(path);
@@ -390,21 +630,18 @@ fn render(scan: &Scan, marks: &BTreeMap<String, Mark>, budget: usize) -> Value {
     for path in &expanded {
         let directory = &scan.directories[path];
         let mut marked = marked_in(path);
-        let mut names: Vec<String> = directory
-            .names
-            .iter()
-            .filter(|name| !marked.contains(name))
-            .take(MAX_LISTED_PER_DIRECTORY.saturating_sub(marked.len()))
-            .cloned()
-            .collect();
+        let mut names: Vec<String> = listed_unmarked(directory, &marked).cloned().collect();
         names.append(&mut marked);
         names.sort();
         let mut entries: Vec<String> = names
             .iter()
             .map(|name| {
-                marks
-                    .get(&join(path, name))
-                    .map_or_else(|| name.clone(), |mark| mark.label(name))
+                let file = join(path, name);
+                match (marks.get(&file), outlines.get(&file)) {
+                    (Some(mark), outline) => mark.label(name, outline),
+                    (None, Some(outline)) => outline.label(name),
+                    (None, None) => name.clone(),
+                }
             })
             .collect();
         let more = directory.direct.saturating_sub(names.len());
@@ -478,11 +715,12 @@ mod tests {
         let marks = BTreeMap::from([(
             "area29/module39/file49.rs".to_owned(),
             Mark {
-                lines: Some(12),
+                read: (1..=12).collect(),
+                total: None,
                 cited: true,
             },
         )]);
-        let map = render(&scan, &marks, MAX_MAP_ENTRIES);
+        let map = render(&scan, &marks, &BTreeMap::new(), MAX_MAP_ENTRIES);
         let directories = map["directories"].as_object().unwrap();
         let shown: usize = directories
             .values()
@@ -510,6 +748,82 @@ mod tests {
     }
 
     #[test]
+    fn a_file_mark_shows_how_much_of_the_file_was_read() {
+        let mark = |read: &[std::ops::RangeInclusive<usize>], total, cited| Mark {
+            read: read.iter().cloned().flatten().collect(),
+            total,
+            cited,
+        };
+        // The live UI manual's main screen file: 120 of 1921 lines.
+        assert_eq!(
+            mark(&[1004..=1123], Some(1921), true).label("App.jsx", None),
+            "App.jsx[read 120 of 1921 lines (1004-1123), mostly unread, cited]"
+        );
+        assert_eq!(
+            mark(&[1..=349], Some(349), true).label("Chat.jsx", None),
+            "Chat.jsx[read all 349 lines, cited]"
+        );
+        // Lines read from a longer earlier version still mean the whole file.
+        assert_eq!(
+            mark(&[1..=60], Some(50), false).label("short.rs", None),
+            "short.rs[read all 50 lines]"
+        );
+        // Most of the file was read.
+        assert_eq!(
+            mark(&[1..=300], Some(400), true).label("mostly.rs", None),
+            "mostly.rs[read 300 of 400 lines (1-300), cited]"
+        );
+        // Most of a small file is unread, but too few lines to matter.
+        assert_eq!(
+            mark(&[1..=10], Some(80), false).label("small.rs", None),
+            "small.rs[read 10 of 80 lines (1-10)]"
+        );
+        assert_eq!(
+            mark(&[1..=10, 20..=20, 30..=40, 50..=60], Some(900), false).label("many.rs", None),
+            "many.rs[read 33 of 900 lines (in 4 ranges), mostly unread]"
+        );
+        assert_eq!(
+            mark(&[1..=10, 20..=20, 30..=40], Some(900), false).label("three.rs", None),
+            "three.rs[read 22 of 900 lines (1-10, 20, 30-40), mostly unread]"
+        );
+        assert_eq!(
+            mark(&[], None, true).label("cited.rs", None),
+            "cited.rs[cited, not read]"
+        );
+    }
+
+    #[test]
+    fn an_outline_lists_the_largest_unread_declarations_outside_test_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let function = |name: &str, lines: usize| {
+            let body: String = (1..lines - 1)
+                .map(|n| format!("    let v{n} = {n};\n"))
+                .collect();
+            format!("fn {name}() {{\n{body}}}\n")
+        };
+        let mut text: String = (1..=8).map(|n| function(&format!("f{n}"), n + 2)).collect();
+        // A one-line constant is counted, not listed.
+        text.push_str("const LIMIT: usize = 3;\n");
+        text.push_str("#[cfg(test)]\nmod tests {\n");
+        text.push_str(&function("checks", 40));
+        text.push_str("}\n");
+        let path = dir.path().join("lib.rs");
+        std::fs::write(&path, &text).unwrap();
+        let deadline = Instant::now() + MAX_OUTLINE_TIME;
+        // f1..f8 span 3..10 lines from line 1; f8 (lines 43-52) is half read.
+        let read: BTreeSet<usize> = (43..=47).collect();
+        let listed = outline(&path, &read, deadline).unwrap();
+        assert_eq!(listed.total, text.lines().count());
+        // The six largest unread functions in line order; f8 is half read
+        // and so not unread, and the test module is never listed.
+        assert_eq!(
+            listed.text(),
+            "f2 4-7, f3 8-12, f4 13-18, f5 19-25, f6 26-33, f7 34-42, +2 more"
+        );
+        assert!(outline(&dir.path().join("notes.md"), &read, deadline).is_none());
+    }
+
+    #[test]
     fn a_scan_that_stops_early_still_names_every_top_level_area() {
         let dir = tempfile::tempdir().unwrap();
         for area in ["alpha", "beta", "gamma"] {
@@ -526,7 +840,7 @@ mod tests {
         let scan = scan(&project, String::new(), 3, MAX_SCAN_TIME).unwrap();
         assert!(scan.truncated);
         assert_eq!(scan.files, 3);
-        let map = render(&scan, &BTreeMap::new(), MAX_MAP_ENTRIES);
+        let map = render(&scan, &BTreeMap::new(), &BTreeMap::new(), MAX_MAP_ENTRIES);
         let root = map["directories"]["./"].as_str().unwrap();
         for area in ["alpha", "beta", "gamma"] {
             assert!(root.contains(&format!("{area}/")), "{root}");

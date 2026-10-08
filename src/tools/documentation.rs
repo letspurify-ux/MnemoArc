@@ -1037,7 +1037,7 @@ pub(super) fn test_code_check(s: &Session, output: &Path, doc: &str) -> Option<V
 }
 
 /// A file whose directory or name marks it as tests.
-fn test_file(relative: &Path) -> bool {
+pub(super) fn test_file(relative: &Path) -> bool {
     let parts: Vec<String> = relative
         .iter()
         .map(|part| part.to_string_lossy().into_owned())
@@ -1069,7 +1069,7 @@ fn test_file(relative: &Path) -> bool {
 /// One-based line ranges of Rust `#[cfg(test)]` modules: the attribute, the
 /// `mod name {` line after it and everything up to the closing brace at that
 /// line's indentation (rustfmt layout), or the end of the file.
-fn rust_test_modules(text: &str) -> Vec<(usize, usize)> {
+pub(super) fn rust_test_modules(text: &str) -> Vec<(usize, usize)> {
     let lines: Vec<&str> = text.lines().collect();
     let mut ranges = Vec::new();
     let mut index = 0;

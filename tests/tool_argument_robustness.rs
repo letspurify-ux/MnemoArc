@@ -43,6 +43,40 @@ fn a_blank_file_read_path_says_how_to_read_the_output() {
 }
 
 #[test]
+fn a_file_read_without_a_path_after_an_edit_is_told_the_edit_already_confirmed_it() {
+    // GLM sent {max_lines, force_read:true} with no path five times, four of
+    // them right after a document edit, apparently to look at the output
+    // again. The description had said to read the output "without supplying
+    // a path" next to the file_read rules.
+    let dir = tempfile::tempdir().unwrap();
+    let mut current = session(dir.path());
+    current.project.output = dir.path().join("generated.md");
+    let error = tools::execute(
+        &mut current,
+        "file_read",
+        json!({"max_lines":200,"force_read":true}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("missing_argument: path"), "{error}");
+    assert!(error.contains("no need to re-read it"), "{error}");
+    assert!(error.contains("document_inspect"), "{error}");
+    let description = ToolRegistry::specs()
+        .into_iter()
+        .find(|spec| spec.name == "file_read")
+        .unwrap()
+        .description;
+    assert!(
+        description.contains("file_read always needs path, or cursor alone"),
+        "{description}"
+    );
+    assert!(
+        !description.contains("without supplying a path"),
+        "{description}"
+    );
+}
+
+#[test]
 fn empty_optional_navigation_strings_are_omitted() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("frontend/src")).unwrap();

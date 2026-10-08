@@ -3032,7 +3032,8 @@ fn a_full_rewrite_sent_as_an_insertion_replaces_the_anchor_once() {
     ).unwrap_err().to_string();
     assert!(error.contains("repeats old_text ambiguously"), "{error}");
     assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), body);
-    // New text next to the anchor, and a short anchor that recurs, still work.
+    // New text next to the anchor, and a short anchor that recurs inside a
+    // longer line, still work.
     let (_dir, mut s) = setup();
     std::fs::write(&s.project.output, body).unwrap();
     let result = run(
@@ -3043,7 +3044,69 @@ fn a_full_rewrite_sent_as_an_insertion_replaces_the_anchor_once() {
     run(
         &mut s,
         "document_edit",
-        json!({"action":"insert_after_text","expected_hash":result["hash"],"old_text":"# 사용법","text":"\n# 사용법 요약"}),
+        json!({"action":"insert_before_text","expected_hash":result["hash"],"old_text":"# 사용법","text":"# 사용법 요약\n"}),
+    );
+    assert!(
+        std::fs::read_to_string(&s.project.output)
+            .unwrap()
+            .starts_with("# 사용법 요약\n# 사용법\n")
+    );
+}
+
+#[test]
+fn a_section_inserted_after_a_short_heading_that_it_repeats_goes_before_it() {
+    // Live shape: to put a section before "## 2. ...", a model inserted the
+    // section followed by that heading after the heading. The 15-character
+    // heading was under the 20-character floor for a repeated anchor, so it
+    // was kept and the document held "## 2. ..." twice.
+    let body = "# Guide\n\n## 1. Intro\n\nText one.\n\n## 2. Start\n\nBody two.\n";
+    let expected = "# Guide\n\n## 1. Intro\n\nText one.\n\n## 1-1. Panel\n\nPanel text.\n\n## 2. Start\n\nBody two.\n";
+    for (batch, text) in [
+        (false, "## 1-1. Panel\n\nPanel text.\n\n## 2. Start"),
+        (true, "## 1-1. Panel\n\nPanel text.\n\n## 2. Start\n"),
+    ] {
+        let (_dir, mut s) = setup();
+        std::fs::write(&s.project.output, body).unwrap();
+        let edit = json!({"action":"insert_after_text","old_text":"## 2. Start","text":text});
+        if batch {
+            run(
+                &mut s,
+                "document_edit_batch",
+                json!({"expected_hash":tools::hash(body.as_bytes()),"edits":[edit]}),
+            );
+        } else {
+            run(&mut s, "document_edit", edit);
+        }
+        assert_eq!(
+            std::fs::read_to_string(&s.project.output).unwrap(),
+            expected
+        );
+    }
+    // A new heading right after a heading line, without repeating it, would
+    // take over that section's text: refuse it and name the section actions.
+    let (_dir, mut s) = setup();
+    std::fs::write(&s.project.output, body).unwrap();
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after_text","old_text":"## 2. Start","text":"\n## 1-1. Panel\n\nPanel text.\n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("take over that text"), "{error}");
+    assert!(error.contains("insert_before with section"), "{error}");
+    assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), body);
+    // Text that is not a heading may still follow a heading line.
+    let result = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after_text","old_text":"## 2. Start","text":"\n\nA lead sentence."}),
+    );
+    assert_eq!(result["status"].as_str().unwrap_or("ok"), "ok", "{result}");
+    assert!(
+        std::fs::read_to_string(&s.project.output)
+            .unwrap()
+            .contains("## 2. Start\n\nA lead sentence.")
     );
 }
 
@@ -3690,8 +3753,15 @@ fn appended_heading_follows_the_document_heading_spacing() {
             "# Guide\r\n\r\n## One\r\nText.\r\n",
             "# Guide\r\n\r\n## One\r\nText.\r\n\r\n## Two\nMore.\n",
         ),
-        // No later heading yet shows no spacing to follow.
+        // With only a title so far, the line after it shows the spacing: a
+        // live manual began "# Title\n\nIntro" and its first "## ..." was
+        // glued to the intro.
         ("# Guide\nIntro.\n", "# Guide\nIntro.\n## Two\nMore.\n"),
+        (
+            "# Guide\n\nIntro.\n\n1. Step\nSources: a.js\n",
+            "# Guide\n\nIntro.\n\n1. Step\nSources: a.js\n\n## Two\nMore.\n",
+        ),
+        ("# Guide\n", "# Guide\n## Two\nMore.\n"),
         // Headings written without blank lines stay that way.
         (
             "# Guide\n## One\nText.\n",

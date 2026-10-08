@@ -343,7 +343,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "file_read",
-                description: "Read a new range with path, 1-based start_line and max_lines (line count). For a targeted source question, first locate the identifier/route with source_search or code_outline, then supply an explicit range. limit is accepted as a compatibility alias for max_lines; prefer max_lines. Do not use offset as a line number. Example: {path:\"src/agent.rs\",start_line:160,max_lines:140}. Relative paths resolve against project.root, NEVER the output directory or workspace parent. For project.output outside the project, copy the absolute path returned by document_inspect; do not shorten it to a basename. Example: root=/workspace/app and output=/workspace/app_summary.md requires path=/workspace/app_summary.md, not app_summary.md. Use document_inspect to read the configured output without supplying a path. If truncated, continue ONLY with {cursor: next_cursor.cursor}; never combine cursor with path/start_line/max_lines/offset. A cursor completes the original requested range and expires if the file changes. Once that range is complete, next_line indicates where a NEW range can start. Returned line_start/line_end describe delivered text; boundary flags mark partial lines, and partial boundary lines do not satisfy citation coverage. Use force_read=true only for deliberate repeat verification.",
+                description: "Read a new range with path, 1-based start_line and max_lines (line count). For a targeted source question, first locate the identifier/route with source_search or code_outline, then supply an explicit range. limit is accepted as a compatibility alias for max_lines; prefer max_lines. Do not use offset as a line number. Example: {path:\"src/agent.rs\",start_line:160,max_lines:140}. Relative paths resolve against project.root, NEVER the output directory or workspace parent. For project.output outside the project, copy the absolute path returned by document_inspect; do not shorten it to a basename. Example: root=/workspace/app and output=/workspace/app_summary.md requires path=/workspace/app_summary.md, not app_summary.md. file_read always needs path, or cursor alone; to view the configured output, call document_inspect instead. If truncated, continue ONLY with {cursor: next_cursor.cursor}; never combine cursor with path/start_line/max_lines/offset. A cursor completes the original requested range and expires if the file changes. Once that range is complete, next_line indicates where a NEW range can start. Returned line_start/line_end describe delivered text; boundary flags mark partial lines, and partial boundary lines do not satisfy citation coverage. Use force_read=true only to re-read the same file range on purpose; a document edit already returns the output's new hash and checks.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -2258,14 +2258,24 @@ fn ends_with_blank_line(text: &str) -> bool {
 }
 
 /// Whether the document sets its headings off with a blank line; None when
-/// no heading follows other content yet.
+/// it shows no spacing yet. Before any heading follows other content, the
+/// line after the first heading shows it: a live manual began
+/// "# Title\n\nIntro..." and its first appended "## ..." was glued to the
+/// intro.
 fn heading_spacing(text: &str) -> Option<bool> {
-    let mut later = documentation::headings(text)
-        .into_iter()
+    let headings = documentation::headings(text);
+    let mut later = headings
+        .iter()
         .filter(|heading| heading.start > 0)
         .peekable();
-    later.peek()?;
-    Some(later.any(|heading| ends_with_blank_line(&text[..heading.start])))
+    if later.peek().is_some() {
+        return Some(later.any(|heading| ends_with_blank_line(&text[..heading.start])));
+    }
+    let first = headings.first()?;
+    text[first.start..]
+        .split_inclusive('\n')
+        .nth(1)
+        .map(|line| line.trim().is_empty())
 }
 
 /// Whether insertion text forms its own line or Markdown block rather than
@@ -2629,11 +2639,32 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             // passage. Ambiguous or approximate repeats are still rejected.
             let anchor = target.trim();
             let insertion = matches!(action, "insert_before_text" | "insert_after_text");
-            let repeated_anchor = insertion && anchor.chars().count() >= 20 && new.contains(anchor);
+            // A heading line repeated as a line of the text is the same
+            // intent however short it is: a live model inserted "## 1-1 ...
+            // ## 2. 새 세션 시작하기" after the 15-character heading to put a
+            // section before it, and below the 20-character floor the
+            // heading appeared twice.
+            let heading_anchor = insertion && !anchor.contains('\n') && starts_with_heading(anchor);
+            let repeated_heading = heading_anchor && new.lines().any(|line| line.trim() == anchor);
+            let target = if repeated_heading { anchor } else { target };
+            let repeated_anchor = insertion
+                && (anchor.chars().count() >= 20 || repeated_heading)
+                && new.contains(anchor);
             let replace_instead = repeated_anchor && new.matches(target).count() == 1;
             if repeated_anchor && !replace_instead {
                 bail!(
                     "invalid_argument_value: {action} keeps old_text and adds text beside it, but text repeats old_text ambiguously, so the passage would appear twice. Use replace_text with an exact old_text and the full revised passage as text"
+                );
+            }
+            // A heading inserted right after a heading line takes over that
+            // section's own text, leaving the anchored heading empty.
+            if action == "insert_after_text"
+                && heading_anchor
+                && !replace_instead
+                && starts_with_heading(new)
+            {
+                bail!(
+                    "invalid_argument_value: insert_after_text puts text right after the heading {anchor:?}, before that section's own text, so the inserted heading would take over that text and leave {anchor:?} empty. Use insert_before with section {anchor:?} to add a section before it, insert_after to add one after its whole section, or insert_first_child to add its first subsection"
                 );
             }
             let scoped = args
@@ -2716,6 +2747,13 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                 separated = Some(separate_inserted_block(old, at, new));
             }
             let new = separated.as_deref().unwrap_or(new);
+            // The heading's line break stays in the document, so a text
+            // that ends with its own does not add a blank line.
+            let new = if repeated_heading && old[end..].starts_with(['\r', '\n']) {
+                new.trim_end_matches(['\r', '\n'])
+            } else {
+                new
+            };
             Ok(match action {
                 _ if replace_instead => format!("{}{}{}", &old[..start], new, &old[end..]),
                 "insert_before_text" => format!("{}{}{}", &old[..start], new, &old[start..]),
@@ -5534,11 +5572,13 @@ fn read_file(
     };
     // A provider that fills every field sent path "" (dropped as a blank
     // placeholder) to read the output, and the bare missing-path error did
-    // not say how to read it.
+    // not say how to read it. GLM sent {max_lines, force_read:true} with no
+    // path five times, four of them right after a document edit, to look at
+    // the output again; the edit result already holds what that would show.
     let Some(path) = args["path"].as_str() else {
         let output = output_path(&s.project).unwrap_or_else(|_| s.project.output.clone());
         bail!(
-            "missing_argument: path; file_read reads a project file by path (relative to project.root) or continues a truncated read with cursor alone. To read the configured output document, call document_inspect with section set to a heading from its outline, or file_read with path {}",
+            "missing_argument: path; file_read reads a project file by path (relative to project.root) or continues a truncated read with cursor alone. A document edit result already reports the output's new hash, measured lines and checks, so there is no need to re-read it to confirm an edit. To view the configured output document, call document_inspect (with section set to a heading from its outline for that section's text), or file_read with path {}",
             output.display()
         );
     };

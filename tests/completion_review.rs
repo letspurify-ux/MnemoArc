@@ -1149,7 +1149,7 @@ fn a_source_document_review_sees_the_project_map_and_judges_scope() {
     assert_eq!(map["opened"], 1, "{map}");
     assert_eq!(
         map["directories"]["src/tools/"],
-        "document_review.rs documentation.rs[read 2 lines, cited]",
+        "document_review.rs(1 line) documentation.rs[read all 2 lines, cited]",
         "{map}"
     );
     assert_eq!(map["directories"]["src/"], "agent.rs tools/", "{map}");
@@ -1186,6 +1186,96 @@ fn a_source_document_review_sees_the_project_map_and_judges_scope() {
             .iter()
             .all(|c| c["id"] != "S1")
     );
+}
+
+#[test]
+fn a_cited_file_read_only_in_part_is_marked_mostly_unread_for_the_scope_check() {
+    // A live UI manual read 120 of App.jsx's 1921 lines. The map said "read
+    // 120 lines", so the scope check took the file for covered and approved
+    // a manual without the project page and the detail panel. The next run
+    // never opened App.jsx, and its path alone did not show those screens.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("frontend/src");
+    std::fs::create_dir_all(&src).unwrap();
+    let function = |name: &str, lines: usize| {
+        let body: String = (1..lines - 1)
+            .map(|n| format!("  const v{n} = {n};\n"))
+            .collect();
+        format!("function {name}() {{\n{body}}}\n")
+    };
+    let app = [
+        function("App", 120),
+        function("Projects", 40),
+        function("Inspector", 240),
+    ]
+    .concat();
+    std::fs::write(src.join("App.jsx"), app).unwrap();
+    let settings = [
+        format!("export {}", function("ProjectForm", 30)),
+        format!("export default {}", function("Settings", 60)),
+    ]
+    .concat();
+    std::fs::write(src.join("Settings.jsx"), settings).unwrap();
+    std::fs::write(src.join("App.test.jsx"), function("renders", 50)).unwrap();
+    std::fs::write(src.join("styles.css"), "body { margin: 0; }\n").unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("manual.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128000),
+            ..support::compact_config()
+        },
+    );
+    s.add_user("ui 사용 심플 매뉴얼 작성".into());
+    s.select_workflow("source_document").unwrap();
+    s.active_tools = tools::ToolRegistry::optional_names();
+    document_step(
+        &mut s,
+        "file_read",
+        json!({"path":"frontend/src/App.jsx","start_line":121,"max_lines":40}),
+    );
+    document_step(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# UI\n\nProjects are listed here (frontend/src/App.jsx:121-122).\n"}),
+    );
+    review::begin(&mut s, "Saved manual.md").unwrap();
+    let p = payload(&review::request(&mut s).unwrap());
+    let map = p["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "runtime_project_map")
+        .expect("project map evidence");
+    // The read file names what it holds beyond the read lines, an unopened
+    // code file beside it names its declarations, and a test file and a
+    // stylesheet stay bare names.
+    assert_eq!(
+        map["directories"]["frontend/src/"],
+        "App.jsx[read 40 of 400 lines (121-160), mostly unread, cited; unread: App 1-120, Inspector 161-400] \
+         App.test.jsx Settings.jsx(90 lines: ProjectForm 1-30, Settings 31-90) styles.css",
+        "{map}"
+    );
+    let note = map["note"].as_str().unwrap();
+    assert!(note.contains("mostly unread"), "{note}");
+    assert!(note.contains("syntax outline"), "{note}");
+    let scope = p["criteria"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "S1")
+        .expect("scope criterion");
+    let scope = scope["text"].as_str().unwrap();
+    assert!(scope.contains("files marked mostly unread"), "{scope}");
+    assert!(
+        scope.contains("unread declarations the map lists"),
+        "{scope}"
+    );
+    assert!(scope.contains("line ranges"), "{scope}");
 }
 
 #[test]
