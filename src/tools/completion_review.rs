@@ -169,9 +169,21 @@ pub(super) fn record_document_baseline(s: &mut Session, path: &Path, old: &str, 
     // Keep the boundary even while review is disabled: enabling it later in
     // this task must not lose the document's first committed preimage.
     if s.is_document_work() && s.completion_review.document_baseline.is_none() {
+        let path = PathBuf::from(review_path(s, path));
         s.completion_review.document_baseline =
-            Some(document_changes::Baseline::new(path, old, existed));
+            Some(document_changes::Baseline::new(&path, old, existed));
     }
+}
+
+/// One spelling per file. Reads resolve symlinks, but the output is written
+/// under its configured path: a live output in /var/folders, read back as
+/// /private/var/folders, reached the reviewer twice and as a changed source
+/// that no write explained. A deleted file keeps the path it was written at.
+fn review_path(s: &Session, path: &Path) -> String {
+    read_path(&s.project, &path.display().to_string())
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
 }
 
 /// The answer workflow runs no reviews; its edits are not verified.
@@ -189,7 +201,7 @@ pub fn required(s: &Session) -> bool {
 /// Called only with paths validated and changed by the filesystem tool.
 pub(super) fn record_file_writes(s: &mut Session, paths: &[PathBuf]) {
     for path in paths {
-        let path = path.display().to_string();
+        let path = review_path(s, path);
         if !s.completion_review.written_paths.contains(&path) {
             s.completion_review.written_paths.push(path.clone());
         }
@@ -381,24 +393,27 @@ fn criteria(s: &Session) -> Vec<Value> {
 // Readiness, cache reuse, pending responses and final reporting all compare
 // this same version. No token counting is needed to check a verdict's freshness.
 fn snapshot_unbounded(s: &Session, draft: &str) -> Value {
+    let output = s
+        .last_document_write
+        .as_ref()
+        .map(|(path, _)| review_path(s, path));
     let mut paths = s.completion_review.files.clone();
-    if let Some((path, _)) = &s.last_document_write {
-        paths.push(path.display().to_string());
-    }
+    paths.extend(output.clone());
     paths.reverse();
     let mut seen = BTreeSet::new();
     let mut evidence = vec![json!({"id":"answer","kind":"candidate_answer",
         "text":format!("{}{draft}",s.completion_review.answer_prefix),
         "truncated":s.completion_review.continues_previous && !s.completion_review.prefix_complete})];
     let mut written = s.completion_review.written_paths.clone();
-    if let Some((path, _)) = &s.last_document_write {
-        let path = path.display().to_string();
-        if !written.contains(&path) {
-            written.push(path);
-        }
+    if let Some(path) = &output
+        && !written.contains(path)
+    {
+        written.push(path.clone());
     }
     // Every source file the agent observed, rehashed now against its first
     // observed version: runtime evidence that originals were left unchanged.
+    // A file the agent wrote is in the write log; reading it back before a
+    // later edit does not make it a changed original.
     let mut first_seen = BTreeMap::<String, (chrono::DateTime<chrono::Utc>, String)>::new();
     for source in s.sources.values().filter(|source| source.origin == "file") {
         if let (Some(path), Some(digest)) = (&source.path, &source.hash) {
@@ -410,6 +425,7 @@ fn snapshot_unbounded(s: &Session, draft: &str) -> Value {
             }
         }
     }
+    first_seen.retain(|path, _| !written.contains(&review_path(s, Path::new(path))));
     let changed: Vec<&String> = first_seen
         .iter()
         .filter(|(path, (_, digest))| {
@@ -422,7 +438,7 @@ fn snapshot_unbounded(s: &Session, draft: &str) -> Value {
     evidence.push(json!({"kind":"runtime_write_log","written_paths":written,
         "project_root":s.project.root.display().to_string(),
         "observed_sources":{"checked":first_seen.len(),"unchanged":first_seen.len()-changed.len(),"changed_or_unreadable":changed},
-        "note":"Recorded by the runtime, not the model. Agent tools can change files only through the logged mutation tools, so this list is complete for this run: files not listed, including every source file and pre-existing document, were not written by the agent. observed_sources rehashes every source file the agent read against its first observed version."}));
+        "note":"Recorded by the runtime, not the model. Agent tools can change files only through the logged mutation tools, so this list is complete for this run: files not listed, including every source file and pre-existing document, were not written by the agent. observed_sources rehashes every source file the agent read and did not write against its first observed version."}));
     // Citation coverage is runtime state, not a model claim: the cited ranges
     // of the saved document never delivered as complete lines of the current
     // file version. A live run was rejected seven times on evidence bookkeeping
@@ -443,17 +459,14 @@ fn snapshot_unbounded(s: &Session, draft: &str) -> Value {
         }
         // The saved output is the artifact under review; a 6000-character
         // preview cut a live manual mid-section and the review rejected it.
-        let output = s
-            .last_document_write
-            .as_ref()
-            .is_some_and(|(written, _)| written.display().to_string() == path);
-        let limit = if output { 40_000 } else { 6000 };
+        let is_output = output.as_ref() == Some(&path);
+        let limit = if is_output { 40_000 } else { 6000 };
         let mut comparison = None;
         let item = match read_path(&s.project, &path).and_then(|p| read_text(&p)) {
             Ok(content) => {
                 let digest = hash(content.as_bytes());
                 versions.insert(path.clone(), digest.clone());
-                if output && let Some(baseline) = &s.completion_review.document_baseline {
+                if is_output && let Some(baseline) = &s.completion_review.document_baseline {
                     comparison = baseline.evidence(&path, &content);
                     comparison_omitted |= comparison
                         .as_ref()
@@ -697,7 +710,7 @@ pub fn reviewed_files_unchanged(s: &Session) -> bool {
     let output = s
         .last_document_write
         .as_ref()
-        .map(|(path, _)| path.display().to_string());
+        .map(|(path, _)| review_path(s, path));
     s.completion_review
         .written_paths
         .iter()

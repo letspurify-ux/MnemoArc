@@ -1231,6 +1231,82 @@ fn saved_output_is_reviewed_whole_and_observed_sources_are_rehashed() {
     assert!(manual["text"].as_str().unwrap().contains("마지막 문장."));
 }
 
+#[cfg(unix)]
+#[test]
+fn an_output_behind_a_symlink_is_one_reviewed_file_and_not_a_changed_source() {
+    // A live output in /var/folders was read back as /private/var/folders:
+    // the reviewer got the manual twice, and the read-then-edited output was
+    // listed as a changed source under a path missing from the write log.
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(dir.path().join("out")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("out"), dir.path().join("link")).unwrap();
+    std::fs::write(project.join("ui.js"), "export const label = '저장';\n").unwrap();
+    let mut s = session(&project);
+    s.project.output = dir.path().join("link/manual.md");
+    s.select_workflow("source_document").unwrap();
+    s.active_tools = tools::ToolRegistry::optional_names();
+    let read = document_step(&mut s, "file_read", json!({"path":"ui.js"}));
+    assert_eq!(read["status"], "ok", "{read}");
+    let created = document_step(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# 안내\n\n저장 버튼을 누릅니다 (`ui.js:1-1`).\n"}),
+    );
+    assert_eq!(created["status"], "ok", "{created}");
+    let output = s.project.output.display().to_string();
+    let reread = document_step(&mut s, "file_read", json!({"path":output}));
+    assert_eq!(reread["status"], "ok", "{reread}");
+    let current = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    let edited = document_step(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":current,"old_text":"저장 버튼","text":"저장 단추"}),
+    );
+    assert_eq!(edited["status"], "ok", "{edited}");
+
+    review::begin(&mut s, "Saved manual.md").unwrap();
+    let p = payload(&review::request(&mut s).unwrap());
+    let resolved = dir
+        .path()
+        .join("out/manual.md")
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    let versions: Vec<&String> = p["file_versions"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|path| path.ends_with("manual.md"))
+        .collect();
+    assert_eq!(versions, [&resolved], "{p}");
+    let evidence = p["evidence"].as_array().unwrap();
+    let manuals: Vec<&Value> = evidence
+        .iter()
+        .filter(|e| {
+            e["kind"] == "current_file" && e["path"].as_str().unwrap().ends_with("manual.md")
+        })
+        .collect();
+    assert_eq!(manuals.len(), 1, "{p}");
+    assert_eq!(manuals[0]["path"], resolved);
+    assert!(manuals[0]["text"].as_str().unwrap().contains("저장 단추"));
+    let log = evidence
+        .iter()
+        .find(|e| e["kind"] == "runtime_write_log")
+        .unwrap();
+    assert_eq!(log["written_paths"], json!([resolved]), "{log}");
+    assert_eq!(log["observed_sources"]["checked"], 1, "{log}");
+    assert_eq!(
+        log["observed_sources"]["changed_or_unreadable"],
+        json!([]),
+        "{log}"
+    );
+    review::finish(&mut s, &verdict(&p, true)).unwrap();
+    assert!(review::reviewed_files_unchanged(&s));
+}
+
 #[test]
 fn a_rejection_binds_only_the_result_it_reviewed() {
     let dir = tempfile::tempdir().unwrap();
