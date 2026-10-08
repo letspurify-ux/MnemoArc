@@ -192,7 +192,7 @@ fn title_similarity(a: &str, b: &str) -> f64 {
     (2 * shared) as f64 / total as f64
 }
 
-fn bare_heading_title(heading: &str) -> &str {
+pub(super) fn bare_heading_title(heading: &str) -> &str {
     let content = heading.trim_start_matches('#').trim_start();
     let without_closing = content.trim_end_matches('#');
     if without_closing.len() < content.len()

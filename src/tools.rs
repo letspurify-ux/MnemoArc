@@ -2528,16 +2528,36 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             if new.lines().next().map(str::trim) != target.lines().next().map(str::trim) {
                 bail!("invalid_argument_value: section replacement must retain its heading");
             }
-            if let Some(extra) = documentation::headings(new)
+            let new_headings = documentation::headings(new);
+            let peers: Vec<_> = new_headings
                 .iter()
                 .skip(1)
-                .find(|heading| heading.level <= resolved.level)
+                .filter(|heading| heading.level <= resolved.level)
+                .collect();
+            // A later heading of this section's level that the document does
+            // not have yet becomes a new section after this one: a live model
+            // wrote section N and N+1 in one replacement three times and
+            // re-sent thousands of tokens after each rejection. An ancestor
+            // heading, a heading numbered as this section's child (1.3 then
+            // 1.3.1 as a sibling) and a heading the document already has are
+            // still rejected.
+            let target_number =
+                section_number(documentation::bare_heading_title(&resolved.heading));
+            let child_numbered = |heading: &str| {
+                let number = section_number(documentation::bare_heading_title(heading));
+                matches!((target_number, number), (Some(parent), Some(child))
+                    if child.strip_prefix(parent).is_some_and(|rest| rest.starts_with('.')))
+            };
+            if let Some(extra) = peers
+                .iter()
+                .find(|heading| heading.level < resolved.level || child_numbered(&heading.heading))
             {
                 let guidance = if resolved.level < 6 {
                     let child_level = resolved.level + 1;
                     let hashes = "#".repeat(child_level);
                     format!(
-                        "Child headings are allowed: if this is a child, change its prefix to {hashes} (level {child_level}) or deeper, up to level 6. Heading depth depends on the number of # characters, not section numbering."
+                        "Child headings are allowed: if this is a child, change its prefix to {hashes} (level {child_level}) or deeper, up to level 6. Heading depth depends on the number of # characters, not section numbering. A later level-{} heading that is not numbered as a child of this section and does not exist yet is inserted as a new section after this one.",
+                        resolved.level
                     )
                 } else {
                     "A level-6 section cannot have Markdown child headings; use paragraphs or lists for details within this section.".into()
@@ -2549,6 +2569,22 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                     extra.line,
                     extra.level,
                     extra.heading
+                );
+            }
+            let existing = documentation::headings(old);
+            if let Some((extra, present)) = peers.iter().find_map(|peer| {
+                existing
+                    .iter()
+                    .find(|heading| heading.heading.trim() == peer.heading.trim())
+                    .map(|present| (peer, present))
+            }) {
+                bail!(
+                    "invalid_argument_value: section replacement cannot add a heading the document already has: line {} of text contains {:?}, which is at document line {}; inserting it would duplicate that section. Keep this replacement to {:?} and its new sections, and rewrite {:?} with its own action=section edit",
+                    extra.line,
+                    extra.heading,
+                    present.line,
+                    resolved.heading,
+                    present.heading
                 );
             }
             let mut replacement = new.to_string();
@@ -2723,6 +2759,26 @@ fn check_whole_write(s: &Session, name: &str, args: &Value) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Headings of the replaced section's level that the replacement added
+/// after it, so the result names the new sections.
+fn inserted_sibling_sections(old: &str, new: &str, section: &str) -> Vec<String> {
+    let Ok(resolved) = documentation::resolve_heading(new, section) else {
+        return Vec::new();
+    };
+    let existing = documentation::headings(old);
+    documentation::headings(new)
+        .iter()
+        .filter(|heading| {
+            heading.level == resolved.level
+                && heading.start > resolved.start
+                && !existing
+                    .iter()
+                    .any(|present| present.heading.trim() == heading.heading.trim())
+        })
+        .map(|heading| heading.heading.clone())
+        .collect()
 }
 
 fn persist_document_edit(
@@ -5125,7 +5181,16 @@ fn execute_repaired(
                 );
             }
             let result = apply_document_edit_operation(&old, &args)?;
-            persist_document_edit(s, &path, &old, exists, result, cancel)
+            let inserted = if action == "section" {
+                inserted_sibling_sections(&old, &result, args["section"].as_str().unwrap_or(""))
+            } else {
+                Vec::new()
+            };
+            let mut saved = persist_document_edit(s, &path, &old, exists, result, cancel)?;
+            if !inserted.is_empty() {
+                saved["inserted_sections"] = json!(inserted);
+            }
+            Ok(saved)
         }
         "document_edit_batch" => {
             let path = output_path(&s.project)?;

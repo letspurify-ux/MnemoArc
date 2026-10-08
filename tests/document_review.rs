@@ -2474,6 +2474,79 @@ async fn a_review_of_several_requests_resumes_the_final_answer_that_started_it()
 }
 
 #[test]
+fn a_halved_review_caps_every_later_page_at_half_the_unanswered_evidence() {
+    // Live run 2026-10-08: the halved count was taken from what each later
+    // page had left, so pages far below the input ceiling took half, then a
+    // quarter, then one chunk of the remaining evidence: 13 requests for
+    // 137 lines, and the review ran out of time. The cap is half of the
+    // unanswered page's evidence and holds for every later page.
+    let (dir, mut s) = fixture();
+    s.project.audience = "일반 사용자".into();
+    let files = 8;
+    for file in 0..files {
+        let source = (1..=20)
+            .map(|i| format!("export const value_{file}_{i} = {i};\n"))
+            .collect::<String>();
+        std::fs::write(dir.path().join(format!("mod{file}.js")), source).unwrap();
+    }
+    let doc = (0..files)
+        .flat_map(|file| {
+            (0..5).map(move |i| {
+                format!(
+                    "Claim {file}-{i} shows the `value_{file}_{i}` setting. mod{file}.js:1-20\n"
+                )
+            })
+        })
+        .collect::<String>();
+    std::fs::write(&s.project.output, &doc).unwrap();
+    let page = |s: &mut Session| {
+        let request = document_review::request(s).unwrap();
+        let payload: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        payload
+    };
+    let full = page(&mut s);
+    assert_eq!(full["evidence"].as_array().unwrap().len(), files);
+    assert!(full["audience_flags"].is_array(), "{full}");
+    assert!(document_review::shrink_page(&mut s));
+    let first = page(&mut s);
+    let first_chunks = first["evidence"].as_array().unwrap().len();
+    assert!((3..=5).contains(&first_chunks), "{first_chunks}");
+    assert_eq!(first["more_evidence_pages"], true);
+    assert!(first["audience_flags"].is_array(), "{first}");
+    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    // The next evidence page of the same range takes as much again, not
+    // half of what is left, and judges only its evidence.
+    let second = page(&mut s);
+    let second_chunks = second["evidence"].as_array().unwrap().len();
+    assert!(
+        second_chunks + 1 >= first_chunks,
+        "{second_chunks} after {first_chunks}"
+    );
+    assert!(first_chunks + second_chunks >= files - 1);
+    assert!(second.get("audience_flags").is_none(), "{second}");
+    assert!(
+        second["page_scope"]
+            .as_str()
+            .unwrap()
+            .contains("continues the same document range with further evidence"),
+        "{second}"
+    );
+    assert!(
+        !first["page_scope"]
+            .as_str()
+            .unwrap()
+            .contains("continues the same document range"),
+        "{first}"
+    );
+    // Another model starts from full pages again.
+    s.config.model = "gpt-4o-mini".into();
+    let other = page(&mut s);
+    assert_eq!(other["evidence"].as_array().unwrap().len(), files);
+    assert!(s.document_review.evidence_cap.is_none());
+}
+
+#[test]
 fn a_shrunk_review_page_covers_fewer_lines_and_evidence_chunks() {
     // A reasoning model ran out of its full output allowance on a page; an
     // identical retry tends to fail the same way, so the page is halved.
