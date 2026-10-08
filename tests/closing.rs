@@ -2862,6 +2862,75 @@ async fn closing_halves_and_skips_an_unanswered_review_page_like_other_runs() {
 }
 
 #[tokio::test]
+async fn closing_skips_only_the_page_of_a_malformed_review_reply() {
+    // Live runs 2026-10-08: one malformed closing reply ended the whole
+    // document review, discarding a page already reviewed and another's
+    // collected findings. Closing now skips that page at once and goes on.
+    let (_dir, mut s, _) = fixture();
+    s.config.completion_review_enabled = false;
+    s.config.run_tokens = 100_000;
+    s.config.closing_reserve_ratio = 0.8;
+    s.config.verification_reserve_ratio = 0.85;
+    s.config.writing_reserve_ratio = 0.9;
+    let doc = (1..=150)
+        .map(|i| format!("Claim {i}. main.js:1-6\n"))
+        .collect::<String>();
+    let hash = s.last_document_write.as_ref().unwrap().1.clone();
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","expected_hash":hash,"text":doc}),
+    )
+    .unwrap();
+    let none = std::time::Duration::ZERO;
+    let mut steps = vec![
+        (
+            none,
+            Completion {
+                usage: Some(Usage {
+                    input: 30_000,
+                    output: 10,
+                    cached: None,
+                }),
+                ..text("Saved out.md.")
+            },
+        ),
+        (none, text(r#"{"{"issues": []"#)),
+    ];
+    steps.extend((0..6).map(|_| (none, text(r#"{"issues":[]}"#))));
+    let (result, _, output_tokens, notices) = run_paced(s, steps).await;
+    assert!(result.progress_recovery.closing.is_some());
+    assert!(
+        notices.iter().any(|n| n
+            == "마감 단계의 검토 응답이 형식에 맞지 않아 이 부분의 검토를 건너뛰고, 나머지 검토를 이어갑니다."),
+        "{notices:?}"
+    );
+    assert!(
+        !notices.iter().any(|n| n.contains("이 결과의 검토를 생략")),
+        "{notices:?}"
+    );
+    // The skipped page is not asked again; the next request is the next page.
+    assert!(output_tokens.len() >= 3, "{output_tokens:?}");
+    assert_eq!(
+        result.status, "complete_with_gaps",
+        "{:?}",
+        result.last_error
+    );
+    let gaps: Vec<_> = result
+        .completion_gaps
+        .iter()
+        .filter(|gap| gap.starts_with("문서 검토 — "))
+        .collect();
+    assert_eq!(gaps.len(), 1, "{:?}", result.completion_gaps);
+    assert!(
+        gaps[0].starts_with("문서 검토 — 1–")
+            && gaps[0].ends_with("줄은 검토를 마치지 못했습니다."),
+        "{gaps:?}"
+    );
+    assert!(!gaps[0].contains("–150줄"), "{gaps:?}");
+}
+
+#[tokio::test]
 async fn reads_after_a_declared_draft_phase_still_count_as_progress() {
     // Live run 2026-10-07: the model declared phase draft before its first
     // save, and its reads for later sections stopped counting (2 to 10).

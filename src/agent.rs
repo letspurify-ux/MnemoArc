@@ -458,26 +458,29 @@ fn suppress_unchanged_repeat(
 /// answers had the wrong format.
 fn unanswered_notice(notice: &'static str) -> &'static str {
     match notice {
-        REVIEW_PAGE_SKIPPED_NOTICE => REVIEW_UNANSWERED_SKIPPED_NOTICE,
+        REVIEW_PAGE_SKIPPED_NOTICE | REVIEW_CLOSING_PAGE_SKIPPED_NOTICE => {
+            REVIEW_UNANSWERED_SKIPPED_NOTICE
+        }
         REVIEW_UNAVAILABLE_NOTICE => REVIEW_UNANSWERED_UNAVAILABLE_NOTICE,
         REVIEW_CLOSING_UNAVAILABLE_NOTICE => REVIEW_CLOSING_UNANSWERED_NOTICE,
         other => other,
     }
 }
 
-/// Abandon a pending review whose responses keep failing, for document work
-/// only. Responses that fail validation end the review after
-/// REVIEW_UNAVAILABLE_LIMIT, in closing mode at the first; the result then
-/// finishes without that review and reports it as unchecked. A page that got
-/// no answer (`unanswered` counts its unanswered responses, `half_retry` marks
-/// the first) is asked once more at half size and then skipped, in closing
-/// mode too: a live run's whole closing review was dropped after one provider
-/// idle timeout with 9 of 12 closing requests left. Skipping keeps the
-/// findings of other pages. Returns the notice to show, if any.
+/// Give up on the page of a pending review whose responses keep failing, for
+/// document work only. A page whose responses fail validation is skipped
+/// after REVIEW_UNAVAILABLE_LIMIT of them, in closing mode at the first. A
+/// page that got no answer (`half_retry` marks its first unanswered
+/// response) is asked once more at half size and then skipped, in closing
+/// mode too. Skipping keeps the findings of other pages and reports the
+/// page as unreviewed; the review ends unchecked only when nothing is left
+/// to judge. In closing mode one malformed reply used to end the whole
+/// review: two live runs lost their closing reviews that way, one with a
+/// page already reviewed and another's findings collected. Returns the
+/// notice to show, if any.
 fn abandon_failing_review(
     s: &mut Session,
     failures: usize,
-    unanswered: usize,
     half_retry: bool,
 ) -> Option<&'static str> {
     let closing = s.progress_recovery.closing.is_some();
@@ -489,8 +492,18 @@ fn abandon_failing_review(
     if !s.is_document_work() || s.checkpoint.is_some() || retry {
         return None;
     }
-    let skip_page = !closing || unanswered > 0;
-    if s.document_review.pending && !s.completion_review.pending && skip_page {
+    // Closing skips a page at its first malformed reply; "repeatedly" would
+    // misstate that.
+    let once = failures < REVIEW_UNAVAILABLE_LIMIT;
+    let (page_skipped, unavailable) = if once {
+        (
+            REVIEW_CLOSING_PAGE_SKIPPED_NOTICE,
+            REVIEW_CLOSING_UNAVAILABLE_NOTICE,
+        )
+    } else {
+        (REVIEW_PAGE_SKIPPED_NOTICE, REVIEW_UNAVAILABLE_NOTICE)
+    };
+    if s.document_review.pending && !s.completion_review.pending {
         use tools::document_review::PageSkip;
         match tools::document_review::skip_failing_page(s) {
             PageSkip::NotApplicable => {}
@@ -498,28 +511,28 @@ fn abandon_failing_review(
                 s.last_error = None;
                 s.progress_recovery.action_required = false;
                 note_document_review_verdict(s);
-                return Some(REVIEW_PAGE_SKIPPED_NOTICE);
+                return Some(page_skipped);
             }
             PageSkip::Unavailable => {
                 s.last_error = Some(DOCUMENT_REVIEW_UNAVAILABLE.into());
                 s.progress_recovery.action_required = false;
-                return Some(REVIEW_UNAVAILABLE_NOTICE);
+                return Some(unavailable);
             }
         }
     }
-    if s.completion_review.pending && skip_page {
+    if s.completion_review.pending {
         use tools::document_review::PageSkip;
         match tools::completion_review::skip_failing_page(s) {
             PageSkip::NotApplicable => {}
             PageSkip::Continued => {
                 s.last_error = None;
                 s.progress_recovery.action_required = false;
-                return Some(REVIEW_PAGE_SKIPPED_NOTICE);
+                return Some(page_skipped);
             }
             PageSkip::Unavailable => {
                 s.last_error = Some("completion_review_unavailable: some criteria got no valid review answer; give the final answer again and the result will be reported as unchecked".into());
                 s.progress_recovery.action_required = false;
-                return Some(REVIEW_UNAVAILABLE_NOTICE);
+                return Some(unavailable);
             }
         }
     }
@@ -539,13 +552,7 @@ fn abandon_failing_review(
         return None;
     }
     s.progress_recovery.action_required = false;
-    // Closing ends a review at its first invalid response; "repeatedly"
-    // would misstate it.
-    Some(if failures < REVIEW_UNAVAILABLE_LIMIT {
-        REVIEW_CLOSING_UNAVAILABLE_NOTICE
-    } else {
-        REVIEW_UNAVAILABLE_NOTICE
-    })
+    Some(unavailable)
 }
 
 /// After a document review verdict with findings, require their repair.
@@ -656,6 +663,8 @@ const REVIEW_CLOSING_UNANSWERED_NOTICE: &str =
     "마감 단계의 검토 응답을 받지 못해 이 결과의 검토를 생략하고, 완료 보고에 미검토로 표시합니다.";
 const REVIEW_PAGE_SKIPPED_NOTICE: &str =
     "검토 응답이 반복해서 형식에 맞지 않아 이 부분의 검토를 건너뛰고, 나머지 검토를 이어갑니다.";
+const REVIEW_CLOSING_PAGE_SKIPPED_NOTICE: &str =
+    "마감 단계의 검토 응답이 형식에 맞지 않아 이 부분의 검토를 건너뛰고, 나머지 검토를 이어갑니다.";
 
 fn finish_cause_text(cause: &str) -> &'static str {
     match cause {
@@ -2338,7 +2347,6 @@ pub async fn run_session_controlled(
                     let Some(notice) = abandon_failing_review(
                         &mut s,
                         review_response_failures,
-                        review_unanswered,
                         unanswered && review_unanswered == 1,
                     ) else {
                         if review_response_failures >= REVIEW_RESPONSE_LIMIT
@@ -2483,8 +2491,8 @@ pub async fn run_session_controlled(
                 })
             } else {
                 // Mirror abandon_failing_review: this response is the last
-                // one before a page skip or, in closing, where any answered
-                // response that fails ends the review or skips its page.
+                // one before a page skip, as is any answered response in
+                // closing.
                 let last_try = s.checkpoint.is_none()
                     && (s.progress_recovery.closing.is_some()
                         || review_response_failures + 1 >= REVIEW_UNAVAILABLE_LIMIT);
@@ -2528,7 +2536,6 @@ pub async fn run_session_controlled(
                     && let Some(notice) = abandon_failing_review(
                         &mut s,
                         review_response_failures,
-                        review_unanswered,
                         unanswered && review_unanswered == 1,
                     )
                 {

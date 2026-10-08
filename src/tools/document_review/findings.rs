@@ -655,7 +655,7 @@ pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str, last_try: bool
     // Check every proposal, even after a bad quote or malformed sibling.
     // Keep page verdicts atomic; only grounded, unconfirmed retry candidates
     // survive a rejected batch, with their original evidence and stable IDs.
-    // On a last try (before a page skip or the single closing review) an
+    // On a last try (before a page skip, as is every closing response) an
     // issue-level rejection drops only that issue. One reconstructed source
     // quote used to discard a closing response with a valid sibling finding.
     let mut stale = Vec::new();

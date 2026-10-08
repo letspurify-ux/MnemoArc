@@ -1356,8 +1356,8 @@ pub fn finish(s: &mut Session, text: &str) -> Result<()> {
     finish_attempt(s, text, false)
 }
 
-/// Accept the last response a review will retry before it skips the page or,
-/// in closing mode, abandons the whole review. An issue whose ui_labels lack
+/// Accept the last response a review will retry before it skips the page
+/// (at the first failure in closing mode). An issue whose ui_labels lack
 /// a quoted source line is dropped (and logged) instead of rejecting every
 /// sibling: in a live run one such label turned the single closing review
 /// into an unreviewed result. A dropped, previously confirmed defect still
