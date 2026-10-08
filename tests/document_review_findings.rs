@@ -289,6 +289,55 @@ fn an_unanswered_validation_batch_is_halved_then_skipped_alone() {
 }
 
 #[test]
+fn a_halved_validation_keeps_half_the_unanswered_batch_for_later_batches() {
+    // Live run 2026-10-08: validation shifted the candidates that fit by
+    // page_shrink, which two unanswered review pages had raised to 2, so a
+    // review validated one candidate per request. Validation is now halved
+    // from its own unanswered batch, and later batches keep that size.
+    let (dir, mut s) = fixture();
+    let ui: String = (1..=6)
+        .map(|i| format!("const label{i} = '기능 {i}';\n"))
+        .collect();
+    std::fs::write(dir.path().join("ui.js"), ui).unwrap();
+    let doc: String = std::iter::once("# 설정\n".to_owned())
+        .chain(
+            (1..=6).map(|i| format!("기능 {i} 버튼을 누르면 동작 {i}이 실행됩니다. ui.js:{i}\n")),
+        )
+        .collect();
+    std::fs::write(&s.project.output, doc).unwrap();
+    review::request(&mut s).unwrap();
+    s.document_review.pending = true;
+    // An unanswered review page halves review pages, not validation.
+    assert!(review::shrink_page(&mut s));
+    assert_eq!(s.document_review.page_shrink, 1);
+    let issues = (1..=6)
+        .map(|i| {
+            json!({"previous_id":null,"kind":"factual",
+                "document":{"start_line":i + 1,"end_line":i + 1,
+                    "quote":format!("기능 {i} 버튼을 누르면 동작 {i}이 실행됩니다.")},
+                "requirement_id":null,
+                "sources":[{"path":"ui.js","start_line":i,"end_line":i,
+                    "quote":format!("const label{i} = '기능 {i}';")}],
+                "problem":format!("기능 {i}의 동작 설명이 소스와 다릅니다."),
+                "correction":format!("기능 {i}의 실제 동작을 적으세요."),"ui_labels":[]})
+        })
+        .collect();
+    submit(&mut s, issues);
+    assert!(s.document_review.validating);
+    assert_eq!(candidate_ids(&mut s).len(), 6);
+    // No answer: half of that batch, and every later batch the same size.
+    assert!(review::shrink_page(&mut s));
+    assert_eq!(s.document_review.page_shrink, 1);
+    assert_eq!(candidate_ids(&mut s), ["F1", "F2", "F3"]);
+    let decisions: Vec<_> = ["F1", "F2", "F3"]
+        .iter()
+        .map(|id| decision(id, "dismissed"))
+        .collect();
+    review::finish(&mut s, &json!({ "decisions": decisions }).to_string()).unwrap();
+    assert_eq!(candidate_ids(&mut s), ["F4", "F5", "F6"]);
+}
+
+#[test]
 fn skipping_a_bad_page_still_validates_its_grounded_candidates() {
     for paginated in [false, true] {
         for status in ["confirmed", "dismissed"] {

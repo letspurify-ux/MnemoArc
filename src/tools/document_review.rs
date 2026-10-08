@@ -112,6 +112,12 @@ pub struct ReviewState {
     /// remaining chunks: a live run spent 13 requests on 137 lines.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_cap: Option<usize>,
+    /// Finding candidates a validation request may carry after one got no
+    /// answer: half of that batch. Validation used to shift its count by
+    /// page_shrink, which review pages also raise, against the candidates
+    /// left: a live review validated one candidate per request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_cap: Option<usize>,
     /// Evidence tokens of the last review page built.
     #[serde(skip)]
     last_evidence_tokens: usize,
@@ -155,6 +161,7 @@ impl ReviewState {
             policy_hash: old.policy_hash,
             page_shrink: old.page_shrink,
             evidence_cap: old.evidence_cap,
+            validation_cap: old.validation_cap,
             shrink_layout: old.shrink_layout,
             ..Default::default()
         };
@@ -279,6 +286,8 @@ pub(crate) fn refresh_policy(s: &mut Session) {
         unavailable_failure: state.unavailable_failure.take(),
         policy_hash: Some(policy_hash().to_owned()),
         page_shrink: state.page_shrink,
+        evidence_cap: state.evidence_cap,
+        validation_cap: state.validation_cap,
         shrink_layout: state.shrink_layout.take(),
         ..Default::default()
     };
@@ -718,18 +727,26 @@ const MAX_PAGE_SHRINK: u8 = 2;
 /// Halve later requests after one got no answer with the full allowance:
 /// retrying the identical request used to end the same way. A review page
 /// takes half the document lines and at most half the evidence tokens of
-/// the unanswered page; during finding validation this halves the
-/// candidates per request instead. False at the limit, or for a single
-/// candidate.
+/// the unanswered page (twice at most). A validation request takes at most
+/// half the candidates of the unanswered batch; review pages and validation
+/// are halved from their own unanswered requests. False at the limit, or
+/// for a single candidate.
 pub fn shrink_page(s: &mut Session) -> bool {
     let state = &mut s.document_review;
-    if state.page_shrink >= MAX_PAGE_SHRINK || (state.validating && state.validation_ids.len() < 2)
-    {
+    if state.validating {
+        if state.validation_ids.len() < 2 {
+            return false;
+        }
+        state.validation_cap = Some(state.validation_ids.len() / 2);
+        state.shrink_layout = state.target_layout.clone();
+        return true;
+    }
+    if state.page_shrink >= MAX_PAGE_SHRINK {
         return false;
     }
     state.page_shrink += 1;
     state.shrink_layout = state.target_layout.clone();
-    if !state.validating && state.last_evidence_tokens > 0 {
+    if state.last_evidence_tokens > 0 {
         let carried = state
             .evidence_cap
             .map_or(state.last_evidence_tokens, |cap| {
@@ -769,11 +786,13 @@ fn request_page(s: &mut Session) -> Result<Option<Value>> {
         .saturating_sub(512);
     let layout = format!("{}:{ceiling}", s.config.model);
     // Another model or input budget has its own output capacity.
-    if s.document_review.page_shrink > 0
-        && s.document_review.shrink_layout.as_deref() != Some(layout.as_str())
-    {
+    let review = &s.document_review;
+    let shrunk =
+        review.page_shrink > 0 || review.evidence_cap.is_some() || review.validation_cap.is_some();
+    if shrunk && review.shrink_layout.as_deref() != Some(layout.as_str()) {
         s.document_review.page_shrink = 0;
         s.document_review.evidence_cap = None;
+        s.document_review.validation_cap = None;
         s.document_review.shrink_layout = None;
     }
     if s.document_review.target_requirements.as_deref() != Some(requirement_hash.as_str())

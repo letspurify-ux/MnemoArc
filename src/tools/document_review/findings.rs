@@ -1266,8 +1266,12 @@ pub fn verification_request(s: &mut Session, ceiling: usize) -> Result<Value> {
     if ids.is_empty() {
         bail!("document_review_budget: one finding and its evidence cannot fit validation input");
     }
-    // A halved request validates fewer candidates; the others follow.
-    let kept = (ids.len() >> s.document_review.page_shrink).max(1);
+    // A halved request validates at most half the unanswered batch; the
+    // others follow in batches of the same size.
+    let kept = s
+        .document_review
+        .validation_cap
+        .map_or(ids.len(), |cap| ids.len().min(cap.max(1)));
     ids.truncate(kept);
     payload["candidates"].as_array_mut().unwrap().truncate(kept);
     request["messages"][1]["content"] = json!(payload.to_string());
