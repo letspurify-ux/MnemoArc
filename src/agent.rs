@@ -55,10 +55,9 @@ fn closing_stall_limit(config: &Config) -> usize {
 }
 
 /// One monotonic measure of document progress: the best document shape,
-/// reduced review findings, met acceptance checks, and distinct source
-/// evidence gathered while investigating, while cited ranges remain unread
-/// or while a review repair is open. Plan bookkeeping is excluded;
-/// completing and reopening the same to-do is not progress.
+/// reduced review findings, met acceptance checks, and the project source
+/// lines delivered so far. Plan bookkeeping is excluded; completing and
+/// reopening the same to-do is not progress.
 fn progress_score(s: &Session) -> usize {
     s.progress_recovery.best_document_section_count * 2
         + s.progress_recovery.best_document_content_lines
@@ -1448,7 +1447,7 @@ pub async fn run_session_controlled(
     // ladder; closing mode and its reported gaps belong to the previous run.
     s.progress_recovery.closing = None;
     s.progress_recovery.plan_checkpoints_seen = s.checkpoints_completed;
-    s.progress_recovery.evidence_credit = s.sources.len();
+    s.progress_recovery.evidence_credit = tools::delivered_source_lines(&s);
     s.progress_recovery.best_score = progress_score(&s);
     s.progress_recovery.rounds_since_best = 0;
     // The ladder counts completed model requests, so the first loop pass of
@@ -1660,9 +1659,13 @@ pub async fn run_session_controlled(
             // after the first save: reading more of the project is how a
             // document gets complete. Only investigation, an unsaved
             // document, open repairs or unread citations used to count it,
-            // so further reading late in a run looked like a stall.
-            s.progress_recovery.evidence_credit =
-                s.progress_recovery.evidence_credit.max(s.sources.len());
+            // so further reading late in a run looked like a stall. Only
+            // lines not delivered before count; re-reading them or the
+            // output is not new evidence.
+            s.progress_recovery.evidence_credit = s
+                .progress_recovery
+                .evidence_credit
+                .max(tools::delivered_source_lines(&s));
             let score = progress_score(&s);
             if score > s.progress_recovery.best_score {
                 s.progress_recovery.best_score = score;
@@ -3167,7 +3170,7 @@ pub async fn run_session_controlled(
         let mut remaining = batch_limit;
         let mut seen_call_ids = std::collections::BTreeSet::new();
         let mut batch_document_hash: Option<String> = None;
-        let prior_source_count = s.sources.len();
+        let prior_source_lines = tools::delivered_source_lines(&s);
         let prior_unread = unread_citation_count(&s);
         let prior_current_todo = s.task.current_todo().map(|item| item.id.clone());
         let prior_pending_todos = s.task.todos.iter().filter(|item| !item.done).count();
@@ -3471,7 +3474,7 @@ pub async fn run_session_controlled(
         if verified_progress {
             repetitions.clear();
         }
-        let new_source_evidence = s.sources.len() > prior_source_count;
+        let new_source_evidence = tools::delivered_source_lines(&s) > prior_source_lines;
         let pending_todos = s.task.todos.iter().filter(|item| !item.done).count();
         let plan_advanced = prior_current_todo.is_some()
             && pending_todos < prior_pending_todos

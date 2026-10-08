@@ -172,7 +172,23 @@ fn position(task: &TaskState, before: Option<&str>) -> Result<usize> {
         Some(id) => {
             let at = index(task, id)?;
             if task.todos[at].done {
-                bail!("Insert or move before an unfinished item; completed history stays fixed");
+                // Name the way out: with no unfinished item left, a live
+                // model kept naming a completed item for three requests.
+                let hint = match task.current_todo() {
+                    Some(current) => format!(
+                        "omit before to place them at the end, or use before {:?} (the current item) to put them ahead of the remaining work",
+                        current.id
+                    ),
+                    None => {
+                        "no unfinished item is left, so omit before to append at the end".into()
+                    }
+                };
+                return Err(operation_error(
+                    format!(
+                        "Insert or move before an unfinished item; completed history stays fixed. {id} is completed: {hint}"
+                    ),
+                    json!({"code":"completed_anchor","before_id":id}),
+                ));
             }
             Ok(at)
         }
@@ -356,6 +372,8 @@ fn unchanged(
             "Review the returned plan, copy current_revision into expected_revision, and combine necessary changes into one apply call.",
         Some("pending_limit" | "state_limit") =>
             "Shorten the request or complete/remove obsolete work, then resend a smaller batch using current_revision.",
+        Some("completed_anchor") =>
+            "No operations were committed. Completed items stay where they are: omit before to append at the end, or set before to an unfinished item such as current_id, then resend the whole batch using current_revision.",
         _ =>
             "Correct the reported operation using the returned IDs and current_revision, then resend the whole batch. No earlier operation was committed.",
     });
@@ -404,11 +422,68 @@ fn decode_json(text: &str) -> Result<Value> {
     // Strict JSON only: never repair partial JSON, evaluate text, or guess
     // operation ordering from a map. Each string wrapper is decoded once.
     serde_json::from_str(text).map_err(|error| {
-        anyhow::anyhow!(
-            "Invalid JSON: {error}; near {}. Send operations as a JSON array value, not as quoted text, so no brackets or quotes need hand escaping",
+        // At the end of the text serde_json reports the last character, so
+        // the marker sat before a final "}" that was fine. A live model sent
+        // text missing only its last "]" six times; name what is missing.
+        let near = if error.classify() == serde_json::error::Category::Eof {
+            let tail: Vec<char> = text.trim_end().chars().collect();
+            let tail: String = tail[tail.len().saturating_sub(40)..].iter().collect();
+            format!(
+                "{tail:?} <here> (end of text), which still needs {}",
+                unfinished_json(text)
+            )
+        } else {
             json_error_context(text, error.line(), error.column())
+        };
+        anyhow::anyhow!(
+            "Invalid JSON: {error}; near {near}. Send operations as a JSON array value, not as quoted text, so no brackets or quotes need hand escaping"
         )
     })
+}
+
+/// What an unfinished JSON text still needs at its end: a value after a
+/// trailing ":" or ",", then the quote and brackets it left open, in order.
+fn unfinished_json(text: &str) -> String {
+    let mut open = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut last = None;
+    for c in text.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '[' => open.push(']'),
+            '{' => open.push('}'),
+            ']' | '}' => {
+                open.pop();
+            }
+            _ => {}
+        }
+        if !c.is_whitespace() {
+            last = Some(c);
+        }
+    }
+    let mut closing = String::new();
+    if in_string {
+        closing.push('"');
+    }
+    closing.extend(open.iter().rev());
+    let value = !in_string && matches!(last, Some(':' | ','));
+    match (value, closing.is_empty()) {
+        (true, true) => "a value".into(),
+        (true, false) => format!("a value and then its closing {closing:?}"),
+        (false, true) => "the rest of its last value".into(),
+        (false, false) => format!("its closing {closing:?}"),
+    }
 }
 
 /// The text around a JSON error with a marker at the reported position, so a
@@ -682,6 +757,80 @@ fn intended_operations(value: &Value) -> bool {
     }
 }
 
+/// Why a batch cannot apply: its reason and conflict details, plus the input
+/// error with an example when the operations value cannot be read.
+struct Rejection {
+    reason: String,
+    conflict: Value,
+    input_error: Option<Value>,
+}
+
+/// The plan after applying every operation to a copy, whether the encoding
+/// was normalized, and notices; or why the batch cannot apply. Nothing is
+/// committed either way.
+fn trial(
+    task: &TaskState,
+    operations: Option<&Value>,
+) -> std::result::Result<(TaskState, bool, Vec<String>), Box<Rejection>> {
+    let (operations, normalized, notices) =
+        parse_operations(operations.unwrap_or(&Value::Null)).map_err(|error| {
+            Box::new(Rejection {
+                reason: format!("Invalid plan operation: {error}"),
+                conflict: error_details(&error, "invalid_operations"),
+                input_error: Some(json!({
+                    "field":"operations", "expected":"array of operation objects",
+                    "received":operations.map_or("missing", value_type),
+                    "example":{"action":"apply","expected_revision":task.plan_revision,"operations":[{"op":"insert","texts":["Write the requested section"]}]}
+                })),
+            })
+        })?;
+    let mut next = task.clone();
+    let count = operations.len();
+    for (index, operation) in operations.into_iter().enumerate() {
+        let (operation_name, target_id) = operation.identity();
+        let target_id = target_id.map(str::to_owned);
+        let current = next.current_todo().map(|item| item.id.clone());
+        if let Err(error) = apply(&mut next, operation) {
+            // Operations apply in order, so the plan the failing one saw can
+            // differ from the one the caller read. Name the operation and the
+            // item that was current at that point.
+            let current_text = current.as_deref().unwrap_or("none");
+            let reason = if count > 1 {
+                format!(
+                    "operations[{index}] failed: {error} (current item at that point: {current_text}). No operation in this batch was applied; earlier operations only take effect together with it"
+                )
+            } else {
+                format!("{error} (current item: {current_text})")
+            };
+            let mut conflict = error_details(&error, "invalid_operation");
+            conflict["operation_index"] = json!(index);
+            conflict["operation"] = json!(operation_name);
+            conflict["target_id"] = json!(target_id);
+            conflict["current_id"] = json!(current);
+            return Err(Box::new(Rejection {
+                reason,
+                conflict,
+                input_error: None,
+            }));
+        }
+    }
+    let pending = next.todos.iter().filter(|item| !item.done).count();
+    if pending > MAX_PENDING {
+        return Err(Box::new(Rejection {
+            reason: format!(
+                "The plan has room for at most {MAX_PENDING} unfinished items; no operations were applied"
+            ),
+            conflict: json!({"code":"pending_limit","limit":MAX_PENDING,"requested_pending":pending}),
+            input_error: None,
+        }));
+    }
+    while next.todos.iter().filter(|item| item.done).count() > MAX_COMPLETED {
+        let at = next.todos.iter().position(|item| item.done).unwrap();
+        next.todos.remove(at);
+    }
+    Ok((next, normalized, notices))
+}
+
 pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
     if args["action"] == "list" {
         let page = view(
@@ -714,75 +863,61 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
             ),
             None => format!("expected_revision is missing; the plan is at revision {revision}"),
         };
+        let mut rejected = None;
         if args.get("operations").is_none() {
             reason.push_str(
                 "; operations is also missing: apply needs an array of operation objects",
             );
+        } else if expected_revision.is_none() {
+            // Check the operations too, so one reply names every problem: a
+            // live model learned of a missing revision, then of JSON text
+            // missing its last bracket, then of a completed anchor, one
+            // request each.
+            match trial(&s.task, args.get("operations")) {
+                Ok(_) => reason.push_str(&format!(
+                    "; the operations are otherwise valid, so resend them unchanged with expected_revision {revision}"
+                )),
+                Err(rejection) => {
+                    reason.push_str(&format!(
+                        "; the operations would also fail: {}",
+                        rejection.reason
+                    ));
+                    rejected = Some(rejection);
+                }
+            }
         }
-        return Ok(unchanged(
+        let mut result = unchanged(
             &s.task,
             reason,
             expected_revision,
             json!({"code":if expected_revision.is_some() { "revision_conflict" } else { "missing_revision" }}),
-        ));
+        );
+        if let Some(rejection) = rejected {
+            result["conflict"]["operations_conflict"] = rejection.conflict;
+            result["conflict"]["correction"] = json!(
+                "No operations were committed. Copy current_revision into expected_revision and correct the operation the reason names, then resend the whole batch in one apply call."
+            );
+            if let Some(input_error) = rejection.input_error {
+                result["input_error"] = input_error;
+            }
+        }
+        return Ok(result);
     }
-    let (operations, normalized, notices) = match parse_operations(&args["operations"]) {
-        Ok(operations) => operations,
-        Err(error) => {
+    let (mut next, normalized, notices) = match trial(&s.task, args.get("operations")) {
+        Ok(trial) => trial,
+        Err(rejection) => {
             let mut result = unchanged(
                 &s.task,
-                format!("Invalid plan operation: {error}"),
+                rejection.reason,
                 expected_revision,
-                error_details(&error, "invalid_operations"),
+                rejection.conflict,
             );
-            result["input_error"] = json!({
-                "field":"operations", "expected":"array of operation objects",
-                "received":args.get("operations").map_or("missing", value_type),
-                "example":{"action":"apply","expected_revision":s.task.plan_revision,"operations":[{"op":"insert","texts":["Write the requested section"]}]}
-            });
+            if let Some(input_error) = rejection.input_error {
+                result["input_error"] = input_error;
+            }
             return Ok(result);
         }
     };
-    let mut next = s.task.clone();
-    let count = operations.len();
-    for (index, operation) in operations.into_iter().enumerate() {
-        let (operation_name, target_id) = operation.identity();
-        let target_id = target_id.map(str::to_owned);
-        let current = next.current_todo().map(|item| item.id.clone());
-        if let Err(error) = apply(&mut next, operation) {
-            // Operations apply in order, so the plan the failing one saw can
-            // differ from the one the caller read. Name the operation and the
-            // item that was current at that point.
-            let current_text = current.as_deref().unwrap_or("none");
-            let reason = if count > 1 {
-                format!(
-                    "operations[{index}] failed: {error} (current item at that point: {current_text}). No operation in this batch was applied; earlier operations only take effect together with it"
-                )
-            } else {
-                format!("{error} (current item: {current_text})")
-            };
-            let mut conflict = error_details(&error, "invalid_operation");
-            conflict["operation_index"] = json!(index);
-            conflict["operation"] = json!(operation_name);
-            conflict["target_id"] = json!(target_id);
-            conflict["current_id"] = json!(current);
-            return Ok(unchanged(&s.task, reason, expected_revision, conflict));
-        }
-    }
-    if next.todos.iter().filter(|item| !item.done).count() > MAX_PENDING {
-        return Ok(unchanged(
-            &s.task,
-            format!(
-                "The plan has room for at most {MAX_PENDING} unfinished items; no operations were applied"
-            ),
-            expected_revision,
-            json!({"code":"pending_limit","limit":MAX_PENDING,"requested_pending":next.todos.iter().filter(|item| !item.done).count()}),
-        ));
-    }
-    while next.todos.iter().filter(|item| item.done).count() > MAX_COMPLETED {
-        let at = next.todos.iter().position(|item| item.done).unwrap();
-        next.todos.remove(at);
-    }
     if next.todos == s.task.todos
         && next.todo_sequence == s.task.todo_sequence
         && next.todos_completed_total == s.task.todos_completed_total

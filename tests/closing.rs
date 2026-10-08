@@ -1939,6 +1939,47 @@ async fn new_sources_are_progress_after_the_first_save_in_any_phase() {
 }
 
 #[tokio::test]
+async fn rereading_delivered_lines_or_the_output_is_not_new_evidence() {
+    // Each new view of a file counted as new evidence: a live run re-read
+    // its own output and subranges of files it had read for 25 requests,
+    // and every stall check was reset each time.
+    let (dir, mut s) = verified_fixture();
+    s.task.phase = "verify".into();
+    std::fs::write(dir.path().join("more.js"), "export const more = 1;\n").unwrap();
+    let steps = vec![
+        call("output", "file_read", json!({"path":"out.md"})),
+        call(
+            "subrange",
+            "file_read",
+            json!({"path":"main.js","start_line":2,"max_lines":3}),
+        ),
+        call(
+            "output-line",
+            "file_read",
+            json!({"path":"out.md","start_line":2,"max_lines":1}),
+        ),
+        call("new", "file_read", json!({"path":"more.js"})),
+    ];
+    let (result, guidance) = run_scripted(s, steps).await;
+    assert!(result.document_written);
+    let counts = |field: &str| -> Vec<Value> {
+        guidance
+            .iter()
+            .take(5)
+            .map(|g| g["progress_recovery"][field].clone())
+            .collect()
+    };
+    assert_eq!(
+        counts("rounds_since_progress"),
+        [json!(0), json!(1), json!(2), json!(3), json!(0)]
+    );
+    assert_eq!(
+        counts("rounds_without_substantive_progress"),
+        [json!(0), json!(1), json!(2), json!(3), json!(0)]
+    );
+}
+
+#[tokio::test]
 async fn edits_grounded_in_new_sources_are_not_edits_without_progress() {
     // Same-length refinements counted as edits without progress unless they
     // added a section or lines, even right after reading a new source; the

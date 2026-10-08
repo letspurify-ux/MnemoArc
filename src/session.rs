@@ -359,8 +359,8 @@ pub struct ProgressRecovery {
     /// One monotonic measure prevents recovery counters from resetting each other.
     pub best_score: usize,
     pub rounds_since_best: usize,
-    /// Distinct delivered sources credited as progress. Frozen once the run
-    /// leaves the investigate phase, where only result improvements count.
+    /// Highest count of distinct project source lines delivered, credited
+    /// as progress; re-read lines and the output document never add to it.
     pub evidence_credit: usize,
     /// Set once document work must converge: exploration stops and the run
     /// finishes within a fixed number of requests, reporting unresolved items.

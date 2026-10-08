@@ -1040,6 +1040,153 @@ fn a_bare_apply_names_the_missing_revision_and_operations() {
 }
 
 #[test]
+fn a_missing_revision_also_names_what_is_wrong_with_the_operations() {
+    // A live model learned of a missing revision, then of JSON text missing
+    // its last bracket, then of a completed anchor, one request each.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(&mut s, json!([{"op":"insert","texts":["a"]}]));
+    apply(&mut s, json!([{"op":"complete","id":"T1","result":"done"}]));
+    let before = json!(s.task);
+    let send = |s: &mut Session, operations: Value| {
+        tools::execute(
+            s,
+            "task_plan",
+            json!({"action":"apply","operations":operations}),
+        )
+        .unwrap()
+    };
+    let result = send(&mut s, json!([{"op":"insert","texts":["b"],"before":"T1"}]));
+    assert_eq!(result["applied"], false, "{result}");
+    let reason = result["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with("expected_revision is missing; the plan is at revision 2"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("the operations would also fail"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("omit before to append at the end"),
+        "{reason}"
+    );
+    let conflict = &result["conflict"];
+    assert_eq!(conflict["code"], "missing_revision", "{result}");
+    assert_eq!(
+        conflict["operations_conflict"]["code"], "completed_anchor",
+        "{result}"
+    );
+    assert!(
+        conflict["correction"]
+            .as_str()
+            .unwrap()
+            .contains("correct the operation the reason names"),
+        "{result}"
+    );
+    // Unreadable operations text is named with its input error too.
+    let result = send(&mut s, json!(r#"[{"op": "insert", "texts": ["b"]}"#));
+    let reason = result["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(r#"still needs its closing "]""#),
+        "{reason}"
+    );
+    assert_eq!(result["input_error"]["received"], "string", "{result}");
+    // Valid operations are confirmed, but still not applied.
+    let result = send(&mut s, json!([{"op":"insert","texts":["b"]}]));
+    let reason = result["reason"].as_str().unwrap();
+    assert!(
+        reason.ends_with(
+            "the operations are otherwise valid, so resend them unchanged with expected_revision 2"
+        ),
+        "{reason}"
+    );
+    assert!(result["conflict"].get("operations_conflict").is_none());
+    assert_eq!(json!(s.task), before);
+}
+
+#[test]
+fn json_text_missing_its_last_bracket_says_what_is_still_needed() {
+    // The live shape: the outer array was never closed. The marker pointed
+    // before the final "}", which was fine, so the model kept resending it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let result = tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":0,"operations":r#"[{"op": "insert", "texts": ["A"]}"#}),
+    )
+    .unwrap();
+    assert_eq!(result["applied"], false, "{result}");
+    let reason = result["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(r#"<here> (end of text), which still needs its closing "]""#),
+        "{reason}"
+    );
+    assert!(!reason.contains(r#"<here> "}""#), "{reason}");
+    // A text cut inside a string or after a key names those too.
+    for (text, needed) in [
+        (
+            r#"[{"op": "insert", "texts": ["A"#,
+            r#"its closing "\"]}]""#,
+        ),
+        (r#"[{"op":"#, r#"a value and then its closing "}]""#),
+    ] {
+        let result = tools::execute(
+            &mut s,
+            "task_plan",
+            json!({"action":"apply","expected_revision":0,"operations":text}),
+        )
+        .unwrap();
+        let reason = result["reason"].as_str().unwrap();
+        assert!(reason.contains(needed), "{text}: {reason}");
+    }
+    assert!(s.task.todos.is_empty());
+}
+
+#[test]
+fn inserting_before_a_completed_item_says_to_omit_before() {
+    // With no unfinished item left, a live model kept naming a completed
+    // item as before for three requests; the error never said how to append.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(&mut s, json!([{"op":"insert","texts":["a"]}]));
+    apply(&mut s, json!([{"op":"complete","id":"T1","result":"done"}]));
+    let result = apply(&mut s, json!([{"op":"insert","texts":["b"],"before":"T1"}]));
+    assert_eq!(result["applied"], false, "{result}");
+    let reason = result["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(
+            "T1 is completed: no unfinished item is left, so omit before to append at the end"
+        ),
+        "{reason}"
+    );
+    assert_eq!(result["conflict"]["code"], "completed_anchor", "{result}");
+    assert_eq!(result["conflict"]["before_id"], "T1", "{result}");
+    assert!(
+        result["conflict"]["correction"]
+            .as_str()
+            .unwrap()
+            .contains("omit before to append at the end"),
+        "{result}"
+    );
+    // With work left, the current item is offered as the other anchor.
+    apply(&mut s, json!([{"op":"insert","texts":["c"]}]));
+    let result = apply(&mut s, json!([{"op":"insert","texts":["d"],"before":"T1"}]));
+    let reason = result["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(
+            r#"omit before to place them at the end, or use before "T2" (the current item)"#
+        ),
+        "{reason}"
+    );
+    // Omitting before appends, as the error says.
+    let result = apply(&mut s, json!([{"op":"insert","texts":["d"]}]));
+    assert_eq!(result["applied"], true, "{result}");
+    assert_eq!(s.task.todos.last().unwrap().text, "d");
+}
+
+#[test]
 fn live_out_of_order_batch_exposes_operation_and_blockers_without_committing_earlier_operations() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());

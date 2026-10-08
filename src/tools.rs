@@ -4129,6 +4129,51 @@ pub(crate) fn same_source(a: &crate::memory::Source, b: &crate::memory::Source) 
         && a.excerpt == b.excerpt
 }
 
+/// Distinct project source lines delivered in this session, counted once per
+/// file version. Progress credits a read only when it delivers lines not
+/// delivered before. Every view used to count: a live run re-read its own
+/// output and subranges of files it had read for 25 requests, and each new
+/// view reset every stall check.
+pub fn delivered_source_lines(s: &Session) -> usize {
+    // The document being written is not evidence for itself.
+    let output = output_path(&s.project).ok();
+    let own = output.as_ref().and_then(|path| path.canonicalize().ok());
+    let mut spans = BTreeMap::<(&str, Option<&str>), Vec<(usize, usize)>>::new();
+    for source in s.sources.values() {
+        let (Some(path), Some(start), Some(end)) =
+            (source.path.as_deref(), source.start_line, source.end_line)
+        else {
+            continue;
+        };
+        if source.origin != "file"
+            || output.as_deref() == Some(Path::new(path))
+            || own.as_deref() == Some(Path::new(path))
+        {
+            continue;
+        }
+        spans
+            .entry((path, source.hash.as_deref()))
+            .or_default()
+            .push((start.max(1), end));
+    }
+    spans
+        .into_values()
+        .map(|mut ranges| {
+            ranges.sort_unstable();
+            let mut lines = 0;
+            let mut counted_to = 0;
+            for (start, end) in ranges {
+                let from = start.max(counted_to + 1);
+                if end >= from {
+                    lines += end + 1 - from;
+                }
+                counted_to = counted_to.max(end);
+            }
+            lines
+        })
+        .sum()
+}
+
 pub(crate) struct Revalidation {
     hashes: BTreeMap<String, Option<String>>,
     stale_memories: BTreeSet<String>,
