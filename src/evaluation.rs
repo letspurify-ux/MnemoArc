@@ -75,7 +75,6 @@ pub async fn run(config: Config, suite_path: &Path, output: &Path) -> Result<()>
         let mut project = Project {
             name: case.name.clone(),
             root: root.clone(),
-            purpose: case.prompt.clone(),
             exclude: case.exclude.clone(),
             ..Default::default()
         };

@@ -133,23 +133,6 @@ export function ProjectForm({ project, onChange, disabled = false }) {
         />
         <small>프로젝트 폴더 기준 상대 경로 또는 절대 경로</small>
       </label>
-      <label>
-        작업 목적
-        <textarea
-          rows={3}
-          value={project.purpose}
-          disabled={disabled}
-          onChange={(e) => set("purpose", e.target.value)}
-        />
-      </label>
-      <label>
-        문서 독자
-        <input
-          value={project.audience}
-          disabled={disabled}
-          onChange={(e) => set("audience", e.target.value)}
-        />
-      </label>
       {["include", "exclude"].map((key) => (
         <label key={key}>
           {key === "include" ? "포함할 파일 패턴" : "제외할 파일 패턴"}

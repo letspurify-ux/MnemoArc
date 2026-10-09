@@ -278,7 +278,7 @@ async fn general_follow_up_collects_files_and_remembers_evidence_without_reviews
         );
         assert!(!names.contains(&"document_audit") && !names.contains(&"document_edit"));
     }
-    assert!(!s.document_review.pending && !s.completion_review.pending);
+    assert!(!s.document_review.pending);
     assert_eq!(s.reviews, 0);
 }
 #[tokio::test]

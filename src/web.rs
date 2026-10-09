@@ -1690,7 +1690,7 @@ mod worker_wait_tests {
             .header("x-mnemoarc-client", "web")
             .json(&json!({"project":Project {
                 root: dir.path().into(),
-                purpose: "x".repeat(2 * 1024 * 1024),
+                name: "x".repeat(2 * 1024 * 1024),
                 ..Default::default()
             }}))
             .send()
@@ -2273,8 +2273,8 @@ mod worker_wait_tests {
             let id = c.order[0].clone();
             (id.clone(), c.sessions[&id].project.clone())
         };
-        let original_purpose = project.purpose.clone();
-        project.purpose = "Pending project update".into();
+        let original_name = project.name.clone();
+        project.name = "Pending project update".into();
         let workers = Arc::new(tokio::sync::Semaphore::new(1));
         let occupied = workers.clone().acquire_owned().await.unwrap();
         state.file_io = FileIo::with_workers(workers, state.stopping.clone());
@@ -2315,7 +2315,7 @@ mod worker_wait_tests {
         assert!(matches!(result, Err(ApiError(StatusCode::CONFLICT, _))));
         let core = state.core.lock().await;
         assert_eq!(core.sessions[&id].workflow_mode, "answer");
-        assert_eq!(core.sessions[&id].project.purpose, original_purpose);
+        assert_eq!(core.sessions[&id].project.name, original_name);
         assert_eq!(core.revision, 1);
     }
 

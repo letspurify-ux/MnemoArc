@@ -92,14 +92,17 @@ pub struct Config {
     pub run_tokens: usize,
     /// Stalled document reviews before focused recovery (not a stop quota).
     pub review_limit: usize,
-    /// Edit requests per automatic document re-review interval.
-    pub document_repair_limit: usize,
+    /// Retired automatic re-review interval: the next final answer starts
+    /// the re-review. Older settings still load; the next save drops it.
+    #[serde(rename = "document_repair_limit", default, skip_serializing)]
+    pub retired_document_repair_limit: Retired,
     /// Retired answer-review switch, accepted so older settings still load.
     #[serde(rename = "source_answer_review", default, skip_serializing)]
     pub retired_source_answer_review: Option<bool>,
     pub source_document_review: bool,
-    /// Run the general read-only acceptance review before completing artifacts.
-    pub completion_review_enabled: bool,
+    /// Retired completion-review switch, accepted so older settings still load.
+    #[serde(rename = "completion_review_enabled", default, skip_serializing)]
+    pub retired_completion_review: Retired,
     pub writing_reserve_ratio: f64,
     pub verification_reserve_ratio: f64,
     /// Remaining-budget fraction at which document work enters closing mode.
@@ -120,12 +123,36 @@ pub struct Project {
     pub output: PathBuf,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
-    pub purpose: String,
-    pub audience: String,
+    /// Retired project purpose and reader settings: the request states them.
+    /// Older settings still load; the next save drops them.
+    #[serde(rename = "purpose", default, skip_serializing)]
+    pub retired_purpose: Retired,
+    #[serde(rename = "audience", default, skip_serializing)]
+    pub retired_audience: Retired,
 }
 impl Default for Project {
     fn default() -> Self {
-        Self { id: uuid::Uuid::new_v4().to_string(), name: "project".into(), root: PathBuf::from("."), output: "docs/source-summary.md".into(), include: vec![], exclude: vec![], purpose: "Explain the architecture, main flows, data structures and error handling with source evidence".into(), audience: "Developers".into() }
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "project".into(),
+            root: PathBuf::from("."),
+            output: "docs/source-summary.md".into(),
+            include: vec![],
+            exclude: vec![],
+            retired_purpose: Retired,
+            retired_audience: Retired,
+        }
+    }
+}
+
+/// A retired setting older files may still name. Its value is read and
+/// discarded, so it never distinguishes two otherwise equal settings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Retired;
+
+impl<'de> Deserialize<'de> for Retired {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        serde::de::IgnoredAny::deserialize(deserializer).map(|_| Retired)
     }
 }
 impl Project {
@@ -186,10 +213,10 @@ impl Default for Config {
             stall_round_limit: 8,
             database: crate::database::DatabaseConfig::default(),
             review_limit: 20,
-            document_repair_limit: 8,
+            retired_document_repair_limit: Retired,
             retired_source_answer_review: None,
             source_document_review: true,
-            completion_review_enabled: false,
+            retired_completion_review: Retired,
             projects: vec![],
         }
     }
@@ -215,7 +242,6 @@ impl Config {
             run_timeout_secs: 1800,
             run_tokens: 500000,
             review_limit: 3,
-            completion_review_enabled: true,
             ..Self::default()
         }
     }
@@ -308,7 +334,6 @@ impl Config {
             self.result_tokens,
             self.read_parallelism,
             self.review_limit,
-            self.document_repair_limit,
             self.output_tokens,
             self.run_tokens,
         ]

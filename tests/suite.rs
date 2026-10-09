@@ -12,8 +12,6 @@ mod agent;
 mod backend_sessions;
 #[path = "closing.rs"]
 mod closing;
-#[path = "completion_review.rs"]
-mod completion_review;
 #[path = "core.rs"]
 mod core_tests;
 #[path = "database.rs"]

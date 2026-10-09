@@ -114,32 +114,6 @@ const provider = createServer(async (req, res) => {
     sendAnswer("기존 작업의 상태와 검토 지적을 유지한 질문 답변입니다.");
     return;
   }
-  let reviewPayload;
-  try {
-    reviewPayload = JSON.parse(data.messages[1]?.content);
-  } catch {}
-  if (
-    reviewPayload?.completion_review &&
-    reviewPayload.original_request === "완료 조건 검증 테스트"
-  ) {
-    const draft =
-      reviewPayload.evidence.find((e) => e.id === "answer")?.text || "";
-    const met = draft.includes("예시");
-    sendAnswer(
-      JSON.stringify({
-        checks: reviewPayload.criteria.map((c) => ({
-          id: c.id,
-          status: met ? "met" : "unmet",
-          reason: met
-            ? "요약과 예시를 확인했습니다."
-            : "요청한 예시가 빠져 있습니다.",
-          evidence: ["answer"],
-          next_action: met ? "" : "누락된 예시를 답변에 추가합니다.",
-        })),
-      }),
-    );
-    return;
-  }
   let retainedState;
   try {
     const raw = data.messages.at(-1).content;
@@ -227,59 +201,6 @@ const provider = createServer(async (req, res) => {
     });
     const keep = setInterval(() => res.write(": keepalive\n\n"), 1000);
     res.on("close", () => clearInterval(keep));
-    return;
-  }
-  const acceptanceTest = isRequest("완료 조건 검증 테스트");
-  if (acceptanceTest) {
-    const message = data.messages.at(-1).content;
-    const state = JSON.parse(message.slice(message.indexOf("\n") + 1));
-    const revision = state.task.plan_revision;
-    if (revision > 0 && !state.run_guidance.current_todo) {
-      sendAnswer(
-        revision === 1
-          ? "요약을 작성했습니다."
-          : "요약과 예시를 모두 작성했습니다.",
-      );
-      return;
-    }
-    if (revision > 0) await new Promise((resolve) => setTimeout(resolve, 700));
-    const operations =
-      revision === 0
-        ? [
-            { op: "insert", texts: ["요약과 예시 작성"] },
-            { op: "complete", id: "T1", result: "요약 작성" },
-          ]
-        : [
-            {
-              op: "complete",
-              id: state.run_guidance.current_todo.id,
-              result: "예시를 답변에 추가했습니다.",
-            },
-          ];
-    event({
-      choices: [
-        {
-          delta: {
-            tool_calls: [
-              {
-                index: 0,
-                id: `acceptance-${revision}`,
-                function: {
-                  name: "task_plan",
-                  arguments: JSON.stringify({
-                    action: "apply",
-                    expected_revision: revision,
-                    operations,
-                  }),
-                },
-              },
-            ],
-          },
-          finish_reason: "tool_calls",
-        },
-      ],
-    });
-    res.end("data: [DONE]\n\n");
     return;
   }
   const planTest = isRequest("할 일 목록 테스트");

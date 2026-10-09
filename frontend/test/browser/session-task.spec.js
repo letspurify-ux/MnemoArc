@@ -212,7 +212,6 @@ test("general initial and follow-up document work and collection execute without
         model: "gpt-4o",
         model_context: 128000,
         source_document_review: true,
-        completion_review_enabled: true,
       },
       api_key: "browser-test-only",
     },
@@ -257,8 +256,6 @@ test("general initial and follow-up document work and collection execute without
     "일반 문서 수정 테스트",
   ]);
   expect(detail.document_review.attempts).toBe(0);
-  expect(detail.completion_review.attempts).toBe(0);
-  expect(detail.completion_review.required).toBe(false);
   expect(detail.document_review.pending).toBe(false);
   const output = await (await request.get(`/api/sessions/${id}/output`)).json();
   expect(output.content).toContain("후속 요청으로 추가한 내용");

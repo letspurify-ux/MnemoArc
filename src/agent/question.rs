@@ -118,7 +118,7 @@ fn request(s: &Session, limit: usize) -> Value {
     let mut snapshot = json!({
         "original_request":s.original_request,"current_goal":s.latest_request,"user_changes":s.task_amendments,"task_status":question.prior_status,
         "task_error":question.prior_error,"task":s.task,
-        "document_review":s.document_review,"completion_review":s.completion_review,
+        "document_review":s.document_review,
         "completion_gaps":s.completion_gaps,
         "checkpoint":s.checkpoint,"run_guidance":s.run_guidance,
         "recent_runs":s.run_history.iter().rev().take(3).collect::<Vec<_>>(),
@@ -129,9 +129,7 @@ fn request(s: &Session, limit: usize) -> Value {
     if s.task.workflow == "answer" {
         // The answer workflow runs no reviews.
         let fields = snapshot.as_object_mut().unwrap();
-        for key in ["document_review", "completion_review"] {
-            fields.remove(key);
-        }
+        fields.remove("document_review");
     }
     let state = bounded(snapshot, limit);
     json!({"model":s.config.model,"messages":[
@@ -344,7 +342,6 @@ async fn answer(
     work.checkpoint = None;
     work.task.workflow = "answer".into();
     work.document_review = Default::default();
-    work.completion_review = Default::default();
     work.progress_recovery = Default::default();
     work.run_guidance = json!({});
     work.ledger.clear();

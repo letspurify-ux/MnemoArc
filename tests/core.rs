@@ -971,11 +971,9 @@ fn answer_workflow_document_edit_skips_document_verification() {
     .unwrap();
     assert!(s.document_written);
     assert!(!s.is_document_work());
-    assert!(!tools::completion_review::required(&s));
     // The same write is verified in a document workflow.
     s.select_workflow("source_document").unwrap();
     assert!(s.is_document_work());
-    assert!(tools::completion_review::required(&s));
 }
 
 #[test]
@@ -986,11 +984,6 @@ fn answer_workflow_runs_no_reviews_and_hides_review_tools() {
     assert!(s.active_tools.contains("document_audit"));
     s.select_workflow("answer").unwrap();
     s.add_user("Plan and answer".into());
-    // Plans, deliverables and writes do not start a completion review.
-    tools::execute(&mut s, "task_plan", json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Answer the question"]}]})).unwrap();
-    s.task.deliverables = vec!["answer".into()];
-    assert!(s.config.completion_review_enabled);
-    assert!(!tools::completion_review::required(&s));
     let name = "document_audit";
     {
         assert!(!s.active_tools.contains(name), "{name}");
@@ -1009,9 +1002,6 @@ fn answer_workflow_runs_no_reviews_and_hides_review_tools() {
     .unwrap_err()
     .to_string();
     assert!(error.starts_with("workflow_forbidden:"), "{error}");
-    // The same task is reviewed in source_document.
-    s.select_workflow("source_document").unwrap();
-    assert!(tools::completion_review::required(&s));
 }
 
 #[test]
@@ -1019,21 +1009,14 @@ fn answer_workflow_sends_no_review_or_verification_guidance() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     s.add_user("Add a note to the summary".into());
-    let review_terms = [
-        "completion_review",
-        "document_review",
-        "unread_citation",
-        "citation_check",
-    ];
+    let review_terms = ["document_review", "unread_citation", "citation_check"];
     let request = ContextManager::request(&s, tools::ToolRegistry::definitions(&s)).unwrap();
     let text = request.to_string();
     for term in review_terms {
         assert!(!text.contains(term), "{term}");
     }
     let state = ContextManager::state(&s).unwrap();
-    for key in ["completion_review", "document_review"] {
-        assert!(state.get(key).is_none(), "{key}");
-    }
+    assert!(state.get("document_review").is_none());
     let written = tools::execute(
         &mut s,
         "document_edit",

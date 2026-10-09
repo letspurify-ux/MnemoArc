@@ -1,5 +1,4 @@
 mod arguments;
-pub mod completion_review;
 mod coverage;
 mod document_format;
 pub mod document_review;
@@ -42,7 +41,7 @@ pub fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 /// Recognize additive document work while ignoring empty-line churn. Semantic
-/// acceptance remains the responsibility of document and completion reviews.
+/// acceptance remains the responsibility of the document review.
 pub(crate) fn document_content_shape(project: &Project) -> Result<(usize, usize)> {
     let doc = read_text(&output_path(project)?)?;
     Ok((
@@ -1849,6 +1848,30 @@ fn validate_document_edit_batch_edits(args: &Value) -> Result<()> {
     Ok(())
 }
 
+/// A batch edit whose expected_section_hash is the hash of the document the
+/// batch started from: once earlier edits of the batch changed the document,
+/// that hash still names the section when those edits left it as it was.
+/// Returns the edit checked against the section's current hash instead.
+fn rebase_document_hash(
+    edit: &Value,
+    original: &str,
+    original_hash: &str,
+    current: &str,
+) -> Option<Value> {
+    if edit["expected_section_hash"].as_str() != Some(original_hash) || original == current {
+        return None;
+    }
+    let section = edit["section"].as_str()?;
+    let before = documentation::resolve_heading(original, section).ok()?;
+    let after = documentation::resolve_heading(current, section).ok()?;
+    let text = &current[after.start..after.end];
+    (original[before.start..before.end] == *text).then(|| {
+        let mut edit = edit.clone();
+        edit["expected_section_hash"] = json!(hash(text.as_bytes()));
+        edit
+    })
+}
+
 /// Explain a batch operation whose old_text did not match exactly once.
 /// `states[k]` is the document before operation k (states[0] = original).
 fn batch_target_hint(states: &[String], applied: &[usize], edit: &Value, error: &str) -> String {
@@ -1861,9 +1884,17 @@ fn batch_target_hint(states: &[String], applied: &[usize], edit: &Value, error: 
         ) else {
             return String::new();
         };
+        // The hash of the original document names its version of the
+        // section as well (see check_section_hash).
+        let original = (expected == hash(states[0].as_bytes()))
+            .then(|| documentation::resolve_heading(&states[0], section).ok())
+            .flatten()
+            .map(|h| &states[0][h.start..h.end]);
         let matched = |doc: &String| {
-            documentation::resolve_heading(doc, section)
-                .is_ok_and(|h| hash(&doc.as_bytes()[h.start..h.end]) == expected)
+            documentation::resolve_heading(doc, section).is_ok_and(|h| {
+                let text = &doc[h.start..h.end];
+                hash(text.as_bytes()) == expected || original == Some(text)
+            })
         };
         if let Some(changed_by) =
             (1..states.len()).find(|&k| matched(&states[k - 1]) && !matched(&states[k]))
@@ -2363,9 +2394,12 @@ fn is_anchored_text_edit(action: &str) -> bool {
 }
 
 /// A section edit, and a text edit scoped to a section, may only apply to the
-/// section version its expected_section_hash names.
-fn check_section_hash(section: &str, heading: &str, sent: &str) -> Result<()> {
-    if sent == hash(section.as_bytes()) {
+/// section version its expected_section_hash names. The hash of the whole
+/// current document names that version too: a live model copied the
+/// document hash from an audit into expected_section_hash, was refused as
+/// stale, and spent two requests re-reading a section that had not changed.
+fn check_section_hash(document: &str, section: &str, heading: &str, sent: &str) -> Result<()> {
+    if sent == hash(section.as_bytes()) || sent == hash(document.as_bytes()) {
         return Ok(());
     }
     if sent.len() != 64 || !sent.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -2451,21 +2485,17 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                     "invalid_argument_value: {action} text must start on its first line with a level-{required_level} heading ({hashes} ...); remove any text or blank line before it"
                 ),
             }
+            // Further sections of the same level follow the first one in
+            // order: a live model put two level-3 sections in one
+            // insert_last_child three times and was refused each time. A
+            // heading above that level would leave the anchor's parent.
             if let Some(extra) = new_headings
                 .iter()
                 .skip(1)
-                .find(|heading| heading.level <= required_level)
+                .find(|heading| heading.level < required_level)
             {
-                let nest = if required_level < 6 {
-                    format!(
-                        ", or make nested headings level {} or deeper",
-                        required_level + 1
-                    )
-                } else {
-                    String::new()
-                };
                 bail!(
-                    "invalid_argument_value: {action} text must contain one section starting with a level-{required_level} heading, but line {} of text starts another level-{} section {:?}; insert each section with its own operation{nest}",
+                    "invalid_argument_value: {action} text inserts level-{required_level} sections, but line {} of text starts level-{} heading {:?}, above that level; insert it with its own operation at its level, or make it level {required_level} or deeper",
                     extra.line,
                     extra.level,
                     extra.heading
@@ -2513,16 +2543,27 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                 inserted.push_str(delimiter);
             }
             let candidate = format!("{}{}{}", prefix, inserted, &old[position..]);
-            let path = documentation::heading_path(&candidate, inserted_start)?;
-            // The only way the new heading's path repeats is that the same
-            // heading already exists there. Reporting it as an ambiguous
-            // section argument would point at the wrong mistake.
-            if documentation::resolve_heading(&candidate, &path).is_err() {
-                let heading = new_headings[0].heading.as_str();
-                bail!(
-                    "invalid_argument_value: {action} text starts with {heading:?}, which already exists under the same parent; inserting it would duplicate that section. To extend it, use insert_first_child or insert_last_child on it with level-{} headings, replace_text/insert_after_text inside it, or action=section to rewrite it",
-                    new_headings[0].level + 1
-                );
+            // The only way an inserted heading's path repeats is that the
+            // same heading already exists there (or twice in text).
+            // Reporting it as an ambiguous section argument would point at
+            // the wrong mistake.
+            for heading in new_headings
+                .iter()
+                .filter(|heading| heading.level == required_level)
+            {
+                let path = documentation::heading_path(&candidate, inserted_start + heading.start)?;
+                if documentation::resolve_heading(&candidate, &path).is_err() {
+                    let verb = if heading.start == 0 {
+                        "starts with"
+                    } else {
+                        "adds"
+                    };
+                    bail!(
+                        "invalid_argument_value: {action} text {verb} {:?}, which already exists under the same parent; inserting it would duplicate that section. To extend it, use insert_first_child or insert_last_child on it with level-{} headings, replace_text/insert_after_text inside it, or action=section to rewrite it",
+                        heading.heading,
+                        heading.level + 1
+                    );
+                }
             }
             Ok(candidate)
         }
@@ -2531,6 +2572,7 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             let resolved = documentation::resolve_heading(old, heading)?;
             let target = &old[resolved.start..resolved.end];
             check_section_hash(
+                old,
                 target,
                 &resolved.heading,
                 args["expected_section_hash"].as_str().unwrap_or(""),
@@ -2675,7 +2717,12 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             if let Some(heading) = &scoped
                 && let Some(expected) = args["expected_section_hash"].as_str()
             {
-                check_section_hash(&old[heading.start..heading.end], &heading.heading, expected)?;
+                check_section_hash(
+                    old,
+                    &old[heading.start..heading.end],
+                    &heading.heading,
+                    expected,
+                )?;
             }
             let (base, scope) = scoped.as_ref().map_or((0, old), |heading| {
                 (heading.start, &old[heading.start..heading.end])
@@ -2928,7 +2975,6 @@ fn persist_document_edit(
     } else {
         temp.persist_noclobber(path)?;
     }
-    completion_review::record_document_baseline(s, path, old, exists);
     s.document_written = true;
     // A smaller edit succeeded; whole-document writes are allowed again.
     s.progress_recovery.whole_write_withheld = false;
@@ -2961,13 +3007,6 @@ fn persist_document_edit(
         "citation_check":citation_check,
         "format_check":format_check
     });
-    // Each save says what a non-developer reader would not understand, while
-    // the passage is still fresh to the writer.
-    if s.is_document_work()
-        && let Some(check) = documentation::audience_check(&s.project.audience, &result)
-    {
-        saved["audience_check"] = check;
-    }
     if s.is_document_work()
         && let Some(check) = documentation::test_code_check(s, path, &result)
     {
@@ -5376,6 +5415,8 @@ fn execute_repaired(
                 }
                 let action = edit["action"].as_str().unwrap_or("unknown");
                 let before_hash = hash(current.as_bytes());
+                let rebased = rebase_document_hash(edit, &old, &digest, &current);
+                let edit = rebased.as_ref().unwrap_or(edit);
                 let next = match apply_document_edit_operation(&current, edit) {
                     Ok(next) => next,
                     Err(error) => {

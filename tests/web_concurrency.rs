@@ -60,7 +60,6 @@ impl App {
             model: "gpt-4o".into(),
             model_context: Some(128000),
             max_concurrent_sessions: limit,
-            completion_review_enabled: false,
             projects: vec![project.clone()],
             ..support::compact_config()
         };

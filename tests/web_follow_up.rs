@@ -98,7 +98,6 @@ async fn default_follow_up_preserves_task_and_new_work_requires_a_new_session() 
     let config = Config {
         model: "gpt-4o".into(),
         model_context: Some(128000),
-        completion_review_enabled: false,
         projects: vec![Project {
             root: dir.path().into(),
             ..Default::default()
@@ -124,7 +123,6 @@ async fn default_follow_up_preserves_task_and_new_work_requires_a_new_session() 
     for key in [
         "task",
         "document_review",
-        "completion_review",
         "checkpoint",
         "status",
         "error",

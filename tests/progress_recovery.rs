@@ -54,11 +54,6 @@ async fn run(s: Session, client: Arc<dyn LlmClient>) -> Session {
     result
 }
 
-fn payload(request: &Value) -> Value {
-    serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
-        .unwrap_or(Value::Null)
-}
-
 #[derive(Clone, Copy)]
 enum Pattern {
     Final,
@@ -70,29 +65,17 @@ enum Pattern {
 struct Stubborn {
     pattern: Pattern,
     calls: Mutex<usize>,
-    reviews: Mutex<usize>,
 }
 
 #[async_trait]
 impl LlmClient for Stubborn {
     async fn complete(
         &self,
-        request: Value,
+        _: Value,
         _: &Config,
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        let review = payload(&request);
-        if review["completion_review"] == true {
-            *self.reviews.lock().unwrap() += 1;
-            return Ok(Completion {
-                text: json!({"checks":review["criteria"].as_array().unwrap().iter().map(|criterion|json!({
-                    "id":criterion["id"],"status":"unmet","reason":"Requested result is absent",
-                    "evidence":[],"next_action":"Write the requested result to result.txt"
-                })).collect::<Vec<_>>()}).to_string(),
-                ..Default::default()
-            });
-        }
         let mut calls = self.calls.lock().unwrap();
         *calls += 1;
         if *calls >= 30 {
@@ -149,7 +132,6 @@ async fn pending_final_and_invalid_plan_calls_are_bounded_and_resume_retains_the
         let client = Arc::new(Stubborn {
             pattern,
             calls: Mutex::new(0),
-            reviews: Mutex::new(0),
         });
         let result = run(s, client.clone()).await;
         assert_eq!(result.status, "partial", "{:?}", result.last_error);
@@ -177,7 +159,6 @@ async fn unchanged_navigation_result_is_bounded() {
     let client = Arc::new(Stubborn {
         pattern: Pattern::RepeatedOutline,
         calls: Mutex::new(0),
-        reviews: Mutex::new(0),
     });
     let result = run(s, client.clone()).await;
     assert_eq!(result.status, "partial", "{:?}", result.last_error);
@@ -205,7 +186,6 @@ async fn repeated_truncated_read_is_not_new_evidence() {
     let client = Arc::new(Stubborn {
         pattern: Pattern::RepeatedLargeRead,
         calls: Mutex::new(0),
-        reviews: Mutex::new(0),
     });
     let result = run(s, client.clone()).await;
     assert_eq!(result.status, "partial", "{:?}", result.last_error);
@@ -406,14 +386,11 @@ struct ManyArtifacts {
 impl LlmClient for ManyArtifacts {
     async fn complete(
         &self,
-        request: Value,
+        _: Value,
         _: &Config,
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let mut calls = self.calls.lock().unwrap();
         *calls += 1;
         if *calls > 50 {

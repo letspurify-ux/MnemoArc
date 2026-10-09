@@ -43,13 +43,8 @@ review_limit = 20
 writing_reserve_ratio = 0.5
 verification_reserve_ratio = 0.25
 closing_reserve_ratio = 0.1
-# Document edit requests after each failed review (reads/checks excluded); increase to resume.
-document_repair_limit = 8
 # Source-document review: read-only same-model pass, up to two attempts per task.
 source_document_review = true
-# General read-only acceptance review before completing artifacts. Off by default: the
-# source-document review already checks evidence, and live runs approved on the first try.
-completion_review_enabled = false
 projects = []
 
 # DB access remains off until you explicitly enable both switches.

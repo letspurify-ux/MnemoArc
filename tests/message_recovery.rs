@@ -113,7 +113,6 @@ async fn cancelled(root: &std::path::Path) -> Session {
             context_tokens: 64000,
             output_tokens: 1024,
             source_document_review: false,
-            completion_review_enabled: false,
             ..support::compact_config()
         },
     );
@@ -134,7 +133,7 @@ async fn cancelled(root: &std::path::Path) -> Session {
 fn preserved(s: &Session) -> Value {
     json!({"goal":s.latest_request,"original":s.original_request,"task":s.task,
         "amendments":s.task_amendments,
-        "document_review":s.document_review,"completion_review":s.completion_review,
+        "document_review":s.document_review,
         "last_write":s.last_document_write,"checkpoint":s.checkpoint})
 }
 

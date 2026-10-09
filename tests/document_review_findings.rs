@@ -15,7 +15,6 @@ fn fixture() -> (tempfile::TempDir, Session) {
         Project {
             root: dir.path().into(),
             output,
-            audience: "일반 사용자".into(),
             ..Default::default()
         },
         Config {
@@ -402,7 +401,7 @@ fn skipping_a_bad_page_still_validates_its_grounded_candidates() {
 
 #[test]
 fn stale_inputs_discard_saved_candidates_instead_of_validating_or_skipping_them() {
-    for (changed, skip_stale) in ["document", "source", "requirements", "audience"]
+    for (changed, skip_stale) in ["document", "source", "requirements"]
         .into_iter()
         .flat_map(|changed| [false, true].map(|skip_stale| (changed, skip_stale)))
     {
@@ -424,8 +423,7 @@ fn stale_inputs_discard_saved_candidates_instead_of_validating_or_skipping_them(
                 std::fs::write(dir.path().join("ui.js"), "function save() { keepKey(); }\n")
                     .unwrap();
             }
-            "requirements" => s.answer_review_question = "Write a different manual".into(),
-            _ => s.project.audience = "개발자".into(),
+            _ => s.answer_review_question = "Write a different manual".into(),
         }
         assert!(
             review::finish(&mut s, r#"{"issues":[]}"#)
@@ -523,6 +521,72 @@ fn recovery_preserves_candidates_already_collected_from_other_pages() {
     assert_eq!(s.document_review.findings.len(), 1);
     assert_eq!(s.document_review.findings[0].id, "F1");
     assert!(!review::approved(&s));
+}
+
+// Live run 2026-10-09: a reviewer copied current findings F4-F6 onto later
+// evidence pages of the same document range, citing their source lines
+// from an earlier page. Each copy rejected the whole page response: nine
+// extra page requests in one review.
+#[test]
+fn a_candidate_restated_on_a_later_evidence_page_is_dropped_without_rejecting_it() {
+    let (dir, mut s) = fixture();
+    let source: String = (1..=900)
+        .map(|i| format!("const setting_{i} = readSetting('section-{i}', {i});\n"))
+        .collect();
+    std::fs::write(dir.path().join("settings.js"), source).unwrap();
+    let mut doc = std::fs::read_to_string(&s.project.output).unwrap();
+    doc.push_str("설정 값은 기본값을 따릅니다. settings.js:1-900\n");
+    std::fs::write(&s.project.output, doc).unwrap();
+    let on_page = |page: &Value, file: &str| {
+        page["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|chunk| chunk["path"].as_str().unwrap().ends_with(file))
+    };
+    let first = payload(review::request(&mut s).unwrap());
+    assert!(on_page(&first, "ui.js"));
+    assert_eq!(first["more_evidence_pages"], true);
+    submit(&mut s, vec![proposal("저장 시점이 빠졌습니다.")]);
+    let second = payload(review::request(&mut s).unwrap());
+    assert_eq!(second["evidence_page"], 1);
+    assert!(!on_page(&second, "ui.js"));
+    assert_eq!(second["current_findings"][0]["id"], "F1");
+    // A different defect in the same passage cites other lines: it is no
+    // copy of F1 and still needs evidence from this page.
+    let mut other = proposal("안내 문구가 코드와 다릅니다.");
+    other["sources"] = json!([{"path":"ui.js","start_line":1,"end_line":1,
+        "quote":"const message = '검색 결과가 없습니다.';"}]);
+    reject(&mut s, vec![other]);
+    // F1 copied with its ID, and without it but with its source.
+    review::request(&mut s).unwrap();
+    let mut with_id = proposal("저장할 때만 삭제됩니다.");
+    with_id["previous_id"] = json!("F1");
+    submit(&mut s, vec![with_id, proposal("저장 시점이 빠졌습니다.")]);
+    let drops: Vec<String> = s
+        .document_review
+        .issue_drop_log
+        .iter()
+        .map(|drop| drop["error"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(drops.len(), 2, "{drops:?}");
+    assert!(
+        drops
+            .iter()
+            .all(|drop| drop.contains("restated candidate F1")),
+        "{drops:?}"
+    );
+    assert!(s.document_review.skipped_ranges.is_empty());
+    // F1 alone goes to validation, with no unreviewed range left behind.
+    loop {
+        let next = payload(review::request(&mut s).unwrap());
+        if let Some(candidates) = next.get("candidates") {
+            assert_eq!(candidates.as_array().unwrap().len(), 1);
+            assert_eq!(candidates[0]["id"], "F1");
+            break;
+        }
+        submit(&mut s, vec![]);
+    }
 }
 
 #[test]
@@ -2058,6 +2122,10 @@ fn source_less_scope_cannot_reuse_an_id_at_another_location_or_requirement() {
         "ambiguous",
     ] {
         let (_dir, mut s) = scope_fixture();
+        if change == "requirement" {
+            // A second catalog key for the changed finding to name.
+            s.request_review_criteria.completion = vec!["Name every screen".into()];
+        }
         if change == "duplicate_heading" {
             let doc = std::fs::read_to_string(&s.project.output).unwrap();
             std::fs::write(&s.project.output, doc.replace("## 설정", "## 답변 보기")).unwrap();
@@ -2094,7 +2162,7 @@ fn source_less_scope_cannot_reuse_an_id_at_another_location_or_requirement() {
         };
         let mut changed = scope_proposal(&s, quote, Some("F1"));
         if change == "requirement" {
-            changed["requirement_id"] = json!("audience");
+            changed["requirement_id"] = json!("C1");
         } else if change == "kind" {
             changed["kind"] = json!("requirement");
         } else if change == "source" {
@@ -2575,19 +2643,21 @@ fn a_requirement_or_scope_finding_without_a_catalog_key_names_the_keys() {
         .to_string();
     assert!(
         error.contains("issues[0] kind scope needs requirement_id, a requirement_catalog key: [")
-            && error.contains("\"audience\"")
+            && !error.contains("\"audience\"")
             && error.contains("\"R0\"")
-            && error.contains("audience or purpose for an audience or detail-level issue"),
+            && error.contains("R0 for an audience or detail-level issue"),
         "{error}"
     );
     let (_dir, mut s) = fixture();
     review::request(&mut s).unwrap();
-    scope["requirement_id"] = json!("Audience");
+    scope["requirement_id"] = json!("r0");
     let error = review::finish(&mut s, &json!({"issues":[scope]}).to_string())
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains(r#"issues[0].requirement_id "Audience" is not a requirement_catalog key; did you mean "audience"?"#),
+        error.contains(
+            r#"issues[0].requirement_id "r0" is not a requirement_catalog key; use one of ["R0"]"#
+        ),
         "{error}"
     );
 }

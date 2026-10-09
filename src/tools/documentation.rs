@@ -621,13 +621,15 @@ pub(super) fn execute(
                 );
             }
             let end = (offset + n(args, "limit", 30).clamp(1, 100)).min(issues.len());
-            let mut result = json!({"hash":document_hash,"revision":revision,"total_lines":doc.lines().count(),"citations_checked":checked,"structural_ok":issues.iter().all(|issue| issue["kind"] == "no_machine_readable_citations"),"semantic_verified":false,"format_check":format_check,"issue_count":issues.len(),"issues":issues[offset..end],"next_offset":(end<issues.len()).then_some(end)});
-            // Advice, not a structural issue: it never blocks the final answer.
-            if s.is_document_work()
-                && let Some(check) = audience_check(&s.project.audience, &doc)
-            {
-                result["audience_check"] = check;
-            }
+            // The document review compares every cited range with the source,
+            // so a range the writer never read does not block the final answer
+            // while that review is on; the audit still lists it.
+            let reviewed = s.config.source_document_review;
+            let structural_ok = issues.iter().all(|issue| {
+                issue["kind"] == "no_machine_readable_citations"
+                    || (reviewed && issue["kind"] == "unread_citation")
+            });
+            let mut result = json!({"hash":document_hash,"revision":revision,"total_lines":doc.lines().count(),"citations_checked":checked,"structural_ok":structural_ok,"semantic_verified":false,"format_check":format_check,"issue_count":issues.len(),"issues":issues[offset..end],"next_offset":(end<issues.len()).then_some(end)});
             if s.is_document_work()
                 && let Some(check) = test_code_check(s, &path, &doc)
             {
@@ -1105,233 +1107,6 @@ pub(super) fn rust_test_modules(text: &str) -> Vec<(usize, usize)> {
     ranges
 }
 
-/// Readers an audience names who build or maintain the software may read its
-/// internals; any other named audience reads what the screen shows.
-fn developer_audience(audience: &str) -> bool {
-    let audience = audience.to_lowercase();
-    [
-        "개발",
-        "developer",
-        "engineer",
-        "엔지니어",
-        "programmer",
-        "프로그래머",
-        "maintainer",
-        "유지보수",
-        "contributor",
-        "기여",
-    ]
-    .iter()
-    .any(|word| audience.contains(word))
-}
-
-const AUDIENCE_FLAG_LIMIT: usize = 12;
-const AUDIENCE_GUIDANCE: &str = "The audience is not developers: restate each flagged item in the reader's terms (what they see or do on screen) or remove it. Keep source citations as path:start-end, and keep a name only if the reader sees it on screen.";
-
-/// Implementation detail a document shows a non-developer audience: code
-/// blocks other than diagrams, and inline code or `::` paths that read as
-/// identifiers. A live end-user document quoted `documentation::execute`,
-/// `resolve_heading` and error codes, and both reviews approved it. None when
-/// the audience is developers, unset, or sees nothing to flag.
-pub(super) fn audience_check(audience: &str, doc: &str) -> Option<Value> {
-    if audience.trim().is_empty() || developer_audience(audience) {
-        return None;
-    }
-    let mut items = Vec::new();
-    let mut total = 0usize;
-    let mut flag = |line: usize, kind: &str, text: &str| {
-        total += 1;
-        if items.len() < AUDIENCE_FLAG_LIMIT {
-            items.push(
-                json!({"line":line,"kind":kind,"text":text.chars().take(80).collect::<String>()}),
-            );
-        }
-    };
-    // The opening marker of the fence the scan is inside, and whether that
-    // fence is a diagram.
-    let mut fence: Option<(String, bool)> = None;
-    for (index, line) in doc.lines().enumerate() {
-        let trimmed = line.trim_start();
-        let marker: String = trimmed
-            .chars()
-            .take_while(|c| *c == '`' || *c == '~')
-            .collect();
-        if marker.len() >= 3 && marker.chars().all(|c| marker.starts_with(c)) {
-            let info = trimmed[marker.len()..].trim();
-            match &fence {
-                None => {
-                    let diagram = info.to_lowercase().starts_with("mermaid");
-                    if !diagram {
-                        flag(index + 1, "code_block", &format!("{marker}{info}"));
-                    }
-                    fence = Some((marker, diagram));
-                }
-                Some((open, _)) if marker.starts_with(open.as_str()) && info.is_empty() => {
-                    fence = None;
-                }
-                Some(_) => {}
-            }
-            continue;
-        }
-        match &fence {
-            // A diagram's labels are text the reader sees: a live end-user
-            // flowchart kept tool names in its nodes.
-            Some((_, true)) => {
-                let text = mermaid_label_text(line);
-                let mut seen = BTreeSet::new();
-                for token in text
-                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
-                    .map(|token| token.trim_matches(':'))
-                {
-                    if implementation_detail(token) && seen.insert(token) {
-                        flag(index + 1, "diagram_label", token);
-                    }
-                }
-                continue;
-            }
-            Some((_, false)) => continue,
-            None => {}
-        }
-        let (spans, prose) = inline_code(line);
-        for span in spans {
-            if implementation_detail(span) {
-                flag(index + 1, "inline_code", span);
-            }
-        }
-        for word in prose.split_whitespace() {
-            let word =
-                word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != ':');
-            if word.contains("::") && word.is_ascii() {
-                flag(index + 1, "identifier", word);
-            }
-        }
-    }
-    (total > 0).then(
-        || json!({"audience":audience,"flagged":total,"items":items,"guidance":AUDIENCE_GUIDANCE}),
-    )
-}
-
-/// The text a reader sees on one Mermaid line: node labels in brackets,
-/// edge labels between pipes, quoted text, and a sequence message after its
-/// colon. Node ids, keywords, arrows and styling are diagram syntax.
-fn mermaid_label_text(line: &str) -> String {
-    let mut text = String::new();
-    let (mut depth, mut piped, mut quoted) = (0usize, false, false);
-    for c in line.chars() {
-        match c {
-            '"' => {
-                quoted = !quoted;
-                text.push(' ');
-            }
-            '[' | '(' | '{' if !quoted => {
-                depth += 1;
-                text.push(' ');
-            }
-            ']' | ')' | '}' if !quoted && depth > 0 => {
-                depth -= 1;
-                text.push(' ');
-            }
-            '|' if !quoted && depth == 0 => {
-                piped = !piped;
-                text.push(' ');
-            }
-            _ if quoted || piped || depth > 0 => text.push(c),
-            _ => {}
-        }
-    }
-    if text.trim().is_empty()
-        && let Some((head, message)) = line.split_once(':')
-        && (head.contains("->") || head.trim_start().to_lowercase().starts_with("note"))
-    {
-        text.push_str(message);
-    }
-    text
-}
-
-/// The inline code spans of one line and the line's other text.
-fn inline_code(line: &str) -> (Vec<&str>, String) {
-    let bytes = line.as_bytes();
-    let (mut spans, mut prose) = (Vec::new(), String::new());
-    let (mut i, mut text_start) = (0, 0);
-    while i < bytes.len() {
-        if bytes[i] != b'`' {
-            i += 1;
-            continue;
-        }
-        let open = i;
-        while i < bytes.len() && bytes[i] == b'`' {
-            i += 1;
-        }
-        let ticks = i - open;
-        let mut j = i;
-        let mut close = None;
-        while j < bytes.len() {
-            if bytes[j] == b'`' {
-                let run = j;
-                while j < bytes.len() && bytes[j] == b'`' {
-                    j += 1;
-                }
-                if j - run == ticks {
-                    close = Some(run);
-                    break;
-                }
-            } else {
-                j += 1;
-            }
-        }
-        let Some(close) = close else {
-            break;
-        };
-        prose.push_str(&line[text_start..open]);
-        spans.push(line[i..close].trim());
-        i = close + ticks;
-        text_start = i;
-    }
-    prose.push_str(&line[text_start..]);
-    (spans, prose)
-}
-
-/// Inline code that reads as an identifier or code. Labels in the reader's
-/// language, key names and plain words are what the reader sees; citations
-/// and file names are verification metadata.
-fn implementation_detail(span: &str) -> bool {
-    if span.is_empty() || !span.is_ascii() || span.contains('/') || span.contains("#L") {
-        return false;
-    }
-    let name = span.split(':').next().unwrap_or(span);
-    let file = name.rsplit_once('.').is_some_and(|(stem, extension)| {
-        !stem.is_empty()
-            && (1..=5).contains(&extension.len())
-            && extension.chars().all(|c| c.is_ascii_alphanumeric())
-    });
-    if file {
-        return false;
-    }
-    if ["::", "=>", "->", "(", "{", "}", ";", "=", "&", "|"]
-        .iter()
-        .any(|token| span.contains(token))
-    {
-        return true;
-    }
-    if span.contains(char::is_whitespace) {
-        return false;
-    }
-    let lower_start = span.starts_with(|c: char| c.is_ascii_lowercase());
-    let snake = lower_start
-        && span.contains('_')
-        && span
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    let screaming = span.contains('_')
-        && span
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    let camel = lower_start
-        && span.chars().any(|c| c.is_ascii_uppercase())
-        && span.chars().all(|c| c.is_ascii_alphanumeric());
-    snake || screaming || camel
-}
-
 fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<Value>)> {
     let (spans, mut issues) = scan_citations(doc)?;
     let mut versions = std::collections::BTreeMap::new();
@@ -1459,11 +1234,18 @@ pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Va
         Ok(unread) => (unread, None),
         Err(error) => (vec![], Some(error.to_string())),
     };
+    // While the document review is on it compares every cited range with
+    // the source, so an unread range is advice rather than a blocker.
+    let guidance = if s.config.source_document_review {
+        "Fix citation or code-fence issues in the next section edit. unread_citations are cited ranges never delivered to you as complete lines of the current file version. They do not block the final answer: the document review compares each cited range with the source. Reading a range before citing it avoids a wrong citation."
+    } else {
+        "Fix citation or code-fence issues in the next section edit. unread_citations are cited ranges never delivered to you as complete lines of the current file version: file_read each listed range, or narrow the citation to the lines you read, before the final answer; the final audit treats them as unresolved evidence."
+    };
     let mut check = json!({"citations_checked":checked,"issue_count":issues.len(),"issues":issues.iter().take(8).collect::<Vec<_>>(),
         "unread_citation_count":unread.len(),"unread_citations":unread.iter().take(8).collect::<Vec<_>>(),
         "unread_citation_error":unread_error,
         "semantic_verified":false,
-        "guidance":"Fix citation or code-fence issues in the next section edit. unread_citations are cited ranges never delivered to you as complete lines of the current file version: file_read each listed range, or narrow the citation to the lines you read, before the final answer; the final audit treats them as unresolved evidence."});
+        "guidance":guidance});
     if checked == 0 {
         check["citations_required"] = json!(NO_CITATIONS_GUIDANCE);
     }

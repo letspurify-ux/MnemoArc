@@ -304,7 +304,6 @@ async fn length_recovery_rejects_fifo_output_and_can_cancel() {
     s.project.output = "out.md".into();
     s.config.run_timeout_secs = 1;
     s.config.source_document_review = false;
-    s.config.completion_review_enabled = false;
     let cancel = CancellationToken::new();
     let client = Arc::new(LengthLimited {
         calls: Default::default(),

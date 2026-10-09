@@ -65,7 +65,6 @@ fn fixture(path: &std::path::Path) -> Session {
             model: "gpt-4o".into(),
             model_context: Some(128_000),
             source_document_review: false,
-            completion_review_enabled: false,
             ..support::compact_config()
         },
     );

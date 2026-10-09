@@ -149,22 +149,6 @@ test("ordered to-do list follows prerequisites and preserves running work on rel
   await expect(page.locator(".status-pill")).toHaveText("중지됨");
 });
 
-test("the answer workflow publishes its final answer without a completion review", async ({ page, request }) => {
-  await page.goto("/");
-  await page.getByRole("button", { name: "새 세션", exact: true }).click();
-  await page.getByRole("button", { name: "세션 시작", exact: true }).click();
-  await page.getByRole("textbox", { name: "메시지", exact: true }).fill("완료 조건 검증 테스트");
-  await page.getByRole("tab", { name: "진행", exact: true }).click();
-  await page.getByRole("button", { name: "메시지 보내기" }).click();
-  await expect(page.locator(".status-pill")).toHaveText("완료");
-  await expect(page.getByRole("region", { name: "완료 조건 검증", exact: true })).toHaveCount(0);
-  const state = await (await request.get("/api/state")).json();
-  const item = state.sessions.find((s) => s.title === "완료 조건 검증 테스트");
-  const detail = await (await request.get(`/api/sessions/${item.id}`)).json();
-  expect(detail.completion_review.required).toBe(false);
-  expect(detail.completion_review.attempts).toBe(0);
-});
-
 test("project folder picker, settings validation and narrow screen", async ({
   page,
 }) => {

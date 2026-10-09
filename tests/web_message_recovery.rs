@@ -164,7 +164,6 @@ async fn cancelling_then_sending_a_changed_prompt_repairs_routing_and_finishes_t
         // is ~12K, so five rounds crossed high_water and started a checkpoint.
         context_tokens: 128000,
         source_document_review: false,
-        completion_review_enabled: false,
         projects: vec![project.clone()],
         ..support::compact_config()
     };

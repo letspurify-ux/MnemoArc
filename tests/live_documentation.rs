@@ -67,11 +67,9 @@ impl LlmClient for ReviewTrace {
         let payload = request["messages"][1]["content"]
             .as_str()
             .and_then(|text| serde_json::from_str::<Value>(text).ok());
-        // Completion reviews too: their unmet checks explain the repair that
-        // follows them, and a live report had no record of one.
         let review = payload
             .as_ref()
-            .is_some_and(|p| p["source_document_review"] == true || p["completion_review"] == true);
+            .is_some_and(|p| p["source_document_review"] == true);
         let started = Instant::now();
         let result = OpenAiClient.complete(request, config, cancel, delta).await;
         if review {
@@ -145,30 +143,21 @@ async fn live_review_trace_preserves_retries_after_success_and_failure() {
             .await
             .is_err()
     );
-    // A completion review is recorded as well; an ordinary model request is
-    // not a review.
-    for (content, review) in [
-        (json!({"completion_review":true}).to_string(), true),
-        ("Write the manual.".to_owned(), false),
-    ] {
-        let request = json!({"messages":[
-            {"role":"system","content":"Test"},
-            {"role":"user","content":content}
-        ]});
-        let before = records.lock().unwrap().len();
-        let (tx, _rx) = mpsc::channel(8);
-        assert!(
-            client
-                .complete(request, &config, CancellationToken::new(), tx)
-                .await
-                .is_err()
-        );
-        assert_eq!(records.lock().unwrap().len(), before + usize::from(review));
-    }
-    assert_eq!(calls.load(Ordering::SeqCst), 8);
+    // An ordinary model request is not a review.
+    let request = json!({"messages":[
+        {"role":"system","content":"Test"},
+        {"role":"user","content":"Write the manual."}
+    ]});
+    let (tx, _rx) = mpsc::channel(8);
+    assert!(
+        client
+            .complete(request, &config, CancellationToken::new(), tx)
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
     let records = records.lock().unwrap();
-    assert_eq!(records.len(), 3);
-    assert_eq!(records[2]["input"]["completion_review"], true);
+    assert_eq!(records.len(), 2);
     assert_eq!(records[0]["provider_attempts"], 2);
     assert_eq!(records[1]["provider_attempts"], 2);
     assert_eq!(
@@ -292,18 +281,6 @@ fn report_diagnostics(result: &Session, audit: &Value) -> Value {
         tools::document_review::CurrentVerdict::Unavailable => "unavailable_current",
         tools::document_review::CurrentVerdict::Unreviewed => "unreviewed",
     };
-    let completion_verdict = match tools::completion_review::current_verdict(result) {
-        tools::completion_review::CurrentVerdict::Approved => "approved",
-        tools::completion_review::CurrentVerdict::Rejected(_) => "rejected_current",
-        tools::completion_review::CurrentVerdict::Unavailable => "unavailable_current",
-        // An earlier version was rejected and nothing has been reviewed since.
-        tools::completion_review::CurrentVerdict::Unreviewed
-            if tools::completion_review::prior_rejection(result).is_some() =>
-        {
-            "unreviewed_after_rejection"
-        }
-        tools::completion_review::CurrentVerdict::Unreviewed => "unreviewed",
-    };
     json!({
         "completion_gaps":result.completion_gaps,
         "run_stop_reason":result.run_history.back().map(|run| run.reason.as_str()),
@@ -311,7 +288,6 @@ fn report_diagnostics(result: &Session, audit: &Value) -> Value {
         "final_document_hash":final_document_hash,
         "review_target_hash":tools::document_review::review_target_hash(result),
         "review_verdict":review_verdict,
-        "completion_verdict":completion_verdict,
     })
 }
 
@@ -347,7 +323,6 @@ fn live_report_records_completion_gaps_and_stop_reason() {
         json!(result.completion_gaps)
     );
     assert_eq!(diagnostics["run_stop_reason"], "closing_round_limit");
-    assert_eq!(diagnostics["completion_verdict"], "unreviewed");
     assert_eq!(diagnostics["final_document_hash"], "current-hash");
     assert_eq!(diagnostics["review_target_hash"], Value::Null);
     assert_eq!(diagnostics["review_verdict"], "unreviewed");
@@ -515,8 +490,6 @@ async fn registered_user_manual_review_preserves_citations() {
         .find(|project| project.name == project_name)
         .expect("registered MnemoArc project")
         .clone();
-    project.audience = "일반 유저".into();
-    project.purpose = "화면 사용법 안내".into();
     let original_output = project.output.clone();
     let original_hash = std::fs::read(&original_output)
         .ok()
@@ -568,7 +541,7 @@ async fn registered_user_manual_review_preserves_citations() {
         std::fs::write(&project.output, &document).unwrap();
         let mut session = Session::new(project.clone(), config.clone());
         session.select_workflow("source_document").unwrap();
-        session.add_user("UI 사용자 매뉴얼의 '새 세션 버튼' 절만 작성해줘. 프로젝트가 하나도 등록되지 않았을 때 버튼을 사용할 수 있는지만 설명해줘. 다른 동작은 범위에 포함하지 마.".into());
+        session.add_user("일반 유저에게 화면 사용법을 안내하는 UI 사용자 매뉴얼의 '새 세션 버튼' 절만 작성해줘. 프로젝트가 하나도 등록되지 않았을 때 버튼을 사용할 수 있는지만 설명해줘. 다른 동작은 범위에 포함하지 마.".into());
         let request = tools::document_review::request(&mut session).unwrap();
         let payload: Value =
             serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
@@ -662,13 +635,9 @@ async fn registered_source_documentation() {
             .expect("MNEMOARC_LIVE_TOKENS must be an integer");
     }
     config.source_document_review = env_bool("MNEMOARC_LIVE_SOURCE_DOCUMENT_REVIEW", true);
-    config.completion_review_enabled = env_bool("MNEMOARC_LIVE_COMPLETION_REVIEW", true);
     eprintln!(
-        "[live] budget_tokens={} budget_seconds={} source_document_review={} completion_review={}",
-        config.run_tokens,
-        config.run_timeout_secs,
-        config.source_document_review,
-        config.completion_review_enabled
+        "[live] budget_tokens={} budget_seconds={} source_document_review={}",
+        config.run_tokens, config.run_timeout_secs, config.source_document_review,
     );
     // MNEMOARC_LIVE_PROJECT picks another registered project (default llm_agent).
     let project_name = std::env::var("MNEMOARC_LIVE_PROJECT").unwrap_or("llm_agent".into());
@@ -823,7 +792,7 @@ async fn registered_source_documentation() {
                         last_round = s.task_rounds;
                         let unread = tools::unread_citations(&s).map_or(0, |unread| unread.len());
                         eprintln!(
-                            "[live] round={} input={} output={} document_written={} unread_citations={} document_reviews={} finding_validations={} dismissed={} merged={} completion_reviews={} checkpoint={} ladder={}/{} best={} closing={} unrepaired_finals={}",
+                            "[live] round={} input={} output={} document_written={} unread_citations={} document_reviews={} finding_validations={} dismissed={} merged={} checkpoint={} ladder={}/{} best={} closing={} unrepaired_finals={}",
                             s.task_rounds,
                             s.input_tokens,
                             s.output_tokens,
@@ -833,7 +802,6 @@ async fn registered_source_documentation() {
                             s.document_review.validation_rounds,
                             s.document_review.dismissed_findings,
                             s.document_review.merged_findings,
-                            s.completion_review.attempts,
                             s.checkpoint
                                 .as_ref()
                                 .map_or(0, |checkpoint| checkpoint.attempts),
@@ -894,8 +862,6 @@ async fn registered_source_documentation() {
     let mut report = json!({"status":result.status,"error":result.last_error,"model":result.config.model,
         "budget_tokens":result.config.run_tokens,"budget_seconds":result.config.run_timeout_secs,
         "source_document_review_enabled":result.config.source_document_review,
-        "completion_review_enabled":result.config.completion_review_enabled,
-        "completion_review":result.completion_review,
         "elapsed_seconds":start.elapsed().as_secs_f64(),"input_tokens":result.input_tokens,"output_tokens":result.output_tokens,
         "usage_incomplete":result.usage_incomplete,"model_rounds":result.task_rounds,"first_write":first_write,"review_attempts":reviews,
         "tool_calls":calls,"tool_errors":errors,"document_review":result.document_review,"audit":audit,
@@ -956,13 +922,6 @@ async fn registered_source_documentation() {
         assert!(tools::document_review::approved(&result));
     } else {
         assert_eq!(result.document_review.attempts, 0);
-    }
-    if result.config.completion_review_enabled {
-        assert!(result.completion_review.attempts > 0);
-        assert_eq!(
-            tools::completion_review::current_verdict(&result),
-            tools::completion_review::CurrentVerdict::Approved
-        );
     }
     assert!(
         tools::unread_citations(&result)

@@ -1037,8 +1037,6 @@ function Projects({ config, onSaved, onCreate, onDirtyChange, creating }) {
     output: "docs/source-summary.md",
     include: [],
     exclude: [".env*"],
-    purpose: "프로젝트 구조, 주요 흐름과 오류 처리를 소스 근거와 함께 설명",
-    audience: "신규 개발자",
   };
   const [list, setList, markSaved] = useServerDraft(config.projects);
   const [index, setIndex] = useState(0),
@@ -1681,51 +1679,6 @@ function Inspector({
                 </ul>
               </section>
             )}
-            {session.workflow_mode === "source_document" &&
-              session.completion_review?.required && (
-                <section
-                  className="progress-section"
-                  aria-label="완료 조건 검증"
-                >
-                  <h4>완료 조건 검증</h4>
-                  <p role="status">
-                    {session.completion_review.pending
-                      ? "실제 결과를 검증하고 있습니다."
-                      : session.completion_review.approved
-                        ? "모든 완료 조건의 검증을 통과했습니다."
-                        : session.completion_review.needs_review
-                          ? "현재 결과의 완료 조건을 다시 확인해야 합니다."
-                          : "할 일 완료 후에도 조건이 충족될 때까지 보완합니다."}
-                  </p>
-                  <ul>
-                    {(session.completion_review.checks || []).map((check) => (
-                      <li key={check.id}>
-                        <strong>
-                          {
-                            {
-                              met: "충족",
-                              unmet: "미충족",
-                              unverified: "확인 불가",
-                            }[check.status]
-                          }
-                          {" · "}
-                          {check.id === "R0"
-                            ? "현재 요청"
-                            : displayPathText(check.criterion) || "완료 조건"}
-                        </strong>
-                        <p>{displayPathText(check.reason)}</p>
-                        {check.next_action && (
-                          <p>보완: {displayPathText(check.next_action)}</p>
-                        )}
-                      </li>
-                    ))}
-                  </ul>
-                  <small className="subtle">
-                    최근 검증 결과입니다. 결과물이나 조건이 바뀌면 다시
-                    확인합니다.
-                  </small>
-                </section>
-              )}
             <section className="progress-section" aria-label="현재 작업 목표">
               <h4>현재 작업 목표</h4>
               <p>{session.current_goal || session.task.purpose}</p>

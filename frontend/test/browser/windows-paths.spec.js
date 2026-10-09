@@ -173,18 +173,6 @@ for (const [kind, root, readable] of [
             timeout_secs: 30,
           },
         ],
-        completion_review: {
-          required: true,
-          checks: [
-            {
-              id: "C1",
-              status: "unverified",
-              criterion: "결과 문서",
-              reason: `검증 필요: ${path}`,
-              next_action: `다시 확인: ${path}`,
-            },
-          ],
-        },
       },
     );
 
@@ -245,10 +233,6 @@ for (const [kind, root, readable] of [
     await expect(page.locator(".run-error")).toHaveText(
       `file_access_error: ${shown}`,
     );
-    const review = page.getByRole("region", { name: "완료 조건 검증" });
-    await expect(review).toContainText(`검증 필요: ${shown}`);
-    await expect(review).toContainText(`다시 확인: ${shown}`);
-    await expect(review).not.toContainText(root);
 
     await page.route("**/api/sessions/*/output", (route) =>
       route.fulfill({

@@ -146,7 +146,8 @@ fn new_sections_can_be_inserted_in_outline_order() {
     for text in [
         "### Wrong level\nBody.",
         "## Flow\nDuplicate.",
-        "## One\n## Two\n",
+        "## One\n# Two\n",
+        "## One\n## Flow\n",
     ] {
         assert!(tools::execute(&mut s, "document_edit", json!({"action":"insert_before","section":"## Errors","expected_hash":batched["hash"],"text":text})).is_err());
     }
@@ -314,7 +315,9 @@ fn child_insertions_handle_first_last_empty_and_repeated_leaf_titles() {
     for text in [
         "## Wrong\nBody.",
         "### First\nDuplicate.",
-        "### One\n### Two\n",
+        "### One\n## Two\n",
+        "### One\n### First\n",
+        "### One\n### One\n",
     ] {
         assert!(tools::execute(&mut s, "document_edit", json!({"action":"insert_last_child","section":alpha,"expected_hash":final_edit["hash"],"text":text})).is_err());
     }
@@ -392,6 +395,80 @@ fn partial_text_edits_insert_replace_and_delete_without_rewriting_sections() {
         std::fs::read_to_string(&s.project.output).unwrap(),
         expected
     );
+}
+
+#[test]
+fn the_current_document_hash_also_names_the_section_version() {
+    // A live model copied the document hash from an audit into
+    // expected_section_hash, was refused as stale and re-read a section
+    // that had not changed.
+    let (_dir, mut s) = setup();
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n\n## Input\n\nOne line box.\n\n## Output\n\nAnswers.\n"}),
+    );
+    let replaced = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","section":"## Input","expected_section_hash":created["hash"],"old_text":"One line box.","text":"A box that grows."}),
+    );
+    let rewritten = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":"## Output","expected_hash":replaced["hash"],"expected_section_hash":replaced["hash"],"text":"## Output\n\nShort answers.\n"}),
+    );
+    // An older document hash is still refused.
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","section":"## Input","expected_section_hash":created["hash"],"old_text":"A box","text":"The box"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with(
+            "section_revision_conflict: expected_section_hash is not the current hash"
+        ),
+        "{error}"
+    );
+    // In a batch the hash of the document it started from still names a
+    // section that its earlier edits left as it was ...
+    let base = rewritten["hash"].clone();
+    run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":base,"edits":[
+            {"action":"replace_text","section":"## Output","old_text":"Short answers.","text":"Brief answers."},
+            {"action":"replace_text","section":"## Input","expected_section_hash":base,"old_text":"A box","text":"The box"}
+        ]}),
+    );
+    let after = std::fs::read_to_string(&s.project.output).unwrap();
+    assert!(
+        after.contains("The box that grows.") && after.contains("Brief answers."),
+        "{after}"
+    );
+    // ... but not one they changed, and the hint names that edit.
+    let base = json!(tools::hash(after.as_bytes()));
+    let error = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":base,"edits":[
+            {"action":"replace_text","section":"## Output","old_text":"Brief","text":"Terse"},
+            {"action":"replace_text","section":"## Output","expected_section_hash":base,"old_text":"answers","text":"replies"}
+        ]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("index=1") && error.contains("section_revision_conflict"),
+        "{error}"
+    );
+    assert!(
+        error.contains("edits[0] in this same batch already changed it"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), after);
 }
 
 #[test]
@@ -539,92 +616,6 @@ fn citations_into_test_code_are_named_on_save_and_audit() {
     let audit = run(&mut s, "document_audit", json!({}));
     assert_eq!(audit["structural_ok"], true, "{audit}");
     assert_eq!(audit["test_code_check"]["flagged"], 3, "{audit}");
-}
-
-#[test]
-fn identifiers_in_diagram_labels_are_flagged_for_non_developers() {
-    // A live end-user document kept tool names in its flowchart nodes: the
-    // check skipped Mermaid blocks entirely, and the reviewer let them stay.
-    let (_dir, mut s) = source_setup();
-    s.project.audience = "일반 사용자".into();
-    let text = "# 흐름\n\n```mermaid\nflowchart TD\n    A[사용자 요청] --> B[소스 탐색<br/>source_search / code_outline]\n    B -->|미독 인용 있음| C[document_edit 로 저장]\n    C --> D((\"documentation::execute\"))\n    D -.-> E{확인}\n```\n";
-    let saved = run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":text}),
-    );
-    let flagged: Vec<_> = saved["audience_check"]["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|item| {
-            (
-                item["kind"].as_str().unwrap(),
-                item["text"].as_str().unwrap(),
-                item["line"].as_u64().unwrap(),
-            )
-        })
-        .collect();
-    // Node ids, the diagram type, arrows and <br/> are diagram syntax.
-    assert_eq!(
-        flagged,
-        [
-            ("diagram_label", "source_search", 5),
-            ("diagram_label", "code_outline", 5),
-            ("diagram_label", "document_edit", 6),
-            ("diagram_label", "documentation::execute", 7),
-        ],
-        "{saved}"
-    );
-}
-
-#[test]
-fn a_document_for_non_developers_names_its_implementation_details() {
-    // An end-user document quoted `documentation::execute`, `resolve_heading`
-    // and error codes, and both reviews approved it.
-    let (dir, mut s) = source_setup();
-    s.project.audience = "일반 사용자".into();
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-    run(&mut s, "file_read", json!({"path":"main.rs"}));
-    let text = "# 안내\n\n`documentation::execute`가 `resolve_heading`으로 섹션을 찾고 `document_hash_required`를 냅니다 (`main.rs:1`).\n\n화면의 `채팅으로` 버튼과 `Shift+Enter`, `config.toml`을 씁니다.\n\n```rust\nfn main() {}\n```\n\n```mermaid\nflowchart TD\n  A[저장 단계] --> B\n```\n\nmodule::path 호출.\n";
-    let saved = run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":text}),
-    );
-    let check = &saved["audience_check"];
-    assert_eq!(check["flagged"], 5, "{saved}");
-    let flagged: Vec<_> = check["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|item| {
-            (
-                item["kind"].as_str().unwrap(),
-                item["text"].as_str().unwrap(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        flagged,
-        [
-            ("inline_code", "documentation::execute"),
-            ("inline_code", "resolve_heading"),
-            ("inline_code", "document_hash_required"),
-            ("code_block", "```rust"),
-            ("identifier", "module::path"),
-        ]
-    );
-    assert_eq!(check["items"][3]["line"], 7);
-    // The audit reports the same advice without making it a structural issue.
-    let audit = run(&mut s, "document_audit", json!({}));
-    assert_eq!(audit["structural_ok"], true, "{audit}");
-    assert_eq!(audit["issue_count"], 0, "{audit}");
-    assert_eq!(audit["audience_check"]["flagged"], 5, "{audit}");
-    // Developers may read the internals.
-    s.project.audience = "신규 개발자".into();
-    let audit = run(&mut s, "document_audit", json!({}));
-    assert!(audit.get("audience_check").is_none(), "{audit}");
 }
 
 #[test]
@@ -2510,13 +2501,61 @@ fn document_edits_reject_embedded_nul_bytes() {
 }
 
 #[test]
+fn one_insertion_may_add_several_sections_of_its_level() {
+    // The live-run shape: two level-3 sections in one insert_last_child,
+    // refused three times in one run. They follow the anchor's existing
+    // children in order, with their own nested headings.
+    let body = "# Manual\n\n## 1. Start\n\nBody\n\n### 1-1. Old\n\nOld\n\n## 2. Next\n\nLater\n";
+    for batch in [false, true] {
+        let (_dir, mut s) = setup();
+        std::fs::write(&s.project.output, body).unwrap();
+        let edit = json!({"action":"insert_last_child","section":"## 1. Start",
+            "text":"### 1-2. Routes\n\nRoutes\n\n#### Detail\n\nMore\n\n### 1-3. Worker\n\nWorker\n"});
+        if batch {
+            run(
+                &mut s,
+                "document_edit_batch",
+                json!({"expected_hash":tools::hash(body.as_bytes()),"edits":[edit]}),
+            );
+        } else {
+            let mut edit = edit;
+            edit["expected_hash"] = json!(tools::hash(body.as_bytes()));
+            run(&mut s, "document_edit", edit);
+        }
+        assert_eq!(
+            std::fs::read_to_string(&s.project.output).unwrap(),
+            "# Manual\n\n## 1. Start\n\nBody\n\n### 1-1. Old\n\nOld\n\n### 1-2. Routes\n\nRoutes\n\n#### Detail\n\nMore\n\n### 1-3. Worker\n\nWorker\n\n## 2. Next\n\nLater\n"
+        );
+    }
+    // A later inserted heading that already exists under the parent is
+    // named as the duplicate, and nothing is written.
+    let (_dir, mut s) = setup();
+    std::fs::write(&s.project.output, body).unwrap();
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_before","section":"## 2. Next","expected_hash":tools::hash(body.as_bytes()),
+            "text":"## 1-9. New\nNew\n## 1. Start\nAgain\n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with(
+            "invalid_argument_value: insert_before text adds \"## 1. Start\", which already exists"
+        ),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&s.project.output).unwrap(), body);
+}
+
+#[test]
 fn section_insert_errors_name_the_heading_that_breaks_the_rule() {
     let body = "# Manual\n## 1. Start\nBody\n";
     let cases = [
-        // The live-run shape: starts at the right level, then a sibling.
+        // A heading above the inserted level would leave the parent.
         (
-            "### 1-1. Overview\ntext\n### 1-2. Details\nmore\n",
-            "line 3 of text starts another level-3 section \"### 1-2. Details\"",
+            "### 1-1. Overview\ntext\n## 2. Next\nmore\n",
+            "line 3 of text starts level-2 heading \"## 2. Next\", above that level",
         ),
         (
             "#### Too deep\ntext\n",
@@ -3983,7 +4022,12 @@ fn unread_citations_follow_delivered_lines_and_file_versions_and_merge_ranges() 
     assert!(unread.iter().any(|range| range["path"] == "b.rs"
         && range["start_line"] == 1
         && range["end_line"] == 1));
-    // The audit blocks completion on the same ranges.
+    // With the document review on, the audit lists the same ranges without
+    // blocking completion: the review compares cited ranges with the source.
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert_eq!(audit["structural_ok"], true, "{audit}");
+    // Without a review the audit blocks completion on them.
+    s.config.source_document_review = false;
     let audit = run(&mut s, "document_audit", json!({}));
     assert_eq!(audit["structural_ok"], false, "{audit}");
     assert_eq!(

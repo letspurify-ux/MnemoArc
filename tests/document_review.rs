@@ -98,39 +98,6 @@ fn review_uses_caller_criteria_without_promoting_agent_workflow_checks() {
 }
 
 #[test]
-fn a_review_for_non_developers_lists_the_implementation_details_found() {
-    // The reviewer of an end-user document full of identifiers reported none.
-    let (dir, mut s) = fixture();
-    s.project.audience = "end users".into();
-    let current = tools::hash(&std::fs::read(dir.path().join("out.md")).unwrap());
-    tools::execute(
-        &mut s,
-        "document_edit",
-        json!({"action":"write","expected_hash":current,"text":"# Flow\n`normalize_history` runs work. main.js:4-5\n"}),
-    )
-    .unwrap();
-    let request = document_review::request(&mut s).unwrap();
-    assert!(
-        request["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("audience_flags, when present, lists implementation details")
-    );
-    let payload: Value =
-        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
-    assert_eq!(
-        payload["audience_flags"],
-        json!([{"line":2,"kind":"inline_code","text":"normalize_history"}])
-    );
-    // A developer audience gets no flags.
-    s.project.audience = "maintainers".into();
-    let request = document_review::request(&mut s).unwrap();
-    let payload: Value =
-        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
-    assert!(payload.get("audience_flags").is_none(), "{payload}");
-}
-
-#[test]
 fn a_review_lists_the_citations_into_test_code() {
     // A live reviewer approved a test's loop cited as how reviews repeat.
     let (dir, mut s) = fixture();
@@ -318,9 +285,6 @@ impl LlmClient for Reviewer {
         _: CancellationToken,
         tx: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         // A resumed repair can cross the context boundary. Complete the
         // requested maintenance before producing the scripted review/final.
         let content = request["messages"].as_array().unwrap().last().unwrap()["content"]
@@ -803,9 +767,6 @@ impl LlmClient for StallingRepair {
         cancel: CancellationToken,
         tx: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let content = request["messages"].as_array().unwrap().last().unwrap()["content"]
             .as_str()
             .unwrap();
@@ -894,50 +855,6 @@ fn grouped_citation_ranges_are_all_audited_and_supplied_to_reviewer() {
     );
 }
 
-#[tokio::test]
-async fn checkpoint_maintenance_does_not_consume_document_repair_requests() {
-    let (_dir, mut s) = fixture();
-    document_review::request(&mut s).unwrap();
-    support::document_review::finish(&mut s, r#"{"issues":["Correct the loop type"]}"#).unwrap();
-    s.task_rounds = 20; // Time spent in other control requests is not document repair.
-    s.document_review.repair_requests = 0;
-    ContextManager::prepare(&mut s, 60000).unwrap();
-    struct Cleanup;
-    #[async_trait]
-    impl LlmClient for Cleanup {
-        async fn complete(
-            &self,
-            request: Value,
-            _: &Config,
-            _: CancellationToken,
-            _: mpsc::Sender<String>,
-        ) -> Result<Completion> {
-            if let Some(review) = support::acceptance(&request) {
-                return Ok(review);
-            }
-            let content = request["messages"].as_array().unwrap().last().unwrap()["content"]
-                .as_str()
-                .unwrap();
-            let state: Value = serde_json::from_str(content.split_once('\n').unwrap().1)?;
-            if state["checkpoint"].is_null() {
-                anyhow::bail!("stop_after_cleanup");
-            }
-            assert_eq!(state["document_review"]["repair_requests"], 0);
-            Ok(Completion { calls:vec![mnemoarc::llm::ToolCall {
-                id:"ack".into(), name:"checkpoint_complete".into(),
-                arguments:json!({"id":state["checkpoint"]["id"],"progress":"Preserve unresolved loop issue", "no_save_reason":"No new findings"}).to_string()
-            }], ..Default::default() })
-        }
-    }
-    let (tx, mut rx) = mpsc::channel(128);
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let result = run_session(s, Arc::new(Cleanup), CancellationToken::new(), tx).await;
-    drain.await.unwrap();
-    assert_eq!(result.checkpoints_completed, 1);
-    assert_eq!(result.document_review.repair_requests, 0);
-    assert_eq!(result.last_error.as_deref(), Some("stop_after_cleanup"));
-}
-
 struct MalformedReview {
     calls: std::sync::Mutex<usize>,
     always_bad: bool,
@@ -951,9 +868,6 @@ impl LlmClient for MalformedReview {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let payload = request["messages"][1]["content"].as_str().unwrap();
         if payload.contains("\"source_document_review\":true") {
             let mut calls = self.calls.lock().unwrap();
@@ -1082,6 +996,94 @@ fn review_pages_cover_all_evidence_before_approval_and_accumulate_findings() {
 }
 
 #[test]
+fn a_rereview_sends_evidence_only_where_the_last_verdict_may_no_longer_hold() {
+    let (dir, mut s) = fixture();
+    std::fs::write(
+        dir.path().join("search.js"),
+        "function search(query) {\n  return index.find(query);\n}\n",
+    )
+    .unwrap();
+    let doc = "# Flow\n\n## Loop\n\nA for loop runs work five times. main.js:3-5\n\n## Search\n\nSearch looks the query up in the index. search.js:2\n";
+    std::fs::write(&s.project.output, doc).unwrap();
+    s.document_review = Default::default();
+    let page = |s: &mut Session| -> (Vec<String>, Value) {
+        let request = document_review::request(s).unwrap();
+        let payload: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        let mut paths: Vec<String> = payload["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|chunk| {
+                let path = std::path::Path::new(chunk["path"].as_str().unwrap());
+                path.file_name().unwrap().to_string_lossy().into_owned()
+            })
+            .collect();
+        paths.dedup();
+        (paths, payload)
+    };
+    let rereview = |payload: &Value| {
+        payload["page_scope"]
+            .as_str()
+            .unwrap()
+            .contains("Re-review")
+    };
+    // The first review checks every citation.
+    let (paths, payload) = page(&mut s);
+    assert_eq!(paths, ["main.js", "search.js"]);
+    assert!(!rereview(&payload));
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    assert!(document_review::approved(&s));
+
+    // A repair of one section sends that section's evidence only.
+    let doc = doc.replace(
+        "Search looks the query up in the index.",
+        "Search returns the first index match.",
+    );
+    std::fs::write(&s.project.output, &doc).unwrap();
+    let (paths, payload) = page(&mut s);
+    assert_eq!(paths, ["search.js"]);
+    assert_eq!(payload["changed_sections"], json!(["# Flow > ## Search"]));
+    assert!(rereview(&payload));
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    assert!(document_review::approved(&s));
+
+    // A changed source is sent again for the unchanged section citing it.
+    let main = std::fs::read_to_string(dir.path().join("main.js")).unwrap();
+    std::fs::write(dir.path().join("main.js"), format!("{main}// end\n")).unwrap();
+    assert!(!document_review::approved(&s));
+    let (paths, payload) = page(&mut s);
+    assert_eq!(paths, ["main.js"]);
+    assert_eq!(payload["changed_sections"], json!([]));
+    let finding = json!({"previous_id":null,"kind":"factual",
+        "document":{"start_line":5,"end_line":5,"quote":"A for loop runs work five times."},
+        "requirement_id":null,
+        "sources":[{"path":"main.js","start_line":3,"end_line":3,"quote":"for (let i = 0; i < 5; i++) {"}],
+        "problem":"The loop bound is not stated as i < 5.","correction":"State the bound i < 5.","ui_labels":[]});
+    support::document_review::finish(&mut s, &json!({"issues":[finding]}).to_string()).unwrap();
+    assert_eq!(s.document_review.findings.len(), 1);
+
+    // The passage of an open finding keeps its evidence although neither
+    // its section nor its source changed.
+    std::fs::write(
+        &s.project.output,
+        doc.replace("first index match", "first match"),
+    )
+    .unwrap();
+    let (paths, payload) = page(&mut s);
+    assert_eq!(paths, ["main.js", "search.js"]);
+    assert_eq!(payload["previous_findings"][0]["id"], "F1");
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+
+    // Lines a review could not judge make the next one complete again.
+    s.document_review.unavailable_ranges = vec![(5, 5)];
+    std::fs::write(&s.project.output, &doc).unwrap();
+    let (paths, payload) = page(&mut s);
+    assert_eq!(paths, ["main.js", "search.js"]);
+    assert!(!rereview(&payload));
+}
+
+#[test]
 fn changing_evidence_between_pages_restarts_review_without_old_findings() {
     let (dir, mut s) = fixture();
     let source: String = (1..=1800)
@@ -1107,22 +1109,6 @@ fn changing_evidence_between_pages_restarts_review_without_old_findings() {
     assert_eq!(s.document_review.attempts, 0);
 }
 
-#[test]
-fn repair_limit_defaults_and_validates() {
-    let mut config: Config = serde_json::from_value(json!({})).unwrap();
-    assert_eq!(config.document_repair_limit, 8);
-    config.document_repair_limit = 0;
-    assert!(config.validate().is_err());
-    config.document_repair_limit = 16;
-    let encoded = toml::to_string(&config).unwrap();
-    assert_eq!(
-        toml::from_str::<Config>(&encoded)
-            .unwrap()
-            .document_repair_limit,
-        16
-    );
-}
-
 async fn run_repair_test(s: Session, client: Arc<dyn LlmClient>) -> Session {
     let (tx, mut rx) = mpsc::channel(128);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -1134,7 +1120,6 @@ async fn run_repair_test(s: Session, client: Arc<dyn LlmClient>) -> Session {
 #[tokio::test]
 async fn repair_interval_rechecks_and_a_changed_document_can_resume() {
     let (_dir, mut s) = fixture();
-    s.config.document_repair_limit = 2;
     s.config.run_tokens = 200_000;
     let mut s = run_repair_test(s, Arc::new(StallingRepair)).await;
     assert_eq!(s.status, "complete_with_gaps");
@@ -1234,9 +1219,6 @@ impl LlmClient for ProgressiveDocumentRepair {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         if request["messages"][1]["content"]
             .as_str()
             .is_some_and(|text| text.contains("\"source_document_review\":true"))
@@ -1290,10 +1272,9 @@ impl LlmClient for ProgressiveDocumentRepair {
 }
 
 #[tokio::test]
-async fn progressive_document_repairs_reach_final_approval_past_both_intervals() {
+async fn progressive_document_repairs_reach_final_approval() {
     let (_dir, mut s) = fixture();
     s.config.review_limit = 2;
-    s.config.document_repair_limit = 2;
     s.config.run_tokens = 5_000_000;
     // This test counts repair requests, not checkpoint cleanup; the default
     // budget sits close enough to the cleanup threshold that a slightly
@@ -1305,78 +1286,13 @@ async fn progressive_document_repairs_reach_final_approval_past_both_intervals()
     });
     let result = run_repair_test(s, client.clone()).await;
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
-    assert_eq!(result.document_review.attempts, 3);
+    // Edits between final answers are not reviewed on their own: the first
+    // final is rejected and the second, after the correction, approved.
+    assert_eq!(result.document_review.attempts, 2);
     assert!(document_review::approved(&result));
     // The final answer that started the approving review is resumed; the
     // model is not asked to answer a seventh time.
     assert_eq!(*client.calls.lock().unwrap(), 6);
-}
-
-#[tokio::test]
-async fn reads_and_verification_can_finish_even_at_the_edit_limit() {
-    struct ReadAndVerify(std::sync::atomic::AtomicUsize);
-    #[async_trait]
-    impl LlmClient for ReadAndVerify {
-        async fn complete(
-            &self,
-            request: Value,
-            config: &Config,
-            cancel: CancellationToken,
-            tx: mpsc::Sender<String>,
-        ) -> Result<Completion> {
-            if let Some(review) = support::acceptance(&request) {
-                return Ok(review);
-            }
-            let round = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if round < 9 {
-                let content = request["messages"].as_array().unwrap().last().unwrap()["content"]
-                    .as_str()
-                    .unwrap();
-                let state: Value = serde_json::from_str(content.split_once('\n').unwrap().1)?;
-                assert_eq!(state["document_review"]["repair_requests"], 2);
-                let name = ["file_read", "document_inspect", "document_audit"][round % 3];
-                let args = match name {
-                    "file_read" => json!({"path":"main.js","force_read":true}),
-                    _ => json!({}),
-                };
-                return Ok(Completion {
-                    calls: vec![mnemoarc::llm::ToolCall {
-                        id: format!("read-{round}"),
-                        name: name.into(),
-                        arguments: args.to_string(),
-                    }],
-                    ..Default::default()
-                });
-            }
-            Reviewer {
-                issues: false,
-                phase: None,
-            }
-            .complete(request, config, cancel, tx)
-            .await
-        }
-    }
-    let (_dir, mut s) = fixture();
-    document_review::request(&mut s).unwrap();
-    support::document_review::finish(&mut s, r#"{"issues":["Check the existing section"]}"#)
-        .unwrap();
-    // A real correction creates a new target. Merely asking again must not
-    // replace the rejected verdict for unchanged content with a random pass.
-    // It cites nothing, so no investigation item has to cover it.
-    let expected = s.last_document_write.as_ref().unwrap().1.clone();
-    tools::execute(&mut s, "document_edit", json!({"action":"append","expected_hash":expected,"text":"# Bounds\nThe loop has a finite bound.\n"})).unwrap();
-    // This test exercises the edit cap across many reads, not checkpoint cleanup.
-    s.config.context_tokens = 128_000;
-    s.config.document_repair_limit = 2;
-    s.document_review.repair_requests = 2;
-    let result = run_repair_test(
-        s,
-        Arc::new(ReadAndVerify(std::sync::atomic::AtomicUsize::new(0))),
-    )
-    .await;
-    assert_eq!(result.status, "complete", "{:?}", result.last_error);
-    assert!(document_review::approved(&result));
-    assert!(result.task_rounds >= 11); // nine non-edit requests + final + paged review
 }
 
 #[test]
@@ -1604,9 +1520,6 @@ async fn pending_document_review_setup_error_returns_to_repair_and_finishes() {
             _: CancellationToken,
             _: mpsc::Sender<String>,
         ) -> Result<Completion> {
-            if let Some(review) = support::acceptance(&request) {
-                return Ok(review);
-            }
             let payload: Value =
                 serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
                     .unwrap_or(Value::Null);
@@ -1702,7 +1615,6 @@ async fn pending_document_review_setup_error_returns_to_repair_and_finishes() {
     let s = run_repair_test(s, client).await;
     assert_eq!(s.status, "complete", "{:?}", s.last_error);
     assert!(document_review::approved(&s));
-    assert!(s.completion_review.approved);
     assert!(
         !s.ledger
             .keys()
@@ -1725,9 +1637,6 @@ impl LlmClient for SlowCorrection {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         if request["messages"][1]["content"]
             .as_str()
             .is_some_and(|text| text.contains("\"source_document_review\":true"))
@@ -1764,7 +1673,7 @@ impl LlmClient for SlowCorrection {
             id: format!("edit-{calls}"), name: "document_edit".into(),
             arguments: json!({"action":"write","expected_hash":tools::hash(&std::fs::read(&self.path)?),"text":text}).to_string(),
         }];
-        // The verification sibling must execute even at the review interval.
+        // The verification sibling executes with the final correction.
         if *calls == 16 {
             tool_calls.push(mnemoarc::llm::ToolCall {
                 id: "audit-final-correction".into(),
@@ -1780,11 +1689,10 @@ impl LlmClient for SlowCorrection {
 }
 
 #[tokio::test]
-async fn source_document_can_finish_after_stalled_reviews_or_many_rejected_finals() {
+async fn source_document_can_finish_after_many_repair_edits_or_rejected_finals() {
     for premature_finals in [false, true] {
         let (_dir, mut s) = fixture();
         s.config.review_limit = 1;
-        s.config.document_repair_limit = 1;
         s.config.context_tokens = 128_000;
         s.config.run_tokens = 2_000_000;
         let client = Arc::new(SlowCorrection {
@@ -1812,8 +1720,9 @@ async fn source_document_can_finish_after_stalled_reviews_or_many_rejected_final
         }
         assert_eq!(s.status, "complete", "{:?}", s.last_error);
         assert!(document_review::approved(&s));
-        assert!(s.completion_review.approved);
-        assert_eq!(s.document_review.attempts, 16);
+        // Fourteen draft edits run without a review of their own; only the
+        // first and the last final answer are reviewed.
+        assert_eq!(s.document_review.attempts, 2);
     }
 }
 
@@ -1888,27 +1797,29 @@ fn a_page_cannot_report_a_later_section_as_missing() {
 }
 
 #[test]
-fn reviewer_judges_detail_for_the_project_audience() {
+fn reviewer_judges_detail_for_the_reader_the_request_names() {
+    // The reader and purpose come from the request, not project settings.
     let (_dir, mut s) = fixture();
-    s.project.audience = "일반 유저".into();
-    s.project.purpose = "화면 사용법 안내".into();
     let request = document_review::request(&mut s).unwrap();
     let payload: Value =
         serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
-    assert_eq!(payload["audience"], "일반 유저");
-    assert_eq!(payload["purpose"], "화면 사용법 안내");
+    assert!(payload.get("audience").is_none(), "{payload}");
+    assert!(payload.get("purpose").is_none(), "{payload}");
     assert!(
-        request["messages"][0]["content"]
-            .as_str()
+        !payload["requirement_catalog"]
+            .as_object()
             .unwrap()
-            .contains("non-developer audience")
+            .contains_key("audience"),
+        "{payload}"
     );
+    let instruction = request["messages"][0]["content"].as_str().unwrap();
+    assert!(instruction.contains("The reader and purpose are whatever the user request states"));
+    assert!(instruction.contains("non-developer audience"));
 }
 
 #[test]
 fn user_manual_citations_retain_source_evidence_and_validation() {
     let (_dir, mut s) = fixture();
-    s.project.audience = "일반 유저".into();
     let source_path = s.project.root.join("main.js").canonicalize().unwrap();
     let request = document_review::request(&mut s).unwrap();
     let payload: Value =
@@ -2016,9 +1927,6 @@ impl LlmClient for TruncatedFirstReview {
         _: CancellationToken,
         tx: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let payload: Value = request["messages"][1]["content"]
             .as_str()
             .and_then(|s| serde_json::from_str(s).ok())
@@ -2095,9 +2003,6 @@ impl LlmClient for FailingSecondPage {
         _: CancellationToken,
         tx: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let payload: Value = request["messages"][1]["content"]
             .as_str()
             .and_then(|s| serde_json::from_str(s).ok())
@@ -2334,9 +2239,6 @@ impl LlmClient for OneFinalAnswer {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         if request["messages"][1]["content"]
             .as_str()
             .is_some_and(|text| text.contains("\"source_document_review\":true"))
@@ -2371,9 +2273,8 @@ async fn an_approved_review_resumes_the_final_answer_that_started_it() {
     let result = run_repair_test(s, client.clone()).await;
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
     assert!(document_review::approved(&result));
-    assert!(result.completion_review.approved);
-    // One model answer: the review approves it and the completion review
-    // checks that same answer, which is the one published.
+    // One model answer: the review approves it, and that same answer is
+    // the one published.
     assert_eq!(
         client.model_calls.load(std::sync::atomic::Ordering::SeqCst),
         1
@@ -2425,9 +2326,6 @@ impl LlmClient for PagedReview {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let payload: Value = request["messages"][1]["content"]
             .as_str()
             .and_then(|text| serde_json::from_str(text).ok())
@@ -2490,7 +2388,6 @@ async fn a_review_of_several_requests_resumes_the_final_answer_that_started_it()
         } else {
             assert!(document_review::approved(&result));
         }
-        assert!(result.completion_review.approved, "{fail_first_page}");
         assert_eq!(
             client.model_calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -2521,7 +2418,6 @@ fn a_halved_review_caps_every_later_page_at_half_the_unanswered_evidence() {
     // 137 lines, and the review ran out of time. The cap is half of the
     // unanswered page's evidence and holds for every later page.
     let (dir, mut s) = fixture();
-    s.project.audience = "일반 사용자".into();
     let files = 8;
     for file in 0..files {
         let source = (1..=20)
@@ -2547,13 +2443,11 @@ fn a_halved_review_caps_every_later_page_at_half_the_unanswered_evidence() {
     };
     let full = page(&mut s);
     assert_eq!(full["evidence"].as_array().unwrap().len(), files);
-    assert!(full["audience_flags"].is_array(), "{full}");
     assert!(document_review::shrink_page(&mut s));
     let first = page(&mut s);
     let first_chunks = first["evidence"].as_array().unwrap().len();
     assert!((3..=5).contains(&first_chunks), "{first_chunks}");
     assert_eq!(first["more_evidence_pages"], true);
-    assert!(first["audience_flags"].is_array(), "{first}");
     document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
     // The next evidence page of the same range takes as much again, not
     // half of what is left, and judges only its evidence.
@@ -2564,7 +2458,6 @@ fn a_halved_review_caps_every_later_page_at_half_the_unanswered_evidence() {
         "{second_chunks} after {first_chunks}"
     );
     assert!(first_chunks + second_chunks >= files - 1);
-    assert!(second.get("audience_flags").is_none(), "{second}");
     assert!(
         second["page_scope"]
             .as_str()

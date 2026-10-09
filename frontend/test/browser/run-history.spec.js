@@ -14,7 +14,6 @@ test("execution history survives another request and reload", async ({
         model: "gpt-4o",
         model_context: 128000,
         source_answer_review: false,
-        completion_review_enabled: false,
       },
       api_key: "browser-test-only",
       credential_mode: "session",
@@ -93,7 +92,6 @@ test("execution history survives another request and reload", async ({
   for (const key of [
     "task",
     "document_review",
-    "completion_review",
     "checkpoint",
     "run_guidance",
     "error",

@@ -80,7 +80,7 @@ pub struct TaskState {
 
 /// Criteria supplied before a user request starts. The agent may refine
 /// TaskState while working, but those working checks must not become new
-/// requirements for document or completion review.
+/// requirements for the document review.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RequestReviewCriteria {
@@ -409,7 +409,6 @@ pub struct Closing {
     /// Final answers submitted during closing. The second accepts reported gaps.
     pub final_attempts: usize,
     pub document_review_used: bool,
-    pub completion_review_used: bool,
 }
 
 impl ProgressRecovery {
@@ -522,10 +521,8 @@ pub struct Session {
     pub activity: Value,
     pub task_rounds: usize,
     pub document_review: crate::tools::document_review::ReviewState,
-    pub completion_review: crate::tools::completion_review::ReviewState,
-    /// First task history id and current requirements with change provenance;
-    /// document and completion reviews compare results against them.
-    pub answer_review_start: u64,
+    /// Current requirements with change provenance; the document review
+    /// compares results against them.
     pub answer_review_question: String,
     // Some(true): truncated tool batch; Some(false): text continuation.
     pub continuation: Option<bool>,
@@ -615,7 +612,6 @@ impl Session {
                 || self.continuation.is_some()
                 || self.task.current_todo().is_some()
                 || self.document_review.pending
-                || self.completion_review.pending
                 || !self.completion_gaps.is_empty())
     }
 
@@ -636,7 +632,6 @@ impl Session {
     pub fn new(mut project: Project, config: Config) -> Self {
         project.ensure_id();
         let task = TaskState {
-            purpose: project.purpose.clone(),
             scope: project.root.display().to_string(),
             // A configured output is a possible destination, not a requested deliverable.
             deliverables: vec![],
@@ -710,8 +705,6 @@ impl Session {
             activity: json!({}),
             task_rounds: 0,
             document_review: Default::default(),
-            completion_review: Default::default(),
-            answer_review_start: 0,
             answer_review_question: String::new(),
             continuation: None,
         }
@@ -846,10 +839,6 @@ impl Session {
             }
         }
         let changed_requirements = amendment.goal.is_some();
-        let explicit_requirements_changed = amendment.goal.is_some()
-            || amendment.completion.is_some()
-            || amendment.constraints.is_some()
-            || amendment.deliverables.is_some();
         let mut next = self.clone();
         let question = next.question.take().unwrap();
         next.current_request = question.text.clone();
@@ -905,17 +894,9 @@ impl Session {
         // invalidate old verdicts even when the document itself is unchanged.
         next.document_review.pending = false;
         next.document_review.approved_hash = None;
-        next.document_review.repair_started_round = None;
-        next.document_review.repair_requests = 0;
         if changed_requirements {
             next.document_review.invalidate_requirements();
         }
-        // Routing sets the current status to running; only the status saved
-        // before this message tells whether the previous work was complete.
-        next.completion_review.invalidate_requirements(
-            explicit_requirements_changed,
-            question.prior_status == "complete",
-        );
         if let Some(cp) = &mut next.checkpoint {
             cp.attempts = 0;
             cp.acknowledged = false;
@@ -985,11 +966,6 @@ impl Session {
             // successful results across a new user task can replay a stale read
             // or suppress a new mutation if a provider reuses an ID.
             self.ledger.clear();
-            self.completion_review = Default::default();
-            self.completion_review.required = self.config.completion_review_enabled
-                && first_request
-                && !self.task.completion.is_empty();
-            self.answer_review_start = self.history.next_id + 1;
             self.answer_review_question = text.clone();
             self.continuation = None;
             // The first prompt may follow a caller's task_state setup. Keep
@@ -1002,7 +978,6 @@ impl Session {
                 let revision = self.task.revision.saturating_add(1);
                 let constraints = std::mem::take(&mut self.task.constraints);
                 self.task = TaskState {
-                    purpose: self.project.purpose.clone(),
                     scope: self.project.root.display().to_string(),
                     constraints,
                     revision,
@@ -1021,7 +996,7 @@ impl Session {
             // later model task_state updates add working acceptance checks.
             // On later requests, task.constraints can contain checks the agent
             // added during the previous task; retain only the earlier caller
-            // constraints for document and completion reviews.
+            // constraints for the document review.
             self.request_review_criteria = RequestReviewCriteria {
                 completion: self.task.completion.clone(),
                 constraints: if first_request {
@@ -1037,7 +1012,7 @@ impl Session {
             self.apply_workflow_mode();
         }
         // A resume message belongs in history, but must not replace the task
-        // requirements used after checkpointing and by completion reviews.
+        // requirements used after checkpointing and by the document review.
         if !continuation || self.latest_request.is_empty() {
             self.latest_request = text.clone();
             self.original_request = text.clone();
@@ -1139,7 +1114,6 @@ impl Session {
             self.active_document_review_failure(),
         )))
         .saturating_add(self.document_review.retained_bytes())
-        .saturating_add(self.completion_review.retained_bytes())
         .saturating_add(self.config.api_key.as_ref().map_or(0, |key| key.0.len()))
         .saturating_add(
             self.pending_config
@@ -1193,7 +1167,6 @@ mod history_tests {
         s.document_review.approved_hash = Some("same-hash".into());
         s.document_review.issues = vec!["Old length requirement".into()];
         s.document_review.validation_log = vec![json!({"prior":"review"})];
-        s.completion_review.approved = true;
         let original = s.original_request.clone();
         let files = s.last_document_write.clone();
         let sources = s.sources.clone();
@@ -1217,7 +1190,6 @@ mod history_tests {
         assert_eq!(s.document_review.approved_hash, None);
         assert!(s.document_review.issues.is_empty());
         assert_eq!(s.document_review.validation_log.len(), 1);
-        assert!(!s.completion_review.approved);
         assert_eq!(s.task_amendments.len(), 1);
         assert_eq!(s.task.workflow, "source_document");
     }

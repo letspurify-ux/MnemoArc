@@ -21,7 +21,8 @@ use tokio_util::sync::CancellationToken;
 const RESULT: &str = "# Report\nThe requested document is saved and verified. report.rs:1\n";
 
 #[tokio::test]
-async fn unread_citations_receive_repair_guidance_instead_of_final_or_plan_closeout() {
+async fn without_a_review_unread_citations_receive_repair_guidance_instead_of_final_or_plan_closeout()
+ {
     struct StopAfterGuidance(Arc<Mutex<usize>>);
     #[async_trait]
     impl LlmClient for StopAfterGuidance {
@@ -51,6 +52,8 @@ async fn unread_citations_receive_repair_guidance_instead_of_final_or_plan_close
                 context_tokens: 128000,
                 output_tokens: 1024,
                 api_key: Some(mnemoarc::config::Secret("offline-probe".into())),
+                // With the document review on, unread ranges are advisory.
+                source_document_review: false,
                 ..support::compact_config()
             },
         );
@@ -174,22 +177,6 @@ impl LlmClient for DocumentClient {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        let payload: Value =
-            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
-                .unwrap_or(Value::Null);
-        if payload["completion_review"] == true {
-            assert!(request.get("tool_choice").is_none());
-            let evidence = payload["evidence"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|item| item["kind"] == "current_file")
-                .unwrap();
-            let met = evidence["text"] == RESULT;
-            return Ok(Completion { text: json!({"checks":payload["criteria"].as_array().unwrap().iter().map(|criterion|
-                json!({"id":criterion["id"],"status":if met {"met"} else {"unmet"},"reason":if met {"The current file contains the required document"} else {"Only a draft is saved"}, "evidence":[evidence["id"]],"next_action":if met {""} else {"Finish the requested document"}})
-            ).collect::<Vec<_>>()}).to_string(), ..Default::default() });
-        }
         let state: Value = serde_json::from_str(
             request["messages"].as_array().unwrap().last().unwrap()["content"]
                 .as_str()
@@ -404,21 +391,16 @@ impl LlmClient for PendingConfigClient {
         cancel: CancellationToken,
         tx: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        let payload: Value =
-            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
-                .unwrap_or(Value::Null);
-        if payload["completion_review"] != true {
-            let should_send = {
-                let mut sent = self.sent.lock().unwrap();
-                let first = !*sent;
-                *sent = true;
-                first
-            };
-            if should_send {
-                self.command_tx
-                    .send(RunCommand::Configure(Box::new(self.replacement.clone())))
-                    .await?;
-            }
+        let should_send = {
+            let mut sent = self.sent.lock().unwrap();
+            let first = !*sent;
+            *sent = true;
+            first
+        };
+        if should_send {
+            self.command_tx
+                .send(RunCommand::Configure(Box::new(self.replacement.clone())))
+                .await?;
         }
         self.client.complete(request, config, cancel, tx).await
     }
@@ -498,7 +480,6 @@ async fn document_recovery_can_finish_after_focus_guidance_before_closing() {
             delay_name(delay),
             s.last_error
         );
-        assert!(s.completion_review.approved);
         assert!(s.task.current_todo().is_none());
         assert!(s.completion_gaps.is_empty());
         assert_eq!(std::fs::read_to_string(path).unwrap(), RESULT);
@@ -553,17 +534,16 @@ async fn sustained_document_no_progress_finishes_with_reported_gaps() {
             "{name}: {calls} requests"
         );
         // The draft is reported as unfinished: either its to-do is still open
-        // or, after bookkeeping-only completion, acceptance checks are unmet.
+        // or, after bookkeeping-only completion, it still cites no source.
         assert!(
             s.completion_gaps
                 .iter()
-                .any(|gap| gap.starts_with("미완료 할 일") || gap.starts_with("완료 조건")),
+                .any(|gap| gap.starts_with("미완료 할 일") || gap.starts_with("소스 인용")),
             "{name}: {:?}",
             s.completion_gaps
         );
         assert_eq!(deltas.len(), 1, "{name}");
         assert!(deltas[0].contains("확인하지 못한 항목"), "{name}");
-        assert!(!s.completion_review.approved, "{name}");
     }
 }
 
@@ -588,7 +568,6 @@ async fn persistent_document_loop_closes_with_gaps_and_resume_can_finish() {
     assert_eq!(deltas.len(), 1);
     assert!(deltas[0].contains("미완료 할 일"));
     assert!(s.task.current_todo().is_some());
-    assert!(!s.completion_review.approved);
     let (s, _) = run(
         s,
         Arc::new(DocumentClient {
@@ -601,195 +580,6 @@ async fn persistent_document_loop_closes_with_gaps_and_resume_can_finish() {
     )
     .await;
     assert_eq!(s.status, "complete", "{:?}", s.last_error);
-    assert!(s.completion_review.approved);
-}
-
-#[tokio::test]
-async fn rejected_acceptance_does_not_stop_a_late_document_repair() {
-    let (_dir, mut s) = fixture();
-    // Forty unproductive reads stay below the closing threshold (3 x 14)
-    // while crossing the older completion-repair focus limits.
-    s.config.stall_round_limit = 14;
-    let path = s.project.output.clone();
-    tools::completion_review::begin(&mut s, "Saved report.md").unwrap();
-    let request = tools::completion_review::request(&mut s).unwrap();
-    let payload: Value =
-        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
-    let verdict = json!({"checks":payload["criteria"].as_array().unwrap().iter().map(|criterion|
-        json!({"id":criterion["id"],"status":"unmet","reason":"Only a draft is saved", "evidence":[],"next_action":"Finish the requested document"})
-    ).collect::<Vec<_>>()});
-    assert!(
-        tools::completion_review::finish(&mut s, &verdict.to_string())
-            .unwrap()
-            .is_none()
-    );
-    tools::completion_review::schedule_repairs(&mut s);
-    let (s, deltas) = run(
-        s,
-        Arc::new(DocumentClient {
-            path,
-            delay: Delay::Read,
-            delay_rounds: 40,
-            calls: Mutex::new(0),
-            input_usage: 1000,
-        }),
-    )
-    .await;
-    assert_eq!(s.status, "complete", "{:?}", s.last_error);
-    assert!(s.completion_review.approved);
-    assert_eq!(deltas, ["Saved report.md"]);
-}
-
-#[test]
-fn a_bare_check_array_is_read_as_the_check_list() {
-    let (_dir, mut s) = fixture();
-    tools::completion_review::begin(&mut s, "Saved report.md").unwrap();
-    let request = tools::completion_review::request(&mut s).unwrap();
-    let payload: Value =
-        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
-    let checks: Vec<Value> = payload["criteria"].as_array().unwrap().iter().map(|criterion|
-        json!({"id":criterion["id"],"status":"unmet","reason":"Only a draft is saved", "evidence":[],"next_action":"Finish the requested document"})
-    ).collect();
-    // The list without its {"checks":...} wrapper is accepted as the verdict.
-    assert!(
-        tools::completion_review::finish(&mut s, &json!(checks).to_string())
-            .unwrap()
-            .is_none()
-    );
-    assert!(!s.completion_review.approved);
-    assert_eq!(s.completion_review.checks.len(), checks.len());
-}
-
-struct LateAcceptance {
-    client: DocumentClient,
-    reviews: Mutex<usize>,
-    too_many_tools: bool,
-    invalid_reviews: usize,
-}
-
-#[async_trait]
-impl LlmClient for LateAcceptance {
-    async fn complete(
-        &self,
-        request: Value,
-        config: &Config,
-        cancel: CancellationToken,
-        tx: mpsc::Sender<String>,
-    ) -> Result<Completion> {
-        let payload: Value =
-            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
-                .unwrap_or(Value::Null);
-        if payload["completion_review"] == true {
-            let mut reviews = self.reviews.lock().unwrap();
-            *reviews += 1;
-            if *reviews > 1 {
-                assert!(
-                    payload["previous_response_error"]
-                        .as_str()
-                        .unwrap()
-                        .starts_with("completion_review_invalid:")
-                );
-            }
-            if *reviews <= self.invalid_reviews {
-                return Ok(Completion {
-                    text: "invalid JSON".into(),
-                    calls: if self.too_many_tools {
-                        (0..33)
-                            .map(|i| ToolCall {
-                                id: format!("forbidden-review-tool-{i}"),
-                                name: "document_edit".into(),
-                                arguments: json!({"action":"append","text":"must not execute"})
-                                    .to_string(),
-                            })
-                            .collect()
-                    } else {
-                        vec![]
-                    },
-                    usage: Some(Usage {
-                        input: 1000,
-                        output: 10,
-                        cached: None,
-                    }),
-                    ..Default::default()
-                });
-            }
-        }
-        self.client.complete(request, config, cancel, tx).await
-    }
-}
-
-#[tokio::test]
-async fn malformed_document_acceptance_recovers_below_the_unavailable_limit() {
-    for too_many_tools in [false, true] {
-        let (_dir, s) = fixture();
-        let client = Arc::new(LateAcceptance {
-            client: DocumentClient {
-                path: s.project.output.clone(),
-                delay: Delay::Read,
-                delay_rounds: 0,
-                calls: Mutex::new(0),
-                input_usage: 1000,
-            },
-            reviews: Mutex::new(0),
-            too_many_tools,
-            invalid_reviews: 2,
-        });
-        let (s, deltas) = run(s, client.clone()).await;
-        assert_eq!(s.status, "complete", "{:?}", s.last_error);
-        assert_eq!(*client.reviews.lock().unwrap(), 3);
-        assert!(s.completion_review.approved);
-        assert_eq!(deltas, ["Saved report.md"]);
-        assert!(
-            !s.ledger
-                .keys()
-                .any(|id| id.starts_with("forbidden-review-tool-"))
-        );
-    }
-}
-
-#[tokio::test]
-async fn persistently_invalid_acceptance_is_reported_as_unchecked() {
-    for too_many_tools in [false, true] {
-        let (_dir, s) = fixture();
-        let client = Arc::new(LateAcceptance {
-            client: DocumentClient {
-                path: s.project.output.clone(),
-                delay: Delay::Read,
-                delay_rounds: 0,
-                calls: Mutex::new(0),
-                input_usage: 1000,
-            },
-            reviews: Mutex::new(0),
-            too_many_tools,
-            invalid_reviews: usize::MAX,
-        });
-        let (s, deltas) = run(s, client.clone()).await;
-        assert_eq!(s.status, "complete_with_gaps", "{:?}", s.last_error);
-        assert_eq!(*client.reviews.lock().unwrap(), 3);
-        assert!(s.completion_review.unavailable);
-        // The report says why the review was abandoned.
-        assert!(
-            s.completion_review
-                .unavailable_reason
-                .as_deref()
-                .is_some_and(|reason| reason.starts_with("completion_review_invalid:")),
-            "{:?}",
-            s.completion_review.unavailable_reason
-        );
-        assert!(!s.completion_review.approved);
-        assert!(
-            s.completion_gaps
-                .iter()
-                .any(|gap| gap.starts_with("완료 조건 검증") && gap.contains("응답 오류"))
-        );
-        assert_eq!(deltas.len(), 1);
-        assert!(deltas[0].starts_with("Saved report.md"));
-        assert!(
-            !s.ledger
-                .keys()
-                .any(|id| id.starts_with("forbidden-review-tool-"))
-        );
-    }
 }
 
 struct LateCheckpoint {
@@ -871,7 +661,6 @@ async fn document_checkpoint_recovers_after_twelve_failures_below_extended_limit
     assert_eq!(s.status, "complete", "{:?}", s.last_error);
     assert_eq!(*client.attempts.lock().unwrap(), 13);
     assert_eq!(s.checkpoints_completed, 1);
-    assert!(s.completion_review.approved);
     assert_eq!(deltas, ["Saved report.md"]);
 }
 
@@ -912,66 +701,6 @@ async fn document_checkpoint_stops_after_repeated_missing_ack_without_losing_con
         assert_eq!(retained.messages, bundle.messages);
     }
     assert!(deltas.is_empty());
-}
-
-struct OversizedFinal {
-    client: DocumentClient,
-    sent: Mutex<bool>,
-}
-
-#[async_trait]
-impl LlmClient for OversizedFinal {
-    async fn complete(
-        &self,
-        request: Value,
-        config: &Config,
-        cancel: CancellationToken,
-        tx: mpsc::Sender<String>,
-    ) -> Result<Completion> {
-        if !*self.sent.lock().unwrap() {
-            *self.sent.lock().unwrap() = true;
-            return Ok(Completion {
-                text: "Extra final report detail. ".repeat(6000),
-                ..Default::default()
-            });
-        }
-        self.client.complete(request, config, cancel, tx).await
-    }
-}
-
-#[tokio::test]
-async fn oversized_final_can_be_shortened_without_stopping_document_work() {
-    let (_dir, mut s) = fixture();
-    tools::execute(
-        &mut s,
-        "document_edit",
-        json!({"action":"write",
-        "expected_hash":tools::hash(b"# Report\nDraft.\n"),"text":RESULT}),
-    )
-    .unwrap();
-    let id = s.task.current_todo().unwrap().id.clone();
-    let revision = s.task.plan_revision;
-    tools::execute(
-        &mut s,
-        "task_plan",
-        json!({"action":"apply","expected_revision":revision,
-        "operations":[{"op":"complete","id":id,"result":"Saved the requested document"}]}),
-    )
-    .unwrap();
-    let client = Arc::new(OversizedFinal {
-        client: DocumentClient {
-            path: s.project.output.clone(),
-            delay: Delay::Read,
-            delay_rounds: 0,
-            calls: Mutex::new(0),
-            input_usage: 1000,
-        },
-        sent: Mutex::new(false),
-    });
-    let (s, deltas) = run(s, client).await;
-    assert_eq!(s.status, "complete", "{:?}", s.last_error);
-    assert!(s.completion_review.approved);
-    assert_eq!(deltas, ["Saved report.md"]);
 }
 
 struct OversizedToolBatch {
@@ -1061,7 +790,6 @@ async fn rejected_provider_tool_json_returns_to_document_repair_until_completion
         });
         let (s, deltas) = run(s, client).await;
         assert_eq!(s.status, "complete", "{fault}: {:?}", s.last_error);
-        assert!(s.completion_review.approved);
         assert!(!s.ledger.contains_key("action-800"));
         assert_eq!(deltas, ["Saved report.md"]);
     }
@@ -1116,7 +844,6 @@ async fn oversized_parsed_response_does_not_execute_its_write_and_can_recover() 
     });
     let (s, deltas) = run(s, client).await;
     assert_eq!(s.status, "complete", "{:?}", s.last_error);
-    assert!(s.completion_review.approved);
     assert!(!s.ledger.contains_key("action-990"));
     assert_eq!(deltas, ["Saved report.md"]);
 }
@@ -1135,24 +862,19 @@ impl LlmClient for OversizedParsedFinal {
         cancel: CancellationToken,
         tx: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        let payload: Value =
-            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap_or(""))
-                .unwrap_or(Value::Null);
-        if payload["completion_review"] != true {
-            let first = {
-                let mut sent = self.sent.lock().unwrap();
-                let first = !*sent;
-                *sent = true;
-                first
-            };
-            if first {
-                return Ok(Completion {
-                    text: "x".repeat(mnemoarc::llm::MAX_COMPLETION_BYTES + 1),
-                    ..Default::default()
-                });
-            }
-            assert!(request.get("tool_choice").is_none());
+        let first = {
+            let mut sent = self.sent.lock().unwrap();
+            let first = !*sent;
+            *sent = true;
+            first
+        };
+        if first {
+            return Ok(Completion {
+                text: "x".repeat(mnemoarc::llm::MAX_COMPLETION_BYTES + 1),
+                ..Default::default()
+            });
         }
+        assert!(request.get("tool_choice").is_none());
         self.client.complete(request, config, cancel, tx).await
     }
 }
@@ -1176,7 +898,6 @@ async fn oversized_final_can_retry_as_a_short_answer_without_a_tool_call() {
     )
     .await;
     assert_eq!(s.status, "complete", "{:?}", s.last_error);
-    assert!(s.completion_review.approved);
     assert_eq!(deltas, ["Saved report.md"]);
 }
 
@@ -1192,7 +913,6 @@ async fn unknown_tool_names_can_be_corrected_without_stopping_document_work() {
     });
     let (s, deltas) = run(s, client).await;
     assert_eq!(s.status, "complete", "{:?}", s.last_error);
-    assert!(s.completion_review.approved);
     assert_eq!(deltas, ["Saved report.md"]);
 }
 
@@ -1220,7 +940,6 @@ async fn malformed_provider_recovery_charges_output_and_finishes_at_run_budget()
     assert_eq!(s.status, "complete_with_gaps", "{:?}", s.last_error);
     assert_eq!(s.output_tokens, output_budget * attempts);
     assert!(s.usage_incomplete);
-    assert!(!s.completion_review.approved);
     assert_eq!(
         std::fs::read_to_string(&s.project.output).unwrap(),
         "# Report\nDraft.\n"
@@ -1302,7 +1021,6 @@ async fn oversized_tool_batch_can_be_split_without_executing_rejected_writes() {
         let (s, deltas) = run(s, client).await;
         assert_eq!(s.status, "complete", "{:?}", s.last_error);
         assert!(!s.ledger.contains_key("action-900"));
-        assert!(s.completion_review.approved);
         assert_eq!(deltas, ["Saved report.md"]);
     }
 }
@@ -1374,7 +1092,6 @@ async fn oversized_batch_before_any_workflow_is_retried_not_fatal() {
             batch_tokens: 400,
             result_tokens: 400,
             source_document_review: false,
-            completion_review_enabled: false,
             ..support::compact_config()
         },
     );
@@ -1446,7 +1163,6 @@ async fn malformed_calls_before_any_workflow_get_one_guided_retry() {
             Config {
                 model: "gpt-4o".into(),
                 model_context: Some(128_000),
-                completion_review_enabled: false,
                 ..support::compact_config()
             },
         );

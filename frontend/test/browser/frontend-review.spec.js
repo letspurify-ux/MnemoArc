@@ -89,9 +89,9 @@ test("session project edits do not overwrite refreshed untouched fields", async 
   const { session } = await workspace({ page, request });
   await page.getByRole("tab", { name: "프로젝트", exact: true }).click();
   await page.getByLabel("프로젝트 이름", { exact: true }).fill("로컬 프로젝트 이름");
-  session.project.purpose = "다른 창에서 갱신한 작업 목적";
+  session.project.output = "docs/external-update.md";
   session.revision++;
-  await expect(page.getByLabel(/^작업 목적/)).toHaveValue("다른 창에서 갱신한 작업 목적");
+  await expect(page.getByLabel(/^결과 문서 경로/)).toHaveValue("docs/external-update.md");
   await expect(page.getByLabel("프로젝트 이름", { exact: true })).toHaveValue("로컬 프로젝트 이름");
   let submitted;
   await page.route("**/api/sessions/*/project", (route) => {
@@ -99,7 +99,7 @@ test("session project edits do not overwrite refreshed untouched fields", async 
     return route.fulfill({ json: { saved: true } });
   });
   await page.getByRole("button", { name: "현재 세션에 적용" }).click();
-  await expect.poll(() => submitted?.purpose).toBe("다른 창에서 갱신한 작업 목적");
+  await expect.poll(() => submitted?.output).toBe("docs/external-update.md");
 });
 
 test("session navigation does not wait for a stalled previous session refresh", async ({ page, request }) => {

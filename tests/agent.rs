@@ -46,9 +46,6 @@ impl LlmClient for Script {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         if request["messages"][1]["content"]
             .as_str()
             .is_some_and(|t| t.contains("\"source_document_review\":true"))
@@ -179,14 +176,11 @@ struct Wait;
 impl LlmClient for Wait {
     async fn complete(
         &self,
-        request: Value,
+        _: Value,
         _: &Config,
         cancel: CancellationToken,
         delta: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         delta.send("partial".into()).await.ok();
         cancel.cancelled().await;
         anyhow::bail!("cancelled")
@@ -224,14 +218,11 @@ struct ConfigureDuringCall {
 impl LlmClient for ConfigureDuringCall {
     async fn complete(
         &self,
-        request: Value,
+        _: Value,
         config: &Config,
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let step = {
             let mut i = self.step.lock().unwrap();
             let step = *i;
@@ -303,9 +294,6 @@ impl LlmClient for RetryCleanup {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let mut step = self.step.lock().unwrap();
         let state: Value = serde_json::from_str(
             request["messages"].as_array().unwrap().last().unwrap()["content"]
@@ -434,9 +422,6 @@ impl LlmClient for InvalidCleanup {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let state: Value = serde_json::from_str(
             request["messages"].as_array().unwrap().last().unwrap()["content"]
                 .as_str()
@@ -509,14 +494,11 @@ struct NeverCalled;
 impl LlmClient for NeverCalled {
     async fn complete(
         &self,
-        request: Value,
+        _: Value,
         _: &Config,
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         panic!("Oversized requests must not reach the provider")
     }
 }
@@ -558,9 +540,6 @@ impl LlmClient for RepeatedRead {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let state: Value = serde_json::from_str(
             request["messages"].as_array().unwrap().last().unwrap()["content"]
                 .as_str()
@@ -628,9 +607,6 @@ impl LlmClient for VariedReadsThenWrites {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let state: Value = serde_json::from_str(
             request["messages"].as_array().unwrap().last().unwrap()["content"]
                 .as_str()
@@ -693,7 +669,7 @@ async fn varied_new_reads_before_the_first_save_are_not_a_stall() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("main.rs"), "one\ntwo\nthree\n").unwrap();
     let mut session = s(dir.path());
-    // This fixed six-step client exercises progress recovery, not cleanup.
+    // This fixed five-step client exercises progress recovery, not cleanup.
     // Leave room for tools/state: random path/ID token counts near the default
     // watermark must not send a final-answer-only fixture into a checkpoint.
     session.config.context_tokens = 96000;
@@ -716,7 +692,7 @@ async fn varied_new_reads_before_the_first_save_are_not_a_stall() {
     .await;
     drain.await.unwrap();
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
-    assert_eq!(result.task_rounds, 6); // includes independent acceptance review
+    assert_eq!(result.task_rounds, 5);
     assert!(dir.path().join("docs/source-summary.md").exists());
 }
 
@@ -732,9 +708,6 @@ impl LlmClient for BudgetPhases {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let mut step = self.step.lock().unwrap();
         let state: Value = serde_json::from_str(
             request["messages"].as_array().unwrap().last().unwrap()["content"]
@@ -820,9 +793,6 @@ impl LlmClient for PrematureFinal {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let mut calls = self.calls.lock().unwrap();
         if *calls > 0 {
             let state = request["messages"].as_array().unwrap().last().unwrap()["content"]
@@ -830,7 +800,7 @@ impl LlmClient for PrematureFinal {
                 .unwrap();
             let state: Value = serde_json::from_str(state.split_once('\n').unwrap().1).unwrap();
             assert!(
-                !state["run_guidance"]["completion_error"]
+                !state["run_guidance"]["finalization_error"]
                     .as_str()
                     .unwrap()
                     .is_empty()
@@ -886,9 +856,6 @@ impl LlmClient for SummaryReads {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let mut step = self.step.lock().unwrap();
         let mut offsets = self.offsets.lock().unwrap();
         let mut calls = vec![];
@@ -1061,9 +1028,6 @@ impl LlmClient for ExpectPhase {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let content = request["messages"].as_array().unwrap().last().unwrap()["content"]
             .as_str()
             .unwrap();
@@ -1126,9 +1090,6 @@ impl LlmClient for LengthScript {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let mut step = self.step.lock().unwrap();
         if *step > 0 {
             assert!(
@@ -1238,14 +1199,11 @@ struct ExhaustOnLength;
 impl LlmClient for ExhaustOnLength {
     async fn complete(
         &self,
-        request: Value,
+        _: Value,
         config: &Config,
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         Ok(Completion {
             text: "Retained prefix".into(),
             length_limited: true,
@@ -1382,7 +1340,7 @@ async fn simple_edit_cannot_complete_if_saved_file_changes_or_disappears() {
             );
         }
         assert!(
-            result.run_guidance["completion_error"]
+            result.run_guidance["finalization_error"]
                 .as_str()
                 .unwrap()
                 .contains(if remove {
@@ -1406,9 +1364,6 @@ impl LlmClient for RecoverUnknownSource {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let state: Value = serde_json::from_str(
             request["messages"].as_array().unwrap().last().unwrap()["content"]
                 .as_str()
@@ -1510,14 +1465,11 @@ struct NeverAcknowledges;
 impl LlmClient for NeverAcknowledges {
     async fn complete(
         &self,
-        request: Value,
+        _: Value,
         _: &Config,
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         Ok(call(
             "lookup",
             "source_lookup",
@@ -1564,9 +1516,6 @@ impl LlmClient for RepeatsWrongDocumentCheckpointId {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let state: Value = serde_json::from_str(
             request["messages"].as_array().unwrap().last().unwrap()["content"]
                 .as_str()
@@ -1597,9 +1546,6 @@ impl LlmClient for RepeatsDocumentCheckpointMaintenanceWithoutAck {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let state: Value = serde_json::from_str(
             request["messages"].as_array().unwrap().last().unwrap()["content"]
                 .as_str()
@@ -1726,14 +1672,11 @@ struct SeparateLengthRecoveries(Mutex<usize>);
 impl LlmClient for SeparateLengthRecoveries {
     async fn complete(
         &self,
-        request: Value,
+        _: Value,
         _: &Config,
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let mut round = self.0.lock().unwrap();
         *round += 1;
         if *round <= 6 && *round % 2 == 1 {
@@ -1780,14 +1723,11 @@ struct ChangingBadSources(Mutex<usize>);
 impl LlmClient for ChangingBadSources {
     async fn complete(
         &self,
-        request: Value,
+        _: Value,
         _: &Config,
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let mut round = self.0.lock().unwrap();
         *round += 1;
         let mut response = call(
@@ -1874,7 +1814,6 @@ async fn document_edits_preserve_explicit_hash_and_recover_omitted_hash() {
         let mut session = s(dir.path());
         session.select_workflow("source_document").unwrap();
         session.config.source_document_review = false;
-        session.config.completion_review_enabled = false;
         session.add_user("Append to the document".into());
         let created = mnemoarc::tools::execute(
             &mut session,
@@ -1983,7 +1922,6 @@ async fn evidence_for_a_later_section_counts_after_the_first_save() {
     let mut session = s(dir.path());
     session.config.context_tokens = 96000;
     session.config.source_document_review = false;
-    session.config.completion_review_enabled = false;
     session.select_workflow("source_document").unwrap();
     session.task.deliverables = vec!["docs/source-summary.md".into()];
     session.add_user("Save a summary of the source".into());

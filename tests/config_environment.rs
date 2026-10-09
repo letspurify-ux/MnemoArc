@@ -222,7 +222,7 @@ fn a_missing_config_file_loads_the_live_tested_settings() {
         (600, 3600)
     );
     assert_eq!((config.run_tokens, config.review_limit), (10_000_000, 20));
-    assert!(config.source_document_review && !config.completion_review_enabled);
+    assert!(config.source_document_review);
     config.runnable().unwrap();
 }
 
@@ -247,4 +247,48 @@ fn cleared_optional_settings_survive_save_and_load() {
     let loaded = Config::load(&path, &Default::default()).unwrap();
     assert_eq!(loaded.model_context, Some(230000));
     assert_eq!(loaded.reasoning_effort.as_deref(), Some("low"));
+}
+
+#[test]
+fn retired_review_settings_still_load_and_are_dropped_on_save() {
+    use mnemoarc::config::Config;
+
+    // Settings saved before the completion review and the automatic
+    // re-review interval were removed name them; they must keep loading,
+    // and the next save must not write them back.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "completion_review_enabled = true\ndocument_repair_limit = 16\n",
+    )
+    .unwrap();
+    let config = Config::load(&path, &Default::default()).unwrap();
+    config.save(&path).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains("completion_review_enabled"), "{saved}");
+    assert!(!saved.contains("document_repair_limit"), "{saved}");
+    Config::load(&path, &Default::default()).unwrap();
+}
+
+#[test]
+fn retired_project_purpose_and_audience_still_load_and_are_dropped_on_save() {
+    use mnemoarc::config::Config;
+
+    // The request states the reader and purpose now; projects saved with
+    // them must keep loading, and the next save must not write them back.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[[projects]]\nname = 'Manual'\nroot = '.'\npurpose = 'Explain the screens'\naudience = 'End users'\n",
+    )
+    .unwrap();
+    let config = Config::load(&path, &Default::default()).unwrap();
+    assert_eq!(config.projects[0].name, "Manual");
+    config.save(&path).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains("purpose"), "{saved}");
+    assert!(!saved.contains("audience"), "{saved}");
+    Config::load(&path, &Default::default()).unwrap();
 }

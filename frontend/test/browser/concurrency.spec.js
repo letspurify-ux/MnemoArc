@@ -9,7 +9,7 @@ test("parallel sessions survive reload and allow independent cancellation and cl
   try {
     const saved = await request.put("/api/settings", { headers, data: { config: {
       ...initial.config, model: "concurrency-fixture", model_context: 128000,
-      max_concurrent_sessions: 2, source_answer_review: false, completion_review_enabled: false,
+      max_concurrent_sessions: 2, source_answer_review: false,
     } } });
     expect(saved.ok()).toBe(true);
     for (let i = 0; i < 3; i++) {

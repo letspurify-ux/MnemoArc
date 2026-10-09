@@ -625,9 +625,6 @@ impl LlmClient for PlanChurn {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let state: Value = serde_json::from_str(
             request["messages"].as_array().unwrap().last().unwrap()["content"]
                 .as_str()
@@ -664,7 +661,7 @@ impl LlmClient for PlanChurn {
             });
         } else if *step == 13 {
             assert!(
-                state["run_guidance"]["completion_error"]
+                state["run_guidance"]["finalization_error"]
                     .as_str()
                     .unwrap()
                     .starts_with("task_plan_pending")
@@ -673,7 +670,7 @@ impl LlmClient for PlanChurn {
         } else if *step == 14 {
             // Advancing the list must discard the previous item's pending
             // warning, otherwise the next request can repeat completed work.
-            assert!(state["run_guidance"]["completion_error"].is_null());
+            assert!(state["run_guidance"]["finalization_error"].is_null());
             assert_eq!(
                 state["run_guidance"]["current_todo"]["text"],
                 "Confirm the saved result"
@@ -739,9 +736,6 @@ impl LlmClient for EmptyPlanChurn {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let state: Value = serde_json::from_str(
             request["messages"].as_array().unwrap().last().unwrap()["content"]
                 .as_str()
@@ -814,9 +808,6 @@ impl LlmClient for InvalidPlanRecovery {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if let Some(review) = support::acceptance(&request) {
-            return Ok(review);
-        }
         let state: Value = serde_json::from_str(
             request["messages"].as_array().unwrap().last().unwrap()["content"]
                 .as_str()

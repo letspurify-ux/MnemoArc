@@ -37,7 +37,6 @@ fn fixture(root: &std::path::Path) -> Session {
     tools::execute(&mut s, "task_plan", json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Fix the existing diagram"]}]})).unwrap();
     s.document_review.issues = vec!["The approved branch loops backwards".into()];
     s.document_review.pending = true;
-    s.completion_review.pending = true;
     s.completion_gaps = vec!["Diagram still needs repair".into()];
     s.progress_recovery.closing = Some(Closing {
         reason: "budget".into(),
@@ -57,7 +56,7 @@ fn fixture(root: &std::path::Path) -> Session {
 }
 
 fn preserved(s: &Session) -> Value {
-    json!({"task":s.task,"document_review":s.document_review,"completion_review":s.completion_review,
+    json!({"task":s.task,"document_review":s.document_review,
         "checkpoint":s.checkpoint,"gaps":s.completion_gaps,"request":s.latest_request,
         "status":s.status,"error":s.last_error,"activity":s.activity,"rounds":s.task_rounds,
         "continuation":s.continuation,"workflow":s.workflow_mode,"written":s.document_written,
