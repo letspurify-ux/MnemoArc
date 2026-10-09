@@ -338,7 +338,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_audit",
-                description: "Check output citations path:line[-line], cited ranges not yet read as complete lines of the current file version (unread_citation), Markdown tables/code fences and fenced Mermaid syntax in one call. format_check reports parser coverage and warnings for unchecked UI extensions. Structural checks do NOT prove semantic correctness or browser layout. Paginated errors; the first result returns revision, and offset > 0 requires expected_revision copied from that result. Restart from offset 0 when the revision changes.",
+                description: "run_guidance.document_readiness already carries this audit of the saved document on every request; call this only to page its remaining issues with offset. Check output citations path:line[-line], cited ranges not yet read as complete lines of the current file version (unread_citation), Markdown tables/code fences and fenced Mermaid syntax in one call. format_check reports parser coverage and warnings for unchecked UI extensions. Structural checks do NOT prove semantic correctness or browser layout. Paginated errors; the first result returns revision, and offset > 0 requires expected_revision copied from that result. Restart from offset 0 when the revision changes.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -388,7 +388,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit",
-                description: "Edit ONLY configured Markdown output. Save one section at a time as its evidence is read. Inspect the outline and copy section_path when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition (a supplied hash is still checked). Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and also requires expected_section_hash; its text must retain the original full heading. In the source_document workflow every save returns citation_check with unread cited ranges; do not patch workflow. Returns measured lines and new hash",
+                description: "Edit ONLY configured Markdown output. Save one section at a time as its evidence is read. Every save returns the outline; copy section_path from it when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition (a supplied hash is still checked). Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and also requires expected_section_hash; its text must retain the original full heading. In the source_document workflow every save returns citation_check with unread cited ranges; do not patch workflow. Returns measured lines, new hash and the outline",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -2933,6 +2933,26 @@ fn recover_copied_text(
     None
 }
 
+/// Outline entries a save result carries at most (about 1.5K tokens).
+const OUTLINE_SAVE_ENTRIES: usize = 60;
+const OUTLINE_OMITTED_NOTE: &str = "outline lists the headings of the edited part with their ancestors and neighbours, then the top heading levels while they fit; outline_omitted deeper headings are not listed. document_inspect (offset 0, limit 100) pages the complete outline when a placement needs an unlisted heading.";
+
+/// One-based line range of `new` that differs from `old`: the lines after
+/// their common prefix and before their common suffix (the whole text of a
+/// new document; the line after the end when nothing changed).
+fn changed_lines(old: &str, new: &str) -> (usize, usize) {
+    let old: Vec<&str> = old.lines().collect();
+    let new: Vec<&str> = new.lines().collect();
+    let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    (prefix + 1, new.len().saturating_sub(suffix).max(prefix + 1))
+}
+
 fn persist_document_edit(
     s: &mut Session,
     path: &Path,
@@ -2999,20 +3019,37 @@ fn persist_document_edit(
     let hash = hash(result.as_bytes());
     let bytes = result.len();
     let total_lines = result.lines().count();
-    // The answer workflow verifies nothing: report the write only.
-    if s.task.workflow == "answer" {
-        return Ok(json!({"path":path,"hash":hash,"bytes":bytes,"total_lines":total_lines}));
-    }
-    let citation_check = documentation::citation_check(s, path, &result)?;
-    let format_check = document_format::check(&result).write_result();
+    // The outline places the next section without a document_inspect round;
+    // live runs paid that round before most insertions. It is bounded to
+    // the edited part and the top levels: every save result stays in
+    // context, and a 400-heading outline filled the result budget per save.
+    let headings = documentation::headings(&result);
+    let paths = documentation::heading_paths(&headings);
+    let outline = documentation::outline(
+        &headings,
+        documentation::OutlineView::Around {
+            lines: vec![changed_lines(old, &result)],
+            max: OUTLINE_SAVE_ENTRIES,
+        },
+    );
     let mut saved = json!({
         "path":path,
         "hash":hash,
         "bytes":bytes,
         "total_lines":total_lines,
-        "citation_check":citation_check,
-        "format_check":format_check
+        "outline":outline.entries(&headings, Some(&paths)),
+        "heading_count":outline.heading_count
     });
+    if outline.omitted() > 0 {
+        saved["outline_omitted"] = json!(outline.omitted());
+        saved["outline_note"] = json!(OUTLINE_OMITTED_NOTE);
+    }
+    // The answer workflow verifies nothing: report the write only.
+    if s.task.workflow == "answer" {
+        return Ok(saved);
+    }
+    saved["citation_check"] = documentation::citation_check(s, path, &result)?;
+    saved["format_check"] = document_format::check(&result).write_result();
     if s.is_document_work()
         && let Some(check) = documentation::test_code_check(s, path, &result)
     {
@@ -3942,10 +3979,102 @@ pub(crate) fn hash_file_cancelled(
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<String> {
     let file = open_regular_file(path)?;
-    if file.metadata()?.len() > MAX_FILE_BYTES as u64 {
+    let meta = file.metadata()?;
+    if meta.len() > MAX_FILE_BYTES as u64 {
         bail!("unsupported_large_file: maximum 16MiB");
     }
-    hash_reader_cancelled(file, cancel)
+    let version = file_version(&meta)?;
+    if let Some(hash) = cached_digest(path, version, |entry| entry.hash.clone()) {
+        return Ok(hash);
+    }
+    let hash = hash_reader_cancelled(file, cancel)?;
+    remember_digest(path, version, |entry| entry.hash = Some(hash.clone()));
+    Ok(hash)
+}
+
+/// Line count of a text file, with read_text's errors for files the tools
+/// cannot read. Cached with the digest: citation checks count every cited
+/// file's lines on each save and audit.
+pub(crate) fn text_line_count(path: &Path) -> Result<usize> {
+    let version = open_regular_file(path)
+        .ok()
+        .and_then(|file| file.metadata().ok())
+        .and_then(|meta| file_version(&meta).ok());
+    if let Some(version) = version
+        && let Some(lines) = cached_digest(path, version, |entry| entry.lines)
+    {
+        return Ok(lines);
+    }
+    let lines = read_text(path)?.lines().count();
+    if let Some(version) = version {
+        remember_digest(path, version, |entry| entry.lines = Some(lines));
+    }
+    Ok(lines)
+}
+
+/// Digest and line count of a file at one size and modification time.
+/// Freshness checks hash every delivered and cited file several times per
+/// request; with the cache an unchanged file costs a metadata read. A file
+/// modified within the last two seconds is not cached, because a second
+/// write in the same timestamp tick could keep its size and time (git's
+/// racy-entry rule), and a changed version replaces the entry.
+struct FileDigest {
+    len: u64,
+    modified: std::time::SystemTime,
+    hash: Option<String>,
+    lines: Option<usize>,
+}
+type FileVersion = (u64, std::time::SystemTime);
+type DigestCache = std::collections::HashMap<std::path::PathBuf, FileDigest>;
+const DIGEST_CACHE_ENTRIES: usize = 8192;
+const DIGEST_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn digest_cache() -> &'static std::sync::Mutex<DigestCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<DigestCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn file_version(meta: &std::fs::Metadata) -> Result<FileVersion> {
+    Ok((meta.len(), meta.modified()?))
+}
+
+fn cached_digest<T>(
+    path: &Path,
+    version: FileVersion,
+    field: impl FnOnce(&FileDigest) -> Option<T>,
+) -> Option<T> {
+    let cache = digest_cache().lock().unwrap_or_else(|p| p.into_inner());
+    cache
+        .get(path)
+        .filter(|entry| (entry.len, entry.modified) == version)
+        .and_then(field)
+}
+
+fn remember_digest(path: &Path, version: FileVersion, update: impl FnOnce(&mut FileDigest)) {
+    let mut cache = digest_cache().lock().unwrap_or_else(|p| p.into_inner());
+    let settled = std::time::SystemTime::now()
+        .duration_since(version.1)
+        .is_ok_and(|age| age >= DIGEST_SETTLE);
+    if !settled
+        || cache
+            .get(path)
+            .is_some_and(|entry| (entry.len, entry.modified) != version)
+    {
+        cache.remove(path);
+    }
+    if !settled {
+        return;
+    }
+    if cache.len() >= DIGEST_CACHE_ENTRIES && !cache.contains_key(path) {
+        cache.clear();
+    }
+    let entry = cache.entry(path.to_path_buf()).or_insert(FileDigest {
+        len: version.0,
+        modified: version.1,
+        hash: None,
+        lines: None,
+    });
+    update(entry);
 }
 
 #[cfg(test)]
@@ -6154,7 +6283,10 @@ pub fn limit_result(
             .or_else(|| args["offset"].as_u64().map(|offset| offset as usize))
             .unwrap_or(0);
         if field == "outline" {
-            let next_offset = start + retained_len;
+            // A bounded save outline is a selection, not a prefix of the
+            // complete outline: its continuation pages that from the start.
+            let selection = data["outline_omitted"].as_u64().is_some_and(|n| n > 0);
+            let next_offset = if selection { 0 } else { start + retained_len };
             data["next_offset"] = json!(next_offset);
             let mut cursor = json!({"tool":"document_inspect","offset":next_offset,"expected_hash":data["hash"]});
             for key in [
@@ -6199,25 +6331,39 @@ pub fn limit_result(
     // Collections stay structured; a shortened native page resumes at the
     // first omitted item, while non-paginated collections use the archive.
     for field in ["paths", "matches", "items", "outline"] {
-        let original_len = output["data"][field].as_array().map_or(0, Vec::len);
-        while output["data"][field]
-            .as_array()
-            .is_some_and(|a| !a.is_empty())
-        {
-            if result_tokens(call, &output, &s.config.model) <= limit {
-                let retained_len = output["data"][field].as_array().unwrap().len();
-                adjust_collection_continuation(
-                    &mut output,
-                    call,
-                    &args,
-                    field,
-                    original_len,
-                    retained_len,
-                    archive,
-                );
-                return output;
+        let Some(items) = output["data"][field].as_array().cloned() else {
+            continue;
+        };
+        if items.is_empty() {
+            continue;
+        }
+        // Bisect for the longest prefix within the limit. Dropping one item
+        // per full re-count took about a second for a 400-heading outline.
+        let mut fits = |keep: usize| {
+            output["data"][field] = Value::Array(items[..keep].to_vec());
+            result_tokens(call, &output, &s.config.model) <= limit
+        };
+        let (mut low, mut high) = (0, items.len());
+        while low < high {
+            let mid = (low + high).div_ceil(2);
+            if fits(mid) {
+                low = mid;
+            } else {
+                high = mid - 1;
             }
-            output["data"][field].as_array_mut().unwrap().pop();
+        }
+        output["data"][field] = Value::Array(items[..low].to_vec());
+        if low > 0 {
+            adjust_collection_continuation(
+                &mut output,
+                call,
+                &args,
+                field,
+                items.len(),
+                low,
+                archive,
+            );
+            return output;
         }
     }
     let mut compact = json!({"status":result["status"],"truncated":true,"data":{"message":"Result retained in history; follow next_cursor."},"next_cursor":{"tool":"history","action":"read","id":archive,"offset":0}});
@@ -6400,8 +6546,7 @@ fn run_call_inner(
     let output = limit_result(s, call, result, s.config.result_tokens);
     // Failed mutations are not cached, allowing deliberate recovery with corrected arguments.
     if output["status"] == "ok" && !unapplied_plan {
-        s.ledger
-            .insert(call.id.clone(), (signature, output.clone()));
+        s.remember_call(call.id.clone(), signature, output.clone());
     }
     output
 }
@@ -6488,6 +6633,36 @@ mod panic_tests {
 #[cfg(test)]
 mod file_tests {
     use super::*;
+
+    #[test]
+    fn file_digests_are_cached_only_for_settled_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn a() {}\n").unwrap();
+        // Just written: hashed, not cached (a same-tick rewrite could keep
+        // the same size and time).
+        let first = hash_file(&path).unwrap();
+        assert!(!digest_cache().lock().unwrap().contains_key(&path));
+        let settled = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(settled)
+            .unwrap();
+        assert_eq!(hash_file(&path).unwrap(), first);
+        assert_eq!(text_line_count(&path).unwrap(), 1);
+        {
+            let cache = digest_cache().lock().unwrap();
+            assert_eq!(cache[&path].hash.as_deref(), Some(first.as_str()));
+            assert_eq!(cache[&path].lines, Some(1));
+        }
+        // A changed size or time misses and the new content is measured.
+        std::fs::write(&path, "fn a() {}\nfn b() {}\n").unwrap();
+        assert_ne!(hash_file(&path).unwrap(), first);
+        assert_eq!(text_line_count(&path).unwrap(), 2);
+        assert!(!digest_cache().lock().unwrap().contains_key(&path));
+    }
 
     #[test]
     fn file_discovery_bounds_count_and_path_bytes_after_applying_scope_and_filters() {

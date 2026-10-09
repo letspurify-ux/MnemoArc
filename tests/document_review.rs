@@ -2525,3 +2525,38 @@ fn a_shrunk_review_page_covers_fewer_lines_and_evidence_chunks() {
     assert_eq!(s.document_review.page_shrink, 0);
     assert_eq!(other_end, full_end);
 }
+
+#[test]
+fn a_long_outline_on_a_review_page_keeps_the_page_and_the_top_levels() {
+    // A page's outline is bounded to the headings near the page and the top
+    // levels, with heading_count and document_outline_omitted saying what
+    // is left out; it used to list every heading, which shrank the room for
+    // the document text and evidence as documents grew.
+    let (_dir, mut s) = fixture();
+    let mut doc = String::from("# Intro\n");
+    for i in 1..=150 {
+        doc.push_str(&format!("## S{i}\nText. main.js:1-6\n"));
+    }
+    std::fs::write(&s.project.output, doc).unwrap();
+    s.document_review = Default::default();
+    let first = document_review::request(&mut s).unwrap();
+    let first: Value =
+        serde_json::from_str(first["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(first["heading_count"], 151);
+    assert_eq!(first["document_outline_omitted"], 31);
+    let headings: Vec<&str> = first["document_outline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["heading"].as_str().unwrap())
+        .collect();
+    assert_eq!(headings.len(), 120, "{headings:?}");
+    // Lines 1-100 hold S1..S50, four neighbours follow, then level-2
+    // sections from the top while they fit; the last sections are left out.
+    assert_eq!(headings[0], "# Intro");
+    assert_eq!(headings[50], "## S50");
+    assert_eq!(headings[54], "## S54");
+    assert_eq!(headings[119], "## S119");
+    assert!(!headings.contains(&"## S120"));
+    assert_eq!(first["document_outline"][1]["start_line"], 2);
+}

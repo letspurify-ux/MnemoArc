@@ -1037,6 +1037,67 @@ fn answer_workflow_sends_no_review_or_verification_guidance() {
 }
 
 #[test]
+fn the_source_prompt_leaves_audit_and_task_state_to_the_runtime() {
+    // The runtime audits the saved document on every request into
+    // run_guidance.document_readiness, fixes the review criteria before any
+    // task_state update and returns the outline with every save; the prompt
+    // no longer asks the model to repeat those steps (3.2 audits, 2.5 outline
+    // inspections and a mandated first task_state call per live run).
+    for removed in [
+        "FIRST call task_state",
+        "refine completion criteria with task_state",
+        "Preserve all requested outcomes in task_state.completion",
+        "Use document_audit to identify",
+        "Inspect the current outline before each addition",
+    ] {
+        assert!(!context::SYSTEM.contains(removed), "{removed}");
+    }
+    assert!(
+        context::SYSTEM.contains("run_guidance.document_readiness is the saved document's audit")
+    );
+    assert!(context::SYSTEM.contains("Every save returns the document's outline"));
+}
+
+#[test]
+fn the_call_ledger_keeps_a_recent_window() {
+    // Every successful result stayed in the ledger for the whole task and
+    // counted toward the metadata cap that stops a run; a provider replays a
+    // response within the next request, so a recent window suffices.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let call = |id: usize| mnemoarc::llm::ToolCall {
+        id: format!("call-{id}"),
+        name: "task_state".into(),
+        arguments: json!({"action":"read"}).to_string(),
+    };
+    for id in 0..300 {
+        assert_eq!(tools::run_call(&mut s, &call(id))["status"], "ok");
+    }
+    assert_eq!(s.ledger.len(), mnemoarc::session::LEDGER_CALLS);
+    assert!(!s.ledger.contains_key("call-0"));
+    assert!(s.ledger.contains_key("call-299"));
+    // A recent ID with another signature is still a collision; an evicted
+    // ID is free again, and a recent one is served from the ledger.
+    let mut changed = call(299);
+    changed.arguments = json!({"action":"details"}).to_string();
+    let collision = tools::run_call(&mut s, &changed);
+    assert!(
+        collision["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("call_id_collision"),
+        "{collision}"
+    );
+    let mut reused = call(0);
+    reused.arguments = json!({"action":"details"}).to_string();
+    assert_eq!(tools::run_call(&mut s, &reused)["status"], "ok");
+    assert_eq!(s.ledger.len(), mnemoarc::session::LEDGER_CALLS);
+    assert!(!s.ledger.contains_key("call-1"));
+    let replayed = tools::run_call(&mut s, &call(299));
+    assert_eq!(replayed["status"], "ok");
+}
+
+#[test]
 fn answer_workflow_withholds_document_audit() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());

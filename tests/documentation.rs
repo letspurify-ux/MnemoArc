@@ -119,6 +119,198 @@ fn coverage_pagination_rejects_obsolete_document_versions() {
 }
 
 #[test]
+fn a_citation_into_an_unreadable_file_says_to_remove_it() {
+    // A cited file over 16 MiB or not UTF-8 fails every audit; the bare read
+    // error gave a model nothing to act on.
+    let (dir, mut s) = source_setup();
+    std::fs::File::create(dir.path().join("huge.rs"))
+        .unwrap()
+        .set_len(16 * 1024 * 1024 + 1)
+        .unwrap();
+    std::fs::write(dir.path().join("blob.rs"), b"\x00\x01\x02").unwrap();
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Doc\nSee huge.rs:1-2 and blob.rs:1-1.\n"}),
+    );
+    let issues = saved["citation_check"]["issues"].as_array().unwrap();
+    let large = issues
+        .iter()
+        .find(|i| i["citation"] == "huge.rs:1-2")
+        .unwrap();
+    assert!(
+        large["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("unsupported_large_file"),
+        "{large}"
+    );
+    assert!(
+        large["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("remove this citation"),
+        "{large}"
+    );
+    let binary = issues
+        .iter()
+        .find(|i| i["citation"] == "blob.rs:1-1")
+        .unwrap();
+    assert!(
+        binary["guidance"].as_str().unwrap().contains("not UTF-8"),
+        "{binary}"
+    );
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert_eq!(audit["structural_ok"], false);
+    assert!(audit["issues"].as_array().unwrap().iter().any(|i| {
+        i["guidance"]
+            .as_str()
+            .is_some_and(|g| g.contains("remove this citation"))
+    }));
+}
+
+#[test]
+fn a_long_outline_in_a_save_result_keeps_the_edited_part_and_the_top_levels() {
+    // A 400-section document's save result carried 400 outline entries, cut
+    // to the result budget on every save. The outline is bounded instead:
+    // the edited headings with their ancestors and neighbours, then the top
+    // levels while they fit; heading_count and outline_omitted say what is
+    // left out, and document_inspect pages the complete outline.
+    let (_dir, mut s) = source_setup();
+    let mut doc = String::from("# Manual\n");
+    for h in 0..400 {
+        doc.push_str(&format!("## Section {h}\nBody.\n"));
+    }
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":doc}),
+    );
+    // A whole-document write has no local focus: the levels alone, in order.
+    let outline = created["outline"].as_array().unwrap();
+    assert_eq!(outline.len(), 60, "{created}");
+    assert_eq!(created["heading_count"], 401);
+    assert_eq!(created["outline_omitted"], 341);
+    assert_eq!(outline[0]["heading"], "# Manual");
+    assert_eq!(outline[59]["heading"], "## Section 58");
+    assert!(
+        created["outline_note"]
+            .as_str()
+            .unwrap()
+            .contains("document_inspect"),
+        "{created}"
+    );
+    let appended = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":created["hash"],"text":"### Detail\nMore."}),
+    );
+    let outline = appended["outline"].as_array().unwrap();
+    assert_eq!(outline.len(), 60, "{appended}");
+    assert_eq!(appended["outline_omitted"], 342);
+    let headings: Vec<&str> = outline
+        .iter()
+        .map(|entry| entry["heading"].as_str().unwrap())
+        .collect();
+    // The new section with its ancestors and the four headings before it
+    // (its parent among them), then level-2 sections from the top; the
+    // middle of the document is left out.
+    assert_eq!(headings[0], "# Manual");
+    assert_eq!(headings[54], "## Section 53");
+    assert_eq!(
+        headings[55..],
+        [
+            "## Section 396",
+            "## Section 397",
+            "## Section 398",
+            "## Section 399",
+            "### Detail"
+        ],
+        "{headings:?}"
+    );
+    assert!(!headings.contains(&"## Section 100"));
+    assert_eq!(
+        outline[59]["section_path"],
+        "# Manual\n## Section 399\n### Detail"
+    );
+    // A result budget below even the bounded outline cuts it further; the
+    // continuation then pages the complete outline from its start, because
+    // the bounded entries are a selection rather than a prefix.
+    let call = mnemoarc::llm::ToolCall {
+        id: "save".into(),
+        name: "document_edit".into(),
+        arguments: json!({"action":"append"}).to_string(),
+    };
+    let mut base = json!({"status":"ok","data":appended.clone()});
+    base["data"]["outline"] = json!([]);
+    let limit = tools::result_tokens(&call, &base, &s.config.model) + 300;
+    let limited = tools::limit_result(
+        &mut s,
+        &call,
+        json!({"status":"ok","data":appended.clone()}),
+        limit,
+    );
+    let retained = limited["data"]["outline"].as_array().unwrap().len();
+    assert!(retained > 0 && retained < 60, "{retained}");
+    assert_eq!(limited["truncated"], true);
+    assert_eq!(limited["next_cursor"]["tool"], "document_inspect");
+    assert_eq!(limited["next_cursor"]["offset"], 0);
+    assert_eq!(limited["next_cursor"]["expected_hash"], appended["hash"]);
+}
+
+#[test]
+fn a_save_returns_the_outline_for_the_next_placement() {
+    // Live runs paid a document_inspect round before most insertions because
+    // the save result carried no outline: 104 outline-only inspections in 41
+    // runs, 87 of them followed directly by an edit.
+    let (_dir, mut s) = source_setup();
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n## Setup\n### Steps\nOne.\n## Usage\n### Steps\nTwo.\n"}),
+    );
+    let outline = created["outline"].as_array().unwrap();
+    assert_eq!(outline.len(), 5, "{created}");
+    assert_eq!(created["heading_count"], 5);
+    assert!(created.get("outline_omitted").is_none());
+    assert_eq!(
+        outline[2],
+        json!({"heading":"### Steps","section_path":"# Guide\n## Setup\n### Steps","level":3,"start_line":3})
+    );
+    assert_eq!(outline[4]["section_path"], "# Guide\n## Usage\n### Steps");
+    // The repeated title is placed from the save result alone.
+    let inserted = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after","section":outline[4]["section_path"],"expected_hash":created["hash"],"text":"### Notes\nThree."}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\n## Setup\n### Steps\nOne.\n## Usage\n### Steps\nTwo.\n### Notes\nThree.\n"
+    );
+    assert_eq!(
+        inserted["outline"].as_array().unwrap().len(),
+        6,
+        "{inserted}"
+    );
+    // A batch and the answer workflow report the outline too.
+    let batched = run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":inserted["hash"],"edits":[{"action":"append","text":"## Limits\nBounds."}]}),
+    );
+    assert_eq!(batched["outline"][6]["heading"], "## Limits", "{batched}");
+    s.select_workflow("answer").unwrap();
+    let plain = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":batched["hash"],"text":"## More\nText."}),
+    );
+    assert_eq!(plain["outline"][7]["heading"], "## More", "{plain}");
+    assert!(plain.get("citation_check").is_none());
+}
+
+#[test]
 fn new_sections_can_be_inserted_in_outline_order() {
     let (_dir, mut s) = setup();
     let created = run(

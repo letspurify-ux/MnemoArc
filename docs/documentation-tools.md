@@ -150,9 +150,9 @@ Mermaid는 AST의 `mermaid` 코드 펜스 본문을 `merman-core`의 `Engine::pa
 
 1. 심볼·경로 검색으로 범위를 좁히고 필요한 소스 줄만 읽는다.
 2. 확인한 내용부터 섹션으로 작성하고, 저장 결과의 `citation_check.unread_citations`를 바로 처리한다.
-3. 출력 파일 해시나 줄 수는 `document_inspect`로 얻는다. 전체 파일을 다시 읽지 않는다.
+3. 저장 결과가 해시·줄 수·목차(`outline`)를 돌려주므로 다음 섹션의 위치는 그것으로 정한다. `document_inspect`는 저장 결과가 문맥에 없을 때만 쓰고, 전체 파일을 다시 읽지 않는다.
 4. 오류는 해당 섹션 원문을 수정한다. 문서 끝에 정정 설명을 덧붙이지 않는다.
-5. `document_audit`의 읽지 않은 인용과 오류를 처리한다.
+5. 런타임이 매 요청 돌린 감사인 `run_guidance.document_readiness`의 읽지 않은 인용과 오류를 처리한다. `document_audit`는 남은 issues를 이어 볼 때만 부른다.
 6. 최종 답변에 결과 경로·검증 범위·남은 한계를 명시한다. 문서 검토는 그 뒤 런타임이 실행한다.
 
 ## 확인한 범위와 한계
@@ -365,3 +365,27 @@ apodex(apodex/apodex-1.1-mini:free)로 같은 요청을 실행했을 때(192라�
 - `document_inspect`를 `offset`만으로 이어 읽거나 `document_audit`를 `expected_revision` 없이 이어 읽으면, 이 세션에서 마지막 페이지가 돌려준 해시·리비전이 현재 내용과 같을 때 그 값으로 이어 읽는다. 사이에 문서나 검사 입력이 바뀌었으면 지금처럼 거절한다(그 재실행에서 7번, 라이브 기록 12개 실행에서 14번).
 
 회귀 테스트: `task_plan::closing_mode_does_not_add_open_to_dos`, `navigation::a_symbol_name_sent_as_pattern_is_named_as_such`, `structure::an_unknown_symbol_names_the_declaration_at_the_sent_line`, `tool_argument_robustness::quoted_booleans_are_read_as_booleans`, `documentation::the_output_file_name_at_the_project_root_names_the_output`, `documentation::a_next_page_without_its_hash_continues_while_the_text_is_unchanged`.
+
+## 런타임이 이미 하는 절차 정리 (2026-10-09)
+
+라이브 실행 86회(조사 도구 제거 이후 41회, 라운드당 평균 입력 4.6만 토큰)의 도구 호출을 세어, 런타임이 이미 하는 일을 모델에게 다시 시키던 절차 세 가지를 뺐다.
+
+- 모델이 부르는 `document_audit`(실행당 3.2회): 런타임이 매 요청 같은 감사를 돌려 실패하면 `run_guidance.document_readiness`로 전달하고, 최종 답변도 같은 감사를 거친다. 감사 다음 호출은 `task_plan` 42·`file_read` 40·`document_inspect` 30·`document_audit` 14로 대부분 확인용이었다. 이제 감사가 통과하면 `document_readiness`에 `structural_ok: true`와 `citations_checked`·`issue_count`를 사실로 적고(끝내라는 지시는 넣지 않는다; 준비 완료 지시가 간결한 모델의 조기 종료를 부른 적이 있다), 프롬프트·집중 안내·권장 순서는 `document_readiness`를 보라고 하며 `document_audit`는 남은 issues를 이어 볼 때만 부르게 한다.
+- 저장 전 `document_inspect` 목차 조회(인자 없는 조회 104회, 그중 87회가 바로 편집으로 이어짐): 저장 결과에 목차가 없어 다음 섹션을 넣으려면 한 라운드를 더 썼다. `document_edit`·`document_edit_batch` 저장 결과(일반 작업 포함)에 `outline`(`heading`·`section_path`·`level`·`start_line`)을 넣고, 프롬프트와 도구 설명은 마지막 저장 결과의 목차로 배치를 정하고 저장 결과가 문맥에 없을 때만 `document_inspect`를 쓰라고 안내한다. 목차는 제목 60개(`OUTLINE_SAVE_ENTRIES`)까지만 통째로 넣고, 더 길면 편집한 부분의 제목과 그 상위·이웃 제목, 이어서 맞는 만큼의 상위 수준 제목만 넣으며 `heading_count`·`outline_omitted`·`outline_note`로 빠진 수와 `document_inspect`로 전체를 보는 법을 알린다(아래 "파일 수·용량이 클 때" 항목). 목록 결과의 압축은 항목을 하나씩 빼며 매번 토큰을 다시 세던 것을 이분 탐색으로 바꿨다(401개 목차의 저장 결과를 4,000토큰에 맞추는 데 약 1초가 걸렸다; `file_list`·`source_search` 페이지도 같은 경로다).
+- 첫 `task_state` 호출 의무: 문서 검토의 요구사항(`request_review_criteria`)은 모델이 `task_state`를 고치기 전에 요청·호출자 조건에서 고정되므로, 모델이 적은 completion·deliverables를 읽는 곳이 없었다(프롬프트 자체가 "task_state adds no requirements"라고 적는다). nemotron·apodex 실행에서는 이 첫 호출의 인자 오류(`constraints`/`deliverables belongs inside patch`)가 반복됐다. "FIRST call task_state…", "refine completion criteria with task_state", "Preserve all requested outcomes in task_state.completion" 문구를 빼고 `task_state`는 단계·진행·미확인 사항용 선택 도구로 둔다. 빈 completion 거절(`completion_required`)은 도구에 그대로 있다.
+
+같은 집계에서 검토 지적 검증 단계는 유지했다. 판정 505건 중 confirmed 402(80%), dismissed 68(13.5%), unverified 23, duplicate 12였고, 검증 호출 199회의 입력 1.30M 토큰은 검토 전체 입력(16.7M)의 7.8%, 실행당 약 1.5만 토큰이다. 걸러낸 지적 약 1.2건/실행이 작성자에게 갔다면 수정 라운드 1회(약 4.6만 토큰)씩 썼을 것이므로 비용이 더 작다. 섹션마다 `memory_write`(3.1회/실행, `memory_read` 0.7회)는 색인이 매 요청 자동 주입되므로 호출 수만으로 판단하지 않고 그대로 둔다.
+
+회귀 테스트: `documentation::a_save_returns_the_outline_for_the_next_placement`, `documentation::a_long_outline_in_a_save_result_keeps_the_edited_part_and_the_top_levels`, `core::the_source_prompt_leaves_audit_and_task_state_to_the_runtime`, `agent::without_a_review_unread_citations_block_readiness_until_read`(통과한 감사를 `document_readiness`로 전달).
+
+## 파일 수·용량이 클 때의 문제 정리 (2026-10-09)
+
+라이브 보고서 86건과 임시 측정(5,000파일 15MB 프로젝트, 300파일을 인용한 2,000줄 문서)으로 소스 파일이 많거나 크거나 결과 문서가 클 때의 병목을 확인하고 세 가지를 고쳤다. 긴 결과 문서의 검토 페이지 수(문서 100줄당 평균 요청 2.4회, 요청당 중앙값 14초; 고정 24K 토큰 상한과 100줄 페이지)가 가장 큰 병목이지만 검토 품질 확인이 필요해 이번에는 손대지 않았다.
+
+- 호출 ID 장부(`ledger`)는 작업 동안 모든 성공 결과를 통째로 보관해 세션 메타데이터 상한(`memory_bytes`, 32MiB)에 포함됐고, 넘으면 `session_metadata_capacity`로 실행이 멈춘다(결과 1건 ≤ 약 16KB → 약 2,000회 호출). 공급자의 응답 재전송은 바로 다음 요청 안에서 일어나므로 최근 256건(`LEDGER_CALLS`)만 남긴다. 같은 ID의 다른 호출은 이 창 안에서만 `call_id_collision`이다.
+- 파일 해시와 줄 수를 (경로, 크기, 수정 시각)으로 캐시한다. 감사·`unread_citations`·검토 신선도 확인이 매 요청 전달·인용 파일 전부를 다시 해시했다(300파일 1.2MB에서 요청당 약 0.2초, 파일 수와 크기에 비례). 수정한 지 2초가 지나지 않은 파일은 같은 크기·시각의 재기록을 놓칠 수 있어 캐시하지 않고(git의 racy 항목 규칙), 버전이 바뀐 항목은 교체한다. 캐시는 8,192항목에서 비운다.
+- 16MiB 초과·바이너리·UTF-8이 아닌 파일 인용의 `citation_path` 오류에 "도구가 읽을 수 없어 감사가 계속 실패하니 인용을 빼거나 읽을 수 있는 소스를 인용하라"는 `guidance`를 붙인다. 전에는 읽기 오류 문구만 있어 모델이 고칠 방법을 알 수 없었다.
+
+- 문서 목차가 통째로 들어가던 곳이 넷이었다. 검토 페이지마다(`document_outline`), 지적 검증 요청마다, 저장 결과마다(`outline`), 그리고 모델이 부르는 `document_inspect`다. 앞의 셋은 상한이 없어 제목 하나당 약 17토큰씩 요청마다 커졌고, 검토 페이지는 24K 요청 상한을 문서 본문·근거와 나눠 쓰므로 제목 300개쯤부터 근거 자리가 줄고 약 1,000개면 `document_review_budget`으로 검토 준비가 실패했다(모델이 고칠 수 없는 오류). 이제 네 곳이 한 함수(`documentation::outline`)를 쓴다. `document_inspect`는 지금처럼 `offset`·`limit` 페이지(`Page`)이고, 나머지 셋은 `Around` 보기다. 제목 수가 상한(저장 결과 60, 검토·검증 120) 이하면 전체를, 넘으면 초점 줄 범위(저장 결과는 바뀐 줄, 검토 페이지는 그 페이지의 100줄 범위, 검증 요청은 후보 지적의 구절) 안 제목과 그 상위 제목, 앞뒤 이웃 4개씩, 이어서 1단계·2단계… 제목을 맞는 만큼 넣고 처음 넘치는 수준은 문서 순서로 일부만 넣는다. 초점이 목차의 절반을 넘으면(문서 전체 쓰기) 수준별 제목만 넣는다. 결과에는 `heading_count`와 빠진 수(`outline_omitted`/`document_outline_omitted`)가 붙고, 검토·검증 지시문은 줄여진 목차에 없는 섹션을 누락으로 보고하지 말라고 한다. 검토 페이지의 초점은 최종 페이지 범위가 아니라 100줄 전체 범위라 같은 범위의 근거 페이지와 재시도가 같은 목차를 받는다(요청 크기가 근거 조각 경계를 정하므로). 줄여진 저장 목차가 결과 예산에 다시 잘리면 이어지는 커서는 접두가 아니므로 `document_inspect` offset 0을 가리킨다.
+
+회귀 테스트: `core::the_call_ledger_keeps_a_recent_window`, `tools::file_tests::file_digests_are_cached_only_for_settled_files`, `documentation::a_citation_into_an_unreadable_file_says_to_remove_it`, `tools::documentation::outline_tests`(보기별 선택 규칙), `documentation::a_long_outline_in_a_save_result_keeps_the_edited_part_and_the_top_levels`, `document_review::a_long_outline_on_a_review_page_keeps_the_page_and_the_top_levels`.

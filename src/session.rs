@@ -460,6 +460,10 @@ impl ProgressRecovery {
     }
 }
 
+/// Successful calls kept for an idempotent replay of their IDs: at least the
+/// calls of the last few responses (a response holds at most 32).
+pub const LEDGER_CALLS: usize = 256;
+
 #[derive(Clone, Debug)]
 pub struct Session {
     pub id: String,
@@ -491,6 +495,8 @@ pub struct Session {
     pub pending_tools: Option<BTreeSet<String>>,
     pub checkpoint: Option<Checkpoint>,
     pub ledger: Shared<BTreeMap<String, (String, Value)>>,
+    /// Ledger keys in insertion order, for evicting the oldest.
+    pub(crate) ledger_order: VecDeque<String>,
     pub latest_request: String,
     pub status: String,
     pub input_tokens: usize,
@@ -686,6 +692,7 @@ impl Session {
             read_only_turn: false,
             checkpoint: None,
             ledger: Shared::default(),
+            ledger_order: VecDeque::new(),
             latest_request: String::new(),
             status: "idle".into(),
             input_tokens: 0,
@@ -890,7 +897,7 @@ impl Session {
                 message["task_update"] = json!(true);
             }
         }
-        next.ledger.clear();
+        next.clear_ledger();
         next.continuation = None;
         next.task.phase.clear();
         next.task.revision = next.task.revision.saturating_add(1);
@@ -972,7 +979,7 @@ impl Session {
             // Tool-call IDs are scoped to one model request sequence. Retaining
             // successful results across a new user task can replay a stale read
             // or suppress a new mutation if a provider reuses an ID.
-            self.ledger.clear();
+            self.clear_ledger();
             self.answer_review_question = text.clone();
             self.continuation = None;
             // The first prompt may follow a caller's task_state setup. Keep
@@ -1072,6 +1079,29 @@ impl Session {
                 self.list_cursor_scopes.pop_front();
             }
         }
+    }
+    /// Keep a successful call's result for an idempotent replay of its ID. A
+    /// provider replays a response within the next request, so only a recent
+    /// window is kept: every result of a task stayed in the ledger before and
+    /// counted toward the metadata cap that stops a run (about 2,000 calls at
+    /// the result budget).
+    pub(crate) fn remember_call(&mut self, id: String, signature: String, result: Value) {
+        if self
+            .ledger
+            .insert(id.clone(), (signature, result))
+            .is_none()
+        {
+            self.ledger_order.push_back(id);
+        }
+        while self.ledger_order.len() > LEDGER_CALLS {
+            if let Some(oldest) = self.ledger_order.pop_front() {
+                self.ledger.remove(&oldest);
+            }
+        }
+    }
+    pub(crate) fn clear_ledger(&mut self) {
+        self.ledger.clear();
+        self.ledger_order.clear();
     }
     /// Return the serialized size of session metadata that is retained outside
     /// the memory and history stores. Runtime turns use the same bound to

@@ -151,6 +151,144 @@ pub(super) fn heading_paths(headings: &[Heading]) -> Vec<String> {
         .collect()
 }
 
+/// How much of a document's outline a tool result or model request carries.
+pub(super) enum OutlineView {
+    /// One page of the complete outline, continued by heading index.
+    Page { offset: usize, limit: usize },
+    /// The complete outline when it has at most `max` headings. Otherwise
+    /// the headings inside the one-based inclusive line ranges with their
+    /// ancestors and a few neighbours, then each heading level from the top
+    /// while it fits, the first level that does not fit in part. A focus
+    /// covering much of the outline (a whole-document write) adds nothing,
+    /// so the levels alone remain. The runtime's automatic outlines (save
+    /// results, review pages, validation requests) use this view, because
+    /// each is repeated per save or request and shares its budget with the
+    /// document and evidence; document_inspect pages the complete outline.
+    Around {
+        lines: Vec<(usize, usize)>,
+        max: usize,
+    },
+}
+
+pub(super) struct Outline {
+    /// Indices into the heading list, in document order.
+    pub indices: Vec<usize>,
+    pub heading_count: usize,
+}
+
+impl Outline {
+    pub(super) fn omitted(&self) -> usize {
+        self.heading_count - self.indices.len()
+    }
+    /// heading, level and start_line of each entry, with section_path when
+    /// `paths` is given (the edit tools take it as `section`).
+    pub(super) fn entries(&self, headings: &[Heading], paths: Option<&[String]>) -> Vec<Value> {
+        self.indices
+            .iter()
+            .map(|&index| {
+                let heading = &headings[index];
+                let mut entry = json!({"heading":heading.heading,"level":heading.level,"start_line":heading.line});
+                if let Some(paths) = paths {
+                    entry["section_path"] = json!(paths[index]);
+                }
+                entry
+            })
+            .collect()
+    }
+}
+
+/// Headings kept on each side of a focus range in an `Around` outline.
+const OUTLINE_NEIGHBOURS: usize = 4;
+
+pub(super) fn outline(headings: &[Heading], view: OutlineView) -> Outline {
+    let total = headings.len();
+    let indices = match view {
+        OutlineView::Page { offset, limit } => {
+            (offset.min(total)..offset.saturating_add(limit).min(total)).collect()
+        }
+        OutlineView::Around { max, .. } if total <= max => (0..total).collect(),
+        OutlineView::Around { lines, max } => around(headings, &lines, max),
+    };
+    Outline {
+        indices,
+        heading_count: total,
+    }
+}
+
+fn around(headings: &[Heading], ranges: &[(usize, usize)], max: usize) -> Vec<usize> {
+    // The nearest earlier heading of a smaller level is the parent.
+    let mut parents = vec![None; headings.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    for (index, heading) in headings.iter().enumerate() {
+        while stack
+            .last()
+            .is_some_and(|&top| headings[top].level >= heading.level)
+        {
+            stack.pop();
+        }
+        parents[index] = stack.last().copied();
+        stack.push(index);
+    }
+    let mut near = BTreeSet::new();
+    let mut neighbours = BTreeSet::new();
+    for &(first, last) in ranges {
+        let mut inside: Vec<usize> = (0..headings.len())
+            .filter(|&index| (first..=last).contains(&headings[index].line))
+            .collect();
+        if inside.is_empty() {
+            // Lines inside a section's body: that section.
+            inside.extend(headings.iter().rposition(|heading| heading.line < first));
+        }
+        let (Some(&lowest), Some(&highest)) = (inside.first(), inside.last()) else {
+            continue;
+        };
+        for index in inside {
+            let mut ancestor = Some(index);
+            while let Some(index) = ancestor {
+                if !near.insert(index) {
+                    break;
+                }
+                ancestor = parents[index];
+            }
+        }
+        neighbours.extend(lowest.saturating_sub(OUTLINE_NEIGHBOURS)..lowest);
+        neighbours.extend(highest + 1..(highest + 1 + OUTLINE_NEIGHBOURS).min(headings.len()));
+    }
+    let mut tiers: Vec<Vec<usize>> = Vec::new();
+    // Nearness means little once the focus covers much of the outline.
+    if !near.is_empty() && near.len() <= max / 2 {
+        tiers.push(near.iter().copied().collect());
+        tiers.push(neighbours.difference(&near).copied().collect());
+    }
+    let deepest = headings
+        .iter()
+        .map(|heading| heading.level)
+        .max()
+        .unwrap_or(0);
+    for level in 1..=deepest {
+        tiers.push(
+            (0..headings.len())
+                .filter(|&index| headings[index].level == level)
+                .collect(),
+        );
+    }
+    let mut selected = BTreeSet::new();
+    for tier in tiers {
+        let fresh: Vec<usize> = tier
+            .into_iter()
+            .filter(|index| !selected.contains(index))
+            .collect();
+        if selected.len() + fresh.len() <= max {
+            selected.extend(fresh);
+        } else {
+            let room = max - selected.len();
+            selected.extend(fresh.into_iter().take(room));
+            break;
+        }
+    }
+    selected.into_iter().collect()
+}
+
 pub(super) fn heading_path(doc: &str, start: usize) -> Result<String> {
     let headings = headings(doc);
     let paths = heading_paths(&headings);
@@ -491,7 +629,7 @@ pub(super) fn execute(
                         headings.len()
                     );
                 }
-                let end = (offset + n(args, "limit", 50).clamp(1, 100)).min(headings.len());
+                let limit = n(args, "limit", 50).clamp(1, 100);
                 let (coverage, read_lines) = super::coverage::report(
                     s,
                     &path,
@@ -545,10 +683,22 @@ pub(super) fn execute(
                         .insert(coverage_key(next as usize), revision.into());
                 }
                 result["coverage"] = coverage;
-                result["outline"] = json!(headings[offset..end].iter().enumerate().map(|(relative, h)| {
+                let outline = outline(&headings, OutlineView::Page { offset, limit });
+                let mut entries = outline.entries(&headings, Some(&paths));
+                for (entry, &index) in entries.iter_mut().zip(&outline.indices) {
+                    let h = &headings[index];
                     let lines = doc[h.start..h.end].lines().count();
-                    json!({"heading":h.heading,"section_path":paths[offset+relative],"level":h.level,"start_line":h.line,"lines":lines,"hash":hash(&doc.as_bytes()[h.start..h.end]),"fully_read":read_lines[h.line-1..h.line-1+lines].iter().all(|&v|v)})
-                }).collect::<Vec<_>>());
+                    entry["lines"] = json!(lines);
+                    entry["hash"] = json!(hash(&doc.as_bytes()[h.start..h.end]));
+                    entry["fully_read"] = json!(
+                        read_lines[h.line - 1..h.line - 1 + lines]
+                            .iter()
+                            .all(|&v| v)
+                    );
+                }
+                let end = outline.indices.last().map_or(offset, |index| index + 1);
+                result["outline"] = json!(entries);
+                result["heading_count"] = json!(outline.heading_count);
                 result["next_offset"] = json!((end < headings.len()).then_some(end));
             }
             Ok(result)
@@ -757,7 +907,7 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
         // not unread evidence; the citation check reports both.
         let total = *line_counts
             .entry(cited.clone())
-            .or_insert_with(|| read_text(&cited).map_or(0, |text| text.lines().count()));
+            .or_insert_with(|| super::text_line_count(&cited).unwrap_or(0));
         if citation.begin == 0 || citation.end < citation.begin || citation.end > total {
             continue;
         }
@@ -1144,21 +1294,46 @@ fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<
         };
         let check = versions.entry(path.clone()).or_insert_with(|| {
             read_path(&s.project, &path)
-                .and_then(|p| read_text(&p))
-                .map(|t| t.lines().count())
+                .and_then(|p| super::text_line_count(&p))
                 .map_err(|e| e.to_string())
         });
         match check {
             Ok(lines) if *begin > 0 && end >= begin && end <= lines => {}
             Ok(_) => issues.push(json!({"kind":"citation_range","citation":raw})),
-            Err(error) if *relative_link => {
-                let error = link_target_error(s, output, cited, *begin, *end, error);
-                issues.push(json!({"kind":"citation_path","citation":raw,"error":error}));
+            Err(error) => {
+                let guidance = unreadable_citation_guidance(error);
+                let error = if *relative_link {
+                    link_target_error(s, output, cited, *begin, *end, error)
+                } else {
+                    error.clone()
+                };
+                let mut issue = json!({"kind":"citation_path","citation":raw,"error":error});
+                if let Some(guidance) = guidance {
+                    issue["guidance"] = json!(guidance);
+                }
+                issues.push(issue);
             }
-            Err(error) => issues.push(json!({"kind":"citation_path","citation":raw,"error":error})),
         }
     }
     Ok((spans.len(), issues))
+}
+
+/// A cited file the tools refuse to read fails every audit until the
+/// citation goes. The bare read error gave a model nothing to act on.
+fn unreadable_citation_guidance(error: &str) -> Option<&'static str> {
+    if error.starts_with("unsupported_large_file") {
+        Some(
+            "This file is over the 16 MiB read limit, so no tool can read, search or verify it and the audit keeps failing: remove this citation and support the claim with a readable source file, or state in the text that the file could not be inspected.",
+        )
+    } else if error.starts_with("unsupported_binary_file")
+        || error.starts_with("unsupported_non_utf8_file")
+    {
+        Some(
+            "This file is not UTF-8 text, so no tool can read or verify it and the audit keeps failing: remove this citation and cite a readable text source, or state in the text that the file could not be inspected.",
+        )
+    } else {
+        None
+    }
 }
 
 /// A `path#Lx-Ly` link target resolves from the output document's folder,
@@ -1263,4 +1438,128 @@ pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Va
         check["citations_required"] = json!(NO_CITATIONS_GUIDANCE);
     }
     Ok(check)
+}
+
+#[cfg(test)]
+mod outline_tests {
+    use super::*;
+
+    /// "# A" on line 1; section i has "## S{i}" on line 3+8i and
+    /// "### S{i}.{j}" on line 5+8i+2j, each followed by a body line.
+    fn nested() -> String {
+        let mut doc = String::from("# A\nbody\n");
+        for i in 0..10 {
+            doc.push_str(&format!("## S{i}\nbody\n"));
+            for j in 0..3 {
+                doc.push_str(&format!("### S{i}.{j}\nbody\n"));
+            }
+        }
+        doc
+    }
+
+    fn titles(doc: &str, view: OutlineView) -> (Vec<String>, usize) {
+        let headings = headings(doc);
+        let outline = outline(&headings, view);
+        let titles = outline
+            .entries(&headings, None)
+            .iter()
+            .map(|entry| entry["heading"].as_str().unwrap().to_owned())
+            .collect();
+        (titles, outline.omitted())
+    }
+
+    #[test]
+    fn a_page_is_a_slice_of_the_complete_outline() {
+        let doc = nested();
+        let (page, omitted) = titles(
+            &doc,
+            OutlineView::Page {
+                offset: 40,
+                limit: 5,
+            },
+        );
+        assert_eq!(page, ["### S9.2"]);
+        assert_eq!(omitted, 40);
+        let (end, _) = titles(
+            &doc,
+            OutlineView::Page {
+                offset: 41,
+                limit: 5,
+            },
+        );
+        assert!(end.is_empty());
+    }
+
+    #[test]
+    fn a_short_outline_is_complete() {
+        let (all, omitted) = titles(
+            &nested(),
+            OutlineView::Around {
+                lines: vec![(47, 47)],
+                max: 41,
+            },
+        );
+        assert_eq!(all.len(), 41);
+        assert_eq!(omitted, 0);
+    }
+
+    #[test]
+    fn a_long_outline_keeps_the_focus_its_ancestors_and_neighbours_then_the_top_levels() {
+        let doc = nested();
+        // Line 47 is "### S5.1"; line 48 is its body, which focuses the
+        // section that contains it.
+        for lines in [(47, 47), (48, 48)] {
+            let (near, omitted) = titles(
+                &doc,
+                OutlineView::Around {
+                    lines: vec![lines],
+                    max: 12,
+                },
+            );
+            assert_eq!(
+                near,
+                [
+                    "# A", "## S0", "## S1", "### S4.1", "### S4.2", "## S5", "### S5.0",
+                    "### S5.1", "### S5.2", "## S6", "### S6.0", "### S6.1"
+                ],
+                "{lines:?}"
+            );
+            assert_eq!(omitted, 29);
+        }
+    }
+
+    #[test]
+    fn a_focus_over_most_of_the_outline_leaves_the_levels_alone() {
+        let (levels, omitted) = titles(
+            &nested(),
+            OutlineView::Around {
+                lines: vec![(1, 82)],
+                max: 12,
+            },
+        );
+        assert_eq!(levels.len(), 12, "{levels:?}");
+        assert!((0..10).all(|i| levels.contains(&format!("## S{i}"))));
+        assert!(levels.contains(&"### S0.0".to_owned()));
+        assert!(!levels.contains(&"### S0.1".to_owned()));
+        assert_eq!(omitted, 29);
+    }
+
+    #[test]
+    fn several_ranges_each_keep_their_neighbourhood() {
+        // "### S1.0" is on line 13 and "### S8.2" on line 73.
+        let (near, omitted) = titles(
+            &nested(),
+            OutlineView::Around {
+                lines: vec![(13, 13), (73, 73)],
+                max: 20,
+            },
+        );
+        assert_eq!(near.len(), 20, "{near:?}");
+        for title in [
+            "### S1.0", "## S1", "### S8.2", "## S8", "### S8.1", "### S9.0",
+        ] {
+            assert!(near.contains(&title.to_owned()), "{title} in {near:?}");
+        }
+        assert_eq!(omitted, 21);
+    }
 }
