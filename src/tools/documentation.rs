@@ -829,7 +829,9 @@ pub(super) struct Citation {
     pub document_line: usize,
 }
 
-/// A missing cited range this long is more likely a pointer than evidence.
+/// A missing cited range this long is more likely a pointer than evidence,
+/// and any range this long fills review evidence pages
+/// (BROAD_CITATION_GUIDANCE states the number).
 const BROAD_CITATION_LINES: usize = 120;
 
 /// Cited ranges never delivered to the model as complete lines of the current
@@ -1437,8 +1439,32 @@ pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Va
     if checked == 0 {
         check["citations_required"] = json!(NO_CITATIONS_GUIDANCE);
     }
+    // The review sends every cited line as evidence, read or not: a 62-line
+    // document citing ten 2,000-line ranges took 35 review requests, and
+    // nothing told the writer while its reads covered those ranges.
+    if s.config.source_document_review {
+        let lines = |c: &Citation| c.end.saturating_sub(c.begin).saturating_add(1);
+        let broad: Vec<_> = citation_spans(doc)?
+            .into_iter()
+            .filter(|c| c.end >= c.begin && lines(c) >= BROAD_CITATION_LINES)
+            .collect();
+        if !broad.is_empty() {
+            check["broad_citation_count"] = json!(broad.len());
+            check["broad_cited_lines"] = json!(broad.iter().map(lines).sum::<usize>());
+            check["broad_citations"] = json!(
+                broad
+                    .iter()
+                    .take(8)
+                    .map(|c| json!({"citation":c.raw,"document_line":c.document_line,"lines":lines(c)}))
+                    .collect::<Vec<_>>()
+            );
+            check["broad_citation_guidance"] = json!(BROAD_CITATION_GUIDANCE);
+        }
+    }
     Ok(check)
 }
+
+const BROAD_CITATION_GUIDANCE: &str = "Each broad citation spans 120 or more source lines. The document review sends every cited line to the reviewer, so long ranges add review requests and time to each review of this document. Where a claim rests on a few lines (a declaration, branch, call or constant), cite those lines; keep a long range only when the claim describes all of it.";
 
 #[cfg(test)]
 mod outline_tests {

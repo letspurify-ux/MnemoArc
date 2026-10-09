@@ -30,6 +30,22 @@ pub const CLOSING_ROUND_LIMIT: usize = 12;
 /// Requests at this run's average duration that the closing time reserve
 /// keeps at least, so closing can still answer and review once.
 const CLOSING_REQUEST_RESERVE: f64 = 6.0;
+/// Of those, the closing write and the final answer; a longer document's
+/// review adds its estimated requests to these two.
+const CLOSING_ANSWER_REQUESTS: f64 = 2.0;
+
+/// Requests the closing time reserve keeps at this run's pace: the closing
+/// write, the answer and the document review that answer starts. Six used to
+/// cover all of them, while a full review of a 3,664-line document took 75
+/// requests and a long document's review ran into the deadline.
+fn closing_reserve_requests(s: &Session) -> f64 {
+    let review = if s.config.source_document_review {
+        tools::document_review::estimated_requests(s)
+    } else {
+        0
+    };
+    CLOSING_REQUEST_RESERVE.max(CLOSING_ANSWER_REQUESTS + review as f64)
+}
 /// A review request the provider never answered: a gateway or idle timeout,
 /// or no data within the request timeout. A live reasoning model reasoned
 /// silently until the provider cut it off (504), and waiting out that
@@ -1555,15 +1571,19 @@ pub async fn run_session_controlled(
                     s.progress_recovery.rounds_since_best.saturating_add(1);
             }
             if s.is_document_work() && s.progress_recovery.closing.is_none() {
-                // The time reserve also covers a few requests at this run's
-                // pace: a slow model spent a 6-minute reserve on the rest of
-                // one review and was stopped by the deadline mid-request. It
-                // never exceeds the verification share, so a very slow model
-                // does not close half way; the deadline finishes the rest.
+                // The time reserve also covers the closing requests and the
+                // document's review at this run's pace: a slow model spent a
+                // 6-minute reserve on the rest of one review and was stopped
+                // by the deadline mid-request. It never exceeds the
+                // verification share, so a very slow model or a very long
+                // document does not close half way; the deadline finishes
+                // the rest. The review estimate reads the document, so it is
+                // made only once the share is reached.
                 let time_short = request_secs.is_some_and(|secs| {
                     let cap =
                         s.config.verification_reserve_ratio * s.config.run_timeout_secs as f64;
-                    (seconds_remaining as f64) < (secs * CLOSING_REQUEST_RESERVE).min(cap)
+                    let remaining = seconds_remaining as f64;
+                    remaining < cap && remaining < secs * closing_reserve_requests(&s)
                 });
                 let reason = if fraction <= s.config.closing_reserve_ratio || time_short {
                     Some("budget")
@@ -3394,6 +3414,47 @@ mod plan_check_tests {
 mod review_gap_tests {
     use super::*;
     use crate::config::{Project, Secret};
+
+    #[test]
+    fn the_closing_time_reserve_covers_the_review_of_a_long_document() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            (1..=200)
+                .map(|n| format!("let value_{n} = compute(&context, {n});\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            Config {
+                model: "gpt-4o".into(),
+                ..Config::compact_test()
+            },
+        );
+        // No document and a short one keep the six-request reserve.
+        assert_eq!(closing_reserve_requests(&s), CLOSING_REQUEST_RESERVE);
+        std::fs::write(&s.project.output, "# A\nValue. a.rs:1-5\n").unwrap();
+        assert_eq!(closing_reserve_requests(&s), CLOSING_REQUEST_RESERVE);
+        // A long document adds its review to the closing write and answer.
+        let long: String = (0..400)
+            .map(|n| format!("Claim {n}. a.rs:1-200\n"))
+            .collect();
+        std::fs::write(&s.project.output, long).unwrap();
+        let review = tools::document_review::estimated_requests(&s);
+        assert!(review > 50, "{review}");
+        assert_eq!(
+            closing_reserve_requests(&s),
+            CLOSING_ANSWER_REQUESTS + review as f64
+        );
+        // Without the review only the closing requests are reserved.
+        s.config.source_document_review = false;
+        assert_eq!(closing_reserve_requests(&s), CLOSING_REQUEST_RESERVE);
+    }
 
     #[test]
     fn without_a_review_unread_citations_block_readiness_until_read() {

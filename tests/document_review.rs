@@ -1010,6 +1010,91 @@ fn review_pages_cover_all_evidence_before_approval_and_accumulate_findings() {
 }
 
 #[test]
+fn the_writer_state_omits_review_bookkeeping_hashes() {
+    // A review left an absolute path and a digest per cited file in the
+    // writer's state, and edits kept them: 24.6K tokens per request for a
+    // document citing 300 files.
+    let (_dir, mut s) = fixture();
+    s.document_review = Default::default();
+    document_review::request(&mut s).unwrap();
+    support::document_review::finish(&mut s, r#"{"issues":["Flow: name the loop type"]}"#).unwrap();
+    assert!(!s.document_review.pending);
+    assert!(document_review::rejected_on_current_result(&s));
+    let state = ContextManager::state(&s).unwrap();
+    let review = &state["document_review"];
+    assert_eq!(review["issues"].as_array().unwrap().len(), 1, "{review}");
+    for key in [
+        "source_hashes",
+        "target_hash",
+        "target_requirements",
+        "target_layout",
+        "reviewed_requirements",
+    ] {
+        assert!(review.get(key).is_none(), "{key}: {review}");
+    }
+    assert!(!json!(s.document_review)["source_hashes"].is_null());
+}
+
+/// Requests one complete review of the saved document takes, with empty
+/// verdicts.
+fn review_requests(s: &mut Session) -> usize {
+    s.document_review = Default::default();
+    let mut requests = 0;
+    loop {
+        document_review::request(s).unwrap();
+        requests += 1;
+        support::document_review::finish(s, r#"{"issues":[]}"#).unwrap();
+        if !s.document_review.pending {
+            return requests;
+        }
+        assert!(requests < 500);
+    }
+}
+
+#[test]
+fn the_review_request_estimate_follows_document_length_and_cited_lines() {
+    // The closing time reserve counts these requests: a fixed six requests
+    // left the review of a long document to the deadline.
+    let (dir, mut s) = fixture();
+    for i in 0..20 {
+        let source: String = (1..=200)
+            .map(|line| format!("    let value_{line} = compute_state(&context, {line}, \"label-{i}-{line}\");\n"))
+            .collect();
+        std::fs::write(dir.path().join(format!("part_{i}.rs")), source).unwrap();
+    }
+    // A long document with short citations.
+    let mut long = String::from("# Manual\n");
+    for section in 0..60 {
+        long.push_str(&format!("## Section {section}\n"));
+        for line in 0..8 {
+            let start = 1 + line * 20;
+            long.push_str(&format!(
+                "Step {line} computes the state. part_{}.rs:{start}-{}\n",
+                section % 20,
+                start + 9
+            ));
+        }
+        long.push('\n');
+    }
+    // A short document whose few citations span whole files.
+    let broad: String = std::iter::once("# Overview\n".to_owned())
+        .chain((0..6).map(|i| format!("## Part {i}\nEvery value of part {i}. part_{i}.rs:1-200\n")))
+        .collect();
+    for doc in [long, broad] {
+        std::fs::write(&s.project.output, &doc).unwrap();
+        let estimate = document_review::estimated_requests(&s);
+        let actual = review_requests(&mut s);
+        assert!(
+            actual / 2 <= estimate && estimate <= actual * 2,
+            "{} lines: estimate {estimate}, actual {actual}",
+            doc.lines().count()
+        );
+    }
+    std::fs::remove_file(&s.project.output).unwrap();
+    assert_eq!(document_review::estimated_requests(&s), 0);
+}
+
+#[test]
 fn a_rereview_sends_evidence_only_where_the_last_verdict_may_no_longer_hold() {
     let (dir, mut s) = fixture();
     std::fs::write(

@@ -4329,6 +4329,53 @@ fn a_long_unread_citation_suggests_citing_entry_lines() {
 }
 
 #[test]
+fn a_save_names_broad_citations_while_the_review_is_on() {
+    // A 62-line document citing ten 2,000-line ranges took 35 review
+    // requests; reading those ranges first left the writer no notice.
+    let (dir, mut s) = source_setup();
+    std::fs::write(
+        dir.path().join("a.rs"),
+        (1..=300)
+            .map(|n| format!("let v{n} = {n};\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let text = "# Guide\nAll values. a.rs:1-200\nOne value. a.rs:10-12\n";
+    let written = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":text}),
+    );
+    let check = &written["citation_check"];
+    assert_eq!(check["broad_citation_count"], 1, "{check}");
+    assert_eq!(check["broad_cited_lines"], 200);
+    assert_eq!(
+        check["broad_citations"],
+        json!([{"citation":"a.rs:1-200","document_line":2,"lines":200}])
+    );
+    assert!(
+        check["broad_citation_guidance"]
+            .as_str()
+            .unwrap()
+            .contains("document review sends every cited line")
+    );
+    // Without the review a long range costs no review requests; an unread
+    // one keeps its own note.
+    s.config.source_document_review = false;
+    let written = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","text":format!("{text}\n"),"expected_hash":written["hash"]}),
+    );
+    assert!(
+        written["citation_check"]
+            .get("broad_citation_count")
+            .is_none(),
+        "{written}"
+    );
+}
+
+#[test]
 fn a_self_citation_of_the_output_is_never_owed_a_read() {
     let (dir, mut s) = source_setup();
     std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();

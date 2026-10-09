@@ -663,6 +663,14 @@ pub fn guidance(s: &Session) -> Value {
         "anchor_corrections",
         "dismissed_findings",
         "resolved_findings",
+        // Review bookkeeping the writer never acts on. source_hashes holds
+        // an absolute path and a digest per cited file: 300 cited files put
+        // 24.6K tokens into every writer request after a review.
+        "source_hashes",
+        "target_hash",
+        "target_requirements",
+        "target_layout",
+        "reviewed_requirements",
     ] {
         value.as_object_mut().unwrap().remove(key);
     }
@@ -810,6 +818,72 @@ const REVIEW_OUTLINE_ENTRIES: usize = 120;
 const MANIFEST_FILES: usize = 32;
 const MAX_PAGE_SHRINK: u8 = 2;
 
+/// Source lines sent around each cited range, so a cited body comes with
+/// the branch or loop declaration just before it.
+const EVIDENCE_CONTEXT_LINES: usize = 8;
+
+/// Input tokens one review request may use.
+fn review_ceiling(config: &crate::config::Config) -> usize {
+    24_000
+        .min(context::ContextManager::input_budget(config))
+        .saturating_sub(512)
+}
+
+/// Requests a complete review of the saved document is likely to take,
+/// estimated without building its pages: one per PAGE_LINES document lines,
+/// plus the evidence of its citations (with their context lines, at 4 source
+/// bytes per token plus each line's number prefix) at half a request each.
+/// Overlapping evidence is counted twice and a re-review sends less, so this
+/// errs long. Zero without a saved document.
+pub fn estimated_requests(s: &Session) -> usize {
+    let Ok(output) = output_path(&s.project) else {
+        return 0;
+    };
+    let Ok(doc) = read_text(&output) else {
+        return 0;
+    };
+    let ranges = doc.lines().count().div_ceil(PAGE_LINES);
+    let Ok(citations) = documentation::citation_spans(&doc) else {
+        return ranges;
+    };
+    let mut files = BTreeMap::<PathBuf, Option<(usize, usize)>>::new();
+    let mut tokens = 0usize;
+    for citation in citations {
+        let path = if citation.relative_link {
+            output
+                .parent()
+                .unwrap()
+                .join(&citation.path)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            citation.path
+        };
+        let Ok(path) = read_path(&s.project, &path) else {
+            continue;
+        };
+        // Bytes and lines of each cited file, from its metadata and the
+        // cached line count the citation check keeps.
+        let Some((bytes, lines)) = *files.entry(path).or_insert_with_key(|path| {
+            let lines = text_line_count(path).ok().filter(|&lines| lines > 0)?;
+            Some((std::fs::metadata(path).ok()?.len() as usize, lines))
+        }) else {
+            continue;
+        };
+        if citation.begin == 0 || citation.begin > citation.end.min(lines) {
+            continue;
+        }
+        let cited = citation
+            .end
+            .saturating_add(EVIDENCE_CONTEXT_LINES)
+            .min(lines)
+            + 1
+            - citation.begin.saturating_sub(EVIDENCE_CONTEXT_LINES).max(1);
+        tokens = tokens.saturating_add(cited.saturating_mul(bytes / lines / 4 + 2));
+    }
+    ranges + tokens.div_ceil((review_ceiling(&s.config) / 2).max(1))
+}
+
 /// Halve later requests after one got no answer with the full allowance:
 /// retrying the identical request used to end the same way. A review page
 /// takes half the document lines and at most half the evidence tokens of
@@ -867,9 +941,7 @@ fn request_page(s: &mut Session) -> Result<Option<Value>> {
     let requirement_hash = requirements(s);
     // Page offsets identify a particular partition. A new input allowance or
     // tokenizer must rebuild that partition before reusing any page verdict.
-    let ceiling = 24_000
-        .min(context::ContextManager::input_budget(&s.config))
-        .saturating_sub(512);
+    let ceiling = review_ceiling(&s.config);
     let layout = format!("{}:{ceiling}", s.config.model);
     // Another model or input budget has its own output capacity.
     let review = &s.document_review;
@@ -1130,8 +1202,8 @@ fn request_page(s: &mut Session) -> Result<Option<Value>> {
         // citation document lines are one-based and the end bound is included.
         if in_scope && (start_line + 1..=next_document_offset).contains(&document_line) {
             // Include branch/loop declarations immediately before a cited body.
-            let start = begin.saturating_sub(8).max(1);
-            let stop = end.saturating_add(8);
+            let start = begin.saturating_sub(EVIDENCE_CONTEXT_LINES).max(1);
+            let stop = end.saturating_add(EVIDENCE_CONTEXT_LINES);
             file.ranges.push((start, stop));
         }
     }
