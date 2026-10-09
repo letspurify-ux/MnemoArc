@@ -460,6 +460,33 @@ impl ProgressRecovery {
     }
 }
 
+/// Characters of a message kept as a user source's excerpt.
+pub(crate) const USER_EXCERPT_CHARS: usize = 2000;
+
+/// `text`, or `{"same_as": name}` naming the first sent field with the same
+/// non-empty text, so a model request carries each request text once.
+pub(crate) fn same_text_as<N: AsRef<str>>(text: &str, sent: &[(N, &str)]) -> Value {
+    sent.iter()
+        .find(|(_, earlier)| !text.is_empty() && *earlier == text)
+        .map_or_else(
+            || json!(text),
+            |(name, _)| json!({"same_as": name.as_ref()}),
+        )
+}
+
+/// A user source's excerpt of a sent request text: `{"same_as": name}` for
+/// the whole text, `{"start_of": name}` for the shortened start of a longer
+/// one, otherwise the excerpt itself.
+pub(crate) fn user_excerpt<N: AsRef<str>>(excerpt: &str, sent: &[(N, &str)]) -> Value {
+    let reference = same_text_as(excerpt, sent);
+    if reference.is_object() || excerpt.chars().count() < USER_EXCERPT_CHARS {
+        return reference;
+    }
+    sent.iter()
+        .find(|(_, text)| text.starts_with(excerpt))
+        .map_or(reference, |(name, _)| json!({"start_of": name.as_ref()}))
+}
+
 /// Successful calls kept for an idempotent replay of their IDs: at least the
 /// calls of the last few responses (a response holds at most 32).
 pub const LEDGER_CALLS: usize = 256;
@@ -968,7 +995,7 @@ impl Session {
             line_end_complete: true,
             evidence_truncated: false,
             hash: None,
-            excerpt: text.chars().take(2000).collect(),
+            excerpt: text.chars().take(USER_EXCERPT_CHARS).collect(),
         };
         self.sources.insert(source.id.clone(), source);
     }
@@ -1103,6 +1130,40 @@ impl Session {
         self.ledger.clear();
         self.ledger_order.clear();
     }
+    /// latest_request, original_request, current_request and task_amendments
+    /// with each request text sent once: a text an earlier field already
+    /// carries is sent as `{"same_as": that field}`. A new task's three
+    /// fields hold one text, and the last amendment repeats the current
+    /// request and goal; every model request carried all of them, so a long
+    /// request was sent three or four times. Also returns the field name of
+    /// each text sent, for references from user source excerpts.
+    pub(crate) fn request_texts(&self) -> (serde_json::Map<String, Value>, Vec<(String, &str)>) {
+        let mut fields = serde_json::Map::new();
+        let mut sent: Vec<(String, &str)> = Vec::new();
+        for (name, text) in [
+            ("latest_request", self.latest_request.as_str()),
+            ("original_request", self.original_request.as_str()),
+            ("current_request", self.current_request.as_str()),
+        ] {
+            fields.insert(name.into(), same_text_as(text, &sent));
+            sent.push((name.into(), text));
+        }
+        let mut amendments = Vec::new();
+        for (index, amendment) in self.task_amendments.iter().enumerate() {
+            let mut value = json!(amendment);
+            value["request"] = same_text_as(&amendment.request, &sent);
+            if let Some(goal) = &amendment.goal {
+                value["goal"] = same_text_as(goal, &sent);
+            }
+            amendments.push(value);
+            sent.push((
+                format!("task_amendments[{index}].request"),
+                &amendment.request,
+            ));
+        }
+        fields.insert("task_amendments".into(), json!(amendments));
+        (fields, sent)
+    }
     /// Return the serialized size of session metadata that is retained outside
     /// the memory and history stores. Runtime turns use the same bound to
     /// avoid silently discarding observations or receipts.
@@ -1229,6 +1290,68 @@ mod history_tests {
         assert_eq!(s.document_review.validation_log.len(), 1);
         assert_eq!(s.task_amendments.len(), 1);
         assert_eq!(s.task.workflow, "source_document");
+    }
+
+    #[test]
+    fn the_model_state_sends_each_request_text_once() {
+        // latest_request, original_request and current_request held one text
+        // and the user source repeated it; an amendment repeated the current
+        // request and goal again. A long request was sent four times.
+        let long = format!("Write both chapters. {}", "Keep every rule. ".repeat(200));
+        assert!(long.chars().count() > USER_EXCERPT_CHARS);
+        let mut s = Session::new(Project::default(), Config::compact_test());
+        s.select_workflow("source_document").unwrap();
+        s.receive_message(long.clone()).unwrap();
+        let state = crate::context::ContextManager::state(&s).unwrap();
+        assert_eq!(state["latest_request"], long);
+        assert_eq!(
+            state["original_request"],
+            json!({"same_as":"latest_request"})
+        );
+        assert_eq!(
+            state["current_request"],
+            json!({"same_as":"latest_request"})
+        );
+        assert_eq!(state["task_amendments"], json!([]));
+        assert_eq!(
+            state["user_sources"][0]["excerpt"],
+            json!({"start_of":"latest_request"})
+        );
+
+        let change = "Remove the second chapter";
+        s.receive_message(change.into()).unwrap();
+        s.accept_amendment(TaskAmendment {
+            goal: Some("Write the first chapter".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let state = crate::context::ContextManager::state(&s).unwrap();
+        assert_eq!(state["latest_request"], "Write the first chapter");
+        assert_eq!(state["original_request"], long);
+        assert_eq!(state["current_request"], change);
+        assert_eq!(
+            state["task_amendments"][0]["request"],
+            json!({"same_as":"current_request"})
+        );
+        assert_eq!(
+            state["task_amendments"][0]["goal"],
+            json!({"same_as":"latest_request"})
+        );
+        let excerpts: Vec<&Value> = state["user_sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|source| &source["excerpt"])
+            .collect();
+        assert!(excerpts.contains(&&json!({"same_as":"current_request"})));
+        assert!(excerpts.contains(&&json!({"start_of":"original_request"})));
+        // The task's initial completion criterion quotes a bounded start of
+        // the request; outside it, each text appears once.
+        let mut rest = state.clone();
+        rest.as_object_mut().unwrap().remove("task");
+        let rest = rest.to_string();
+        assert_eq!(rest.matches("Write both chapters.").count(), 1);
+        assert_eq!(rest.matches(change).count(), 1);
     }
 
     #[test]

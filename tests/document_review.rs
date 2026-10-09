@@ -81,13 +81,25 @@ fn review_uses_caller_criteria_without_promoting_agent_workflow_checks() {
     let request = document_review::request(&mut s).unwrap();
     let payload: Value =
         serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
-    assert_eq!(payload["request"], "Write a screen manual");
+    // The request and the caller's criteria are sent once, in the catalog.
     assert_eq!(
-        payload["requirements"],
-        json!(["Include the named controls in the manual"])
+        payload["requirement_catalog"],
+        json!({"R0":"Write a screen manual","C1":"Include the named controls in the manual",
+            "K1":"Use Korean","D1":"A Markdown manual"})
     );
-    assert_eq!(payload["constraints"], json!(["Use Korean"]));
-    assert_eq!(payload["deliverables"], json!(["A Markdown manual"]));
+    for key in [
+        "request",
+        "requirements",
+        "constraints",
+        "deliverables",
+        "request_history",
+    ] {
+        assert!(payload.get(key).is_none(), "{key}");
+    }
+    assert_eq!(
+        payload.to_string().matches("Write a screen manual").count(),
+        1
+    );
     assert!(!payload.to_string().contains("investigation"));
 
     s.add_user("continue".into());
@@ -136,12 +148,10 @@ fn review_of_an_unprepared_request_does_not_use_agent_completion_checks() {
     let payload: Value =
         serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
     assert_eq!(
-        payload["request"],
-        "Write a source document covering history normalization and all loop bounds."
+        payload["requirement_catalog"],
+        json!({"R0":"Write a source document covering history normalization and all loop bounds."})
     );
-    assert_eq!(payload["requirements"], json!([]));
-    assert_eq!(payload["constraints"], json!([]));
-    assert_eq!(payload["deliverables"], json!([]));
+    assert!(payload.get("request").is_none());
 }
 
 #[test]
