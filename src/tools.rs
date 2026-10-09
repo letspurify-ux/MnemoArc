@@ -55,6 +55,12 @@ fn schema(fields: Value, required: &[&str]) -> Value {
 fn string() -> Value {
     json!({"type":"string"})
 }
+/// `pattern` is the legacy alias of path_glob. Bare, the name reads as the
+/// text to find: live models sent search text or a symbol name there 29
+/// times in 13 runs, then 12 times in one run, to the two search tools.
+fn legacy_pattern(instead: &str) -> Value {
+    json!({"type":"string","description":format!("Legacy alias of path_glob: a file-path glob such as src/**/*.rs, never {instead}")})
+}
 fn number() -> Value {
     json!({"type":"integer","minimum":0})
 }
@@ -276,7 +282,7 @@ impl ToolRegistry {
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"query":string(),"queries":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1}},"path":string(),"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"whole_word":{"type":"boolean"},"mode":action(&["matches","files","count"]),"before":{"type":"integer","minimum":0,"maximum":20},"after":{"type":"integer","minimum":0,"maximum":20},"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number()}),
+                    json!({"query":string(),"queries":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1}},"path":string(),"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"whole_word":{"type":"boolean"},"mode":action(&["matches","files","count"]),"before":{"type":"integer","minimum":0,"maximum":20},"after":{"type":"integer","minimum":0,"maximum":20},"path_glob":string(),"pattern":legacy_pattern("the text to find (send that as query)"),"cursor":string(),"limit":number()}),
                     &[],
                 ),
             },
@@ -296,7 +302,7 @@ impl ToolRegistry {
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"query":string(),"path_glob":string(),"pattern":string(),"cursor":string(),"limit":number()}),
+                    json!({"query":string(),"path_glob":string(),"pattern":legacy_pattern("a symbol name (send that as query)"),"cursor":string(),"limit":number()}),
                     &[],
                 ),
             },
@@ -3434,6 +3440,13 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
             {
                 *value = json!(number);
             }
+            // A live model sent case_sensitive:"false" and whole_word:"true"
+            // and resent them after the type error.
+            if *kind == "boolean"
+                && let Some(raw @ ("true" | "false")) = value.as_str()
+            {
+                *value = json!(raw == "true");
+            }
             // Models sometimes send an array or object argument as its JSON
             // text, e.g. edits:"[{...}]". Decode it only when it is that type.
             // task_plan decodes its operations itself and reports doing so.
@@ -3556,6 +3569,22 @@ pub fn output_path(p: &Project) -> Result<PathBuf> {
     }
     Ok(path)
 }
+/// The configured output's file name at the project root, where no file has
+/// it, names the output: live runs sent "generated.md" for an output outside
+/// the root, and one sent that name joined to the root path 12 times, each
+/// told that no project file had the name.
+fn output_name_at_root(p: &Project, candidate: &Path) -> Option<PathBuf> {
+    if candidate.exists() {
+        return None;
+    }
+    let output = output_path(p).ok()?;
+    let root = p.root.canonicalize().ok()?;
+    (candidate.file_name().is_some()
+        && candidate.file_name() == output.file_name()
+        && candidate.parent()?.canonicalize().ok()? == root)
+        .then_some(output)
+}
+
 pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
     let root = p.root.canonicalize()?;
     let mut candidate = if Path::new(path).is_absolute() {
@@ -3563,14 +3592,7 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
     } else {
         root.join(path)
     };
-    // A bare file name that no project file has but the configured output
-    // does names the output (live runs sent "generated.md" for an output
-    // outside the project root).
-    if !candidate.exists()
-        && Path::new(path).components().count() == 1
-        && let Ok(output) = output_path(p)
-        && output.file_name() == Some(std::ffi::OsStr::new(path))
-    {
+    if let Some(output) = output_name_at_root(p, &candidate) {
         candidate = output;
     }
     let canonical = candidate.canonicalize().map_err(|e| {

@@ -374,6 +374,8 @@ fn unchanged(
             "Shorten the request or complete/remove obsolete work, then resend a smaller batch using current_revision.",
         Some("completed_anchor") =>
             "No operations were committed. Completed items stay where they are: omit before to append at the end, or set before to an unfinished item such as current_id, then resend the whole batch using current_revision.",
+        Some("closing_mode") =>
+            "No operations were committed. Complete each remaining item with its actual result, or remove it with a reason when it will not be done, then give the final answer; the runtime reports unfinished work.",
         _ =>
             "Correct the reported operation using the returned IDs and current_revision, then resend the whole batch. No earlier operation was committed.",
     });
@@ -980,6 +982,24 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
             return Ok(result);
         }
     };
+    // Closing mode finishes from gathered evidence, and open to-dos refuse
+    // the final answer, so the plan may only shrink there. A live model split
+    // one item into six in closing mode (eight open items became twelve,
+    // several repeating open ones) and the run ended at the closing limit
+    // with every one of them reported unfinished and no review.
+    let open = |task: &TaskState| task.todos.iter().filter(|item| !item.done).count();
+    if s.progress_recovery.closing.is_some() && open(&next) > open(&s.task) {
+        return Ok(unchanged(
+            &s.task,
+            format!(
+                "closing_mode: this change would raise the open to-dos from {} to {}; closing mode adds none",
+                open(&s.task),
+                open(&next)
+            ),
+            expected_revision,
+            json!({"code":"closing_mode"}),
+        ));
+    }
     if next.todos == s.task.todos
         && next.todo_sequence == s.task.todo_sequence
         && next.todos_completed_total == s.task.todos_completed_total

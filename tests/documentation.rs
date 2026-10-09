@@ -934,6 +934,65 @@ fn the_output_file_name_alone_names_the_output() {
     assert!(read.to_string().contains("project copy"), "{read}");
 }
 
+// Live run 2026-10-09: a model named the output by its file name joined to
+// the project root 12 times and was told no project file had that name.
+#[test]
+fn the_output_file_name_at_the_project_root_names_the_output() {
+    let (dir, mut s) = setup();
+    let outside = tempfile::tempdir().unwrap();
+    s.project.output = outside.path().join("generated.md");
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\nText.\n"}),
+    );
+    let joined = dir.path().join("generated.md").display().to_string();
+    let read = run(&mut s, "file_read", json!({"path":joined}));
+    assert!(read.to_string().contains("Text."), "{read}");
+    let inspected = run(&mut s, "document_inspect", json!({"path":joined}));
+    assert!(inspected.to_string().contains("Guide"), "{inspected}");
+    // The name in another directory is not the output.
+    let error = tools::execute(&mut s, "file_read", json!({"path":"docs/generated.md"}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("file_not_found"), "{error}");
+}
+
+// Live run 2026-10-09: a model paged document_inspect with offset alone five
+// times (14 times in 12 runs) and document_audit without its revision twice.
+#[test]
+fn a_next_page_without_its_hash_continues_while_the_text_is_unchanged() {
+    let (_dir, mut s) = setup();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n## One\nline one\n## Two\nline two\n"}),
+    );
+    let first = run(&mut s, "document_inspect", json!({}));
+    let next = run(&mut s, "document_inspect", json!({"offset":1}));
+    assert_eq!(next["hash"], first["hash"], "{next}");
+    // After an edit the remembered hash names older text.
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","old_text":"line two","text":"line 2"}),
+    );
+    let error = tools::execute(&mut s, "document_inspect", json!({"offset":1}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("document_hash_required"), "{error}");
+    let error = tools::execute(&mut s, "document_audit", json!({"offset":1}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.starts_with("document_audit_revision_required"),
+        "{error}"
+    );
+    let audit = run(&mut s, "document_audit", json!({"limit":1}));
+    let page = run(&mut s, "document_audit", json!({"offset":1,"limit":1}));
+    assert_eq!(page["revision"], audit["revision"], "{page}");
+}
+
 #[test]
 fn an_audit_given_the_output_path_audits_the_output() {
     // A live model named the configured output in document_audit's path and

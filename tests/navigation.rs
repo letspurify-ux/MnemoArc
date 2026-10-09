@@ -2110,3 +2110,51 @@ fn csharp_verbatim_attribute_name_uses_only_the_exact_type() {
     assert_eq!(references["parse_error_count"], 0, "{references}");
     assert_eq!(references["total_results"], 1, "{references}");
 }
+
+// Live run 2026-10-09: a model sent symbol names as pattern, the legacy
+// alias of path_glob, five times in a row, and was told to drop a path_glob
+// it never sent.
+#[test]
+fn a_symbol_name_sent_as_pattern_is_named_as_such() {
+    let (_dir, mut s) = setup(&[("src/web.rs", "fn headless() {}\nfn serve_app() {}\n")]);
+    let error = tools::execute(
+        &mut s,
+        "symbol_search",
+        json!({"path":"src/web.rs","pattern":"headless","kind":"function"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with(
+            "conflicting_path_filters: pattern \"headless\" is the legacy alias of path_glob"
+        ),
+        "{error}"
+    );
+    assert!(error.contains("send the name as query"), "{error}");
+    let error = tools::execute(&mut s, "symbol_search", json!({"pattern":"serve_app|api"}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.starts_with("invalid_argument_value: pattern"),
+        "{error}"
+    );
+    // A real file glob still filters files.
+    let found = run(
+        &mut s,
+        "symbol_search",
+        json!({"pattern":"src/*.rs","query":"headless"}),
+    );
+    assert_eq!(found["symbols"].as_array().unwrap().len(), 1, "{found}");
+    let schema = ToolRegistry::specs()
+        .into_iter()
+        .find(|spec| spec.name == "symbol_search")
+        .unwrap()
+        .parameters;
+    assert!(
+        schema["properties"]["pattern"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("never a symbol name"),
+        "{schema}"
+    );
+}

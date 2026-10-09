@@ -271,3 +271,24 @@ fn malformed_fields_never_panic_in_any_registered_tool() {
         }
     }
 }
+
+// Live run 2026-10-09: a model sent case_sensitive:"false" and
+// whole_word:"true" and resent them after the type error.
+#[test]
+fn quoted_booleans_are_read_as_booleans() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "fn Execute_one() {}\nfn execute_once() {}\n",
+    )
+    .unwrap();
+    let mut s = session(dir.path());
+    let result = tools::execute(
+        &mut s,
+        "source_search",
+        json!({"path":"a.rs","query":"execute_one","case_sensitive":"false","whole_word":"true"}),
+    )
+    .unwrap();
+    assert_eq!(result["matches"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(result["matches"][0]["line"], 1, "{result}");
+}

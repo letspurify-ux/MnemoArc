@@ -1218,3 +1218,39 @@ fn malformed_symbol_id_is_not_reported_as_a_changed_source() {
     assert_eq!(result["recovery"]["action"], "copy_observed_symbol_id");
     assert!(!result["error"].as_str().unwrap().contains("source changed"));
 }
+
+// Live run 2026-10-09: a model resent one invented symbol_id four times. Its
+// byte range ran past the end of the file, and the start_line it sent lay
+// inside the function it wanted.
+#[test]
+fn an_unknown_symbol_names_the_declaration_at_the_sent_line() {
+    let (dir, mut s) = setup();
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "fn first() {}\n\nfn second() {\n    let x = 1;\n}\n",
+    )
+    .unwrap();
+    let outline = run(&mut s, "code_outline", json!({"path":"a.rs"}));
+    let second = outline["symbols"][1]["symbol_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let hash = second.split(':').next().unwrap();
+    let invented = format!("{hash}:{hash}:{hash}:164297:165947");
+    let error = tools::execute(
+        &mut s,
+        "symbol_read",
+        json!({"path":"a.rs","symbol_id":invented,"start_line":4}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("unknown_symbol:"), "{error}");
+    assert!(
+        error.contains("ends at 165947, past the end of this 46-byte file"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("line 4 is second with symbol_id \"{second}\"")),
+        "{error}"
+    );
+}

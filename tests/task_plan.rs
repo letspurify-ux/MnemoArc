@@ -1752,3 +1752,37 @@ fn list_with_a_real_operation_says_it_was_not_applied() {
     }
     assert_eq!(json!(s.task), before);
 }
+
+// Live run 2026-10-09: in closing mode a model split one item into six
+// (eight open to-dos became twelve) and the run ended at the closing limit
+// with all of them reported unfinished and no document review.
+#[test]
+fn closing_mode_does_not_add_open_to_dos() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(
+        &mut s,
+        json!([{"op":"insert","texts":["Read the sources","Write the document"]}]),
+    );
+    s.progress_recovery.closing = Some(mnemoarc::session::Closing {
+        reason: "stall".into(),
+        ..Default::default()
+    });
+    let id = s.task.todos[0].id.clone();
+    let split = apply(
+        &mut s,
+        json!([{"op":"split","id":id,"texts":["Read a.rs","Read b.rs"]}]),
+    );
+    assert_eq!(split["applied"], false, "{split}");
+    assert_eq!(split["conflict"]["code"], "closing_mode");
+    assert!(
+        split["reason"].as_str().unwrap().contains("from 2 to 3"),
+        "{split}"
+    );
+    assert_eq!(s.task.todos.len(), 2);
+    let done = apply(
+        &mut s,
+        json!([{"op":"complete","id":id,"result":"Read the sources."}]),
+    );
+    assert_eq!(done["applied"], true, "{done}");
+}

@@ -503,6 +503,11 @@ pub struct Session {
     pub history_loads: usize,
     pub document_written: bool,
     pub last_document_write: Option<(std::path::PathBuf, String)>,
+    /// The file and hash the last document_inspect page returned, and the
+    /// revision of the last document_audit page: a next page sent without
+    /// them continues while they still name the current text.
+    pub last_inspected: Option<(std::path::PathBuf, String)>,
+    pub last_audit_revision: Option<String>,
     pub last_error: Option<String>,
     pub question: Option<FollowUpQuestion>,
     /// Finished executions survive new questions within this session.
@@ -693,6 +698,8 @@ impl Session {
             history_loads: 0,
             document_written: false,
             last_document_write: None,
+            last_inspected: None,
+            last_audit_revision: None,
             last_error: None,
             question: None,
             run_history: VecDeque::new(),

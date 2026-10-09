@@ -376,9 +376,7 @@ pub(super) fn names_output(s: &Session, path: &str, output: &Path) -> bool {
             .root
             .canonicalize()
             .is_ok_and(|root| root.join(given) == output)
-        || (given.components().count() == 1
-            && !candidate.exists()
-            && output.file_name() == Some(given.as_os_str()))
+        || super::output_name_at_root(&s.project, &candidate).is_some()
         || output
             .canonicalize()
             .is_ok_and(|real| candidate.canonicalize().is_ok_and(|named| named == real))
@@ -417,16 +415,23 @@ pub(super) fn execute(
             let digest = hash(doc.as_bytes());
             let document_offset = n(args, "offset", 0);
             let coverage_offset = n(args, "coverage_offset", 0);
-            if (document_offset > 0 || coverage_offset > 0)
-                && args["expected_hash"].as_str().is_none()
-            {
+            // Models page with offset alone (14 times in 12 live runs, 5 in
+            // one). The hash the last page of this file returned still names
+            // the current text, so the pages stay consistent.
+            let remembered = s
+                .last_inspected
+                .as_ref()
+                .filter(|(seen, hash)| *hash == digest && same_file(seen, &path))
+                .map(|(_, hash)| hash.as_str());
+            let expected_hash = args["expected_hash"].as_str().or(remembered);
+            if (document_offset > 0 || coverage_offset > 0) && expected_hash.is_none() {
                 bail!(
                     "document_hash_required: offset or coverage_offset > 0 requires expected_hash from the first document_inspect result; copy its hash or the returned next_cursor arguments. If that result is unavailable, call document_inspect with offset 0 and coverage_offset 0 first"
                 );
             }
             // Offset 0 starts a fresh read that returns the current hash, so a
             // stale or placeholder expected_hash has nothing to protect there.
-            if let Some(expected) = args["expected_hash"].as_str()
+            if let Some(expected) = expected_hash
                 && (document_offset > 0 || coverage_offset > 0)
                 && expected != digest
             {
@@ -442,6 +447,7 @@ pub(super) fn execute(
                     "document_revision_conflict: document changed during paged read; restart document_inspect with offset 0 and use its new hash"
                 );
             }
+            s.last_inspected = Some((path.clone(), digest.clone()));
             let mut result = json!({"exists":true,"path":path,"hash":digest,"total_lines":doc.lines().count(),"bytes":doc.len()});
             // Another document read by path is not the one the edit tools
             // change. A live run inspected the project's own user manual,
@@ -597,7 +603,13 @@ pub(super) fn execute(
             ))?);
             let offset = n(args, "offset", 0);
             if offset > 0 {
-                let expected = args["expected_revision"].as_str().ok_or_else(|| {
+                // As with document_inspect: the revision the last audit page
+                // returned, while it still names the current audit inputs.
+                let remembered = s
+                    .last_audit_revision
+                    .as_deref()
+                    .filter(|seen| *seen == revision);
+                let expected = args["expected_revision"].as_str().or(remembered).ok_or_else(|| {
                     anyhow::anyhow!(
                         "document_audit_revision_required: offset > 0 requires expected_revision from the first result; copy its revision or restart at offset 0"
                     )
@@ -620,6 +632,7 @@ pub(super) fn execute(
                     issues.len()
                 );
             }
+            s.last_audit_revision = Some(revision.clone());
             let end = (offset + n(args, "limit", 30).clamp(1, 100)).min(issues.len());
             // The document review compares every cited range with the source,
             // so a range the writer never read does not block the final answer

@@ -669,6 +669,59 @@ impl SyntaxFile {
     }
 }
 
+/// Where an unknown symbol_id went wrong, and the ID the call most likely
+/// meant. A live model resent one invented ID four times: its path hash
+/// appeared twice and its byte range ran past the end of the file, while the
+/// start_line it sent lay inside the function it wanted.
+fn unknown_symbol_hint(
+    file: &SyntaxFile,
+    id: &str,
+    args: &Value,
+    cancel: &tokio_util::sync::CancellationToken,
+    deadline: std::time::Instant,
+) -> String {
+    let mut hint = String::new();
+    if let Some(end) = id
+        .rsplit(':')
+        .next()
+        .and_then(|end| end.parse::<usize>().ok())
+        && end > file.source.len()
+    {
+        hint.push_str(&format!(
+            "; its byte range ends at {end}, past the end of this {}-byte file, so it was not copied from this file's outline",
+            file.source.len()
+        ));
+    }
+    let Some(line) = args["start_line"].as_u64() else {
+        hint.push_str("; call code_outline for this path and copy one of its symbol_id values, or read the lines with file_read");
+        return hint;
+    };
+    let containing = file
+        .symbols(&json!({}), None, cancel, deadline)
+        .ok()
+        .and_then(|(symbols, _)| {
+            symbols
+                .into_iter()
+                .filter_map(|symbol| {
+                    let start = symbol["start_line"].as_u64()?;
+                    let end = symbol["end_line"].as_u64()?;
+                    (start <= line && line <= end).then_some((end - start, symbol))
+                })
+                .min_by_key(|(span, _)| *span)
+        });
+    match containing {
+        Some((_, symbol)) => hint.push_str(&format!(
+            "; the declaration containing line {line} is {} with symbol_id {}",
+            symbol["qualified_name"].as_str().unwrap_or_default(),
+            symbol["symbol_id"]
+        )),
+        None => hint.push_str(&format!(
+            "; no declaration contains line {line}; read it with file_read"
+        )),
+    }
+    hint
+}
+
 pub(super) fn execute(
     s: &mut Session,
     tool: &str,
@@ -681,6 +734,11 @@ pub(super) fn execute(
     let file = SyntaxFile::parse(path, source, cancel, deadline)?;
     let requested = (tool == "symbol_read").then(|| args["symbol_id"].as_str().unwrap());
     let (symbols, containers) = file.symbols(args, requested, cancel, deadline)?;
+    let unknown_hint = requested
+        .filter(|id| id.starts_with(&format!("{}:", file.digest)))
+        .filter(|id| !symbols.iter().any(|item| item["symbol_id"] == *id))
+        .map(|id| unknown_symbol_hint(&file, id, args, cancel, deadline))
+        .unwrap_or_default();
     let SyntaxFile {
         path,
         source,
@@ -699,7 +757,7 @@ pub(super) fn execute(
             .find(|item| item["symbol_id"] == id)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "unknown_symbol: no declaration in this version of the file has symbol_id {id:?}; the ID must be copied whole, including its byte range, from code_outline or symbol_search for this path"
+                    "unknown_symbol: no declaration in this version of the file has symbol_id {id:?}; the ID must be copied whole, including its byte range, from code_outline or symbol_search for this path{unknown_hint}"
                 )
             })?;
         let start = symbol["start_line"].as_u64().unwrap();

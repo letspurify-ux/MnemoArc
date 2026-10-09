@@ -197,6 +197,31 @@ fn page(
 }
 
 pub(super) fn search(s: &mut Session, args: &Value, cancel: &CancellationToken) -> Result<Value> {
+    // pattern is the legacy alias of path_glob. Live models sent a symbol
+    // name there ("headless", "serve_app|api") five times in a row and were
+    // told to drop a path_glob they never sent. Supported source files all
+    // have an extension, so a pattern with no `.`, `/` or `*` matches none of
+    // them, and spaces, `|` or regex syntax do not belong in a file glob.
+    // A content regex keeps path_glob's own error, which names source_search.
+    path_glob(args)?;
+    if args["path_glob"].as_str().is_none()
+        && let Some(pattern) = args["pattern"].as_str()
+        && (!pattern.contains(['.', '/', '*']) || pattern.contains([' ', '|', '(', '^', '$', '\\']))
+    {
+        bail!(
+            "{}: pattern {pattern:?} is the legacy alias of path_glob, a file filter, not a symbol name{}; send the name as query (match=exact for an exact name) and drop pattern",
+            if args["path"].is_string() {
+                "conflicting_path_filters"
+            } else {
+                "invalid_argument_value"
+            },
+            if args["path"].is_string() {
+                ", and path already sets the scope"
+            } else {
+                ""
+            }
+        );
+    }
     let deadline = crate::config::deadline_after(s.config.tool_timeout_secs)?;
     let workspace = Workspace::load(s, args, None, cancel, deadline)?;
     let fingerprint = request_fingerprint(&workspace, "symbol_search", args);
