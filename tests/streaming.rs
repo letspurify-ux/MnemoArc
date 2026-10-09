@@ -1332,6 +1332,44 @@ async fn an_outage_cleared_by_the_json_mode_attempt_keeps_strict_schema_output()
     server.abort();
 }
 
+// Live run 2026-10-09: after three in-stream Nvidia overloads, the JSON-mode
+// comparison attempt returned an unfinished `{"issues":{}` and the closing
+// review skipped that page. An overload says nothing about the schema.
+#[tokio::test]
+async fn an_in_stream_overload_keeps_the_strict_schema() {
+    use std::sync::{Arc, Mutex};
+    let formats = Arc::new(Mutex::new(Vec::new()));
+    let seen = formats.clone();
+    let app=Router::new().route("/chat/completions",post(move |axum::Json(body):axum::Json<serde_json::Value>| {
+        let seen=seen.clone();
+        async move {
+            let format=body["response_format"]["type"].as_str().unwrap_or("none").to_owned();
+            let content=if format=="json_schema" {
+                event(json!({"error":{"code":503,"message":"Upstream error from Nvidia: Service temporarily overloaded","metadata":{"error_type":"provider_overloaded"}}}))
+            } else {format!("{}data: [DONE]\n\n",event(json!({"choices":[{"delta":{"content":"{\"issues\":{}"},"finish_reason":"stop"}]})))};
+            seen.lock().unwrap().push(format);
+            ([(header::CONTENT_TYPE,"text/event-stream")],content)
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = Config {
+        base_url: format!("http://{}", listener.local_addr().unwrap()),
+        model: "schema-overload".into(),
+        retries: 0,
+        ..support::compact_config()
+    };
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let error = OpenAiClient
+        .complete(request, &config, CancellationToken::new(), tx)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("provider_overloaded"), "{error}");
+    assert_eq!(*formats.lock().unwrap(), ["json_schema"]);
+    server.abort();
+}
+
 #[tokio::test]
 async fn an_outage_in_both_formats_is_bounded_and_does_not_poison_schema_cache() {
     use std::sync::{

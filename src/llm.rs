@@ -169,6 +169,14 @@ pub(crate) fn timeout_error(text: &str) -> bool {
         || text.to_ascii_lowercase().contains("idle timeout")
 }
 
+/// An in-stream error from an overloaded or rate-limited provider. Like a
+/// timeout, it says nothing about the response format.
+fn overload_error(text: &str) -> bool {
+    text.contains("\"code\":429")
+        || text.contains("\"code\":503")
+        || text.contains("\"error_type\":\"provider_overloaded\"")
+}
+
 /// Failures of the provider or the connection, not of the request itself.
 fn transient_error(text: &str) -> bool {
     text.starts_with("provider_stream_error:")
@@ -968,8 +976,12 @@ impl LlmClient for OpenAiClient {
                     // Exhaust ordinary transient retries first, then make one
                     // compatibility attempt for an SSE grammar failure. The
                     // caller still validates the complete response schema.
+                    // An overload is no grammar failure: after three Nvidia
+                    // "Service temporarily overloaded" errors, a live review's
+                    // JSON-mode attempt returned an unfinished `{"issues":{}`.
                     if silent
                         && !unanswered
+                        && !overload_error(&text)
                         && !schema_stream_fallback
                         && text.starts_with("provider_stream_error:")
                         && transient_retries >= c.retries

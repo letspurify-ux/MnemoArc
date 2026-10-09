@@ -770,7 +770,7 @@ pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str, last_try: bool
             });
         if let (Err(error), Some(id)) = (&result, &restates) {
             settled.push(format!(
-                "issues[{issue_index}] restated candidate {id}, which keeps the evidence it was found with, and could not be grounded on this page ({error}); the issue was dropped without a gap"
+                "issues[{issue_index}] restated candidate {id}, which keeps the evidence it was found with, and was rejected on this page ({error}); the issue was dropped without a gap"
             ));
             continue;
         }
@@ -949,17 +949,45 @@ fn collect_one(
 ) -> Result<(usize, usize, Option<Value>)> {
     let state = &s.document_review;
     let mut corrections = usize::from(normalize_document_kind(s, &mut proposal));
+    // Name the issue and each limit it broke. One message listing every
+    // rule never said which issue had five sources, and retrying live
+    // reviewers dropped valid sibling findings (five issues became one).
+    let mut broken = Vec::new();
     if !["factual", "citation", "requirement", "scope", "document"]
         .contains(&proposal.kind.as_str())
-        || proposal.problem.trim().is_empty()
-        || proposal.correction.trim().is_empty()
-        || proposal.problem.chars().count() > 1500
-        || proposal.correction.chars().count() > 1500
-        || proposal.sources.len() > 4
-        || proposal.ui_labels.len() > 12
     {
+        broken.push(format!(
+            "kind {:?} must be factual, citation, requirement, scope or document",
+            proposal.kind
+        ));
+    }
+    for (field, text) in [
+        ("problem", &proposal.problem),
+        ("correction", &proposal.correction),
+    ] {
+        let chars = text.chars().count();
+        if text.trim().is_empty() {
+            broken.push(format!("{field} is empty"));
+        } else if chars > 1500 {
+            broken.push(format!("{field} has {chars} characters, at most 1500"));
+        }
+    }
+    if proposal.sources.len() > 4 {
+        broken.push(format!(
+            "{} sources, at most 4: keep the most direct ones",
+            proposal.sources.len()
+        ));
+    }
+    if proposal.ui_labels.len() > 12 {
+        broken.push(format!(
+            "{} ui_labels, at most 12",
+            proposal.ui_labels.len()
+        ));
+    }
+    if !broken.is_empty() {
         bail!(
-            "document_review_invalid: kind must be factual, citation, requirement, scope or document; problem/correction must be nonempty and at most 1500 characters; at most 4 sources and 12 UI labels"
+            "document_review_invalid: issues[{issue_index}] {}; fix only this issue and keep the other issues as they were",
+            broken.join("; ")
         );
     }
     // Name the keys the reviewer can copy: a live reviewer sent scope

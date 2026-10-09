@@ -589,6 +589,35 @@ fn a_candidate_restated_on_a_later_evidence_page_is_dropped_without_rejecting_it
     }
 }
 
+// Live run 2026-10-09: a reviewer cited five sources for one issue. The
+// rejection listed every rule without naming the issue, and earlier retries
+// dropped valid sibling findings (five issues became one).
+#[test]
+fn an_issue_over_the_source_limit_is_named_with_its_count() {
+    let (_dir, mut s) = fixture();
+    let request = review::request(&mut s).unwrap();
+    assert!(
+        request["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("at most 4 per issue")
+    );
+    let mut crowded = proposal("저장 시점이 빠졌습니다.");
+    let source = crowded["sources"][0].clone();
+    crowded["sources"] = json!(vec![source; 5]);
+    crowded["correction"] = json!(" ");
+    reject(&mut s, vec![proposal("저장 시점이 빠졌습니다."), crowded]);
+    let error = s.last_error.as_deref().unwrap();
+    assert!(
+        error.contains("issues[1] correction is empty; 5 sources, at most 4"),
+        "{error}"
+    );
+    assert!(
+        error.contains("keep the other issues as they were"),
+        "{error}"
+    );
+}
+
 #[test]
 fn a_misreading_is_not_a_repair_instruction_until_validation() {
     let (_dir, mut s) = fixture();
