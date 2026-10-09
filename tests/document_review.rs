@@ -950,14 +950,18 @@ fn review_pages_cover_all_evidence_before_approval_and_accumulate_findings() {
         assert!(mnemoarc::context::count(&req, &s.config.model) <= 24000);
         let payload: Value =
             serde_json::from_str(req["messages"][1]["content"].as_str().unwrap()).unwrap();
+        // One manifest entry per cited file, however many chunks it has.
         let manifest = payload["evidence_manifest"].as_array().unwrap();
-        assert!(!manifest.is_empty());
-        let first = payload["first_evidence_chunk"].as_u64().unwrap() as usize;
-        for (index, chunk) in manifest.iter().enumerate() {
-            assert_eq!(chunk["reviewed_on_prior_page"], index < first);
-            assert!(std::path::Path::new(chunk["path"].as_str().unwrap()).ends_with("main.js"));
-            assert!(chunk["first_line"].as_u64().unwrap() <= chunk["last_line"].as_u64().unwrap());
-        }
+        assert_eq!(manifest.len(), 1, "{manifest:?}");
+        let first = payload["first_evidence_chunk"].as_u64().unwrap();
+        let file = &manifest[0];
+        assert!(std::path::Path::new(file["path"].as_str().unwrap()).ends_with("main.js"));
+        assert_eq!(file["first_line"], 1);
+        assert_eq!(file["last_line"], lines);
+        assert_eq!(file["chunks"], payload["evidence_chunks_total"]);
+        assert!(file["chunks"].as_u64().unwrap() > 1);
+        assert_eq!(file["reviewed_on_prior_pages"], first);
+        assert_eq!(payload["evidence_manifest_omitted_files"], 0);
         assert_eq!(first > 0, pages > 0);
         assert!(
             payload["page_scope"]
@@ -2559,4 +2563,54 @@ fn a_long_outline_on_a_review_page_keeps_the_page_and_the_top_levels() {
     assert_eq!(headings[119], "## S119");
     assert!(!headings.contains(&"## S120"));
     assert_eq!(first["document_outline"][1]["start_line"], 2);
+}
+
+#[test]
+fn a_rereview_page_lists_only_its_own_changed_sections() {
+    // changed_sections went into every page of a re-review as the whole
+    // document's list (every section after a full rewrite). A page judges
+    // only its own range, so it lists the changed sections it overlaps and
+    // changed_section_count counts them all.
+    let (_dir, mut s) = fixture();
+    let mut doc = String::from("# Guide\n");
+    for i in 0..60 {
+        doc.push_str(&format!("## S{i}\nText {i}. main.js:1-6\n\n"));
+    }
+    std::fs::write(&s.project.output, &doc).unwrap();
+    s.document_review = Default::default();
+    let mut payloads = Vec::new();
+    let review = |s: &mut Session, payloads: &mut Vec<Value>| loop {
+        let request = document_review::request(s).unwrap();
+        payloads.push(
+            serde_json::from_str::<Value>(request["messages"][1]["content"].as_str().unwrap())
+                .unwrap(),
+        );
+        support::document_review::finish(s, r#"{"issues":[]}"#).unwrap();
+        if !s.document_review.pending {
+            break;
+        }
+        assert!(payloads.len() < 32);
+    };
+    review(&mut s, &mut payloads);
+    assert!(payloads.iter().all(|p| p["changed_sections"].is_null()));
+    assert!(document_review::approved(&s));
+
+    // Lines 2-4 hold S0, so S1 is on the first page and S50 (line 152) on a
+    // later one.
+    let doc = doc
+        .replace("Text 1. ", "Text one. ")
+        .replace("Text 50. ", "Text fifty. ");
+    std::fs::write(&s.project.output, &doc).unwrap();
+    payloads.clear();
+    review(&mut s, &mut payloads);
+    assert!(payloads.len() > 1);
+    assert_eq!(payloads[0]["changed_sections"], json!(["# Guide > ## S1"]));
+    let late = payloads
+        .iter()
+        .find(|p| p["document_line_start"].as_u64().unwrap() > 1)
+        .unwrap();
+    assert_eq!(late["changed_sections"], json!(["# Guide > ## S50"]));
+    for payload in &payloads {
+        assert_eq!(payload["changed_section_count"], 2, "{payload}");
+    }
 }
