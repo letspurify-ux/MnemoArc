@@ -378,7 +378,7 @@ async fn the_full_current_message_and_user_requirements_survive_context_fitting(
     let mut s = cancelled(dir.path()).await;
     let prompt = format!("{} {}", "추가 조건을 모두 유지한다. ".repeat(700), CHANGE);
     assert!(prompt.chars().count() > 8000);
-    let criteria = s.request_review_criteria.clone();
+    let criteria = s.user_criteria.clone();
     s.receive_message(prompt.clone()).unwrap();
     let (s, requests) = execute(s, vec![work(&prompt), Reply::WorkReached]).await;
     let payload: Value =

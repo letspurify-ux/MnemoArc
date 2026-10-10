@@ -344,8 +344,8 @@ async fn an_explicit_goal_and_completion_change_updates_the_same_task() {
         s.latest_request,
         "Create a report about the first chapter only"
     );
-    assert_eq!(s.request_review_criteria.completion, ["First chapter only"]);
-    assert_eq!(s.task.completion, s.request_review_criteria.completion);
+    assert_eq!(s.user_criteria.completion, ["First chapter only"]);
+    assert_eq!(s.task.completion, s.user_criteria.completion);
     assert_eq!(s.task.todos[0].id, "T1");
     assert!(s.task.todos[0].done);
     assert_eq!(s.task_amendments[0].request, s.current_request);

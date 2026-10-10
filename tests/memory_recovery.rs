@@ -438,6 +438,30 @@ fn a_path_source_id_resolves_to_its_delivered_evidence() {
         assert_eq!(memory.sources.len(), 1);
         assert_eq!(memory.sources[0].id, source);
     }
+    // Live checkpoint shapes: a path relative to its folder, and an S-ID
+    // with the cited range appended, both name the delivered source.
+    for (key, id) in [
+        ("by-file-name", "a.rs:1"),
+        ("by-id-range", &*format!("{source}:1-1")),
+    ] {
+        let result = write(&mut s, key, json!([id]));
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(result["data"]["resolved_source_ids"][id], json!([source]));
+        assert_eq!(s.memory.get(key).unwrap().sources[0].id, source);
+    }
+    // A file name that several delivered files end with is not guessed.
+    std::fs::create_dir(dir.path().join("lib")).unwrap();
+    std::fs::write(dir.path().join("lib/a.rs"), "fn lib() {}\n").unwrap();
+    tools::execute(
+        &mut s,
+        "file_read",
+        json!({"path":"lib/a.rs","start_line":1,"max_lines":1}),
+    )
+    .unwrap();
+    let ambiguous = write(&mut s, "ambiguous", json!(["a.rs:1"]));
+    assert_eq!(ambiguous["status"], "error", "{ambiguous}");
+    let error = ambiguous["error"].as_str().unwrap();
+    assert!(error.contains("lib/a.rs, src/a.rs"), "{error}");
     // A citation range or a file with no delivered lines is still refused,
     // so a memory never cites evidence the session did not observe.
     for (key, path) in [

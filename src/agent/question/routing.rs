@@ -56,7 +56,7 @@ fn request(
     let question = s.question.as_ref().unwrap();
     let mut payload = json!({
         "session_message_routing":true,"current_goal":s.latest_request,
-        "user_criteria":s.request_review_criteria,"current_message":question.text,
+        "user_criteria":s.user_criteria,"current_message":question.text,
         "task_status":question.prior_status,"workflow":s.workflow_mode,
 
         "context_note":"The current message and effective requirements are complete. Optional saved context may be shortened or omitted."

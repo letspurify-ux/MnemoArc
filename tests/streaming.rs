@@ -781,7 +781,7 @@ async fn a_request_without_timeout_retries_does_not_wait_out_a_timeout_again() {
     // follow-up answer is asked again with a smaller request instead of
     // waiting it out, and a timeout is no reason to drop the strict JSON schema.
     let timeout = event(json!({"error":{"code":504,"message":"Upstream idle timeout exceeded"}}));
-    let request = json!({"messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"review","strict":true,"schema":{"type":"object"}}}});
+    let request = json!({"messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"follow_up","strict":true,"schema":{"type":"object"}}}});
     for retry_timeouts in [true, false] {
         let (url, server, calls) = sequenced_server(vec![timeout.clone()]).await;
         let c = Config {

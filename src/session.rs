@@ -83,7 +83,7 @@ pub struct TaskState {
 /// user requirements.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct RequestReviewCriteria {
+pub struct UserCriteria {
     pub completion: Vec<String>,
     pub constraints: Vec<String>,
     pub deliverables: Vec<String>,
@@ -480,7 +480,7 @@ pub struct Session {
     pub write_outcome_uncertain: Arc<AtomicBool>,
     pub pending_config: Option<Config>,
     pub task: TaskState,
-    pub request_review_criteria: RequestReviewCriteria,
+    pub user_criteria: UserCriteria,
     /// Workflow selected when the session is created (one of WORKFLOW_MODES).
     pub workflow_mode: String,
     pub workflow_locked: bool,
@@ -626,20 +626,6 @@ impl Session {
                 || !self.completion_gaps.is_empty())
     }
 
-    fn initial_completion(&self, request: &str) -> Vec<String> {
-        let request = request.trim();
-        let max_chars = (self.config.state_tokens / 6).clamp(24, 320);
-        let excerpt: String = request.chars().take(max_chars).collect();
-        let suffix = if request.chars().count() > max_chars {
-            "… (전체 요청은 latest_request 참고)"
-        } else {
-            ""
-        };
-        vec![format!(
-            "사용자 요청의 명시 요구를 충족한다: {excerpt}{suffix}"
-        )]
-    }
-
     pub fn new(mut project: Project, config: Config) -> Self {
         project.ensure_id();
         let task = TaskState {
@@ -657,7 +643,7 @@ impl Session {
             write_outcome_uncertain: Arc::new(AtomicBool::new(false)),
             pending_config: None,
             task,
-            request_review_criteria: Default::default(),
+            user_criteria: Default::default(),
             memory: Default::default(),
             history: Default::default(),
             sources: Shared::default(),
@@ -857,23 +843,20 @@ impl Session {
             next.latest_request = goal.clone();
         }
         if let Some(values) = &amendment.completion {
-            next.request_review_criteria.completion = values.clone();
-            next.task.completion = if values.is_empty() {
-                next.initial_completion(&next.latest_request)
-            } else {
-                values.clone()
-            };
+            next.user_criteria.completion = values.clone();
+            next.task.completion = values.clone();
         }
         if let Some(values) = &amendment.constraints {
-            next.request_review_criteria.constraints = values.clone();
+            next.user_criteria.constraints = values.clone();
             next.task.constraints = values.clone();
         }
         if let Some(values) = &amendment.deliverables {
-            next.request_review_criteria.deliverables = values.clone();
+            next.user_criteria.deliverables = values.clone();
             next.task.deliverables = values.clone();
         }
+        // The old goal's completion checks do not carry over to a new goal.
         if amendment.goal.is_some() && amendment.completion.is_none() {
-            next.task.completion = next.initial_completion(&next.latest_request);
+            next.task.completion.clear();
         }
         next.task_amendments.push(amendment);
         if let Some(bundle) = next
@@ -987,23 +970,20 @@ impl Session {
                 self.progress_recovery = Default::default();
                 self.completion_gaps = Vec::new();
             }
-            // Capture caller-provided criteria before initial_completion and
-            // later model task_state updates add working acceptance checks.
+            // Capture caller-provided criteria before model task_state
+            // updates add working acceptance checks.
             // On later requests, task.constraints can contain checks the agent
             // added during the previous task; retain only the earlier caller
             // constraints as user criteria.
-            self.request_review_criteria = RequestReviewCriteria {
+            self.user_criteria = UserCriteria {
                 completion: self.task.completion.clone(),
                 constraints: if first_request {
                     self.task.constraints.clone()
                 } else {
-                    self.request_review_criteria.constraints.clone()
+                    self.user_criteria.constraints.clone()
                 },
                 deliverables: self.task.deliverables.clone(),
             };
-            if self.task.completion.is_empty() {
-                self.task.completion = self.initial_completion(&text);
-            }
             self.apply_workflow_mode();
         }
         // A resume message belongs in history, but must not replace the task
@@ -1129,7 +1109,7 @@ impl Session {
             &self.file_cursors,
             &self.read_coverage,
             &self.coverage_cursors,
-            &self.request_review_criteria,
+            &self.user_criteria,
             &self.checkpoint,
             &self.config,
             &self.pending_config,
@@ -1232,7 +1212,7 @@ mod history_tests {
         assert_eq!(s.last_document_write, files);
         assert_eq!(s.sources.len(), sources.len() + 1);
         assert!(s.document_written && s.question.is_none());
-        assert_eq!(s.request_review_criteria.completion, s.task.completion);
+        assert_eq!(s.user_criteria.completion, s.task.completion);
         assert_eq!(s.task_amendments.len(), 1);
         assert_eq!(s.task.workflow, "source_document");
     }

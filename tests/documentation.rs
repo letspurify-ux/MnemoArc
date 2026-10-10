@@ -4360,3 +4360,166 @@ fn a_blank_section_reads_the_outline() {
     );
     assert_eq!(page["outline"].as_array().map(Vec::len), Some(2), "{page}");
 }
+
+#[test]
+fn a_citation_missing_its_folder_comes_with_its_line_and_a_ready_fix() {
+    let (dir, mut s) = source_setup();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    let source: String = (1..=2600).map(|n| format!("fn f{n}() {{}}\n")).collect();
+    std::fs::write(dir.path().join("src/agent.rs"), source).unwrap();
+    run(
+        &mut s,
+        "file_read",
+        json!({"path":"src/agent.rs","start_line":25,"max_lines":1}),
+    );
+    // The live shape: agent.rs:25 also occurs inside src/agent.rs:2563, so
+    // a replace_text of the bare citation alone matched several places.
+    let doc = "# Flow\n\nThe loop starts here (agent.rs:25).\nIt ends at `src/agent.rs:2563`.\n\n| Step | Where |\n|---|---|\n| Start | agent.rs:25 |\n";
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":doc}),
+    );
+    let issues: Vec<_> = saved["citation_check"]["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| issue["kind"] == "citation_path")
+        .cloned()
+        .collect();
+    assert_eq!(issues.len(), 2, "{saved}");
+    assert_eq!(issues[0]["line"], 3);
+    assert_eq!(issues[0]["suggested"], "src/agent.rs:25");
+    assert_eq!(issues[1]["line"], 8);
+    let fixes: Vec<_> = issues.iter().map(|issue| issue["fix"].clone()).collect();
+    assert!(fixes.iter().all(Value::is_object), "{saved}");
+    // Every listed fix applies together in one batch.
+    run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":saved["hash"],"edits":fixes}),
+    );
+    let doc = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+    assert!(doc.contains("(src/agent.rs:25)"), "{doc}");
+    assert!(doc.contains("| src/agent.rs:25 |"), "{doc}");
+    assert!(
+        doc.contains("`src/agent.rs:2563`") && !doc.contains("src/src/"),
+        "{doc}"
+    );
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert!(
+        audit["issue_kinds"].get("citation_path").is_none(),
+        "{audit}"
+    );
+}
+
+#[test]
+fn a_citation_path_naming_several_files_gets_no_guess() {
+    let (dir, mut s) = source_setup();
+    for folder in ["src", "lib"] {
+        std::fs::create_dir(dir.path().join(folder)).unwrap();
+        std::fs::write(dir.path().join(folder).join("a.rs"), "fn a() {}\n").unwrap();
+    }
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# A\n\nSee a.rs:1 for it.\n"}),
+    );
+    let audit = run(&mut s, "document_audit", json!({}));
+    let issue = &audit["issues"][0];
+    assert_eq!(issue["kind"], "citation_path", "{audit}");
+    assert_eq!(issue["line"], 3);
+    assert!(
+        issue.get("suggested").is_none() && issue.get("fix").is_none(),
+        "{audit}"
+    );
+    assert_eq!(audit["issue_kinds"]["citation_path"], 1);
+    // With one project file left, that file is suggested.
+    std::fs::remove_file(dir.path().join("lib/a.rs")).unwrap();
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert_eq!(audit["issues"][0]["suggested"], "src/a.rs:1", "{audit}");
+    assert_eq!(
+        audit["issues"][0]["fix"],
+        json!({"action":"replace_text","old_text":"a.rs:1","text":"src/a.rs:1"})
+    );
+}
+
+#[test]
+fn a_budget_cut_read_of_the_output_is_not_repeated_with_another_max_lines() {
+    let (dir, mut s) = source_setup();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/agent.rs"), "fn a() {}\n").unwrap();
+    let mut doc = String::from("# Flow\n\n");
+    for n in 0..600 {
+        doc.push_str(&format!(
+            "Step {n} keeps the run going and is explained at some length here.\n"
+        ));
+    }
+    doc.push_str("The end is at agent.rs:1.\n");
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":doc}),
+    );
+    let output = dir.path().join("summary.md").to_string_lossy().into_owned();
+    let first = run(
+        &mut s,
+        "file_read",
+        json!({"path":output,"start_line":1,"max_lines":722}),
+    );
+    assert_eq!(first["content"]["truncated"], true, "{first}");
+    // A read of the output says where its open issues are.
+    assert_eq!(first["open_issue_lines"], json!([603]));
+    for _ in 0..s.config.repeated_read_limit {
+        s.history.push(
+            vec![json!({"role":"tool","content":json!({"status":"ok","data":first}).to_string()})],
+            true,
+        );
+    }
+    // The live model alternated max_lines to re-read the same budget-cut
+    // start of its output; any max_lines now delivers no new text.
+    let again = run(&mut s, "file_read", json!({"path":output}));
+    assert_eq!(again["suppressed"], true, "{again}");
+    assert_eq!(again["open_issue_lines"], json!([603]));
+    assert!(
+        again["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("open_issue_lines")
+    );
+    // Starting near the issue still reads.
+    let near = run(
+        &mut s,
+        "file_read",
+        json!({"path":output,"start_line":598,"max_lines":10}),
+    );
+    assert!(near.get("suppressed").is_none(), "{near}");
+}
+
+#[test]
+fn two_unresolved_citations_on_one_line_share_one_fix() {
+    let (dir, mut s) = source_setup();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    let source: String = (1..=40).map(|n| format!("fn f{n}() {{}}\n")).collect();
+    std::fs::write(dir.path().join("src/agent.rs"), source).unwrap();
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# A\n\nFrom agent.rs:3 to agent.rs:30-32.\n"}),
+    );
+    let issues = saved["citation_check"]["issues"].as_array().unwrap();
+    assert_eq!(issues.len(), 2, "{saved}");
+    assert!(issues[0]["fix"].is_object(), "{saved}");
+    assert!(issues[1].get("fix").is_none(), "{saved}");
+    assert_eq!(issues[1]["covered_by_line_fix"], true);
+    run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":saved["hash"],"edits":[issues[0]["fix"].clone()]}),
+    );
+    let doc = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+    assert!(
+        doc.contains("From src/agent.rs:3 to src/agent.rs:30-32."),
+        "{doc}"
+    );
+}

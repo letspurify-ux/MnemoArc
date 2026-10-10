@@ -4512,14 +4512,39 @@ fn resolve_path_source_ids(
     let mut resolved = serde_json::Map::new();
     for id in ids {
         let path = strip_line_suffix(id);
-        if s.source_refs(std::slice::from_ref(id)).is_ok()
-            || !(id.contains('/') || id.contains('.'))
-            || read_path(&s.project, path).is_err()
-        {
+        if s.source_refs(std::slice::from_ref(id)).is_ok() {
             out.push(id.clone());
             continue;
         }
-        let (start, end) = id[path.len()..]
+        // An S-ID with a line range appended (S570:211-325) names that
+        // source; a live checkpoint resent this shape after unknown_source.
+        if path != id && s.source_refs(&[path.to_owned()]).is_ok() {
+            if !out.iter().any(|known| known == path) {
+                out.push(path.to_owned());
+            }
+            resolved.insert(id.clone(), json!([path]));
+            continue;
+        }
+        if !(id.contains('/') || id.contains('.')) {
+            out.push(id.clone());
+            continue;
+        }
+        // A path relative to a subfolder (agent.rs for src/agent.rs) names
+        // the one delivered file it ends with; a live checkpoint spent four
+        // requests resending such paths after a generic unknown_source.
+        let project_path = if read_path(&s.project, path).is_ok() {
+            path.to_owned()
+        } else {
+            match delivered_file_ending_with(s, path)? {
+                Some(file) => file,
+                None => {
+                    out.push(id.clone());
+                    continue;
+                }
+            }
+        };
+        let path = project_path.as_str();
+        let (start, end) = id[strip_line_suffix(id).len()..]
             .strip_prefix(':')
             .map(|lines| {
                 let mut bounds = lines.split('-').map(|b| b.parse::<usize>().unwrap_or(0));
@@ -4548,6 +4573,77 @@ fn resolve_path_source_ids(
         resolved.insert(id.clone(), json!(ids));
     }
     Ok((out, resolved))
+}
+
+/// The project-relative path of the one file with delivered evidence whose
+/// path ends with `suffix` (whole components), or None when no delivered
+/// file does. Several matching files are an error naming them, since
+/// picking one would cite evidence the caller did not mean.
+fn delivered_file_ending_with(s: &Session, suffix: &str) -> Result<Option<String>> {
+    let wanted = Path::new(suffix);
+    if wanted.is_absolute() || suffix.is_empty() {
+        return Ok(None);
+    }
+    let root = s.project.root.canonicalize()?;
+    let mut files = BTreeSet::new();
+    for source in s.sources.values() {
+        if source.origin != "file" || source.evidence_truncated {
+            continue;
+        }
+        let Some(path) = source.path.as_deref() else {
+            continue;
+        };
+        let Ok(resolved) = read_path(&s.project, path) else {
+            continue;
+        };
+        if let Ok(relative) = resolved.strip_prefix(&root)
+            && relative.ends_with(wanted)
+        {
+            files.insert(relative.to_string_lossy().into_owned());
+        }
+    }
+    match files.len() {
+        0 => Ok(None),
+        1 => Ok(files.pop_first()),
+        _ => bail!(
+            "unknown_source: {suffix} is not a project path and several delivered files end with it ({}); pass the project-relative path of the intended file, or its S-ID",
+            files.into_iter().collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// The one file a cited path that is not a project path names: the one
+/// delivered file ending with it, else the one project file ending with it.
+/// None when no file or several do, since a guess could point elsewhere.
+fn file_ending_with(s: &Session, suffix: &str) -> Option<String> {
+    match delivered_file_ending_with(s, suffix) {
+        Ok(Some(file)) => return Some(file),
+        Ok(None) => {}
+        Err(_) => return None,
+    }
+    if Path::new(suffix).is_absolute() || suffix.is_empty() {
+        return None;
+    }
+    let root = s.project.root.canonicalize().ok()?;
+    let paths = candidate_paths(
+        &s.project,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .ok()?;
+    let mut found = None;
+    for path in &paths {
+        let Ok(relative) = path.strip_prefix(&root) else {
+            continue;
+        };
+        if relative.ends_with(suffix) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    found
 }
 
 /// A leading `1.`, `2.3` or `4)` label, without its trailing punctuation.
@@ -5614,6 +5710,15 @@ struct FileReadMetadata {
     read_start: usize,
     read_offset: usize,
     read_max_lines: usize,
+    #[serde(default)]
+    content: FileReadContent,
+}
+
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+struct FileReadContent {
+    /// The token budget cut the delivered text short of the range.
+    #[serde(default)]
+    truncated: bool,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -5807,14 +5912,30 @@ fn read_file(
                 && metadata.source.hash == digest
                 && metadata.read_start == start
                 && metadata.read_offset == offset
-                && metadata.read_max_lines == lines
+                // A read the token budget cut short delivers the same text
+                // for any larger max_lines; a live model alternated
+                // max_lines to re-read the start of its output 23 times.
+                && (metadata.read_max_lines == lines || metadata.content.truncated)
         })
         .take(s.config.repeated_read_limit)
         .count();
+    // Where the output's open audit issues are, so a read can start there
+    // instead of at line 1 again.
+    let issue_lines = (s.is_document_work()
+        && output_path(&s.project)
+            .and_then(|output| Ok(output.canonicalize()?))
+            .is_ok_and(|output| output == path))
+    .then(|| documentation::open_issue_lines(s, &path, &contents, OPEN_ISSUE_LINES))
+    .filter(|lines| !lines.is_empty());
     if prior >= s.config.repeated_read_limit && !args["force_read"].as_bool().unwrap_or(false) {
-        return Ok(
-            json!({"path":path,"hash":digest,"total_lines":contents.lines().count(),"repeated_read":true,"suppressed":true,"guidance":"Unchanged range already present repeatedly in active context. Reuse it, read another range, use document_inspect for output metadata, or force_read=true for deliberate verification."}),
-        );
+        let mut result = json!({"path":path,"hash":digest,"total_lines":contents.lines().count(),"repeated_read":true,"suppressed":true,"guidance":"Unchanged range already present repeatedly in active context. Reuse it, continue it with its next_cursor, read another range, use document_inspect for output metadata, or force_read=true for deliberate verification."});
+        if let Some(issue_lines) = &issue_lines {
+            result["open_issue_lines"] = json!(issue_lines);
+            result["guidance"] = json!(
+                "Unchanged range already present repeatedly in active context. To reach the document's open issues, read with start_line near an open_issue_lines entry or continue the earlier read with its next_cursor; document_audit lists each issue with its line, and a citation_path issue with a ready fix. force_read=true only for deliberate verification."
+            );
+        }
+        return Ok(result);
     }
     let mut content = bounded_text(s, selected, offset);
     let shown = content["text"].as_str().unwrap();
@@ -5863,10 +5984,15 @@ fn read_file(
     } else {
         (start - 1 + lines < contents.lines().count()).then_some(start + lines)
     };
-    Ok(
-        json!({"path":path,"total_lines":contents.lines().count(),"hash":digest,"read_start":start,"read_offset":offset,"read_max_lines":lines,"content":content,"source":source,"next_line":next_line,"next_offset":if truncated{content["next_offset"].clone()}else{json!(0)}}),
-    )
+    let mut result = json!({"path":path,"total_lines":contents.lines().count(),"hash":digest,"read_start":start,"read_offset":offset,"read_max_lines":lines,"content":content,"source":source,"next_line":next_line,"next_offset":if truncated{content["next_offset"].clone()}else{json!(0)}});
+    if let Some(issue_lines) = issue_lines {
+        result["open_issue_lines"] = json!(issue_lines);
+    }
+    Ok(result)
 }
+
+/// Open audit issue lines listed with a read of the output document.
+const OPEN_ISSUE_LINES: usize = 20;
 
 /// Machine-readable source citations in the configured output; zero when
 /// the document cannot be compared with any source.

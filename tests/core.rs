@@ -844,6 +844,7 @@ fn continuation_keeps_the_original_request_for_checkpointed_tasks() {
     let original =
         "Document the routes, preserving the authentication and error-handling requirements";
     s.add_user(original.into());
+    s.task.completion = vec!["Cover authentication and error handling".into()];
     let criteria = s.task.completion.clone();
     // The original prompt can leave the active context after a checkpoint.
     for bundle in &mut s.history.bundles {
@@ -867,7 +868,7 @@ fn continuation_keeps_the_original_request_for_checkpointed_tasks() {
     }
     s.start_new_task("continue".into());
     assert_eq!(s.latest_request, "continue");
-    assert_ne!(s.task.completion, criteria);
+    assert!(s.task.completion.is_empty());
 }
 
 #[test]
@@ -886,12 +887,9 @@ fn first_prompt_preserves_prepared_completion_and_new_tasks_start_with_criteria(
     s.add_user("Document the routes".into());
     assert_eq!(s.task.completion, ["Check every requested flow"]);
     assert_eq!(s.task.deliverables, ["Report"]);
-    assert_eq!(
-        s.request_review_criteria.completion,
-        ["Check every requested flow"]
-    );
-    assert_eq!(s.request_review_criteria.constraints, ["Use Korean"]);
-    assert_eq!(s.request_review_criteria.deliverables, ["Report"]);
+    assert_eq!(s.user_criteria.completion, ["Check every requested flow"]);
+    assert_eq!(s.user_criteria.constraints, ["Use Korean"]);
+    assert_eq!(s.user_criteria.deliverables, ["Report"]);
     assert_eq!(s.task.workflow, "source_document");
     assert!(s.task.revision > prepared_revision);
     s.add_user("계속 진행".into());
@@ -900,12 +898,13 @@ fn first_prompt_preserves_prepared_completion_and_new_tasks_start_with_criteria(
         .constraints
         .push("Record every investigation ID in the document".into());
     s.add_user("Explain a different module".into());
-    assert_eq!(s.task.completion.len(), 1);
-    assert!(s.task.completion[0].contains("Explain a different module"));
+    // A new task starts without completion criteria; the request itself is
+    // the requirement.
+    assert!(s.task.completion.is_empty());
     assert!(s.task.deliverables.is_empty());
-    assert!(s.request_review_criteria.completion.is_empty());
-    assert_eq!(s.request_review_criteria.constraints, ["Use Korean"]);
-    assert!(s.request_review_criteria.deliverables.is_empty());
+    assert!(s.user_criteria.completion.is_empty());
+    assert_eq!(s.user_criteria.constraints, ["Use Korean"]);
+    assert!(s.user_criteria.deliverables.is_empty());
     // The session's selection carries over to the new task.
     assert_eq!(s.task.workflow, "source_document");
 }
@@ -1155,13 +1154,13 @@ fn answer_workflow_withholds_document_audit() {
 }
 
 #[test]
-fn long_user_request_keeps_a_bounded_completion_and_full_request() {
+fn long_user_request_is_kept_whole_without_a_copy_in_completion() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     let request = "사용자 요구 조건과 예외 처리 확인. ".repeat(2000);
     s.add_user(request.clone());
     assert_eq!(s.latest_request, request);
-    assert!(s.task.completion[0].contains("latest_request"));
+    assert!(s.task.completion.is_empty());
     assert!(ContextManager::state(&s).is_ok());
 }
 

@@ -27,7 +27,7 @@ pub const CLOSING_ROUND_LIMIT: usize = 12;
 /// keeps: the closing write, the final answer and one repair of a rejected
 /// final. Should the deadline fall before a second final, the runtime
 /// reports the same unresolved items that final would have been accepted
-/// with. Six used to leave room for the document review as well.
+/// with.
 const CLOSING_REQUEST_RESERVE: f64 = 3.0;
 const MAX_REPORTED_GAPS: usize = 30;
 
@@ -64,7 +64,7 @@ fn closing_instruction(s: &Session) -> String {
         );
     }
     format!(
-        "Closing mode: finish the requested document now from the evidence already gathered; discovery tools are withheld. 1) Write any missing requested section from gathered evidence, stating in the text when a fact is unconfirmed. 2) For a cited range reported as unread (citation_check or document_readiness unread_citation), file_read that range or narrow the citation to the lines already read; qualify a claim that cannot be supported in its section instead of describing it as verified. If the document cites no project source at all, cite the sources of its claims as path:start-end from ranges already read. 3) Complete or remove remaining to-dos with actual results, then give a concise final answer. At most {remaining} requests remain; afterwards the runtime finishes the document and lists every unresolved item. Do not invent evidence."
+        "Closing mode: finish the requested document now from the evidence already gathered; discovery tools are withheld. 1) Write any missing requested section from gathered evidence, stating in the text when a fact is unconfirmed. 2) For a cited range reported as unread (citation_check or document_readiness unread_citation), file_read that range or narrow the citation to the lines already read; qualify a claim that cannot be supported in its section instead of describing it as verified. For a citation whose path or range is invalid (citation_path or citation_range), send the fix of every such issue from document_audit together in one document_edit_batch; where an issue has no fix, correct that citation to an existing project path:start-end or remove it. If the document cites no project source at all, cite the sources of its claims as path:start-end from ranges already read. 3) Complete or remove remaining to-dos with actual results, then give a concise final answer. At most {remaining} requests remain; afterwards the runtime finishes the document and lists every unresolved item. Do not invent evidence."
     )
 }
 
@@ -105,7 +105,20 @@ fn plan_check(s: &mut Session) -> Option<String> {
         }
         (format!("empty:{}", s.task.plan_revision), "task_plan is empty. Add one short item per section or area the request covers (one sentence naming it and its main source files), plus final verification, using task_plan action=apply with expected_revision 0; then work through them.".to_owned())
     } else if checkpoint_done {
-        (format!("checkpoint:{}", s.checkpoints_completed), "A checkpoint just completed and task_plan was preserved. Check current_todo and the remaining items against the saved document, and update them if the work has moved on, before continuing.".to_owned())
+        // Before the first save there is no document to compare with; a live
+        // run was told to check its plan "against the saved document" at five
+        // checkpoints before it wrote anything.
+        let against = if s.document_written {
+            "the saved document"
+        } else {
+            "the work done so far (no document is saved yet)"
+        };
+        (
+            format!("checkpoint:{}", s.checkpoints_completed),
+            format!(
+                "A checkpoint just completed and task_plan was preserved. Check current_todo and the remaining items against {against}, and update them if the work has moved on, before continuing."
+            ),
+        )
     } else if let Some(watch) = &mut s.progress_recovery.todo_watch {
         let id = watch.id.clone();
         if sections > watch.sections {
@@ -202,7 +215,11 @@ const READY_FOR_FINAL_INSTRUCTION: &str = "Ready to finish, provided every reque
 /// Document work whose own bookkeeping is finished: the next useful step is
 /// the final answer.
 fn ready_for_final(s: &mut Session) -> bool {
-    s.task.current_todo().is_none() && ready_except_plan(s)
+    // Audit even while a to-do is open: closing mode reads the document's
+    // problems from document_readiness, which a live closing never received
+    // because its last to-do stayed open.
+    let ready = ready_except_plan(s);
+    ready && s.task.current_todo().is_none()
 }
 
 /// Everything the final answer needs except that to-dos remain open. The
@@ -238,6 +255,8 @@ fn ready_except_plan(s: &mut Session) -> bool {
                 "citations_checked":audit["citations_checked"],"issue_count":audit["issue_count"]});
             true
         }
+        // issue_kinds (from the audit) still shows the whole set: a live
+        // closing saw five of 17 path issues and never their scale.
         Ok(mut audit) => {
             if let Some(issues) = audit["issues"].as_array_mut() {
                 issues.truncate(5);
@@ -1403,24 +1422,13 @@ pub async fn run_session_controlled(
             "current_todo":s.task.current_todo(),
             "max_tool_calls":32.min(if s.checkpoint.is_some() { ContextManager::cleanup_result_budget(&s.config) } else { s.config.batch_tokens } / 200),
             "plan_pending_count":s.task.todos.iter().filter(|item| !item.done).count(),
-            "plan_instruction":"Keep task_plan covering the requested work: if it is empty or misses a requested section or area, add items for them with action=apply. Execute current_todo before later items. Insert a concrete prerequisite before it when needed, or split a broad pending item into ordered smaller outcomes while preserving its goal. Complete the current item through task_plan with the observed result. If the plan is full, finish the current item or remove obsolete pending items; do not stop the task.",
-            "writing_reserve_tokens":(s.config.run_tokens as f64*s.config.writing_reserve_ratio) as usize,
-            "verification_reserve_tokens":(s.config.run_tokens as f64*s.config.verification_reserve_ratio) as usize,
             "finalization_error":s.last_error.as_deref().filter(|error| finalization_attempts > 0 || error.starts_with("task_plan_pending:")),
             "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: the last requests produced no new evidence, document change or resolved citation. Change approach instead of repeating them: read sources the document still needs and has not read, write or correct a section, or file_read a cited range reported as unread. Do not repeat an unchanged read, plan rewrite or memory save. If a claim cannot be supported, mark that gap in the relevant section and continue with supported work; do not invent evidence." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"For source documentation, batch reads for missing evidence, then repair known issues in their original locations with targeted section or text edits when safe. Corrections are edits, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Keep correcting the original requirements within the remaining run tokens and time.","draft"=>"Half of the run budget is spent: plan the remaining reading and writing so the requested document is complete and verified within remaining_tokens and remaining_seconds. Save sections in separate edits; place each from the outline in the last save result, use insert_before/insert_after for siblings and insert_first_child/insert_last_child for nested sections when that preserves the document flow, and copy section_path when headings repeat.",_=>if answer_workflow { ANSWER_INVESTIGATE_INSTRUCTION } else { "For source documentation, judge from the request and the evidence how much to read and when the document is complete. When a section's evidence is in context, write that section with its path:start-end citations right away, then read for the next one; save sections in separate edits rather than one full-file write; place each from the outline in the last save result (document_inspect only when none is in context), copy section_path when headings repeat, and use sibling or child insertion to place it within the hierarchy. Batch independent searches or reads together instead of paying a model round per file." }} }});
         s.run_guidance["progress_recovery"]["rounds_since_progress"] = json!(stall_rounds);
         s.run_guidance["progress_recovery"]["closing_after"] =
             json!(closing_stall_limit(&s.config));
         if answer_workflow {
-            // Drafting/verification reserves, document repair counts and
-            // closing belong to document work, which answer never enters.
-            for key in [
-                "writing_reserve_tokens",
-                "verification_reserve_tokens",
-                "pending_count",
-            ] {
-                s.run_guidance.as_object_mut().unwrap().remove(key);
-            }
+            // Closing belongs to document work, which answer never enters.
             s.run_guidance["progress_recovery"]
                 .as_object_mut()
                 .unwrap()
@@ -1442,7 +1450,7 @@ pub async fn run_session_controlled(
             && s.run_guidance["document_readiness"]["structural_ok"] == false
         {
             s.run_guidance["instruction"] = json!(
-                "The document is not ready for final acceptance. Resolve document_readiness.issues using their next actions: file_read each unread_citation range (or narrow that citation to the lines already read), or repair the reported format/citation problem. Do not submit another final answer before those issues are resolved. For additional issues, use document_audit with offset=next_offset and expected_revision=revision from this audit."
+                "The document is not ready for final acceptance. Resolve document_readiness.issues using their next actions: file_read each unread_citation range (or narrow that citation to the lines already read), send the fix of each citation_path issue together in one document_edit_batch, or repair the reported format/citation problem at its line. Do not submit another final answer before those issues are resolved. For additional issues, use document_audit with offset=next_offset and expected_revision=revision from this audit."
             );
         }
         if let Some(closing) = &s.progress_recovery.closing {
@@ -2774,6 +2782,43 @@ mod plan_check_tests {
                 .contains("current for 4 requests")
         );
     }
+
+    #[test]
+    fn a_checkpoint_before_the_first_save_names_no_saved_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            Config::compact_test(),
+        );
+        s.select_workflow("source_document").unwrap();
+        s.add_user("Write a source document".into());
+        tools::execute(
+            &mut s,
+            "task_plan",
+            json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Read the request flow","Write the document"]}]}),
+        )
+        .unwrap();
+        s.task_rounds = 1;
+        assert_eq!(plan_check(&mut s), None);
+        s.checkpoints_completed = 1;
+        let before_save = plan_check(&mut s).unwrap();
+        assert!(
+            before_save.contains("no document is saved yet"),
+            "{before_save}"
+        );
+        assert!(!before_save.contains("the saved document"), "{before_save}");
+        s.document_written = true;
+        s.checkpoints_completed = 2;
+        let after_save = plan_check(&mut s).unwrap();
+        assert!(
+            after_save.contains("against the saved document"),
+            "{after_save}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2842,6 +2887,51 @@ mod readiness_tests {
         std::fs::write(dir.path().join("a.rs"), "fn changed() {}\nfn b() {}\n").unwrap();
         assert!(!ready_for_final(&mut s));
         assert_eq!(s.run_guidance["document_readiness"]["structural_ok"], false);
+    }
+
+    #[test]
+    fn closing_with_an_open_to_do_still_reports_document_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/agent.rs"), "fn a() {}\n").unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            Config {
+                model: "gpt-4o".into(),
+                ..Config::compact_test()
+            },
+        );
+        s.add_user("Document agent.rs.".into());
+        s.select_workflow("source_document").unwrap();
+        tools::execute(
+            &mut s,
+            "task_plan",
+            json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Write the document"]}]}),
+        )
+        .unwrap();
+        tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"create","text":"# Manual\n\nStarts at agent.rs:1.\n"}),
+        )
+        .unwrap();
+        // A live closing kept its last to-do open and never received the
+        // document's problems.
+        s.progress_recovery.closing = Some(Default::default());
+        assert!(!ready_for_final(&mut s));
+        let readiness = &s.run_guidance["document_readiness"];
+        assert_eq!(readiness["structural_ok"], false, "{readiness}");
+        assert_eq!(readiness["issue_kinds"]["citation_path"], 1, "{readiness}");
+        assert_eq!(
+            readiness["issues"][0]["fix"],
+            json!({"action":"replace_text","old_text":"agent.rs:1","text":"src/agent.rs:1"})
+        );
+        let instruction = closing_instruction(&s);
+        assert!(instruction.contains("citation_path"), "{instruction}");
     }
 
     #[test]
