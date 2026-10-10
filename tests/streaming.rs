@@ -333,65 +333,6 @@ async fn connection_probe_times_out_despite_stream_keepalives() {
     assert!(count.load(Ordering::SeqCst) >= 2);
 }
 #[tokio::test]
-async fn a_completion_names_its_upstream_provider_and_first_event_delay() {
-    // The same request took 116 s in one run and 11 s in another, with
-    // nothing to tell waiting at the provider from generating.
-    use futures_util::StreamExt;
-    let first = event(
-        json!({"provider":"Novita","choices":[{"delta":{"content":"O"},"finish_reason":null}]}),
-    );
-    let rest = format!(
-        "{}data: [DONE]\n\n",
-        event(
-            json!({"provider":"Novita","choices":[{"delta":{"content":"K"},"finish_reason":"stop"}]})
-        )
-    );
-    let app = Router::new().route(
-        "/chat/completions",
-        post(move || {
-            let (first, rest) = (first.clone(), rest.clone());
-            async move {
-                let delayed = futures_util::stream::once(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    Ok::<_, std::io::Error>(axum::body::Bytes::from(first))
-                })
-                .chain(futures_util::stream::once(async move {
-                    Ok::<_, std::io::Error>(axum::body::Bytes::from(rest))
-                }));
-                (
-                    [(header::CONTENT_TYPE, "text/event-stream")],
-                    axum::body::Body::from_stream(delayed),
-                )
-                    .into_response()
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let config = Config {
-        base_url: url,
-        retries: 0,
-        ..support::compact_config()
-    };
-    let (tx, _rx) = tokio::sync::mpsc::channel(8);
-    let completion = OpenAiClient
-        .complete(
-            json!({"messages":[]}),
-            &config,
-            CancellationToken::new(),
-            tx,
-        )
-        .await
-        .unwrap();
-    server.abort();
-    assert_eq!(completion.text, "OK");
-    assert_eq!(completion.provider.as_deref(), Some("Novita"));
-    let waited = completion.first_event_seconds.unwrap();
-    assert!((0.3..10.0).contains(&waited), "{waited}");
-}
-
-#[tokio::test]
 async fn assemble_interleaved_calls_and_usage() {
     let body=[event(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"memory_read","arguments":"{\"id\":"}},{"index":1,"id":"c2","function":{"name":"memory_read","arguments":"{\"id\":"}}]},"finish_reason":null}]})),event(json!({"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"b\"}"}},{"index":0,"function":{"arguments":"\"a\"}"}}]},"finish_reason":"tool_calls"}]})),event(json!({"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":3}}})),"data: [DONE]\n\n".into()].concat();
     let (url, server) = server(body).await;

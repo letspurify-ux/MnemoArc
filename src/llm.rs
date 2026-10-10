@@ -94,13 +94,6 @@ pub struct Completion {
     pub attempt_diagnostics: Vec<AttemptDiagnostic>,
     pub length_limited: bool,
     pub discarded_tool_calls: bool,
-    /// The upstream provider a gateway such as OpenRouter routed the request
-    /// to, when its stream names one.
-    pub provider: Option<String>,
-    /// Seconds from sending the request to its first stream event. The same
-    /// request took 116 s in one run and 11 s in another; this tells waiting
-    /// at the provider from generating.
-    pub first_event_seconds: Option<f64>,
 }
 
 impl Completion {
@@ -515,7 +508,6 @@ impl OpenAiClient {
         // answer that keeps streaming (or sends keepalives) is not cut off.
         // The run deadline bounds total duration.
         let idle = Duration::from_secs(c.request_timeout_secs);
-        let sent = std::time::Instant::now();
         let response = tokio::select! {
             _ = cancel.cancelled() => bail!("cancelled"),
             r = tokio::time::timeout(idle, req.send()) => r.map_err(|_| {
@@ -576,12 +568,6 @@ impl OpenAiClient {
                 }
                 let v: Value = serde_json::from_str(&event)
                     .map_err(|e| anyhow::anyhow!("invalid_stream_event: {e}"))?;
-                if out.first_event_seconds.is_none() {
-                    out.first_event_seconds = Some(sent.elapsed().as_secs_f64());
-                }
-                if out.provider.is_none() {
-                    out.provider = v["provider"].as_str().map(str::to_owned);
-                }
                 if !v["error"].is_null() {
                     // Gateways such as OpenRouter open the stream with 200 and
                     // report an upstream overload or rate limit as an error

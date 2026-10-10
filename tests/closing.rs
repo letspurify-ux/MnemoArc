@@ -1613,11 +1613,10 @@ async fn a_checkpoint_on_the_last_closing_request_keeps_that_request() {
 }
 
 /// Scripted replies with a delay each, recording every request's
-/// run_guidance and output allowance, and the run's notices.
+/// run_guidance.
 struct Paced {
     steps: Mutex<Vec<(std::time::Duration, Completion)>>,
     guidance: Mutex<Vec<Value>>,
-    output_tokens: Mutex<Vec<usize>>,
 }
 
 #[async_trait]
@@ -1625,7 +1624,7 @@ impl LlmClient for Paced {
     async fn complete(
         &self,
         request: Value,
-        config: &Config,
+        _: &Config,
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
@@ -1640,10 +1639,6 @@ impl LlmClient for Paced {
             .lock()
             .unwrap()
             .push(state["run_guidance"].clone());
-        self.output_tokens
-            .lock()
-            .unwrap()
-            .push(config.output_tokens);
         let step = {
             let mut steps = self.steps.lock().unwrap();
             if steps.is_empty() {
@@ -1659,27 +1654,17 @@ impl LlmClient for Paced {
 async fn run_paced(
     s: Session,
     steps: Vec<(std::time::Duration, Completion)>,
-) -> (Session, Vec<Value>, Vec<usize>, Vec<String>) {
+) -> (Session, Vec<Value>) {
     let client = Arc::new(Paced {
         steps: Mutex::new(steps),
         guidance: Mutex::new(vec![]),
-        output_tokens: Mutex::new(vec![]),
     });
     let (tx, mut rx) = mpsc::channel(256);
-    let drain = tokio::spawn(async move {
-        let mut notices = Vec::new();
-        while let Some(event) = rx.recv().await {
-            if let AgentEvent::Notice { text, .. } = event {
-                notices.push(text);
-            }
-        }
-        notices
-    });
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result = run_session(s, client.clone(), CancellationToken::new(), tx).await;
-    let notices = drain.await.unwrap();
+    drain.await.unwrap();
     let guidance = client.guidance.lock().unwrap().clone();
-    let output_tokens = client.output_tokens.lock().unwrap().clone();
-    (result, guidance, output_tokens, notices)
+    (result, guidance)
 }
 
 fn text(reply: &str) -> Completion {
@@ -1705,7 +1690,7 @@ async fn a_deadline_inside_a_request_finishes_with_the_gap_report() {
         std::time::Duration::from_secs(4),
         call("read", "file_read", json!({"path":"main.js"})),
     )];
-    let (result, guidance, _, _) = run_paced(s, steps).await;
+    let (result, guidance) = run_paced(s, steps).await;
     assert_eq!(guidance.len(), 1);
     assert_eq!(
         result.status, "complete_with_gaps",
@@ -1749,7 +1734,7 @@ async fn a_slow_model_closes_early_and_skips_a_request_that_cannot_end() {
             result
         }
     };
-    let ((capped, capped_guidance, _, _), (open, open_guidance, _, _)) =
+    let ((capped, capped_guidance), (open, open_guidance)) =
         tokio::join!(slow_run(0.25), slow_run(0.9));
     assert!(
         capped_guidance[1]["closing"].is_null(),
@@ -1836,14 +1821,13 @@ async fn run_switching(
     s: Session,
     steps: Vec<(std::time::Duration, Completion)>,
     at: usize,
-) -> (Session, Vec<Value>, Vec<usize>) {
+) -> (Session, Vec<Value>) {
     let mut next = s.config.clone();
     next.model = "gpt-4o-mini".into();
     let (commands, receiver) = mpsc::channel(4);
     let paced = Arc::new(Paced {
         steps: Mutex::new(steps),
         guidance: Mutex::new(vec![]),
-        output_tokens: Mutex::new(vec![]),
     });
     let client = Arc::new(SwitchModel {
         inner: paced.clone(),
@@ -1858,8 +1842,7 @@ async fn run_switching(
             .await;
     drain.await.unwrap();
     let guidance = paced.guidance.lock().unwrap().clone();
-    let output_tokens = paced.output_tokens.lock().unwrap().clone();
-    (result, guidance, output_tokens)
+    (result, guidance)
 }
 
 #[tokio::test]
@@ -1879,7 +1862,7 @@ async fn a_model_switched_mid_run_learns_its_own_pace() {
         ),
         (std::time::Duration::ZERO, text("Saved out.md.")),
     ];
-    let (result, guidance, _) = run_switching(s, steps, 1).await;
+    let (result, guidance) = run_switching(s, steps, 1).await;
     assert_eq!(result.config.model, "gpt-4o-mini");
     assert!(guidance[1]["closing"].is_null(), "{}", guidance[1]);
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
