@@ -214,6 +214,17 @@ fn collect_gaps(s: &mut Session) -> Vec<String> {
                     for issue in issues.iter().take(12) {
                         gaps.push(format!("문서 검토 지적 — {issue}"));
                     }
+                    let unreached = tools::document_review::unreached_ranges(s);
+                    if !unreached.is_empty() {
+                        let ranges = unreached
+                            .iter()
+                            .map(|(start, end)| format!("{start}–{end}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        gaps.push(format!(
+                            "문서 검토 — 지적이 한 번에 받는 최대 건수에 도달해 {ranges}줄은 이번 검토에서 확인하지 못했습니다. 지적을 고친 뒤의 검토가 이 부분을 이어서 확인합니다."
+                        ));
+                    }
                 }
                 tools::document_review::CurrentVerdict::Unavailable => {
                     if ranges.is_empty() {
@@ -221,7 +232,12 @@ fn collect_gaps(s: &mut Session) -> Vec<String> {
                     }
                 }
                 tools::document_review::CurrentVerdict::Unreviewed => {
-                    gaps.push("문서 검토 — 현재 문서를 마감 전에 검토하지 못했습니다.".into());
+                    gaps.push(match tools::document_review::paused_pages(s) {
+                        Some(pages) => format!(
+                            "문서 검토 — 마감 전에 검토를 마치지 못했습니다(검토 요청 {pages}건 완료). 문서를 고치지 않고 이어서 진행하면 남은 부분부터 검토합니다."
+                        ),
+                        None => "문서 검토 — 현재 문서를 마감 전에 검토하지 못했습니다.".into(),
+                    });
                 }
             }
             if !ranges.is_empty() {
@@ -642,7 +658,9 @@ fn force_finish(s: &mut Session, cause: &str) -> Option<String> {
     }
     s.set_run_stop_reason(cause);
     if s.document_review.pending {
-        tools::document_review::defer_for_repair(s);
+        // Keep the answered pages: a resumed run continues the review of
+        // the unchanged document instead of starting it over.
+        tools::document_review::pause(s);
     }
     s.continuation = None;
     s.completion_gaps = collect_gaps(s);
@@ -958,18 +976,17 @@ async fn execute_one(
     if tokio::time::Instant::now() >= run_deadline {
         return (s, tools::envelope(Err(anyhow::anyhow!("run_timeout"))));
     }
-    let deadline = ToolDeadline::new(
-        Duration::from_secs(s.config.tool_timeout_secs),
-        run_deadline,
-    );
+    let timeout = s.config.tool_timeout_secs;
+    let deadline = ToolDeadline::new(Duration::from_secs(timeout), run_deadline);
     let backup = s.clone();
     let child = cancel.child_token();
+    let tool = call.name.clone();
     let external_write = tools::external_write(&call.name);
     let receiver = match spawn_tool_worker(s, call, child.clone()) {
         Ok(receiver) => receiver,
         Err(error) => return (backup, tools::envelope(Err(error.into()))),
     };
-    await_tool_worker(
+    let (session, result) = await_tool_worker(
         backup,
         receiver,
         cancel,
@@ -978,7 +995,31 @@ async fn execute_one(
         Duration::from_secs(1),
         external_write,
     )
-    .await
+    .await;
+    if result["error"] == "tool_timeout" {
+        let error = anyhow::anyhow!(stop_message("tool_timeout", &tool, timeout));
+        return (session, tools::envelope(Err(error)));
+    }
+    (session, result)
+}
+
+/// Why a tool call was stopped at its deadline. A search or listing stopped
+/// at the tool time limit stops the same way again over the same scope, so
+/// it names the scope as the cause: a bare tool_timeout read as transient
+/// and invited the identical call.
+fn stop_message(reason: &str, tool: &str, secs: u64) -> String {
+    if reason == "tool_timeout"
+        && matches!(
+            tool,
+            "file_list" | "source_search" | "symbol_search" | "symbol_relations" | "code_outline"
+        )
+    {
+        format!(
+            "scope_timeout: {tool} did not finish within the {secs}s tool time limit, and the same call would stop again; narrow its scope (path, path_glob, or a more specific query or pattern) or split it into smaller calls"
+        )
+    } else {
+        reason.to_owned()
+    }
 }
 
 type ToolOutcome = (Session, Value);
@@ -1198,6 +1239,7 @@ async fn read_parallel(
             let deadline = ToolDeadline::new(Duration::from_secs(timeout), run_deadline);
             let child = cancel.child_token();
             let _worker_cancel = child.clone().drop_guard();
+            let tool = call.name.clone();
             let mut receiver = spawn_tool_worker(temporary, call, child.clone())
                 .map_err(|error| {
                     if error.to_string().starts_with("tool_worker_capacity:") {
@@ -1219,7 +1261,7 @@ async fn read_parallel(
                 }
                 _ = tokio::time::sleep_until(deadline.at) => {
                     child.cancel();
-                    Err(anyhow::anyhow!(deadline.reason))
+                    Err(anyhow::anyhow!(stop_message(deadline.reason, &tool, timeout)))
                 }
             }
         }
@@ -4018,6 +4060,26 @@ mod worker_wait_tests {
         .expect("run deadline must bound a stuck read");
         assert_eq!(result["error"], "run_timeout");
         assert!(child.is_cancelled());
+    }
+
+    #[test]
+    fn a_search_stopped_at_the_tool_time_limit_is_told_to_narrow_its_scope() {
+        // A bare tool_timeout was classified as transient, which invites the
+        // same wide search again.
+        let message = stop_message("tool_timeout", "source_search", 30);
+        assert!(message.starts_with("scope_timeout: source_search did not finish within the 30s"));
+        let recovery = tools::recovery::describe(&message);
+        assert_eq!(recovery["code"], "scope_timeout");
+        assert_eq!(recovery["action"], "reduce_request_or_cleanup");
+        // Other tools and the run deadline keep their reason.
+        assert_eq!(
+            stop_message("tool_timeout", "file_read", 30),
+            "tool_timeout"
+        );
+        assert_eq!(
+            stop_message("run_timeout", "source_search", 30),
+            "run_timeout"
+        );
     }
 
     #[tokio::test]

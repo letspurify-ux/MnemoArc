@@ -1460,8 +1460,70 @@ pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Va
             );
             check["broad_citation_guidance"] = json!(BROAD_CITATION_GUIDANCE);
         }
+        // The review leaves such a line out of its evidence and reports the
+        // citation for repair; saying so now saves that review cycle.
+        let long = long_line_citations(s, output, doc);
+        if !long.is_empty() {
+            check["long_line_citation_count"] = json!(long.len());
+            check["long_line_citations"] = json!(long.iter().take(8).collect::<Vec<_>>());
+            check["long_line_guidance"] = json!(format!(
+                "Each listed citation includes a source line longer than {} bytes (generated or minified text). The document review cannot send such a line to the reviewer and reports the citation for repair. Leave that line out of the range, or cite the code that produces or reads its content.",
+                super::document_review::evidence_line_limit(&s.config)
+            ));
+        }
     }
     Ok(check)
+}
+
+/// Citations whose cited lines include one longer than the document review
+/// sends as evidence: the citation, its document line and the first such
+/// source line with its length. A review used to fail on such a line with
+/// "narrow citations", which a single line cannot do.
+pub(super) fn long_line_citations(s: &Session, output: &Path, doc: &str) -> Vec<Value> {
+    let limit = super::document_review::evidence_line_limit(&s.config);
+    let Ok(citations) = citation_spans(doc) else {
+        return Vec::new();
+    };
+    let mut files = BTreeMap::<PathBuf, Vec<(usize, usize)>>::new();
+    citations
+        .iter()
+        .filter_map(|citation| {
+            let path = cited_path(s, output, citation).ok()?;
+            let long = files.entry(path).or_insert_with_key(|path| {
+                super::long_text_lines(path)
+                    .map(|lines| {
+                        lines
+                            .into_iter()
+                            .filter(|&(_, bytes)| bytes > limit)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            });
+            let &(line, bytes) = long
+                .iter()
+                .find(|&&(line, _)| citation.begin <= line && line <= citation.end)?;
+            Some(
+                json!({"citation":citation.raw,"document_line":citation.document_line,
+                "source_line":line,"bytes":bytes}),
+            )
+        })
+        .collect()
+}
+
+/// The project file a citation names: relative links resolve against the
+/// document's directory, other paths against the project root.
+pub(super) fn cited_path(s: &Session, output: &Path, citation: &Citation) -> Result<PathBuf> {
+    let path = if citation.relative_link {
+        output
+            .parent()
+            .unwrap()
+            .join(&citation.path)
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        citation.path.clone()
+    };
+    read_path(&s.project, &path)
 }
 
 const BROAD_CITATION_GUIDANCE: &str = "Each broad citation spans 120 or more source lines. The document review sends every cited line to the reviewer, so long ranges add review requests and time to each review of this document. Where a claim rests on a few lines (a declaration, branch, call or constant), cite those lines; keep a long range only when the claim describes all of it.";

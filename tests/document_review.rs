@@ -2690,22 +2690,294 @@ fn a_rereview_page_lists_only_its_own_changed_sections() {
     assert!(payloads.iter().all(|p| p["changed_sections"].is_null()));
     assert!(document_review::approved(&s));
 
-    // Lines 2-4 hold S0, so S1 is on the first page and S50 (line 152) on a
-    // later one.
+    // S1 starts on line 5 and S50 on line 152: the re-review requests one
+    // range from each and nothing between them.
     let doc = doc
         .replace("Text 1. ", "Text one. ")
         .replace("Text 50. ", "Text fifty. ");
     std::fs::write(&s.project.output, &doc).unwrap();
     payloads.clear();
     review(&mut s, &mut payloads);
-    assert!(payloads.len() > 1);
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(payloads[0]["document_line_start"], 5);
     assert_eq!(payloads[0]["changed_sections"], json!(["# Guide > ## S1"]));
-    let late = payloads
-        .iter()
-        .find(|p| p["document_line_start"].as_u64().unwrap() > 1)
-        .unwrap();
-    assert_eq!(late["changed_sections"], json!(["# Guide > ## S50"]));
+    assert_eq!(payloads[1]["document_line_start"], 152);
+    assert_eq!(payloads[1]["changed_sections"], json!(["# Guide > ## S50"]));
     for payload in &payloads {
         assert_eq!(payload["changed_section_count"], 2, "{payload}");
     }
+}
+
+/// The payload of the next review request.
+fn next_payload(s: &mut Session) -> Value {
+    let request = document_review::request(s).unwrap();
+    serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap()
+}
+
+/// A factual issue about the document line `line` that reads `quote`.
+fn line_issue(line: usize, quote: &str) -> Value {
+    json!({"previous_id":null,"kind":"factual",
+        "document":{"start_line":line,"end_line":line,"quote":quote},
+        "requirement_id":null,
+        "sources":[{"path":"main.js","start_line":4,"end_line":4,"quote":"work(turns);"}],
+        "problem":format!("{quote} misstates the loop."),"correction":"State the loop bound.","ui_labels":[]})
+}
+
+/// "# Guide" and `sections` sections of three lines: "## S{i}" on line
+/// 2 + 3i, then "Text {i}." with a citation, then a blank line.
+fn guide(sections: usize) -> String {
+    let mut doc = String::from("# Guide\n");
+    for i in 0..sections {
+        doc.push_str(&format!("## S{i}\nText {i}. main.js:1-6\n\n"));
+    }
+    doc
+}
+
+#[test]
+fn a_review_stops_at_its_finding_limit_and_the_next_one_covers_the_rest() {
+    // Live: once twelve candidates were collected, later pages kept being
+    // requested, their findings were dropped, and every section was marked
+    // reviewed, so a re-review never looked at them again.
+    let (_dir, mut s) = fixture();
+    std::fs::write(&s.project.output, guide(60)).unwrap();
+    s.document_review = Default::default();
+    let first = next_payload(&mut s);
+    assert_eq!(first["document_line_start"], 1);
+    let end = first["document_line_end"].as_u64().unwrap() as usize;
+    let issues: Vec<Value> = (0..12)
+        .map(|i| line_issue(3 + 3 * i, &format!("Text {i}.")))
+        .collect();
+    support::document_review::finish(&mut s, &json!({"issues":issues}).to_string()).unwrap();
+    // No further range was requested: the twelve findings went to validation
+    // and the verdict asks for their repair.
+    assert!(!s.document_review.pending);
+    assert_eq!(s.document_review.issues.len(), 12);
+    assert_eq!(document_review::unreached_ranges(&s), [(end + 1, 181)]);
+
+    // The repair review re-checks the repaired passages and covers the
+    // unreached sections in full: they are listed as changed and their
+    // citations are sent.
+    let doc = guide(60).replace("Text 0. ", "Text zero. ");
+    std::fs::write(&s.project.output, &doc).unwrap();
+    let mut late = Vec::new();
+    loop {
+        let payload = next_payload(&mut s);
+        if payload["document_line_start"].as_u64().unwrap() as usize > end {
+            late.push(payload);
+        }
+        support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+        if !s.document_review.pending {
+            break;
+        }
+    }
+    assert!(!late.is_empty());
+    for payload in &late {
+        assert!(!payload["changed_sections"].as_array().unwrap().is_empty());
+        assert!(!payload["evidence"].as_array().unwrap().is_empty());
+    }
+    assert!(document_review::approved(&s));
+    assert!(document_review::unreached_ranges(&s).is_empty());
+}
+
+/// Dismiss every candidate of the pending finding validation.
+fn dismiss_all(s: &mut Session) {
+    while s.document_review.validating {
+        let payload = next_payload(s);
+        let decisions: Vec<Value> = payload["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| json!({"id":c["id"],"status":"dismissed","reason":"The source supports the passage as written.","duplicate_of":null}))
+            .collect();
+        document_review::finish(s, &json!({"decisions":decisions}).to_string()).unwrap();
+    }
+}
+
+#[test]
+fn a_full_cycle_of_dismissed_findings_continues_the_review_once_per_position() {
+    let (dir, mut s) = fixture();
+    // The second range cites a long file, so it spans several evidence pages.
+    let big: String = (1..=600)
+        .map(|n| {
+            format!(
+                "const value_{n} = compute_value({n}, \"{}\");\n",
+                "x".repeat(40)
+            )
+        })
+        .collect();
+    std::fs::write(dir.path().join("big.js"), big).unwrap();
+    let mut doc = guide(40);
+    let second = doc.lines().count() + 1;
+    for i in 0..12 {
+        doc.push_str(&format!("## B{i}\nBig {i}. big.js:1-600\n\n"));
+    }
+    std::fs::write(&s.project.output, &doc).unwrap();
+    s.document_review = Default::default();
+    s.document_review.pending = true;
+    let first = next_payload(&mut s);
+    assert!((first["document_line_end"].as_u64().unwrap() as usize) < second);
+    let issues: Vec<Value> = (0..12)
+        .map(|i| line_issue(3 + 3 * i, &format!("Text {i}.")))
+        .collect();
+    document_review::finish(&mut s, &json!({"issues":issues}).to_string()).unwrap();
+    dismiss_all(&mut s);
+    // Nothing to repair: the review goes on with the unreached lines instead
+    // of approving them unseen.
+    assert!(s.document_review.pending);
+    assert!(!document_review::approved(&s));
+    let resumed = next_payload(&mut s);
+    let start = resumed["document_line_start"].as_u64().unwrap() as usize;
+    assert!(start > first["document_line_end"].as_u64().unwrap() as usize);
+    assert!(resumed["more_evidence_pages"].as_bool().unwrap());
+
+    // Filling the findings again before passing that position would repeat
+    // the same lines: they are reported unreviewed instead.
+    let issues: Vec<Value> = (0..12)
+        .map(|i| {
+            let line = second + 1 + 3 * i;
+            let mut issue = line_issue(line, &format!("Big {i}."));
+            issue["sources"] = json!([{"path":"big.js","start_line":1,"end_line":1,
+                "quote":format!("const value_1 = compute_value(1, \"{}\");", "x".repeat(40))}]);
+            issue
+        })
+        .collect();
+    document_review::finish(&mut s, &json!({"issues":issues}).to_string()).unwrap();
+    dismiss_all(&mut s);
+    assert!(!s.document_review.pending);
+    assert!(document_review::unavailable_on_current(&s));
+    assert_eq!(
+        document_review::unavailable_ranges(&s),
+        [(start, doc.lines().count())]
+    );
+}
+
+#[test]
+fn a_review_cut_off_by_the_deadline_continues_where_it_stopped() {
+    let (_dir, mut s) = fixture();
+    let doc = guide(60);
+    std::fs::write(&s.project.output, &doc).unwrap();
+    s.document_review = Default::default();
+    s.document_review.pending = true;
+    let first = next_payload(&mut s);
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    let second = next_payload(&mut s);
+    assert!(second["document_line_start"].as_u64() > first["document_line_start"].as_u64());
+
+    // The deadline ends the run while the second page is pending.
+    document_review::pause(&mut s);
+    assert!(!s.document_review.pending);
+    assert_eq!(document_review::paused_pages(&s), Some(1));
+    assert_eq!(
+        document_review::current_verdict(&s),
+        document_review::CurrentVerdict::Unreviewed
+    );
+    // The next final answer of the unchanged document resumes that page.
+    s.document_review.pending = true;
+    let resumed = next_payload(&mut s);
+    assert_eq!(
+        resumed["document_line_start"],
+        second["document_line_start"]
+    );
+    assert_eq!(resumed["evidence_page"], second["evidence_page"]);
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    assert!(!s.document_review.pending);
+    assert!(document_review::approved(&s));
+    assert_eq!(s.document_review.attempts, 1);
+
+    // An edit after the pause starts the review over.
+    std::fs::write(&s.project.output, guide(61)).unwrap();
+    s.document_review = Default::default();
+    s.document_review.pending = true;
+    next_payload(&mut s);
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    document_review::pause(&mut s);
+    std::fs::write(&s.project.output, &doc).unwrap();
+    assert_eq!(document_review::paused_pages(&s), None);
+    s.document_review.pending = true;
+    assert_eq!(next_payload(&mut s)["document_line_start"], 1);
+}
+
+#[test]
+fn renumbered_headings_and_unchanged_ranges_are_not_reviewed_again() {
+    let (_dir, mut s) = fixture();
+    let numbered = |inserted: bool| {
+        let mut doc = String::from("# Guide\n");
+        let mut number = 0;
+        for i in 0..60 {
+            number += 1;
+            doc.push_str(&format!("## {number}. Part {i}\nText {i}. main.js:1-6\n\n"));
+            if inserted && i == 29 {
+                number += 1;
+                doc.push_str(&format!("## {number}. New part\nNew text. main.js:3-5\n\n"));
+            }
+        }
+        doc
+    };
+    std::fs::write(&s.project.output, numbered(false)).unwrap();
+    assert!(review_requests(&mut s) > 1);
+    assert!(document_review::approved(&s));
+
+    // A section inserted in the middle renumbers every later heading; only
+    // the new section is reviewed again, in one request.
+    std::fs::write(&s.project.output, numbered(true)).unwrap();
+    assert_eq!(document_review::estimated_requests(&s), 2);
+    let payload = next_payload(&mut s);
+    assert_eq!(payload["changed_section_count"], 1);
+    assert_eq!(
+        payload["changed_sections"],
+        json!(["# Guide > ## 31. New part"])
+    );
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    assert!(!s.document_review.pending);
+    assert!(document_review::approved(&s));
+}
+
+#[test]
+fn a_cited_line_too_long_for_review_evidence_is_reported_for_repair() {
+    // A cited line of generated text failed review setup with "narrow
+    // citations", which a single line cannot do.
+    let (dir, mut s) = fixture();
+    let bundle = format!(
+        "// bundle\nvar data=\"{}\";\nrun(data);\n",
+        "a1b2".repeat(5000)
+    );
+    std::fs::write(dir.path().join("bundle.js"), bundle).unwrap();
+    tools::execute(&mut s, "file_read", json!({"path":"bundle.js"})).unwrap();
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    let saved = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","expected_hash":hash,
+            "text":"# Flow\nThe bundle runs its data. bundle.js:1-3\n"}),
+    )
+    .unwrap();
+    let check = &saved["citation_check"];
+    assert_eq!(check["long_line_citation_count"], 1, "{saved}");
+    assert_eq!(check["long_line_citations"][0]["source_line"], 2);
+
+    s.document_review = Default::default();
+    let payload = next_payload(&mut s);
+    let evidence = payload["evidence"].to_string();
+    assert!(
+        evidence.contains("2|[line not shown: 20012 bytes"),
+        "{evidence}"
+    );
+    assert!(evidence.contains("3|run(data);"));
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    let document_review::CurrentVerdict::Rejected(issues) = document_review::current_verdict(&s)
+    else {
+        panic!("a citation the review cannot check is not approved");
+    };
+    assert!(issues[0].starts_with("인용 근거:"), "{issues:?}");
+    assert!(issues[0].contains("bundle.js:1-3"));
+
+    // Leaving the long line out of the citation repairs it.
+    std::fs::write(
+        &s.project.output,
+        "# Flow\nThe bundle runs its data. bundle.js:3\n",
+    )
+    .unwrap();
+    next_payload(&mut s);
+    support::document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
+    assert!(document_review::approved(&s));
 }

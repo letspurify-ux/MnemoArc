@@ -474,10 +474,8 @@ fn saved_candidate_feedback_is_bounded_without_changing_page_selection() {
         assert_eq!(retry["evidence_manifest"], first["evidence_manifest"]);
     }
     submit(&mut s, vec![]);
-    let next = payload(review::request(&mut s).unwrap());
-    assert_eq!(next["retry_findings"], json!([]));
-    assert_eq!(next["current_findings"].as_array().unwrap().len(), 12);
-    submit(&mut s, vec![]);
+    // The twelve saved candidates fill the cycle: they are validated now and
+    // the next review covers the later ranges.
     let request = review::request(&mut s).unwrap();
     assert!(mnemoarc::context::count(&request, &s.config.model) <= 24_000);
     let verify = payload(request);

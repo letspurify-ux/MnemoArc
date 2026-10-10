@@ -740,6 +740,10 @@ fn restated_candidate<'a>(
         .map(|candidate| candidate.id.as_str())
 }
 
+/// Findings one review cycle collects. A page that fills them ends the cycle
+/// after its range (advance_page); the next review covers the rest.
+pub(super) const FINDING_LIMIT: usize = 12;
+
 pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str, last_try: bool) -> Result<()> {
     if proposals.len() > 12 {
         bail!("document_review_invalid: at most 12 findings per page");
@@ -753,6 +757,7 @@ pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str, last_try: bool
     let mut next_id = state.next_finding_id;
     let mut merged = 0;
     let mut corrections = 0;
+    let mut capped = false;
     let mut first_error = None;
     let mut dropped = Vec::new();
     let mut released = Vec::new();
@@ -802,10 +807,11 @@ pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str, last_try: bool
             continue;
         }
         match result {
-            Ok((m, c, r)) => {
+            Ok((m, c, r, dropped)) => {
                 merged += m;
                 corrections += c;
                 released.extend(r);
+                capped |= dropped;
             }
             Err(error) if last_try && error.is::<UnprovenLabel>() => {
                 let label = error.downcast::<UnprovenLabel>().unwrap();
@@ -886,6 +892,7 @@ pub fn collect(s: &mut Session, proposals: Vec<Value>, doc: &str, last_try: bool
     }
     state.page_findings = next;
     state.retry_findings.clear();
+    state.cap_dropped = capped;
     Ok(())
 }
 
@@ -973,7 +980,7 @@ fn collect_one(
     next: &mut Vec<Finding>,
     next_id: &mut usize,
     issue_index: usize,
-) -> Result<(usize, usize, Option<Value>)> {
+) -> Result<(usize, usize, Option<Value>, bool)> {
     let state = &s.document_review;
     let mut corrections = usize::from(normalize_document_kind(s, &mut proposal));
     // Name the issue and each limit it broke. One message listing every
@@ -1331,11 +1338,12 @@ fn collect_one(
                 .as_bytes(),
             );
         }
-        return Ok((1, corrections, released));
+        return Ok((1, corrections, released, false));
     }
-    if next.len() >= 12 {
-        // Keep reviewing coverage; the next repair review can report further findings.
-        return Ok((0, corrections, released));
+    if next.len() >= FINDING_LIMIT {
+        // The cycle's findings are full: report the drop, so the review
+        // stops after this range and the next one reviews it again.
+        return Ok((0, corrections, released, true));
     }
     let mut context = json!({"document_context":document_context,"sources":sources});
     if let Some(anchor) = scope_anchor {
@@ -1372,7 +1380,7 @@ fn collect_one(
         previous_scope,
         released_from,
     });
-    Ok((0, corrections, released))
+    Ok((0, corrections, released, false))
 }
 
 pub fn verification_request(s: &mut Session, ceiling: usize) -> Result<Value> {

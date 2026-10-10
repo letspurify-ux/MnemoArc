@@ -3996,23 +3996,53 @@ pub(crate) fn hash_file_cancelled(
 /// cannot read. Cached with the digest: citation checks count every cited
 /// file's lines on each save and audit.
 pub(crate) fn text_line_count(path: &Path) -> Result<usize> {
+    text_shape(path).map(|(lines, _)| lines)
+}
+
+/// Lines of a text file longer than LONG_LINE_FLOOR bytes, as (line number,
+/// bytes), from the same cached pass as its line count. Cited lines this
+/// long are generated or minified text the document review cannot send.
+pub(crate) fn long_text_lines(path: &Path) -> Result<Vec<(usize, usize)>> {
+    text_shape(path).map(|(_, long)| long)
+}
+
+/// Lines above this many bytes are recorded per file; the review's own
+/// limit (document_review::evidence_line_limit) is never lower.
+pub(crate) const LONG_LINE_FLOOR: usize = 1024;
+
+/// Line count and long lines of a text file, cached together.
+fn text_shape(path: &Path) -> Result<(usize, Vec<(usize, usize)>)> {
     let version = open_regular_file(path)
         .ok()
         .and_then(|file| file.metadata().ok())
         .and_then(|meta| file_version(&meta).ok());
     if let Some(version) = version
-        && let Some(lines) = cached_digest(path, version, |entry| entry.lines)
+        && let Some(shape) = cached_digest(path, version, |entry| {
+            Some((entry.lines?, entry.long_lines.clone()?))
+        })
     {
-        return Ok(lines);
+        return Ok(shape);
     }
-    let lines = read_text(path)?.lines().count();
+    let text = read_text(path)?;
+    let mut lines = 0;
+    let mut long = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        lines += 1;
+        if line.len() > LONG_LINE_FLOOR {
+            long.push((index + 1, line.len()));
+        }
+    }
     if let Some(version) = version {
-        remember_digest(path, version, |entry| entry.lines = Some(lines));
+        remember_digest(path, version, |entry| {
+            entry.lines = Some(lines);
+            entry.long_lines = Some(long.clone());
+        });
     }
-    Ok(lines)
+    Ok((lines, long))
 }
 
-/// Digest and line count of a file at one size and modification time.
+/// Digest, line count and long lines of a file at one size and modification
+/// time.
 /// Freshness checks hash every delivered and cited file several times per
 /// request; with the cache an unchanged file costs a metadata read. A file
 /// modified within the last two seconds is not cached, because a second
@@ -4023,6 +4053,7 @@ struct FileDigest {
     modified: std::time::SystemTime,
     hash: Option<String>,
     lines: Option<usize>,
+    long_lines: Option<Vec<(usize, usize)>>,
 }
 type FileVersion = (u64, std::time::SystemTime);
 type DigestCache = std::collections::HashMap<std::path::PathBuf, FileDigest>;
@@ -4073,6 +4104,7 @@ fn remember_digest(path: &Path, version: FileVersion, update: impl FnOnce(&mut F
         modified: version.1,
         hash: None,
         lines: None,
+        long_lines: None,
     });
     update(entry);
 }

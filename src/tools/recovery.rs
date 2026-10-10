@@ -214,7 +214,7 @@ pub fn describe(message: &str) -> Value {
         (Class::Unavailable, "check_file_permissions")
     } else if matches!(
         code,
-        "search_too_broad" | "outline_too_broad" | "navigation_too_broad"
+        "search_too_broad" | "outline_too_broad" | "navigation_too_broad" | "scope_timeout"
     ) {
         (Class::Capacity, "reduce_request_or_cleanup")
     } else if code == "document_write_verification_failed" {
@@ -505,7 +505,11 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "reduce_request_or_cleanup" if call.name == "db_query" => &["db_query"],
         "reduce_request_or_cleanup" if call.name == "db_execute" => &["db_execute", "db_query"],
         "reduce_request_or_cleanup"
-            if call.name == "file_list" && result["recovery"]["code"] == "file_scan_capacity" =>
+            if call.name == "file_list"
+                && matches!(
+                    result["recovery"]["code"].as_str(),
+                    Some("file_scan_capacity" | "scope_timeout")
+                ) =>
         {
             &["file_list"]
         }
