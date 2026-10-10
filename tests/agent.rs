@@ -669,6 +669,9 @@ async fn varied_new_reads_before_the_first_save_are_not_a_stall() {
     session.task.deliverables = vec!["docs/source-summary.md".into()];
     session.active_tools.insert("document_edit".into());
     session.add_user("Save a summary of the source".into());
+    // A fixed five-step client: the one coverage check before the first
+    // final is tested in closing.rs.
+    session.progress_recovery.coverage_checked = true;
     let (tx, mut rx) = mpsc::channel(128);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result = run_session(
@@ -751,6 +754,9 @@ async fn request_budget_transitions_to_writing_then_verification() {
     // The draft cites a source read before the run.
     std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
     mnemoarc::tools::execute(&mut session, "file_read", json!({"path":"main.rs"})).unwrap();
+    // The phase sequence is scripted per request; the coverage check is
+    // tested in closing.rs.
+    session.progress_recovery.coverage_checked = true;
     let (tx, mut rx) = mpsc::channel(128);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result = run_session(

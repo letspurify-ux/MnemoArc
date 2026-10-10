@@ -43,6 +43,9 @@ fn fixture() -> (tempfile::TempDir, Session, Value) {
         json!({"action":"create","text":"# Flow\nA for loop runs work five times. main.js:3-5\n\n# History\nHistory is normalized first. main.js:2-2\n"}),
     )
     .unwrap();
+    // Scripts here end on one final; the coverage check that sends the
+    // first final back once has its own test.
+    s.progress_recovery.coverage_checked = true;
     (dir, s, read["source"]["id"].clone())
 }
 
@@ -2023,5 +2026,225 @@ fn an_uncited_save_says_the_final_answer_needs_a_citation() {
     assert!(
         cited["citation_check"].get("citations_required").is_none(),
         "{cited}"
+    );
+}
+
+#[tokio::test]
+async fn unresolved_items_are_shown_once_before_they_are_reported() {
+    // A live run listed its pending to-dos in task.unresolved, finished
+    // them, and still ended complete_with_gaps reporting all of them.
+    let final_answer = || Completion {
+        text: "Saved out.md".into(),
+        ..Default::default()
+    };
+    let (_dir, mut s) = saved_fixture();
+    s.task.unresolved = vec!["T7: checkpoint tests".into()];
+    let (result, guidance) = run_scripted(
+        s,
+        vec![
+            final_answer(),
+            call(
+                "clear-unresolved",
+                "task_state",
+                json!({"action":"update","patch":{"unresolved":[]}}),
+            ),
+            final_answer(),
+        ],
+    )
+    .await;
+    let error = guidance[1]["finalization_error"].as_str().unwrap();
+    assert!(error.starts_with("task_unresolved_open:"), "{error}");
+    assert!(error.contains("T7: checkpoint tests"), "{error}");
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert!(
+        result.completion_gaps.is_empty(),
+        "{:?}",
+        result.completion_gaps
+    );
+
+    // An item kept on purpose is reported on the next final, not asked
+    // about again.
+    let (_dir, mut s) = saved_fixture();
+    s.task.unresolved = vec!["Retry timing is not confirmed".into()];
+    let (result, guidance) = run_scripted(s, vec![final_answer(), final_answer()]).await;
+    assert_eq!(guidance.len(), 2);
+    assert_eq!(
+        result.status, "complete_with_gaps",
+        "{:?}",
+        result.last_error
+    );
+    assert_eq!(
+        result.completion_gaps,
+        ["미확인 사항 — Retry timing is not confirmed"]
+    );
+}
+
+#[tokio::test]
+async fn the_first_final_compares_the_document_with_the_request_once() {
+    // A live run closed every planned module section, passed its audit and
+    // finished with 43% of its budget left, never covering the run loop and
+    // completion the request asked for.
+    let final_answer = || Completion {
+        text: "Saved out.md".into(),
+        ..Default::default()
+    };
+    let (_dir, mut s) = saved_fixture();
+    s.progress_recovery.coverage_checked = false;
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    let (result, guidance) = run_scripted(
+        s,
+        vec![
+            final_answer(),
+            call(
+                "missing-step",
+                "document_edit",
+                json!({"action":"append","expected_hash":hash,"text":"\n# Completion\nThe run ends after the fifth pass. main.js:3-5\n"}),
+            ),
+            final_answer(),
+        ],
+    )
+    .await;
+    let error = guidance[1]["finalization_error"].as_str().unwrap();
+    assert!(error.starts_with("request_coverage_check:"), "{error}");
+    assert!(error.contains("# Flow | # History"), "{error}");
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert!(
+        std::fs::read_to_string(&result.project.output)
+            .unwrap()
+            .contains("# Completion")
+    );
+
+    // A document that already covers the request just answers again; the
+    // check is not repeated.
+    let (_dir, mut s) = saved_fixture();
+    s.progress_recovery.coverage_checked = false;
+    let (result, guidance) = run_scripted(s, vec![final_answer(), final_answer()]).await;
+    assert_eq!(guidance.len(), 2);
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+
+    // Closing mode finishes with what it has: idle rounds stall the run
+    // into closing, whose first final is accepted without the check.
+    let (_dir, mut s) = saved_fixture();
+    s.progress_recovery.coverage_checked = false;
+    s.config.stall_round_limit = 2;
+    let mut steps: Vec<_> = (0..9)
+        .map(|i| call(&format!("idle-{i}"), "task_state", json!({"action":"read"})))
+        .collect();
+    steps.push(final_answer());
+    let (result, guidance) = run_scripted(s, steps).await;
+    assert_eq!(guidance.len(), 10);
+    assert_eq!(guidance[9]["closing"]["active"], true, "{}", guidance[9]);
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+}
+
+/// One reply with several tool calls, in order.
+fn calls(items: Vec<(&str, &str, Value)>) -> Completion {
+    Completion {
+        calls: items
+            .into_iter()
+            .map(|(id, name, args)| ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: args.to_string(),
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// The saved fixture with a checkpoint pending on its next request.
+fn checkpoint_fixture() -> (tempfile::TempDir, Session, String) {
+    use mnemoarc::context::ContextManager;
+    let (dir, mut s) = saved_fixture();
+    pad_history(&mut s, 12);
+    let budget = ContextManager::input_budget(&s.config);
+    let above_high_water = (budget as f64 * (1.0 + s.config.high_water) / 2.0) as usize;
+    assert!(ContextManager::prepare(&mut s, above_high_water).unwrap());
+    let id = s.checkpoint.as_ref().unwrap().id.clone();
+    (dir, s, id)
+}
+
+#[tokio::test]
+async fn a_checkpoint_lets_document_work_save_a_section_first() {
+    // A live model sent a whole section during a checkpoint, the last
+    // request with its reads in context, and the checkpoint refused it.
+    let (_dir, s, id) = checkpoint_fixture();
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    // Only the cleanup batch is scripted: the padded history may start
+    // another checkpoint afterwards, which is not under test here.
+    let (result, _, tools_offered) = run_scripted_tools(
+        s,
+        vec![calls(vec![
+            (
+                "save-before-checkpoint",
+                "document_edit",
+                json!({"action":"append","expected_hash":hash,"text":"\n# Loop\nThe loop runs work five times. main.js:3-5\n"}),
+            ),
+            (
+                "ack",
+                "checkpoint_complete",
+                json!({"id":id,"progress":"Saved the loop section; continue with the remaining sections."}),
+            ),
+        ])],
+    )
+    .await;
+    assert!(
+        tools_offered[0].contains(&"document_edit".to_owned()),
+        "{tools_offered:?}"
+    );
+    assert!(
+        !tools_offered[0].contains(&"file_read".to_owned()),
+        "{tools_offered:?}"
+    );
+    assert_eq!(result.checkpoints_completed, 1, "{:?}", result.last_error);
+    assert!(
+        std::fs::read_to_string(&result.project.output)
+            .unwrap()
+            .contains("# Loop")
+    );
+}
+
+#[tokio::test]
+async fn a_failed_edit_holds_a_checkpoint_only_once() {
+    let (_dir, s, id) = checkpoint_fixture();
+    let before = std::fs::read_to_string(&s.project.output).unwrap();
+    let hash = tools::hash(before.as_bytes());
+    let failing_batch = |n: &str| {
+        calls(vec![
+            (
+                &*format!("bad-edit-{n}"),
+                "document_edit",
+                json!({"action":"replace_text","expected_hash":hash,"old_text":"text that is not in the document","text":"x"}),
+            ),
+            (
+                &*format!("ack-{n}"),
+                "checkpoint_complete",
+                json!({"id":id,"progress":"Continue with the remaining sections."}),
+            ),
+        ])
+    };
+    let (result, _) = run_scripted(s, vec![failing_batch("1"), failing_batch("2")]).await;
+    let tool_results: Vec<&str> = result
+        .history
+        .bundles
+        .iter()
+        .flat_map(|b| b.messages.iter())
+        .filter(|m| m["role"] == "tool")
+        .filter_map(|m| m["content"].as_str())
+        .collect();
+    // The first failure held the checkpoint so the edit could be corrected
+    // with its evidence in context; the second did not hold it again.
+    assert_eq!(
+        tool_results
+            .iter()
+            .filter(|r| r.contains("checkpoint_has_failed_operations"))
+            .count(),
+        1,
+        "{tool_results:#?}"
+    );
+    assert_eq!(result.checkpoints_completed, 1, "{:?}", result.last_error);
+    assert_eq!(
+        std::fs::read_to_string(&result.project.output).unwrap(),
+        before
     );
 }

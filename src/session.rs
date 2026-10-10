@@ -367,6 +367,17 @@ pub struct ProgressRecovery {
     /// Checkpoints completed when the plan was last checked.
     #[serde(skip)]
     pub plan_checkpoints_seen: usize,
+    /// task.unresolved items already shown before a final answer: each is
+    /// shown once, then reported as it stands.
+    #[serde(skip)]
+    pub unresolved_shown: BTreeSet<String>,
+    /// Whether a final answer was already sent back once to compare the
+    /// document with the request.
+    #[serde(skip)]
+    pub coverage_checked: bool,
+    /// The checkpoint whose batch a failed document edit already held once.
+    #[serde(skip)]
+    pub checkpoint_edit_held: Option<String>,
 }
 
 /// The current to-do with the task round it became current, and the

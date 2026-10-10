@@ -481,6 +481,23 @@ impl ToolRegistry {
     fn checkpoint_allowed(name: &str) -> bool {
         Self::CHECKPOINT_TOOLS.contains(&name)
     }
+    /// Document edits allowed while a checkpoint is pending.
+    const CHECKPOINT_DOCUMENT_TOOLS: [&str; 2] = ["document_edit", "document_edit_batch"];
+    /// Tools a pending checkpoint allows in this session. Document work may
+    /// also save sections: the checkpoint request is the last one with the
+    /// current reads in context, and a live model sent a whole section then
+    /// that the checkpoint refused.
+    pub fn checkpoint_allows(s: &Session, name: &str) -> bool {
+        Self::checkpoint_allowed(name)
+            || (s.is_document_work() && Self::CHECKPOINT_DOCUMENT_TOOLS.contains(&name))
+    }
+    fn checkpoint_tool_names(s: &Session) -> Vec<&'static str> {
+        let mut names = Self::CHECKPOINT_TOOLS.to_vec();
+        if s.is_document_work() {
+            names.extend(Self::CHECKPOINT_DOCUMENT_TOOLS);
+        }
+        names
+    }
     fn workflow_required_tools(s: &Session) -> &'static [&'static str] {
         if s.task.workflow == "source_document" {
             &["document_edit", "document_edit_batch", "document_audit"]
@@ -603,7 +620,7 @@ impl ToolRegistry {
                     || !matches!(t.name, "file_edit" | "file_write" | "file_patch")
             })
             .filter(|t| s.config.memory_reuse || !["memory_read", "memory_find"].contains(&t.name))
-            .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allowed(t.name))
+            .filter(|t| s.checkpoint.is_none() || Self::checkpoint_allows(s, t.name))
             // Only a pending checkpoint can be acknowledged. Offered on every
             // request, it was called to announce a finished task with no
             // checkpoint pending, once in each of three live runs.
@@ -4869,12 +4886,12 @@ fn execute_repaired(
     if let Some(cp) = s
         .checkpoint
         .as_ref()
-        .filter(|_| !ToolRegistry::checkpoint_allowed(name))
+        .filter(|_| !ToolRegistry::checkpoint_allows(s, name))
     {
         bail!(
             "checkpoint_pending: {name} is withheld while checkpoint {} is pending; nothing was executed. Call checkpoint_complete with this id and progress (memory_write first only for a reusable finding not saved yet); {name} is available again afterwards. Allowed now: {}",
             cp.id,
-            ToolRegistry::CHECKPOINT_TOOLS.join(", ")
+            ToolRegistry::checkpoint_tool_names(s).join(", ")
         );
     }
     if s.run_guidance["phase"] == "verify"
@@ -6003,6 +6020,19 @@ pub fn citation_count(s: &Session) -> usize {
         .map_or(0, |citations| citations.len())
 }
 
+/// The configured output's heading lines, at most `limit`, with the total
+/// heading count.
+pub fn output_outline(s: &Session, limit: usize) -> Result<(Vec<String>, usize)> {
+    let doc = read_text(&output_path(&s.project)?)?;
+    let headings = documentation::headings(&doc);
+    let lines = headings
+        .iter()
+        .take(limit)
+        .map(|heading| heading.heading.clone())
+        .collect();
+    Ok((lines, headings.len()))
+}
+
 /// Cited ranges of the configured output never delivered to the model as
 /// complete lines of the current file version in this session.
 pub fn unread_citations(s: &Session) -> Result<Vec<Value>> {
@@ -6552,12 +6582,31 @@ pub fn run_call_cancellable(
     let mut result = guard_tool(s, |s| run_call_inner(s, call, cancel));
     recovery::attach(s, call, &mut result);
     if result["status"] != "ok"
+        && failure_holds_checkpoint(s, &call.name)
         && let Some(cp) = &mut s.checkpoint
     {
         cp.failed = true;
         cp.acknowledged = false;
     }
     limit_result(s, call, result, s.config.result_tokens)
+}
+
+/// Whether a failed call fails the pending checkpoint's batch. A failed
+/// document edit changes nothing in the document: it holds the checkpoint
+/// once, so the edit can be corrected while its evidence is still in
+/// context, and after that the checkpoint goes ahead without it.
+fn failure_holds_checkpoint(s: &mut Session, name: &str) -> bool {
+    let Some(cp) = &s.checkpoint else {
+        return false;
+    };
+    if !matches!(name, "document_edit" | "document_edit_batch") {
+        return true;
+    }
+    if s.progress_recovery.checkpoint_edit_held.as_deref() == Some(cp.id.as_str()) {
+        return false;
+    }
+    s.progress_recovery.checkpoint_edit_held = Some(cp.id.clone());
+    true
 }
 
 fn guard_tool(s: &mut Session, operation: impl FnOnce(&mut Session) -> Value) -> Value {

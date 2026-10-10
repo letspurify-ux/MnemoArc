@@ -71,6 +71,35 @@ fn closing_instruction(s: &Session) -> String {
 /// Requests before an empty plan of document work is pointed out.
 const PLAN_CHECK_START: usize = 3;
 
+/// plan_check key of the one comparison of a new plan with the request.
+const PLAN_STRUCTURE_KEY: &str = "structure";
+/// Plan items listed in that comparison, and characters kept of each.
+const PLAN_STRUCTURE_ITEMS: usize = 20;
+const PLAN_STRUCTURE_ITEM_CHARS: usize = 120;
+
+/// Asks once, as soon as a plan exists, whether it follows the request.
+/// A live run planned five "understand <module>" items and one section per
+/// module for a request about the procedure from question to completion,
+/// then wrote a module tour that never reached the run loop or completion.
+fn plan_structure_check(task: &crate::session::TaskState) -> String {
+    let pending: Vec<_> = task.todos.iter().filter(|item| !item.done).collect();
+    let mut items: Vec<String> = pending
+        .iter()
+        .take(PLAN_STRUCTURE_ITEMS)
+        .map(|item| {
+            let text: String = item.text.chars().take(PLAN_STRUCTURE_ITEM_CHARS).collect();
+            format!("{} {text}", item.id)
+        })
+        .collect();
+    if pending.len() > PLAN_STRUCTURE_ITEMS {
+        items.push(format!("and {} more", pending.len() - PLAN_STRUCTURE_ITEMS));
+    }
+    format!(
+        "Before reading further, compare task_plan with latest_request. The items should follow the structure the request asks for, in order: when it asks how something proceeds (a flow or procedure), one item per step of that flow in the order it happens; otherwise one per area it names; each naming its step or area first, then its source files. If the items instead follow modules or files, or plan separate reading such as understanding a module, restructure the plan now in one task_plan apply (update, split, remove, insert or move), then continue with the first item. Items: {}",
+        items.join("; ")
+    )
+}
+
 /// A state in which task_plan no longer matches the work, pointed out once in
 /// run_guidance.plan_check. A fixed reminder every few requests would repeat
 /// what run_guidance already shows and invite plan rewrites; a live run
@@ -103,7 +132,13 @@ fn plan_check(s: &mut Session) -> Option<String> {
         if rounds < PLAN_CHECK_START {
             return None;
         }
-        (format!("empty:{}", s.task.plan_revision), "task_plan is empty. Add one short item per section or area the request covers (one sentence naming it and its main source files), plus final verification, using task_plan action=apply with expected_revision 0; then work through them.".to_owned())
+        (format!("empty:{}", s.task.plan_revision), "task_plan is empty. Add one short item per section the request needs, in the order the document presents them (for a flow or procedure, one per step in the order it happens; otherwise one per requested area), each naming its step or area first and then its main source files, plus final verification, using task_plan action=apply with expected_revision 0; then work through them.".to_owned())
+    } else if !s
+        .progress_recovery
+        .plan_checks_shown
+        .contains(PLAN_STRUCTURE_KEY)
+    {
+        (PLAN_STRUCTURE_KEY.to_owned(), plan_structure_check(&s.task))
     } else if checkpoint_done {
         // Before the first save there is no document to compare with; a live
         // run was told to check its plan "against the saved document" at five
@@ -272,6 +307,69 @@ fn ready_except_plan(s: &mut Session) -> bool {
             false
         }
     }
+}
+
+/// Document headings shown with the coverage check.
+const COVERAGE_OUTLINE_HEADINGS: usize = 60;
+
+/// The error that sends the first final answer of a task back once to
+/// compare the document with the request. A live run closed every planned
+/// module section, passed its audit and finished with 43% of its budget
+/// left, never covering the run loop or completion the request asked for.
+fn coverage_check(s: &mut Session) -> Option<String> {
+    if s.progress_recovery.coverage_checked {
+        return None;
+    }
+    s.progress_recovery.coverage_checked = true;
+    let (headings, total) = tools::output_outline(s, COVERAGE_OUTLINE_HEADINGS).ok()?;
+    let more = if total > headings.len() {
+        format!(" (and {} more headings)", total - headings.len())
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "request_coverage_check: before finishing, compare the saved document with latest_request. Its headings are: {}{more}. Check that a section explains each part the request asks for; for a flow or procedure, every step from its start to its end. If a part has no section, add a task_plan item for it and write that section from source you have read (read more first if needed). If every part is covered, give the final answer again. Do not add a section that only lists coverage or checks.",
+        headings.join(" | ")
+    ))
+}
+
+/// Unresolved items shown with one unresolved closeout.
+const UNRESOLVED_CLOSEOUT_ITEMS: usize = 10;
+
+/// The error that sends a final answer back once when task.unresolved has
+/// items not shown before. A finished document reports every unresolved
+/// item as unconfirmed; a live run listed its pending to-dos there,
+/// finished them and still ended complete_with_gaps reporting all three.
+fn unresolved_closeout(s: &mut Session) -> Option<String> {
+    let shown = &s.progress_recovery.unresolved_shown;
+    if s.task.unresolved.iter().all(|item| shown.contains(item)) {
+        return None;
+    }
+    s.progress_recovery
+        .unresolved_shown
+        .extend(s.task.unresolved.iter().cloned());
+    let items: Vec<_> = s
+        .task
+        .unresolved
+        .iter()
+        .take(UNRESOLVED_CLOSEOUT_ITEMS)
+        .map(|item| format!("{item:?}"))
+        .collect();
+    let more = s
+        .task
+        .unresolved
+        .len()
+        .saturating_sub(UNRESOLVED_CLOSEOUT_ITEMS);
+    let more = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "task_unresolved_open: task.unresolved has {} item(s) that the result will report as unconfirmed: {}{more}. Check each against the saved document and the work done: when it is resolved (its work is done or the document covers it), drop it with task_state action=update, patch.unresolved set to only the items still open. Keep an item only if it is genuinely still unconfirmed. Then give the final answer again.",
+        s.task.unresolved.len(),
+        items.join("; ")
+    ))
 }
 
 /// The open to-dos in order, bounded by one task_plan batch.
@@ -1422,7 +1520,7 @@ pub async fn run_session_controlled(
             "current_todo":s.task.current_todo(),
             "max_tool_calls":32.min(if s.checkpoint.is_some() { ContextManager::cleanup_result_budget(&s.config) } else { s.config.batch_tokens } / 200),
             "plan_pending_count":s.task.todos.iter().filter(|item| !item.done).count(),
-            "finalization_error":s.last_error.as_deref().filter(|error| finalization_attempts > 0 || error.starts_with("task_plan_pending:")),
+            "finalization_error":s.last_error.as_deref().filter(|error| finalization_attempts > 0 || error.starts_with("task_plan_pending:") || error.starts_with("task_unresolved_open:") || error.starts_with("request_coverage_check:")),
             "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: the last requests produced no new evidence, document change or resolved citation. Change approach instead of repeating them: read sources the document still needs and has not read, write or correct a section, or file_read a cited range reported as unread. Do not repeat an unchanged read, plan rewrite or memory save. If a claim cannot be supported, mark that gap in the relevant section and continue with supported work; do not invent evidence." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"For source documentation, batch reads for missing evidence, then repair known issues in their original locations with targeted section or text edits when safe. Corrections are edits, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Keep correcting the original requirements within the remaining run tokens and time.","draft"=>"Half of the run budget is spent: plan the remaining reading and writing so the requested document is complete and verified within remaining_tokens and remaining_seconds. Save sections in separate edits; place each from the outline in the last save result, use insert_before/insert_after for siblings and insert_first_child/insert_last_child for nested sections when that preserves the document flow, and copy section_path when headings repeat.",_=>if answer_workflow { ANSWER_INVESTIGATE_INSTRUCTION } else { "For source documentation, judge from the request and the evidence how much to read and when the document is complete. When a section's evidence is in context, write that section with its path:start-end citations right away, then read for the next one; save sections in separate edits rather than one full-file write; place each from the outline in the last save result (document_inspect only when none is in context), copy section_path when headings repeat, and use sibling or child insertion to place it within the hierarchy. Batch independent searches or reads together instead of paying a model round per file." }} }});
         s.run_guidance["progress_recovery"]["rounds_since_progress"] = json!(stall_rounds);
         s.run_guidance["progress_recovery"]["closing_after"] =
@@ -2056,6 +2154,52 @@ pub async fn run_session_controlled(
                 .await;
                 continue;
             }
+            // The first final of a task compares the document with the
+            // request once; closing mode finishes with what it has.
+            if s.status == "complete"
+                && s.is_document_work()
+                && s.progress_recovery.closing.is_none()
+                && let Some(error) = coverage_check(&mut s)
+            {
+                // Not action_required: its forced tool call would rule out
+                // the answer "every part is covered".
+                s.status = "running".into();
+                s.last_error = Some(error);
+                emit(
+                    &events,
+                    AgentEvent::Notice {
+                        session: s.id.clone(),
+                        text: "Checking that the document covers the whole request before the final answer.".into(),
+                    },
+                    &cancel,
+                    run_deadline(started, &s.config),
+                )
+                .await;
+                continue;
+            }
+            // An accepted final reports task.unresolved as gaps: show the
+            // items once so resolved ones are dropped before they are.
+            if s.status == "complete"
+                && s.is_document_work()
+                && !accept_gaps
+                && let Some(error) = unresolved_closeout(&mut s)
+            {
+                // Not action_required: keeping every item and answering
+                // again is a valid reply, which a forced tool call rules out.
+                s.status = "running".into();
+                s.last_error = Some(error);
+                emit(
+                    &events,
+                    AgentEvent::Notice {
+                        session: s.id.clone(),
+                        text: "Checking the unresolved items before the final answer.".into(),
+                    },
+                    &cancel,
+                    run_deadline(started, &s.config),
+                )
+                .await;
+                continue;
+            }
             let mut final_text = completion.text.clone();
             if s.status == "complete" && s.is_document_work() {
                 s.completion_gaps = collect_gaps(&mut s);
@@ -2322,8 +2466,11 @@ pub async fn run_session_controlled(
                     }
                 }
 
+                // The tool run marks the failures that fail the checkpoint
+                // batch (tools::failure_holds_checkpoint).
                 if result["status"] != "ok"
                     && let Some(cp) = &mut s.checkpoint
+                    && cp.failed
                 {
                     // Count a failed batch once, preserving its first cause rather
                     // than replacing it with a secondary acknowledgement failure.
@@ -2769,6 +2916,7 @@ mod plan_check_tests {
         assert_eq!(
             shown,
             [
+                (1, "Before reading furth"),
                 (2, "A section was saved "),
                 (5, "current_todo T1 has "),
                 (6, "A checkpoint just co"),
@@ -2780,6 +2928,56 @@ mod plan_check_tests {
                 .as_ref()
                 .unwrap()
                 .contains("current for 4 requests")
+        );
+    }
+
+    #[test]
+    fn a_new_plan_is_compared_with_the_request_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            Config::compact_test(),
+        );
+        s.select_workflow("source_document").unwrap();
+        s.add_user("Explain the procedure from question to final completion".into());
+        // No plan yet: nothing to compare until the empty-plan check is due.
+        s.task_rounds = 1;
+        assert_eq!(plan_check(&mut s), None);
+        // The live shape: module reading items, then one section per module.
+        tools::execute(
+            &mut s,
+            "task_plan",
+            json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Understand main.rs","Write document: Session Management"]}]}),
+        )
+        .unwrap();
+        let check = plan_check(&mut s).unwrap();
+        assert!(check.contains("latest_request"), "{check}");
+        assert!(check.contains("a flow or procedure"), "{check}");
+        assert!(
+            check.contains("Items: T1 Understand main.rs; T2 Write document: Session Management"),
+            "{check}"
+        );
+        // Shown once: a restructured plan is not asked about again.
+        tools::execute(
+            &mut s,
+            "task_plan",
+            json!({"action":"apply","expected_revision":1,"operations":[{"op":"update","id":"T1","text":"Receive and route the question (session.rs, question/routing.rs)"}]}),
+        )
+        .unwrap();
+        assert_eq!(plan_check(&mut s), None);
+        // The empty-plan check names steps before files.
+        let mut empty = Session::new(s.project.clone(), Config::compact_test());
+        empty.select_workflow("source_document").unwrap();
+        empty.add_user("Explain the procedure".into());
+        empty.task_rounds = PLAN_CHECK_START;
+        let check = plan_check(&mut empty).unwrap();
+        assert!(
+            check.contains("one per step in the order it happens"),
+            "{check}"
         );
     }
 
@@ -2803,6 +3001,12 @@ mod plan_check_tests {
         )
         .unwrap();
         s.task_rounds = 1;
+        // The new plan is compared with the request once, first.
+        assert!(
+            plan_check(&mut s)
+                .unwrap()
+                .starts_with("Before reading further")
+        );
         assert_eq!(plan_check(&mut s), None);
         s.checkpoints_completed = 1;
         let before_save = plan_check(&mut s).unwrap();
@@ -3672,6 +3876,9 @@ mod usage_tests {
             json!({"action":"create","text":"# Flow\nCode. main.rs:1\n"}),
         )
         .unwrap();
+        // These tests count requests and their charges; the one coverage
+        // check before the first final is covered elsewhere.
+        session.progress_recovery.coverage_checked = true;
         let model = Arc::new(Model {
             failure,
             requests: AtomicUsize::new(0),

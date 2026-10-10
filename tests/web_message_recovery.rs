@@ -103,7 +103,9 @@ impl LlmClient for Engine {
                 "document_edit",
                 json!({"action":"write","expected_hash":tools::hash(&std::fs::read(&self.output)?),"text":DOCUMENT}),
             ),
-            3 => Completion {
+            // The first final is sent back once to compare the document
+            // with the request; the second confirms it.
+            3 | 4 => Completion {
                 text: "첫 장을 저장하고 소스와 대조했습니다.".into(),
                 ..Default::default()
             },
