@@ -24,8 +24,11 @@ const LENGTH_RECOVERY_LIMIT: usize = 8;
 /// the document itself when they are spent.
 pub const CLOSING_ROUND_LIMIT: usize = 12;
 /// Requests at this run's average duration that the closing time reserve
-/// keeps, so closing can still write and answer.
-const CLOSING_REQUEST_RESERVE: f64 = 6.0;
+/// keeps: the closing write, the final answer and one repair of a rejected
+/// final. Should the deadline fall before a second final, the runtime
+/// reports the same unresolved items that final would have been accepted
+/// with. Six used to leave room for the document review as well.
+const CLOSING_REQUEST_RESERVE: f64 = 3.0;
 const MAX_REPORTED_GAPS: usize = 30;
 
 /// Requests without a new best progress score before closing mode. Earlier
@@ -1095,6 +1098,12 @@ pub async fn run_session_controlled(
     let mut finalization_attempts = s.progress_recovery.finalization_attempts;
     let mut length_recoveries = 0usize;
     let mut empty_completions = 0usize;
+    // Unread cited ranges counted after the last tool batch. Only tool calls
+    // change the delivered evidence or the document, so the next request
+    // starts from this count instead of scanning again; an external edit in
+    // between still shows in that request's readiness audit, which runs
+    // afresh.
+    let mut known_unread: Option<usize> = None;
     // Smoothed duration of completed model requests in this run. A slow
     // model needs a larger closing reserve than a share of the time budget.
     let mut request_secs: Option<f64> = None;
@@ -1240,7 +1249,9 @@ pub async fn run_session_controlled(
         }
         // One progress ladder for document work: focus (1x), narrowed tools
         // (2x), then closing mode (3x) or the closing budget reserve.
-        let unread_count = unread_citation_count(&s);
+        let unread_count = known_unread
+            .take()
+            .unwrap_or_else(|| unread_citation_count(&s));
         let request_completed = std::mem::replace(&mut ladder_request_completed, true);
         // A closing request counted here may still become a checkpoint
         // request below; that request then returns its closing round.
@@ -2070,18 +2081,6 @@ pub async fn run_session_controlled(
         if s.checkpoint.is_none() {
             s.progress_recovery.action_required = false;
         }
-        if document_workflow && !s.is_document_work() && !completion.text.is_empty() {
-            emit(
-                &events,
-                AgentEvent::Delta {
-                    session: s.id.clone(),
-                    text: completion.text.clone(),
-                },
-                &cancel,
-                run_deadline(started, &s.config),
-            )
-            .await;
-        }
         // Tool-call prose is intermediate. For document work it may claim
         // completion before the calls have run, so keep only the executable
         // calls in user-visible history; the final verified reply is added later.
@@ -2101,7 +2100,6 @@ pub async fn run_session_controlled(
         let mut seen_call_ids = std::collections::BTreeSet::new();
         let mut batch_document_hash: Option<String> = None;
         let prior_source_lines = tools::delivered_source_lines(&s);
-        let prior_unread = unread_citation_count(&s);
         let prior_current_todo = s.task.current_todo().map(|item| item.id.clone());
         let prior_pending_todos = s.task.todos.iter().filter(|item| !item.done).count();
         let checkpoint_batch = s.checkpoint.is_some();
@@ -2398,7 +2396,12 @@ pub async fn run_session_controlled(
         }
         // Reading a cited range the document still owed counts like a
         // verification did: the saved result is better supported.
-        let verified_progress = unread_citation_count(&s) < prior_unread;
+        // Only the tool batch changes the delivered evidence or the document
+        // within a request, so the count at its start is the count before
+        // this batch. The final answer audits afresh either way.
+        let unread_after = unread_citation_count(&s);
+        let verified_progress = unread_after < unread_count;
+        known_unread = Some(unread_after);
         if verified_progress {
             repetitions.clear();
         }

@@ -1710,7 +1710,7 @@ async fn a_deadline_inside_a_request_finishes_with_the_gap_report() {
 
 #[tokio::test]
 async fn a_slow_model_closes_early_and_skips_a_request_that_cannot_end() {
-    // Six requests at this run's pace (15 s) exceed the 10% reserve (0.6 s),
+    // Three requests at this run's pace (7.5 s) exceed the 10% reserve (0.6 s),
     // so closing can start after the first request, but never before the
     // verification share of the run: 25% here keeps it (1.5 s), 90% lets it
     // start. With half a request's time left, either run finishes instead of
