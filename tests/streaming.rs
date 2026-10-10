@@ -263,6 +263,13 @@ async fn server(body: impl Into<axum::body::Bytes>) -> (String, tokio::task::Joi
     let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (url, handle)
 }
+/// A strict structured-output format, like the one message routing sends.
+fn strict_format() -> serde_json::Value {
+    json!({"type":"json_schema","json_schema":{"name":"structured_reply","strict":true,
+        "schema":{"type":"object","required":["issues"],"additionalProperties":false,
+            "properties":{"issues":{"type":"array","items":{"type":"string"}}}}}})
+}
+
 fn event(v: serde_json::Value) -> String {
     format!("data: {v}\n\n")
 }
@@ -325,65 +332,6 @@ async fn connection_probe_times_out_despite_stream_keepalives() {
     );
     assert!(count.load(Ordering::SeqCst) >= 2);
 }
-#[tokio::test]
-async fn a_completion_names_its_upstream_provider_and_first_event_delay() {
-    // One review page took 116 s and the same page 11 s in another run, with
-    // nothing to tell waiting at the provider from generating.
-    use futures_util::StreamExt;
-    let first = event(
-        json!({"provider":"Novita","choices":[{"delta":{"content":"O"},"finish_reason":null}]}),
-    );
-    let rest = format!(
-        "{}data: [DONE]\n\n",
-        event(
-            json!({"provider":"Novita","choices":[{"delta":{"content":"K"},"finish_reason":"stop"}]})
-        )
-    );
-    let app = Router::new().route(
-        "/chat/completions",
-        post(move || {
-            let (first, rest) = (first.clone(), rest.clone());
-            async move {
-                let delayed = futures_util::stream::once(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    Ok::<_, std::io::Error>(axum::body::Bytes::from(first))
-                })
-                .chain(futures_util::stream::once(async move {
-                    Ok::<_, std::io::Error>(axum::body::Bytes::from(rest))
-                }));
-                (
-                    [(header::CONTENT_TYPE, "text/event-stream")],
-                    axum::body::Body::from_stream(delayed),
-                )
-                    .into_response()
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let config = Config {
-        base_url: url,
-        retries: 0,
-        ..support::compact_config()
-    };
-    let (tx, _rx) = tokio::sync::mpsc::channel(8);
-    let completion = OpenAiClient
-        .complete(
-            json!({"messages":[]}),
-            &config,
-            CancellationToken::new(),
-            tx,
-        )
-        .await
-        .unwrap();
-    server.abort();
-    assert_eq!(completion.text, "OK");
-    assert_eq!(completion.provider.as_deref(), Some("Novita"));
-    let waited = completion.first_event_seconds.unwrap();
-    assert!((0.3..10.0).contains(&waited), "{waited}");
-}
-
 #[tokio::test]
 async fn assemble_interleaved_calls_and_usage() {
     let body=[event(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"memory_read","arguments":"{\"id\":"}},{"index":1,"id":"c2","function":{"name":"memory_read","arguments":"{\"id\":"}}]},"finish_reason":null}]})),event(json!({"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"b\"}"}},{"index":0,"function":{"arguments":"\"a\"}"}}]},"finish_reason":"tool_calls"}]})),event(json!({"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":3}}})),"data: [DONE]\n\n".into()].concat();
@@ -827,11 +775,11 @@ async fn repeated_provider_finish_error_stops_at_retry_limit() {
 }
 
 #[tokio::test]
-async fn a_review_request_does_not_wait_out_a_timeout_again() {
+async fn a_request_without_timeout_retries_does_not_wait_out_a_timeout_again() {
     use std::sync::atomic::Ordering;
-    // OpenRouter reports an upstream idle timeout as an error event. A review
-    // request halves or skips the page instead of waiting it out again, and a
-    // timeout is no reason to drop the strict JSON schema.
+    // OpenRouter reports an upstream idle timeout as an error event. A
+    // follow-up answer is asked again with a smaller request instead of
+    // waiting it out, and a timeout is no reason to drop the strict JSON schema.
     let timeout = event(json!({"error":{"code":504,"message":"Upstream idle timeout exceeded"}}));
     let request = json!({"messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"review","strict":true,"schema":{"type":"object"}}}});
     for retry_timeouts in [true, false] {
@@ -1136,7 +1084,7 @@ async fn rejected_json_schema_degrades_to_json_mode_and_is_remembered() {
         ..support::compact_config()
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
+    let request = json!({"messages":[],"response_format":strict_format()});
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let first = OpenAiClient
         .complete(request.clone(), &c, CancellationToken::new(), tx)
@@ -1214,7 +1162,7 @@ async fn sse_schema_failure_is_cached_after_two_recoveries_and_only_for_that_sch
         let seen=seen.clone();
         async move {
             let format=body["response_format"]["type"].as_str().unwrap_or("none").to_owned();
-            let failing=format=="json_schema" && body["response_format"]["json_schema"]["name"]=="document_review";
+            let failing=format=="json_schema" && body["response_format"]["json_schema"]["name"]=="structured_reply";
             seen.lock().unwrap().push(format);
             let content=if failing { event(json!({"error":{"code":502,"message":"JSON error injected into SSE stream"}})) }
                 else { format!("{}data: [DONE]\n\n",event(json!({"choices":[{"delta":{"content":"{\"issues\":[]}"},"finish_reason":"stop"}]}))) };
@@ -1229,7 +1177,7 @@ async fn sse_schema_failure_is_cached_after_two_recoveries_and_only_for_that_sch
         ..support::compact_config()
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let mut request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
+    let mut request = json!({"messages":[],"response_format":strict_format()});
     // One recovery may be an outage that cleared in time; the second request
     // with the same schema confirms the grammar failure and caches it.
     for attempts in [2, 2, 1] {
@@ -1306,7 +1254,7 @@ async fn an_outage_cleared_by_the_json_mode_attempt_keeps_strict_schema_output()
         ..support::compact_config()
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
+    let request = json!({"messages":[],"response_format":strict_format()});
     for (attempts, fail_next) in [(2, 0), (1, 1), (2, 0), (1, 0)] {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let result = OpenAiClient
@@ -1333,8 +1281,8 @@ async fn an_outage_cleared_by_the_json_mode_attempt_keeps_strict_schema_output()
 }
 
 // Live run 2026-10-09: after three in-stream Nvidia overloads, the JSON-mode
-// comparison attempt returned an unfinished `{"issues":{}` and the closing
-// review skipped that page. An overload says nothing about the schema.
+// comparison attempt returned an unfinished `{"issues":{}`. An overload says
+// nothing about the schema.
 #[tokio::test]
 async fn an_in_stream_overload_keeps_the_strict_schema() {
     use std::sync::{Arc, Mutex};
@@ -1359,7 +1307,7 @@ async fn an_in_stream_overload_keeps_the_strict_schema() {
         ..support::compact_config()
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
+    let request = json!({"messages":[],"response_format":strict_format()});
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let error = OpenAiClient
         .complete(request, &config, CancellationToken::new(), tx)
@@ -1395,7 +1343,7 @@ async fn an_outage_in_both_formats_is_bounded_and_does_not_poison_schema_cache()
         ..support::compact_config()
     };
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
+    let request = json!({"messages":[],"response_format":strict_format()});
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let error = tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -1634,14 +1582,14 @@ async fn an_endpoint_rejecting_every_response_format_is_remembered() {
         retries: 0,
         ..support::compact_config()
     };
-    let request = json!({"messages":[],"response_format":mnemoarc::tools::document_review::response_format()});
+    let request = json!({"messages":[],"response_format":strict_format()});
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let first = OpenAiClient
         .complete(request.clone(), &c, CancellationToken::new(), tx)
         .await
         .unwrap();
     assert_eq!(first.attempts, 3);
-    // A live run paid one rejected attempt on every later review call.
+    // A live run paid one rejected attempt on every later structured call.
     for _ in 0..2 {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let next = OpenAiClient

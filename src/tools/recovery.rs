@@ -104,8 +104,6 @@ pub fn describe(message: &str) -> Value {
         (Class::StaleState, "repair_memory_references")
     } else if code == "verification_sources_required" {
         (Class::MissingEvidence, "lookup_observed_evidence")
-    } else if code == "review_repair_required" {
-        (Class::Prerequisite, "complete_prerequisite")
     } else if code == "file_not_found" || code == "document_missing" {
         (Class::MissingPath, "resolve_path")
     } else if code == "file_patch_rollback_failed" || code == "file_patch_write_failed" {
@@ -219,17 +217,6 @@ pub fn describe(message: &str) -> Value {
         (Class::Capacity, "reduce_request_or_cleanup")
     } else if code == "document_write_verification_failed" {
         (Class::OutcomeUnknown, "inspect_outcome_before_retry")
-    } else if code == "document_review_evidence" {
-        (Class::MissingEvidence, "lookup_observed_evidence")
-    } else if code == "document_review_stale" {
-        (Class::StaleState, "refresh_matching_state")
-    } else if matches!(
-        code,
-        "document_review_invalid" | "document_review_incomplete"
-    ) {
-        (Class::InvalidInput, "correct_arguments")
-    } else if code == "document_review_budget" {
-        (Class::Capacity, "reduce_request_or_cleanup")
     } else if code.contains("conflict")
         || code.contains("changed")
         || code.contains("stale")

@@ -20,41 +20,15 @@ mod question;
 
 const FINALIZATION_RETRY_LIMIT: usize = 8;
 const LENGTH_RECOVERY_LIMIT: usize = 8;
-const REVIEW_RESPONSE_LIMIT: usize = 8;
-/// Consecutive invalid verdicts after which a document-work review is skipped
-/// for the current result and reported as unreviewed.
-const REVIEW_UNAVAILABLE_LIMIT: usize = 3;
 /// Model requests available once closing mode starts. The runtime finishes
 /// the document itself when they are spent.
 pub const CLOSING_ROUND_LIMIT: usize = 12;
 /// Requests at this run's average duration that the closing time reserve
-/// keeps at least, so closing can still answer and review once.
-const CLOSING_REQUEST_RESERVE: f64 = 6.0;
-/// Of those, the closing write and the final answer; a longer document's
-/// review adds its estimated requests to these two.
-const CLOSING_ANSWER_REQUESTS: f64 = 2.0;
-
-/// Requests the closing time reserve keeps at this run's pace: the closing
-/// write, the answer and the document review that answer starts. Six used to
-/// cover all of them, while a full review of a 3,664-line document took 75
-/// requests and a long document's review ran into the deadline.
-fn closing_reserve_requests(s: &Session) -> f64 {
-    let review = if s.config.source_document_review {
-        tools::document_review::estimated_requests(s)
-    } else {
-        0
-    };
-    CLOSING_REQUEST_RESERVE.max(CLOSING_ANSWER_REQUESTS + review as f64)
-}
-/// A review request the provider never answered: a gateway or idle timeout,
-/// or no data within the request timeout. A live reasoning model reasoned
-/// silently until the provider cut it off (504), and waiting out that
-/// "outage" and resending the same page stalled the run for 11 minutes.
-const REVIEW_NO_ANSWER: &str =
-    "document_review_incomplete: the review request got no answer before a timeout";
-/// A review response that used up its output allowance before its JSON
-/// closed. A reasoning model can spend the whole allowance on reasoning.
-const REVIEW_TRUNCATED: &str = "document_review_incomplete: response reached the output token limit before the JSON closed; return one complete issues JSON object with fewer, shorter issues and quotes";
+/// keeps: the closing write, the final answer and one repair of a rejected
+/// final. Should the deadline fall before a second final, the runtime
+/// reports the same unresolved items that final would have been accepted
+/// with. Six used to leave room for the document review as well.
+const CLOSING_REQUEST_RESERVE: f64 = 3.0;
 const MAX_REPORTED_GAPS: usize = 30;
 
 /// Requests without a new best progress score before closing mode. Earlier
@@ -63,14 +37,12 @@ fn closing_stall_limit(config: &Config) -> usize {
     config.stall_round_limit.saturating_mul(3)
 }
 
-/// One monotonic measure of document progress: the best document shape,
-/// reduced review findings and the project source lines delivered so far.
-/// Plan bookkeeping is excluded; completing and reopening the same to-do is
-/// not progress.
+/// One monotonic measure of document progress: the best document shape and
+/// the project source lines delivered so far. Plan bookkeeping is excluded;
+/// completing and reopening the same to-do is not progress.
 fn progress_score(s: &Session) -> usize {
     s.progress_recovery.best_document_section_count * 2
         + s.progress_recovery.best_document_content_lines
-        + tools::document_review::progress(s)
         + s.progress_recovery.evidence_credit
 }
 
@@ -92,7 +64,7 @@ fn closing_instruction(s: &Session) -> String {
         );
     }
     format!(
-        "Closing mode: finish the requested document now from the evidence already gathered; discovery tools are withheld. 1) Write any missing requested section from gathered evidence, stating in the text when a fact is unconfirmed. 2) For a cited range reported as unread (citation_check or document_readiness unread_citation), file_read that range or narrow the citation to the lines already read; qualify a claim that cannot be supported in its section instead of describing it as verified. If the document cites no project source at all, cite the sources of its claims as path:start-end from ranges already read. 3) Fix review findings confirmed for the current document with targeted edits when possible; otherwise leave them, the runtime reports them as unresolved. 4) Complete or remove remaining to-dos with actual results, then give a concise final answer. At most {remaining} requests remain; afterwards the runtime finishes the document and lists every unresolved item. Do not invent evidence."
+        "Closing mode: finish the requested document now from the evidence already gathered; discovery tools are withheld. 1) Write any missing requested section from gathered evidence, stating in the text when a fact is unconfirmed. 2) For a cited range reported as unread (citation_check or document_readiness unread_citation), file_read that range or narrow the citation to the lines already read; qualify a claim that cannot be supported in its section instead of describing it as verified. If the document cites no project source at all, cite the sources of its claims as path:start-end from ranges already read. 3) Complete or remove remaining to-dos with actual results, then give a concise final answer. At most {remaining} requests remain; afterwards the runtime finishes the document and lists every unresolved item. Do not invent evidence."
     )
 }
 
@@ -176,11 +148,7 @@ fn collect_gaps(s: &mut Session) -> Vec<String> {
     }
     if s.is_document_work() && s.document_written {
         let unread = tools::unread_citations(s).unwrap_or_default();
-        // An approved review compared every cited range with the source; a
-        // range the writer did not read is then no open question.
-        let review_approved =
-            s.config.source_document_review && tools::document_review::approved(s);
-        for range in unread.iter().take(if review_approved { 0 } else { 12 }) {
+        for range in unread.iter().take(12) {
             gaps.push(format!(
                 "근거 미확인 — {}:{}-{} 범위를 읽지 않고 인용했습니다.",
                 range["path"].as_str().unwrap_or_default(),
@@ -199,57 +167,11 @@ fn collect_gaps(s: &mut Session) -> Vec<String> {
                 "근거 점검 — 구조 문제 {other}건이 남아 있습니다 (document_audit)."
             ));
         }
-        let cited = tools::citation_count(s) > 0;
-        if !cited {
+        if tools::citation_count(s) == 0 {
             gaps.push(
                 "소스 인용 — 문서에 경로:줄 형식의 소스 인용이 없어 소스와 대조하지 못했습니다."
                     .into(),
             );
-        }
-        if s.document_written && s.config.source_document_review && cited {
-            let ranges = tools::document_review::unavailable_ranges(s);
-            match tools::document_review::current_verdict(s) {
-                tools::document_review::CurrentVerdict::Approved => {}
-                tools::document_review::CurrentVerdict::Rejected(issues) => {
-                    for issue in issues.iter().take(12) {
-                        gaps.push(format!("문서 검토 지적 — {issue}"));
-                    }
-                    let unreached = tools::document_review::unreached_ranges(s);
-                    if !unreached.is_empty() {
-                        let ranges = unreached
-                            .iter()
-                            .map(|(start, end)| format!("{start}–{end}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        gaps.push(format!(
-                            "문서 검토 — 지적이 한 번에 받는 최대 건수에 도달해 {ranges}줄은 이번 검토에서 확인하지 못했습니다. 지적을 고친 뒤의 검토가 이 부분을 이어서 확인합니다."
-                        ));
-                    }
-                }
-                tools::document_review::CurrentVerdict::Unavailable => {
-                    if ranges.is_empty() {
-                        gaps.push("문서 검토 — 검토 응답 오류로 검토를 마치지 못했습니다.".into());
-                    }
-                }
-                tools::document_review::CurrentVerdict::Unreviewed => {
-                    gaps.push(match tools::document_review::paused_pages(s) {
-                        Some(pages) => format!(
-                            "문서 검토 — 마감 전에 검토를 마치지 못했습니다(검토 요청 {pages}건 완료). 문서를 고치지 않고 이어서 진행하면 남은 부분부터 검토합니다."
-                        ),
-                        None => "문서 검토 — 현재 문서를 마감 전에 검토하지 못했습니다.".into(),
-                    });
-                }
-            }
-            if !ranges.is_empty() {
-                let ranges = ranges
-                    .iter()
-                    .map(|(start, end)| format!("{start}–{end}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                gaps.push(format!(
-                    "문서 검토 — {ranges}줄은 검토를 마치지 못했습니다."
-                ));
-            }
         }
     }
     for item in &s.task.unresolved {
@@ -270,53 +192,15 @@ fn collect_gaps(s: &mut Session) -> Vec<String> {
 // sections.
 const PLAN_CLOSEOUT_INSTRUCTION: &str = "The document is written and passes its audit, but the to-dos in plan_closeout are open and the final answer is refused while any is open. A to-do whose work is not done yet, such as a requested section still missing from the document, is NOT obsolete. Do that work first: read the evidence and write the section. When the listed work is done, close them in ONE task_plan apply using plan_closeout.expected_revision: one operation per item in the listed order, complete with the actual observed result, or remove with a reason only when the item is genuinely obsolete, never merely unstarted. complete must follow list order, because only the current item can complete. Give the final answer only when the requested document is complete.";
 
-const REVIEW_REPAIR_RESUME_INSTRUCTION: &str = "A checkpoint cleared the context during review repair, and the document is still UNCHANGED: every finding in review_repair.unrepaired_findings is still open. A final answer now is rejected again without a new review. Edit the document for these findings first.";
-
 /// The final answer of a source document that cites no project source.
 const DOCUMENT_CITATIONS_MISSING: &str = "document_citations_missing: the saved document cites no project source as path:start-end (for example backend/src/server.js:12-30), so it cannot be checked against the source and the final answer is refused. Cite the sources next to the claims they support, from ranges you have read (file_read a range first if needed), then give the final answer.";
 
 /// Closing mode only: the runtime is ending the run and nothing is left to
 /// repair. Outside closing the model judges when the document is complete.
-const READY_FOR_FINAL_INSTRUCTION: &str = "Ready to finish, provided every requested section is written: the document is saved, its audit passes, no to-do remains and no review finding is open for this document version. If a requested section is still missing, write it first. Give the concise final answer now (output path, verification scope, remaining limitations). The runtime then runs the document review and returns any finding as a repair. Do not inspect or audit again unless you change the document.";
-
-const REVIEW_REPAIR_INSTRUCTION: &str = "Review repair: fix ALL findings in document_review.issues before the next final answer. Read any source range a finding needs, then apply the corrections with as few document edits as possible: group non-overlapping corrections in one document_edit_batch whose single expected_hash is the top-level argument (never inside edits). Operations apply in order, so never target text that an earlier operation in the same batch replaces; when corrections touch the same passage, merge them into one operation or use a separate request. Then give the final answer to start the re-review. Do not alternate single edits with document_audit or document_inspect. Fix findings in their original sections; do not add a review-notes section.";
-
-/// A completed document review rejected the result and no re-review is
-/// running: the next work is repairing its findings.
-fn review_repair_pending(s: &Session) -> bool {
-    s.checkpoint.is_none()
-        && s.is_document_work()
-        && s.document_written
-        && s.config.source_document_review
-        && matches!(
-            tools::document_review::current_verdict(s),
-            tools::document_review::CurrentVerdict::Rejected(_)
-        )
-}
-
-/// During review repair an audit between edits needs only its verdict and a
-/// few issues; the full list is available by paging with offset.
-fn compact_repair_audit(s: &Session, call: &ToolCall, mut result: Value) -> Value {
-    const REPAIR_AUDIT_ISSUES: usize = 5;
-    if call.name != "document_audit" || result["status"] != "ok" || !review_repair_pending(s) {
-        return result;
-    }
-    if let Some(issues) = result["data"]["issues"].as_array_mut()
-        && issues.len() > REPAIR_AUDIT_ISSUES
-    {
-        let offset = serde_json::from_str::<Value>(&call.arguments)
-            .ok()
-            .and_then(|args| args["offset"].as_u64())
-            .unwrap_or(0) as usize;
-        issues.truncate(REPAIR_AUDIT_ISSUES);
-        result["data"]["next_offset"] = json!(offset + REPAIR_AUDIT_ISSUES);
-        result["data"]["compacted_for_review_repair"] = json!(true);
-    }
-    result
-}
+const READY_FOR_FINAL_INSTRUCTION: &str = "Ready to finish, provided every requested section is written: the document is saved, its audit passes and no to-do remains. If a requested section is still missing, write it first. Give the concise final answer now (output path, verification scope, remaining limitations). Do not inspect or audit again unless you change the document.";
 
 /// Document work whose own bookkeeping is finished: the next useful step is
-/// the final answer, which starts the runtime's document review.
+/// the final answer.
 fn ready_for_final(s: &mut Session) -> bool {
     s.task.current_todo().is_none() && ready_except_plan(s)
 }
@@ -331,15 +215,12 @@ fn ready_except_plan(s: &mut Session) -> bool {
     let bookkeeping_ready = s.checkpoint.is_none()
         && s.is_document_work()
         && s.document_written
-        && !s.document_review.pending
-        && !tools::document_review::rejected_on_current_result(s)
         && tools::verify_document_write(s).is_ok();
     if !bookkeeping_ready {
         return false;
     }
-    // Every citation must be well-formed, and read unless the document
-    // review checks it. Use the same audit as final acceptance, including
-    // its freshness revalidation.
+    // Every citation must be well-formed and read. Use the same audit as
+    // final acceptance, including its freshness revalidation.
     match tools::audit_document(s) {
         // A document without citations has every cited range read trivially;
         // its final answer is refused, so it is not ready either.
@@ -419,106 +300,9 @@ fn suppress_unchanged_repeat(
         "guidance":"Identical result is already in active context: the document and its evidence have not changed since. Use that result and act on it: edit, read an unread cited range, or give the final answer. Do not repeat this check until something changes."}})
 }
 
-/// The notice of a review skipped because it got no answer, not because its
-/// answers had the wrong format.
-fn unanswered_notice(notice: &'static str) -> &'static str {
-    match notice {
-        REVIEW_PAGE_SKIPPED_NOTICE | REVIEW_CLOSING_PAGE_SKIPPED_NOTICE => {
-            REVIEW_UNANSWERED_SKIPPED_NOTICE
-        }
-        REVIEW_UNAVAILABLE_NOTICE => REVIEW_UNANSWERED_UNAVAILABLE_NOTICE,
-        REVIEW_CLOSING_UNAVAILABLE_NOTICE => REVIEW_CLOSING_UNANSWERED_NOTICE,
-        other => other,
-    }
-}
-
-/// Give up on the page of a pending review whose responses keep failing, for
-/// document work only. A page whose responses fail validation is skipped
-/// after REVIEW_UNAVAILABLE_LIMIT of them, in closing mode at the first. A
-/// page that got no answer (`half_retry` marks its first unanswered
-/// response) is asked once more at half size and then skipped, in closing
-/// mode too. Skipping keeps the findings of other pages and reports the
-/// page as unreviewed; the review ends unchecked only when nothing is left
-/// to judge. In closing mode one malformed reply used to end the whole
-/// review: two live runs lost their closing reviews that way, one with a
-/// page already reviewed and another's findings collected. Returns the
-/// notice to show, if any.
-fn abandon_failing_review(
-    s: &mut Session,
-    failures: usize,
-    half_retry: bool,
-) -> Option<&'static str> {
-    let closing = s.progress_recovery.closing.is_some();
-    let retry = if closing {
-        half_retry
-    } else {
-        failures < REVIEW_UNAVAILABLE_LIMIT
-    };
-    if !s.is_document_work() || s.checkpoint.is_some() || retry {
-        return None;
-    }
-    // Closing skips a page at its first malformed reply; "repeatedly" would
-    // misstate that.
-    let once = failures < REVIEW_UNAVAILABLE_LIMIT;
-    let (page_skipped, unavailable) = if once {
-        (
-            REVIEW_CLOSING_PAGE_SKIPPED_NOTICE,
-            REVIEW_CLOSING_UNAVAILABLE_NOTICE,
-        )
-    } else {
-        (REVIEW_PAGE_SKIPPED_NOTICE, REVIEW_UNAVAILABLE_NOTICE)
-    };
-    if s.document_review.pending {
-        use tools::document_review::PageSkip;
-        match tools::document_review::skip_failing_page(s) {
-            PageSkip::NotApplicable => {}
-            PageSkip::Continued => {
-                s.last_error = None;
-                s.progress_recovery.action_required = false;
-                note_document_review_verdict(s);
-                return Some(page_skipped);
-            }
-            PageSkip::Unavailable => {
-                s.last_error = Some(DOCUMENT_REVIEW_UNAVAILABLE.into());
-                s.progress_recovery.action_required = false;
-                return Some(unavailable);
-            }
-        }
-    }
-    if !s.document_review.pending {
-        return None;
-    }
-    tools::document_review::mark_unavailable(s);
-    s.last_error = Some(DOCUMENT_REVIEW_UNAVAILABLE.into());
-    s.progress_recovery.action_required = false;
-    Some(unavailable)
-}
-
-/// After a document review verdict with findings, require their repair.
-fn note_document_review_verdict(s: &mut Session) {
-    if s.document_review.pending || s.document_review.issues.is_empty() {
-        return;
-    }
-    s.last_error = Some(format!(
-        "document_review: {}",
-        s.document_review.issues.join("; ")
-    ));
-    s.progress_recovery.action_required = true;
-    if s.document_review.stalled_attempts >= s.config.review_limit {
-        recover_document(
-            s,
-            "Document review still has unresolved findings. Correct the first finding in its original section; do not request another unchanged review.",
-        );
-    }
-}
-
-/// Why a final answer went back to work. A document review rejection was
-/// once announced as failed completion checks, which never ran.
+/// Why a final answer went back to work.
 fn finalization_notice(error: Option<&str>) -> &'static str {
     match error {
-        Some(error) if error.starts_with("document_review:") => {
-            "Document review findings remain; returning to repair them within the remaining budget"
-        }
         Some(error)
             if error.starts_with("Document format/evidence audit")
                 || error.starts_with("Document audit failed") =>
@@ -543,66 +327,6 @@ const EMPTY_COMPLETION_RETRIES: usize = 2;
 /// ladder closed it: a live run spent 24 rounds (1.4M input tokens) there.
 const EMPTY_DOCUMENT_CLOSING: usize = 3;
 
-/// Unchanged-document final answers rejected by a review before closing.
-/// A live run closed after two with most of its budget left.
-const UNREPAIRED_FINAL_LIMIT: usize = 3;
-
-/// The output document's current hash, if it exists.
-fn output_hash(s: &Session) -> Option<String> {
-    tools::output_path(&s.project)
-        .and_then(|path| tools::hash_file(&path))
-        .ok()
-}
-
-/// The final answer that started a document review, once that review has
-/// ended for the same document without findings to repair: approved, or
-/// unavailable (finished as unreviewed). One review spans several requests
-/// (document and evidence pages, finding validation), and the answer stays
-/// held while it is pending: taking it at the first page lost it, and a live
-/// run asked the model for its final answer again after the approval (3.9%
-/// of the run's input). A rejection or a changed document drops it.
-fn resume_held_final(s: &Session, held: &mut Option<(String, Option<String>)>) -> Option<String> {
-    if s.document_review.pending {
-        return None;
-    }
-    let (text, hash) = held.take()?;
-    (hash == output_hash(s)
-        && (tools::document_review::approved(s)
-            || tools::document_review::unavailable_on_current(s)))
-    .then_some(text)
-}
-
-/// Count a final answer rejected because the reviewed document was not
-/// edited. An edit changes the document hash and restarts the count.
-fn note_unrepaired_final(s: &mut Session) -> usize {
-    let current = output_hash(s);
-    let recovery = &mut s.progress_recovery;
-    if current.is_some() && recovery.unrepaired_final_hash == current {
-        recovery.unrepaired_finals = recovery.unrepaired_finals.saturating_add(1);
-    } else {
-        recovery.unrepaired_final_hash = current;
-        recovery.unrepaired_finals = 1;
-    }
-    recovery.unrepaired_finals
-}
-
-const REVIEW_UNAVAILABLE_NOTICE: &str = "검토 응답이 반복해서 형식에 맞지 않아 이 결과의 검토를 생략하고, 완료 보고에 미검토로 표시합니다.";
-const REVIEW_CLOSING_UNAVAILABLE_NOTICE: &str = "마감 단계의 검토 응답이 형식에 맞지 않아 이 결과의 검토를 생략하고, 완료 보고에 미검토로 표시합니다.";
-const DOCUMENT_REVIEW_UNAVAILABLE: &str = "document_review_unavailable: document review responses were invalid; give the final answer again and the document will be reported as unreviewed";
-const REVIEW_PAGE_SHRUNK_NOTICE: &str = "검토 응답을 받지 못해(출력 한도 소진 또는 응답 시간 초과), 이 부분을 절반 범위로 다시 검토합니다.";
-const REVIEW_RETRY_NOTICE: &str =
-    "검토 응답을 받지 못해(출력 한도 소진 또는 응답 시간 초과), 검토를 한 번 더 요청합니다.";
-const REVIEW_UNANSWERED_SKIPPED_NOTICE: &str =
-    "검토 응답을 받지 못해 이 부분의 검토를 건너뛰고, 나머지 검토를 이어갑니다.";
-const REVIEW_UNANSWERED_UNAVAILABLE_NOTICE: &str =
-    "검토 응답을 받지 못해 이 결과의 검토를 생략하고, 완료 보고에 미검토로 표시합니다.";
-const REVIEW_CLOSING_UNANSWERED_NOTICE: &str =
-    "마감 단계의 검토 응답을 받지 못해 이 결과의 검토를 생략하고, 완료 보고에 미검토로 표시합니다.";
-const REVIEW_PAGE_SKIPPED_NOTICE: &str =
-    "검토 응답이 반복해서 형식에 맞지 않아 이 부분의 검토를 건너뛰고, 나머지 검토를 이어갑니다.";
-const REVIEW_CLOSING_PAGE_SKIPPED_NOTICE: &str =
-    "마감 단계의 검토 응답이 형식에 맞지 않아 이 부분의 검토를 건너뛰고, 나머지 검토를 이어갑니다.";
-
 fn finish_cause_text(cause: &str) -> &'static str {
     match cause {
         "run_budget_exhausted" => "실행 예산이 소진되어 마감했습니다.",
@@ -610,7 +334,6 @@ fn finish_cause_text(cause: &str) -> &'static str {
         "closing_round_limit" => "마감 단계의 요청 한도에 도달해 마감했습니다.",
         "budget" => "마감 예산에 도달해 마감했습니다.",
         "stall" => "진행이 오래 멈춰 마감했습니다.",
-        "review_unrepaired" => "검토 지적이 반영되지 않은 채 최종 답변이 반복돼 마감했습니다.",
         "empty_response" => "모델이 빈 응답을 반복해 마감했습니다.",
         _ => "마감했습니다.",
     }
@@ -657,11 +380,6 @@ fn force_finish(s: &mut Session, cause: &str) -> Option<String> {
         return None;
     }
     s.set_run_stop_reason(cause);
-    if s.document_review.pending {
-        // Keep the answered pages: a resumed run continues the review of
-        // the unchanged document instead of starting it over.
-        tools::document_review::pause(s);
-    }
     s.continuation = None;
     s.completion_gaps = collect_gaps(s);
     s.status = if s.completion_gaps.is_empty() {
@@ -744,30 +462,6 @@ fn recover_document(s: &mut Session, reason: &str) -> bool {
     true
 }
 
-/// A tool-free reviewer cannot repair a missing citation, an oversized draft,
-/// or invalid metadata. Return such failures to the agent with the cause intact.
-fn recover_review_setup(s: &mut Session, reason: &str) -> bool {
-    if !s.is_document_work()
-        || !tools::recovery::correctable_document_error(&json!({
-            "recovery": tools::recovery::describe(reason)
-        }))
-    {
-        return false;
-    }
-    if s.document_review.pending {
-        tools::document_review::defer_for_repair(s);
-    }
-    s.status = "running".into();
-    s.last_error = Some(reason.into());
-    s.progress_recovery.action_required = true;
-    recover_document(
-        s,
-        &format!(
-            "Review preparation failed: {reason}. Correct the cited content, missing evidence or task metadata with tools. Preserve the original requirements and requested document content, then request final verification again."
-        ),
-    )
-}
-
 fn recover_unexecuted_batch(s: &mut Session, reason: &str) -> bool {
     let code = reason.split(':').next().unwrap_or(reason);
     if !matches!(
@@ -789,14 +483,6 @@ fn recover_unexecuted_batch(s: &mut Session, reason: &str) -> bool {
     // The provider parser and completion validator reject the whole response
     // before execution. Recover malformed calls just like oversized batches;
     // they must not bypass the tool executor's correctable-input policy.
-    // Review requests have no executable tools. Their next request needs JSON
-    // protocol feedback, not an instruction to reissue a smaller tool batch.
-    if s.checkpoint.is_none() && s.document_review.pending {
-        s.last_error = Some(format!(
-            "document_review_incomplete: {reason}; return complete issues JSON without tool calls"
-        ));
-        return true;
-    }
     let budget = if s.checkpoint.is_some() {
         ContextManager::cleanup_result_budget(&s.config)
     } else {
@@ -1394,7 +1080,6 @@ pub async fn run_session_controlled(
         }
     }
     s.begin_run();
-    tools::document_review::refresh_policy(&mut s);
     s.task.migrate_legacy_plan();
     s.status = "running".into();
     s.last_error = None;
@@ -1413,21 +1098,17 @@ pub async fn run_session_controlled(
     let mut finalization_attempts = s.progress_recovery.finalization_attempts;
     let mut length_recoveries = 0usize;
     let mut empty_completions = 0usize;
-    let mut review_response_failures = 0usize;
-    // Requests of the pending review that got no answer: the output ran out
-    // or the request timed out. The second one skips the page or the review.
-    let mut review_unanswered = 0usize;
+    // Unread cited ranges counted after the last tool batch. Only tool calls
+    // change the delivered evidence or the document, so the next request
+    // starts from this count instead of scanning again; an external edit in
+    // between still shows in that request's readiness audit, which runs
+    // afresh.
+    let mut known_unread: Option<usize> = None;
     // Smoothed duration of completed model requests in this run. A slow
     // model needs a larger closing reserve than a share of the time budget.
     let mut request_secs: Option<f64> = None;
-    // The model the two values above were learned with.
+    // The model request_secs was learned with.
     let mut learned_model = s.config.model.clone();
-    // The final answer that started the pending document review, with the
-    // output hash it was given for. When that review ends for the same
-    // document without findings to repair, resume_held_final resumes it
-    // instead of asking the model to answer again: the repeated request cost
-    // a full-context round per approval (8% of a live run's input).
-    let mut held_final: Option<(String, Option<String>)> = None;
     // Consecutive provider outages and the requests they consumed.
     let mut provider_outages = 0usize;
     let mut provider_requests = 0usize;
@@ -1479,9 +1160,9 @@ pub async fn run_session_controlled(
             }
             Ok(false) => {}
         }
-        // A model switched during the run has its own pace and review output
-        // need. Relearn both, as apply_config does with token calibration:
-        // the previous model's slow requests would start closing at once.
+        // A model switched during the run has its own pace. Relearn it, as
+        // apply_config does with token calibration: the previous model's
+        // slow requests would start closing at once.
         if s.config.model != learned_model {
             learned_model.clone_from(&s.config.model);
             request_secs = None;
@@ -1511,9 +1192,6 @@ pub async fn run_session_controlled(
             s.set_run_stop_reason(reason);
             failure = Some(format!("{reason}: partial results and memory retained"));
             break;
-        }
-        if !s.config.source_document_review {
-            s.document_review.pending = false;
         }
         let spent = s
             .input_tokens
@@ -1564,35 +1242,21 @@ pub async fn run_session_controlled(
         {
             phase = "answer".into();
         }
-        if finalization_attempts > 0
-            || (s.config.source_document_review
-                && tools::document_review::rejected_on_current_result(&s))
-        {
+        if finalization_attempts > 0 {
             // A rejected document completion always returns to verification,
             // even if the model previously declared itself ready to answer.
             phase = "verify".into();
         }
         // One progress ladder for document work: focus (1x), narrowed tools
-        // (2x), then closing mode (3x) or the closing budget reserve. Review
-        // requests never count: page skips and the unavailable verdict
-        // already bound failing responses, and a live run's slow but working
-        // review climbed the ladder from 4 to 18. Closing spends its bounded
-        // requests on retried review responses too.
-        let unread_count = unread_citation_count(&s);
-        let review_request = s.checkpoint.is_none() && s.document_review.pending;
+        // (2x), then closing mode (3x) or the closing budget reserve.
+        let unread_count = known_unread
+            .take()
+            .unwrap_or_else(|| unread_citation_count(&s));
         let request_completed = std::mem::replace(&mut ladder_request_completed, true);
-        let counts_as_round = request_completed && !review_request;
-        let counts_as_closing_round =
-            request_completed && (!review_request || review_response_failures > 0);
         // A closing request counted here may still become a checkpoint
         // request below; that request then returns its closing round.
         let mut closing_round_counted = false;
         if s.checkpoint.is_none() {
-            // Reading new sources is progress until the document exists, even
-            // after the budget or the document workflow switches the
-            // guidance to drafting; afterwards only result improvements count,
-            // except while review findings are open: repairing them needs new
-            // evidence, and a live run stalled out reading exactly that.
             // New source evidence is always progress, in every phase and
             // after the first save: reading more of the project is how a
             // document gets complete. Only investigation, an unsaved
@@ -1608,24 +1272,20 @@ pub async fn run_session_controlled(
             if score > s.progress_recovery.best_score {
                 s.progress_recovery.best_score = score;
                 s.progress_recovery.rounds_since_best = 0;
-            } else if counts_as_round {
+            } else if request_completed {
                 s.progress_recovery.rounds_since_best =
                     s.progress_recovery.rounds_since_best.saturating_add(1);
             }
             if s.is_document_work() && s.progress_recovery.closing.is_none() {
-                // The time reserve also covers the closing requests and the
-                // document's review at this run's pace: a slow model spent a
-                // 6-minute reserve on the rest of one review and was stopped
-                // by the deadline mid-request. It never exceeds the
-                // verification share, so a very slow model or a very long
-                // document does not close half way; the deadline finishes
-                // the rest. The review estimate reads the document, so it is
-                // made only once the share is reached.
+                // The time reserve also covers the closing requests at this
+                // run's pace. It never exceeds the verification share, so a
+                // very slow model does not close half way; the deadline
+                // finishes the rest.
                 let time_short = request_secs.is_some_and(|secs| {
                     let cap =
                         s.config.verification_reserve_ratio * s.config.run_timeout_secs as f64;
                     let remaining = seconds_remaining as f64;
-                    remaining < cap && remaining < secs * closing_reserve_requests(&s)
+                    remaining < cap && remaining < secs * CLOSING_REQUEST_RESERVE
                 });
                 let reason = if fraction <= s.config.closing_reserve_ratio || time_short {
                     Some("budget")
@@ -1659,7 +1319,7 @@ pub async fn run_session_controlled(
                 }
             }
             if let Some(closing) = &mut s.progress_recovery.closing {
-                if counts_as_closing_round {
+                if request_completed {
                     closing.rounds = closing.rounds.saturating_add(1);
                     closing_round_counted = true;
                 }
@@ -1687,8 +1347,7 @@ pub async fn run_session_controlled(
         let stall_rounds = s.progress_recovery.rounds_since_best;
         let document_work = s.is_document_work();
         let planned_work = s.task.current_todo().is_some();
-        let focused_repair = s.document_review.stalled_attempts >= s.config.review_limit
-            || s.progress_recovery.recovery_reason.is_some();
+        let focused_repair = s.progress_recovery.recovery_reason.is_some();
         let repeated_outcome_focus =
             s.progress_recovery.repeated_outcome_rounds >= s.config.stall_round_limit;
         let substantive_focus = s.progress_recovery.rounds_without_substantive_progress
@@ -1735,7 +1394,7 @@ pub async fn run_session_controlled(
         } else {
             DOCUMENT_FOCUSED_INSTRUCTION
         };
-        const DOCUMENT_FOCUSED_INSTRUCTION: &str = "Focused recovery: choose the first document_review issue or current to-do and perform one concrete action that changes the requested result or verifies specific missing evidence. Read recovery_reason and the last tool's recovery contract; correct the cause or choose a different action before retrying. A task_plan applied=false or unchanged=true result did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, repeat an unchanged plan, or save another summary. After a real edit, advance its to-do or read any cited range it left unread. If the original result already exists, take its remaining problems from run_guidance.document_readiness and complete only the actual remaining work. Document retry counts are recovery signals, not permission to stop or weaken requirements: continue to final verification within the remaining tokens and time.";
+        const DOCUMENT_FOCUSED_INSTRUCTION: &str = "Focused recovery: choose the current to-do and perform one concrete action that changes the requested result or verifies specific missing evidence. Read recovery_reason and the last tool's recovery contract; correct the cause or choose a different action before retrying. A task_plan applied=false or unchanged=true result did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, repeat an unchanged plan, or save another summary. After a real edit, advance its to-do or read any cited range it left unread. If the original result already exists, take its remaining problems from run_guidance.document_readiness and complete only the actual remaining work. Document retry counts are recovery signals, not permission to stop or weaken requirements: continue to final verification within the remaining tokens and time.";
         const ANSWER_INVESTIGATE_INSTRUCTION: &str = "For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. For a requested document edit, inspect the target section and make a targeted edit. Answer once evidence is sufficient.";
         const ANSWER_FOCUSED_INSTRUCTION: &str = "Focused recovery: choose the current to-do, or the question itself, and perform one concrete action that changes the requested result. Read recovery_reason and the last tool's recovery contract; correct the cause or choose a different action before retrying. A task_plan applied=false or unchanged=true result did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, repeat an unchanged plan, or save another summary. If the requested result already exists, complete only the actual remaining work, then answer.";
         s.run_guidance = json!({"task_rounds":s.task_rounds,"run_rounds":s.run_rounds(),"finalization_attempts":finalization_attempts,"phase":phase,"remaining_tokens":remaining,"remaining_seconds":seconds_remaining,"unread_citation_count":unread_count,
@@ -1748,7 +1407,7 @@ pub async fn run_session_controlled(
             "writing_reserve_tokens":(s.config.run_tokens as f64*s.config.writing_reserve_ratio) as usize,
             "verification_reserve_tokens":(s.config.run_tokens as f64*s.config.verification_reserve_ratio) as usize,
             "finalization_error":s.last_error.as_deref().filter(|error| finalization_attempts > 0 || error.starts_with("task_plan_pending:")),
-            "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: the last requests produced no new evidence, document change or resolved citation. Change approach instead of repeating them: read sources the document still needs and has not read, write or correct a section, or file_read a cited range reported as unread. Do not repeat an unchanged read, plan rewrite or memory save. If a claim cannot be supported, mark that gap in the relevant section and continue with supported work; do not invent evidence." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"For source documentation, batch reads for missing evidence, then repair known issues in their original locations with targeted section or text edits when safe. Review findings are edit instructions, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. The next final answer starts the re-review; an unchanged rejected document reuses its findings. Keep correcting the original requirements within the remaining run tokens and time.","draft"=>"Half of the run budget is spent: plan the remaining reading and writing so the requested document is complete and verified within remaining_tokens and remaining_seconds. Save sections in separate edits; place each from the outline in the last save result, use insert_before/insert_after for siblings and insert_first_child/insert_last_child for nested sections when that preserves the document flow, and copy section_path when headings repeat.",_=>if answer_workflow { ANSWER_INVESTIGATE_INSTRUCTION } else { "For source documentation, judge from the request and the evidence how much to read and when the document is complete. When a section's evidence is in context, write that section with its path:start-end citations right away, then read for the next one; save sections in separate edits rather than one full-file write; place each from the outline in the last save result (document_inspect only when none is in context), copy section_path when headings repeat, and use sibling or child insertion to place it within the hierarchy. Batch independent searches or reads together instead of paying a model round per file." }} }});
+            "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: the last requests produced no new evidence, document change or resolved citation. Change approach instead of repeating them: read sources the document still needs and has not read, write or correct a section, or file_read a cited range reported as unread. Do not repeat an unchanged read, plan rewrite or memory save. If a claim cannot be supported, mark that gap in the relevant section and continue with supported work; do not invent evidence." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"For source documentation, batch reads for missing evidence, then repair known issues in their original locations with targeted section or text edits when safe. Corrections are edits, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Keep correcting the original requirements within the remaining run tokens and time.","draft"=>"Half of the run budget is spent: plan the remaining reading and writing so the requested document is complete and verified within remaining_tokens and remaining_seconds. Save sections in separate edits; place each from the outline in the last save result, use insert_before/insert_after for siblings and insert_first_child/insert_last_child for nested sections when that preserves the document flow, and copy section_path when headings repeat.",_=>if answer_workflow { ANSWER_INVESTIGATE_INSTRUCTION } else { "For source documentation, judge from the request and the evidence how much to read and when the document is complete. When a section's evidence is in context, write that section with its path:start-end citations right away, then read for the next one; save sections in separate edits rather than one full-file write; place each from the outline in the last save result (document_inspect only when none is in context), copy section_path when headings repeat, and use sibling or child insertion to place it within the hierarchy. Batch independent searches or reads together instead of paying a model round per file." }} }});
         s.run_guidance["progress_recovery"]["rounds_since_progress"] = json!(stall_rounds);
         s.run_guidance["progress_recovery"]["closing_after"] =
             json!(closing_stall_limit(&s.config));
@@ -1776,14 +1435,6 @@ pub async fn run_session_controlled(
         // models stop after the first sections. Readiness is still checked
         // here for its document_readiness problems and the to-do closeout.
         let ready = s.progress_recovery.closing.is_none() && ready_except_plan(&mut s);
-        if ready && s.task.current_todo().is_none() && s.config.source_document_review {
-            let previous = s.document_review.issues.len();
-            if previous > 0 {
-                s.run_guidance["document_review_note"] = json!(format!(
-                    "document_review.issues contains {previous} findings from a previous document version. They are repair context, not confirmed defects in the current version. The next review checks the current document after your final answer."
-                ));
-            }
-        }
         if ready && s.task.current_todo().is_some() {
             s.run_guidance["plan_closeout"] = plan_closeout(&s);
             s.run_guidance["instruction"] = json!(PLAN_CLOSEOUT_INSTRUCTION);
@@ -1793,22 +1444,6 @@ pub async fn run_session_controlled(
             s.run_guidance["instruction"] = json!(
                 "The document is not ready for final acceptance. Resolve document_readiness.issues using their next actions: file_read each unread_citation range (or narrow that citation to the lines already read), or repair the reported format/citation problem. Do not submit another final answer before those issues are resolved. For additional issues, use document_audit with offset=next_offset and expected_revision=revision from this audit."
             );
-        } else if s.progress_recovery.closing.is_none() && review_repair_pending(&s) {
-            s.run_guidance["review_repair"] = json!({"findings":s.document_review.issues.len()});
-            s.run_guidance["instruction"] = json!(REVIEW_REPAIR_INSTRUCTION);
-            // After a checkpoint cleared the repair context, restate the
-            // findings until the document changes.
-            let resume = s.progress_recovery.review_repair_resume_hash.clone();
-            if resume.is_some() && resume == output_hash(&s) {
-                s.run_guidance["review_repair"]["resumed_after_checkpoint"] = json!(true);
-                s.run_guidance["review_repair"]["unrepaired_findings"] =
-                    json!(s.document_review.issues);
-                s.run_guidance["instruction"] = json!(format!(
-                    "{REVIEW_REPAIR_RESUME_INSTRUCTION} {REVIEW_REPAIR_INSTRUCTION}"
-                ));
-            } else if resume.is_some() {
-                s.progress_recovery.review_repair_resume_hash = None;
-            }
         }
         if let Some(closing) = &s.progress_recovery.closing {
             s.run_guidance["closing"] = json!({"active":true,"reason":closing.reason,
@@ -1885,37 +1520,17 @@ pub async fn run_session_controlled(
                 }
             };
         }
-        let reviewing_document = s.document_review.pending && s.checkpoint.is_none();
-        // Any other request means the held answer no longer ends the run.
-        if !reviewing_document {
-            held_final = None;
-        }
-        let mut replaying_final = false;
-        if reviewing_document {
-            request = match tools::document_review::request(&mut s) {
-                Ok(request) => request,
-                Err(error) => {
-                    if recover_review_setup(&mut s, &error.to_string()) {
-                        continue;
-                    }
-                    failure = Some(error.to_string());
-                    break;
-                }
-            };
-        }
         // After an empty reply, let the model choose: some providers answer a
         // required tool choice with reasoning only and no content or calls.
         if document_work
             && s.progress_recovery.action_required
             && empty_completions == 0
             && s.checkpoint.is_none()
-            && !reviewing_document
         {
-            // A rejected final must return to a concrete tool action. Review
-            // requests remain tool-free, and a subsequent final is still gated.
+            // A rejected final must return to a concrete tool action; a
+            // subsequent final is still gated.
             request["tool_choice"] = json!("required");
         }
-        let buffer_answer = reviewing_document;
         let raw_request_tokens = context::count(&request, &s.config.model);
         let request_tokens = ContextManager::calibrated(&s, raw_request_tokens);
         // Reasoning models spend output tokens on reasoning too. Cleanup
@@ -1923,14 +1538,6 @@ pub async fn run_session_controlled(
         let mut request_config = s.config.clone();
         if s.checkpoint.is_some() {
             request_config.output_tokens = ContextManager::cleanup_output_tokens(&s.config);
-        }
-        // A review asks with the configured output allowance at once: a
-        // reasoning model spent a short first allowance on reasoning alone.
-        // A timed-out review is not retried as is, since each retry waited
-        // out the provider's idle timeout again; it is asked once more,
-        // halved where it can be, and then skipped.
-        if s.is_document_work() && reviewing_document {
-            request_config.retry_timeouts = false;
         }
         if request_tokens
             .saturating_add(request_config.output_tokens)
@@ -1958,7 +1565,7 @@ pub async fn run_session_controlled(
             break;
         }
         s.task_rounds += 1;
-        s.activity = json!({"stage":if reviewing_document {"document_review"} else {"model"},"started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds()});
+        s.activity = json!({"stage":"model","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds()});
         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
         let deadline = run_deadline(started, &s.config);
         if tokio::time::Instant::now() >= deadline {
@@ -1973,7 +1580,7 @@ pub async fn run_session_controlled(
             cp.attempts += 1;
         }
         let document_workflow = s.is_document_work();
-        request[crate::llm::STREAM_DELTAS_MARKER] = json!(!(buffer_answer || document_workflow));
+        request[crate::llm::STREAM_DELTAS_MARKER] = json!(!document_workflow);
         let (tx, mut rx) = mpsc::channel(64);
         let event_tx = events.clone();
         let sid = s.id.clone();
@@ -1989,7 +1596,7 @@ pub async fn run_session_controlled(
                     text = rx.recv() => text,
                 };
                 let Some(text) = text else { break };
-                if buffer_answer || document_workflow {
+                if document_workflow {
                     continue;
                 }
                 emit(
@@ -2005,7 +1612,6 @@ pub async fn run_session_controlled(
             }
         });
         let _relay_guard = AbortOnDrop(relay.abort_handle());
-        let usage_before = (s.input_tokens, s.output_tokens);
         let request_started = std::time::Instant::now();
         let response = tokio::select! {_ = cancel.cancelled()=>Err(anyhow::anyhow!("cancelled")),result=tokio::time::timeout_at(deadline,std::panic::AssertUnwindSafe(client.complete(request,&request_config,cancel.clone(),tx)).catch_unwind())=>match result{Ok(Ok(r))=>r,Ok(Err(_))=>Err(anyhow::anyhow!("model_worker_panic: model request interrupted; session retained")),Err(_)=>Err(anyhow::anyhow!("run_timeout"))}};
         relay_done.cancel();
@@ -2087,41 +1693,12 @@ pub async fn run_session_controlled(
                 }
             }
         }
-        let charged_input = s.input_tokens.saturating_sub(usage_before.0);
-        let charged_output = s.output_tokens.saturating_sub(usage_before.1);
-        if reviewing_document {
-            s.document_review.input_tokens =
-                s.document_review.input_tokens.saturating_add(charged_input);
-            s.document_review.output_tokens = s
-                .document_review
-                .output_tokens
-                .saturating_add(charged_output);
-        }
         let response = match invalid_completion {
             Some(error) => Err(error),
             None => response,
         };
-        // A review response rejected before its JSON was read (a malformed
-        // tool call, an oversized response) is an invalid review response:
-        // the review branches below count it, announce a skipped or
-        // abandoned review, and accept the answer that started an abandoned
-        // one. It used to be retried silently and, once abandoned, asked the
-        // model for that answer again.
-        let mut rejected_review = None;
-        let mut completion = match response {
+        let completion = match response {
             Ok(completion) => completion,
-            Err(_) if recovered_batch && reviewing_document => {
-                rejected_review = s.last_error.clone();
-                crate::llm::Completion::default()
-            }
-            Err(error)
-                if s.is_document_work()
-                    && reviewing_document
-                    && crate::llm::timeout_error(&error.to_string()) =>
-            {
-                rejected_review = Some(REVIEW_NO_ANSWER.into());
-                crate::llm::Completion::default()
-            }
             Err(error) => {
                 if recovered_batch {
                     continue;
@@ -2197,175 +1774,6 @@ pub async fn run_session_controlled(
                 break;
             }
         };
-        if reviewing_document {
-            // Validate the visible response before looking at provider
-            // metadata. Some compatible providers attach a spurious tool call
-            // or report finish_reason=length even when the JSON object is
-            // complete. The review request has no executable tools, so a
-            // complete, hash-checked verdict is safe to accept in that case.
-            // A reasoning model can spend the output allowance before the
-            // JSON closes. Name that cause instead of tool use, so the retry
-            // shortens its verdict rather than looking for tools.
-            let truncated = || anyhow::anyhow!(REVIEW_TRUNCATED);
-            let review_result = if let Some(error) = rejected_review.take() {
-                Err(anyhow::anyhow!(error))
-            } else if completion.discarded_tool_calls || !completion.calls.is_empty() {
-                Err(anyhow::anyhow!(
-                    "document_review_incomplete: review must return complete JSON without tools"
-                ))
-            } else if completion.text.trim().is_empty() {
-                Err(if completion.length_limited {
-                    truncated()
-                } else {
-                    anyhow::anyhow!(
-                        "document_review_incomplete: review returned no text; return complete issues JSON"
-                    )
-                })
-            } else {
-                // Mirror abandon_failing_review: this response is the last
-                // one before a page skip, as is any answered response in
-                // closing.
-                let last_try = s.checkpoint.is_none()
-                    && (s.progress_recovery.closing.is_some()
-                        || review_response_failures + 1 >= REVIEW_UNAVAILABLE_LIMIT);
-                let finish = if last_try {
-                    tools::document_review::finish_last_try
-                } else {
-                    tools::document_review::finish
-                };
-                match finish(&mut s, &completion.text) {
-                    Ok(()) => Ok(()),
-                    Err(error)
-                        if completion.length_limited
-                            && error.to_string().starts_with("document_review_invalid:") =>
-                    {
-                        Err(truncated())
-                    }
-                    Err(error) => Err(error),
-                }
-            };
-            // The answer that started a review which ended without a verdict.
-            let mut unreviewed_final = None;
-            if let Err(error) = review_result {
-                let reason = error.to_string();
-                review_response_failures += 1;
-                s.last_error = Some(reason.clone());
-                // No answer with the full allowance: the output ran out or the
-                // request timed out. An identical retry tends to end the same
-                // way, so the page is asked once more at half size (below);
-                // unanswered again, it is skipped and the review goes on.
-                let unanswered = reason == REVIEW_TRUNCATED || reason == REVIEW_NO_ANSWER;
-                if unanswered {
-                    review_unanswered += 1;
-                    if review_unanswered >= 2 {
-                        review_response_failures =
-                            review_response_failures.max(REVIEW_UNAVAILABLE_LIMIT);
-                    }
-                }
-                if (reason.starts_with("document_review_invalid:")
-                    || reason.starts_with("document_review_incomplete:")
-                    || reason.starts_with("document_review_stale:"))
-                    && let Some(notice) = abandon_failing_review(
-                        &mut s,
-                        review_response_failures,
-                        unanswered && review_unanswered == 1,
-                    )
-                {
-                    review_response_failures = 0;
-                    review_unanswered = 0;
-                    let notice = if unanswered {
-                        unanswered_notice(notice)
-                    } else {
-                        notice
-                    };
-                    emit(
-                        &events,
-                        AgentEvent::Notice {
-                            session: s.id.clone(),
-                            text: notice.into(),
-                        },
-                        &cancel,
-                        run_deadline(started, &s.config),
-                    )
-                    .await;
-                    snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
-                    // The review ended without a verdict on the answer that
-                    // started it: take that answer as unreviewed rather than
-                    // asking for it again, which in closing left a live run
-                    // repairing until the deadline. A page skip that keeps
-                    // reviewing keeps the answer held for the next page; a
-                    // rejection still returns to the model.
-                    unreviewed_final = resume_held_final(&s, &mut held_final);
-                    if unreviewed_final.is_none() {
-                        continue;
-                    }
-                } else {
-                    if (s.is_document_work() || review_response_failures < REVIEW_RESPONSE_LIMIT)
-                        && (reason.starts_with("document_review_invalid:")
-                            || reason.starts_with("document_review_incomplete:")
-                            || reason.starts_with("document_review_stale:"))
-                    {
-                        if unanswered && review_unanswered == 1 {
-                            // A single validation candidate and an already
-                            // twice-halved page are asked again as they are.
-                            let notice = if tools::document_review::shrink_page(&mut s) {
-                                REVIEW_PAGE_SHRUNK_NOTICE
-                            } else {
-                                REVIEW_RETRY_NOTICE
-                            };
-                            emit(
-                                &events,
-                                AgentEvent::Notice {
-                                    session: s.id.clone(),
-                                    text: notice.into(),
-                                },
-                                &cancel,
-                                run_deadline(started, &s.config),
-                            )
-                            .await;
-                        }
-                        snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
-                        continue;
-                    }
-                    if recover_review_setup(&mut s, &reason) {
-                        continue;
-                    }
-                    // Document retries retain the pending page until the run budget.
-                    // Other workflows retain the bounded protocol-recovery policy.
-                    if reason.starts_with("document_review_invalid:")
-                        || reason.starts_with("document_review_incomplete:")
-                        || reason.starts_with("document_review_stale:")
-                    {
-                        s.status = "partial".into();
-                        s.document_review.pending = true;
-                    } else {
-                        failure = Some(reason);
-                    }
-                    break;
-                }
-            }
-            let text = match unreviewed_final {
-                Some(text) => text,
-                None => {
-                    review_response_failures = 0;
-                    review_unanswered = 0;
-                    note_document_review_verdict(&mut s);
-                    snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
-                    let Some(text) = resume_held_final(&s, &mut held_final) else {
-                        continue;
-                    };
-                    text
-                }
-            };
-            // Re-enter the final-answer checks with the answer that started
-            // this review; a rejection there returns to the model as before.
-            completion.text = text;
-            completion.calls.clear();
-            completion.discarded_tool_calls = false;
-            completion.length_limited = false;
-            replaying_final = true;
-            s.last_error = None;
-        }
         if !completion.length_limited
             && completion.calls.is_empty()
             && completion.text.trim().is_empty()
@@ -2495,18 +1903,6 @@ pub async fn run_session_controlled(
         }
         if completion.calls.is_empty() {
             let hold_document_final = document_workflow && s.checkpoint.is_none();
-            if buffer_answer && !hold_document_final {
-                emit(
-                    &events,
-                    AgentEvent::Delta {
-                        session: s.id.clone(),
-                        text: completion.text.clone(),
-                    },
-                    &cancel,
-                    run_deadline(started, &s.config),
-                )
-                .await;
-            }
             let mut message = assistant(&completion.text, &[]);
             if continuing {
                 message["continues_previous"] = json!(true);
@@ -2534,17 +1930,10 @@ pub async fn run_session_controlled(
             }
             // Closing mode gives a rejected final one repair turn. The next
             // final is accepted and every unresolved item is reported instead.
-            let closing_attempt = if replaying_final {
-                s.progress_recovery
-                    .closing
-                    .as_ref()
-                    .map(|c| c.final_attempts)
-            } else {
-                s.progress_recovery.closing.as_mut().map(|closing| {
-                    closing.final_attempts = closing.final_attempts.saturating_add(1);
-                    closing.final_attempts
-                })
-            };
+            let closing_attempt = s.progress_recovery.closing.as_mut().map(|closing| {
+                closing.final_attempts = closing.final_attempts.saturating_add(1);
+                closing.final_attempts
+            });
             let accept_gaps = s.is_document_work()
                 && closing_attempt.is_some_and(|n| n >= 2)
                 && document_saved(&s);
@@ -2602,66 +1991,15 @@ pub async fn run_session_controlled(
             } else if s.is_document_work() {
                 match tools::audit_document(&mut s) {
                     Ok(audit) if audit["structural_ok"] == true => {
-                        let closing_review_used = s
-                            .progress_recovery
-                            .closing
-                            .as_ref()
-                            .is_some_and(|c| c.document_review_used);
                         // A source document cites the sources of its claims.
-                        // Without a citation there is nothing to review: a
-                        // live run finished "complete" with no source check
+                        // Without a citation nothing ties them to the source:
+                        // a live run finished "complete" with no source check
                         // and no reported gap. The final answer goes back to
                         // work; closing accepts it and reports the omission.
-                        let cited = tools::citation_count(&s) > 0;
-                        if !cited && !accept_gaps {
+                        if tools::citation_count(&s) == 0 && !accept_gaps {
                             s.status = "partial".into();
                             s.last_error = Some(DOCUMENT_CITATIONS_MISSING.into());
-                        } else if s.document_written
-                            && s.config.source_document_review
-                            && cited
-                            && !tools::document_review::approved(&s)
-                            && !tools::document_review::unavailable_on_current(&s)
-                            && !closing_review_used
-                        {
-                            // Closing mode spends at most one review; its
-                            // unresolved findings are reported afterwards.
-                            if let Some(closing) = &mut s.progress_recovery.closing {
-                                closing.document_review_used = true;
-                            }
-                            if tools::document_review::rejected_on_current_result(&s) {
-                                s.status = "partial".into();
-                                s.last_error = Some(format!(
-                                    "document_review: unchanged document still requires correction: {}",
-                                    s.document_review.issues.join("; ")
-                                ));
-                                // Repeating the final answer without editing the
-                                // rejected document is not repair. After a second
-                                // unchanged rejection, close instead of waiting for
-                                // the stall ladder; the next final is accepted with
-                                // the findings reported. One review stays available:
-                                // an edit made while closing is reviewed again, an
-                                // unchanged document reuses the rejection.
-                                if s.progress_recovery.closing.is_none()
-                                    && note_unrepaired_final(&mut s) >= UNREPAIRED_FINAL_LIMIT
-                                {
-                                    s.progress_recovery.closing = Some(crate::session::Closing {
-                                        reason: "review_unrepaired".into(),
-                                        final_attempts: 1,
-                                        ..Default::default()
-                                    });
-                                    emit(&events, AgentEvent::Notice { session: s.id.clone(), text: "검토 지적을 반영하지 않은 채 최종 답변이 반복돼 마감 단계로 전환합니다. 남은 지적은 결과에 명시합니다.".into() }, &cancel, run_deadline(started, &s.config)).await;
-                                }
-                            } else {
-                                s.document_review.pending = true;
-                                s.status = "running".into();
-                                held_final = (!continuing)
-                                    .then(|| (completion.text.clone(), output_hash(&s)));
-                                emit(&events, AgentEvent::Notice { session:s.id.clone(), text:"Reviewing the document against source evidence and requested coverage.".into() }, &cancel, run_deadline(started, &s.config)).await;
-                                continue;
-                            }
                         } else {
-                            // Approved, or finishing without a further
-                            // review: collect_gaps reports the latter.
                             s.status = "complete".into();
                             s.last_error = None;
                         }
@@ -2741,23 +2079,7 @@ pub async fn run_session_controlled(
             break;
         }
         if s.checkpoint.is_none() {
-            s.progress_recovery.repair_step = tools::ToolRegistry::repair_only(&s);
             s.progress_recovery.action_required = false;
-        }
-        if (buffer_answer || document_workflow)
-            && !s.is_document_work()
-            && !completion.text.is_empty()
-        {
-            emit(
-                &events,
-                AgentEvent::Delta {
-                    session: s.id.clone(),
-                    text: completion.text.clone(),
-                },
-                &cancel,
-                run_deadline(started, &s.config),
-            )
-            .await;
         }
         // Tool-call prose is intermediate. For document work it may claim
         // completion before the calls have run, so keep only the executable
@@ -2778,7 +2100,6 @@ pub async fn run_session_controlled(
         let mut seen_call_ids = std::collections::BTreeSet::new();
         let mut batch_document_hash: Option<String> = None;
         let prior_source_lines = tools::delivered_source_lines(&s);
-        let prior_unread = unread_citation_count(&s);
         let prior_current_todo = s.task.current_todo().map(|item| item.id.clone());
         let prior_pending_todos = s.task.todos.iter().filter(|item| !item.done).count();
         let checkpoint_batch = s.checkpoint.is_some();
@@ -3021,7 +2342,6 @@ pub async fn run_session_controlled(
                     .max(200);
                 let result = tools::limit_result(&mut s, call, result, budget);
                 let result = suppress_unchanged_repeat(&s, &messages, call, result);
-                let result = compact_repair_audit(&s, call, result);
                 tools::record_delivered_read(&mut s, call, &result);
                 if result["status"] == "ok"
                     && [
@@ -3076,7 +2396,12 @@ pub async fn run_session_controlled(
         }
         // Reading a cited range the document still owed counts like a
         // verification did: the saved result is better supported.
-        let verified_progress = unread_citation_count(&s) < prior_unread;
+        // Only the tool batch changes the delivered evidence or the document
+        // within a request, so the count at its start is the count before
+        // this batch. The final answer audits afresh either way.
+        let unread_after = unread_citation_count(&s);
+        let verified_progress = unread_after < unread_count;
+        known_unread = Some(unread_after);
         if verified_progress {
             repetitions.clear();
         }
@@ -3095,7 +2420,6 @@ pub async fn run_session_controlled(
                 .artifact_edits_without_milestone
                 .saturating_add(1);
         }
-        s.progress_recovery.repair_step = false;
         if !s.is_document_work() {
             // Outside document work the reason only explains the rejected batch.
             s.progress_recovery.recovery_reason = None;
@@ -3453,53 +2777,12 @@ mod plan_check_tests {
 }
 
 #[cfg(test)]
-mod review_gap_tests {
+mod readiness_tests {
     use super::*;
-    use crate::config::{Project, Secret};
+    use crate::config::Project;
 
     #[test]
-    fn the_closing_time_reserve_covers_the_review_of_a_long_document() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("a.rs"),
-            (1..=200)
-                .map(|n| format!("let value_{n} = compute(&context, {n});\n"))
-                .collect::<String>(),
-        )
-        .unwrap();
-        let mut s = Session::new(
-            Project {
-                root: dir.path().into(),
-                output: dir.path().join("out.md"),
-                ..Default::default()
-            },
-            Config {
-                model: "gpt-4o".into(),
-                ..Config::compact_test()
-            },
-        );
-        // No document and a short one keep the six-request reserve.
-        assert_eq!(closing_reserve_requests(&s), CLOSING_REQUEST_RESERVE);
-        std::fs::write(&s.project.output, "# A\nValue. a.rs:1-5\n").unwrap();
-        assert_eq!(closing_reserve_requests(&s), CLOSING_REQUEST_RESERVE);
-        // A long document adds its review to the closing write and answer.
-        let long: String = (0..400)
-            .map(|n| format!("Claim {n}. a.rs:1-200\n"))
-            .collect();
-        std::fs::write(&s.project.output, long).unwrap();
-        let review = tools::document_review::estimated_requests(&s);
-        assert!(review > 50, "{review}");
-        assert_eq!(
-            closing_reserve_requests(&s),
-            CLOSING_ANSWER_REQUESTS + review as f64
-        );
-        // Without the review only the closing requests are reserved.
-        s.config.source_document_review = false;
-        assert_eq!(closing_reserve_requests(&s), CLOSING_REQUEST_RESERVE);
-    }
-
-    #[test]
-    fn without_a_review_unread_citations_block_readiness_until_read() {
+    fn unread_citations_block_readiness_until_read() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
         let mut s = Session::new(
@@ -3510,7 +2793,6 @@ mod review_gap_tests {
             },
             Config {
                 model: "gpt-4o".into(),
-                source_document_review: false,
                 ..Config::compact_test()
             },
         );
@@ -3560,21 +2842,11 @@ mod review_gap_tests {
         std::fs::write(dir.path().join("a.rs"), "fn changed() {}\nfn b() {}\n").unwrap();
         assert!(!ready_for_final(&mut s));
         assert_eq!(s.run_guidance["document_readiness"]["structural_ok"], false);
-        // With the document review on, the review compares cited ranges with
-        // the source, so the stale read no longer blocks readiness.
-        s.config.source_document_review = true;
-        assert!(ready_for_final(&mut s));
     }
 
     #[test]
     fn finalization_notices_name_their_cause() {
-        // A live run announced a document review rejection as failed
-        // completion checks, which had not run.
         for (error, start) in [
-            (
-                Some("document_review: F1 needs a fix"),
-                "Document review findings remain",
-            ),
             (
                 Some("Document format/evidence audit has 2 issues; use document_audit"),
                 "The document audit found problems",
@@ -3592,216 +2864,6 @@ mod review_gap_tests {
         ] {
             assert!(finalization_notice(error).starts_with(start), "{error:?}");
         }
-    }
-
-    #[test]
-    fn closing_reports_only_findings_reviewed_for_the_current_document() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("source.rs"),
-            "fn run() { for _ in 0..5 {} }\n",
-        )
-        .unwrap();
-        let mut s = Session::new(
-            Project {
-                root: dir.path().into(),
-                output: dir.path().join("out.md"),
-                ..Default::default()
-            },
-            Config {
-                ..Config::compact_test()
-            },
-        );
-        s.add_user("Document the loop.".into());
-        s.select_workflow("source_document").unwrap();
-        tools::execute(&mut s, "file_read", json!({"path":"source.rs"})).unwrap();
-        tools::execute(
-            &mut s,
-            "document_edit",
-            json!({"action":"create","text":"# Flow\nA while loop runs five times. source.rs:1\n"}),
-        )
-        .unwrap();
-        tools::document_review::request(&mut s).unwrap();
-        s.document_review.skipped_ranges.push((2, 2));
-        tools::document_review::test_finish(
-            &mut s,
-            r#"{"issues":["Flow: the loop is for, not while"]}"#,
-        )
-        .unwrap();
-        let gaps = collect_gaps(&mut s);
-        assert!(gaps.iter().any(|gap| gap.contains("the loop is for")));
-        assert!(
-            gaps.iter()
-                .any(|gap| gap == "문서 검토 — 2–2줄은 검토를 마치지 못했습니다.")
-        );
-
-        let expected = s.last_document_write.as_ref().unwrap().1.clone();
-        tools::execute(
-            &mut s,
-            "document_edit",
-            json!({"action":"replace_text","expected_hash":expected,"old_text":"A while loop","text":"A for loop"}),
-        )
-        .unwrap();
-        let gaps = collect_gaps(&mut s);
-        assert!(
-            gaps.iter()
-                .any(|gap| gap == "문서 검토 — 현재 문서를 마감 전에 검토하지 못했습니다.")
-        );
-        assert!(!gaps.iter().any(|gap| gap.contains("the loop is for")));
-        assert!(!gaps.iter().any(|gap| gap.contains("2–2줄")));
-
-        s.config.source_document_review = false;
-        let gaps = collect_gaps(&mut s);
-        assert!(!gaps.iter().any(|gap| gap.starts_with("문서 검토")));
-
-        s.config.source_document_review = true;
-        tools::document_review::request(&mut s).unwrap();
-        tools::document_review::test_finish(&mut s, r#"{"issues":[]}"#).unwrap();
-        let gaps = collect_gaps(&mut s);
-        assert!(!gaps.iter().any(|gap| gap.starts_with("문서 검토")));
-    }
-
-    #[tokio::test]
-    #[ignore = "paid provider; explicitly set MNEMOARC_LIVE_TEST=1"]
-    async fn focused_live_review_does_not_report_previous_findings_after_an_edit() {
-        assert_eq!(std::env::var("MNEMOARC_LIVE_TEST").as_deref(), Ok("1"));
-        let config_path = std::path::PathBuf::from(
-            std::env::var("MNEMOARC_LIVE_CONFIG").unwrap_or("config.toml".into()),
-        );
-        let mut config = Config::load(&config_path, &std::collections::BTreeMap::new()).unwrap();
-        if config_path.with_extension("credentials.json").exists() {
-            let keys: std::collections::BTreeMap<String, String> = serde_json::from_slice(
-                &std::fs::read(config_path.with_extension("credentials.json")).unwrap(),
-            )
-            .unwrap();
-            config.api_key = keys.get(&config.api_key_env).cloned().map(Secret);
-        }
-        config.model = "stealth/space-bunny-alpha".into();
-        config.source_document_review = true;
-        config.output_tokens = 2048;
-        config.request_timeout_secs = 90;
-        config.retries = 0;
-        let mut project = config
-            .projects
-            .iter()
-            .find(|project| project.name == "MnemoArc")
-            .expect("registered MnemoArc project")
-            .clone();
-        let dir = tempfile::tempdir().unwrap();
-        project.root = dir.path().into();
-        project.output = dir.path().join("focused-live-manual.md");
-        std::fs::write(
-            dir.path().join("source.rs"),
-            "fn run() {\n    for _ in 0..5 {\n        work();\n    }\n}\n",
-        )
-        .unwrap();
-        let mut s = Session::new(project, config);
-        s.select_workflow("source_document").unwrap();
-        s.add_user(
-            "source.rs의 run 함수에서 반복문 종류와 work 호출 횟수를 정확히 설명해줘.".into(),
-        );
-        tools::execute(&mut s, "file_read", json!({"path":"source.rs"})).unwrap();
-        tools::execute(
-            &mut s,
-            "document_edit",
-            json!({"action":"create","text":"# 실행 흐름\nrun은 while 반복문으로 work를 열 번 실행합니다. source.rs:1-5\n"}),
-        )
-        .unwrap();
-        let request = tools::document_review::request(&mut s).unwrap();
-        let request_tokens = context::count(&request, &s.config.model);
-        assert!(
-            request_tokens <= 6_000,
-            "review input grew to {request_tokens} tokens"
-        );
-        let payload: Value =
-            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
-        assert_eq!(payload["more_document_pages"], false);
-        assert_eq!(payload["more_evidence_pages"], false);
-        let (tx, mut rx) = mpsc::channel(32);
-        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let started = Instant::now();
-        let completion = tokio::time::timeout(
-            Duration::from_secs(120),
-            OpenAiClient.complete(request, &s.config, CancellationToken::new(), tx),
-        )
-        .await
-        .expect("focused review timeout")
-        .expect("focused review request");
-        drain.await.unwrap();
-        let review_text = completion.text.clone();
-        eprintln!(
-            "[live] focused review: seconds={:.1} input_bound={} output_bound={} usage={:?} text={review_text}",
-            started.elapsed().as_secs_f64(),
-            request_tokens,
-            s.config.output_tokens,
-            completion.usage
-        );
-        tools::document_review::finish(&mut s, &review_text).unwrap();
-        while s.document_review.pending {
-            let request = tools::document_review::request(&mut s).unwrap();
-            let (tx, mut rx) = mpsc::channel(32);
-            let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-            let remaining = Duration::from_secs(120)
-                .checked_sub(started.elapsed())
-                .expect("focused review deadline");
-            let response = tokio::time::timeout(
-                remaining,
-                OpenAiClient.complete(request, &s.config, CancellationToken::new(), tx),
-            )
-            .await
-            .expect("focused review validation timeout")
-            .unwrap();
-            drain.await.unwrap();
-            tools::document_review::finish(&mut s, &response.text).unwrap();
-        }
-        assert!(
-            tools::document_review::rejected_on_current_result(&s),
-            "the live reviewer did not reject the deliberately false loop claim: {review_text}"
-        );
-        let previous_issues = s.document_review.issues.clone();
-        let review_target_hash = tools::document_review::review_target_hash(&s)
-            .unwrap()
-            .to_owned();
-        let expected = s.last_document_write.as_ref().unwrap().1.clone();
-        tools::execute(
-            &mut s,
-            "document_edit",
-            json!({"action":"replace_text","expected_hash":expected,"old_text":"while 반복문으로 work를 열 번","text":"for 반복문으로 work를 다섯 번"}),
-        )
-        .unwrap();
-        let final_document_hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
-        let final_message = force_finish(&mut s, "focused_live_test").expect("saved document");
-        let expected_gap = "문서 검토 — 현재 문서를 마감 전에 검토하지 못했습니다.";
-        let report = json!({
-            "model":s.config.model,
-            "project":s.project.name,
-            "source_document_review_enabled":s.config.source_document_review,
-            "request_tokens_upper_bound":request_tokens,
-            "output_tokens_upper_bound":s.config.output_tokens,
-            "review_usage":completion.usage,
-            "review_seconds":started.elapsed().as_secs_f64(),
-            "review_text":review_text,
-            "review_issues":previous_issues,
-            "review_target_hash":review_target_hash,
-            "final_document_hash":final_document_hash,
-            "status":s.status,
-            "completion_gaps":s.completion_gaps,
-            "document_review_attempts":s.document_review.attempts,
-        });
-        if let Ok(path) = std::env::var("MNEMOARC_DOC_REPORT") {
-            std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
-        }
-        eprintln!("[live] focused close: {}", report);
-        assert_ne!(final_document_hash, review_target_hash);
-        assert_eq!(s.status, "complete_with_gaps");
-        assert_eq!(s.document_review.attempts, 1);
-        assert_eq!(s.completion_gaps, [expected_gap]);
-        assert!(final_message.contains(expected_gap));
-        assert!(
-            previous_issues
-                .iter()
-                .all(|issue| { !s.completion_gaps.iter().any(|gap| gap.contains(issue)) })
-        );
     }
 }
 
@@ -4327,7 +3389,6 @@ mod provider_outage_tests {
             Config {
                 model: "gpt-4o".into(),
                 model_context: Some(128_000),
-                source_document_review: false,
                 run_timeout_secs: 3600,
                 ..Config::compact_test()
             },
@@ -4387,7 +3448,7 @@ mod provider_outage_tests {
 }
 
 #[cfg(test)]
-mod review_usage_tests {
+mod usage_tests {
     use super::*;
     use crate::{
         config::Project,
@@ -4402,53 +3463,26 @@ mod review_usage_tests {
         Fatal,
         Malformed,
         InvalidCompletion(bool),
-        /// The provider's idle timeout cut off this many review requests.
-        Timeout(usize),
     }
 
-    struct Reviewer {
+    /// Fails its first requests as `failure` says, then gives the final answer.
+    struct Model {
         failure: Failure,
         requests: AtomicUsize,
         reserved_outputs: Mutex<Vec<usize>>,
     }
 
     #[async_trait::async_trait]
-    impl LlmClient for Reviewer {
+    impl LlmClient for Model {
         async fn complete(
             &self,
-            request: Value,
+            _: Value,
             config: &Config,
             _: CancellationToken,
             _: mpsc::Sender<String>,
         ) -> Result<Completion> {
-            let payload = request["messages"][1]["content"]
-                .as_str()
-                .and_then(|text| serde_json::from_str::<Value>(text).ok())
-                .unwrap_or_default();
-            if payload["source_document_review"] != true {
-                return Ok(Completion {
-                    text: "Saved source document.".into(),
-                    usage: Some(Usage {
-                        input: 11,
-                        output: 7,
-                        cached: None,
-                    }),
-                    ..Default::default()
-                });
-            }
             let index = self.requests.fetch_add(1, Ordering::SeqCst);
-            assert!(!config.retry_timeouts);
             match self.failure {
-                Failure::Timeout(failures) if index < failures => {
-                    return Err(CompletionError::new(
-                        anyhow::anyhow!(
-                            "provider_stream_error: {{\"code\":504,\"message\":\"Upstream idle timeout exceeded\"}}"
-                        ),
-                        1,
-                        true,
-                    )
-                    .into());
-                }
                 Failure::Provider(failures) if index < failures => {
                     return Err(CompletionError::new(
                         anyhow::anyhow!("provider_stream_error: test outage"),
@@ -4472,7 +3506,7 @@ mod review_usage_tests {
                     .with_diagnostics((1..=3).map(refused).collect())
                     .into());
                 }
-                Failure::Fatal => anyhow::bail!("test_review_failure"),
+                Failure::Fatal => anyhow::bail!("test_model_failure"),
                 Failure::Malformed if index == 0 => {
                     self.reserved_outputs
                         .lock()
@@ -4511,7 +3545,7 @@ mod review_usage_tests {
                 _ => {}
             }
             Ok(Completion {
-                text: json!({"issues":[]}).to_string(),
+                text: "Saved source document.".into(),
                 usage: Some(Usage {
                     input: 13,
                     output: 5,
@@ -4522,7 +3556,8 @@ mod review_usage_tests {
         }
     }
 
-    async fn run(failure: Failure) -> (Session, Arc<Reviewer>) {
+    /// A saved, cited and read document whose next final answer completes.
+    async fn run(failure: Failure) -> (Session, Arc<Model>) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.rs"), "fn run() {}\n").unwrap();
         let mut session = Session::new(
@@ -4534,7 +3569,6 @@ mod review_usage_tests {
             Config {
                 model: "gpt-4o".into(),
                 model_context: Some(128_000),
-                source_document_review: true,
                 run_timeout_secs: 3600,
                 ..Config::compact_test()
             },
@@ -4548,130 +3582,79 @@ mod review_usage_tests {
             json!({"action":"create","text":"# Flow\nCode. main.rs:1\n"}),
         )
         .unwrap();
-        tools::document_review::request(&mut session).unwrap();
-        session.document_review.pending = true;
-        let reviewer = Arc::new(Reviewer {
+        let model = Arc::new(Model {
             failure,
             requests: AtomicUsize::new(0),
             reserved_outputs: Mutex::new(Vec::new()),
         });
         let (tx, mut rx) = mpsc::channel(128);
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let result = run_session(session, reviewer.clone(), CancellationToken::new(), tx).await;
+        let result = run_session(session, model.clone(), CancellationToken::new(), tx).await;
         drain.await.unwrap();
-        (result, reviewer)
-    }
-
-    fn review_usage(session: &Session) -> (usize, usize) {
-        let usage = (
-            session.document_review.input_tokens,
-            session.document_review.output_tokens,
-        );
-        // An approved review needs a separate, charged final answer request.
-        let final_usage = if session.status == "complete" {
-            (11, 7)
-        } else {
-            (0, 0)
-        };
-        assert_eq!(
-            usage,
-            (
-                session.input_tokens - final_usage.0,
-                session.output_tokens - final_usage.1
-            )
-        );
-        usage
+        (result, model)
     }
 
     #[tokio::test]
-    async fn failed_review_requests_are_attributed_before_stopping() {
+    async fn failed_requests_are_charged_before_stopping() {
         let (session, _) = run(Failure::Fatal).await;
         assert_eq!(session.status, "blocked");
-        assert!(review_usage(&session).0 > 0);
+        assert!(session.input_tokens > 0);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn review_outage_retries_and_success_are_attributed_once() {
-        let (session, reviewer) = run(Failure::Provider(2)).await;
+    async fn outage_retries_and_success_are_charged_once() {
+        let (session, model) = run(Failure::Provider(2)).await;
         assert_eq!(session.status, "complete", "{:?}", session.last_error);
-        assert_eq!(reviewer.requests.load(Ordering::SeqCst), 3);
-        let (input, output) = review_usage(&session);
-        assert!(input > 13);
-        assert_eq!(output, 5);
+        assert_eq!(model.requests.load(Ordering::SeqCst), 3);
+        assert!(session.input_tokens > 13);
+        assert_eq!(session.output_tokens, 5);
     }
 
     #[tokio::test(start_paused = true)]
     async fn refused_attempts_are_not_charged_as_input() {
         // Live run 2026-10-06: four 429 sequences added ~0.5M unbilled input
         // to the run budget. A refusal with an HTTP status generated nothing.
-        let (session, reviewer) = run(Failure::Refused(2)).await;
+        let (session, model) = run(Failure::Refused(2)).await;
         assert_eq!(session.status, "complete", "{:?}", session.last_error);
-        assert_eq!(reviewer.requests.load(Ordering::SeqCst), 3);
-        assert_eq!(review_usage(&session), (13, 5));
+        assert_eq!(model.requests.load(Ordering::SeqCst), 3);
+        assert_eq!((session.input_tokens, session.output_tokens), (13, 5));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn exhausted_review_outages_include_every_failed_attempt() {
-        let (session, reviewer) = run(Failure::Provider(usize::MAX)).await;
+    async fn exhausted_outages_include_every_failed_attempt() {
+        let (session, model) = run(Failure::Provider(usize::MAX)).await;
         assert_eq!(session.status, "blocked");
-        assert_eq!(reviewer.requests.load(Ordering::SeqCst), 5);
-        assert!(review_usage(&session).0 > 0);
+        assert_eq!(model.requests.load(Ordering::SeqCst), 5);
+        assert!(session.input_tokens > 0);
     }
 
     #[tokio::test]
-    async fn malformed_review_recovery_attributes_reserved_output() {
-        let (session, reviewer) = run(Failure::Malformed).await;
+    async fn malformed_response_recovery_charges_reserved_output() {
+        let (session, model) = run(Failure::Malformed).await;
         assert_eq!(session.status, "complete", "{:?}", session.last_error);
-        assert_eq!(reviewer.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(model.requests.load(Ordering::SeqCst), 2);
         assert_eq!(
-            review_usage(&session).1,
-            reviewer.reserved_outputs.lock().unwrap()[0] + 5
+            session.output_tokens,
+            model.reserved_outputs.lock().unwrap()[0] + 5
         );
     }
 
     #[tokio::test]
-    async fn invalid_review_completion_keeps_its_usage_receipt() {
-        let (session, reviewer) = run(Failure::InvalidCompletion(true)).await;
+    async fn invalid_completion_keeps_its_usage_receipt() {
+        let (session, model) = run(Failure::InvalidCompletion(true)).await;
         assert_eq!(session.status, "complete", "{:?}", session.last_error);
-        assert_eq!(reviewer.requests.load(Ordering::SeqCst), 2);
-        assert_eq!(review_usage(&session), (30, 28));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn an_unanswered_review_is_halved_then_skipped() {
-        // A live reasoning model's review page timed out at the provider;
-        // waiting that out as an outage and resending the same page stalled
-        // the run for 11 minutes.
-        let started = tokio::time::Instant::now();
-        let (session, reviewer) = run(Failure::Timeout(usize::MAX)).await;
-        assert!(started.elapsed() < Duration::from_secs(10));
-        assert_eq!(
-            session.status, "complete_with_gaps",
-            "{:?}",
-            session.last_error
-        );
-        assert_eq!(reviewer.requests.load(Ordering::SeqCst), 2);
-        assert_eq!(session.document_review.page_shrink, 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_review_answered_after_one_timeout_keeps_its_verdict() {
-        let started = tokio::time::Instant::now();
-        let (session, reviewer) = run(Failure::Timeout(1)).await;
-        assert!(started.elapsed() < Duration::from_secs(10));
-        assert_eq!(session.status, "complete", "{:?}", session.last_error);
-        assert_eq!(reviewer.requests.load(Ordering::SeqCst), 2);
-        assert_eq!(session.document_review.page_shrink, 1);
+        assert_eq!(model.requests.load(Ordering::SeqCst), 2);
+        assert_eq!((session.input_tokens, session.output_tokens), (30, 28));
     }
 
     #[tokio::test]
-    async fn invalid_review_completion_without_usage_attributes_reserved_output() {
-        let (session, reviewer) = run(Failure::InvalidCompletion(false)).await;
+    async fn invalid_completion_without_usage_charges_reserved_output() {
+        let (session, model) = run(Failure::InvalidCompletion(false)).await;
         assert_eq!(session.status, "complete", "{:?}", session.last_error);
-        assert_eq!(reviewer.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(model.requests.load(Ordering::SeqCst), 2);
         assert_eq!(
-            review_usage(&session).1,
-            reviewer.reserved_outputs.lock().unwrap()[0] + 5
+            session.output_tokens,
+            model.reserved_outputs.lock().unwrap()[0] + 5
         );
     }
 }

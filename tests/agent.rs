@@ -46,16 +46,6 @@ impl LlmClient for Script {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        if request["messages"][1]["content"]
-            .as_str()
-            .is_some_and(|t| t.contains("\"source_document_review\":true"))
-        {
-            assert!(request.get("tools").is_none());
-            return Ok(Completion {
-                text: r#"{"issues":[]}"#.into(),
-                ..Default::default()
-            });
-        }
         let mut step = self.step.lock().unwrap();
         let state: Value = serde_json::from_str(
             request["messages"].as_array().unwrap().last().unwrap()["content"]
@@ -169,7 +159,6 @@ async fn source_documentation_full_loop_without_api() {
     assert_eq!(result.memory.entries.len(), 1);
     assert!(dir.path().join("docs/source-summary.md").exists());
     assert!(!dir.path().join("config.toml").exists());
-    assert_eq!(result.document_review.attempts, 1);
 }
 struct Wait;
 #[async_trait]
@@ -674,9 +663,8 @@ async fn varied_new_reads_before_the_first_save_are_not_a_stall() {
     // watermark must not send a final-answer-only fixture into a checkpoint.
     session.config.context_tokens = 96000;
     session.config.stall_round_limit = 3;
-    // The scripted client answers no document review: these runs exercise
-    // progress recovery (its summary cites main.rs only to be finishable).
-    session.config.source_document_review = false;
+    // These runs exercise progress recovery (its summary cites main.rs only
+    // to be finishable).
     session.workflow_mode = "source_document".into();
     session.task.deliverables = vec!["docs/source-summary.md".into()];
     session.active_tools.insert("document_edit".into());
@@ -760,9 +748,7 @@ async fn request_budget_transitions_to_writing_then_verification() {
     // The answer workflow presents every phase as answering; budget phases
     // belong to document work.
     session.select_workflow("source_document").unwrap();
-    // The draft cites a source read before the run; the scripted client
-    // answers no document review.
-    session.config.source_document_review = false;
+    // The draft cites a source read before the run.
     std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
     mnemoarc::tools::execute(&mut session, "file_read", json!({"path":"main.rs"})).unwrap();
     let (tx, mut rx) = mpsc::channel(128);
@@ -1577,7 +1563,6 @@ impl LlmClient for RepeatsDocumentCheckpointMaintenanceWithoutAck {
 
 fn document_checkpoint_session(dir: &std::path::Path) -> Session {
     let mut session = s(dir);
-    session.config.source_document_review = false;
     session.add_user("Document this source code with evidence".into());
     session.task.workflow = "source_document".into();
     session.checkpoint = Some(Checkpoint {
@@ -1813,7 +1798,6 @@ async fn document_edits_preserve_explicit_hash_and_recover_omitted_hash() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = s(dir.path());
         session.select_workflow("source_document").unwrap();
-        session.config.source_document_review = false;
         session.add_user("Append to the document".into());
         let created = mnemoarc::tools::execute(
             &mut session,
@@ -1921,7 +1905,6 @@ async fn evidence_for_a_later_section_counts_after_the_first_save() {
     .unwrap();
     let mut session = s(dir.path());
     session.config.context_tokens = 96000;
-    session.config.source_document_review = false;
     session.select_workflow("source_document").unwrap();
     session.task.deliverables = vec!["docs/source-summary.md".into()];
     session.add_user("Save a summary of the source".into());

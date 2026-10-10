@@ -228,7 +228,7 @@ for (const [kind, root, readable] of [
       sourceText,
     );
 
-    await page.getByRole("tab", { name: "진행", exact: true }).click();
+    await page.getByRole("tab", { name: "실행 기록", exact: true }).click();
     await page.locator(".run-record > summary").click();
     await expect(page.locator(".run-error")).toHaveText(
       `file_access_error: ${shown}`,

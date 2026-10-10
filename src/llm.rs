@@ -94,13 +94,6 @@ pub struct Completion {
     pub attempt_diagnostics: Vec<AttemptDiagnostic>,
     pub length_limited: bool,
     pub discarded_tool_calls: bool,
-    /// The upstream provider a gateway such as OpenRouter routed the request
-    /// to, when its stream names one.
-    pub provider: Option<String>,
-    /// Seconds from sending the request to its first stream event. One
-    /// review page took 116 s and the same page 11 s in another run; this
-    /// tells waiting at the provider from generating.
-    pub first_event_seconds: Option<f64>,
 }
 
 impl Completion {
@@ -296,7 +289,7 @@ static JSON_SCHEMA_STREAM_RECOVERED: std::sync::Mutex<SchemaCache> =
 
 /// Schemas recovered by JSON mode once. An outage that clears before the
 /// comparison attempt looks the same as a grammar failure (a live run lost
-/// strict output for a whole review after three in-stream 502s), so a schema
+/// strict output for a whole run after three in-stream 502s), so a schema
 /// moves to JSON_SCHEMA_STREAM_RECOVERED only when a second request needs the
 /// same recovery; a strict response that succeeds clears the suspicion.
 static JSON_SCHEMA_STREAM_SUSPECTED: std::sync::Mutex<SchemaCache> =
@@ -305,7 +298,7 @@ static JSON_SCHEMA_STREAM_SUSPECTED: std::sync::Mutex<SchemaCache> =
 /// Endpoints (base URL and model) that rejected every response_format,
 /// strict schema and plain JSON mode alike. Recorded only after the same
 /// request then succeeded without one, so an unrelated 400 cannot disable
-/// JSON mode. A live run otherwise paid a failed attempt on every review call.
+/// JSON mode. A live run otherwise paid a failed attempt on every structured call.
 static RESPONSE_FORMAT_REJECTED: std::sync::Mutex<SchemaCache> =
     std::sync::Mutex::new(SchemaCache(VecDeque::new()));
 
@@ -515,7 +508,6 @@ impl OpenAiClient {
         // answer that keeps streaming (or sends keepalives) is not cut off.
         // The run deadline bounds total duration.
         let idle = Duration::from_secs(c.request_timeout_secs);
-        let sent = std::time::Instant::now();
         let response = tokio::select! {
             _ = cancel.cancelled() => bail!("cancelled"),
             r = tokio::time::timeout(idle, req.send()) => r.map_err(|_| {
@@ -576,12 +568,6 @@ impl OpenAiClient {
                 }
                 let v: Value = serde_json::from_str(&event)
                     .map_err(|e| anyhow::anyhow!("invalid_stream_event: {e}"))?;
-                if out.first_event_seconds.is_none() {
-                    out.first_event_seconds = Some(sent.elapsed().as_secs_f64());
-                }
-                if out.provider.is_none() {
-                    out.provider = v["provider"].as_str().map(str::to_owned);
-                }
                 if !v["error"].is_null() {
                     // Gateways such as OpenRouter open the stream with 200 and
                     // report an upstream overload or rate limit as an error
@@ -970,14 +956,14 @@ impl LlmClient for OpenAiClient {
                     // user; the partial response is discarded, never merged.
                     let silent = !emitted_text.load(Ordering::Relaxed);
                     let transient = transient_error(&text);
-                    // A review request halves or skips an unanswered page
+                    // A follow-up answer is asked again with a smaller request
                     // instead; another attempt would wait out the same timeout.
                     let unanswered = !c.retry_timeouts && timeout_error(&text);
                     // Exhaust ordinary transient retries first, then make one
                     // compatibility attempt for an SSE grammar failure. The
                     // caller still validates the complete response schema.
                     // An overload is no grammar failure: after three Nvidia
-                    // "Service temporarily overloaded" errors, a live review's
+                    // "Service temporarily overloaded" errors, a live run's
                     // JSON-mode attempt returned an unfinished `{"issues":{}`.
                     if silent
                         && !unanswered

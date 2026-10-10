@@ -62,7 +62,6 @@ export const groups = [
         "boolean",
         "max_completion_tokens 대신 max_tokens 사용",
       ],
-      ["source_document_review", "소스 문서 검토", "boolean", "생성 문서를 소스·요구사항과 별도로 대조합니다. 검토 페이지와 보완 재검토에 추가 모델 호출 비용이 발생합니다."],
       [
         "stream_usage",
         "스트리밍 사용량 요청",
@@ -194,7 +193,6 @@ export const groups = [
         "number",
         "결과가 나아지지 않은 요청이 이 횟수면 원인 수정에 집중하고, 2배면 광범위한 탐색을 숨기며, 3배면 문서를 마감 단계로 전환해 확인하지 못한 항목을 명시하고 마무리합니다",
       ],
-      ["review_limit", "문서 검토 집중 복구 기준", "number", "문제가 줄지 않은 검토가 이 횟수에 도달하면 첫 지적의 수정에 집중합니다. 작업을 중단하는 한도가 아닙니다."],
     ],
   },
 ];

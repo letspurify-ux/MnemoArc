@@ -214,8 +214,8 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
             if texts.is_empty() || texts.len() > MAX_PENDING {
                 bail!("Insert between 1 and {MAX_PENDING} concise items");
             }
-            let mut at = position(task, before.as_deref())?;
-            for text in texts {
+            let start = position(task, before.as_deref())?;
+            for (at, text) in (start..).zip(texts) {
                 let text = nonempty(&text, MAX_TEXT_CHARS)?;
                 unique(task, text, None)?;
                 task.todo_sequence = task
@@ -232,7 +232,6 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
                         reopen_reason: String::new(),
                     },
                 );
-                at += 1;
             }
         }
         Operation::Update { id, text } => {
@@ -986,7 +985,7 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
     // the final answer, so the plan may only shrink there. A live model split
     // one item into six in closing mode (eight open items became twelve,
     // several repeating open ones) and the run ended at the closing limit
-    // with every one of them reported unfinished and no review.
+    // with every one of them reported unfinished.
     let open = |task: &TaskState| task.todos.iter().filter(|item| !item.done).count();
     if s.progress_recovery.closing.is_some() && open(&next) > open(&s.task) {
         return Ok(unchanged(

@@ -737,8 +737,7 @@ fn a_section_hash_beside_a_scoped_text_edit_guards_that_section() {
 #[test]
 fn lone_carriage_returns_in_document_text_are_saved_as_line_breaks() {
     // A live model sent lone carriage returns as the line breaks of its
-    // edits (19 to 40 each); saved, they showed as broken text that the
-    // document review reported three times.
+    // edits (19 to 40 each); saved, they showed as broken text.
     let (_dir, mut s) = setup();
     run(
         &mut s,
@@ -761,8 +760,7 @@ fn lone_carriage_returns_in_document_text_are_saved_as_line_breaks() {
 
 #[test]
 fn citations_into_test_code_are_named_on_save_and_audit() {
-    // A live document cited a test's loop as how reviews repeat, and the
-    // document review approved it.
+    // A live document cited a test's loop as how the product repeats a step.
     let (dir, mut s) = source_setup();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::create_dir_all(dir.path().join("tests")).unwrap();
@@ -1475,7 +1473,11 @@ fn a_link_target_error_names_its_folder_and_the_citation_to_write() {
     let outside = tempfile::tempdir().unwrap();
     s.project.output = outside.path().join("generated.md");
     let root = dir.path().canonicalize().unwrap();
-    let spelled = format!("../..{}/frontend/src/App.jsx#L2-L3", root.display());
+    // One step up from the output folder, the spelled-out root names no file
+    // however deep the temporary folders are. With as many steps as that
+    // folder is deep (two under Linux's /tmp), the link would reach the real
+    // file and be a valid citation.
+    let spelled = format!("..{}/frontend/src/App.jsx#L2-L3", root.display());
     let saved = run(
         &mut s,
         "document_edit",
@@ -3490,8 +3492,8 @@ fn block_insertion_keeps_its_far_edge_off_the_neighboring_line() {
 
 #[test]
 fn broken_characters_are_rejected_before_any_document_write() {
-    // Live run 2026-10-04: an append wrote "객��" (객체); the reviewer could not
-    // quote the line, and the broken word survived into the approved document.
+    // Live run 2026-10-04: an append wrote "객��" (객체), and the broken word
+    // survived into the finished document.
     let body = "# 매뉴얼\n\n객체 브라우저 설명입니다.\n";
     let (_dir, mut s) = setup();
     std::fs::write(&s.project.output, body).unwrap();
@@ -4273,12 +4275,7 @@ fn unread_citations_follow_delivered_lines_and_file_versions_and_merge_ranges() 
     assert!(unread.iter().any(|range| range["path"] == "b.rs"
         && range["start_line"] == 1
         && range["end_line"] == 1));
-    // With the document review on, the audit lists the same ranges without
-    // blocking completion: the review compares cited ranges with the source.
-    let audit = run(&mut s, "document_audit", json!({}));
-    assert_eq!(audit["structural_ok"], true, "{audit}");
-    // Without a review the audit blocks completion on them.
-    s.config.source_document_review = false;
+    // The audit lists the same ranges and blocks completion on them.
     let audit = run(&mut s, "document_audit", json!({}));
     assert_eq!(audit["structural_ok"], false, "{audit}");
     assert_eq!(
@@ -4324,53 +4321,6 @@ fn a_long_unread_citation_suggests_citing_entry_lines() {
     assert_eq!(unread["path"], "App.jsx");
     assert!(
         unread["note"].as_str().unwrap().contains("entry lines"),
-        "{written}"
-    );
-}
-
-#[test]
-fn a_save_names_broad_citations_while_the_review_is_on() {
-    // A 62-line document citing ten 2,000-line ranges took 35 review
-    // requests; reading those ranges first left the writer no notice.
-    let (dir, mut s) = source_setup();
-    std::fs::write(
-        dir.path().join("a.rs"),
-        (1..=300)
-            .map(|n| format!("let v{n} = {n};\n"))
-            .collect::<String>(),
-    )
-    .unwrap();
-    let text = "# Guide\nAll values. a.rs:1-200\nOne value. a.rs:10-12\n";
-    let written = run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":text}),
-    );
-    let check = &written["citation_check"];
-    assert_eq!(check["broad_citation_count"], 1, "{check}");
-    assert_eq!(check["broad_cited_lines"], 200);
-    assert_eq!(
-        check["broad_citations"],
-        json!([{"citation":"a.rs:1-200","document_line":2,"lines":200}])
-    );
-    assert!(
-        check["broad_citation_guidance"]
-            .as_str()
-            .unwrap()
-            .contains("document review sends every cited line")
-    );
-    // Without the review a long range costs no review requests; an unread
-    // one keeps its own note.
-    s.config.source_document_review = false;
-    let written = run(
-        &mut s,
-        "document_edit",
-        json!({"action":"write","text":format!("{text}\n"),"expected_hash":written["hash"]}),
-    );
-    assert!(
-        written["citation_check"]
-            .get("broad_citation_count")
-            .is_none(),
         "{written}"
     );
 }

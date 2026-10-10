@@ -1,7 +1,6 @@
 mod arguments;
 mod coverage;
 mod document_format;
-pub mod document_review;
 mod documentation;
 mod file_edit;
 mod memory_tools;
@@ -40,8 +39,7 @@ pub struct ToolSpec {
 pub fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-/// Recognize additive document work while ignoring empty-line churn. Semantic
-/// acceptance remains the responsibility of the document review.
+/// Recognize additive document work while ignoring empty-line churn.
 pub(crate) fn document_content_shape(project: &Project) -> Result<(usize, usize)> {
     let doc = read_text(&output_path(project)?)?;
     Ok((
@@ -125,7 +123,7 @@ fn task_patch_schema() -> Value {
 
 impl ToolRegistry {
     /// Follow-up discussion may gather and remember evidence without changing
-    /// files, the task plan, review verdicts or checkpoint state.
+    /// files, the task plan or checkpoint state.
     pub fn question_allows(name: &str) -> bool {
         matches!(
             name,
@@ -451,29 +449,6 @@ impl ToolRegistry {
         ]
         .contains(&name)
     }
-    /// Re-auditing the unchanged rejected document is not repair (a live run
-    /// answered three times, re-checking in between); a check follows an
-    /// edit, which ends repair_only.
-    const REPAIR_TOOLS: &'static [&'static str] = &[
-        "document_edit",
-        "document_edit_batch",
-        "file_read",
-        "source_search",
-        "symbol_read",
-    ];
-    fn repair_allows(name: &str) -> bool {
-        Self::REPAIR_TOOLS.contains(&name)
-    }
-    /// A final answer was rejected by a review whose findings the unchanged
-    /// document still carries. The required tool call must be a repair step,
-    /// not a plan, outline or audit call that merely satisfies the requirement.
-    pub fn repair_only(s: &Session) -> bool {
-        s.checkpoint.is_none()
-            && (s.progress_recovery.action_required || s.progress_recovery.repair_step)
-            && s.is_document_work()
-            && !s.document_review.issues.is_empty()
-            && document_review::rejected_on_current_result(s)
-    }
     /// Tools withheld in closing mode for this session. Before any document is
     /// saved, source reading is withheld as well: the only way forward is to
     /// write the document from the evidence already gathered.
@@ -559,8 +534,8 @@ impl ToolRegistry {
         }
         normalized
     }
-    /// Description text that refers to investigation, verification or
-    /// reviews, none of which exist in the answer workflow.
+    /// Description text that refers to investigation or verification,
+    /// neither of which exists in the answer workflow.
     const ANSWER_DESCRIPTION_EDITS: &[(&str, &str, &str)] = &[
         (
             "document_edit",
@@ -640,7 +615,6 @@ impl ToolRegistry {
                     })
             })
             .filter(|t| !Self::closing_withholds(s, t.name))
-            .filter(|t| !Self::repair_only(s) || Self::repair_allows(t.name))
             // Second stage of the document progress ladder: after twice the
             // stall limit without a better result, stop broad discovery even
             // in the verify phase. Targeted file_read/symbol_read remain.
@@ -802,13 +776,6 @@ impl ToolRegistry {
             }
             .replace("{name}", name));
         }
-        // The offered list alone did not stop a live model from calling
-        // document_audit in a forced repair step.
-        if Self::repair_only(s) && !Self::repair_allows(name) {
-            bail!(
-                "review_repair_required: {name} is not a repair step; the reviewed document is unchanged, so edit it for document_review.issues with document_edit or document_edit_batch (read a cited source range first if needed)"
-            );
-        }
         if !s.config.memory_reuse && ["memory_find", "memory_read"].contains(&name) {
             bail!("unsupported: memory reuse disabled for evaluation");
         }
@@ -899,12 +866,6 @@ impl ToolRegistry {
     }
 }
 
-/// " ; did you mean ..." for a rejected value of `field`, or "".
-pub(crate) fn suggest_value(tool: &str, field: &str, received: &str, allowed: &[Value]) -> String {
-    suggest::value(tool, field, &json!(received), allowed, &Value::Null)
-        .map_or_else(String::new, |s| s.text)
-}
-
 /// A tool name that does not exist, with the offered tool the call most
 /// likely meant: live runs called read, tool_plan and run_guidance.
 fn unsupported_tool(s: &Session, name: &str) -> anyhow::Error {
@@ -985,9 +946,8 @@ fn validate_task_state_arguments(args: &Value) -> Result<()> {
 }
 
 /// Models sometimes emit U+FFFD for a character they failed to produce: live
-/// runs wrote "제���" and "객��" into documents. Saved, the reviewer cannot quote
-/// it (5 rejected review calls and a skipped page) and it survived into an
-/// approved document, so reject it before anything is written.
+/// runs wrote "제���" and "객��" into documents, and saved it survived into
+/// the finished document, so reject it before anything is written.
 fn reject_replacement_character(field: &str, text: &str) -> Result<()> {
     let Some(at) = text.find('\u{FFFD}') else {
         return Ok(());
@@ -1314,11 +1274,11 @@ fn unwrap_continuation_cursor(name: &str, args: &mut Value) {
 }
 
 /// A live model sent lone carriage returns as the line breaks of its document
-/// edits (19 to 40 each); saved, they showed as broken text that the review
-/// reported three times. A carriage return without a line feed is no
-/// Markdown line ending, so it is the line break the text meant. Old text
-/// gets the same treatment, so a passage copied from such an edit still
-/// matches what was saved; a CRLF pair stays as it is.
+/// edits (19 to 40 each); saved, they showed as broken text. A carriage
+/// return without a line feed is no Markdown line ending, so it is the line
+/// break the text meant. Old text gets the same treatment, so a passage
+/// copied from such an edit still matches what was saved; a CRLF pair stays
+/// as it is.
 fn normalize_lone_carriage_returns(name: &str, args: &mut Value) {
     fn line_breaks(value: &mut Value) {
         let Some(text) = value.as_str().filter(|text| text.contains('\r')) else {
@@ -3004,16 +2964,6 @@ fn persist_document_edit(
     s.document_written = true;
     // A smaller edit succeeded; whole-document writes are allowed again.
     s.progress_recovery.whole_write_withheld = false;
-    if s.document_review.approved_hash.is_some() {
-        // A later edit starts a new review cycle. An earlier approval's zero
-        // issues must not make the first new finding look like a stalled review.
-        document_review::close_cycle(s);
-        s.document_review.stalled_attempts = 0;
-        s.document_review.best_issue_count = None;
-        s.document_review.last_reviewed_section_count = 0;
-        s.document_review.last_reviewed_content_lines = 0;
-    }
-    s.document_review.approved_hash = None;
     s.last_document_write = Some((path.to_path_buf(), hash(result.as_bytes())));
     revalidate(s)?;
     let hash = hash(result.as_bytes());
@@ -3842,7 +3792,7 @@ impl std::error::Error for DirectoryPath {}
 /// file listed in this error.
 fn directory_entries(p: &Project, directory: &Path) -> (Vec<String>, usize) {
     const MAX_ENTRIES: usize = 12;
-    let Ok(paths) = candidate_paths_bounded(
+    let Ok((paths, _)) = candidate_paths_bounded(
         p,
         None,
         &tokio_util::sync::CancellationToken::new(),
@@ -3996,53 +3946,23 @@ pub(crate) fn hash_file_cancelled(
 /// cannot read. Cached with the digest: citation checks count every cited
 /// file's lines on each save and audit.
 pub(crate) fn text_line_count(path: &Path) -> Result<usize> {
-    text_shape(path).map(|(lines, _)| lines)
-}
-
-/// Lines of a text file longer than LONG_LINE_FLOOR bytes, as (line number,
-/// bytes), from the same cached pass as its line count. Cited lines this
-/// long are generated or minified text the document review cannot send.
-pub(crate) fn long_text_lines(path: &Path) -> Result<Vec<(usize, usize)>> {
-    text_shape(path).map(|(_, long)| long)
-}
-
-/// Lines above this many bytes are recorded per file; the review's own
-/// limit (document_review::evidence_line_limit) is never lower.
-pub(crate) const LONG_LINE_FLOOR: usize = 1024;
-
-/// Line count and long lines of a text file, cached together.
-fn text_shape(path: &Path) -> Result<(usize, Vec<(usize, usize)>)> {
     let version = open_regular_file(path)
         .ok()
         .and_then(|file| file.metadata().ok())
         .and_then(|meta| file_version(&meta).ok());
     if let Some(version) = version
-        && let Some(shape) = cached_digest(path, version, |entry| {
-            Some((entry.lines?, entry.long_lines.clone()?))
-        })
+        && let Some(lines) = cached_digest(path, version, |entry| entry.lines)
     {
-        return Ok(shape);
+        return Ok(lines);
     }
-    let text = read_text(path)?;
-    let mut lines = 0;
-    let mut long = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        lines += 1;
-        if line.len() > LONG_LINE_FLOOR {
-            long.push((index + 1, line.len()));
-        }
-    }
+    let lines = read_text(path)?.lines().count();
     if let Some(version) = version {
-        remember_digest(path, version, |entry| {
-            entry.lines = Some(lines);
-            entry.long_lines = Some(long.clone());
-        });
+        remember_digest(path, version, |entry| entry.lines = Some(lines));
     }
-    Ok((lines, long))
+    Ok(lines)
 }
 
-/// Digest, line count and long lines of a file at one size and modification
-/// time.
+/// Digest and line count of a file at one size and modification time.
 /// Freshness checks hash every delivered and cited file several times per
 /// request; with the cache an unchanged file costs a metadata read. A file
 /// modified within the last two seconds is not cached, because a second
@@ -4053,7 +3973,6 @@ struct FileDigest {
     modified: std::time::SystemTime,
     hash: Option<String>,
     lines: Option<usize>,
-    long_lines: Option<Vec<(usize, usize)>>,
 }
 type FileVersion = (u64, std::time::SystemTime);
 type DigestCache = std::collections::HashMap<std::path::PathBuf, FileDigest>;
@@ -4104,7 +4023,6 @@ fn remember_digest(path: &Path, version: FileVersion, update: impl FnOnce(&mut F
         modified: version.1,
         hash: None,
         lines: None,
-        long_lines: None,
     });
     update(entry);
 }
@@ -4194,6 +4112,19 @@ fn candidate_paths_scoped(
     directory: Option<&Path>,
     deadline: Option<std::time::Instant>,
 ) -> Result<Vec<PathBuf>> {
+    candidate_paths_counted(p, pattern, cancel, directory, deadline).map(|(paths, _)| paths)
+}
+
+/// candidate_paths_scoped, with the number of files in scope whose names are
+/// not UTF-8. Tools cannot address those files, so a search reports them as
+/// skipped instead of leaving them out unmentioned.
+pub(crate) fn candidate_paths_counted(
+    p: &Project,
+    pattern: Option<&str>,
+    cancel: &tokio_util::sync::CancellationToken,
+    directory: Option<&Path>,
+    deadline: Option<std::time::Instant>,
+) -> Result<(Vec<PathBuf>, usize)> {
     candidate_paths_bounded(
         p,
         pattern,
@@ -4234,7 +4165,7 @@ fn candidate_paths_bounded(
     directory: Option<&Path>,
     deadline: Option<std::time::Instant>,
     limits: FileScanLimits,
-) -> Result<Vec<PathBuf>> {
+) -> Result<(Vec<PathBuf>, usize)> {
     let check = || -> Result<()> {
         if let Some(deadline) = deadline {
             structure::check_budget(cancel, deadline)
@@ -4255,6 +4186,7 @@ fn candidate_paths_bounded(
     }
     let scope = directory.map(Path::to_path_buf);
     let mut entries = vec![];
+    let mut non_utf8 = 0usize;
     let mut path_bytes = 0usize;
     let filter = pattern
         .map(globset::Glob::new)
@@ -4277,16 +4209,17 @@ fn candidate_paths_bounded(
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
-        // JSON tool paths cannot address OS names that are not UTF-8. A lossy
-        // path can name a different file, and serializing the real path panics.
-        if entry.path().to_str().is_none() {
-            continue;
-        }
         let rel = entry.path().strip_prefix(&root)?;
         if directory.is_some_and(|scope| !entry.path().starts_with(scope))
             || excluded(p, rel)?
             || filter.as_ref().is_some_and(|f| !f.is_match(rel))
         {
+            continue;
+        }
+        // JSON tool paths cannot address OS names that are not UTF-8. A lossy
+        // path can name a different file, and serializing the real path panics.
+        if entry.path().to_str().is_none() {
+            non_utf8 += 1;
             continue;
         }
         path_bytes = path_bytes.saturating_add(entry.path().as_os_str().as_encoded_bytes().len());
@@ -4303,7 +4236,7 @@ fn candidate_paths_bounded(
     }
     entries.sort();
     check()?;
-    Ok(entries)
+    Ok((entries, non_utf8))
 }
 // Keep the existing text-only listing contract. Searches use candidates directly
 // so text validation and matching share one read instead of opening every file twice.
@@ -6725,6 +6658,7 @@ mod file_tests {
                     max_path_bytes: bytes,
                 },
             )
+            .map(|(paths, _)| paths)
         };
         let expected = vec![kept.join("a.rs"), kept.join("b.rs")];
         let bytes: usize = expected

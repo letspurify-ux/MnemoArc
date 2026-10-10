@@ -1710,6 +1710,14 @@ fn workspace_search_skips_non_utf8_paths_without_hiding_other_results() {
     assert_eq!(result["total_results"], 1, "{result}");
     assert_eq!(result["symbols"][0]["path"], "valid.rs");
     assert_eq!(result["skipped_files"], 1);
+    // A file outside the requested scope is not counted as skipped.
+    let result = run(
+        &mut s,
+        "symbol_search",
+        json!({"query":"found","path_glob":"valid*"}),
+    );
+    assert_eq!(result["total_results"], 1, "{result}");
+    assert_eq!(result["skipped_files"], 0, "{result}");
 }
 
 #[test]

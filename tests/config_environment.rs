@@ -221,8 +221,7 @@ fn a_missing_config_file_loads_the_live_tested_settings() {
         (config.request_timeout_secs, config.run_timeout_secs),
         (600, 3600)
     );
-    assert_eq!((config.run_tokens, config.review_limit), (10_000_000, 20));
-    assert!(config.source_document_review);
+    assert_eq!(config.run_tokens, 10_000_000);
     config.runnable().unwrap();
 }
 
@@ -253,21 +252,27 @@ fn cleared_optional_settings_survive_save_and_load() {
 fn retired_review_settings_still_load_and_are_dropped_on_save() {
     use mnemoarc::config::Config;
 
-    // Settings saved before the completion review and the automatic
-    // re-review interval were removed name them; they must keep loading,
-    // and the next save must not write them back.
+    // Settings saved before the completion review, the automatic re-review
+    // interval and the document review were removed name them; they must
+    // keep loading, and the next save must not write them back.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     std::fs::write(
         &path,
-        "completion_review_enabled = true\ndocument_repair_limit = 16\n",
+        "completion_review_enabled = true\ndocument_repair_limit = 16\nsource_document_review = true\nreview_limit = 20\n",
     )
     .unwrap();
     let config = Config::load(&path, &Default::default()).unwrap();
     config.save(&path).unwrap();
     let saved = std::fs::read_to_string(&path).unwrap();
-    assert!(!saved.contains("completion_review_enabled"), "{saved}");
-    assert!(!saved.contains("document_repair_limit"), "{saved}");
+    for key in [
+        "completion_review_enabled",
+        "document_repair_limit",
+        "source_document_review",
+        "review_limit",
+    ] {
+        assert!(!saved.contains(key), "{key}: {saved}");
+    }
     Config::load(&path, &Default::default()).unwrap();
 }
 

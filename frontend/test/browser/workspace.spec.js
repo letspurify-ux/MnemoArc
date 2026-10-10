@@ -87,7 +87,7 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
   await expect(
     page.getByText("느린 요청 테스트", { exact: true }).last(),
   ).toBeVisible();
-  await page.getByRole("tab", { name: "기억", exact: true }).click();
+  await page.getByRole("tab", { name: "사용량", exact: true }).click();
   await expect(page.getByText(/컨텍스트 예산은 기준 토크나이저/)).toBeVisible();
   await page.getByRole("tab", { name: "도구", exact: true }).click();
   await expect(
@@ -103,7 +103,7 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
   await expect(
     page.getByRole("checkbox", { name: "문서 구조 조회", exact: true }),
   ).toBeVisible();
-  // The answer workflow hides the review tools.
+  // The answer workflow hides the audit tool.
   await expect(
     page.getByRole("checkbox", { name: "문서 근거 점검", exact: true }),
   ).toHaveCount(0);

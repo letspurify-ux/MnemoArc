@@ -40,19 +40,17 @@ export default function Chat({
       ? `요청의 작업 변경 사항 확인 중${session.activity.attempt > 1 ? ` · ${session.activity.attempt}번째 시도` : ""}`
       : stage === "question"
         ? "기존 작업을 보존하고 질문 답변 중"
-        : stage === "document_review"
-          ? "문서와 소스 근거 대조 중"
-          : stage === "tools"
-            ? `${(session.activity.tools || []).map((name) => toolLabels[name] || name).join(" · ")} 실행 중`
-            : session?.stream
-              ? "답변 생성 중"
-              : stage === "model"
-                ? session?.continuation_pending
-                  ? "길이 제한으로 이어서 생성 중"
-                  : "모델 응답 대기 중"
-                : stage === "continuing"
-                  ? "받은 답변을 보존하고 이어서 생성 중"
-                  : "요청 준비 중";
+        : stage === "tools"
+          ? `${(session.activity.tools || []).map((name) => toolLabels[name] || name).join(" · ")} 실행 중`
+          : session?.stream
+            ? "답변 생성 중"
+            : stage === "model"
+              ? session?.continuation_pending
+                ? "길이 제한으로 이어서 생성 중"
+                : "모델 응답 대기 중"
+              : stage === "continuing"
+                ? "받은 답변을 보존하고 이어서 생성 중"
+                : "요청 준비 중";
   const draft = useSyncExternalStore(drafts.subscribe, () =>
     drafts.get(session.id),
   );

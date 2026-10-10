@@ -4,15 +4,14 @@ use crate::support;
 use anyhow::Result;
 use async_trait::async_trait;
 use mnemoarc::{
-    agent::AgentEvent,
+    agent::{AgentEvent, run_session},
     config::{Config, Project},
     llm::{Completion, LlmClient, ToolCall, Usage},
     session::{Closing, Session},
-    tools::{self, ToolRegistry, document_review},
+    tools::{self, ToolRegistry},
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
-use support::document_review::run_session;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -94,82 +93,6 @@ fn closing_mode_and_second_stall_stage_withhold_discovery_tools() {
     );
     assert_eq!(result["recovery"]["class"], "unavailable");
     assert!(tools::recovery::correctable_document_error(&result));
-}
-
-#[test]
-fn rereview_lists_previous_findings_and_changed_sections() {
-    let (_dir, mut s, _) = fixture();
-    let first = document_review::request(&mut s).unwrap();
-    assert_eq!(first["response_format"]["type"], "json_schema");
-    let payload: Value =
-        serde_json::from_str(first["messages"][1]["content"].as_str().unwrap()).unwrap();
-    assert_eq!(payload["previous_findings"], json!([]));
-    assert!(payload["changed_sections"].is_null());
-    support::document_review::finish(&mut s, r#"{"issues":["History: name the helper"]}"#).unwrap();
-    assert!(!s.document_review.pending);
-
-    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
-    tools::execute(
-        &mut s,
-        "document_edit",
-        json!({"action":"replace_text","expected_hash":hash,"old_text":"History is normalized first.","text":"History is normalized by normalize() first."}),
-    )
-    .unwrap();
-    let second = document_review::request(&mut s).unwrap();
-    let payload: Value =
-        serde_json::from_str(second["messages"][1]["content"].as_str().unwrap()).unwrap();
-    assert_eq!(payload["previous_findings"][0]["id"], "F1");
-    assert_eq!(
-        payload["previous_findings"][0]["text"],
-        "History: name the helper"
-    );
-    assert!(payload["previous_findings"][0]["document"].is_object());
-    assert_eq!(payload["changed_sections"], json!(["# History"]));
-    assert!(
-        second["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("RE-REVIEW")
-    );
-}
-
-#[test]
-fn unavailable_review_applies_only_to_the_unchanged_document() {
-    let (_dir, mut s, _) = fixture();
-    document_review::request(&mut s).unwrap();
-    s.document_review.pending = true;
-    document_review::mark_unavailable(&mut s);
-    assert!(!s.document_review.pending);
-    assert!(document_review::unavailable_on_current(&s));
-    assert_eq!(
-        document_review::current_verdict(&s),
-        document_review::CurrentVerdict::Unavailable
-    );
-    s.request_review_criteria
-        .constraints
-        .push("Use Korean".into());
-    assert_eq!(
-        document_review::current_verdict(&s),
-        document_review::CurrentVerdict::Unreviewed
-    );
-    s.request_review_criteria.constraints.pop();
-    let source_path = s.project.root.join("main.js");
-    let source = std::fs::read(&source_path).unwrap();
-    std::fs::write(&source_path, "function changed() {}\n").unwrap();
-    assert_eq!(
-        document_review::current_verdict(&s),
-        document_review::CurrentVerdict::Unreviewed
-    );
-    std::fs::write(&source_path, source).unwrap();
-    assert!(document_review::unavailable_on_current(&s));
-    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
-    tools::execute(
-        &mut s,
-        "document_edit",
-        json!({"action":"append","expected_hash":hash,"text":"\nMore detail.\n"}),
-    )
-    .unwrap();
-    assert!(!document_review::unavailable_on_current(&s));
 }
 
 /// Appends a new paragraph each request (real progress) until closing mode is
@@ -256,7 +179,6 @@ async fn closing_reserve_finishes_steady_work_before_the_budget() {
             context_tokens: 128_000,
             output_tokens: 1024,
             run_tokens: 1_000_000,
-            source_document_review: false,
             ..support::compact_config()
         },
     );
@@ -341,7 +263,6 @@ impl LlmClient for Scripted {
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
-        // Review requests carry a JSON payload instead of the program state.
         let state: Value = request["messages"]
             .as_array()
             .and_then(|messages| messages.last())
@@ -383,161 +304,10 @@ fn call(id: &str, name: &str, args: Value) -> Completion {
     }
 }
 
-fn verified_fixture() -> (tempfile::TempDir, Session) {
-    let (dir, mut s, _) = fixture();
-    s.config.source_document_review = false;
+/// The fixture without the source ID of its read.
+fn saved_fixture() -> (tempfile::TempDir, Session) {
+    let (dir, s, _) = fixture();
     (dir, s)
-}
-
-#[tokio::test]
-async fn closing_preserves_the_failed_document_review_in_state_and_run_history() {
-    let (_dir, mut s) = verified_fixture();
-    s.config.source_document_review = true;
-    s.config.run_tokens = 100_000;
-    s.config.closing_reserve_ratio = 0.8;
-    s.config.verification_reserve_ratio = 0.85;
-    s.config.writing_reserve_ratio = 0.9;
-    // Truncated JSON is rejected by the real validator as a whole response:
-    // a last try drops only issue-level rejections such as an absent quote.
-    // The first answer's usage starts closing before that review.
-    let invalid =
-        r#"{"issues":[{"previous_id":null,"kind":"scope","document":{"start_line":2"#.to_owned();
-    let mut check = s.clone();
-    let request = document_review::request(&mut check).unwrap();
-    let payload: Value =
-        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
-    let error = document_review::finish(&mut check, &invalid)
-        .unwrap_err()
-        .to_string();
-    assert!(error.starts_with("document_review_invalid:"), "{error}");
-    let document_hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
-    let final_answer = || Completion {
-        text: "Saved out.md".into(),
-        ..Default::default()
-    };
-    let (mut result, notices) = run_scripted_notices(
-        s,
-        vec![
-            Completion {
-                usage: Some(Usage {
-                    input: 30_000,
-                    output: 10,
-                    cached: None,
-                }),
-                ..final_answer()
-            },
-            Completion {
-                text: invalid,
-                ..Default::default()
-            },
-            final_answer(),
-        ],
-    )
-    .await;
-    assert_eq!(result.status, "complete_with_gaps");
-    // Closing allows one review response: the notice must not say "repeatedly".
-    assert!(
-        notices
-            .iter()
-            .any(|n| n.starts_with("마감 단계의 검토 응답")),
-        "{notices:?}"
-    );
-    assert!(
-        !notices.iter().any(|n| n.contains("반복해서")),
-        "{notices:?}"
-    );
-    assert!(document_review::unavailable_on_current(&result));
-    assert!(result.last_error.is_none());
-    let state = json!(result.document_review);
-    let failure = &state["unavailable_failure"];
-    assert_eq!(failure["error"], error);
-    assert_eq!(failure["document_hash"], document_hash);
-    assert_eq!(
-        failure["lines"],
-        json!([payload["document_line_start"], payload["document_line_end"]])
-    );
-    assert_eq!(failure["evidence_page"], payload["evidence_page"]);
-    assert_eq!(failure["stage"], "review_page");
-    assert!(
-        document_review::guidance(&result)
-            .get("unavailable_failure")
-            .is_none()
-    );
-    let record = json!(result.run_history.back().unwrap());
-    assert_eq!(record["document_review_failure"], *failure);
-    assert!(record["error"].is_null());
-
-    // Resetting review state for another task cannot erase the finished run,
-    // nor attach its failure to the next run as a new failure.
-    result.document_review = Default::default();
-    result.config.source_document_review = false;
-    let (result, _) = run_scripted(result, vec![final_answer()]).await;
-    assert_eq!(result.status, "complete");
-    assert_eq!(result.run_history.len(), 2);
-    assert_eq!(json!(result.run_history[0]), record);
-    assert!(json!(result.run_history[1])["document_review_failure"].is_null());
-}
-
-// Live run 2026-10-04: the single closing review failed on one scope issue
-// listing kept labels ("Undo", "Redo") without sources, and the whole review
-// ended unreviewed. On the last try only that issue is dropped and logged.
-#[tokio::test]
-async fn closing_review_drops_only_an_issue_with_an_unproven_label() {
-    let (_dir, mut s) = verified_fixture();
-    s.config.source_document_review = true;
-    s.config.run_tokens = 100_000;
-    s.config.closing_reserve_ratio = 0.8;
-    s.config.verification_reserve_ratio = 0.85;
-    s.config.writing_reserve_ratio = 0.9;
-    let unproven = json!({"issues":[{
-        "previous_id":null,"kind":"scope",
-        "document":{"start_line":2,"end_line":2,
-            "quote":"A for loop runs work five times. main.js:3-5"},
-        "requirement_id":"R0","sources":[],
-        "problem":"Remove an implementation name","correction":"Refer to Cancel",
-        "ui_labels":["Cancel"]
-    }]})
-    .to_string();
-    let final_answer = || Completion {
-        text: "Saved out.md".into(),
-        ..Default::default()
-    };
-    let (result, _) = run_scripted(
-        s,
-        vec![
-            Completion {
-                usage: Some(Usage {
-                    input: 30_000,
-                    output: 10,
-                    cached: None,
-                }),
-                ..final_answer()
-            },
-            Completion {
-                text: unproven,
-                ..Default::default()
-            },
-            final_answer(),
-        ],
-    )
-    .await;
-    assert!(!document_review::unavailable_on_current(&result));
-    assert!(document_review::approved(&result));
-    assert!(result.document_review.unavailable_failure.is_none());
-    let drops = &result.document_review.issue_drop_log;
-    assert_eq!(drops.len(), 1, "{drops:?}");
-    assert!(
-        drops[0]["error"]
-            .as_str()
-            .unwrap()
-            .contains("issues[0].ui_labels[0] \"Cancel\""),
-        "{drops:?}"
-    );
-    assert!(
-        document_review::guidance(&result)
-            .get("issue_drop_log")
-            .is_none()
-    );
 }
 
 async fn run_scripted(s: Session, steps: Vec<Completion>) -> (Session, Vec<Value>) {
@@ -585,7 +355,7 @@ async fn run_scripted_notices(s: Session, steps: Vec<Completion>) -> (Session, V
 
 #[tokio::test]
 async fn unchanged_outline_repeat_returns_a_short_marker() {
-    let (_dir, s) = verified_fixture();
+    let (_dir, s) = saved_fixture();
     let (result, _) = run_scripted(
         s,
         vec![
@@ -618,7 +388,7 @@ async fn finished_bookkeeping_leaves_the_final_answer_to_the_model() {
     // A "ready to finish" instruction as soon as the citations were read and
     // the to-dos closed let concise models stop after their first sections.
     // Outside closing the model judges when the document is complete.
-    let (_dir, s) = verified_fixture();
+    let (_dir, s) = saved_fixture();
     let (result, guidance) = run_scripted(
         s,
         vec![Completion {
@@ -659,7 +429,7 @@ async fn finished_bookkeeping_leaves_the_final_answer_to_the_model() {
 
 #[tokio::test]
 async fn open_todos_on_a_finished_document_are_closed_in_one_batch() {
-    let (_dir, mut s) = verified_fixture();
+    let (_dir, mut s) = saved_fixture();
     // The live shape: the document is done but three plan items remain,
     // which previously cost a request each.
     tools::execute(
@@ -749,115 +519,6 @@ fn provider_usage_calibrates_estimated_token_counts() {
     s.config.model = "gpt-4o".into();
     ContextManager::record_usage(&mut s, 10_000, 5_000);
     assert_eq!(ContextManager::token_ratio(&s), 1.0);
-}
-
-#[tokio::test]
-async fn rejected_review_asks_for_one_batched_repair() {
-    let (_dir, mut s, _) = fixture();
-    document_review::request(&mut s).unwrap();
-    support::document_review::finish(
-        &mut s,
-        r#"{"issues":["Flow: state the loop bound","History: name the helper"]}"#,
-    )
-    .unwrap();
-    let (_, guidance) = run_scripted(
-        s,
-        vec![Completion {
-            text: "Saved out.md".into(),
-            ..Default::default()
-        }],
-    )
-    .await;
-    assert_eq!(guidance[0]["review_repair"]["findings"], 2);
-    assert!(
-        guidance[0]["instruction"]
-            .as_str()
-            .unwrap()
-            .starts_with("Review repair: fix ALL findings")
-    );
-
-    for legacy_policy in [false, true] {
-        let (_dir, mut s) = verified_fixture();
-        s.config.source_document_review = true;
-        if legacy_policy {
-            // Older state has findings but no review policy fingerprint.
-            s.document_review.issues = vec!["Flow: remove source citations".into()];
-        } else {
-            // Current-policy findings survive a lost review target as repair context.
-            document_review::request(&mut s).unwrap();
-            support::document_review::finish(
-                &mut s,
-                r#"{"issues":["Flow: state the loop bound"]}"#,
-            )
-            .unwrap();
-            document_review::defer_for_repair(&mut s);
-        }
-        let (_, guidance) = run_scripted(
-            s,
-            vec![
-                Completion {
-                    text: "Saved out.md".into(),
-                    ..Default::default()
-                },
-                Completion {
-                    text: r#"{"issues":[]}"#.into(),
-                    ..Default::default()
-                },
-            ],
-        )
-        .await;
-        // Findings of an earlier version are named as repair context, with
-        // no instruction to finish.
-        assert!(guidance[0]["ready_for_final"].is_null());
-        assert_eq!(
-            guidance[0]["document_review_note"]
-                .as_str()
-                .is_some_and(|note| note.contains("1 findings from a previous document version")),
-            !legacy_policy
-        );
-    }
-}
-
-#[tokio::test]
-async fn audits_during_review_repair_return_a_short_page() {
-    let (_dir, mut s, _) = fixture();
-    // Unread citations yield enough audit issues to exercise paging, while
-    // the document and its cited source remain reviewable.
-    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
-    let mut extra = String::from("\n# Extras\n");
-    for i in 0..7 {
-        std::fs::write(
-            s.project.root.join(format!("extra{i}.js")),
-            "export const x = 1;\n",
-        )
-        .unwrap();
-        extra.push_str(&format!("Extra {i}. extra{i}.js:1\n"));
-    }
-    tools::execute(
-        &mut s,
-        "document_edit",
-        json!({"action":"append","expected_hash":hash,"text":extra}),
-    )
-    .unwrap();
-    document_review::request(&mut s).unwrap();
-    support::document_review::finish(&mut s, r#"{"issues":["Flow: fix citations"]}"#).unwrap();
-    let (result, _) = run_scripted(s, vec![call("audit", "document_audit", json!({}))]).await;
-    let output: Value = result
-        .history
-        .bundles
-        .iter()
-        .flat_map(|bundle| &bundle.messages)
-        .filter(|message| message["role"] == "tool")
-        .map(|message| serde_json::from_str(message["content"].as_str().unwrap()).unwrap())
-        .next()
-        .unwrap();
-    assert_eq!(
-        output["data"]["compacted_for_review_repair"], true,
-        "{output}"
-    );
-    assert_eq!(output["data"]["issues"].as_array().unwrap().len(), 5);
-    assert_eq!(output["data"]["next_offset"], 5);
-    assert!(output["data"]["issue_count"].as_u64().unwrap() > 5);
 }
 
 #[test]
@@ -1164,70 +825,6 @@ fn list_cursor_keeps_its_scope_when_the_glob_is_omitted() {
     assert!(error.contains("issued for different arguments"), "{error}");
 }
 
-#[tokio::test]
-async fn repeated_final_answers_on_an_unrepaired_review_close_the_run() {
-    let (_dir, mut s) = verified_fixture();
-    s.config.source_document_review = true;
-    let final_answer = || Completion {
-        text: "Saved out.md".into(),
-        ..Default::default()
-    };
-    let steps = vec![
-        final_answer(),
-        // The document review rejects the result.
-        Completion {
-            text: r#"{"issues":["Flow: state that the loop runs five times"]}"#.into(),
-            ..Default::default()
-        },
-        final_answer(), // rejected, unchanged (1)
-        call("read-1", "file_read", json!({"path":"main.js"})), // forced step
-        final_answer(), // rejected, unchanged (2)
-        call("read-2", "file_read", json!({"path":"main.js"})), // forced step
-        final_answer(), // rejected, unchanged (3) -> closing
-        call("read-3", "file_read", json!({"path":"main.js"})), // forced step
-        final_answer(), // accepted with reported gaps
-    ];
-    let (result, guidance, offered) = run_scripted_tools(s, steps).await;
-    assert_eq!(
-        result.status, "complete_with_gaps",
-        "{:?}",
-        result.last_error
-    );
-    assert_eq!(
-        result.progress_recovery.closing.as_ref().unwrap().reason,
-        "review_unrepaired"
-    );
-    assert!(
-        result
-            .completion_gaps
-            .iter()
-            .any(|gap| gap.contains("loop runs five times")),
-        "{:?}",
-        result.completion_gaps
-    );
-    // The forced step after a rejected final offers repair tools only.
-    for forced in [3, 5, 7] {
-        let names = &offered[forced];
-        assert!(
-            names.iter().any(|name| name == "document_edit_batch"),
-            "{names:?}"
-        );
-        for trivial in [
-            "task_plan",
-            "task_state",
-            "document_inspect",
-            "document_audit",
-            "history",
-        ] {
-            assert!(
-                !names.iter().any(|name| name == trivial),
-                "{trivial} offered: {names:?}"
-            );
-        }
-    }
-    assert!(guidance[8]["closing"]["active"] == true);
-}
-
 #[test]
 fn a_truncated_checkpoint_id_still_acknowledges_the_checkpoint() {
     use mnemoarc::context::ContextManager;
@@ -1317,60 +914,6 @@ fn a_checkpoint_id_with_a_one_character_typo_still_acknowledges_the_checkpoint()
 }
 
 #[tokio::test]
-async fn a_fix_made_after_closing_on_an_unrepaired_review_is_reviewed_again() {
-    let (dir, mut s) = verified_fixture();
-    s.config.source_document_review = true;
-    let final_answer = || Completion {
-        text: "Saved out.md".into(),
-        ..Default::default()
-    };
-    let path = dir.path().join("out.md");
-    let fixed = std::fs::read_to_string(&path).unwrap().replace(
-        "A for loop runs work five times.",
-        "A for loop runs work exactly five times.",
-    );
-    let steps = vec![
-        final_answer(),
-        Completion {
-            text: r#"{"issues":["Flow: say exactly how many times the loop runs"]}"#.into(),
-            ..Default::default()
-        },
-        final_answer(), // rejected, unchanged (1)
-        call("read-1", "file_read", json!({"path":"main.js"})),
-        final_answer(), // rejected, unchanged (2)
-        call("read-2", "file_read", json!({"path":"main.js"})),
-        final_answer(), // rejected, unchanged (3) -> closing
-        // The forced step finally edits the document.
-        call(
-            "fix",
-            "document_edit",
-            json!({"action":"write","expected_hash":tools::hash(&std::fs::read(&path).unwrap()),"text":fixed}),
-        ),
-        final_answer(), // changed document: reviewed once more
-        Completion {
-            text: r#"{"issues":[]}"#.into(),
-            ..Default::default()
-        },
-        final_answer(),
-    ];
-    let (result, _, _) = run_scripted_tools(s, steps).await;
-    assert_eq!(
-        result.document_review.attempts, 2,
-        "{:?}",
-        result.last_error
-    );
-    assert!(document_review::approved(&result));
-    assert!(
-        !result
-            .completion_gaps
-            .iter()
-            .any(|gap| gap.starts_with("문서 검토")),
-        "{:?}",
-        result.completion_gaps
-    );
-}
-
-#[tokio::test]
 async fn transient_empty_replies_are_retried_before_any_workflow_is_set() {
     let plain = || {
         let dir = tempfile::tempdir().unwrap();
@@ -1435,11 +978,11 @@ async fn an_output_limit_truncation_withholds_whole_document_writes() {
     };
     // A document small relative to the output limit cannot be the cause:
     // whole writes stay available.
-    let (_small_dir, small) = verified_fixture();
+    let (_small_dir, small) = saved_fixture();
     let (result, _) = run_scripted(small, truncated_then_final()).await;
     assert!(!result.progress_recovery.whole_write_withheld);
 
-    let (dir, mut s) = verified_fixture();
+    let (dir, mut s) = saved_fixture();
     let filler: String = (1..=600)
         .map(|i| format!("Detail line {i} explains one more step of the flow.\n"))
         .collect();
@@ -1506,164 +1049,9 @@ async fn an_output_limit_truncation_withholds_whole_document_writes() {
     assert!(!s.progress_recovery.whole_write_withheld);
 }
 
-#[test]
-fn paged_rereview_judges_previous_findings_only_on_their_page() {
-    let (_dir, mut s, _) = fixture();
-    let request = document_review::request(&mut s).unwrap();
-    let system = request["messages"][0]["content"].as_str().unwrap();
-    assert!(system.contains("List ONLY problems that are still present"));
-    assert!(system.contains("skip it otherwise"));
-    assert!(system.contains("cannot be observed on this page"));
-}
-
-#[tokio::test]
-async fn a_checkpoint_during_review_repair_restates_the_open_findings() {
-    use mnemoarc::context::ContextManager;
-    let (_dir, mut s) = verified_fixture();
-    s.config.source_document_review = true;
-    let final_answer = || Completion {
-        text: "Saved out.md".into(),
-        ..Default::default()
-    };
-    // The review rejects the document, which then stays unchanged.
-    let (mut s, _, _) = run_scripted_tools(
-        s,
-        vec![
-            final_answer(),
-            Completion {
-                text: r#"{"issues":["Flow: state that the loop runs five times"]}"#.into(),
-                ..Default::default()
-            },
-        ],
-    )
-    .await;
-    assert!(document_review::rejected_on_current_result(&s));
-    // A checkpoint then clears the context that held the findings.
-    for i in 0..6 {
-        s.history.push(
-            vec![json!({"role":"user","content":format!("{i} {}", "context ".repeat(2500))})],
-            true,
-        );
-    }
-    let budget = ContextManager::input_budget(&s.config);
-    assert!(ContextManager::prepare(&mut s, budget).unwrap());
-    let id = s.checkpoint.as_ref().unwrap().id.clone();
-    tools::execute(
-        &mut s,
-        "checkpoint_complete",
-        json!({"id":id,"progress":"Repairing the review findings","no_save_reason":"Nothing new to save"}),
-    )
-    .unwrap();
-    ContextManager::commit(&mut s).unwrap();
-    assert!(s.progress_recovery.review_repair_resume_hash.is_some());
-    let (after, guidance, _) = run_scripted_tools(s, vec![final_answer()]).await;
-    assert!(
-        !guidance.is_empty(),
-        "{} {:?}",
-        after.status,
-        after.last_error
-    );
-    let repair = &guidance[0]["review_repair"];
-    assert_eq!(repair["resumed_after_checkpoint"], true, "{}", guidance[0]);
-    assert!(
-        repair["unrepaired_findings"][0]
-            .as_str()
-            .unwrap()
-            .contains("loop runs five times")
-    );
-    assert!(
-        guidance[0]["instruction"]
-            .as_str()
-            .unwrap()
-            .starts_with("A checkpoint cleared the context")
-    );
-}
-
-#[tokio::test]
-async fn a_forced_repair_step_refuses_non_repair_tools() {
-    let (_dir, mut s) = verified_fixture();
-    s.config.source_document_review = true;
-    let final_answer = || Completion {
-        text: "Saved out.md".into(),
-        ..Default::default()
-    };
-    let steps = vec![
-        final_answer(),
-        Completion {
-            text: r#"{"issues":["Flow: state that the loop runs five times"]}"#.into(),
-            ..Default::default()
-        },
-        final_answer(), // rejected, unchanged
-        // The live shape: an audit instead of an edit in the forced step.
-        call("audit", "document_audit", json!({})),
-        final_answer(),
-        call("read-1", "file_read", json!({"path":"main.js"})),
-        final_answer(), // third unchanged rejection -> closing
-        call("read-2", "file_read", json!({"path":"main.js"})),
-        final_answer(),
-    ];
-    let (result, _, offered) = run_scripted_tools(s, steps).await;
-    let audit = result
-        .history
-        .bundles
-        .iter()
-        .flat_map(|bundle| &bundle.messages)
-        .find(|message| message["tool_call_id"] == "audit")
-        .expect("audit result");
-    assert!(
-        audit["content"]
-            .as_str()
-            .unwrap()
-            .contains("review_repair_required:"),
-        "{audit}"
-    );
-    // Re-auditing the unchanged document is not offered as repair.
-    assert!(!offered[3].iter().any(|name| name == "document_audit"));
-    assert!(offered[3].iter().any(|name| name == "document_edit_batch"));
-}
-
-#[tokio::test]
-async fn new_evidence_read_for_open_review_findings_is_progress() {
-    let (dir, mut s) = verified_fixture();
-    for name in ["a.js", "b.js", "c.js"] {
-        std::fs::write(
-            dir.path().join(name),
-            format!("export const {} = 1;\n", &name[..1]),
-        )
-        .unwrap();
-    }
-    document_review::request(&mut s).unwrap();
-    support::document_review::finish(
-        &mut s,
-        r#"{"issues":["Line 3: cite the helper that normalizes history"]}"#,
-    )
-    .unwrap();
-    let (_, guidance) = run_scripted(
-        s,
-        vec![
-            call("read-a", "file_read", json!({"path":"a.js"})),
-            call("read-b", "file_read", json!({"path":"b.js"})),
-            call("read-c", "file_read", json!({"path":"c.js"})),
-            Completion {
-                text: "Saved out.md".into(),
-                ..Default::default()
-            },
-        ],
-    )
-    .await;
-    // Each read delivered new evidence for the open finding, so the stall
-    // ladder never advanced.
-    for step in &guidance[1..4] {
-        assert_eq!(
-            step["progress_recovery"]["rounds_since_progress"], 0,
-            "{step}"
-        );
-    }
-}
-
 #[tokio::test]
 async fn progress_recovery_verify_does_not_persist_into_the_task_phase() {
-    let (_dir, mut s) = verified_fixture();
+    let (_dir, mut s) = saved_fixture();
     // Ten idle rounds sit near the default 64K high-water mark; a memory
     // checkpoint would suspend progress recovery, which is not under test.
     s.config.context_tokens = 128_000;
@@ -1685,7 +1073,7 @@ async fn progress_recovery_verify_does_not_persist_into_the_task_phase() {
 
 #[tokio::test]
 async fn closing_on_a_finished_result_asks_for_the_final_answer() {
-    let (_dir, mut s) = verified_fixture();
+    let (_dir, mut s) = saved_fixture();
     s.config.stall_round_limit = 2;
     let steps = (0..10)
         .map(|i| {
@@ -1743,7 +1131,7 @@ async fn repeated_empty_document_replies_change_the_request_and_close() {
     // A live run repeated one identical request for 24 rounds: document
     // recovery retried empty replies without changing anything until the
     // stall ladder closed the run.
-    let (_dir, mut s) = verified_fixture();
+    let (_dir, mut s) = saved_fixture();
     s.progress_recovery.action_required = true;
     let client = Arc::new(EmptyThenFinal {
         empties: 3,
@@ -1883,7 +1271,7 @@ async fn new_sources_are_progress_after_the_first_save_in_any_phase() {
     // New reads counted only while investigating, before the first save,
     // during a repair or while citations were unread. Reading more of the
     // project in the verify phase of a saved document looked like a stall.
-    let (dir, mut s) = verified_fixture();
+    let (dir, mut s) = saved_fixture();
     s.task.phase = "verify".into();
     let steps = (0..4)
         .map(|i| {
@@ -1913,7 +1301,7 @@ async fn rereading_delivered_lines_or_the_output_is_not_new_evidence() {
     // Each new view of a file counted as new evidence: a live run re-read
     // its own output and subranges of files it had read for 25 requests,
     // and every stall check was reset each time.
-    let (dir, mut s) = verified_fixture();
+    let (dir, mut s) = saved_fixture();
     s.task.phase = "verify".into();
     std::fs::write(dir.path().join("more.js"), "export const more = 1;\n").unwrap();
     let steps = vec![
@@ -1954,7 +1342,7 @@ async fn edits_grounded_in_new_sources_are_not_edits_without_progress() {
     // Same-length refinements counted as edits without progress unless they
     // added a section or lines, even right after reading a new source; the
     // sixteenth sent the run into focused recovery.
-    let (dir, mut s) = verified_fixture();
+    let (dir, mut s) = saved_fixture();
     // Room for eighteen read-and-edit requests without a checkpoint.
     s.config.model_context = Some(400_000);
     s.config.context_tokens = 300_000;
@@ -2037,7 +1425,7 @@ fn plan_checks(guidance: &[Value], text: &str) -> Vec<usize> {
 async fn an_empty_plan_of_document_work_is_pointed_out_once() {
     // A live run's first plan call was rejected and it worked for 100
     // requests without a plan; nothing pointed that out.
-    let (dir, s) = verified_fixture();
+    let (dir, s) = saved_fixture();
     let steps = new_file_reads(dir.path(), 0, 6);
     let (_, guidance) = run_scripted(s, steps).await;
     let shown = plan_checks(&guidance, "task_plan is empty");
@@ -2047,7 +1435,7 @@ async fn an_empty_plan_of_document_work_is_pointed_out_once() {
 
 #[tokio::test]
 async fn a_plan_that_falls_behind_the_work_is_pointed_out_once_per_state() {
-    let (dir, s) = verified_fixture();
+    let (dir, s) = saved_fixture();
     let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
     let mut steps = vec![
         call(
@@ -2084,7 +1472,7 @@ async fn a_plan_that_falls_behind_the_work_is_pointed_out_once_per_state() {
 
 #[tokio::test]
 async fn a_to_do_that_stays_current_while_work_moves_on_is_pointed_out_once() {
-    let (dir, mut s) = verified_fixture();
+    let (dir, mut s) = saved_fixture();
     s.config.stall_round_limit = 3;
     let mut steps = vec![call(
         "plan",
@@ -2115,7 +1503,7 @@ fn pad_history(s: &mut Session, groups: usize) {
 #[test]
 fn closing_starts_a_checkpoint_only_when_the_request_no_longer_fits() {
     use mnemoarc::context::ContextManager;
-    let (_dir, mut s) = verified_fixture();
+    let (_dir, mut s) = saved_fixture();
     pad_history(&mut s, 12);
     let budget = ContextManager::input_budget(&s.config);
     let above_high_water = (budget as f64 * (1.0 + s.config.high_water) / 2.0) as usize;
@@ -2196,7 +1584,7 @@ impl LlmClient for ClosingCheckpoint {
 #[tokio::test]
 async fn a_checkpoint_on_the_last_closing_request_keeps_that_request() {
     use mnemoarc::context::ContextManager;
-    let (_dir, mut s) = verified_fixture();
+    let (_dir, mut s) = saved_fixture();
     s.config.run_tokens = 10_000_000;
     s.config.context_tokens = 128_000;
     pad_history(&mut s, 4);
@@ -2224,89 +1612,11 @@ async fn a_checkpoint_on_the_last_closing_request_keeps_that_request() {
     assert_eq!(result.status, "complete", "{:?}", result.completion_gaps);
 }
 
-#[tokio::test]
-async fn an_edit_after_an_approved_review_is_progress() {
-    // Live run 2026-10-07: the next edit after an approval restarted the
-    // review cycle and took back its credit, so repair edits that added a
-    // section counted as no progress until the following approval.
-    let (_dir, mut s, _) = fixture();
-    document_review::request(&mut s).unwrap();
-    document_review::finish(&mut s, r#"{"issues":[]}"#).unwrap();
-    assert!(document_review::approved(&s));
-    // Score only the edit: it must not schedule another review here.
-    s.config.source_document_review = false;
-    s.progress_recovery.best_document_section_count = 2;
-    s.progress_recovery.best_document_content_lines = 4;
-    let hash = s.last_document_write.as_ref().unwrap().1.clone();
-    let steps = vec![call(
-        "append",
-        "document_edit",
-        json!({"action":"append","expected_hash":hash,
-            "text":"\n# Notes\nThe loop always runs work five times. main.js:3-5\n"}),
-    )];
-    let (result, guidance) = run_scripted(s, steps).await;
-    assert_eq!(result.progress_recovery.best_document_section_count, 3);
-    assert_eq!(guidance.len(), 2, "{guidance:?}");
-    assert_eq!(
-        guidance[1]["progress_recovery"]["rounds_since_progress"], 0,
-        "{}",
-        guidance[1]
-    );
-}
-
-#[test]
-fn later_review_cycles_count_only_the_findings_they_reduce() {
-    let (_dir, mut s, _) = fixture();
-    let edit = |s: &mut Session, old: &str, new: &str| {
-        let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
-        tools::execute(
-            s,
-            "document_edit",
-            json!({"action":"replace_text","expected_hash":hash,"old_text":old,"text":new}),
-        )
-        .unwrap();
-    };
-    let review = |s: &mut Session, issues: Value| {
-        document_review::request(s).unwrap();
-        support::document_review::finish(s, &json!({"issues":issues}).to_string()).unwrap();
-    };
-    // The first cycle counts in full: a finding, then its repair.
-    review(&mut s, json!(["Flow: name the loop bound"]));
-    assert_eq!(document_review::progress(&s), 11);
-    edit(&mut s, "five times.", "five times (i < 5).");
-    review(&mut s, json!([]));
-    assert!(document_review::approved(&s));
-    assert_eq!(document_review::progress(&s), 12);
-    // An edit after the approval opens a second cycle without losing it.
-    edit(&mut s, "first.", "first by normalize().");
-    assert_eq!(document_review::progress(&s), 12);
-    // New findings on the re-edited document are no progress by themselves,
-    review(
-        &mut s,
-        json!(["History: cite the helper", "Flow: name the counter"]),
-    );
-    assert_eq!(s.document_review.best_issue_count, Some(2));
-    assert_eq!(document_review::progress(&s), 12);
-    // but each one the cycle removes afterwards is.
-    edit(&mut s, "normalize().", "normalize() (main.js:2).");
-    review(&mut s, json!(["Flow: name the counter"]));
-    assert_eq!(document_review::progress(&s), 13);
-    edit(&mut s, "(i < 5)", "(counter i < 5)");
-    review(&mut s, json!([]));
-    assert_eq!(document_review::progress(&s), 14);
-    // A cycle approved at its first review adds nothing.
-    edit(&mut s, "# History", "# History handling");
-    review(&mut s, json!([]));
-    assert!(document_review::approved(&s));
-    assert_eq!(document_review::progress(&s), 14);
-}
-
 /// Scripted replies with a delay each, recording every request's
-/// run_guidance and output allowance, and the run's notices.
+/// run_guidance.
 struct Paced {
     steps: Mutex<Vec<(std::time::Duration, Completion)>>,
     guidance: Mutex<Vec<Value>>,
-    output_tokens: Mutex<Vec<usize>>,
 }
 
 #[async_trait]
@@ -2314,7 +1624,7 @@ impl LlmClient for Paced {
     async fn complete(
         &self,
         request: Value,
-        config: &Config,
+        _: &Config,
         _: CancellationToken,
         _: mpsc::Sender<String>,
     ) -> Result<Completion> {
@@ -2329,10 +1639,6 @@ impl LlmClient for Paced {
             .lock()
             .unwrap()
             .push(state["run_guidance"].clone());
-        self.output_tokens
-            .lock()
-            .unwrap()
-            .push(config.output_tokens);
         let step = {
             let mut steps = self.steps.lock().unwrap();
             if steps.is_empty() {
@@ -2348,27 +1654,17 @@ impl LlmClient for Paced {
 async fn run_paced(
     s: Session,
     steps: Vec<(std::time::Duration, Completion)>,
-) -> (Session, Vec<Value>, Vec<usize>, Vec<String>) {
+) -> (Session, Vec<Value>) {
     let client = Arc::new(Paced {
         steps: Mutex::new(steps),
         guidance: Mutex::new(vec![]),
-        output_tokens: Mutex::new(vec![]),
     });
     let (tx, mut rx) = mpsc::channel(256);
-    let drain = tokio::spawn(async move {
-        let mut notices = Vec::new();
-        while let Some(event) = rx.recv().await {
-            if let AgentEvent::Notice { text, .. } = event {
-                notices.push(text);
-            }
-        }
-        notices
-    });
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result = run_session(s, client.clone(), CancellationToken::new(), tx).await;
-    let notices = drain.await.unwrap();
+    drain.await.unwrap();
     let guidance = client.guidance.lock().unwrap().clone();
-    let output_tokens = client.output_tokens.lock().unwrap().clone();
-    (result, guidance, output_tokens, notices)
+    (result, guidance)
 }
 
 fn text(reply: &str) -> Completion {
@@ -2384,11 +1680,17 @@ async fn a_deadline_inside_a_request_finishes_with_the_gap_report() {
     // ran, and the run ended blocked with no gap report for its saved doc.
     let (_dir, mut s, _) = fixture();
     s.config.run_timeout_secs = 2;
+    tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Verify the loop section"]}]}),
+    )
+    .unwrap();
     let steps = vec![(
         std::time::Duration::from_secs(4),
         call("read", "file_read", json!({"path":"main.js"})),
     )];
-    let (result, guidance, _, _) = run_paced(s, steps).await;
+    let (result, guidance) = run_paced(s, steps).await;
     assert_eq!(guidance.len(), 1);
     assert_eq!(
         result.status, "complete_with_gaps",
@@ -2400,7 +1702,7 @@ async fn a_deadline_inside_a_request_finishes_with_the_gap_report() {
         result
             .completion_gaps
             .iter()
-            .any(|gap| gap.starts_with("문서 검토")),
+            .any(|gap| gap.starts_with("미완료 할 일")),
         "{:?}",
         result.completion_gaps
     );
@@ -2408,14 +1710,13 @@ async fn a_deadline_inside_a_request_finishes_with_the_gap_report() {
 
 #[tokio::test]
 async fn a_slow_model_closes_early_and_skips_a_request_that_cannot_end() {
-    // Six requests at this run's pace (15 s) exceed the 10% reserve (0.6 s),
+    // Three requests at this run's pace (7.5 s) exceed the 10% reserve (0.6 s),
     // so closing can start after the first request, but never before the
     // verification share of the run: 25% here keeps it (1.5 s), 90% lets it
     // start. With half a request's time left, either run finishes instead of
     // sending a request the deadline would cut.
     let slow_run = |verification_reserve_ratio: f64| {
         let (dir, mut s, _) = fixture();
-        s.config.source_document_review = false;
         s.config.run_timeout_secs = 6;
         s.config.verification_reserve_ratio = verification_reserve_ratio;
         s.config.writing_reserve_ratio = s.config.writing_reserve_ratio.max(0.95);
@@ -2433,7 +1734,7 @@ async fn a_slow_model_closes_early_and_skips_a_request_that_cannot_end() {
             result
         }
     };
-    let ((capped, capped_guidance, _, _), (open, open_guidance, _, _)) =
+    let ((capped, capped_guidance), (open, open_guidance)) =
         tokio::join!(slow_run(0.25), slow_run(0.9));
     assert!(
         capped_guidance[1]["closing"].is_null(),
@@ -2454,240 +1755,10 @@ async fn a_slow_model_closes_early_and_skips_a_request_that_cannot_end() {
 }
 
 #[tokio::test]
-async fn failed_review_responses_neither_stall_nor_need_another_answer() {
-    // Live run 2026-10-07: retried review responses climbed the stall
-    // ladder from 4 to 18 while the review was progressing.
-    let (_dir, s, _) = fixture();
-    let steps = vec![
-        text("Saved out.md."),
-        text("not json"),
-        text("still not json"),
-        text("no"),
-    ];
-    let (result, guidance) = run_scripted(s, steps).await;
-    // The page was skipped after three invalid responses and the review is
-    // unavailable: the answer that started it is accepted, not asked again.
-    assert_eq!(guidance.len(), 4, "{guidance:?}");
-    assert_eq!(
-        result.status, "complete_with_gaps",
-        "{:?}",
-        result.last_error
-    );
-    assert!(
-        result
-            .completion_gaps
-            .iter()
-            .any(|gap| gap.starts_with("문서 검토")),
-        "{:?}",
-        result.completion_gaps
-    );
-    assert_eq!(result.progress_recovery.rounds_since_best, 0);
-}
-
-#[tokio::test]
-async fn a_review_page_without_an_answer_is_halved_then_skipped() {
-    // A reasoning model spent a short first allowance and then the full one
-    // on reasoning, and the halved page timed out at the provider until the
-    // run stalled. A review asks with the full allowance at once, halves an
-    // unanswered page once and then skips it.
-    let (_dir, mut s, _) = fixture();
-    let doc = (1..=150)
-        .map(|i| format!("Claim {i}. main.js:1-6\n"))
-        .collect::<String>();
-    let hash = s.last_document_write.as_ref().unwrap().1.clone();
-    tools::execute(
-        &mut s,
-        "document_edit",
-        json!({"action":"write","expected_hash":hash,"text":doc}),
-    )
-    .unwrap();
-    let cut = || Completion {
-        length_limited: true,
-        ..Default::default()
-    };
-    let none = std::time::Duration::ZERO;
-    let mut steps = vec![(none, text("Saved out.md.")), (none, cut()), (none, cut())];
-    steps.extend((0..6).map(|_| (none, text(r#"{"issues":[]}"#))));
-    let (result, _, output_tokens, notices) = run_paced(s, steps).await;
-    let full = 8000;
-    assert_eq!(output_tokens[1], full, "{output_tokens:?}");
-    assert_eq!(output_tokens[2], full, "{output_tokens:?}");
-    assert_eq!(result.document_review.page_shrink, 1);
-    for said in [
-        "절반 범위로 다시 검토",
-        "검토 응답을 받지 못해 이 부분의 검토를 건너뛰고",
-    ] {
-        assert!(
-            notices.iter().any(|notice| notice.contains(said)),
-            "{notices:?}"
-        );
-    }
-    // The other pages are reviewed; the skipped part is reported.
-    assert_eq!(
-        result.status, "complete_with_gaps",
-        "{:?}",
-        result.last_error
-    );
-    assert!(
-        result
-            .completion_gaps
-            .iter()
-            .any(|gap| gap == "문서 검토 — 1–50줄은 검토를 마치지 못했습니다."),
-        "{:?}",
-        result.completion_gaps
-    );
-}
-
-#[tokio::test]
-async fn closing_halves_and_skips_an_unanswered_review_page_like_other_runs() {
-    // Live run 2026-10-08: the first closing review page ended in a provider
-    // idle timeout and the whole review was dropped with 9 of 12 closing
-    // requests left. Only answers that fail validation end a closing review
-    // at once.
-    let (_dir, mut s, _) = fixture();
-    s.config.run_tokens = 100_000;
-    s.config.closing_reserve_ratio = 0.8;
-    s.config.verification_reserve_ratio = 0.85;
-    s.config.writing_reserve_ratio = 0.9;
-    let doc = (1..=150)
-        .map(|i| format!("Claim {i}. main.js:1-6\n"))
-        .collect::<String>();
-    let hash = s.last_document_write.as_ref().unwrap().1.clone();
-    tools::execute(
-        &mut s,
-        "document_edit",
-        json!({"action":"write","expected_hash":hash,"text":doc}),
-    )
-    .unwrap();
-    let cut = || Completion {
-        length_limited: true,
-        ..Default::default()
-    };
-    let none = std::time::Duration::ZERO;
-    // The final answer's usage starts closing before the review.
-    let mut steps = vec![
-        (
-            none,
-            Completion {
-                usage: Some(Usage {
-                    input: 30_000,
-                    output: 10,
-                    cached: None,
-                }),
-                ..text("Saved out.md.")
-            },
-        ),
-        (none, cut()),
-        (none, cut()),
-    ];
-    steps.extend((0..6).map(|_| (none, text(r#"{"issues":[]}"#))));
-    let (result, _, _, notices) = run_paced(s, steps).await;
-    assert!(result.progress_recovery.closing.is_some());
-    assert_eq!(result.document_review.page_shrink, 1);
-    for said in [
-        "절반 범위로 다시 검토",
-        "검토 응답을 받지 못해 이 부분의 검토를 건너뛰고",
-    ] {
-        assert!(
-            notices.iter().any(|notice| notice.contains(said)),
-            "{notices:?}"
-        );
-    }
-    assert!(
-        !notices
-            .iter()
-            .any(|n| n.starts_with("마감 단계의 검토 응답")),
-        "{notices:?}"
-    );
-    assert_eq!(
-        result.status, "complete_with_gaps",
-        "{:?}",
-        result.last_error
-    );
-    assert!(
-        result
-            .completion_gaps
-            .iter()
-            .any(|gap| gap == "문서 검토 — 1–50줄은 검토를 마치지 못했습니다."),
-        "{:?}",
-        result.completion_gaps
-    );
-}
-
-#[tokio::test]
-async fn closing_skips_only_the_page_of_a_malformed_review_reply() {
-    // Live runs 2026-10-08: one malformed closing reply ended the whole
-    // document review, discarding a page already reviewed and another's
-    // collected findings. Closing now skips that page at once and goes on.
-    let (_dir, mut s, _) = fixture();
-    s.config.run_tokens = 100_000;
-    s.config.closing_reserve_ratio = 0.8;
-    s.config.verification_reserve_ratio = 0.85;
-    s.config.writing_reserve_ratio = 0.9;
-    let doc = (1..=150)
-        .map(|i| format!("Claim {i}. main.js:1-6\n"))
-        .collect::<String>();
-    let hash = s.last_document_write.as_ref().unwrap().1.clone();
-    tools::execute(
-        &mut s,
-        "document_edit",
-        json!({"action":"write","expected_hash":hash,"text":doc}),
-    )
-    .unwrap();
-    let none = std::time::Duration::ZERO;
-    let mut steps = vec![
-        (
-            none,
-            Completion {
-                usage: Some(Usage {
-                    input: 30_000,
-                    output: 10,
-                    cached: None,
-                }),
-                ..text("Saved out.md.")
-            },
-        ),
-        (none, text(r#"{"{"issues": []"#)),
-    ];
-    steps.extend((0..6).map(|_| (none, text(r#"{"issues":[]}"#))));
-    let (result, _, output_tokens, notices) = run_paced(s, steps).await;
-    assert!(result.progress_recovery.closing.is_some());
-    assert!(
-        notices.iter().any(|n| n
-            == "마감 단계의 검토 응답이 형식에 맞지 않아 이 부분의 검토를 건너뛰고, 나머지 검토를 이어갑니다."),
-        "{notices:?}"
-    );
-    assert!(
-        !notices.iter().any(|n| n.contains("이 결과의 검토를 생략")),
-        "{notices:?}"
-    );
-    // The skipped page is not asked again; the next request is the next page.
-    assert!(output_tokens.len() >= 3, "{output_tokens:?}");
-    assert_eq!(
-        result.status, "complete_with_gaps",
-        "{:?}",
-        result.last_error
-    );
-    let gaps: Vec<_> = result
-        .completion_gaps
-        .iter()
-        .filter(|gap| gap.starts_with("문서 검토 — "))
-        .collect();
-    assert_eq!(gaps.len(), 1, "{:?}", result.completion_gaps);
-    assert!(
-        gaps[0].starts_with("문서 검토 — 1–")
-            && gaps[0].ends_with("줄은 검토를 마치지 못했습니다."),
-        "{gaps:?}"
-    );
-    assert!(!gaps[0].contains("–150줄"), "{gaps:?}");
-}
-
-#[tokio::test]
 async fn reads_after_a_declared_draft_phase_still_count_as_progress() {
     // Live run 2026-10-07: the model declared phase draft before its first
     // save, and its reads for later sections stopped counting (2 to 10).
-    let (dir, mut s, _) = fixture();
-    s.config.source_document_review = false;
+    let (dir, s, _) = fixture();
     for name in ["a.js", "b.js", "c.js"] {
         std::fs::write(
             dir.path().join(name),
@@ -2710,58 +1781,6 @@ async fn reads_after_a_declared_draft_phase_still_count_as_progress() {
     for g in &guidance[2..] {
         assert_eq!(g["progress_recovery"]["rounds_since_progress"], 0, "{g}");
     }
-}
-
-#[tokio::test]
-async fn the_single_closing_review_gets_the_full_output_allowance() {
-    // Closing allows one review response; a short allowance that a
-    // reasoning model fills with its reasoning would end the review there.
-    let (_dir, mut s, _) = fixture();
-    s.config.run_tokens = 1_000_000;
-    let none = std::time::Duration::ZERO;
-    let mut into_closing = call("state", "task_state", json!({"action":"read"}));
-    into_closing.usage = Some(Usage {
-        input: 905_000,
-        output: 10,
-        cached: None,
-    });
-    let steps = vec![
-        (none, into_closing),
-        (none, text("Saved out.md.")),
-        (none, text(r#"{"issues":[]}"#)),
-    ];
-    let (result, guidance, output_tokens, _) = run_paced(s, steps).await;
-    assert_eq!(guidance[1]["closing"]["active"], true, "{}", guidance[1]);
-    assert_eq!(output_tokens.len(), 3, "{output_tokens:?}");
-    assert_eq!(output_tokens[2], 8000, "{output_tokens:?}");
-    assert_eq!(result.status, "complete", "{:?}", result.last_error);
-}
-
-#[tokio::test]
-async fn review_responses_rejected_before_parsing_end_reviews_like_invalid_ones() {
-    // A review response with a malformed tool call is rejected before its
-    // JSON is read. It was retried without notice, and an abandoned review
-    // asked for the answer again instead of accepting it unreviewed.
-    let malformed = || call("x", &"n".repeat(200), json!({}));
-    let none = std::time::Duration::ZERO;
-    let (_dir, s, _) = fixture();
-    let steps = vec![
-        (none, text("Saved out.md.")),
-        (none, malformed()),
-        (none, malformed()),
-        (none, malformed()),
-    ];
-    let (result, guidance, _, notices) = run_paced(s, steps).await;
-    assert_eq!(guidance.len(), 4, "{guidance:?}");
-    assert_eq!(
-        result.status, "complete_with_gaps",
-        "{:?}",
-        result.last_error
-    );
-    assert!(
-        notices.iter().any(|notice| notice.contains("검토를 생략")),
-        "{notices:?}"
-    );
 }
 
 /// Switches the run to another model, as a settings change during a run
@@ -2802,14 +1821,13 @@ async fn run_switching(
     s: Session,
     steps: Vec<(std::time::Duration, Completion)>,
     at: usize,
-) -> (Session, Vec<Value>, Vec<usize>) {
+) -> (Session, Vec<Value>) {
     let mut next = s.config.clone();
     next.model = "gpt-4o-mini".into();
     let (commands, receiver) = mpsc::channel(4);
     let paced = Arc::new(Paced {
         steps: Mutex::new(steps),
         guidance: Mutex::new(vec![]),
-        output_tokens: Mutex::new(vec![]),
     });
     let client = Arc::new(SwitchModel {
         inner: paced.clone(),
@@ -2819,18 +1837,12 @@ async fn run_switching(
     });
     let (tx, mut rx) = mpsc::channel(256);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let result = mnemoarc::agent::run_session_controlled(
-        s,
-        Arc::new(support::document_review::Client(client)),
-        CancellationToken::new(),
-        tx,
-        receiver,
-    )
-    .await;
+    let result =
+        mnemoarc::agent::run_session_controlled(s, client, CancellationToken::new(), tx, receiver)
+            .await;
     drain.await.unwrap();
     let guidance = paced.guidance.lock().unwrap().clone();
-    let output_tokens = paced.output_tokens.lock().unwrap().clone();
-    (result, guidance, output_tokens)
+    (result, guidance)
 }
 
 #[tokio::test]
@@ -2839,7 +1851,6 @@ async fn a_model_switched_mid_run_learns_its_own_pace() {
     // a_slow_model_closes_early...); the model that replaced it has shown
     // no pace yet, so the ratio reserve alone decides.
     let (dir, mut s, _) = fixture();
-    s.config.source_document_review = false;
     s.config.run_timeout_secs = 6;
     s.config.verification_reserve_ratio = 0.9;
     s.config.writing_reserve_ratio = s.config.writing_reserve_ratio.max(0.95);
@@ -2851,7 +1862,7 @@ async fn a_model_switched_mid_run_learns_its_own_pace() {
         ),
         (std::time::Duration::ZERO, text("Saved out.md.")),
     ];
-    let (result, guidance, _) = run_switching(s, steps, 1).await;
+    let (result, guidance) = run_switching(s, steps, 1).await;
     assert_eq!(result.config.model, "gpt-4o-mini");
     assert!(guidance[1]["closing"].is_null(), "{}", guidance[1]);
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
@@ -2906,11 +1917,9 @@ impl LlmClient for CiteOnRefusal {
     }
 }
 
-/// The fixture with its document rewritten to cite nothing; the review is
-/// off because the citation requirement applies to source documents either way.
+/// The fixture with its document rewritten to cite nothing.
 fn uncited_fixture() -> (tempfile::TempDir, Session) {
     let (dir, mut s, _) = fixture();
-    s.config.source_document_review = false;
     let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
     tools::execute(
         &mut s,
@@ -2931,8 +1940,8 @@ async fn run_citing(s: Session, client: Arc<CiteOnRefusal>) -> Session {
 
 #[tokio::test]
 async fn a_source_document_finishes_only_once_it_cites_a_source() {
-    // Live run 2026-10-07: a document that cited nothing skipped the source
-    // review and finished "complete" with no reported gap.
+    // Live run 2026-10-07: a document that cited nothing finished "complete"
+    // with no source check and no reported gap.
     let (_dir, s) = uncited_fixture();
     let client = Arc::new(CiteOnRefusal {
         calls: Mutex::new(0),

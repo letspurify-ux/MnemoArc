@@ -163,7 +163,6 @@ async fn cancelling_then_sending_a_changed_prompt_repairs_routing_and_finishes_t
         // 64K context leaves ~16.8K input budget, and the fixed prompt alone
         // is ~12K, so five rounds crossed high_water and started a checkpoint.
         context_tokens: 128000,
-        source_document_review: false,
         projects: vec![project.clone()],
         ..support::compact_config()
     };

@@ -160,10 +160,9 @@ pub(super) enum OutlineView {
     /// ancestors and a few neighbours, then each heading level from the top
     /// while it fits, the first level that does not fit in part. A focus
     /// covering much of the outline (a whole-document write) adds nothing,
-    /// so the levels alone remain. The runtime's automatic outlines (save
-    /// results, review pages, validation requests) use this view, because
-    /// each is repeated per save or request and shares its budget with the
-    /// document and evidence; document_inspect pages the complete outline.
+    /// so the levels alone remain. The runtime's automatic outlines in save
+    /// results use this view, because each is repeated per save and shares
+    /// the result budget; document_inspect pages the complete outline.
     Around {
         lines: Vec<(usize, usize)>,
         max: usize,
@@ -784,14 +783,9 @@ pub(super) fn execute(
             }
             s.last_audit_revision = Some(revision.clone());
             let end = (offset + n(args, "limit", 30).clamp(1, 100)).min(issues.len());
-            // The document review compares every cited range with the source,
-            // so a range the writer never read does not block the final answer
-            // while that review is on; the audit still lists it.
-            let reviewed = s.config.source_document_review;
-            let structural_ok = issues.iter().all(|issue| {
-                issue["kind"] == "no_machine_readable_citations"
-                    || (reviewed && issue["kind"] == "unread_citation")
-            });
+            let structural_ok = issues
+                .iter()
+                .all(|issue| issue["kind"] == "no_machine_readable_citations");
             let mut result = json!({"hash":document_hash,"revision":revision,"total_lines":doc.lines().count(),"citations_checked":checked,"structural_ok":structural_ok,"semantic_verified":false,"format_check":format_check,"issue_count":issues.len(),"issues":issues[offset..end],"next_offset":(end<issues.len()).then_some(end)});
             if s.is_document_work()
                 && let Some(check) = test_code_check(s, &path, &doc)
@@ -829,9 +823,7 @@ pub(super) struct Citation {
     pub document_line: usize,
 }
 
-/// A missing cited range this long is more likely a pointer than evidence,
-/// and any range this long fills review evidence pages
-/// (BROAD_CITATION_GUIDANCE states the number).
+/// A missing cited range this long is more likely a pointer than evidence.
 const BROAD_CITATION_LINES: usize = 120;
 
 /// Cited ranges never delivered to the model as complete lines of the current
@@ -1149,8 +1141,8 @@ const TEST_CODE_GUIDANCE: &str = "These citations point into test code. A test s
 /// Citations into test code: files a test layout names (a tests, test or
 /// __tests__ directory; .test., .spec., _test, _spec, test_, tests or ...Test
 /// names) and Rust `#[cfg(test)]` modules. A live document cited a test's
-/// loop as how reviews repeat, and the document review approved it. Advice
-/// only; None when nothing is flagged.
+/// loop as how the product repeats a step. Advice only; None when nothing is
+/// flagged.
 pub(super) fn test_code_check(s: &Session, output: &Path, doc: &str) -> Option<Value> {
     let root = s.project.root.canonicalize().ok()?;
     let citations = citation_spans(doc).ok()?;
@@ -1411,9 +1403,9 @@ fn project_file_for_link(s: &Session, target: &str) -> Option<String> {
         })
 }
 
-/// A source document without a machine-readable citation can be neither
-/// reviewed nor finished: say so on every save and audit, not only when the
-/// final answer is refused.
+/// A source document without a machine-readable citation cannot be
+/// finished: say so on every save and audit, not only when the final answer
+/// is refused.
 const NO_CITATIONS_GUIDANCE: &str = "The document cites no project source as relative/path.ext:start-end. Cite the sources of its claims next to them (for example backend/src/server.js:12-30); the final answer is refused while the document cites no project source. memory_read returns the path and lines of each source saved with a memory. Other citation formats require manual review.";
 
 pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Value> {
@@ -1424,13 +1416,7 @@ pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Va
         Ok(unread) => (unread, None),
         Err(error) => (vec![], Some(error.to_string())),
     };
-    // While the document review is on it compares every cited range with
-    // the source, so an unread range is advice rather than a blocker.
-    let guidance = if s.config.source_document_review {
-        "Fix citation or code-fence issues in the next section edit. unread_citations are cited ranges never delivered to you as complete lines of the current file version. They do not block the final answer: the document review compares each cited range with the source. Reading a range before citing it avoids a wrong citation."
-    } else {
-        "Fix citation or code-fence issues in the next section edit. unread_citations are cited ranges never delivered to you as complete lines of the current file version: file_read each listed range, or narrow the citation to the lines you read, before the final answer; the final audit treats them as unresolved evidence."
-    };
+    let guidance = "Fix citation or code-fence issues in the next section edit. unread_citations are cited ranges never delivered to you as complete lines of the current file version: file_read each listed range, or narrow the citation to the lines you read, before the final answer; the final audit treats them as unresolved evidence.";
     let mut check = json!({"citations_checked":checked,"issue_count":issues.len(),"issues":issues.iter().take(8).collect::<Vec<_>>(),
         "unread_citation_count":unread.len(),"unread_citations":unread.iter().take(8).collect::<Vec<_>>(),
         "unread_citation_error":unread_error,
@@ -1439,94 +1425,8 @@ pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Va
     if checked == 0 {
         check["citations_required"] = json!(NO_CITATIONS_GUIDANCE);
     }
-    // The review sends every cited line as evidence, read or not: a 62-line
-    // document citing ten 2,000-line ranges took 35 review requests, and
-    // nothing told the writer while its reads covered those ranges.
-    if s.config.source_document_review {
-        let lines = |c: &Citation| c.end.saturating_sub(c.begin).saturating_add(1);
-        let broad: Vec<_> = citation_spans(doc)?
-            .into_iter()
-            .filter(|c| c.end >= c.begin && lines(c) >= BROAD_CITATION_LINES)
-            .collect();
-        if !broad.is_empty() {
-            check["broad_citation_count"] = json!(broad.len());
-            check["broad_cited_lines"] = json!(broad.iter().map(lines).sum::<usize>());
-            check["broad_citations"] = json!(
-                broad
-                    .iter()
-                    .take(8)
-                    .map(|c| json!({"citation":c.raw,"document_line":c.document_line,"lines":lines(c)}))
-                    .collect::<Vec<_>>()
-            );
-            check["broad_citation_guidance"] = json!(BROAD_CITATION_GUIDANCE);
-        }
-        // The review leaves such a line out of its evidence and reports the
-        // citation for repair; saying so now saves that review cycle.
-        let long = long_line_citations(s, output, doc);
-        if !long.is_empty() {
-            check["long_line_citation_count"] = json!(long.len());
-            check["long_line_citations"] = json!(long.iter().take(8).collect::<Vec<_>>());
-            check["long_line_guidance"] = json!(format!(
-                "Each listed citation includes a source line longer than {} bytes (generated or minified text). The document review cannot send such a line to the reviewer and reports the citation for repair. Leave that line out of the range, or cite the code that produces or reads its content.",
-                super::document_review::evidence_line_limit(&s.config)
-            ));
-        }
-    }
     Ok(check)
 }
-
-/// Citations whose cited lines include one longer than the document review
-/// sends as evidence: the citation, its document line and the first such
-/// source line with its length. A review used to fail on such a line with
-/// "narrow citations", which a single line cannot do.
-pub(super) fn long_line_citations(s: &Session, output: &Path, doc: &str) -> Vec<Value> {
-    let limit = super::document_review::evidence_line_limit(&s.config);
-    let Ok(citations) = citation_spans(doc) else {
-        return Vec::new();
-    };
-    let mut files = BTreeMap::<PathBuf, Vec<(usize, usize)>>::new();
-    citations
-        .iter()
-        .filter_map(|citation| {
-            let path = cited_path(s, output, citation).ok()?;
-            let long = files.entry(path).or_insert_with_key(|path| {
-                super::long_text_lines(path)
-                    .map(|lines| {
-                        lines
-                            .into_iter()
-                            .filter(|&(_, bytes)| bytes > limit)
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            });
-            let &(line, bytes) = long
-                .iter()
-                .find(|&&(line, _)| citation.begin <= line && line <= citation.end)?;
-            Some(
-                json!({"citation":citation.raw,"document_line":citation.document_line,
-                "source_line":line,"bytes":bytes}),
-            )
-        })
-        .collect()
-}
-
-/// The project file a citation names: relative links resolve against the
-/// document's directory, other paths against the project root.
-pub(super) fn cited_path(s: &Session, output: &Path, citation: &Citation) -> Result<PathBuf> {
-    let path = if citation.relative_link {
-        output
-            .parent()
-            .unwrap()
-            .join(&citation.path)
-            .to_string_lossy()
-            .into_owned()
-    } else {
-        citation.path.clone()
-    };
-    read_path(&s.project, &path)
-}
-
-const BROAD_CITATION_GUIDANCE: &str = "Each broad citation spans 120 or more source lines. The document review sends every cited line to the reviewer, so long ranges add review requests and time to each review of this document. Where a claim rests on a few lines (a declaration, branch, call or constant), cite those lines; keep a long range only when the claim describes all of it.";
 
 #[cfg(test)]
 mod outline_tests {

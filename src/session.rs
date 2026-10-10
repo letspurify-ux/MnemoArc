@@ -80,7 +80,7 @@ pub struct TaskState {
 
 /// Criteria supplied before a user request starts. The agent may refine
 /// TaskState while working, but those working checks must not become new
-/// requirements for the document review.
+/// user requirements.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RequestReviewCriteria {
@@ -331,9 +331,6 @@ pub struct ReadCoverage {
 pub struct ProgressRecovery {
     /// A rejected document final must return to tools before trying to finish.
     pub action_required: bool,
-    /// The batch being executed answers a forced repair step, so non-repair
-    /// tools are refused while it runs (action_required is already cleared).
-    pub repair_step: bool,
     /// Recovery thresholds change the approach; document work retains its budget.
     pub recovery_reason: Option<String>,
     /// New navigation pages alone cannot keep a stalled task alive forever.
@@ -344,14 +341,6 @@ pub struct ProgressRecovery {
     pub finalization_attempts: usize,
     pub best_document_section_count: usize,
     pub best_document_content_lines: usize,
-    /// Document-review progress banked from review cycles closed by an edit
-    /// after an approval (see document_review::progress).
-    pub review_credit: usize,
-    /// Credit of the current review cycle's first review, which is no
-    /// progress by itself. The first cycle of a task counts from zero.
-    pub review_cycle_base: usize,
-    /// A new review cycle waits for its first review to set that base.
-    pub review_cycle_unbased: bool,
     pub seen_artifact_versions: VecDeque<String>,
     pub seen_artifact_paths: VecDeque<String>,
     pub seen_navigation_results: VecDeque<String>,
@@ -365,14 +354,6 @@ pub struct ProgressRecovery {
     /// Set once document work must converge: exploration stops and the run
     /// finishes within a fixed number of requests, reporting unresolved items.
     pub closing: Option<Closing>,
-    /// Final answers rejected by an unrepaired document review while the
-    /// reviewed document stayed unchanged (keyed by that document's hash).
-    pub unrepaired_finals: usize,
-    pub unrepaired_final_hash: Option<String>,
-    /// Hash of the rejected document when a checkpoint cleared the context
-    /// during review repair; the next requests restate the findings until
-    /// the document changes.
-    pub review_repair_resume_hash: Option<String>,
     /// Set when a document-work response hit the output limit: a whole
     /// document rewrite is withheld until a smaller edit succeeds.
     pub whole_write_withheld: bool,
@@ -400,15 +381,13 @@ pub struct TodoWatch {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Closing {
-    /// "budget" when the reserve is reached, "stall" after sustained no progress,
-    /// "review_unrepaired" after unchanged rejected finals, "empty_response"
-    /// after consecutive empty model replies.
+    /// "budget" when the reserve is reached, "stall" after sustained no
+    /// progress, "empty_response" after consecutive empty model replies.
     pub reason: String,
-    /// Non-review model requests (and failed review retries) since closing began.
+    /// Model requests since closing began.
     pub rounds: usize,
     /// Final answers submitted during closing. The second accepts reported gaps.
     pub final_attempts: usize,
-    pub document_review_used: bool,
 }
 
 impl ProgressRecovery {
@@ -530,7 +509,6 @@ pub struct Session {
     pub output_tokens: usize,
     pub cached_tokens: Option<usize>,
     pub usage_incomplete: bool,
-    pub reviews: usize,
     pub checkpoints_completed: usize,
     pub memory_loads: usize,
     pub history_loads: usize,
@@ -558,10 +536,6 @@ pub struct Session {
     pub list_cursor_scopes: VecDeque<(String, Value)>,
     pub activity: Value,
     pub task_rounds: usize,
-    pub document_review: crate::tools::document_review::ReviewState,
-    /// Current requirements with change provenance; the document review
-    /// compares results against them.
-    pub answer_review_question: String,
     // Some(true): truncated tool batch; Some(false): text continuation.
     pub continuation: Option<bool>,
 }
@@ -596,7 +570,7 @@ impl Session {
     }
 
     /// Optional tools the user's workflow selection excludes. Chat answers
-    /// run no citation audit or review, so `document_audit` is withheld.
+    /// run no citation audit, so `document_audit` is withheld.
     pub fn workflow_forbidden_tools(&self) -> &'static [&'static str] {
         if self.workflow_mode == "answer" {
             &["document_audit"]
@@ -649,7 +623,6 @@ impl Session {
             ) || self.checkpoint.is_some()
                 || self.continuation.is_some()
                 || self.task.current_todo().is_some()
-                || self.document_review.pending
                 || !self.completion_gaps.is_empty())
     }
 
@@ -726,7 +699,6 @@ impl Session {
             output_tokens: 0,
             cached_tokens: None,
             usage_incomplete: false,
-            reviews: 0,
             checkpoints_completed: 0,
             memory_loads: 0,
             history_loads: 0,
@@ -745,8 +717,6 @@ impl Session {
             list_cursor_scopes: VecDeque::new(),
             activity: json!({}),
             task_rounds: 0,
-            document_review: Default::default(),
-            answer_review_question: String::new(),
             continuation: None,
         }
     }
@@ -879,7 +849,6 @@ impl Session {
                 bail!("invalid_task_requirements: use at most 100 non-empty entries");
             }
         }
-        let changed_requirements = amendment.goal.is_some();
         let mut next = self.clone();
         let question = next.question.take().unwrap();
         next.current_request = question.text.clone();
@@ -907,11 +876,6 @@ impl Session {
             next.task.completion = next.initial_completion(&next.latest_request);
         }
         next.task_amendments.push(amendment);
-        next.answer_review_question = json!({
-            "current_goal":next.latest_request,"initial_request":next.original_request,
-            "user_changes":next.task_amendments,
-            "policy":"The latest explicit user change supersedes an earlier conflicting requirement. Unchanged requirements remain in force. Initial request and change history are provenance, not additional requirements to reimpose."
-        }).to_string();
         if let Some(bundle) = next
             .history
             .bundles
@@ -931,13 +895,6 @@ impl Session {
         next.progress_recovery = Default::default();
         next.run_guidance = json!({});
         next.completion_gaps.clear();
-        // Keep artifacts and review history. Requirements hashes
-        // invalidate old verdicts even when the document itself is unchanged.
-        next.document_review.pending = false;
-        next.document_review.approved_hash = None;
-        if changed_requirements {
-            next.document_review.invalidate_requirements();
-        }
         if let Some(cp) = &mut next.checkpoint {
             cp.attempts = 0;
             cp.acknowledged = false;
@@ -1007,7 +964,6 @@ impl Session {
             // successful results across a new user task can replay a stale read
             // or suppress a new mutation if a provider reuses an ID.
             self.clear_ledger();
-            self.answer_review_question = text.clone();
             self.continuation = None;
             // The first prompt may follow a caller's task_state setup. Keep
             // that plan; later non-continuation messages start a new task.
@@ -1015,7 +971,7 @@ impl Session {
                 self.task.revision = self.task.revision.saturating_add(1);
             } else {
                 // Keep explicit user constraints as session safety rules,
-                // but discard the previous task's plan and review state.
+                // but discard the previous task's plan.
                 let revision = self.task.revision.saturating_add(1);
                 let constraints = std::mem::take(&mut self.task.constraints);
                 self.task = TaskState {
@@ -1024,8 +980,6 @@ impl Session {
                     revision,
                     ..Default::default()
                 };
-                self.reviews = 0;
-                self.document_review = Default::default();
                 self.document_written = false;
                 self.last_document_write = None;
                 self.task_rounds = 0;
@@ -1037,7 +991,7 @@ impl Session {
             // later model task_state updates add working acceptance checks.
             // On later requests, task.constraints can contain checks the agent
             // added during the previous task; retain only the earlier caller
-            // constraints for the document review.
+            // constraints as user criteria.
             self.request_review_criteria = RequestReviewCriteria {
                 completion: self.task.completion.clone(),
                 constraints: if first_request {
@@ -1053,7 +1007,7 @@ impl Session {
             self.apply_workflow_mode();
         }
         // A resume message belongs in history, but must not replace the task
-        // requirements used after checkpointing and by the document review.
+        // requirements used after checkpointing.
         if !continuation || self.latest_request.is_empty() {
             self.latest_request = text.clone();
             self.original_request = text.clone();
@@ -1065,8 +1019,8 @@ impl Session {
             .push(vec![json!({"role":"user","content":text})], true);
     }
     /// Add a maintenance request without starting a new user task. Cleanup
-    /// must keep the current workflow, evidence requirements and review state
-    /// so a pending settings change cannot silently weaken completion checks.
+    /// must keep the current workflow and evidence requirements so a pending
+    /// settings change cannot silently weaken completion checks.
     pub fn add_maintenance(&mut self, text: String) {
         self.finish_maintenance();
         self.history.push(
@@ -1207,11 +1161,8 @@ impl Session {
             &self.token_ratios,
             &self.list_cursor_scopes,
             &self.activity,
-            &self.answer_review_question,
             &self.run_history,
-            self.active_document_review_failure(),
         )))
-        .saturating_add(self.document_review.retained_bytes())
         .saturating_add(self.config.api_key.as_ref().map_or(0, |key| key.0.len()))
         .saturating_add(
             self.pending_config
@@ -1255,16 +1206,13 @@ mod history_tests {
     use super::*;
 
     #[test]
-    fn explicit_changes_preserve_artifacts_and_unaffected_work_and_invalidate_old_reviews() {
+    fn explicit_changes_preserve_artifacts_and_unaffected_work() {
         let mut s = Session::new(Project::default(), Config::compact_test());
         s.select_workflow("source_document").unwrap();
         s.receive_message("Write both chapters, around 800 lines".into())
             .unwrap();
         s.document_written = true;
         s.last_document_write = Some((std::path::PathBuf::from("out.md"), "same-hash".into()));
-        s.document_review.approved_hash = Some("same-hash".into());
-        s.document_review.issues = vec!["Old length requirement".into()];
-        s.document_review.validation_log = vec![json!({"prior":"review"})];
         let original = s.original_request.clone();
         let files = s.last_document_write.clone();
         let sources = s.sources.clone();
@@ -1285,9 +1233,6 @@ mod history_tests {
         assert_eq!(s.sources.len(), sources.len() + 1);
         assert!(s.document_written && s.question.is_none());
         assert_eq!(s.request_review_criteria.completion, s.task.completion);
-        assert_eq!(s.document_review.approved_hash, None);
-        assert!(s.document_review.issues.is_empty());
-        assert_eq!(s.document_review.validation_log.len(), 1);
         assert_eq!(s.task_amendments.len(), 1);
         assert_eq!(s.task.workflow, "source_document");
     }

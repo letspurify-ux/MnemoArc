@@ -22,10 +22,6 @@ mod database_free;
 mod document_completion_recovery;
 #[path = "document_format.rs"]
 mod document_format;
-#[path = "document_review.rs"]
-mod document_review;
-#[path = "document_review_findings.rs"]
-mod document_review_findings;
 #[path = "documentation.rs"]
 mod documentation;
 #[path = "evaluation.rs"]

@@ -222,7 +222,7 @@ async fn follow_up_error_previews_are_bounded_and_do_not_guess_missing_calls() {
 }
 
 #[tokio::test]
-async fn general_follow_up_collects_files_and_remembers_evidence_without_reviews_or_resuming() {
+async fn general_follow_up_collects_files_and_remembers_evidence_without_resuming() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("notes.txt"), "Newly collected evidence\n").unwrap();
     std::fs::write(dir.path().join("out.md"), "# Saved\nExisting document\n").unwrap();
@@ -278,8 +278,6 @@ async fn general_follow_up_collects_files_and_remembers_evidence_without_reviews
         );
         assert!(!names.contains(&"document_audit") && !names.contains(&"document_edit"));
     }
-    assert!(!s.document_review.pending);
-    assert_eq!(s.reviews, 0);
 }
 #[tokio::test]
 async fn further_work_edits_files_and_preserves_the_original_plan_and_evidence() {
@@ -352,7 +350,6 @@ async fn an_explicit_goal_and_completion_change_updates_the_same_task() {
     assert!(s.task.todos[0].done);
     assert_eq!(s.task_amendments[0].request, s.current_request);
     assert_eq!(requests.len(), 2);
-    assert_eq!(s.reviews, 0);
 }
 
 #[tokio::test]

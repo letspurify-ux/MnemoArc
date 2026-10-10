@@ -111,7 +111,7 @@ const provider = createServer(async (req, res) => {
       else sendAnswer("후속 질문에서도 sample.rs:1-1 자료를 수집했습니다.");
       return;
     }
-    sendAnswer("기존 작업의 상태와 검토 지적을 유지한 질문 답변입니다.");
+    sendAnswer("기존 작업의 상태를 유지한 질문 답변입니다.");
     return;
   }
   let retainedState;
@@ -305,9 +305,11 @@ const provider = createServer(async (req, res) => {
   res.end("data: [DONE]\n\n");
 });
 await new Promise((resolve) => provider.listen(0, "127.0.0.1", resolve));
+// The specs set a 128K model context (gpt-4o); the built-in 160K context
+// budget would exceed it and every settings save would be refused.
 await writeFile(
   join(dir, "config.toml"),
-  `base_url = "http://127.0.0.1:${provider.address().port}"\nmodel = ""\n[[projects]]\nname = "Browser fixture"\nroot = ${JSON.stringify(dir)}\noutput = "summary.md"\n`,
+  `base_url = "http://127.0.0.1:${provider.address().port}"\nmodel = ""\ncontext_tokens = 128000\n[[projects]]\nname = "Browser fixture"\nroot = ${JSON.stringify(dir)}\noutput = "summary.md"\n`,
 );
 const child = spawn(
   resolve("../target/debug/mnemoarc"),

@@ -38,7 +38,7 @@ impl Workspace {
         } else {
             None
         };
-        let mut paths = if let Some(path) = exact {
+        let (mut paths, non_utf8) = if let Some(path) = exact {
             if path_glob(args)?.is_some() {
                 bail!(
                     "conflicting_path_filters: pass path or path_glob, not both{}",
@@ -47,12 +47,12 @@ impl Workspace {
             }
             let path = read_path(&s.project, path)?;
             if path.is_dir() {
-                candidate_paths_scoped(&s.project, None, cancel, Some(&path), Some(deadline))?
+                candidate_paths_counted(&s.project, None, cancel, Some(&path), Some(deadline))?
             } else {
-                vec![path]
+                (vec![path], 0)
             }
         } else {
-            candidate_paths_scoped(&s.project, path_glob(args)?, cancel, None, Some(deadline))?
+            candidate_paths_counted(&s.project, path_glob(args)?, cancel, None, Some(deadline))?
         };
         if let Some(target) = target
             && !paths.iter().any(|p| p == target)
@@ -60,12 +60,15 @@ impl Workspace {
             paths.push(target.to_owned());
             paths.sort();
         }
-        let matched_files = paths.len();
+        // A file whose name is not UTF-8 matched the scope but cannot be
+        // read by any tool: it is skipped like an unsupported language.
+        let matched_files = paths.len() + non_utf8;
         let mut files = Vec::new();
-        let mut skipped_files = 0;
+        let mut skipped_files = non_utf8;
         let mut bytes = 0usize;
         let mut symbols_count = 0usize;
         let mut fingerprint = Sha256::new();
+        fingerprint.update(non_utf8.to_le_bytes());
         for path in paths {
             check_budget(cancel, deadline)?;
             fingerprint.update(path.as_os_str().as_encoded_bytes());

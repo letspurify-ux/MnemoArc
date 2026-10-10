@@ -13,7 +13,7 @@ TypeScript/TSX의 `namespace`·`module`도 모듈 선언으로 추출하며 자�
 1. `symbol_search`로 선언을 찾는다. 위치가 알려져 있으면 `path`, 여러 파일이면 `path_glob`으로 범위를 좁힌다.
 2. 결과의 `path`와 `symbol_id`를 `symbol_relations`에 그대로 전달한다.
 3. 관계 결과의 호출 위치는 `file_read`, 후보 구현은 `symbol_read`로 읽는다. 조건문·조기 반환·오류 경로도 함께 확인한다.
-4. 읽은 근거로 문서를 작성하고 기존 조사 검증과 문서 검토를 수행한다.
+4. 읽은 근거로 문서를 작성하고 인용 검사를 통과시킨다.
 
 ```json
 {"query":"handleRequest","match":"exact","path_glob":"src/**/*.ts","kind":"function"}

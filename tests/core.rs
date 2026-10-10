@@ -977,7 +977,7 @@ fn answer_workflow_document_edit_skips_document_verification() {
 }
 
 #[test]
-fn answer_workflow_runs_no_reviews_and_hides_review_tools() {
+fn answer_workflow_hides_the_audit_tool() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     s.select_workflow("source_document").unwrap();
@@ -1005,18 +1005,16 @@ fn answer_workflow_runs_no_reviews_and_hides_review_tools() {
 }
 
 #[test]
-fn answer_workflow_sends_no_review_or_verification_guidance() {
+fn answer_workflow_sends_no_verification_guidance() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     s.add_user("Add a note to the summary".into());
-    let review_terms = ["document_review", "unread_citation", "citation_check"];
+    let verification_terms = ["unread_citation", "citation_check"];
     let request = ContextManager::request(&s, tools::ToolRegistry::definitions(&s)).unwrap();
     let text = request.to_string();
-    for term in review_terms {
+    for term in verification_terms {
         assert!(!text.contains(term), "{term}");
     }
-    let state = ContextManager::state(&s).unwrap();
-    assert!(state.get("document_review").is_none());
     let written = tools::execute(
         &mut s,
         "document_edit",
@@ -1039,7 +1037,7 @@ fn answer_workflow_sends_no_review_or_verification_guidance() {
 #[test]
 fn the_source_prompt_leaves_audit_and_task_state_to_the_runtime() {
     // The runtime audits the saved document on every request into
-    // run_guidance.document_readiness, fixes the review criteria before any
+    // run_guidance.document_readiness, fixes the user criteria before any
     // task_state update and returns the outline with every save; the prompt
     // no longer asks the model to repeat those steps (3.2 audits, 2.5 outline
     // inspections and a mandated first task_state call per live run).
