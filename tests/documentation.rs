@@ -1473,7 +1473,11 @@ fn a_link_target_error_names_its_folder_and_the_citation_to_write() {
     let outside = tempfile::tempdir().unwrap();
     s.project.output = outside.path().join("generated.md");
     let root = dir.path().canonicalize().unwrap();
-    let spelled = format!("../..{}/frontend/src/App.jsx#L2-L3", root.display());
+    // One step up from the output folder, the spelled-out root names no file
+    // however deep the temporary folders are. With as many steps as that
+    // folder is deep (two under Linux's /tmp), the link would reach the real
+    // file and be a valid citation.
+    let spelled = format!("..{}/frontend/src/App.jsx#L2-L3", root.display());
     let saved = run(
         &mut s,
         "document_edit",

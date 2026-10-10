@@ -87,7 +87,7 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
   await expect(
     page.getByText("느린 요청 테스트", { exact: true }).last(),
   ).toBeVisible();
-  await page.getByRole("tab", { name: "기억", exact: true }).click();
+  await page.getByRole("tab", { name: "사용량", exact: true }).click();
   await expect(page.getByText(/컨텍스트 예산은 기준 토크나이저/)).toBeVisible();
   await page.getByRole("tab", { name: "도구", exact: true }).click();
   await expect(

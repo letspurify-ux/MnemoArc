@@ -3792,7 +3792,7 @@ impl std::error::Error for DirectoryPath {}
 /// file listed in this error.
 fn directory_entries(p: &Project, directory: &Path) -> (Vec<String>, usize) {
     const MAX_ENTRIES: usize = 12;
-    let Ok(paths) = candidate_paths_bounded(
+    let Ok((paths, _)) = candidate_paths_bounded(
         p,
         None,
         &tokio_util::sync::CancellationToken::new(),
@@ -4112,6 +4112,19 @@ fn candidate_paths_scoped(
     directory: Option<&Path>,
     deadline: Option<std::time::Instant>,
 ) -> Result<Vec<PathBuf>> {
+    candidate_paths_counted(p, pattern, cancel, directory, deadline).map(|(paths, _)| paths)
+}
+
+/// candidate_paths_scoped, with the number of files in scope whose names are
+/// not UTF-8. Tools cannot address those files, so a search reports them as
+/// skipped instead of leaving them out unmentioned.
+pub(crate) fn candidate_paths_counted(
+    p: &Project,
+    pattern: Option<&str>,
+    cancel: &tokio_util::sync::CancellationToken,
+    directory: Option<&Path>,
+    deadline: Option<std::time::Instant>,
+) -> Result<(Vec<PathBuf>, usize)> {
     candidate_paths_bounded(
         p,
         pattern,
@@ -4152,7 +4165,7 @@ fn candidate_paths_bounded(
     directory: Option<&Path>,
     deadline: Option<std::time::Instant>,
     limits: FileScanLimits,
-) -> Result<Vec<PathBuf>> {
+) -> Result<(Vec<PathBuf>, usize)> {
     let check = || -> Result<()> {
         if let Some(deadline) = deadline {
             structure::check_budget(cancel, deadline)
@@ -4173,6 +4186,7 @@ fn candidate_paths_bounded(
     }
     let scope = directory.map(Path::to_path_buf);
     let mut entries = vec![];
+    let mut non_utf8 = 0usize;
     let mut path_bytes = 0usize;
     let filter = pattern
         .map(globset::Glob::new)
@@ -4195,16 +4209,17 @@ fn candidate_paths_bounded(
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
-        // JSON tool paths cannot address OS names that are not UTF-8. A lossy
-        // path can name a different file, and serializing the real path panics.
-        if entry.path().to_str().is_none() {
-            continue;
-        }
         let rel = entry.path().strip_prefix(&root)?;
         if directory.is_some_and(|scope| !entry.path().starts_with(scope))
             || excluded(p, rel)?
             || filter.as_ref().is_some_and(|f| !f.is_match(rel))
         {
+            continue;
+        }
+        // JSON tool paths cannot address OS names that are not UTF-8. A lossy
+        // path can name a different file, and serializing the real path panics.
+        if entry.path().to_str().is_none() {
+            non_utf8 += 1;
             continue;
         }
         path_bytes = path_bytes.saturating_add(entry.path().as_os_str().as_encoded_bytes().len());
@@ -4221,7 +4236,7 @@ fn candidate_paths_bounded(
     }
     entries.sort();
     check()?;
-    Ok(entries)
+    Ok((entries, non_utf8))
 }
 // Keep the existing text-only listing contract. Searches use candidates directly
 // so text validation and matching share one read instead of opening every file twice.
@@ -6643,6 +6658,7 @@ mod file_tests {
                     max_path_bytes: bytes,
                 },
             )
+            .map(|(paths, _)| paths)
         };
         let expected = vec![kept.join("a.rs"), kept.join("b.rs")];
         let bytes: usize = expected

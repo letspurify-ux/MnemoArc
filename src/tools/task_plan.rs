@@ -214,8 +214,8 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
             if texts.is_empty() || texts.len() > MAX_PENDING {
                 bail!("Insert between 1 and {MAX_PENDING} concise items");
             }
-            let mut at = position(task, before.as_deref())?;
-            for text in texts {
+            let start = position(task, before.as_deref())?;
+            for (at, text) in (start..).zip(texts) {
                 let text = nonempty(&text, MAX_TEXT_CHARS)?;
                 unique(task, text, None)?;
                 task.todo_sequence = task
@@ -232,7 +232,6 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
                         reopen_reason: String::new(),
                     },
                 );
-                at += 1;
             }
         }
         Operation::Update { id, text } => {
