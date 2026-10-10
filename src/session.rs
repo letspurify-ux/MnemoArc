@@ -378,6 +378,11 @@ pub struct ProgressRecovery {
     /// The checkpoint whose batch a failed document edit already held once.
     #[serde(skip)]
     pub checkpoint_edit_held: Option<String>,
+    /// Cleanup batches processed for one checkpoint (its ID and count):
+    /// document edits close after the first, or the second when a failed
+    /// edit held the first.
+    #[serde(skip)]
+    pub checkpoint_write_batches: (String, usize),
 }
 
 /// The current to-do with the task round it became current, and the

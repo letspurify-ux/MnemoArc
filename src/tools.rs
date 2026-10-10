@@ -489,11 +489,25 @@ impl ToolRegistry {
     /// that the checkpoint refused.
     pub fn checkpoint_allows(s: &Session, name: &str) -> bool {
         Self::checkpoint_allowed(name)
-            || (s.is_document_work() && Self::CHECKPOINT_DOCUMENT_TOOLS.contains(&name))
+            || (Self::CHECKPOINT_DOCUMENT_TOOLS.contains(&name) && Self::checkpoint_writes_open(s))
+    }
+    /// Whether a pending checkpoint still offers document edits: on its
+    /// first cleanup request, and once more only when a failed edit held
+    /// that request. A live model offered edits on every cleanup request
+    /// kept writing for eleven requests and never acknowledged.
+    pub fn checkpoint_writes_open(s: &Session) -> bool {
+        let Some(cp) = s.checkpoint.as_ref().filter(|_| s.is_document_work()) else {
+            return false;
+        };
+        let (id, batches) = &s.progress_recovery.checkpoint_write_batches;
+        let batches = if *id == cp.id { *batches } else { 0 };
+        batches == 0
+            || (batches == 1
+                && s.progress_recovery.checkpoint_edit_held.as_deref() == Some(cp.id.as_str()))
     }
     fn checkpoint_tool_names(s: &Session) -> Vec<&'static str> {
         let mut names = Self::CHECKPOINT_TOOLS.to_vec();
-        if s.is_document_work() {
+        if Self::checkpoint_writes_open(s) {
             names.extend(Self::CHECKPOINT_DOCUMENT_TOOLS);
         }
         names
@@ -6602,7 +6616,11 @@ fn failure_holds_checkpoint(s: &mut Session, name: &str) -> bool {
     if !matches!(name, "document_edit" | "document_edit_batch") {
         return true;
     }
-    if s.progress_recovery.checkpoint_edit_held.as_deref() == Some(cp.id.as_str()) {
+    // An edit refused because writes are closed changed nothing either and
+    // must not keep the checkpoint open.
+    if !ToolRegistry::checkpoint_writes_open(s)
+        || s.progress_recovery.checkpoint_edit_held.as_deref() == Some(cp.id.as_str())
+    {
         return false;
     }
     s.progress_recovery.checkpoint_edit_held = Some(cp.id.clone());

@@ -2549,6 +2549,15 @@ pub async fn run_session_controlled(
             }
             i += group;
         }
+        // Document edits close after a checkpoint's first cleanup batch
+        // (tools::ToolRegistry::checkpoint_writes_open).
+        if checkpoint_batch && let Some(cp) = &s.checkpoint {
+            let batches = &mut s.progress_recovery.checkpoint_write_batches;
+            if batches.0 != cp.id {
+                *batches = (cp.id.clone(), 0);
+            }
+            batches.1 += 1;
+        }
         // Reading a cited range the document still owed counts like a
         // verification did: the saved result is better supported.
         // Only the tool batch changes the delivered evidence or the document

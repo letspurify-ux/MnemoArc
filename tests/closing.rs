@@ -2248,3 +2248,53 @@ async fn a_failed_edit_holds_a_checkpoint_only_once() {
         before
     );
 }
+
+#[tokio::test]
+async fn checkpoint_document_edits_close_after_the_first_cleanup_request() {
+    // A live model offered edits on every cleanup request kept writing for
+    // eleven requests and never acknowledged the checkpoint.
+    let (_dir, s, id) = checkpoint_fixture();
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    let appended = format!(
+        "{}\n# Loop\nThe loop runs work five times. main.js:3-5\n",
+        std::fs::read_to_string(&s.project.output).unwrap()
+    );
+    let after = tools::hash(appended.as_bytes());
+    let (result, _, tools_offered) = run_scripted_tools(
+        s,
+        vec![
+            // First cleanup request: a section is saved, no acknowledgement.
+            call(
+                "save",
+                "document_edit",
+                json!({"action":"append","expected_hash":hash,"text":"\n# Loop\nThe loop runs work five times. main.js:3-5\n"}),
+            ),
+            // Second: writes are closed, so this edit is refused without
+            // holding the checkpoint, and the acknowledgement commits it.
+            calls(vec![
+                (
+                    "late-save",
+                    "document_edit",
+                    json!({"action":"append","expected_hash":after,"text":"\n# Late\nToo late. main.js:2-2\n"}),
+                ),
+                (
+                    "ack",
+                    "checkpoint_complete",
+                    json!({"id":id,"progress":"Saved the loop section."}),
+                ),
+            ]),
+        ],
+    )
+    .await;
+    assert!(
+        tools_offered[0].contains(&"document_edit".to_owned()),
+        "{tools_offered:?}"
+    );
+    assert!(
+        !tools_offered[1].contains(&"document_edit".to_owned()),
+        "{tools_offered:?}"
+    );
+    assert_eq!(result.checkpoints_completed, 1, "{:?}", result.last_error);
+    let doc = std::fs::read_to_string(&result.project.output).unwrap();
+    assert!(doc.contains("# Loop") && !doc.contains("# Late"), "{doc}");
+}
