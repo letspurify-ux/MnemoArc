@@ -112,7 +112,6 @@ async fn cancelled(root: &std::path::Path) -> Session {
             model_context: Some(128000),
             context_tokens: 64000,
             output_tokens: 1024,
-            source_document_review: false,
             ..support::compact_config()
         },
     );
@@ -133,7 +132,6 @@ async fn cancelled(root: &std::path::Path) -> Session {
 fn preserved(s: &Session) -> Value {
     json!({"goal":s.latest_request,"original":s.original_request,"task":s.task,
         "amendments":s.task_amendments,
-        "document_review":s.document_review,
         "last_write":s.last_document_write,"checkpoint":s.checkpoint})
 }
 
@@ -225,9 +223,9 @@ async fn truncated_or_tool_bearing_classifications_are_corrected_without_executi
 
 #[tokio::test]
 async fn an_unanswered_classification_is_asked_once_more_with_half_the_context() {
-    // As with an unanswered review page: the request is not retried as is
-    // by the client, the next one carries half the optional context, and a
-    // second request without an answer gives up.
+    // The request is not retried as is by the client, the next one carries
+    // half the optional context, and a second request without an answer
+    // gives up.
     for answered in [true, false] {
         let dir = tempfile::tempdir().unwrap();
         let mut s = cancelled(dir.path()).await;

@@ -986,7 +986,7 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
     // the final answer, so the plan may only shrink there. A live model split
     // one item into six in closing mode (eight open items became twelve,
     // several repeating open ones) and the run ended at the closing limit
-    // with every one of them reported unfinished and no review.
+    // with every one of them reported unfinished.
     let open = |task: &TaskState| task.todos.iter().filter(|item| !item.done).count();
     if s.progress_recovery.closing.is_some() && open(&next) > open(&s.task) {
         return Ok(unchanged(

@@ -29,30 +29,17 @@ fn session(root: &std::path::Path) -> Session {
 }
 
 #[test]
-fn source_document_review_instruction_follows_session_setting() {
+fn source_document_instruction_names_no_review() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     s.select_workflow("source_document").unwrap();
-
-    for enabled in [false, true] {
-        s.config.source_document_review = enabled;
-        let request = ContextManager::request(&s, vec![]).unwrap();
-        let instruction = request["messages"][0]["content"].as_str().unwrap();
-        assert_eq!(
-            instruction
-                .contains("The separate source-document review is enabled for this session."),
-            enabled
-        );
-        assert_eq!(
-            instruction
-                .contains("The separate source-document review is disabled for this session."),
-            !enabled
-        );
-        assert!(
-            !instruction
-                .contains("Source-document work also requires the separate document review.")
-        );
-    }
+    let request = ContextManager::request(&s, vec![]).unwrap();
+    let instruction = request["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        instruction.contains("document_audit checks citations and format, not semantic accuracy")
+    );
+    assert!(!instruction.contains("document review"), "{instruction}");
+    assert!(!instruction.contains("re-review"), "{instruction}");
 }
 
 async fn run(s: Session, client: Arc<dyn LlmClient>) -> Session {

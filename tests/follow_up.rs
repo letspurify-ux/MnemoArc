@@ -35,8 +35,6 @@ fn fixture(root: &std::path::Path) -> Session {
     )
     .unwrap();
     tools::execute(&mut s, "task_plan", json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Fix the existing diagram"]}]})).unwrap();
-    s.document_review.issues = vec!["The approved branch loops backwards".into()];
-    s.document_review.pending = true;
     s.completion_gaps = vec!["Diagram still needs repair".into()];
     s.progress_recovery.closing = Some(Closing {
         reason: "budget".into(),
@@ -56,7 +54,7 @@ fn fixture(root: &std::path::Path) -> Session {
 }
 
 fn preserved(s: &Session) -> Value {
-    json!({"task":s.task,"document_review":s.document_review,
+    json!({"task":s.task,
         "checkpoint":s.checkpoint,"gaps":s.completion_gaps,"request":s.latest_request,
         "status":s.status,"error":s.last_error,"activity":s.activity,"rounds":s.task_rounds,
         "continuation":s.continuation,"workflow":s.workflow_mode,"written":s.document_written,
@@ -113,10 +111,7 @@ impl LlmClient for Reply {
         .unwrap();
         assert_eq!(state["original_request"], "Write the original document");
         assert_eq!(state["task_status"], "blocked");
-        assert_eq!(
-            state["document_review"]["issues"][0],
-            "The approved branch loops backwards"
-        );
+        assert_eq!(state["completion_gaps"][0], "Diagram still needs repair");
         let mut response = Completion {
             text: "The budget was exhausted; the diagram still needs repair.".into(),
             usage: Some(Usage {
@@ -378,7 +373,7 @@ async fn a_question_does_not_replace_the_request_when_resuming() {
     assert_eq!(s.run_history.back().unwrap().reason, "resume_checked");
     assert_eq!(s.latest_request, "Write the original document");
     s.start_new_task("A different task".into());
-    assert!(s.document_review.issues.is_empty());
+    assert!(s.completion_gaps.is_empty());
     assert!(s.task.todos.is_empty());
     assert!(s.checkpoint.is_none());
     assert_eq!(s.run_history.len(), 2);

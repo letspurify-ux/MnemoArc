@@ -97,9 +97,9 @@ pub struct Completion {
     /// The upstream provider a gateway such as OpenRouter routed the request
     /// to, when its stream names one.
     pub provider: Option<String>,
-    /// Seconds from sending the request to its first stream event. One
-    /// review page took 116 s and the same page 11 s in another run; this
-    /// tells waiting at the provider from generating.
+    /// Seconds from sending the request to its first stream event. The same
+    /// request took 116 s in one run and 11 s in another; this tells waiting
+    /// at the provider from generating.
     pub first_event_seconds: Option<f64>,
 }
 
@@ -296,7 +296,7 @@ static JSON_SCHEMA_STREAM_RECOVERED: std::sync::Mutex<SchemaCache> =
 
 /// Schemas recovered by JSON mode once. An outage that clears before the
 /// comparison attempt looks the same as a grammar failure (a live run lost
-/// strict output for a whole review after three in-stream 502s), so a schema
+/// strict output for a whole run after three in-stream 502s), so a schema
 /// moves to JSON_SCHEMA_STREAM_RECOVERED only when a second request needs the
 /// same recovery; a strict response that succeeds clears the suspicion.
 static JSON_SCHEMA_STREAM_SUSPECTED: std::sync::Mutex<SchemaCache> =
@@ -305,7 +305,7 @@ static JSON_SCHEMA_STREAM_SUSPECTED: std::sync::Mutex<SchemaCache> =
 /// Endpoints (base URL and model) that rejected every response_format,
 /// strict schema and plain JSON mode alike. Recorded only after the same
 /// request then succeeded without one, so an unrelated 400 cannot disable
-/// JSON mode. A live run otherwise paid a failed attempt on every review call.
+/// JSON mode. A live run otherwise paid a failed attempt on every structured call.
 static RESPONSE_FORMAT_REJECTED: std::sync::Mutex<SchemaCache> =
     std::sync::Mutex::new(SchemaCache(VecDeque::new()));
 
@@ -970,14 +970,14 @@ impl LlmClient for OpenAiClient {
                     // user; the partial response is discarded, never merged.
                     let silent = !emitted_text.load(Ordering::Relaxed);
                     let transient = transient_error(&text);
-                    // A review request halves or skips an unanswered page
+                    // A follow-up answer is asked again with a smaller request
                     // instead; another attempt would wait out the same timeout.
                     let unanswered = !c.retry_timeouts && timeout_error(&text);
                     // Exhaust ordinary transient retries first, then make one
                     // compatibility attempt for an SSE grammar failure. The
                     // caller still validates the complete response schema.
                     // An overload is no grammar failure: after three Nvidia
-                    // "Service temporarily overloaded" errors, a live review's
+                    // "Service temporarily overloaded" errors, a live run's
                     // JSON-mode attempt returned an unfinished `{"issues":{}`.
                     if silent
                         && !unanswered

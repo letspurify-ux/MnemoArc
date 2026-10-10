@@ -82,7 +82,7 @@ test("execution history survives another request and reload", async ({
     .fill("어떤 상황으로 종료된거야?");
   await page.getByRole("button", { name: "메시지 보내기" }).click();
   await expect(
-    page.getByText("기존 작업의 상태와 검토 지적을 유지한 질문 답변입니다.", {
+    page.getByText("기존 작업의 상태를 유지한 질문 답변입니다.", {
       exact: true,
     }),
   ).toBeVisible();
@@ -91,7 +91,7 @@ test("execution history survives another request and reload", async ({
   const answered = await (await request.get(`/api/sessions/${id}`)).json();
   for (const key of [
     "task",
-    "document_review",
+    "completion_gaps",
     "checkpoint",
     "run_guidance",
     "error",

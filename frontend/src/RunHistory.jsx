@@ -10,7 +10,6 @@ const reasons = {
   closing_round_limit: "마감 단계 요청 한도 도달",
   budget: "남은 예산에 맞춰 마감",
   stall: "진행 정체로 마감",
-  review_unrepaired: "검토 지적 미반영으로 마감",
   empty_response: "빈 응답 반복으로 마감",
   model_worker_panic: "모델 처리 오류",
   agent_worker_panic: "작업 처리 오류",
@@ -27,7 +26,6 @@ const stages = {
   preparing: "요청 준비",
   model: "모델 응답",
   tools: "도구 실행",
-  document_review: "문서 검토",
   checkpoint: "기억 정리",
   continuing: "답변 이어 쓰기",
 };

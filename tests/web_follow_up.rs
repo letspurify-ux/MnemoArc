@@ -122,7 +122,7 @@ async fn default_follow_up_preserves_task_and_new_work_requires_a_new_session() 
     let question = execute(&c, &url, id, json!({"text":"Why did it stop?"})).await;
     for key in [
         "task",
-        "document_review",
+        "completion_gaps",
         "checkpoint",
         "status",
         "error",

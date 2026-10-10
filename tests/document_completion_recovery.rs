@@ -21,8 +21,7 @@ use tokio_util::sync::CancellationToken;
 const RESULT: &str = "# Report\nThe requested document is saved and verified. report.rs:1\n";
 
 #[tokio::test]
-async fn without_a_review_unread_citations_receive_repair_guidance_instead_of_final_or_plan_closeout()
- {
+async fn unread_citations_receive_repair_guidance_instead_of_final_or_plan_closeout() {
     struct StopAfterGuidance(Arc<Mutex<usize>>);
     #[async_trait]
     impl LlmClient for StopAfterGuidance {
@@ -52,8 +51,6 @@ async fn without_a_review_unread_citations_receive_repair_guidance_instead_of_fi
                 context_tokens: 128000,
                 output_tokens: 1024,
                 api_key: Some(mnemoarc::config::Secret("offline-probe".into())),
-                // With the document review on, unread ranges are advisory.
-                source_document_review: false,
                 ..support::compact_config()
             },
         );
@@ -118,7 +115,6 @@ fn fixture() -> (tempfile::TempDir, Session) {
             run_tokens: 1_000_000,
             output_tokens: 1024,
             stall_round_limit: 3,
-            source_document_review: false,
             ..support::compact_config()
         },
     );
@@ -1091,7 +1087,6 @@ async fn oversized_batch_before_any_workflow_is_retried_not_fatal() {
             output_tokens: 1024,
             batch_tokens: 400,
             result_tokens: 400,
-            source_document_review: false,
             ..support::compact_config()
         },
     );

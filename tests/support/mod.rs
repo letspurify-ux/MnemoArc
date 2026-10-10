@@ -1,7 +1,5 @@
-#[allow(dead_code)]
-pub mod document_review;
-use mnemoarc::{config::Config, llm::Completion};
-use serde_json::{Value, json};
+use mnemoarc::config::Config;
+use serde_json::Value;
 
 /// The compact 64K-context profile these tests were written against, kept
 /// apart from Config::default so a default change does not rewrite their
@@ -22,7 +20,6 @@ pub fn compact_config() -> Config {
         request_timeout_secs: 180,
         run_timeout_secs: 1800,
         run_tokens: 500000,
-        review_limit: 3,
         ..Config::default()
     }
 }

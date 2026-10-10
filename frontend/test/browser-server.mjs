@@ -111,7 +111,7 @@ const provider = createServer(async (req, res) => {
       else sendAnswer("후속 질문에서도 sample.rs:1-1 자료를 수집했습니다.");
       return;
     }
-    sendAnswer("기존 작업의 상태와 검토 지적을 유지한 질문 답변입니다.");
+    sendAnswer("기존 작업의 상태를 유지한 질문 답변입니다.");
     return;
   }
   let retainedState;

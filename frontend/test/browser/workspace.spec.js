@@ -103,7 +103,7 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
   await expect(
     page.getByRole("checkbox", { name: "문서 구조 조회", exact: true }),
   ).toBeVisible();
-  // The answer workflow hides the review tools.
+  // The answer workflow hides the audit tool.
   await expect(
     page.getByRole("checkbox", { name: "문서 근거 점검", exact: true }),
   ).toHaveCount(0);

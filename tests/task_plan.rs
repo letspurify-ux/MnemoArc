@@ -1646,7 +1646,7 @@ fn an_operation_name_sent_as_the_action_names_the_apply_call() {
 fn an_update_carrying_a_result_says_the_item_is_still_unfinished() {
     // Live run 2026-10-06: the model sent update with an unchanged text and a
     // real result five times; the reply only said unchanged, so it believed
-    // T1 was complete and stalled into closing without a review.
+    // T1 was complete and stalled into closing.
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     apply(
@@ -1755,7 +1755,7 @@ fn list_with_a_real_operation_says_it_was_not_applied() {
 
 // Live run 2026-10-09: in closing mode a model split one item into six
 // (eight open to-dos became twelve) and the run ended at the closing limit
-// with all of them reported unfinished and no document review.
+// with all of them reported unfinished.
 #[test]
 fn closing_mode_does_not_add_open_to_dos() {
     let dir = tempfile::tempdir().unwrap();

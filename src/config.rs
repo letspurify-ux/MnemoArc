@@ -84,22 +84,23 @@ pub struct Config {
     pub tool_timeout_secs: u64,
     pub retries: usize,
     /// Runtime only: whether the client retries a request that timed out.
-    /// Review requests turn it off; an unanswered review page is halved or
-    /// skipped instead of waiting out another timeout.
+    /// Follow-up answers turn it off: an unanswered one is asked once more
+    /// with a smaller request instead of waiting out another timeout.
     #[serde(skip)]
     pub retry_timeouts: bool,
     pub run_timeout_secs: u64,
     pub run_tokens: usize,
-    /// Stalled document reviews before focused recovery (not a stop quota).
-    pub review_limit: usize,
-    /// Retired automatic re-review interval: the next final answer starts
-    /// the re-review. Older settings still load; the next save drops it.
+    /// Retired document-review settings: the review was removed. Older
+    /// settings still load; the next save drops them.
+    #[serde(rename = "source_document_review", default, skip_serializing)]
+    pub retired_source_document_review: Retired,
+    #[serde(rename = "review_limit", default, skip_serializing)]
+    pub retired_review_limit: Retired,
     #[serde(rename = "document_repair_limit", default, skip_serializing)]
     pub retired_document_repair_limit: Retired,
     /// Retired answer-review switch, accepted so older settings still load.
     #[serde(rename = "source_answer_review", default, skip_serializing)]
     pub retired_source_answer_review: Option<bool>,
-    pub source_document_review: bool,
     /// Retired completion-review switch, accepted so older settings still load.
     #[serde(rename = "completion_review_enabled", default, skip_serializing)]
     pub retired_completion_review: Retired,
@@ -212,10 +213,10 @@ impl Default for Config {
             repeated_read_limit: 2,
             stall_round_limit: 8,
             database: crate::database::DatabaseConfig::default(),
-            review_limit: 20,
+            retired_source_document_review: Retired,
+            retired_review_limit: Retired,
             retired_document_repair_limit: Retired,
             retired_source_answer_review: None,
-            source_document_review: true,
             retired_completion_review: Retired,
             projects: vec![],
         }
@@ -241,7 +242,6 @@ impl Config {
             request_timeout_secs: 180,
             run_timeout_secs: 1800,
             run_tokens: 500000,
-            review_limit: 3,
             ..Self::default()
         }
     }
@@ -333,7 +333,6 @@ impl Config {
             self.state_tokens,
             self.result_tokens,
             self.read_parallelism,
-            self.review_limit,
             self.output_tokens,
             self.run_tokens,
         ]

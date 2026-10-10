@@ -63,7 +63,6 @@ async fn configured_model_recovers_and_routes_changed_document_requests_after_ca
     config.run_tokens = 100000;
     config.run_timeout_secs = 180;
     config.output_tokens = config.output_tokens.min(8000);
-    config.source_document_review = false;
     for prompt in [
         "요청 범위를 첫 장으로 변경하고 첫 장만 문서에 남기도록 수정해줘. 원본 sample.rs는 변경하지 마.",
         "sample.rs를 직접 조사해서 한국어 문서를 작성해줘. 이번에는 첫 장에서 count 함수가 반환하는 값만 설명하고 둘째 장은 빼줘. 원본 파일은 변경하지 마.",
