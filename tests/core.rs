@@ -1059,6 +1059,19 @@ fn the_source_prompt_leaves_audit_and_task_state_to_the_runtime() {
 }
 
 #[test]
+fn both_workflow_prompts_follow_the_request_language() {
+    // Nothing named an output language, so an English-leaning model wrote
+    // an English document for a Korean request (2 of 3 Nemotron live runs).
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let rule = "in the language of the user's request";
+    for workflow in ["answer", "source_document"] {
+        s.select_workflow(workflow).unwrap();
+        assert!(context::system_prompt(&s).contains(rule), "{workflow}");
+    }
+}
+
+#[test]
 fn the_call_ledger_keeps_a_recent_window() {
     // Every successful result stayed in the ledger for the whole task and
     // counted toward the metadata cap that stops a run; a provider replays a
