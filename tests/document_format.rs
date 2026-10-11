@@ -324,3 +324,58 @@ fn answer_workflow_keeps_the_plain_write_contract() {
     assert!(written.get("format_check").is_none(), "{written}");
     assert!(written.get("citation_check").is_none());
 }
+
+// Live runs 2026-10-06..11: Korean documents kept garbled words such as
+// "배치末尾로", "인프รา" and "있으면それを", and nothing flagged them.
+#[test]
+fn korean_words_running_into_another_script_block_the_final_until_rewritten() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("source.rs"), "fn source() {}\n").unwrap();
+    run(&mut s, "file_read", json!({"path":"source.rs"}));
+    let doc = "# 가이드\n\n호출이 배치末尾로 정렬된다. source.rs:1\n\n## 도구 워커 인프รา\n\n값이 있으면それを 쓴다.\n\n\
+API를 호출하고 2단계로 나눈다. 일본어(日本語)를 지원하고 「漢字」를 표시한다. `한국語` 표기는 코드다.\n\n\
+```text\n배치末尾로\n```\n";
+    let written = create(&mut s, doc);
+    let format = &written["format_check"];
+    assert_eq!(format["ok"], false, "{format}");
+    let issues = format["issues"].as_array().unwrap();
+    let found: Vec<_> = issues
+        .iter()
+        .map(|issue| {
+            (
+                issue["word"].as_str().unwrap(),
+                issue["line"].as_u64().unwrap(),
+                issue["scripts"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            ("배치末尾로", 3, json!(["Han"])),
+            ("인프รา", 5, json!(["Thai"])),
+            ("있으면それを", 7, json!(["Kana"])),
+        ],
+        "{format}"
+    );
+    assert!(
+        issues
+            .iter()
+            .all(|issue| issue["kind"] == "mixed_script_word")
+    );
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert_eq!(audit["structural_ok"], false, "{audit}");
+    assert_eq!(audit["issue_kinds"]["mixed_script_word"], 3, "{audit}");
+    let edited = run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":written["hash"],"edits":[
+            {"action":"replace_text","old_text":"호출이 배치末尾로","text":"호출이 배치 끝으로"},
+            {"action":"replace_text","old_text":"인프รา","text":"인프라"},
+            {"action":"replace_text","old_text":"있으면それを","text":"있으면 그것을"}
+        ]}),
+    );
+    assert_eq!(edited["format_check"]["ok"], true, "{edited}");
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert_eq!(audit["structural_ok"], true, "{audit}");
+}

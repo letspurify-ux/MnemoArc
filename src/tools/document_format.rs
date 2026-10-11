@@ -46,7 +46,7 @@ impl FormatCheck {
         result["issues"] = json!(self.issues.iter().take(PREVIEW_LIMIT).collect::<Vec<_>>());
         result["issues_truncated"] = json!(self.issues.len() > PREVIEW_LIMIT);
         result["guidance"] = json!(
-            "Fix Markdown/Mermaid errors in the next edit; document_audit paginates all errors. Warnings identify unchecked syntax or UI extensions. Browser layout and compatibility with newer Mermaid versions require UI inspection."
+            "Fix Markdown/Mermaid errors and garbled words in the next edit; document_audit paginates all errors. Warnings identify unchecked syntax or UI extensions. Browser layout and compatibility with newer Mermaid versions require UI inspection."
         );
         result
     }
@@ -90,6 +90,8 @@ pub(super) fn check(doc: &str) -> FormatCheck {
         let start = data.sourcepos.start.line;
         let end = data.sourcepos.end.line;
         match &data.value {
+            // Prose only: code spans, code blocks and HTML are other nodes.
+            NodeValue::Text(text) => mixed_script_words(&mut result, start, text),
             NodeValue::CodeBlock(code) if code.fenced => {
                 if !code.closed {
                     result.issues.push(json!({"kind":"unclosed_code_fence","line":start,
@@ -210,6 +212,51 @@ pub(super) fn check(doc: &str) -> FormatCheck {
         }
     }
     result
+}
+
+/// Korean words that run straight into another script, such as "배치末尾로",
+/// "인프รา" or "있으면それを": models garble a word into a neighbouring
+/// language's characters. In 66 Korean live-run documents from four models
+/// every such word in prose was garbled; intended foreign text is set apart
+/// with parentheses, quotes or code, so it never touches the Korean word.
+fn mixed_script_words(result: &mut FormatCheck, line: usize, text: &str) {
+    let mut seen = Vec::new();
+    for word in text.split(|c: char| !c.is_alphanumeric()) {
+        if !word.chars().any(is_hangul) || seen.contains(&word) {
+            continue;
+        }
+        let mut scripts: Vec<&str> = word.chars().filter_map(other_script).collect();
+        if scripts.is_empty() {
+            continue;
+        }
+        scripts.sort_unstable();
+        scripts.dedup();
+        seen.push(word);
+        result.issues.push(json!({"kind":"mixed_script_word","line":line,"word":word,"scripts":scripts,
+            "guidance":"This Korean word runs into characters of another script, which is a garbled word. Rewrite it in the document's language. If the foreign text is intended, set it apart from the Korean text with parentheses or quotes, or put it in inline code."}));
+    }
+}
+
+fn is_hangul(c: char) -> bool {
+    matches!(c, '\u{AC00}'..='\u{D7A3}' | '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}')
+}
+
+/// Scripts that do not belong inside a Korean word. Latin, digits and Greek
+/// do (API를, 2단계, λ식), so they are not listed.
+fn other_script(c: char) -> Option<&'static str> {
+    Some(match c {
+        '\u{3400}'..='\u{4DBF}'
+        | '\u{4E00}'..='\u{9FFF}'
+        | '\u{F900}'..='\u{FAFF}'
+        | '\u{20000}'..='\u{2FA1F}' => "Han",
+        '\u{3040}'..='\u{30FF}' | '\u{31F0}'..='\u{31FF}' | '\u{FF66}'..='\u{FF9D}' => "Kana",
+        '\u{0E00}'..='\u{0E7F}' => "Thai",
+        '\u{0400}'..='\u{04FF}' => "Cyrillic",
+        '\u{0590}'..='\u{05FF}' => "Hebrew",
+        '\u{0600}'..='\u{06FF}' => "Arabic",
+        '\u{0900}'..='\u{097F}' => "Devanagari",
+        _ => return None,
+    })
 }
 
 fn extension_warning(result: &mut FormatCheck, line: usize, end_line: usize) {
