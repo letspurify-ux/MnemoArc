@@ -465,3 +465,48 @@ fn garbled_words_are_fixed_by_fix_id_without_retyping_them() {
     let audit = run(&mut s, "document_audit", json!({}));
     assert_eq!(audit["structural_ok"], true, "{audit}");
 }
+
+// Live run 2026-10-11: a correction turned Option\<Checkpoint\> into raw
+// Option<Checkpoint>, which Markdown reads as an HTML tag the page drops.
+#[test]
+fn a_type_written_as_raw_html_blocks_the_final_until_it_is_code() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("source.rs"), "fn source() {}\n").unwrap();
+    run(&mut s, "file_read", json!({"path":"source.rs"}));
+    let doc = "# Guide\n\nThe field is Option<Checkpoint>. source.rs:1\n\n\
+Lengths are Vec<u64> and close with </Checkpoint>.\n\n\
+| A | B |\n|---|---|\n| one<br>two | `Option<Checkpoint>` |\n\n\
+Escaped Option\\<Checkpoint\\> and <!-- note --> and <https://example.com> and <BR> pass.\n\n\
+```rust\nlet cp: Option<Checkpoint> = None;\n```\n";
+    let written = create(&mut s, doc);
+    let format = &written["format_check"];
+    assert_eq!(format["ok"], false, "{format}");
+    let found: Vec<_> = format["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|issue| {
+            assert_eq!(issue["kind"], "raw_html_tag", "{issue}");
+            (
+                issue["line"].as_u64().unwrap(),
+                issue["tag"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        found,
+        vec![(3, "<Checkpoint>"), (5, "<u64>"), (5, "</Checkpoint>")],
+        "{format}"
+    );
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert_eq!(audit["structural_ok"], false, "{audit}");
+    let hash = written["hash"].as_str().unwrap();
+    let fixed = run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":hash,"edits":[
+            {"action":"replace_text","old_text":"Option<Checkpoint>.","text":"`Option<Checkpoint>`."},
+            {"action":"replace_text","old_text":"Vec<u64> and close with </Checkpoint>","text":"`Vec<u64>` and close with `</Checkpoint>`"}]}),
+    );
+    assert_eq!(fixed["format_check"]["ok"], true, "{fixed}");
+}

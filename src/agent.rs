@@ -58,15 +58,18 @@ fn unread_citation_count(s: &Session) -> usize {
     tools::unread_citations(s).map_or(0, |unread| unread.len())
 }
 
-/// Keep a record of a reply that carried no tool call. A cut reply's outcome
-/// is known at once; the others are settled once the runtime has handled
-/// them (settle_reply).
-fn note_reply(s: &mut Session, completion: &crate::llm::Completion) {
+/// Keep a record of a reply that carried no tool call. A reply cut at the
+/// output limit or made during a checkpoint is settled at once; for the
+/// others it returns true and settle_reply records the outcome once the
+/// runtime has handled them.
+fn note_reply(s: &mut Session, completion: &crate::llm::Completion) -> bool {
     if s.replies_without_calls.len() >= crate::session::REPLY_RECORDS {
         s.replies_without_calls.pop_front();
     }
     let (finish, outcome) = if completion.length_limited {
         ("length", "length_recovery")
+    } else if s.checkpoint.is_some() {
+        ("stop", "checkpoint")
     } else {
         ("stop", "pending")
     };
@@ -81,17 +84,20 @@ fn note_reply(s: &mut Session, completion: &crate::llm::Completion) {
             discarded_tool_calls: completion.discarded_tool_calls,
             outcome: outcome.into(),
         });
+    outcome == "pending"
 }
 
 /// Record what the runtime did with the last reply without calls: accepted
-/// it as the final answer, sent the run back to work with an error (named by
-/// its code), or went on without one.
-fn settle_reply(s: &mut Session, error_before: Option<String>) {
+/// it as the final answer, or sent the run back to work with the error named
+/// by its code. Every refusal sets that error, so the same refusal twice in
+/// a row names it twice; a live run showed 25 repeated refusals as
+/// "continued" when only changes were compared.
+fn settle_reply(s: &mut Session) {
     let outcome = if matches!(s.status.as_str(), "complete" | "complete_with_gaps") {
         format!("accepted ({})", s.status)
-    } else if s.last_error != error_before {
+    } else {
         s.last_error.as_deref().map_or_else(
-            || "error cleared".to_owned(),
+            || "continued".to_owned(),
             |error| {
                 let code = error.split(':').next().unwrap_or(error);
                 if !code.is_empty() && !code.contains(' ') {
@@ -101,8 +107,6 @@ fn settle_reply(s: &mut Session, error_before: Option<String>) {
                 }
             },
         )
-    } else {
-        "continued".to_owned()
     };
     if let Some(reply) = s
         .replies_without_calls
@@ -385,8 +389,32 @@ fn coverage_check(s: &mut Session) -> Option<String> {
     } else {
         String::new()
     };
+    // Shown with the one coverage check, the last look before the final: a
+    // live correction kept a claim whose cited lines hold other code.
+    let mismatches = tools::citation_mismatches(s)
+        .map(|check| {
+            let items: Vec<String> = check["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|item| {
+                    format!(
+                        "line {} {} names {}",
+                        item["line"],
+                        item["citations"],
+                        item["names"]
+                    )
+                })
+                .collect();
+            format!(
+                " Also, {} claim(s) name code that the lines they cite never mention: {}. Read those lines, then correct the claim or its citation.",
+                check["flagged"],
+                items.join("; ")
+            )
+        })
+        .unwrap_or_default();
     Some(format!(
-        "request_coverage_check: before finishing, compare the saved document with latest_request. Its headings are: {}{more}. Check that a section explains each part the request asks for; for a flow or procedure, every step from its start to its end. If a part has no section, add a task_plan item for it and write that section from source you have read (read more first if needed). If every part is covered, give the final answer again. Do not add a section that only lists coverage or checks.",
+        "request_coverage_check: before finishing, compare the saved document with latest_request. Its headings are: {}{more}. Check that a section explains each part the request asks for; for a flow or procedure, every step from its start to its end. If a part has no section, add a task_plan item for it and write that section from source you have read (read more first if needed). If every part is covered, give the final answer again. Do not add a section that only lists coverage or checks.{mismatches}",
         headings.join(" | ")
     ))
 }
@@ -1256,6 +1284,19 @@ pub async fn run_session_controlled(
     }
     s.begin_run();
     s.task.migrate_legacy_plan();
+    // An output that already exists when a task begins, before this task
+    // saved it, is earlier work; its sections this task leaves unchanged owe
+    // no reread (unread_citations).
+    if s.task_rounds == 0 && !s.document_written {
+        s.document_baseline = s
+            .is_document_work()
+            .then(|| tools::output_path(&s.project).ok())
+            .flatten()
+            .and_then(|path| {
+                let doc = tools::read_text(&path).ok()?;
+                Some((path, tools::section_fingerprints(&doc)))
+            });
+    }
     s.status = "running".into();
     s.last_error = None;
     // Every run brings its own budget. A resumed task starts a fresh progress
@@ -1276,9 +1317,9 @@ pub async fn run_session_controlled(
     // The recovery reason the last empty reply set, cleared with its error
     // once a reply carries text or calls again.
     let mut empty_reply_reason: Option<String> = None;
-    // The error before the last reply without calls, until that reply's
-    // outcome is recorded at the next request or the end of the run.
-    let mut pending_reply: Option<Option<String>> = None;
+    // A reply without calls whose outcome is recorded at the next request
+    // or the end of the run, once the runtime has handled it.
+    let mut pending_reply = false;
     // Unread cited ranges counted after the last tool batch. Only tool calls
     // change the delivered evidence or the document, so the next request
     // starts from this count instead of scanning again; an external edit in
@@ -1313,8 +1354,8 @@ pub async fn run_session_controlled(
     }
     snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
     while failure.is_none() && !cancel.is_cancelled() {
-        if let Some(error_before) = pending_reply.take() {
-            settle_reply(&mut s, error_before);
+        if std::mem::take(&mut pending_reply) {
+            settle_reply(&mut s);
         }
         consume_commands(&mut s, &mut commands);
         match apply_pending_config(&mut s, true) {
@@ -1953,10 +1994,7 @@ pub async fn run_session_controlled(
             }
         };
         if completion.calls.is_empty() {
-            note_reply(&mut s, &completion);
-            if !completion.length_limited {
-                pending_reply = Some(s.last_error.clone());
-            }
+            pending_reply = note_reply(&mut s, &completion);
         }
         if !completion.length_limited
             && completion.calls.is_empty()
@@ -2799,8 +2837,8 @@ pub async fn run_session_controlled(
         }
         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
     }
-    if let Some(error_before) = pending_reply.take() {
-        settle_reply(&mut s, error_before);
+    if pending_reply {
+        settle_reply(&mut s);
     }
     if s.write_outcome_uncertain.load(Ordering::Acquire) {
         s.status = "blocked".into();

@@ -113,6 +113,12 @@ pub(super) fn check(doc: &str) -> FormatCheck {
                 data.sourcepos.start.column,
                 text,
             ),
+            NodeValue::HtmlInline(html) => {
+                if let Some(tag) = unknown_html_tag(html) {
+                    result.issues.push(json!({"kind":"raw_html_tag","line":start,"tag":tag,
+                        "guidance":"Markdown reads this as an HTML tag and the rendered page drops it: Option<Checkpoint> shows as \"Option\". Put the type or expression in inline code (`Option<Checkpoint>`), or escape the angle brackets as \\< and \\>."}));
+                }
+            }
             NodeValue::CodeBlock(code) if code.fenced => {
                 if !code.closed {
                     result.issues.push(json!({"kind":"unclosed_code_fence","line":start,
@@ -298,6 +304,93 @@ fn report_garbled_words(result: &mut FormatCheck) {
         }
         result.issues.push(issue);
     }
+}
+
+/// HTML elements a document may write inline, such as <br> in a table cell.
+const HTML_ELEMENTS: &[&str] = &[
+    "a",
+    "abbr",
+    "b",
+    "bdi",
+    "bdo",
+    "big",
+    "blockquote",
+    "br",
+    "center",
+    "cite",
+    "code",
+    "dd",
+    "del",
+    "details",
+    "dfn",
+    "div",
+    "dl",
+    "dt",
+    "em",
+    "figcaption",
+    "figure",
+    "font",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "hr",
+    "i",
+    "img",
+    "ins",
+    "kbd",
+    "li",
+    "mark",
+    "ol",
+    "p",
+    "picture",
+    "pre",
+    "q",
+    "rp",
+    "rt",
+    "ruby",
+    "s",
+    "samp",
+    "small",
+    "source",
+    "span",
+    "strike",
+    "strong",
+    "sub",
+    "summary",
+    "sup",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "time",
+    "tr",
+    "tt",
+    "u",
+    "ul",
+    "var",
+    "video",
+    "wbr",
+];
+
+/// An inline tag whose name is no HTML element, such as the <Checkpoint> of
+/// Option<Checkpoint> or the <u64> of Vec<u64>: a type written as prose that
+/// the rendered page drops. Comments, declarations and known elements pass.
+fn unknown_html_tag(html: &str) -> Option<String> {
+    let name: String = html
+        .strip_prefix("</")
+        .or_else(|| html.strip_prefix('<'))?
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    let known = |name: &str| HTML_ELEMENTS.contains(&name);
+    let element = known(&name)
+        || (name.chars().all(|c| !c.is_ascii_lowercase()) && known(&name.to_ascii_lowercase()));
+    (!name.is_empty() && !element).then(|| html.chars().take(80).collect())
 }
 
 fn is_hangul(c: char) -> bool {

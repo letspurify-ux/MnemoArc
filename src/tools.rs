@@ -3186,6 +3186,11 @@ fn persist_document_edit(
     {
         saved["test_code_check"] = check;
     }
+    if s.is_document_work()
+        && let Some(check) = documentation::citation_mismatch_check(s, path, &result)
+    {
+        saved["citation_mismatch_check"] = check;
+    }
     Ok(saved)
 }
 
@@ -6236,6 +6241,21 @@ pub fn output_outline(s: &Session, limit: usize) -> Result<(Vec<String>, usize)>
 
 /// Cited ranges of the configured output never delivered to the model as
 /// complete lines of the current file version in this session.
+/// Fingerprints of a document's sections (see Session::document_baseline).
+pub fn section_fingerprints(doc: &str) -> std::collections::BTreeSet<String> {
+    documentation::section_fingerprints(doc)
+        .into_iter()
+        .map(|(_, fingerprint)| fingerprint)
+        .collect()
+}
+
+/// Citations whose claim names code the cited lines never mention (advice).
+pub fn citation_mismatches(s: &Session) -> Option<Value> {
+    let path = output_path(&s.project).ok()?;
+    let doc = read_text(&path).ok()?;
+    documentation::citation_mismatch_check(s, &path, &doc)
+}
+
 pub fn unread_citations(s: &Session) -> Result<Vec<Value>> {
     let doc = read_text(&output_path(&s.project)?)?;
     documentation::unread_citations(s, &doc)

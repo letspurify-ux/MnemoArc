@@ -505,8 +505,9 @@ pub struct ReplyWithoutCalls {
     pub text_chars: usize,
     /// A tool-call batch was cut and discarded unexecuted.
     pub discarded_tool_calls: bool,
-    /// What the runtime did with it: "length_recovery", "accepted (status)",
-    /// the code of the error that sent the run back to work, or "continued".
+    /// What the runtime did with it: "length_recovery", "checkpoint" (a reply
+    /// during a checkpoint), "accepted (status)", the code of the error that
+    /// sent the run back to work, or "continued" when no error was set.
     /// "pending" until the runtime has handled the reply.
     pub outcome: String,
 }
@@ -581,6 +582,10 @@ pub struct Session {
     pub continuation: Option<bool>,
     /// Recent replies without a tool call (runtime diagnostics only).
     pub replies_without_calls: VecDeque<ReplyWithoutCalls>,
+    /// The output path and its section fingerprints when this task's first
+    /// run began, if the document already existed. Citations in a section
+    /// still unchanged were earlier work and owe no read in this task.
+    pub document_baseline: Option<(std::path::PathBuf, BTreeSet<String>)>,
 }
 /// Workflows a user selects when creating a session.
 /// General file/document work runs in answer without document verification.
@@ -748,6 +753,7 @@ impl Session {
             task_rounds: 0,
             continuation: None,
             replies_without_calls: VecDeque::new(),
+            document_baseline: None,
         }
     }
     pub fn protected(&self) -> BTreeSet<String> {

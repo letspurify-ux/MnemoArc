@@ -4574,3 +4574,94 @@ fn a_heading_above_the_anchor_level_names_the_enclosing_section() {
         "{error}"
     );
 }
+
+// Live run 2026-10-11: section paths arrived with their headings joined on
+// one line ("# Guide## 4. Close") or by a literal "\n", and were refused as
+// unknown sections although every heading existed.
+#[test]
+fn a_section_path_joined_on_one_line_is_split_back_into_headings() {
+    let (_dir, mut s) = setup();
+    let body = "# Guide\n\n## 4. Close\n\n### Notes\n\nA.\n\n## 6. Memory\n\n### Notes\n\nB.\n";
+    std::fs::write(&s.project.output, body).unwrap();
+    let expected = run(
+        &mut s,
+        "document_inspect",
+        json!({"section":"# Guide\n## 6. Memory\n### Notes"}),
+    )["start_line"]
+        .clone();
+    assert_eq!(expected, 11);
+    for joined in [
+        "# Guide## 6. Memory### Notes",
+        r"# Guide\n## 6. Memory\n### Notes",
+    ] {
+        let page = run(&mut s, "document_inspect", json!({"section":joined}));
+        assert_eq!(page["start_line"], expected, "{joined}: {page}");
+    }
+    let section = run(
+        &mut s,
+        "document_inspect",
+        json!({"section":"# Guide## 4. Close"}),
+    );
+    assert_eq!(section["start_line"], 3, "{section}");
+    // A joined path that still names no section keeps the original error.
+    let error = tools::execute(
+        &mut s,
+        "document_inspect",
+        json!({"section":"# Guide## 5. Missing"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("section_not_found: \"# Guide## 5. Missing\""),
+        "{error}"
+    );
+}
+
+// Live run 2026-10-11: a correction read the range it cited for
+// "checkpoint_complete runs first" and kept the claim, although those lines
+// hold other code; reading is all the unread check can ask for.
+#[test]
+fn a_claim_naming_code_its_cited_lines_never_mention_is_flagged() {
+    let (dir, mut s) = source_setup();
+    std::fs::write(
+        dir.path().join("src.rs"),
+        "fn start() {}\nfn helper() {}\nfn finish() {}\n",
+    )
+    .unwrap();
+    let doc = "# Guide\n\
+`start` begins the run (src.rs:1). `finish` ends it (src.rs:2).\n\
+Both `start` and `finish` appear (src.rs:1, 3).\n\
+```mermaid\nflowchart LR\n  A[\"`finish` src.rs:1\"]\n```\n\
+`missing_name` is cited twice (`src.rs:1`, `src.rs:2`).\n\
+A `path/to/file.rs` mention and `true` alone (src.rs:2).\n";
+    let written = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":doc}),
+    );
+    let check = &written["citation_mismatch_check"];
+    assert_eq!(check["flagged"], 2, "{written}");
+    assert_eq!(
+        check["items"],
+        json!([
+            {"line":2,"citations":["src.rs:2"],"names":["finish"]},
+            {"line":8,"citations":["src.rs:1","src.rs:2"],"names":["missing_name"]}
+        ]),
+        "{check}"
+    );
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert_eq!(audit["citation_mismatch_check"]["flagged"], 2, "{audit}");
+    // Advice only: the audit still passes on its own terms.
+    assert!(
+        audit["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|issue| issue["kind"] != "citation_mismatch")
+    );
+    // Sections an existing output had unchanged when the task began are
+    // earlier work and are not checked.
+    let output = tools::output_path(&s.project).unwrap();
+    s.document_baseline = Some((output, tools::section_fingerprints(doc)));
+    assert!(tools::citation_mismatches(&s).is_none());
+}

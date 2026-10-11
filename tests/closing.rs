@@ -1228,20 +1228,24 @@ async fn an_output_limit_on_an_existing_document_is_recorded_and_withholds_whole
     assert!(!cut.discarded_tool_calls);
 }
 
-// Live runs 2026-10-11: correcting an existing document, the model was told
-// of no unread citation and learned of 24 to 51 only when its final answer
-// was refused.
+// Live runs 2026-10-11: a correction limited to two sections of an existing
+// document was refused 31 times for unread citations in sections it never
+// touched; exempting unchanged lines instead let a wrong claim pass because
+// the model rewrote its line as it was. A section the task changes owes a
+// read for every citation in it; untouched sections owe none.
 #[tokio::test]
-async fn an_existing_document_reports_its_unread_citations_before_any_save() {
+async fn an_existing_document_owes_reads_only_for_the_sections_this_task_changes() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("main.js"),
         "function run() {\n  work();\n}\n",
     )
     .unwrap();
+    std::fs::write(dir.path().join("lib.js"), "function work() {}\n").unwrap();
+    std::fs::write(dir.path().join("exit.js"), "process.exit(0);\n").unwrap();
     std::fs::write(
         dir.path().join("out.md"),
-        "# Flow\nThe run calls work. main.js:1-3\n",
+        "# Flow\nThe run calls work. main.js:1-3\nWork is defined once. lib.js:1\n\n## Exit\nThe run exits. exit.js:1\n",
     )
     .unwrap();
     let mut s = Session::new(
@@ -1256,21 +1260,30 @@ async fn an_existing_document_reports_its_unread_citations_before_any_save() {
             ..support::compact_config()
         },
     );
-    s.add_user("Check the document against the source and fix the wrong parts.".into());
+    s.add_user("Check the Flow section against the source and fix it.".into());
     s.select_workflow("source_document").unwrap();
-    let (result, guidance) = run_scripted(
+    let (_, guidance) = run_scripted(
         s,
-        vec![call(
-            "read",
-            "file_read",
-            json!({"path":"main.js","start_line":1,"max_lines":3}),
-        )],
+        vec![
+            call(
+                "edit",
+                "document_edit",
+                json!({"action":"replace_text","old_text":"The run calls work.",
+                    "text":"The run calls work once."}),
+            ),
+            call(
+                "read",
+                "file_read",
+                json!({"path":"main.js","start_line":1,"max_lines":3}),
+            ),
+        ],
     )
     .await;
-    assert!(!result.document_written);
-    assert_eq!(guidance[0]["unread_citation_count"], 1, "{}", guidance[0]);
-    // Reading the cited range counts as progress before any save.
-    assert_eq!(guidance[1]["unread_citation_count"], 0, "{}", guidance[1]);
+    assert_eq!(guidance[0]["unread_citation_count"], 0, "{}", guidance[0]);
+    // Both citations of the changed Flow section owe a read, the unchanged
+    // lib.js line included; the untouched Exit section owes none.
+    assert_eq!(guidance[1]["unread_citation_count"], 2, "{}", guidance[1]);
+    assert_eq!(guidance[2]["unread_citation_count"], 1, "{}", guidance[2]);
 }
 
 // Live run 2026-10-11: an 11K-token reply ended without a tool call, and the
@@ -1289,6 +1302,11 @@ async fn replies_without_calls_record_what_the_runtime_did_with_them() {
         s,
         vec![
             Completion::default(),
+            Completion {
+                text: "Done".into(),
+                ..Default::default()
+            },
+            // The same refusal again names its error, not "continued".
             Completion {
                 text: "Done".into(),
                 ..Default::default()
@@ -1323,7 +1341,8 @@ async fn replies_without_calls_record_what_the_runtime_did_with_them() {
         vec![
             (1, "stop", 0, "empty_completion"),
             (2, "stop", 4, "task_plan_pending"),
-            (4, "stop", 12, "accepted (complete)"),
+            (3, "stop", 4, "task_plan_pending"),
+            (5, "stop", 12, "accepted (complete)"),
         ]
     );
 }
@@ -2388,6 +2407,23 @@ async fn the_first_final_compares_the_document_with_the_request_once() {
         std::fs::read_to_string(&result.project.output)
             .unwrap()
             .contains("# Completion")
+    );
+
+    // The one check also names claims whose cited lines hold other code.
+    let (_dir, mut s) = saved_fixture();
+    s.progress_recovery.coverage_checked = false;
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":hash,"text":"\n# Retry\n`retry_later` waits before the next pass. main.js:3-5\n"}),
+    )
+    .unwrap();
+    let (_, guidance) = run_scripted(s, vec![final_answer(), final_answer()]).await;
+    let error = guidance[1]["finalization_error"].as_str().unwrap();
+    assert!(
+        error.contains(r#"1 claim(s) name code that the lines they cite never mention: line 8 ["main.js:3-5"] names ["retry_later"]"#),
+        "{error}"
     );
 
     // A document that already covers the request just answers again; the

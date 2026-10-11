@@ -372,6 +372,18 @@ impl HeadingIndex {
     }
 
     pub(super) fn resolve(&self, requested: &str) -> Result<&Heading> {
+        match self.resolve_exact(requested) {
+            Err(error) if error.to_string().starts_with("section_not_found") => {
+                match split_joined_path(requested) {
+                    Some(split) => self.resolve_exact(&split).map_err(|_| error),
+                    None => Err(error),
+                }
+            }
+            result => result,
+        }
+    }
+
+    fn resolve_exact(&self, requested: &str) -> Result<&Heading> {
         let requested = requested.trim();
         let headings = &self.headings;
         let paths = &self.paths;
@@ -517,6 +529,65 @@ pub(super) fn names_output(s: &Session, path: &str, output: &Path) -> bool {
         || output
             .canonicalize()
             .is_ok_and(|real| candidate.canonicalize().is_ok_and(|named| named == real))
+}
+
+/// A section path whose headings arrived on one line, joined by a literal
+/// "\\n" or by nothing ("# Guide## 4. Flow"), split back into lines; None
+/// when that changes nothing. Live models sent both and were refused as naming
+/// an unknown section although every heading exists (nine times in one run).
+fn split_joined_path(requested: &str) -> Option<String> {
+    let text = requested.trim();
+    if !text.starts_with('#') {
+        return None;
+    }
+    let chars: Vec<char> = text.replace("\\n", "\n").chars().collect();
+    let mut split = String::with_capacity(text.len() + 8);
+    for (index, &c) in chars.iter().enumerate() {
+        if c == '#' && index > 0 && !matches!(chars[index - 1], '#' | '\n') {
+            let run = chars[index..]
+                .iter()
+                .take_while(|&&next| next == '#')
+                .count();
+            if (1..=6).contains(&run) && chars.get(index + run) == Some(&' ') {
+                split.push('\n');
+            }
+        }
+        split.push(c);
+    }
+    (split != text).then_some(split)
+}
+
+/// Each section's own lines, from its heading to the next heading of any
+/// level (the text before the first heading is a section too), as (first
+/// line, fingerprint). The fingerprint hashes the trimmed nonblank lines, so
+/// blank-line and indentation changes keep it and a section that moves
+/// keeps it too.
+pub(super) fn section_fingerprints(doc: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = doc.lines().collect();
+    let mut starts = vec![1];
+    starts.extend(
+        headings(doc)
+            .iter()
+            .map(|heading| heading.line)
+            .filter(|&line| line > 1),
+    );
+    starts
+        .iter()
+        .enumerate()
+        .map(|(index, &start)| {
+            let end = starts
+                .get(index + 1)
+                .map_or(lines.len(), |next| next - 1)
+                .max(start - 1);
+            let text = lines[(start - 1).min(lines.len())..end.min(lines.len())]
+                .iter()
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (start, super::hash(text.as_bytes()))
+        })
+        .collect()
 }
 
 pub(super) fn resolve_heading(doc: &str, requested: &str) -> Result<Heading> {
@@ -792,6 +863,11 @@ pub(super) fn execute(
             {
                 result["test_code_check"] = check;
             }
+            if s.is_document_work()
+                && let Some(check) = citation_mismatch_check(s, &path, &doc)
+            {
+                result["citation_mismatch_check"] = check;
+            }
             Ok(result)
         }
         _ => bail!("unsupported_tool"),
@@ -848,6 +924,10 @@ pub(super) struct Citation {
     pub end: usize,
     pub relative_link: bool,
     pub document_line: usize,
+    /// Byte range of the citation in its document line (with HTML comments
+    /// removed), and whether it stands in prose rather than in a diagram.
+    pub columns: (usize, usize),
+    pub prose: bool,
 }
 
 /// A missing cited range this long is more likely a pointer than evidence.
@@ -906,7 +986,17 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
     // The document is not evidence for itself: a self-citation would go
     // unread again after every edit, so it is never owed a read.
     let own = output.canonicalize().ok();
+    // A section an existing output already had when this task began, and
+    // still has unchanged, is earlier work: this task owes a read only for
+    // citations in the sections it wrote or changed. A live correction
+    // limited to two sections was refused 31 times for unread citations in
+    // the other four. Exempting only unchanged lines let a section's wrong
+    // claim pass because the model rewrote that line as it was.
+    let unchanged = unchanged_sections(s, &output, doc);
     for citation in citation_spans(doc)? {
+        if unchanged(citation.document_line) {
+            continue;
+        }
         let path = if citation.relative_link {
             output
                 .parent()
@@ -982,6 +1072,206 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
         }
     }
     Ok(issues)
+}
+
+/// Whether a document line lies in a section an existing output already had,
+/// unchanged, when this task began (Session::document_baseline).
+fn unchanged_sections<'a>(s: &'a Session, output: &Path, doc: &str) -> impl Fn(usize) -> bool + 'a {
+    let sections = match &s.document_baseline {
+        Some((path, _)) if path == output => section_fingerprints(doc),
+        _ => Vec::new(),
+    };
+    move |line: usize| {
+        let index = sections.partition_point(|(start, _)| *start <= line);
+        index > 0
+            && s.document_baseline
+                .as_ref()
+                .is_some_and(|(_, kept)| kept.contains(&sections[index - 1].1))
+    }
+}
+
+/// Words too common in code to tell one cited passage from another.
+const COMMON_CODE_WORDS: &[&str] = &[
+    "async",
+    "await",
+    "bool",
+    "break",
+    "const",
+    "continue",
+    "else",
+    "false",
+    "function",
+    "impl",
+    "json",
+    "let",
+    "match",
+    "null",
+    "None",
+    "Option",
+    "Result",
+    "return",
+    "self",
+    "Self",
+    "Some",
+    "static",
+    "String",
+    "struct",
+    "this",
+    "true",
+    "undefined",
+    "usize",
+    "Value",
+];
+
+/// The code names a claim mentions in inline code: identifiers of four or
+/// more characters, without file paths and common keywords.
+fn code_names(span: &str) -> Vec<String> {
+    if span.contains('/') {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    let mut word = String::new();
+    for c in span.chars().chain([' ']) {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            word.push(c);
+            continue;
+        }
+        if word.len() >= 4
+            && !word.starts_with(|first: char| first.is_ascii_digit())
+            && !COMMON_CODE_WORDS.contains(&word.as_str())
+        {
+            names.push(std::mem::take(&mut word));
+        }
+        word.clear();
+    }
+    names
+}
+
+const CITATION_MISMATCH_LIMIT: usize = 8;
+const CITATION_MISMATCH_GUIDANCE: &str = "None of the code names written before these citations occurs in the lines they cite: the claim may describe other code, or the cited lines may have moved. Read the cited lines, then correct the claim or cite the lines that hold that code. Advice only; it does not block the final answer.";
+
+/// Citations whose claim names code that the cited lines never mention, such
+/// as `checkpoint_complete` cited at lines that hold other code. A live
+/// correction read such a range and kept the wrong claim, because reading
+/// is all the unread check can ask for. The names are those in inline code
+/// between the previous citation on the line and this one; citations with
+/// only separators between them share the names and are matched together.
+/// Only prose citations in sections this task wrote or changed are checked.
+/// Advice only; None when nothing is flagged.
+pub(super) fn citation_mismatch_check(s: &Session, output: &Path, doc: &str) -> Option<Value> {
+    let citations = citation_spans(doc).ok()?;
+    let unchanged = unchanged_sections(s, output, doc);
+    let lines: Vec<&str> = doc.lines().collect();
+    let own = output.canonicalize().ok();
+    let mut files = BTreeMap::<PathBuf, Option<Vec<String>>>::new();
+    let mut items = Vec::new();
+    let mut total = 0usize;
+    let mut index = 0;
+    while index < citations.len() {
+        let line = citations[index].document_line;
+        let group_end = citations[index..]
+            .iter()
+            .position(|citation| citation.document_line != line)
+            .map_or(citations.len(), |offset| index + offset);
+        let on_line = &citations[index..group_end];
+        index = group_end;
+        if unchanged(line) || !on_line.iter().all(|citation| citation.prose) {
+            continue;
+        }
+        let Some(text) = lines.get(line - 1) else {
+            continue;
+        };
+        // Inline code spans of the whole line, so a span is never paired
+        // across a citation's own backticks.
+        let mut spans = Vec::new();
+        let mut open = None;
+        for (at, c) in text.char_indices() {
+            if c == '`' {
+                match open.take() {
+                    Some(start) => spans.push((start, at + 1)),
+                    None => open = Some(at),
+                }
+            }
+        }
+        let mut claims: Vec<(Vec<String>, Vec<&Citation>)> = Vec::new();
+        let mut previous_end = 0;
+        for citation in on_line {
+            let (start, end) = citation.columns;
+            let mut names: Vec<String> = Vec::new();
+            for (from, to) in spans
+                .iter()
+                .filter(|(from, to)| *from >= previous_end && *to <= start)
+            {
+                for name in code_names(&text[*from..*to]) {
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+            previous_end = end;
+            match claims.last_mut() {
+                Some((_, cited)) if names.is_empty() => cited.push(citation),
+                _ if names.is_empty() => {}
+                _ => claims.push((names, vec![citation])),
+            }
+        }
+        for (names, cited) in claims {
+            let mut found = false;
+            let mut checked = false;
+            for citation in &cited {
+                let path = if citation.relative_link {
+                    output
+                        .parent()
+                        .unwrap()
+                        .join(&citation.path)
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    citation.path.clone()
+                };
+                let Ok(resolved) = read_path(&s.project, &path) else {
+                    continue;
+                };
+                if own.as_ref() == Some(&resolved) {
+                    continue;
+                }
+                let Some(source) = files
+                    .entry(resolved.clone())
+                    .or_insert_with(|| {
+                        read_text(&resolved)
+                            .ok()
+                            .map(|text| text.lines().map(str::to_owned).collect())
+                    })
+                    .as_ref()
+                else {
+                    continue;
+                };
+                if citation.begin == 0
+                    || citation.end < citation.begin
+                    || citation.end > source.len()
+                {
+                    continue;
+                }
+                checked = true;
+                let cited_text = &source[citation.begin - 1..citation.end];
+                found |= names.iter().any(|name| {
+                    cited_text
+                        .iter()
+                        .any(|cited_line| cited_line.contains(name.as_str()))
+                });
+            }
+            if checked && !found {
+                total += 1;
+                if items.len() < CITATION_MISMATCH_LIMIT {
+                    items.push(json!({"line":line,
+                        "citations":cited.iter().map(|citation| citation.raw.clone()).collect::<Vec<_>>(),
+                        "names":names.iter().take(5).collect::<Vec<_>>()}));
+                }
+            }
+        }
+    }
+    (total > 0)
+        .then(|| json!({"flagged":total,"items":items,"guidance":CITATION_MISMATCH_GUIDANCE}))
 }
 
 struct CitationFence {
@@ -1130,6 +1420,7 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
                 .get(4)
                 .map(|v| v.as_str().parse().unwrap_or(0))
                 .unwrap_or(begin);
+            let whole = c.get(0).unwrap();
             spans.push(Citation {
                 raw: c[0].into(),
                 path: c[1].into(),
@@ -1137,15 +1428,19 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
                 end,
                 relative_link: &c[2] == "#L",
                 document_line: document_line + 1,
+                columns: (whole.start(), whole.end()),
+                prose: fence.is_none(),
             });
             // Repeat the path internally for grouped citations such as a.js:3, 8-10.
-            let mut tail = &visible[c.get(0).unwrap().end()..];
+            let mut tail_start = whole.end();
+            let mut tail = &visible[tail_start..];
             while let Some(extra) = continuation.captures(tail) {
                 let begin = extra[1].parse().unwrap_or(0);
                 let end = extra
                     .get(2)
                     .map(|m| m.as_str().parse().unwrap_or(0))
                     .unwrap_or(begin);
+                let matched = extra.get(0).unwrap();
                 spans.push(Citation {
                     raw: format!("{}{}{}-{}", &c[1], &c[2], begin, end),
                     path: c[1].into(),
@@ -1153,8 +1448,11 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
                     end,
                     relative_link: &c[2] == "#L",
                     document_line: document_line + 1,
+                    columns: (tail_start + matched.start(), tail_start + matched.end()),
+                    prose: fence.is_none(),
                 });
-                tail = &tail[extra.get(0).unwrap().end()..];
+                tail_start += matched.end();
+                tail = &tail[matched.end()..];
             }
         }
     }
@@ -1310,6 +1608,7 @@ fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<
         end,
         relative_link,
         document_line,
+        ..
     } in &spans
     {
         let path = if *relative_link {
