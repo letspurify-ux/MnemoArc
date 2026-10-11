@@ -13,10 +13,25 @@ const PREVIEW_LIMIT: usize = 8;
 #[derive(Default)]
 pub(super) struct FormatCheck {
     pub issues: Vec<Value>,
+    /// Garbled words in document order, also reported as issues.
+    pub garbled: Vec<GarbledWord>,
     warnings: Vec<Value>,
     tables_checked: usize,
     mermaid_blocks: usize,
     mermaid_checked: usize,
+}
+
+/// A garbled word and where it stands, so an edit can name it by fix_id
+/// instead of retyping characters the model keeps getting wrong.
+pub(super) struct GarbledWord {
+    /// "W" and the first 8 hex digits of the word's hash, with "-2", "-3"
+    /// for later copies of the same word. It survives edits elsewhere.
+    pub fix_id: String,
+    /// One-based document line.
+    pub line: usize,
+    /// Byte offset of the word in that line, when the source line holds it.
+    pub column: Option<usize>,
+    pub word: String,
 }
 
 impl FormatCheck {
@@ -46,7 +61,7 @@ impl FormatCheck {
         result["issues"] = json!(self.issues.iter().take(PREVIEW_LIMIT).collect::<Vec<_>>());
         result["issues_truncated"] = json!(self.issues.len() > PREVIEW_LIMIT);
         result["guidance"] = json!(
-            "Fix Markdown/Mermaid errors and garbled words in the next edit; document_audit paginates all errors. Warnings identify unchecked syntax or UI extensions. Browser layout and compatibility with newer Mermaid versions require UI inspection."
+            "Fix Markdown/Mermaid errors in the next edit, and each garbled word with document_edit action=fix_word and its fix_id; document_audit paginates all errors. Warnings identify unchecked syntax or UI extensions. Browser layout and compatibility with newer Mermaid versions require UI inspection."
         );
         result
     }
@@ -91,7 +106,13 @@ pub(super) fn check(doc: &str) -> FormatCheck {
         let end = data.sourcepos.end.line;
         match &data.value {
             // Prose only: code spans, code blocks and HTML are other nodes.
-            NodeValue::Text(text) => mixed_script_words(&mut result, start, text),
+            NodeValue::Text(text) => mixed_script_words(
+                &mut result,
+                &lines,
+                start,
+                data.sourcepos.start.column,
+                text,
+            ),
             NodeValue::CodeBlock(code) if code.fenced => {
                 if !code.closed {
                     result.issues.push(json!({"kind":"unclosed_code_fence","line":start,
@@ -211,6 +232,7 @@ pub(super) fn check(doc: &str) -> FormatCheck {
             _ => {}
         }
     }
+    report_garbled_words(&mut result);
     result
 }
 
@@ -219,21 +241,62 @@ pub(super) fn check(doc: &str) -> FormatCheck {
 /// language's characters. In 66 Korean live-run documents from four models
 /// every such word in prose was garbled; intended foreign text is set apart
 /// with parentheses, quotes or code, so it never touches the Korean word.
-fn mixed_script_words(result: &mut FormatCheck, line: usize, text: &str) {
-    let mut seen = Vec::new();
+fn mixed_script_words(
+    result: &mut FormatCheck,
+    lines: &[&str],
+    line: usize,
+    column: usize,
+    text: &str,
+) {
+    let source = lines.get(line.wrapping_sub(1)).copied().unwrap_or("");
+    // Look for each word in the source line from this text node on, so the
+    // same word earlier on the line (in code, say) is not taken for it.
+    let mut from = column.saturating_sub(1).min(source.len());
+    while !source.is_char_boundary(from) {
+        from -= 1;
+    }
     for word in text.split(|c: char| !c.is_alphanumeric()) {
-        if !word.chars().any(is_hangul) || seen.contains(&word) {
+        if !word.chars().any(is_hangul) || !word.chars().any(|c| other_script(c).is_some()) {
             continue;
         }
-        let mut scripts: Vec<&str> = word.chars().filter_map(other_script).collect();
-        if scripts.is_empty() {
-            continue;
+        let at = source[from..]
+            .find(word)
+            .map(|offset| from + offset)
+            .or_else(|| source.find(word));
+        if let Some(at) = at {
+            from = at + word.len();
         }
+        result.garbled.push(GarbledWord {
+            fix_id: String::new(),
+            line,
+            column: at,
+            word: word.into(),
+        });
+    }
+}
+
+/// Name each garbled word and report it as an issue the model can fix by
+/// that name.
+fn report_garbled_words(result: &mut FormatCheck) {
+    let mut copies = std::collections::BTreeMap::<String, usize>::new();
+    for garbled in &mut result.garbled {
+        let base = format!("W{}", &super::hash(garbled.word.as_bytes())[..8]);
+        let copy = copies.entry(base.clone()).or_default();
+        *copy += 1;
+        garbled.fix_id = if *copy == 1 {
+            base
+        } else {
+            format!("{base}-{copy}")
+        };
+        let mut scripts: Vec<&str> = garbled.word.chars().filter_map(other_script).collect();
         scripts.sort_unstable();
         scripts.dedup();
-        seen.push(word);
-        result.issues.push(json!({"kind":"mixed_script_word","line":line,"word":word,"scripts":scripts,
-            "guidance":"This Korean word runs into characters of another script, which is a garbled word. Rewrite it in the document's language. If the foreign text is intended, set it apart from the Korean text with parentheses or quotes, or put it in inline code."}));
+        let mut issue = json!({"kind":"mixed_script_word","line":garbled.line,"word":garbled.word,"scripts":scripts,
+            "guidance":"This Korean word runs into characters of another script, which is a garbled word. Replace it with document_edit action=fix_word, this fix_id and text set to the whole word rewritten correctly; the garbled characters need not be copied. If the foreign text is intended, set it apart from the Korean text with parentheses or quotes, or put it in inline code."});
+        if garbled.column.is_some() {
+            issue["fix_id"] = json!(garbled.fix_id);
+        }
+        result.issues.push(issue);
     }
 }
 

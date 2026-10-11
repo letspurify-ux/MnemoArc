@@ -62,6 +62,9 @@ fn legacy_pattern(instead: &str) -> Value {
 fn number() -> Value {
     json!({"type":"integer","minimum":0})
 }
+fn fix_id() -> Value {
+    json!({"type":"string","description":"fix_word only: the fix_id of a mixed_script_word issue from the last save result or document_audit"})
+}
 fn strings() -> Value {
     json!({"type":"array","items":{"type":"string"}})
 }
@@ -386,21 +389,21 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit",
-                description: "Edit ONLY configured Markdown output. Save one section at a time as its evidence is read. Every save returns the outline; copy section_path from it when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition (a supplied hash is still checked). Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and also requires expected_section_hash; its text must retain the original full heading. In the source_document workflow every save returns citation_check with unread cited ranges; do not patch workflow. Returns measured lines, new hash and the outline",
+                description: "Edit ONLY configured Markdown output. Save one section at a time as its evidence is read. Every save returns the outline; copy section_path from it when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition (a supplied hash is still checked). Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and also requires expected_section_hash; its text must retain the original full heading. fix_word replaces one garbled word reported as a mixed_script_word issue: send its fix_id and the whole word rewritten as text, without copying the garbled characters. In the source_document workflow every save returns citation_check with unread cited ranges; do not patch workflow. Returns measured lines, new hash and the outline",
                 optional: true,
                 read_only: false,
                 parameters: schema(
-                    json!({"action":action(&["create","write","append","insert_before","insert_after","insert_first_child","insert_last_child","patch","replace_text","delete_text","insert_before_text","insert_after_text","section"]),"text":string(),"old_text":string(),"expected_hash":string(),"section":string(),"expected_section_hash":string()}),
+                    json!({"action":action(&["create","write","append","insert_before","insert_after","insert_first_child","insert_last_child","patch","replace_text","delete_text","insert_before_text","insert_after_text","section","fix_word"]),"text":string(),"old_text":string(),"expected_hash":string(),"section":string(),"expected_section_hash":string(),"fix_id":fix_id()}),
                     &["action"],
                 ),
             },
             ToolSpec {
                 name: "document_edit_batch",
-                description: "Apply 1..32 related edits to the existing configured Markdown output in order using one base expected_hash. Each edit is write, append, insert_before, insert_after, insert_first_child, insert_last_child, patch, replace_text, delete_text, insert_before_text, insert_after_text or section and observes prior edits. Copy section_path from document_inspect for repeated headings. Sibling insertion uses a same-level section anchor; child insertion uses a parent section and a heading one level deeper. Text edits use an exact unique old_text anchor, optionally within section. If insertion text contains that exact old_text once, it is treated as a replacement to avoid duplication; prefer replace_text for rewrites. All edits are prepared in memory and persisted only if every operation succeeds. Use this for related corrections from one snapshot; save new sections as their evidence is read. section replaces descendants and requires expected_section_hash.",
+                description: "Apply 1..32 related edits to the existing configured Markdown output in order using one base expected_hash. Each edit is write, append, insert_before, insert_after, insert_first_child, insert_last_child, patch, replace_text, delete_text, insert_before_text, insert_after_text, section or fix_word (fix_id of a mixed_script_word issue plus the whole word rewritten as text) and observes prior edits. Copy section_path from document_inspect for repeated headings. Sibling insertion uses a same-level section anchor; child insertion uses a parent section and a heading one level deeper. Text edits use an exact unique old_text anchor, optionally within section. If insertion text contains that exact old_text once, it is treated as a replacement to avoid duplication; prefer replace_text for rewrites. All edits are prepared in memory and persisted only if every operation succeeds. Use this for related corrections from one snapshot; save new sections as their evidence is read. section replaces descendants and requires expected_section_hash.",
                 optional: true,
                 read_only: false,
                 parameters: schema(
-                    json!({"expected_hash":string(),"edits":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"action":action(&["write","append","insert_before","insert_after","insert_first_child","insert_last_child","patch","replace_text","delete_text","insert_before_text","insert_after_text","section"]),"text":string(),"old_text":string(),"section":string(),"expected_section_hash":string()},"required":["action"],"additionalProperties":false}}}),
+                    json!({"expected_hash":string(),"edits":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"action":action(&["write","append","insert_before","insert_after","insert_first_child","insert_last_child","patch","replace_text","delete_text","insert_before_text","insert_after_text","section","fix_word"]),"text":string(),"old_text":string(),"section":string(),"expected_section_hash":string(),"fix_id":fix_id()},"required":["action"],"additionalProperties":false}}}),
                     &["expected_hash", "edits"],
                 ),
             },
@@ -691,7 +694,8 @@ impl ToolRegistry {
                         {"type":"object","properties":{"action":{"enum":["insert_before","insert_after","insert_first_child","insert_last_child"]},"text":fields["text"],"expected_hash":fields["expected_hash"],"section":fields["section"]},"required":["text","expected_hash","section"],"additionalProperties":false},
                         {"type":"object","properties":{"action":{"enum":["patch","replace_text","insert_before_text","insert_after_text"]},"text":fields["text"],"expected_hash":fields["expected_hash"],"old_text":fields["old_text"],"section":fields["section"]},"required":["text","old_text"],"additionalProperties":false},
                         {"type":"object","properties":{"action":{"const":"delete_text"},"expected_hash":fields["expected_hash"],"old_text":fields["old_text"],"section":fields["section"]},"required":["old_text"],"additionalProperties":false},
-                        {"type":"object","properties":{"action":{"const":"section"},"text":fields["text"],"expected_hash":fields["expected_hash"],"section":fields["section"],"expected_section_hash":fields["expected_section_hash"]},"required":["text","expected_hash","section","expected_section_hash"],"additionalProperties":false}
+                        {"type":"object","properties":{"action":{"const":"section"},"text":fields["text"],"expected_hash":fields["expected_hash"],"section":fields["section"],"expected_section_hash":fields["expected_section_hash"]},"required":["text","expected_hash","section","expected_section_hash"],"additionalProperties":false},
+                        {"type":"object","properties":{"action":{"const":"fix_word"},"fix_id":fields["fix_id"],"text":fields["text"],"expected_hash":fields["expected_hash"]},"required":["fix_id","text"],"additionalProperties":false}
                     ]);
                 }
                 if t.name == "document_edit_batch" {
@@ -703,7 +707,8 @@ impl ToolRegistry {
                             {"type":"object","properties":{"action":{"enum":["insert_before","insert_after","insert_first_child","insert_last_child"]},"text":item_fields["text"],"section":item_fields["section"]},"required":["action","text","section"],"additionalProperties":false},
                             {"type":"object","properties":{"action":{"enum":["patch","replace_text","insert_before_text","insert_after_text"]},"text":item_fields["text"],"old_text":item_fields["old_text"],"section":item_fields["section"]},"required":["action","text","old_text"],"additionalProperties":false},
                             {"type":"object","properties":{"action":{"const":"delete_text"},"old_text":item_fields["old_text"],"section":item_fields["section"]},"required":["action","old_text"],"additionalProperties":false},
-                            {"type":"object","properties":{"action":{"const":"section"},"text":item_fields["text"],"section":item_fields["section"],"expected_section_hash":item_fields["expected_section_hash"]},"required":["action","text","section","expected_section_hash"],"additionalProperties":false}
+                            {"type":"object","properties":{"action":{"const":"section"},"text":item_fields["text"],"section":item_fields["section"],"expected_section_hash":item_fields["expected_section_hash"]},"required":["action","text","section","expected_section_hash"],"additionalProperties":false},
+                            {"type":"object","properties":{"action":{"const":"fix_word"},"fix_id":item_fields["fix_id"],"text":item_fields["text"]},"required":["action","fix_id","text"],"additionalProperties":false}
                         ]
                     });
                 }
@@ -1008,6 +1013,7 @@ const DOCUMENT_EDIT_ACTIONS: &[&str] = &[
     "insert_before_text",
     "insert_after_text",
     "section",
+    "fix_word",
 ];
 
 /// A section hash guards a text edit only through the section it names.
@@ -1043,6 +1049,7 @@ fn document_edit_fields(action: &str) -> &'static [&'static str] {
             "section",
             "expected_section_hash",
         ][..],
+        "fix_word" => &["action", "fix_id", "text", "expected_hash"][..],
         _ => &["action", "text"][..],
     }
 }
@@ -1177,6 +1184,7 @@ fn document_edit_needs(action: &str) -> &'static [&'static str] {
             &["text", "section"]
         }
         "section" => &["text", "section", "expected_section_hash"],
+        "fix_word" => &["fix_id", "text"],
         _ => &["text"],
     }
 }
@@ -2864,6 +2872,118 @@ fn enclosing_placement(doc: &str, anchor: &documentation::Heading, level: usize)
     }
 }
 
+/// fix_word names a garbled word by the fix_id of its mixed_script_word
+/// issue, so the model never retypes the broken characters: a live model
+/// sent "인프라", "인ฟรา" and other spellings seven times for the document's
+/// "인프รา" and never matched it. The edit becomes a replace_text of that
+/// word's line, checked and saved like any other text edit.
+fn expand_fix_word(s: &Session, name: &str, args: &mut Value) -> Result<()> {
+    let edits: Vec<(String, &mut Value)> = match name {
+        "document_edit" => vec![(String::new(), args)],
+        "document_edit_batch" => match args.get_mut("edits").and_then(Value::as_array_mut) {
+            Some(edits) => edits
+                .iter_mut()
+                .enumerate()
+                .map(|(index, edit)| (format!("edits[{index}]."), edit))
+                .collect(),
+            None => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    if !edits.iter().any(|(_, edit)| edit["action"] == "fix_word") {
+        return Ok(());
+    }
+    let path = output_path(&s.project)?;
+    if !path.exists() {
+        bail!(
+            "document_missing: the configured output has not been written yet, so it has no garbled word for fix_word"
+        );
+    }
+    let doc = read_text(&path)?;
+    let garbled = document_format::check(&doc).garbled;
+    let lines: Vec<&str> = doc.lines().collect();
+    // Batch edits apply in order, so a second fix on a line already fixed in
+    // this batch starts from that line's new text, its column moved by the
+    // length change of the fixes before it on the line.
+    let mut fixed_lines = BTreeMap::<usize, (String, Vec<(usize, isize)>)>::new();
+    for (prefix, edit) in edits {
+        if edit["action"] != "fix_word" {
+            continue;
+        }
+        let fix_id = edit["fix_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing_argument: {prefix}fix_id for action=fix_word; copy fix_id from a mixed_script_word issue of the last save result or document_audit"
+                )
+            })?
+            .to_owned();
+        let replacement = edit["text"].as_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing_argument: {prefix}text for action=fix_word; send the corrected word"
+            )
+        })?;
+        if replacement.trim().is_empty() || replacement.contains('\n') {
+            bail!(
+                "invalid_argument_value: {prefix}text for action=fix_word must be the corrected word or phrase on one line"
+            );
+        }
+        let found = garbled
+            .iter()
+            .find(|word| word.fix_id == fix_id)
+            .and_then(|word| {
+                let original = *lines.get(word.line.checked_sub(1)?)?;
+                let column = word.column?;
+                let (current, shifts) = fixed_lines
+                    .get(&word.line)
+                    .map_or((original, &[][..]), |(text, shifts)| {
+                        (text.as_str(), shifts.as_slice())
+                    });
+                let moved: isize = shifts
+                    .iter()
+                    .filter(|(at, _)| *at < column)
+                    .map(|(_, delta)| delta)
+                    .sum();
+                let at = column.checked_add_signed(moved)?;
+                current
+                    .get(at..)?
+                    .starts_with(word.word.as_str())
+                    .then(|| (word.line, current.to_owned(), column, at, word.word.len()))
+            });
+        let Some((number, line, column, at, length)) = found else {
+            let current: Vec<String> = garbled
+                .iter()
+                .filter(|word| word.column.is_some())
+                .map(|word| format!("{} (line {}: {:?})", word.fix_id, word.line, word.word))
+                .collect();
+            if current.is_empty() {
+                bail!(
+                    "invalid_argument_value: {prefix}fix_id {fix_id} names no garbled word; the document has none left, so no fix_word is needed; nothing was written"
+                );
+            }
+            bail!(
+                "invalid_argument_value: {prefix}fix_id {fix_id} names no garbled word in the current document (or this batch already fixed it); current fix_ids: {}; nothing was written",
+                current.join(", ")
+            );
+        };
+        let corrected = format!("{}{replacement}{}", &line[..at], &line[at + length..]);
+        let mut shifts = fixed_lines
+            .remove(&number)
+            .map(|(_, shifts)| shifts)
+            .unwrap_or_default();
+        shifts.push((column, replacement.len() as isize - length as isize));
+        fixed_lines.insert(number, (corrected.clone(), shifts));
+        let object = edit.as_object_mut().unwrap();
+        object.remove("fix_id");
+        object.insert("action".into(), json!("replace_text"));
+        object.insert("old_text".into(), json!(line));
+        object.insert("text".into(), json!(corrected));
+    }
+    Ok(())
+}
+
 /// After an output-limit truncation, a whole-document write is withheld.
 fn check_whole_write(s: &Session, name: &str, args: &Value) -> Result<()> {
     if !s.progress_recovery.whole_write_withheld {
@@ -3371,6 +3491,7 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
                     | "expected_section_hash"
                     | "verification_note"
                     | "reason"
+                    | "fix_id"
             )
     }
     fn required_document_field(action: &str, key: &str) -> bool {
@@ -3392,6 +3513,7 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
                     | "section"
             ),
             "expected_section_hash" => action == "section",
+            "fix_id" => action == "fix_word",
             // A blank expected_hash is a placeholder, read as omitted:
             // anchored text edits need none, and the others report a
             // missing hash with their dry-run result or take the model's own
@@ -4871,6 +4993,7 @@ fn execute_repaired(
     normalize_argument_aliases(s, name, &mut args)?;
     normalize_lone_carriage_returns(name, &mut args);
     drop_empty_unaccepted_fields(name, &mut args);
+    expand_fix_word(s, name, &mut args)?;
     if name == "source_search"
         && args["query"]
             .as_str()

@@ -379,3 +379,89 @@ API를 호출하고 2단계로 나눈다. 일본어(日本語)를 지원하고 �
     let audit = run(&mut s, "document_audit", json!({}));
     assert_eq!(audit["structural_ok"], true, "{audit}");
 }
+
+// Live run 2026-10-11: the model sent "인프라", "인ฟรา" and other spellings
+// seven times for the document's "인프รา" and never matched it. A garbled
+// word is fixed by the fix_id of its issue instead of by retyping it.
+#[test]
+fn garbled_words_are_fixed_by_fix_id_without_retyping_them() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("source.rs"), "fn source() {}\n").unwrap();
+    run(&mut s, "file_read", json!({"path":"source.rs"}));
+    let doc = "# 가이드\n\n호출이 배치末尾로 정렬된다. source.rs:1\n\n## 도구 워커 인프รา\n\n값이 있으면それを 쓰고 다시 있으면それを 쓴다.\n\n```text\n배치末尾로\n```\n";
+    let written = create(&mut s, doc);
+    let ids = |result: &Value| -> Vec<(String, String)> {
+        result["format_check"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|issue| {
+                (
+                    issue["word"].as_str().unwrap().to_owned(),
+                    issue["fix_id"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let first = ids(&written);
+    assert_eq!(first.len(), 4, "{written}");
+    let id_of = |word: &str| first.iter().find(|(w, _)| w == word).unwrap().1.clone();
+    let thai = id_of("인프รา");
+    assert!(thai.starts_with('W') && thai.len() == 9, "{thai}");
+    // A repeated word gets its own fix_id per copy.
+    assert_eq!(first[3].1, format!("{}-2", first[2].1), "{first:?}");
+    // Edits elsewhere move the lines but keep the fix_ids.
+    let moved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","old_text":"# 가이드","text":"# 가이드\n\n머리말."}),
+    );
+    assert_eq!(ids(&moved), first);
+    // The Thai heading is fixed without copying "รา".
+    let fixed = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"fix_word","fix_id":thai,"text":"인프라"}),
+    );
+    let saved = std::fs::read_to_string(&s.project.output).unwrap();
+    assert!(saved.contains("\n## 도구 워커 인프라\n"), "{saved}");
+    assert_eq!(fixed["format_check"]["issue_count"], 3, "{fixed}");
+    // A stale fix_id names the ones left.
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"fix_word","fix_id":thai,"text":"인프라"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("names no garbled word"), "{error}");
+    assert!(error.contains(&id_of("배치末尾로")), "{error}");
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"fix_word","text":"인프라"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("fix_id"), "{error}");
+    // A batch fixes the rest; the code block keeps its text.
+    let rest = run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":fixed["hash"],"edits":[
+            {"action":"fix_word","fix_id":id_of("배치末尾로"),"text":"배치 끝으로"},
+            {"action":"fix_word","fix_id":first[2].1,"text":"있으면 그것을"},
+            {"action":"fix_word","fix_id":first[3].1,"text":"있으면 그것을"}
+        ]}),
+    );
+    assert_eq!(rest["format_check"]["ok"], true, "{rest}");
+    let saved = std::fs::read_to_string(&s.project.output).unwrap();
+    assert!(saved.contains("호출이 배치 끝으로 정렬된다."), "{saved}");
+    assert!(
+        saved.contains("값이 있으면 그것을 쓰고 다시 있으면 그것을 쓴다."),
+        "{saved}"
+    );
+    assert!(saved.contains("```text\n배치末尾로\n```"), "{saved}");
+    let audit = run(&mut s, "document_audit", json!({}));
+    assert_eq!(audit["structural_ok"], true, "{audit}");
+}
