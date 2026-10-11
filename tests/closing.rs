@@ -916,6 +916,127 @@ fn a_checkpoint_id_with_a_one_character_typo_still_acknowledges_the_checkpoint()
     assert_eq!(result["acknowledged"], true, "{result}");
 }
 
+// Live run 2026-10-11: an answer-workflow correction run made its plan in
+// round 8, after the round-6 hint to answer from gathered evidence. The hint
+// stayed in the task phase and every later request told the model to answer
+// instead of finishing its review.
+#[tokio::test]
+async fn the_answer_hint_steers_only_requests_without_a_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let source: String = (1..=60).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(dir.path().join("a.txt"), source).unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128_000),
+            context_tokens: 128_000,
+            run_tokens: 5_000_000,
+            ..support::compact_config()
+        },
+    );
+    s.add_user("Check out.md against the source and fix only the wrong parts.".into());
+    assert_eq!(s.task.workflow, "answer");
+    let mut steps: Vec<Completion> = (0..6)
+        .map(|i| {
+            call(
+                &format!("read-{i}"),
+                "file_read",
+                json!({"path":"a.txt","start_line":i * 5 + 1,"max_lines":5}),
+            )
+        })
+        .collect();
+    steps.push(call(
+        "plan",
+        "task_plan",
+        json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Check section 1","Fix section 1"]}]}),
+    ));
+    steps.push(call(
+        "read-7",
+        "file_read",
+        json!({"path":"a.txt","start_line":41,"max_lines":5}),
+    ));
+    let (result, guidance) = run_scripted(s, steps).await;
+    // The seventh request still had no plan: the hint applies to it.
+    assert_eq!(guidance[6]["phase"], "answer", "{}", guidance[6]);
+    // Once the plan exists, the following requests investigate again.
+    for later in &guidance[7..] {
+        assert_eq!(later["phase"], "investigate", "{later}");
+    }
+    assert_ne!(result.task.phase, "answer");
+}
+
+// Live run 2026-10-11: after one empty reply the session showed
+// "empty_completion: 1 consecutive responses …" until its final answer, and
+// every later request carried focused-recovery guidance although the model
+// was back to reading sources.
+#[tokio::test]
+async fn a_reply_after_an_empty_one_clears_its_error_and_reason() {
+    let (_dir, s) = saved_fixture();
+    let client = Arc::new(Scripted {
+        steps: Mutex::new(vec![
+            Completion::default(),
+            call(
+                "read",
+                "file_read",
+                json!({"path":"main.js","start_line":1,"max_lines":2}),
+            ),
+            call(
+                "read-again",
+                "file_read",
+                json!({"path":"main.js","start_line":3,"max_lines":2}),
+            ),
+        ]),
+        guidance: Mutex::new(vec![]),
+        tools: Mutex::new(vec![]),
+    });
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move {
+        let mut errors = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::Snapshot(s) = event
+                && s.activity["stage"] == "model"
+            {
+                errors.push(s.last_error.clone());
+            }
+        }
+        errors
+    });
+    run_session(s, client.clone(), CancellationToken::new(), tx).await;
+    let errors = drain.await.unwrap();
+    let guidance = client.guidance.lock().unwrap().clone();
+    // The request after the empty reply names it.
+    assert!(
+        errors[1]
+            .as_deref()
+            .is_some_and(|error| error.starts_with("empty_completion: 1 consecutive")),
+        "{errors:?}"
+    );
+    assert!(
+        guidance[1]["recovery_reason"]
+            .as_str()
+            .unwrap()
+            .contains("empty response"),
+        "{}",
+        guidance[1]
+    );
+    // A reply with calls ends the episode: no error and no focused guidance.
+    assert_eq!(errors[2], None, "{errors:?}");
+    assert!(guidance[2]["recovery_reason"].is_null(), "{}", guidance[2]);
+    assert!(
+        !guidance[2]["instruction"]
+            .as_str()
+            .unwrap()
+            .starts_with("Focused recovery"),
+        "{}",
+        guidance[2]
+    );
+}
+
 #[tokio::test]
 async fn transient_empty_replies_are_retried_before_any_workflow_is_set() {
     let plain = || {

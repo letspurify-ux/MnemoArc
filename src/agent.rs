@@ -1215,6 +1215,9 @@ pub async fn run_session_controlled(
     let mut finalization_attempts = s.progress_recovery.finalization_attempts;
     let mut length_recoveries = 0usize;
     let mut empty_completions = 0usize;
+    // The recovery reason the last empty reply set, cleared with its error
+    // once a reply carries text or calls again.
+    let mut empty_reply_reason: Option<String> = None;
     // Unread cited ranges counted after the last tool batch. Only tool calls
     // change the delivered evidence or the document, so the next request
     // starts from this count instead of scanning again; an external edit in
@@ -1351,14 +1354,16 @@ pub async fn run_session_controlled(
         }
         // Chat explanations get a bounded investigation hint, not a forced finish:
         // missing evidence may still be read, while document workflows retain verification.
-        if s.task_rounds >= 6
+        // Like progress recovery below, it steers only this request. Kept in
+        // the task phase it outranked every later phase: a live correction
+        // run whose plan landed in round 8 was told to answer from gathered
+        // evidence for the rest of its review.
+        let answer_hint = finalization_attempts == 0
+            && s.task_rounds >= 6
             && s.task.workflow != "source_document"
             && s.task.current_todo().is_none()
             && s.task.deliverables.is_empty()
-            && !s.document_written
-        {
-            phase = "answer".into();
-        }
+            && !s.document_written;
         if finalization_attempts > 0 {
             // A rejected document completion always returns to verification,
             // even if the model previously declared itself ready to answer.
@@ -1457,6 +1462,9 @@ pub async fn run_session_controlled(
         // would ratchet the task into verification for good: a live run was
         // left unable to register its next section after one early stall.
         let persisted_phase = phase.clone();
+        if answer_hint {
+            phase = "answer".into();
+        }
         let closing_active = s.progress_recovery.closing.is_some();
         if closing_active {
             phase = "verify".into();
@@ -1890,12 +1898,11 @@ pub async fn run_session_controlled(
             empty_completions += 1;
             // Change the next request: an identical one tends to produce the
             // same empty reply again. recovery_reason reaches run_guidance.
-            if recover_document(
-                &mut s,
-                &format!(
-                    "The model returned {empty_completions} empty response(s) in a row (no text and no tool call). Call one concrete document repair or verification tool, or give the final answer if the document is finished."
-                ),
-            ) {
+            let reason = format!(
+                "The model returned {empty_completions} empty response(s) in a row (no text and no tool call). Call one concrete document repair or verification tool, or give the final answer if the document is finished."
+            );
+            if recover_document(&mut s, &reason) {
+                empty_reply_reason = Some(reason);
                 s.last_error = Some(format!(
                     "empty_completion: {empty_completions} consecutive responses had neither text nor tool calls"
                 ));
@@ -1943,6 +1950,24 @@ pub async fn run_session_controlled(
             break;
         }
 
+        if empty_completions > 0 {
+            // The empty replies are over and their error and reason described
+            // only them. Left in place, a live run showed the error until its
+            // final answer and sent focused-recovery guidance with every
+            // request until its next document edit.
+            if s.last_error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("empty_completion:"))
+            {
+                s.last_error = None;
+            }
+            if empty_reply_reason.is_some()
+                && s.progress_recovery.recovery_reason == empty_reply_reason
+            {
+                s.progress_recovery.recovery_reason = None;
+            }
+            empty_reply_reason = None;
+        }
         empty_completions = 0;
         if completion.length_limited {
             let mut partial = assistant(&completion.text, &[]);
