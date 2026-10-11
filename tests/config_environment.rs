@@ -205,23 +205,23 @@ fn a_missing_config_file_loads_the_live_tested_settings() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config::load(&dir.path().join("missing.toml"), &Default::default()).unwrap();
     assert_eq!(config.base_url, "https://openrouter.ai/api/v1");
-    assert_eq!(config.model, "stealth/space-bunny-alpha");
-    assert_eq!(config.model_context, Some(230000));
+    assert_eq!(config.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
+    assert_eq!(config.model_context, Some(1000000));
     assert_eq!(
         (config.context_tokens, config.output_tokens),
-        (160000, 16000)
+        (230000, 32000)
     );
     assert_eq!(config.reasoning_effort.as_deref(), Some("low"));
     assert_eq!(
         (config.memory_body_bytes, config.memory_bytes),
         (32768, 33554432)
     );
-    assert_eq!((config.high_water, config.low_water), (0.9, 0.4));
+    assert_eq!((config.high_water, config.low_water), (0.9, 0.5));
     assert_eq!(
         (config.request_timeout_secs, config.run_timeout_secs),
-        (600, 3600)
+        (600, 7200)
     );
-    assert_eq!(config.run_tokens, 10_000_000);
+    assert_eq!(config.run_tokens, 20_000_000);
     config.runnable().unwrap();
 }
 
@@ -244,7 +244,7 @@ fn cleared_optional_settings_survive_save_and_load() {
     // Set values are saved as they are.
     Config::default().save(&path).unwrap();
     let loaded = Config::load(&path, &Default::default()).unwrap();
-    assert_eq!(loaded.model_context, Some(230000));
+    assert_eq!(loaded.model_context, Some(1000000));
     assert_eq!(loaded.reasoning_effort.as_deref(), Some("low"));
 }
 
