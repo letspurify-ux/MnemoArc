@@ -2469,6 +2469,8 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                             "; a level-{} heading is a child of {:?}: use insert_last_child or insert_first_child to add it under that section",
                             first.level, anchor.heading
                         )
+                    } else if first.level < anchor.level {
+                        enclosing_placement(old, &anchor, first.level)
                     } else {
                         String::new()
                     };
@@ -2832,6 +2834,34 @@ fn withhold_write_action(schema: &mut Value) {
         }
     }
     strip(schema);
+}
+
+/// Where a heading above the anchor's level goes: beside the section of its
+/// level that contains the anchor, or under the nearest higher heading. A
+/// live model sent "## 2." with insert_after "### 1.5" and, refused without
+/// a placement, appended it instead, which lands right only when that
+/// section is the last one.
+fn enclosing_placement(doc: &str, anchor: &documentation::Heading, level: usize) -> String {
+    let headings = documentation::headings(doc);
+    let Some(enclosing) = headings
+        .iter()
+        .rev()
+        .filter(|heading| heading.start < anchor.start)
+        .find(|heading| heading.level <= level)
+    else {
+        return String::new();
+    };
+    if enclosing.level == level {
+        format!(
+            "; a level-{level} heading is a sibling of {:?}, which contains {:?}: use insert_after or insert_before with section {:?} to add it beside that section",
+            enclosing.heading, anchor.heading, enclosing.heading
+        )
+    } else {
+        format!(
+            "; a level-{level} heading belongs under {:?}, which contains {:?}: use insert_last_child or insert_first_child with section {:?}",
+            enclosing.heading, anchor.heading, enclosing.heading
+        )
+    }
 }
 
 /// After an output-limit truncation, a whole-document write is withheld.

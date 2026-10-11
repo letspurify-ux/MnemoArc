@@ -4523,3 +4523,54 @@ fn two_unresolved_citations_on_one_line_share_one_fix() {
         "{doc}"
     );
 }
+
+// Live run 2026-10-11: "## 2." sent with insert_after "### 1.5" was refused
+// without a placement, and the model appended it instead, which is right
+// only while section 1 is the last one.
+#[test]
+fn a_heading_above_the_anchor_level_names_the_enclosing_section() {
+    let (_dir, mut s) = setup();
+    let body = "# Guide\n\n## 1. Intake\n\n### 1.1 Route\n\nText.\n\n### 1.5 Trigger\n\nText.\n\n## 3. Loop\n\nText.\n";
+    std::fs::write(&s.project.output, body).unwrap();
+    let hash = tools::hash(body.as_bytes());
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after","section":"### 1.5 Trigger","expected_hash":hash,"text":"## 2. Routing\n\nText.\n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains(r####"a level-2 heading is a sibling of "## 1. Intake", which contains "### 1.5 Trigger""####),
+        "{error}"
+    );
+    assert!(
+        error.contains(r####"use insert_after or insert_before with section "## 1. Intake""####),
+        "{error}"
+    );
+    // Following the hint places the section between 1 and 3.
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after","section":"## 1. Intake","expected_hash":hash,"text":"## 2. Routing\n\nText.\n"}),
+    );
+    let saved = std::fs::read_to_string(&s.project.output).unwrap();
+    let position = |heading: &str| saved.find(heading).unwrap();
+    assert!(position("### 1.5 Trigger") < position("## 2. Routing"));
+    assert!(position("## 2. Routing") < position("## 3. Loop"));
+    // With no section of that level around the anchor, the hint names the
+    // nearest higher heading to nest under.
+    let body = "# Guide\n\n### Deep\n\nText.\n";
+    std::fs::write(&s.project.output, body).unwrap();
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_after","section":"### Deep","expected_hash":tools::hash(body.as_bytes()),"text":"## Two\n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains(r####"a level-2 heading belongs under "# Guide", which contains "### Deep": use insert_last_child or insert_first_child with section "# Guide""####),
+        "{error}"
+    );
+}
