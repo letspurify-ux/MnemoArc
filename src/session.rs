@@ -398,6 +398,8 @@ pub struct TodoWatch {
     pub since_round: usize,
     pub sections: usize,
     pub from_round: usize,
+    /// The output's hash when the to-do became current, if it existed.
+    pub document: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

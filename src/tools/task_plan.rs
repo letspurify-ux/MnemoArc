@@ -1061,11 +1061,41 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
     {
         return Ok(unchanged(&s.task, "Task state budget is full; shorten item text or task_state findings/details before extending the plan".into(), expected_revision, json!({"code":"state_limit"})));
     }
+    let mut notices = notices;
+    notices.extend(completed_without_edit(s, &next));
     s.task = next;
     Ok(with_notices(
         json!({"applied":true,"input_normalized":normalized,"plan":view(&s.task, 0, DEFAULT_PAGE)}),
         notices,
     ))
+}
+
+/// A to-do of document work completed while the document stayed exactly as
+/// it was when the to-do became current. A live correction completed five
+/// section to-dos as "corrected against the code" without one saved edit.
+/// Checking a part may rightly change nothing, so this is a notice.
+fn completed_without_edit(s: &Session, next: &TaskState) -> Option<String> {
+    let watch = s.progress_recovery.todo_watch.as_ref()?;
+    let before = watch.document.as_deref()?;
+    let was_open = s
+        .task
+        .todos
+        .iter()
+        .any(|item| item.id == watch.id && !item.done);
+    let now_done = next
+        .todos
+        .iter()
+        .any(|item| item.id == watch.id && item.done);
+    if !s.is_document_work() || !was_open || !now_done {
+        return None;
+    }
+    let current = super::read_text(&super::output_path(&s.project).ok()?).ok()?;
+    (super::hash(current.as_bytes()) == before).then(|| {
+        format!(
+            "No document edit was saved while {id} was current: the document is exactly as it was when {id} began. If {id} needed corrections, they are not in the document; save them with document_edit or document_edit_batch, then reopen or update {id} so its result states only what was actually changed.",
+            id = watch.id
+        )
+    })
 }
 
 fn with_notices(mut result: Value, notices: Vec<String>) -> Value {

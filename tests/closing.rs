@@ -1286,6 +1286,97 @@ async fn an_existing_document_owes_reads_only_for_the_sections_this_task_changes
     assert_eq!(guidance[2]["unread_citation_count"], 1, "{}", guidance[2]);
 }
 
+// Live run 2026-10-11: a correction completed five section to-dos as
+// "corrected against the code" without saving one edit.
+#[tokio::test]
+async fn completing_a_to_do_without_a_saved_edit_is_pointed_out() {
+    let tool_results = |s: &Session| -> Vec<String> {
+        s.history
+            .bundles
+            .iter()
+            .flat_map(|bundle| bundle.messages.iter())
+            .filter(|message| message["role"] == "tool")
+            .filter_map(|message| message["content"].as_str().map(str::to_owned))
+            .collect()
+    };
+    for edit_first in [false, true] {
+        let (_dir, mut s) = saved_fixture();
+        tools::execute(
+            &mut s,
+            "task_plan",
+            json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Correct the flow section"]}]}),
+        )
+        .unwrap();
+        let id = s.task.todos[0].id.clone();
+        let mut steps = vec![call(
+            "read",
+            "file_read",
+            json!({"path":"main.js","start_line":1,"max_lines":6}),
+        )];
+        if edit_first {
+            steps.push(call(
+                "fix",
+                "document_edit",
+                json!({"action":"replace_text","old_text":"A for loop runs work five times.","text":"A for loop calls work five times."}),
+            ));
+        }
+        steps.push(call(
+            "done",
+            "task_plan",
+            json!({"action":"apply","expected_revision":1,"operations":[{"op":"complete","id":id,"result":"Corrected against main.js"}]}),
+        ));
+        let (result, _) = run_scripted(s, steps).await;
+        let pointed_out = tool_results(&result).iter().any(|content| {
+            content.contains(&format!(
+                "No document edit was saved while {id} was current"
+            ))
+        });
+        assert_eq!(pointed_out, !edit_first, "{:#?}", tool_results(&result));
+    }
+}
+
+// Live run 2026-10-11: a correction that saved nothing was told to create
+// the document it was correcting.
+#[tokio::test]
+async fn an_unchanged_existing_document_is_refused_with_edit_guidance() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.js"), "function run() {}\n").unwrap();
+    std::fs::write(
+        dir.path().join("out.md"),
+        "# Flow\nThe run starts. main.js:1\n",
+    )
+    .unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128_000),
+            ..support::compact_config()
+        },
+    );
+    s.add_user("Check the document against the source and fix it.".into());
+    s.select_workflow("source_document").unwrap();
+    s.progress_recovery.coverage_checked = true;
+    let (_, guidance) = run_scripted(
+        s,
+        vec![Completion {
+            text: "Corrected every section.".into(),
+            ..Default::default()
+        }],
+    )
+    .await;
+    let error = guidance[1]["finalization_error"].as_str().unwrap();
+    assert!(
+        error.contains("it existed before the task and is unchanged")
+            && error.contains("the document exists, so not create"),
+        "{error}"
+    );
+}
+
 // Live run 2026-10-11: an 11K-token reply ended without a tool call, and the
 // log could not tell a refused final answer from an empty reply.
 #[tokio::test]

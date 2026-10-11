@@ -177,9 +177,20 @@ fn settle_reply(s: &mut Session) {
     }
 }
 
+/// Whether the configured output exists on disk, written before this task
+/// or by it.
+fn output_exists(s: &Session) -> bool {
+    tools::output_path(&s.project).is_ok_and(|path| path.is_file())
+}
+
 fn closing_instruction(s: &Session) -> String {
     let closing = s.progress_recovery.closing.as_ref();
     let remaining = CLOSING_ROUND_LIMIT.saturating_sub(closing.map_or(0, |c| c.rounds));
+    if !s.document_written && output_exists(s) {
+        return format!(
+            "Closing mode: this task has not changed the existing document yet and source reading is withheld. Save the corrections the request asks for NOW with document_edit or document_edit_batch (replace_text or section; the document exists, so not create), from the evidence already gathered. Then give a concise final answer. At most {remaining} requests remain."
+        );
+    }
     if !s.document_written {
         return format!(
             "Closing mode: no document is saved yet and source reading is withheld. Create the requested document NOW with document_edit action=create (or document_edit_batch) from the evidence already gathered. Write every requested section; where a fact was not confirmed from delivered sources, say so in the text instead of guessing. Then give a concise final answer. At most {remaining} requests remain; without a saved document the run stops unfinished."
@@ -235,6 +246,10 @@ fn plan_check(s: &mut Session) -> Option<String> {
     let rounds = s.task_rounds;
     let stall_limit = s.config.stall_round_limit;
     let current = s.task.current_todo().map(|item| item.id.clone());
+    let document = tools::output_path(&s.project)
+        .and_then(|path| tools::read_text(&path))
+        .ok()
+        .map(|doc| tools::hash(doc.as_bytes()));
     let watch = &mut s.progress_recovery.todo_watch;
     match (current, watch.as_ref()) {
         (Some(id), Some(watched)) if watched.id == id => {}
@@ -244,6 +259,7 @@ fn plan_check(s: &mut Session) -> Option<String> {
                 since_round: rounds,
                 sections,
                 from_round: rounds,
+                document,
             })
         }
         (None, _) => *watch = None,
@@ -267,6 +283,8 @@ fn plan_check(s: &mut Session) -> Option<String> {
         // checkpoints before it wrote anything.
         let against = if s.document_written {
             "the saved document"
+        } else if output_exists(s) {
+            "the document, which this task has not changed yet"
         } else {
             "the work done so far (no document is saved yet)"
         };
@@ -2296,7 +2314,13 @@ pub async fn run_session_controlled(
                 s.last_error = Some(error.to_string());
             } else if s.is_document_work() && !s.document_written {
                 s.status = "partial".into();
-                s.last_error = Some("The requested source document has not been saved in this task: create it with document_edit (action=create) from the evidence already gathered before finishing".into());
+                // A live correction was told to create a document that
+                // existed, after completing its to-dos without one edit.
+                s.last_error = Some(if output_exists(&s) {
+                    "The requested source document has not been saved in this task: it existed before the task and is unchanged, so none of the corrections the request asks for is in it. Save them with document_edit or document_edit_batch (replace_text or section; the document exists, so not create) before finishing".into()
+                } else {
+                    "The requested source document has not been saved in this task: create it with document_edit (action=create) from the evidence already gathered before finishing".into()
+                });
             } else if s.is_document_work() {
                 match tools::audit_document(&mut s) {
                     Ok(audit) if audit["structural_ok"] == true => {
