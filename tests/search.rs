@@ -303,9 +303,16 @@ fn bounded_context_marks_truncation_and_invalid_options_fail() {
         500
     );
     assert_eq!(r["matches"][0]["context"][1]["truncated"], true);
+    // Context above the maximum is read at the maximum.
     for args in [
         json!({"query":"hit","before":21}),
         json!({"query":"hit","after":u64::MAX}),
+    ] {
+        let r = search(&mut s, args);
+        assert_eq!(r["matches"][0]["context"].as_array().unwrap().len(), 1);
+        assert!(r["adjusted_arguments"][0].is_string(), "{r}");
+    }
+    for args in [
         json!({"query":"hit","mode":"files","after":1}),
         json!({"query":"[","regex":true}),
     ] {

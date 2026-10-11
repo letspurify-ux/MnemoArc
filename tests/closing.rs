@@ -1052,6 +1052,59 @@ async fn an_output_limit_truncation_withholds_whole_document_writes() {
     assert!(!s.progress_recovery.whole_write_withheld);
 }
 
+// Live run 2026-10-11: a correction request on an existing 261-line
+// document had four responses end at the output limit before its first edit.
+// The output was large but not yet written by this task, so whole writes
+// stayed offered, and the log could not show where the allowance went.
+#[tokio::test]
+async fn an_output_limit_on_an_existing_document_is_recorded_and_withholds_whole_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let existing: String = (1..=600)
+        .map(|i| format!("Detail line {i} explains one more step of the flow.\n"))
+        .collect();
+    std::fs::write(dir.path().join("out.md"), format!("# Flow\n{existing}")).unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128_000),
+            ..support::compact_config()
+        },
+    );
+    s.add_user("Check the document against the source and fix only the wrong parts.".into());
+    s.select_workflow("source_document").unwrap();
+    assert!(!s.document_written);
+    let output_tokens = s.config.output_tokens;
+    let (result, _) = run_scripted(
+        s,
+        vec![Completion {
+            text: "Checking".into(),
+            length_limited: true,
+            usage: Some(Usage {
+                input: 1000,
+                output: output_tokens,
+                cached: None,
+            }),
+            reasoning_tokens: Some(output_tokens - 2),
+            reasoning_chars: 900,
+            ..Default::default()
+        }],
+    )
+    .await;
+    assert!(result.progress_recovery.whole_write_withheld);
+    let cut = result.output_limits.back().unwrap();
+    assert_eq!(cut.round, 1);
+    assert_eq!(cut.output_tokens, Some(output_tokens));
+    assert_eq!(cut.reasoning_tokens, Some(output_tokens - 2));
+    assert_eq!(cut.reasoning_chars, 900);
+    assert_eq!(cut.text_chars, "Checking".len());
+    assert!(!cut.discarded_tool_calls);
+}
+
 #[tokio::test]
 async fn progress_recovery_verify_does_not_persist_into_the_task_phase() {
     let (_dir, mut s) = saved_fixture();

@@ -94,6 +94,10 @@ pub struct Completion {
     pub attempt_diagnostics: Vec<AttemptDiagnostic>,
     pub length_limited: bool,
     pub discarded_tool_calls: bool,
+    /// Reasoning tokens the provider reported inside the output usage.
+    pub reasoning_tokens: Option<usize>,
+    /// Characters of streamed reasoning text, for providers that send it.
+    pub reasoning_chars: usize,
 }
 
 impl Completion {
@@ -592,6 +596,9 @@ impl OpenAiClient {
                             .as_u64()
                             .map(|n| n as usize),
                     });
+                    out.reasoning_tokens = u["completion_tokens_details"]["reasoning_tokens"]
+                        .as_u64()
+                        .map(|n| n as usize);
                 }
                 let Some(choice) = v["choices"].as_array().and_then(|a| a.first()) else {
                     continue;
@@ -624,6 +631,14 @@ impl OpenAiClient {
                         expects_calls = reason == "tool_calls";
                         finish_reason = Some(reason.to_owned());
                     }
+                }
+                // OpenRouter streams reasoning as `reasoning`; others use
+                // `reasoning_content`. Only its size is kept.
+                if let Some(reasoning) = choice["delta"]["reasoning"]
+                    .as_str()
+                    .or_else(|| choice["delta"]["reasoning_content"].as_str())
+                {
+                    out.reasoning_chars += reasoning.chars().count();
                 }
                 if let Some(text) = choice["delta"]["content"].as_str() {
                     out.text.push_str(text);

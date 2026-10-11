@@ -531,6 +531,36 @@ async fn contradictory_stream_finish_reasons_never_complete() {
         assert!(result.unwrap_err().to_string().contains(expected));
     }
 }
+// Live run 2026-10-11: responses ended at exactly the output limit with no
+// tool call, and nothing showed whether reasoning or text used it up.
+#[tokio::test]
+async fn an_output_limited_response_reports_its_reasoning() {
+    let body = [
+        event(json!({"choices":[{"delta":{"reasoning":"Check the loop "},"finish_reason":null}]})),
+        event(json!({"choices":[{"delta":{"reasoning_content":"조건"},"finish_reason":null}]})),
+        event(json!({"choices":[{"delta":{"content":"Cut"},"finish_reason":"length"}]})),
+        event(json!({"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":37}}})),
+        "data: [DONE]\n\n".into(),
+    ]
+    .concat();
+    let (url, server) = server(body).await;
+    let c = Config {
+        base_url: url,
+        ..support::compact_config()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let out = OpenAiClient
+        .complete(json!({"messages":[]}), &c, CancellationToken::new(), tx)
+        .await
+        .unwrap();
+    assert!(out.length_limited);
+    assert_eq!(out.text, "Cut");
+    assert_eq!(out.reasoning_chars, "Check the loop 조건".chars().count());
+    assert_eq!(out.reasoning_tokens, Some(37));
+    assert_eq!(out.usage.unwrap().output, 40);
+    server.abort();
+}
+
 #[tokio::test]
 async fn missing_usage_is_not_zero() {
     let body = format!(

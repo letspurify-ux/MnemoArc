@@ -1956,17 +1956,27 @@ pub async fn run_session_controlled(
                 s.continuation = Some(completion.discarded_tool_calls);
             }
             length_recoveries += 1;
+            if s.output_limits.len() >= crate::session::OUTPUT_LIMIT_RECORDS {
+                s.output_limits.pop_front();
+            }
+            s.output_limits.push_back(crate::session::OutputLimit {
+                round: s.task_rounds,
+                output_tokens: completion.usage.as_ref().map(|usage| usage.output),
+                reasoning_tokens: completion.reasoning_tokens,
+                reasoning_chars: completion.reasoning_chars,
+                text_chars: completion.text.chars().count(),
+                discarded_tool_calls: completion.discarded_tool_calls,
+            });
             // Rewriting a grown document in one call is the usual way to exceed
             // the output limit; require section-sized edits. A document small
             // relative to the limit cannot be the cause, so it stays writable.
+            // An output this task has not written yet counts too: correcting
+            // a large existing document carries the same risk.
             let document_tokens = tools::output_path(&s.project)
                 .and_then(|path| tools::read_text(&path))
                 .ok()
                 .map_or(0, |doc| context::tokens(&doc, &s.config.model));
-            if s.is_document_work()
-                && s.document_written
-                && document_tokens >= s.config.output_tokens / 4
-            {
+            if s.is_document_work() && document_tokens >= s.config.output_tokens / 4 {
                 s.progress_recovery.whole_write_withheld = true;
             }
             s.activity = json!({"stage":"continuing","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds()});

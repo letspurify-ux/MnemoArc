@@ -108,6 +108,7 @@ fn report_diagnostics(result: &Session, audit: &Value) -> Value {
     });
     json!({
         "completion_gaps":result.completion_gaps,
+        "output_limits":result.output_limits,
         "run_stop_reason":result.run_history.back().map(|run| run.reason.as_str()),
         "last_run":result.run_history.back(),
         "final_document_hash":final_document_hash,
@@ -194,6 +195,11 @@ async fn registered_source_documentation() {
     let before = tools::project_fingerprint(&project).unwrap();
     let dir = tempfile::tempdir().unwrap();
     project.output = dir.path().join("generated.md");
+    // MNEMOARC_LIVE_SEED_DOCUMENT starts from an earlier result document, as
+    // when a user asks for corrections to a document already at the output.
+    if let Ok(seed) = std::env::var("MNEMOARC_LIVE_SEED_DOCUMENT") {
+        std::fs::copy(&seed, &project.output).expect("MNEMOARC_LIVE_SEED_DOCUMENT");
+    }
     let mut session = Session::new(project, config);
     // The workflow a user selects in the session window; MNEMOARC_LIVE_WORKFLOW
     // overrides the documentation default.
@@ -210,6 +216,7 @@ async fn registered_source_documentation() {
     let drain = tokio::spawn(async move {
         let mut first_write = None;
         let mut last_round = 0;
+        let mut last_output_limit = 0;
         let mut last_plan_check = String::new();
         let mut seen_call_ids = BTreeSet::new();
         let mut seen_result_ids = BTreeSet::new();
@@ -347,6 +354,23 @@ async fn registered_source_documentation() {
                                 |closing| format!("{}:{}", closing.reason, closing.rounds)
                             ),
                         );
+                    }
+                    // A response cut at the output limit, with where its
+                    // allowance went.
+                    for cut in &s.output_limits {
+                        if cut.round <= last_output_limit {
+                            continue;
+                        }
+                        eprintln!(
+                            "[live] output_limit round={} output={:?} reasoning_tokens={:?} reasoning_chars={} text_chars={} discarded_tool_calls={}",
+                            cut.round,
+                            cut.output_tokens,
+                            cut.reasoning_tokens,
+                            cut.reasoning_chars,
+                            cut.text_chars,
+                            cut.discarded_tool_calls
+                        );
+                        last_output_limit = cut.round;
                     }
                     // Plan checks are pointed out once per plan state.
                     if let Some(check) = s.run_guidance["plan_check"].as_str()

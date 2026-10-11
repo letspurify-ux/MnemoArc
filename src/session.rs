@@ -486,6 +486,24 @@ pub(crate) fn user_excerpt<N: AsRef<str>>(excerpt: &str, sent: &[(N, &str)]) -> 
 /// calls of the last few responses (a response holds at most 32).
 pub const LEDGER_CALLS: usize = 256;
 
+/// Output-limit records kept per session (the most recent ones).
+pub const OUTPUT_LIMIT_RECORDS: usize = 32;
+
+/// A model response cut at the output limit, kept to diagnose where the
+/// allowance went: live runs had rounds end at exactly the limit with no
+/// tool call and no way to tell reasoning from visible text.
+#[derive(Clone, Debug, Serialize)]
+pub struct OutputLimit {
+    pub round: usize,
+    /// Output tokens the provider reported for the response, if any.
+    pub output_tokens: Option<usize>,
+    pub reasoning_tokens: Option<usize>,
+    pub reasoning_chars: usize,
+    pub text_chars: usize,
+    /// A tool-call batch was cut and discarded unexecuted.
+    pub discarded_tool_calls: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Session {
     pub id: String,
@@ -554,6 +572,8 @@ pub struct Session {
     pub task_rounds: usize,
     // Some(true): truncated tool batch; Some(false): text continuation.
     pub continuation: Option<bool>,
+    /// Recent responses cut at the output limit (runtime diagnostics only).
+    pub output_limits: VecDeque<OutputLimit>,
 }
 /// Workflows a user selects when creating a session.
 /// General file/document work runs in answer without document verification.
@@ -720,6 +740,7 @@ impl Session {
             activity: json!({}),
             task_rounds: 0,
             continuation: None,
+            output_limits: VecDeque::new(),
         }
     }
     pub fn protected(&self) -> BTreeSet<String> {

@@ -188,18 +188,6 @@ fn schema_bounds_report_the_bound_and_do_not_run_the_tool() {
             json!({"minimum":1}),
         ),
         (
-            "file_read",
-            json!({"path":"absent.txt","max_lines":2001}),
-            "max_lines",
-            json!({"maximum":2000}),
-        ),
-        (
-            "source_search",
-            json!({"query":"x","before":21}),
-            "before",
-            json!({"maximum":20}),
-        ),
-        (
             "source_search",
             json!({"queries":[""]}),
             "queries[0]",

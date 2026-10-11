@@ -812,6 +812,16 @@ fn symbol_read_slices_use_absolute_lines_and_cannot_escape_symbol() {
     );
     assert_eq!(tail["content"]["line_end"], 7);
     assert!(!tail["content"]["text"].as_str().unwrap().contains("next"));
+    // A line count above the maximum reads at the maximum, still inside
+    // the symbol.
+    for max_lines in [2001, u64::MAX] {
+        let capped = run(
+            &mut s,
+            "symbol_read",
+            json!({"path":"a.rs","symbol_id":id,"start_line":6,"max_lines":max_lines}),
+        );
+        assert_eq!(capped["content"]["line_end"], 7);
+    }
     let before = s.sources.len();
     for extra in [
         json!({"start_line":0}),
@@ -819,8 +829,6 @@ fn symbol_read_slices_use_absolute_lines_and_cannot_escape_symbol() {
         json!({"start_line":8}),
         json!({"start_line":u64::MAX}),
         json!({"max_lines":0}),
-        json!({"max_lines":2001}),
-        json!({"max_lines":u64::MAX}),
     ] {
         let mut args = json!({"path":"a.rs","symbol_id":id});
         args.as_object_mut()

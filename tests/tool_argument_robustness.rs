@@ -292,3 +292,61 @@ fn quoted_booleans_are_read_as_booleans() {
     assert_eq!(result["matches"].as_array().unwrap().len(), 1, "{result}");
     assert_eq!(result["matches"][0]["line"], 1, "{result}");
 }
+
+// Live run 2026-10-11: a model sent source_search after:40, then 30 and 25,
+// each rejected while the read was still needed. A size argument above its
+// maximum only bounds how much is returned, so the call runs at the maximum.
+#[test]
+fn size_arguments_above_their_maximum_run_at_the_maximum() {
+    let dir = tempfile::tempdir().unwrap();
+    let source: String = (1..=60).map(|i| format!("let line_{i} = {i};\n")).collect();
+    std::fs::write(dir.path().join("a.rs"), &source).unwrap();
+    let mut s = session(dir.path());
+    let result = tools::execute(
+        &mut s,
+        "source_search",
+        json!({"path":"a.rs","query":"line_30 ","after":40,"before":"25","mode":"matches"}),
+    )
+    .unwrap();
+    let context = result["matches"][0]["context"].as_array().unwrap();
+    assert_eq!(context.len(), 40, "{result}");
+    assert_eq!(
+        result["adjusted_arguments"],
+        json!([
+            "before 25 is above its maximum 20; 20 was used",
+            "after 40 is above its maximum 20; 20 was used"
+        ]),
+        "{result}"
+    );
+    let result = tools::execute(
+        &mut s,
+        "file_read",
+        json!({"path":"a.rs","start_line":1,"max_lines":5000}),
+    )
+    .unwrap();
+    assert_eq!(result["content"]["line_end"], 60, "{result}");
+    assert_eq!(
+        result["adjusted_arguments"][0],
+        "max_lines 5000 is above its maximum 2000; 2000 was used"
+    );
+    let result = tools::execute(&mut s, "task_plan", json!({"action":"list","limit":50})).unwrap();
+    assert!(
+        result["adjusted_arguments"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("limit 50")
+    );
+    // A call within the bounds carries no adjustment.
+    let result = tools::execute(
+        &mut s,
+        "source_search",
+        json!({"path":"a.rs","query":"line_30 ","after":2}),
+    )
+    .unwrap();
+    assert!(result.get("adjusted_arguments").is_none(), "{result}");
+    // Lower bounds are still reported.
+    let error = tools::execute(&mut s, "file_read", json!({"path":"a.rs","max_lines":0}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("minimum=1"), "{error}");
+}

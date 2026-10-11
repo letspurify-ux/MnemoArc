@@ -4836,6 +4836,7 @@ fn execute_repaired(
 ) -> Result<Value> {
     unwrap_task_state_call(name, &mut args);
     normalize_integer_arguments(name, &mut args);
+    let adjusted = clamp_size_arguments(name, &mut args);
     unwrap_continuation_cursor(name, &mut args);
     normalize_argument_aliases(s, name, &mut args)?;
     normalize_lone_carriage_returns(name, &mut args);
@@ -4929,7 +4930,7 @@ fn execute_repaired(
             "verification_reserve: use a targeted path_glob or nonempty symbol query for missing evidence; broad discovery is paused"
         );
     }
-    match name {
+    let result = match name {
         "db_execute" => crate::database::execute_free(
             &s.config.database,
             &args,
@@ -5731,7 +5732,40 @@ fn execute_repaired(
             Ok(result)
         }
         _ => bail!("unsupported_tool"),
+    };
+    let mut result = result?;
+    if !adjusted.is_empty() && result.is_object() {
+        result["adjusted_arguments"] = json!(adjusted);
     }
+    Ok(result)
+}
+
+/// Size arguments (context lines, page size, line count) above their
+/// schema maximum. They only bound how much a call returns, so the call runs
+/// at the maximum and the result says so. A live model sent source_search
+/// after:40, then 30 and 25, each rejected while the read was still needed.
+fn clamp_size_arguments(name: &str, args: &mut Value) -> Vec<String> {
+    let Some(spec) = ToolRegistry::specs().into_iter().find(|t| t.name == name) else {
+        return vec![];
+    };
+    let Some(fields) = args.as_object_mut() else {
+        return vec![];
+    };
+    let mut adjusted = Vec::new();
+    for key in ["before", "after", "limit", "max_lines"] {
+        let schema = &spec.parameters["properties"][key];
+        if schema["type"] == "integer"
+            && let Some(maximum) = schema["maximum"].as_u64()
+            && let Some(sent) = fields.get(key).and_then(Value::as_u64)
+            && sent > maximum
+        {
+            fields.insert(key.into(), json!(maximum));
+            adjusted.push(format!(
+                "{key} {sent} is above its maximum {maximum}; {maximum} was used"
+            ));
+        }
+    }
+    adjusted
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
