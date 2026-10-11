@@ -2070,6 +2070,73 @@ fn anchor_outside_section(
     ))
 }
 
+/// An edit that leaves an already saved document exactly as it is. A live
+/// model sent four batches whose every replacement equalled its old_text,
+/// each reported as a successful save. The first save of an existing output
+/// still counts as saving it in this task, so only later ones are refused.
+fn document_unchanged(digest: &str, edits: &[Value]) -> anyhow::Error {
+    let identical = edits
+        .iter()
+        .all(|edit| edit["old_text"].is_string() && edit["old_text"] == edit["text"]);
+    let cause = if identical {
+        " (every text equals its old_text)"
+    } else {
+        ""
+    };
+    anyhow::anyhow!(
+        "document_unchanged: these edits leave the document exactly as it is{cause}, so nothing was written and its hash is still {digest}. To change text, send text that differs from what the document has; to check wording, read it with document_inspect instead of rewriting it"
+    )
+}
+
+/// The passage holding old_text's core, its text without the brackets,
+/// punctuation and spaces at its ends, when the core stands once in the
+/// document between word bounds: a live model wrote "(agent.rs:170-251)"
+/// for the citation ", agent.rs:170-251)" and resent it five times on the
+/// bare not-found message. The passage keeps as many characters on each
+/// side as old_text set aside, widened until it occurs once.
+fn trimmed_core_passage(old: &str, target: &str) -> Option<String> {
+    let edge = |c: char| c.is_whitespace() || "()[]{}<>,.;:!?`'\"".contains(c);
+    let start_trimmed = target.trim_start_matches(edge);
+    let core = start_trimmed.trim_end_matches(edge);
+    if core.chars().count() < 6 || core.len() == target.len() {
+        return None;
+    }
+    let lead = target.chars().count() - start_trimmed.chars().count();
+    let trail = start_trimmed.chars().count() - core.chars().count();
+    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    let mut bounded = old.match_indices(core).filter(|(at, _)| {
+        let before = old[..*at].chars().next_back();
+        let after = old[at + core.len()..].chars().next();
+        !before.is_some_and(|c| word(c) || c == '/' || c == '.') && !after.is_some_and(word)
+    });
+    let (at, _) = bounded.next()?;
+    if bounded.next().is_some() {
+        return None;
+    }
+    let back = |from: usize, count: usize| {
+        old[..from]
+            .char_indices()
+            .rev()
+            .take(count)
+            .last()
+            .map_or(from, |(index, _)| index)
+    };
+    let forward = |from: usize, count: usize| {
+        old[from..]
+            .char_indices()
+            .nth(count)
+            .map_or(old.len(), |(index, _)| from + index)
+    };
+    let end = at + core.len();
+    for widen in 0..=20 {
+        let passage = &old[back(at, lead + widen)..forward(end, trail + widen)];
+        if old.matches(passage).nth(1).is_none() {
+            return Some(passage.to_owned());
+        }
+    }
+    None
+}
+
 fn unique_document_text_span(old: &str, target: &str) -> Result<(usize, usize)> {
     if target.is_empty() {
         bail!("patch_target_must_match_once: old_text is empty");
@@ -2083,6 +2150,11 @@ fn unique_document_text_span(old: &str, target: &str) -> Result<(usize, usize)> 
         if let Some(passage) = near_match(old, target) {
             bail!(
                 "patch_target_must_match_once: old_text is not in the current document (or the given section), but this passage differs from it only in backticks, dashes, quotes or spacing: {passage:?}. Copy that passage exactly as old_text"
+            );
+        }
+        if let Some(passage) = trimmed_core_passage(old, target) {
+            bail!(
+                "patch_target_must_match_once: old_text is not in the current document (or the given section), but its text without the brackets, punctuation or spaces at its ends occurs once, in this passage: {passage:?}. Copy that passage exactly as old_text"
             );
         }
         if let Some(passage) = anchored_passage(old, target) {
@@ -5766,6 +5838,9 @@ fn execute_repaired(
                 );
             }
             let result = apply_document_edit_operation(&old, &args)?;
+            if exists && result == old && s.document_written {
+                return Err(document_unchanged(&digest, &[args.clone()]));
+            }
             let inserted = if action == "section" {
                 inserted_sibling_sections(&old, &result, args["section"].as_str().unwrap_or(""))
             } else {
@@ -5879,6 +5954,9 @@ fn execute_repaired(
                     data: json!({"execution":"rejected_without_changes","failed_edits":failed_edits}),
                 }
                 .into());
+            }
+            if current == old && s.document_written {
+                return Err(document_unchanged(&digest, edits));
             }
             let result = persist_document_edit(s, &path, &old, exists, current, cancel)?;
             let final_hash = result["hash"].clone();

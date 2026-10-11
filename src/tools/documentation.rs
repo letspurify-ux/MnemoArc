@@ -1124,27 +1124,67 @@ const COMMON_CODE_WORDS: &[&str] = &[
 ];
 
 /// The code names a claim mentions in inline code: identifiers of four or
-/// more characters, without file paths and common keywords.
-fn code_names(span: &str) -> Vec<String> {
+/// more characters, without file paths and common keywords. A qualified name
+/// such as `question::run` or `s.is_document_work()` names its last part;
+/// the parts before it are qualifiers, returned second. A live run's claims
+/// citing `fn run` were flagged for the module name its lines never repeat,
+/// so a claim is checked by its names, and a qualifier found in the cited
+/// lines (a call site of `routing::run`) counts as a match too.
+fn code_names(span: &str) -> (Vec<String>, Vec<String>) {
+    let (mut names, mut qualifiers) = (Vec::new(), Vec::new());
     if span.contains('/') {
-        return Vec::new();
+        return (names, qualifiers);
     }
-    let mut names = Vec::new();
     let mut word = String::new();
-    for c in span.chars().chain([' ']) {
-        if c.is_ascii_alphanumeric() || c == '_' {
-            word.push(c);
+    let mut chars = span.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        if !(c.is_ascii_alphanumeric() || c == '_') {
             continue;
         }
+        word.push(c);
+        if chars
+            .peek()
+            .is_some_and(|(_, next)| next.is_ascii_alphanumeric() || *next == '_')
+        {
+            continue;
+        }
+        let rest = &span[at + c.len_utf8()..];
+        let qualifier = rest
+            .strip_prefix("::")
+            .or_else(|| rest.strip_prefix('.'))
+            .is_some_and(|after| {
+                after.starts_with(|next: char| next.is_ascii_alphabetic() || next == '_')
+            });
         if word.len() >= 4
             && !word.starts_with(|first: char| first.is_ascii_digit())
             && !COMMON_CODE_WORDS.contains(&word.as_str())
         {
-            names.push(std::mem::take(&mut word));
+            let list = if qualifier {
+                &mut qualifiers
+            } else {
+                &mut names
+            };
+            if !list.contains(&word) {
+                list.push(word.clone());
+            }
         }
         word.clear();
     }
-    names
+    (names, qualifiers)
+}
+
+/// The name of the nearest definition (fn, struct, class, ...) that starts
+/// above a line: a claim may cite lines inside a function by that
+/// function's name, as in "the loop inside `run_session_controlled`".
+fn enclosing_definition(source: &[String], line: usize) -> Option<String> {
+    static DEFINITION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\b(?:fn|function|def|struct|enum|trait|class|interface|mod)\s+([A-Za-z_][A-Za-z0-9_]*)")
+            .expect("definition pattern")
+    });
+    source[..line.saturating_sub(1).min(source.len())]
+        .iter()
+        .rev()
+        .find_map(|text| DEFINITION.captures(text).map(|found| found[1].to_owned()))
 }
 
 const CITATION_MISMATCH_LIMIT: usize = 8;
@@ -1193,29 +1233,41 @@ pub(super) fn citation_mismatch_check(s: &Session, output: &Path, doc: &str) -> 
                 }
             }
         }
-        let mut claims: Vec<(Vec<String>, Vec<&Citation>)> = Vec::new();
+        // (names, qualifiers, citations) per claim. A citation with no
+        // code between it and the previous one shares that claim; a claim
+        // naming only qualifiers (`question::run`) is not checked.
+        let mut claims: Vec<(Vec<String>, Vec<String>, Vec<&Citation>)> = Vec::new();
         let mut previous_end = 0;
         for citation in on_line {
             let (start, end) = citation.columns;
-            let mut names: Vec<String> = Vec::new();
+            let (mut names, mut qualifiers) = (Vec::new(), Vec::new());
             for (from, to) in spans
                 .iter()
                 .filter(|(from, to)| *from >= previous_end && *to <= start)
             {
-                for name in code_names(&text[*from..*to]) {
-                    if !names.contains(&name) {
-                        names.push(name);
+                let (span_names, span_qualifiers) = code_names(&text[*from..*to]);
+                for (list, found) in [(&mut names, span_names), (&mut qualifiers, span_qualifiers)]
+                {
+                    for name in found {
+                        if !list.contains(&name) {
+                            list.push(name);
+                        }
                     }
                 }
             }
             previous_end = end;
             match claims.last_mut() {
-                Some((_, cited)) if names.is_empty() => cited.push(citation),
-                _ if names.is_empty() => {}
-                _ => claims.push((names, vec![citation])),
+                Some((_, _, cited)) if names.is_empty() && qualifiers.is_empty() => {
+                    cited.push(citation)
+                }
+                _ if names.is_empty() && qualifiers.is_empty() => {}
+                _ => claims.push((names, qualifiers, vec![citation])),
             }
         }
-        for (names, cited) in claims {
+        for (names, qualifiers, cited) in claims {
+            if names.is_empty() {
+                continue;
+            }
             let mut found = false;
             let mut checked = false;
             for citation in &cited {
@@ -1254,11 +1306,12 @@ pub(super) fn citation_mismatch_check(s: &Session, output: &Path, doc: &str) -> 
                 }
                 checked = true;
                 let cited_text = &source[citation.begin - 1..citation.end];
-                found |= names.iter().any(|name| {
+                found |= names.iter().chain(&qualifiers).any(|name| {
                     cited_text
                         .iter()
                         .any(|cited_line| cited_line.contains(name.as_str()))
-                });
+                }) || enclosing_definition(source, citation.begin)
+                    .is_some_and(|enclosing| names.contains(&enclosing));
             }
             if checked && !found {
                 total += 1;

@@ -2516,6 +2516,53 @@ async fn a_checkpoint_lets_document_work_save_a_section_first() {
     );
 }
 
+// Live run 2026-10-11: a citation fix saved during a checkpoint's cleanup
+// lost its result when the checkpoint committed; the model resent it with
+// the old hash, then applied it again inside the fixed text.
+#[tokio::test]
+async fn edits_saved_during_a_checkpoint_are_listed_with_the_hash_after_it() {
+    let (_dir, s, id) = checkpoint_fixture();
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    let (result, guidance) = run_scripted(
+        s,
+        vec![
+            calls(vec![
+                (
+                    "save",
+                    "document_edit",
+                    json!({"action":"append","expected_hash":hash,"text":"\n# Loop\nThe loop runs work five times. main.js:3-5\n"}),
+                ),
+                (
+                    "ack",
+                    "checkpoint_complete",
+                    json!({"id":id,"progress":"Saved the loop section."}),
+                ),
+            ]),
+            call("inspect", "document_inspect", json!({})),
+        ],
+    )
+    .await;
+    assert_eq!(result.checkpoints_completed, 1, "{:?}", result.last_error);
+    assert!(guidance[0].get("checkpoint_document_edits").is_none());
+    let listed = &guidance[1]["checkpoint_document_edits"];
+    assert_eq!(
+        listed["edits"],
+        json!([r##"document_edit: append beginning "# Loop""##]),
+        "{listed}"
+    );
+    assert_eq!(
+        listed["hash"],
+        tools::hash(&std::fs::read(&result.project.output).unwrap()),
+        "{listed}"
+    );
+    // An inspection after the checkpoint carries the hash itself.
+    assert!(
+        guidance[2].get("checkpoint_document_edits").is_none(),
+        "{}",
+        guidance[2]
+    );
+}
+
 #[tokio::test]
 async fn a_failed_edit_holds_a_checkpoint_only_once() {
     let (_dir, s, id) = checkpoint_fixture();

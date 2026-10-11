@@ -4665,3 +4665,102 @@ A `path/to/file.rs` mention and `true` alone (src.rs:2).\n";
     s.document_baseline = Some((output, tools::section_fingerprints(doc)));
     assert!(tools::citation_mismatches(&s).is_none());
 }
+
+// Live run 2026-10-11: four batches whose every replacement equalled its
+// old_text were each reported as a successful save.
+#[test]
+fn an_edit_that_changes_nothing_is_refused_once_the_document_is_saved() {
+    let (_dir, mut s) = source_setup();
+    std::fs::write(&s.project.output, "# Guide\nThe run calls work.\n").unwrap();
+    let same = json!({"action":"replace_text","old_text":"The run calls work.","text":"The run calls work."});
+    // Saving an existing output unchanged still counts as saving it.
+    let saved = run(&mut s, "document_edit", same.clone());
+    assert!(s.document_written, "{saved}");
+    let error = tools::execute(&mut s, "document_edit", same.clone())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.starts_with("document_unchanged: these edits leave the document exactly as it is (every text equals its old_text)"),
+        "{error}"
+    );
+    let hash = saved["hash"].as_str().unwrap();
+    assert!(error.contains(hash), "{error}");
+    let error = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":hash,"edits":[same.clone(), same]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("document_unchanged:"), "{error}");
+    // A batch that changes something is saved as before.
+    run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":hash,"edits":[{"action":"replace_text","old_text":"calls work.","text":"calls work twice."}]}),
+    );
+}
+
+// Live run 2026-10-11: "(agent.rs:170-251)" was sent for the citation
+// ", agent.rs:170-251)" five times on the bare not-found message.
+#[test]
+fn old_text_with_wrong_brackets_names_the_passage_that_holds_its_core() {
+    let (_dir, mut s) = source_setup();
+    std::fs::write(
+        &s.project.output,
+        "# Guide\nPlan checks (`plan_check`, agent.rs:170-251) run.\nSee src/agent.rs:170-251 too.\n",
+    )
+    .unwrap();
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","old_text":"(agent.rs:170-251)","text":"(src/agent.rs:170-251)"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains(r#"occurs once, in this passage: " agent.rs:170-251)". Copy that passage exactly as old_text"#),
+        "{error}"
+    );
+    // A core that stands nowhere between word bounds gets no passage.
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","old_text":"(gent.rs:170-251)","text":"x"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(!error.contains("in this passage"), "{error}");
+}
+
+// Live run 2026-10-11: all four flags were false: `question::run` and
+// `routing::run` cite a fn run their lines never qualify, and a loop line
+// was cited as being inside `run_session_controlled`.
+#[test]
+fn qualified_names_and_enclosing_definitions_match_their_cited_lines() {
+    let (dir, mut s) = source_setup();
+    std::fs::write(
+        dir.path().join("src.rs"),
+        "pub async fn drive(state: &State) {\n    loop {\n        step(state);\n    }\n}\nfn other() {}\n",
+    )
+    .unwrap();
+    let doc = "# Guide\n\
+`question::run` steps the state (src.rs:2-4).\n\
+The loop inside `driver_loop` repeats (src.rs:2-4).\n\
+The loop inside `drive` repeats (src.rs:2-4).\n\
+`helper::missing_step` is not there (src.rs:6).\n";
+    let written = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":doc}),
+    );
+    let check = &written["citation_mismatch_check"];
+    assert_eq!(
+        check["items"],
+        json!([
+            {"line":3,"citations":["src.rs:2-4"],"names":["driver_loop"]},
+            {"line":5,"citations":["src.rs:6"],"names":["missing_step"]}
+        ]),
+        "{written}"
+    );
+}

@@ -142,7 +142,7 @@ pub fn describe(message: &str) -> Value {
         (Class::InvalidInput, "correct_arguments")
     } else if code == "document_revision_conflict" {
         (Class::StaleState, "restart_document_inspection")
-    } else if code == "document_batch_operation_failed" {
+    } else if code == "document_batch_operation_failed" || code == "document_unchanged" {
         (Class::InvalidInput, "correct_arguments")
     } else if code == "ambiguous_section" {
         (Class::InvalidInput, "choose_exact_section")

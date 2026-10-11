@@ -383,6 +383,11 @@ pub struct ProgressRecovery {
     /// edit held the first.
     #[serde(skip)]
     pub checkpoint_write_batches: (String, usize),
+    /// Document edits saved while a checkpoint was pending. Committing the
+    /// checkpoint clears their results from context, so they are listed with
+    /// the current hash until the next document edit or inspection.
+    #[serde(skip)]
+    pub checkpoint_document_edits: Vec<String>,
 }
 
 /// The current to-do with the task round it became current, and the

@@ -58,6 +58,66 @@ fn unread_citation_count(s: &Session) -> usize {
     tools::unread_citations(s).map_or(0, |unread| unread.len())
 }
 
+/// Document edits listed after a checkpoint (see describe_document_edit).
+const CHECKPOINT_EDITS_LISTED: usize = 6;
+
+/// A short account of a document edit, for the model once a checkpoint has
+/// cleared the edit's result: a live model resent a citation fix it had
+/// saved during cleanup with the old hash, then applied it again inside the
+/// fixed text ("src/src/agent.rs").
+fn describe_document_edit(name: &str, arguments: &str) -> String {
+    const SHOWN: usize = 4;
+    let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+    let operations = if name == "document_edit_batch" {
+        args["edits"].as_array().cloned().unwrap_or_default()
+    } else {
+        vec![args]
+    };
+    let clip = |text: &str| {
+        let clipped: String = text.chars().take(60).collect();
+        if clipped.len() < text.len() {
+            format!("{clipped}…")
+        } else {
+            clipped
+        }
+    };
+    let mut parts: Vec<String> = operations
+        .iter()
+        .take(SHOWN)
+        .map(|operation| {
+            let action = operation["action"].as_str().unwrap_or("edit");
+            match (
+                operation["old_text"].as_str(),
+                operation["text"].as_str(),
+                operation["section"].as_str(),
+            ) {
+                (Some(old), Some(new), _) => {
+                    format!("{action} {:?} -> {:?}", clip(old), clip(new))
+                }
+                (_, _, Some(section)) => {
+                    format!(
+                        "{action} {:?}",
+                        clip(section.lines().last().unwrap_or(section))
+                    )
+                }
+                (_, Some(text), _) => format!(
+                    "{action} beginning {:?}",
+                    clip(
+                        text.lines()
+                            .find(|line| !line.trim().is_empty())
+                            .unwrap_or("")
+                    )
+                ),
+                _ => action.to_owned(),
+            }
+        })
+        .collect();
+    if operations.len() > SHOWN {
+        parts.push(format!("and {} more", operations.len() - SHOWN));
+    }
+    format!("{name}: {}", parts.join("; "))
+}
+
 /// Keep a record of a reply that carried no tool call. A reply cut at the
 /// output limit or made during a checkpoint is settled at once; for the
 /// others it returns true and settle_reply records the outcome once the
@@ -1635,6 +1695,17 @@ pub async fn run_session_controlled(
             "plan_pending_count":s.task.todos.iter().filter(|item| !item.done).count(),
             "finalization_error":s.last_error.as_deref().filter(|error| finalization_attempts > 0 || error.starts_with("task_plan_pending:") || error.starts_with("task_unresolved_open:") || error.starts_with("request_coverage_check:")),
             "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: the last requests produced no new evidence, document change or resolved citation. Change approach instead of repeating them: read sources the document still needs and has not read, write or correct a section, or file_read a cited range reported as unread. Do not repeat an unchanged read, plan rewrite or memory save. If a claim cannot be supported, mark that gap in the relevant section and continue with supported work; do not invent evidence." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"For source documentation, batch reads for missing evidence, then repair known issues in their original locations with targeted section or text edits when safe. Corrections are edits, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Keep correcting the original requirements within the remaining run tokens and time.","draft"=>"Half of the run budget is spent: plan the remaining reading and writing so the requested document is complete and verified within remaining_tokens and remaining_seconds. Save sections in separate edits; place each from the outline in the last save result, use insert_before/insert_after for siblings and insert_first_child/insert_last_child for nested sections when that preserves the document flow, and copy section_path when headings repeat.",_=>if answer_workflow { ANSWER_INVESTIGATE_INSTRUCTION } else { "For source documentation, judge from the request and the evidence how much to read and when the document is complete. When a section's evidence is in context, write that section with its path:start-end citations right away, then read for the next one; save sections in separate edits rather than one full-file write; place each from the outline in the last save result (document_inspect only when none is in context), copy section_path when headings repeat, and use sibling or child insertion to place it within the hierarchy. Batch independent searches or reads together instead of paying a model round per file." }} }});
+        if s.checkpoint.is_none() && !s.progress_recovery.checkpoint_document_edits.is_empty() {
+            let hash = tools::output_path(&s.project)
+                .and_then(|path| tools::read_text(&path))
+                .map(|doc| tools::hash(doc.as_bytes()))
+                .ok();
+            s.run_guidance["checkpoint_document_edits"] = json!({
+                "edits":s.progress_recovery.checkpoint_document_edits,
+                "hash":hash,
+                "note":"These edits were saved during the last checkpoint's cleanup, which cleared their results from context. They are already in the document: do not apply them again. Use hash as expected_hash for the next edit, or read the current text with document_inspect."
+            });
+        }
         s.run_guidance["progress_recovery"]["rounds_since_progress"] = json!(stall_rounds);
         s.run_guidance["progress_recovery"]["closing_after"] =
             json!(closing_stall_limit(&s.config));
@@ -2553,6 +2624,24 @@ pub async fn run_session_controlled(
                 }
                 if rebased_document_call && result["status"] == "ok" {
                     result["data"]["batch_rebased"] = json!(true);
+                }
+                // A checkpoint's commit clears the results of edits saved
+                // during its cleanup; list them afterwards so they are not
+                // applied twice. A later edit or inspection has the hash.
+                if result["status"] == "ok"
+                    && matches!(
+                        call.name.as_str(),
+                        "document_edit" | "document_edit_batch" | "document_inspect"
+                    )
+                {
+                    if s.checkpoint.is_some() && call.name != "document_inspect" {
+                        let edits = &mut s.progress_recovery.checkpoint_document_edits;
+                        if edits.len() < CHECKPOINT_EDITS_LISTED {
+                            edits.push(describe_document_edit(&call.name, &call.arguments));
+                        }
+                    } else if s.checkpoint.is_none() {
+                        s.progress_recovery.checkpoint_document_edits.clear();
+                    }
                 }
                 if matches!(call.name.as_str(), "document_edit" | "document_edit_batch")
                     && result["status"] == "ok"
