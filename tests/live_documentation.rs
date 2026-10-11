@@ -108,7 +108,7 @@ fn report_diagnostics(result: &Session, audit: &Value) -> Value {
     });
     json!({
         "completion_gaps":result.completion_gaps,
-        "output_limits":result.output_limits,
+        "replies_without_calls":result.replies_without_calls,
         "run_stop_reason":result.run_history.back().map(|run| run.reason.as_str()),
         "last_run":result.run_history.back(),
         "final_document_hash":final_document_hash,
@@ -216,7 +216,7 @@ async fn registered_source_documentation() {
     let drain = tokio::spawn(async move {
         let mut first_write = None;
         let mut last_round = 0;
-        let mut last_output_limit = 0;
+        let mut last_reply = 0;
         let mut last_plan_check = String::new();
         let mut seen_call_ids = BTreeSet::new();
         let mut seen_result_ids = BTreeSet::new();
@@ -355,22 +355,27 @@ async fn registered_source_documentation() {
                             ),
                         );
                     }
-                    // A response cut at the output limit, with where its
-                    // allowance went.
-                    for cut in &s.output_limits {
-                        if cut.round <= last_output_limit {
+                    // A reply without a tool call, with where its output went
+                    // and what the runtime did with it, once that is known.
+                    for reply in &s.replies_without_calls {
+                        if reply.round <= last_reply {
                             continue;
                         }
+                        if reply.outcome == "pending" {
+                            break;
+                        }
                         eprintln!(
-                            "[live] output_limit round={} output={:?} reasoning_tokens={:?} reasoning_chars={} text_chars={} discarded_tool_calls={}",
-                            cut.round,
-                            cut.output_tokens,
-                            cut.reasoning_tokens,
-                            cut.reasoning_chars,
-                            cut.text_chars,
-                            cut.discarded_tool_calls
+                            "[live] reply_without_calls round={} finish={} output={:?} reasoning_tokens={:?} reasoning_chars={} text_chars={} discarded_tool_calls={} outcome={}",
+                            reply.round,
+                            reply.finish,
+                            reply.output_tokens,
+                            reply.reasoning_tokens,
+                            reply.reasoning_chars,
+                            reply.text_chars,
+                            reply.discarded_tool_calls,
+                            reply.outcome
                         );
-                        last_output_limit = cut.round;
+                        last_reply = reply.round;
                     }
                     // Plan checks are pointed out once per plan state.
                     if let Some(check) = s.run_guidance["plan_check"].as_str()

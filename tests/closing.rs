@@ -1217,13 +1217,115 @@ async fn an_output_limit_on_an_existing_document_is_recorded_and_withholds_whole
     )
     .await;
     assert!(result.progress_recovery.whole_write_withheld);
-    let cut = result.output_limits.back().unwrap();
+    let cut = result.replies_without_calls.front().unwrap();
     assert_eq!(cut.round, 1);
+    assert_eq!(cut.finish, "length");
+    assert_eq!(cut.outcome, "length_recovery");
     assert_eq!(cut.output_tokens, Some(output_tokens));
     assert_eq!(cut.reasoning_tokens, Some(output_tokens - 2));
     assert_eq!(cut.reasoning_chars, 900);
     assert_eq!(cut.text_chars, "Checking".len());
     assert!(!cut.discarded_tool_calls);
+}
+
+// Live runs 2026-10-11: correcting an existing document, the model was told
+// of no unread citation and learned of 24 to 51 only when its final answer
+// was refused.
+#[tokio::test]
+async fn an_existing_document_reports_its_unread_citations_before_any_save() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.js"),
+        "function run() {\n  work();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("out.md"),
+        "# Flow\nThe run calls work. main.js:1-3\n",
+    )
+    .unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128_000),
+            ..support::compact_config()
+        },
+    );
+    s.add_user("Check the document against the source and fix the wrong parts.".into());
+    s.select_workflow("source_document").unwrap();
+    let (result, guidance) = run_scripted(
+        s,
+        vec![call(
+            "read",
+            "file_read",
+            json!({"path":"main.js","start_line":1,"max_lines":3}),
+        )],
+    )
+    .await;
+    assert!(!result.document_written);
+    assert_eq!(guidance[0]["unread_citation_count"], 1, "{}", guidance[0]);
+    // Reading the cited range counts as progress before any save.
+    assert_eq!(guidance[1]["unread_citation_count"], 0, "{}", guidance[1]);
+}
+
+// Live run 2026-10-11: an 11K-token reply ended without a tool call, and the
+// log could not tell a refused final answer from an empty reply.
+#[tokio::test]
+async fn replies_without_calls_record_what_the_runtime_did_with_them() {
+    let (_dir, mut s) = saved_fixture();
+    tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Check the flow section"]}]}),
+    )
+    .unwrap();
+    let id = s.task.todos[0].id.clone();
+    let (result, _) = run_scripted(
+        s,
+        vec![
+            Completion::default(),
+            Completion {
+                text: "Done".into(),
+                ..Default::default()
+            },
+            call(
+                "done",
+                "task_plan",
+                json!({"action":"apply","expected_revision":1,"operations":[{"op":"complete","id":id,"result":"Checked against main.js"}]}),
+            ),
+            Completion {
+                text: "Saved out.md".into(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await;
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    let replies: Vec<_> = result
+        .replies_without_calls
+        .iter()
+        .map(|reply| {
+            (
+                reply.round,
+                reply.finish.as_str(),
+                reply.text_chars,
+                reply.outcome.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        replies,
+        vec![
+            (1, "stop", 0, "empty_completion"),
+            (2, "stop", 4, "task_plan_pending"),
+            (4, "stop", 12, "accepted (complete)"),
+        ]
+    );
 }
 
 #[tokio::test]

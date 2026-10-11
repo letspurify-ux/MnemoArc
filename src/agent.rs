@@ -46,13 +46,71 @@ fn progress_score(s: &Session) -> usize {
         + s.progress_recovery.evidence_credit
 }
 
-/// Cited ranges of the saved document never delivered as complete lines of
-/// the current file version; zero before the document exists.
+/// Cited ranges of the output document never delivered as complete lines of
+/// the current file version; zero before the document exists. An existing
+/// output this task has not written yet counts too: correction runs on an
+/// existing document were told of no unread citation and learned of 24 to
+/// 51 only when the final answer was refused.
 fn unread_citation_count(s: &Session) -> usize {
-    if !s.is_document_work() || !s.document_written {
+    if !s.is_document_work() {
         return 0;
     }
     tools::unread_citations(s).map_or(0, |unread| unread.len())
+}
+
+/// Keep a record of a reply that carried no tool call. A cut reply's outcome
+/// is known at once; the others are settled once the runtime has handled
+/// them (settle_reply).
+fn note_reply(s: &mut Session, completion: &crate::llm::Completion) {
+    if s.replies_without_calls.len() >= crate::session::REPLY_RECORDS {
+        s.replies_without_calls.pop_front();
+    }
+    let (finish, outcome) = if completion.length_limited {
+        ("length", "length_recovery")
+    } else {
+        ("stop", "pending")
+    };
+    s.replies_without_calls
+        .push_back(crate::session::ReplyWithoutCalls {
+            round: s.task_rounds,
+            finish: finish.into(),
+            output_tokens: completion.usage.as_ref().map(|usage| usage.output),
+            reasoning_tokens: completion.reasoning_tokens,
+            reasoning_chars: completion.reasoning_chars,
+            text_chars: completion.text.chars().count(),
+            discarded_tool_calls: completion.discarded_tool_calls,
+            outcome: outcome.into(),
+        });
+}
+
+/// Record what the runtime did with the last reply without calls: accepted
+/// it as the final answer, sent the run back to work with an error (named by
+/// its code), or went on without one.
+fn settle_reply(s: &mut Session, error_before: Option<String>) {
+    let outcome = if matches!(s.status.as_str(), "complete" | "complete_with_gaps") {
+        format!("accepted ({})", s.status)
+    } else if s.last_error != error_before {
+        s.last_error.as_deref().map_or_else(
+            || "error cleared".to_owned(),
+            |error| {
+                let code = error.split(':').next().unwrap_or(error);
+                if !code.is_empty() && !code.contains(' ') {
+                    code.to_owned()
+                } else {
+                    error.chars().take(80).collect()
+                }
+            },
+        )
+    } else {
+        "continued".to_owned()
+    };
+    if let Some(reply) = s
+        .replies_without_calls
+        .back_mut()
+        .filter(|reply| reply.outcome == "pending")
+    {
+        reply.outcome = outcome;
+    }
 }
 
 fn closing_instruction(s: &Session) -> String {
@@ -1218,6 +1276,9 @@ pub async fn run_session_controlled(
     // The recovery reason the last empty reply set, cleared with its error
     // once a reply carries text or calls again.
     let mut empty_reply_reason: Option<String> = None;
+    // The error before the last reply without calls, until that reply's
+    // outcome is recorded at the next request or the end of the run.
+    let mut pending_reply: Option<Option<String>> = None;
     // Unread cited ranges counted after the last tool batch. Only tool calls
     // change the delivered evidence or the document, so the next request
     // starts from this count instead of scanning again; an external edit in
@@ -1252,6 +1313,9 @@ pub async fn run_session_controlled(
     }
     snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
     while failure.is_none() && !cancel.is_cancelled() {
+        if let Some(error_before) = pending_reply.take() {
+            settle_reply(&mut s, error_before);
+        }
         consume_commands(&mut s, &mut commands);
         match apply_pending_config(&mut s, true) {
             Ok(true) => {
@@ -1888,6 +1952,12 @@ pub async fn run_session_controlled(
                 break;
             }
         };
+        if completion.calls.is_empty() {
+            note_reply(&mut s, &completion);
+            if !completion.length_limited {
+                pending_reply = Some(s.last_error.clone());
+            }
+        }
         if !completion.length_limited
             && completion.calls.is_empty()
             && completion.text.trim().is_empty()
@@ -1981,17 +2051,6 @@ pub async fn run_session_controlled(
                 s.continuation = Some(completion.discarded_tool_calls);
             }
             length_recoveries += 1;
-            if s.output_limits.len() >= crate::session::OUTPUT_LIMIT_RECORDS {
-                s.output_limits.pop_front();
-            }
-            s.output_limits.push_back(crate::session::OutputLimit {
-                round: s.task_rounds,
-                output_tokens: completion.usage.as_ref().map(|usage| usage.output),
-                reasoning_tokens: completion.reasoning_tokens,
-                reasoning_chars: completion.reasoning_chars,
-                text_chars: completion.text.chars().count(),
-                discarded_tool_calls: completion.discarded_tool_calls,
-            });
             // Rewriting a grown document in one call is the usual way to exceed
             // the output limit; require section-sized edits. A document small
             // relative to the limit cannot be the cause, so it stays writable.
@@ -2739,6 +2798,9 @@ pub async fn run_session_controlled(
             break;
         }
         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
+    }
+    if let Some(error_before) = pending_reply.take() {
+        settle_reply(&mut s, error_before);
     }
     if s.write_outcome_uncertain.load(Ordering::Acquire) {
         s.status = "blocked".into();

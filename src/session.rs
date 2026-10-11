@@ -486,22 +486,29 @@ pub(crate) fn user_excerpt<N: AsRef<str>>(excerpt: &str, sent: &[(N, &str)]) -> 
 /// calls of the last few responses (a response holds at most 32).
 pub const LEDGER_CALLS: usize = 256;
 
-/// Output-limit records kept per session (the most recent ones).
-pub const OUTPUT_LIMIT_RECORDS: usize = 32;
+/// Replies without a tool call kept per session (the most recent ones).
+pub const REPLY_RECORDS: usize = 32;
 
-/// A model response cut at the output limit, kept to diagnose where the
-/// allowance went: live runs had rounds end at exactly the limit with no
-/// tool call and no way to tell reasoning from visible text.
+/// A model reply that carried no tool call: cut at the output limit, empty,
+/// or a final answer, with what the runtime did next. Live replies of 11K
+/// output tokens and four minutes ended without a call, and the log could
+/// not tell whether they were cut, empty or a refused final answer.
 #[derive(Clone, Debug, Serialize)]
-pub struct OutputLimit {
+pub struct ReplyWithoutCalls {
     pub round: usize,
-    /// Output tokens the provider reported for the response, if any.
+    /// "length" when cut at the output limit, otherwise "stop".
+    pub finish: String,
+    /// Output tokens the provider reported for the reply, if any.
     pub output_tokens: Option<usize>,
     pub reasoning_tokens: Option<usize>,
     pub reasoning_chars: usize,
     pub text_chars: usize,
     /// A tool-call batch was cut and discarded unexecuted.
     pub discarded_tool_calls: bool,
+    /// What the runtime did with it: "length_recovery", "accepted (status)",
+    /// the code of the error that sent the run back to work, or "continued".
+    /// "pending" until the runtime has handled the reply.
+    pub outcome: String,
 }
 
 #[derive(Clone, Debug)]
@@ -572,8 +579,8 @@ pub struct Session {
     pub task_rounds: usize,
     // Some(true): truncated tool batch; Some(false): text continuation.
     pub continuation: Option<bool>,
-    /// Recent responses cut at the output limit (runtime diagnostics only).
-    pub output_limits: VecDeque<OutputLimit>,
+    /// Recent replies without a tool call (runtime diagnostics only).
+    pub replies_without_calls: VecDeque<ReplyWithoutCalls>,
 }
 /// Workflows a user selects when creating a session.
 /// General file/document work runs in answer without document verification.
@@ -740,7 +747,7 @@ impl Session {
             activity: json!({}),
             task_rounds: 0,
             continuation: None,
-            output_limits: VecDeque::new(),
+            replies_without_calls: VecDeque::new(),
         }
     }
     pub fn protected(&self) -> BTreeSet<String> {

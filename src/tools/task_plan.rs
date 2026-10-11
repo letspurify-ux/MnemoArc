@@ -416,13 +416,38 @@ fn value_type(value: &Value) -> &'static str {
     }
 }
 
-fn decode_json(text: &str) -> Result<Value> {
+/// Decoded JSON text, with the closing brackets added when the text lacked
+/// only those at its end.
+fn decode_json(text: &str) -> Result<(Value, Option<String>)> {
     if text.len() > MAX_ENCODED_BYTES {
         bail!("Encoded operations exceed {MAX_ENCODED_BYTES} bytes; use a smaller batch");
     }
-    // Strict JSON only: never repair partial JSON, evaluate text, or guess
-    // operation ordering from a map. Each string wrapper is decoded once.
-    serde_json::from_str(text).map_err(|error| {
+    // Strict JSON otherwise: never repair partial JSON, evaluate text, or
+    // guess operation ordering from a map. Each string wrapper is decoded
+    // once. The one completion: every item finished and only the closing
+    // bracket of the outermost array or object missing. A cut response never
+    // gets here (its calls are discarded unexecuted) and only that bracket is
+    // added, so no value or item is guessed. A live model was told the
+    // missing "]" and sent the same text three times in a row.
+    let error = match serde_json::from_str(text) {
+        Ok(value) => return Ok((value, None)),
+        Err(error) => error,
+    };
+    let outer = match text.trim_start().chars().next() {
+        Some('[') => "]",
+        Some('{') => "}",
+        _ => "",
+    };
+    if error.classify() == serde_json::error::Category::Eof && !outer.is_empty() {
+        let (closing, value_due) = open_json(text);
+        if !value_due
+            && closing == outer
+            && let Ok(value) = serde_json::from_str(&format!("{text}{closing}"))
+        {
+            return Ok((value, Some(closing)));
+        }
+    }
+    Err({
         // At the end of the text serde_json reports the last character, so
         // the marker sat before a final "}" that was fine. A live model sent
         // text missing only its last "]" six times; name what is missing.
@@ -445,6 +470,18 @@ fn decode_json(text: &str) -> Result<Value> {
 /// What an unfinished JSON text still needs at its end: a value after a
 /// trailing ":" or ",", then the quote and brackets it left open, in order.
 fn unfinished_json(text: &str) -> String {
+    let (closing, value) = open_json(text);
+    match (value, closing.is_empty()) {
+        (true, true) => "a value".into(),
+        (true, false) => format!("a value and then its closing {closing:?}"),
+        (false, true) => "the rest of its last value".into(),
+        (false, false) => format!("its closing {closing:?}"),
+    }
+}
+
+/// The quote and brackets an unfinished JSON text left open, in closing
+/// order, and whether a value is still due (after a trailing ":" or ",").
+fn open_json(text: &str) -> (String, bool) {
     let mut open = Vec::new();
     let mut in_string = false;
     let mut escaped = false;
@@ -478,13 +515,7 @@ fn unfinished_json(text: &str) -> String {
         closing.push('"');
     }
     closing.extend(open.iter().rev());
-    let value = !in_string && matches!(last, Some(':' | ','));
-    match (value, closing.is_empty()) {
-        (true, true) => "a value".into(),
-        (true, false) => format!("a value and then its closing {closing:?}"),
-        (false, true) => "the rest of its last value".into(),
-        (false, false) => format!("its closing {closing:?}"),
-    }
+    (closing, !in_string && matches!(last, Some(':' | ',')))
 }
 
 /// The text around a JSON error with a marker at the reported position, so a
@@ -515,8 +546,14 @@ fn parse_operations(value: &Value) -> Result<Parsed> {
     let mut normalized = false;
     let mut notices = Vec::new();
     let value = if let Some(text) = value.as_str() {
-        decoded = decode_json(text)?;
+        let (value, closed) = decode_json(text)?;
+        decoded = value;
         normalized = true;
+        if let Some(closing) = closed {
+            notices.push(format!(
+                "operations text was missing its final {closing:?}, which was added; send operations as a JSON array value, not as quoted text"
+            ));
+        }
         &decoded
     } else {
         value
@@ -541,13 +578,19 @@ fn parse_operations(value: &Value) -> Result<Parsed> {
     for (i, item) in items.into_iter().enumerate() {
         let decoded;
         let item = if let Some(text) = item.as_str() {
-            decoded = decode_json(text).map_err(|error| {
+            let (value, closed) = decode_json(text).map_err(|error| {
                 operation_error(
                     format!("operations[{i}]: {error}"),
                     json!({"code":"invalid_operations","operation_index":i}),
                 )
             })?;
+            decoded = value;
             normalized = true;
+            if let Some(closing) = closed {
+                notices.push(format!(
+                    "operations[{i}] text was missing its final {closing:?}, which was added; send each operation as a JSON object, not as quoted text"
+                ));
+            }
             &decoded
         } else {
             item

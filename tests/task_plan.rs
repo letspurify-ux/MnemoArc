@@ -1076,10 +1076,10 @@ fn a_missing_revision_also_names_what_is_wrong_with_the_operations() {
         "{result}"
     );
     // Unreadable operations text is named with its input error too.
-    let result = send(&mut s, json!(r#"[{"op": "insert", "texts": ["b"]}"#));
+    let result = send(&mut s, json!(r#"[{"op": "insert", "texts": ["b"#));
     let reason = result["reason"].as_str().unwrap();
     assert!(
-        reason.contains(r#"still needs its closing "]""#),
+        reason.contains(r#"still needs its closing "\"]}]""#),
         "{reason}"
     );
     assert_eq!(result["input_error"]["received"], "string", "{result}");
@@ -1097,31 +1097,18 @@ fn a_missing_revision_also_names_what_is_wrong_with_the_operations() {
 }
 
 #[test]
-fn json_text_missing_its_last_bracket_says_what_is_still_needed() {
-    // The live shape: the outer array was never closed. The marker pointed
-    // before the final "}", which was fine, so the model kept resending it.
+fn json_text_missing_only_its_last_bracket_is_completed() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
-    let result = tools::execute(
-        &mut s,
-        "task_plan",
-        json!({"action":"apply","expected_revision":0,"operations":r#"[{"op": "insert", "texts": ["A"]}"#}),
-    )
-    .unwrap();
-    assert_eq!(result["applied"], false, "{result}");
-    let reason = result["reason"].as_str().unwrap();
-    assert!(
-        reason.contains(r#"<here> (end of text), which still needs its closing "]""#),
-        "{reason}"
-    );
-    assert!(!reason.contains(r#"<here> "}""#), "{reason}");
-    // A text cut inside a string or after a key names those too.
+    // A text cut inside an item still names what is missing, and nothing is
+    // applied: completing it would guess where the item ended.
     for (text, needed) in [
         (
             r#"[{"op": "insert", "texts": ["A"#,
             r#"its closing "\"]}]""#,
         ),
         (r#"[{"op":"#, r#"a value and then its closing "}]""#),
+        (r#"[{"op": "insert", "texts": ["A"]"#, r#"its closing "}]""#),
     ] {
         let result = tools::execute(
             &mut s,
@@ -1129,10 +1116,27 @@ fn json_text_missing_its_last_bracket_says_what_is_still_needed() {
             json!({"action":"apply","expected_revision":0,"operations":text}),
         )
         .unwrap();
+        assert_eq!(result["applied"], false, "{text}: {result}");
         let reason = result["reason"].as_str().unwrap();
         assert!(reason.contains(needed), "{text}: {reason}");
     }
     assert!(s.task.todos.is_empty());
+    // Live run 2026-10-11: told the outer "]" was missing, a model sent the
+    // same text three times in a row. With every item finished, only that
+    // bracket is added, and the result says so.
+    let result = tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":0,"operations":r#"[{"op": "insert", "texts": ["A", "B"]}"#}),
+    )
+    .unwrap();
+    assert_eq!(result["applied"], true, "{result}");
+    assert_eq!(s.task.todos.len(), 2);
+    let notice = result["notices"][0].as_str().unwrap();
+    assert!(
+        notice.contains(r#"missing its final "]", which was added"#),
+        "{notice}"
+    );
 }
 
 #[test]
