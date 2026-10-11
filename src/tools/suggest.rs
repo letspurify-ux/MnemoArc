@@ -497,11 +497,11 @@ fn document_action(received: &str, siblings: &Value, batch: bool) -> Option<Sugg
             } else if sectioned {
                 chosen(
                     "section",
-                    "it replaces the named section, including its heading, and needs expected_section_hash",
+                    "it replaces the named section, including its heading, and needs expected_section_hash or the current expected_hash",
                 )
             } else {
                 options(
-                    "use replace_text with old_text for a passage, section with section and expected_section_hash for a whole section, or write to replace the whole document",
+                    "use replace_text with old_text for a passage, section with section and expected_section_hash (or expected_hash) for a whole section, or write to replace the whole document",
                 )
             }
         }

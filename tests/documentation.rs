@@ -4764,3 +4764,74 @@ The loop inside `drive` repeats (src.rs:2-4).\n\
         "{written}"
     );
 }
+
+// Live run 2026-10-11: a section edit sent expected_section_hash without
+// expected_hash, then expected_hash without expected_section_hash, and was
+// refused four times. Either hash pins the section it replaces.
+#[test]
+fn a_section_edit_needs_either_its_section_hash_or_the_document_hash() {
+    let (_dir, mut s) = source_setup();
+    let body = "# Guide\n## One\nFirst.\n## Two\nSecond.\n";
+    std::fs::write(&s.project.output, body).unwrap();
+    let section_hash = |s: &mut Session, heading: &str| {
+        run(s, "document_inspect", json!({"section":heading}))["section_hash"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    // Before this task saves the document, neither hash is refused.
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":"## Two","text":"## Two\nUnpinned.\n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("missing_argument: expected_section_hash for document_edit action=section; action=section needs text, section, expected_section_hash; the current expected_hash may stand in for expected_section_hash"),
+        "{error}"
+    );
+    let one = section_hash(&mut s, "## One");
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":"## One","expected_section_hash":one,"text":"## One\nFirst, fixed.\n"}),
+    );
+    let hash = saved["hash"].as_str().unwrap().to_owned();
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":"## Two","expected_hash":hash,"text":"## Two\nSecond, fixed.\n"}),
+    );
+    let hash = saved["hash"].as_str().unwrap().to_owned();
+    let saved = run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":hash,"edits":[{"action":"section","section":"## One","text":"## One\nFirst, again.\n"}]}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\n## One\nFirst, again.\n## Two\nSecond, fixed.\n",
+        "{saved}"
+    );
+    // A stale hash of either kind is still refused.
+    let edit = |extra: Value| {
+        let mut args = json!({"action":"section","section":"## Two","text":"## Two\nStale.\n"});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        args
+    };
+    for (extra, refused) in [
+        (
+            json!({"expected_section_hash":one}),
+            "section_revision_conflict",
+        ),
+        (json!({"expected_hash":hash}), "document_revision_conflict"),
+    ] {
+        let error = tools::execute(&mut s, "document_edit", edit(extra))
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with(refused), "{error}");
+    }
+}

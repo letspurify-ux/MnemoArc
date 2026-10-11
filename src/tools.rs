@@ -389,7 +389,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit",
-                description: "Edit ONLY configured Markdown output. Save one section at a time as its evidence is read. Every save returns the outline; copy section_path from it when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition (a supplied hash is still checked). Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and also requires expected_section_hash; its text must retain the original full heading. fix_word replaces one garbled word reported as a mixed_script_word issue: send its fix_id and the whole word rewritten as text, without copying the garbled characters. In the source_document workflow every save returns citation_check with unread cited ranges; do not patch workflow. Returns measured lines, new hash and the outline",
+                description: "Edit ONLY configured Markdown output. Save one section at a time as its evidence is read. Every save returns the outline; copy section_path from it when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition (a supplied hash is still checked). Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and needs expected_section_hash (its section_hash) or the current expected_hash; its text must retain the original full heading. fix_word replaces one garbled word reported as a mixed_script_word issue: send its fix_id and the whole word rewritten as text, without copying the garbled characters. In the source_document workflow every save returns citation_check with unread cited ranges; do not patch workflow. Returns measured lines, new hash and the outline",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -399,7 +399,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit_batch",
-                description: "Apply 1..32 related edits to the existing configured Markdown output in order using one base expected_hash. Each edit is write, append, insert_before, insert_after, insert_first_child, insert_last_child, patch, replace_text, delete_text, insert_before_text, insert_after_text, section or fix_word (fix_id of a mixed_script_word issue plus the whole word rewritten as text) and observes prior edits. Copy section_path from document_inspect for repeated headings. Sibling insertion uses a same-level section anchor; child insertion uses a parent section and a heading one level deeper. Text edits use an exact unique old_text anchor, optionally within section. If insertion text contains that exact old_text once, it is treated as a replacement to avoid duplication; prefer replace_text for rewrites. All edits are prepared in memory and persisted only if every operation succeeds. Use this for related corrections from one snapshot; save new sections as their evidence is read. section replaces descendants and requires expected_section_hash.",
+                description: "Apply 1..32 related edits to the existing configured Markdown output in order using one base expected_hash. Each edit is write, append, insert_before, insert_after, insert_first_child, insert_last_child, patch, replace_text, delete_text, insert_before_text, insert_after_text, section or fix_word (fix_id of a mixed_script_word issue plus the whole word rewritten as text) and observes prior edits. Copy section_path from document_inspect for repeated headings. Sibling insertion uses a same-level section anchor; child insertion uses a parent section and a heading one level deeper. Text edits use an exact unique old_text anchor, optionally within section. If insertion text contains that exact old_text once, it is treated as a replacement to avoid duplication; prefer replace_text for rewrites. All edits are prepared in memory and persisted only if every operation succeeds. Use this for related corrections from one snapshot; save new sections as their evidence is read. section replaces descendants; the batch's expected_hash pins it, so its expected_section_hash is optional.",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -694,7 +694,7 @@ impl ToolRegistry {
                         {"type":"object","properties":{"action":{"enum":["insert_before","insert_after","insert_first_child","insert_last_child"]},"text":fields["text"],"expected_hash":fields["expected_hash"],"section":fields["section"]},"required":["text","expected_hash","section"],"additionalProperties":false},
                         {"type":"object","properties":{"action":{"enum":["patch","replace_text","insert_before_text","insert_after_text"]},"text":fields["text"],"expected_hash":fields["expected_hash"],"old_text":fields["old_text"],"section":fields["section"]},"required":["text","old_text"],"additionalProperties":false},
                         {"type":"object","properties":{"action":{"const":"delete_text"},"expected_hash":fields["expected_hash"],"old_text":fields["old_text"],"section":fields["section"]},"required":["old_text"],"additionalProperties":false},
-                        {"type":"object","properties":{"action":{"const":"section"},"text":fields["text"],"expected_hash":fields["expected_hash"],"section":fields["section"],"expected_section_hash":fields["expected_section_hash"]},"required":["text","expected_hash","section","expected_section_hash"],"additionalProperties":false},
+                        {"type":"object","properties":{"action":{"const":"section"},"text":fields["text"],"expected_hash":fields["expected_hash"],"section":fields["section"],"expected_section_hash":fields["expected_section_hash"]},"required":["text","section"],"additionalProperties":false},
                         {"type":"object","properties":{"action":{"const":"fix_word"},"fix_id":fields["fix_id"],"text":fields["text"],"expected_hash":fields["expected_hash"]},"required":["fix_id","text"],"additionalProperties":false}
                     ]);
                 }
@@ -707,7 +707,7 @@ impl ToolRegistry {
                             {"type":"object","properties":{"action":{"enum":["insert_before","insert_after","insert_first_child","insert_last_child"]},"text":item_fields["text"],"section":item_fields["section"]},"required":["action","text","section"],"additionalProperties":false},
                             {"type":"object","properties":{"action":{"enum":["patch","replace_text","insert_before_text","insert_after_text"]},"text":item_fields["text"],"old_text":item_fields["old_text"],"section":item_fields["section"]},"required":["action","text","old_text"],"additionalProperties":false},
                             {"type":"object","properties":{"action":{"const":"delete_text"},"old_text":item_fields["old_text"],"section":item_fields["section"]},"required":["action","old_text"],"additionalProperties":false},
-                            {"type":"object","properties":{"action":{"const":"section"},"text":item_fields["text"],"section":item_fields["section"],"expected_section_hash":item_fields["expected_section_hash"]},"required":["action","text","section","expected_section_hash"],"additionalProperties":false},
+                            {"type":"object","properties":{"action":{"const":"section"},"text":item_fields["text"],"section":item_fields["section"],"expected_section_hash":item_fields["expected_section_hash"]},"required":["action","text","section"],"additionalProperties":false},
                             {"type":"object","properties":{"action":{"const":"fix_word"},"fix_id":item_fields["fix_id"],"text":item_fields["text"]},"required":["action","fix_id","text"],"additionalProperties":false}
                         ]
                     });
@@ -1058,7 +1058,7 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
     let action = args["action"].as_str().unwrap_or("");
     // Name every missing field of this action at once; a live model fixed
     // text and then failed again on the missing old_text.
-    let needed = document_edit_needs(action);
+    let needed = section_edit_needs(action, args.get("expected_hash").is_some());
     let missing: Vec<&str> = needed
         .iter()
         .copied()
@@ -1106,7 +1106,9 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
     // A missing hash is reported when the edit runs, together with any
     // problem the edit has against the current document, so one retry fixes
     // both. Argument errors found here mention it for the same reason.
-    let hash_deferred = requires_document_hash(action) && args.get("expected_hash").is_none();
+    let hash_deferred = requires_document_hash(action)
+        && args.get("expected_hash").is_none()
+        && !(action == "section" && args.get("expected_section_hash").is_some());
     let also_hash = |error: anyhow::Error| {
         if hash_deferred {
             anyhow::anyhow!("{error}; expected_hash is also missing")
@@ -1118,6 +1120,8 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
     if let [first, rest @ ..] = missing.as_slice() {
         let whole = if action == "section" && missing.contains(&"section") {
             WHOLE_DOCUMENT_HINT
+        } else if action == "section" && missing.contains(&"expected_section_hash") {
+            "; the current expected_hash may stand in for expected_section_hash"
         } else {
             ""
         };
@@ -1156,7 +1160,9 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
         }
         "section" => {
             require("section").map_err(|error| anyhow::anyhow!("{error}{WHOLE_DOCUMENT_HINT}"))?;
-            require("expected_section_hash")?;
+            if args.get("expected_hash").is_none() || args.get("expected_section_hash").is_some() {
+                require("expected_section_hash")?;
+            }
         }
         "insert_before" | "insert_after" | "insert_first_child" | "insert_last_child" => {
             require("section")?;
@@ -1171,6 +1177,18 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
 /// live model sent its complete text that way, section "", and was told only
 /// that section must not be empty.
 const WHOLE_DOCUMENT_HINT: &str = "; action=section replaces the one section its section heading names (copy the heading from the document_inspect outline). To replace the whole document, use action=write with expected_hash and the complete text";
+
+/// What a document edit needs (document_edit_needs), except that a section
+/// edit pinned by the document's expected_hash needs no section hash: that
+/// hash fixes the section too. A live model sent one hash or the other for
+/// the same section edit four times and was refused each time.
+fn section_edit_needs(action: &str, document_hash: bool) -> &'static [&'static str] {
+    if action == "section" && document_hash {
+        &["text", "section"]
+    } else {
+        document_edit_needs(action)
+    }
+}
 
 /// Fields a document edit action needs besides action and expected_hash,
 /// text first (the order errors have always used).
@@ -1739,7 +1757,7 @@ fn validate_document_edit_batch_edits(args: &Value) -> Result<()> {
         {
             bail!("invalid_argument_value: edits[{index}].action is not a supported document edit");
         }
-        let needed = document_edit_needs(action);
+        let needed = section_edit_needs(action, true);
         let missing: Vec<&str> = needed
             .iter()
             .copied()
@@ -1804,16 +1822,18 @@ fn validate_document_edit_batch_edits(args: &Value) -> Result<()> {
                 if section.trim().is_empty() {
                     bail!("invalid_argument_value: edits[{index}].section must not be empty");
                 }
-                let section_hash_value = object.get("expected_section_hash").ok_or_else(|| {
-                    anyhow::anyhow!("missing_argument: edits[{index}].expected_section_hash")
-                })?;
-                let section_hash = section_hash_value.as_str().ok_or_else(|| {
-                    anyhow::anyhow!("invalid_argument_type: edits[{index}].expected_section_hash")
-                })?;
-                if section_hash.trim().is_empty() {
-                    bail!(
-                        "invalid_argument_value: edits[{index}].expected_section_hash must not be empty"
-                    );
+                // Optional: the batch's expected_hash pins every section.
+                if let Some(section_hash_value) = object.get("expected_section_hash") {
+                    let section_hash = section_hash_value.as_str().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid_argument_type: edits[{index}].expected_section_hash"
+                        )
+                    })?;
+                    if section_hash.trim().is_empty() {
+                        bail!(
+                            "invalid_argument_value: edits[{index}].expected_section_hash must not be empty"
+                        );
+                    }
                 }
                 if object.contains_key("old_text") {
                     bail!(
@@ -2650,12 +2670,11 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             let heading = text(args, "section")?;
             let resolved = documentation::resolve_heading(old, heading)?;
             let target = &old[resolved.start..resolved.end];
-            check_section_hash(
-                old,
-                target,
-                &resolved.heading,
-                args["expected_section_hash"].as_str().unwrap_or(""),
-            )?;
+            // Without a section hash the caller pinned the whole document
+            // with expected_hash (section_edit_needs).
+            if let Some(expected) = args["expected_section_hash"].as_str() {
+                check_section_hash(old, target, &resolved.heading, expected)?;
+            }
             if new.lines().next().map(str::trim) != target.lines().next().map(str::trim) {
                 bail!("invalid_argument_value: section replacement must retain its heading");
             }
@@ -3589,7 +3608,6 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
                     | "insert_last_child"
                     | "section"
             ),
-            "expected_section_hash" => action == "section",
             "fix_id" => action == "fix_word",
             // A blank expected_hash is a placeholder, read as omitted:
             // anchored text edits need none, and the others report a
@@ -5799,7 +5817,10 @@ fn execute_repaired(
             // Anchored text edits match an exact old_text once in the current
             // document; that match is their precondition, so a hash is
             // optional for them. A supplied hash is still enforced.
-            let anchored = is_anchored_text_edit(action);
+            // A section edit's expected_section_hash pins the section it
+            // replaces, as an exact old_text pins a passage.
+            let anchored = is_anchored_text_edit(action)
+                || (action == "section" && args["expected_section_hash"].is_string());
             let omitted = args.get("expected_hash").is_none();
             if exists && action != "create" && !anchored && args["expected_hash"].as_str().is_none()
             {

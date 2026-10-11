@@ -1491,7 +1491,7 @@ fn every_missing_field_of_an_edit_action_is_named_together() {
     );
     assert_eq!(
         result["error"],
-        "missing_argument: edits[0].section is required for action=section; expected_section_hash is also missing; action=section needs text, section, expected_section_hash"
+        "missing_argument: edits[0].section is required for action=section; action=section needs text, section"
     );
 
     // file_patch operations name the action and where a field belongs.
