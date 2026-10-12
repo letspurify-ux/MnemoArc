@@ -2517,6 +2517,26 @@ async fn the_first_final_compares_the_document_with_the_request_once() {
         "{error}"
     );
 
+    // And sections showing code that cite no lines (live run 2026-10-12:
+    // unread functions shown as code beside "these functions still need
+    // reading" passed every check). A cited section and a command block
+    // are not named.
+    let (_dir, mut s) = saved_fixture();
+    s.progress_recovery.coverage_checked = false;
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":hash,"text":"\n# Finish\nThe run ends here:\n\n```js\nfunction finish(turns) { return turns; }\n```\n\n# Cited\nThe loop calls work. main.js:3-5\n\n```js\nwork(turns);\n```\n\n# Usage\n\n```bash\nnode main.js\n```\n"}),
+    )
+    .unwrap();
+    let (_, guidance) = run_scripted(s, vec![final_answer(), final_answer()]).await;
+    let error = guidance[1]["finalization_error"].as_str().unwrap();
+    assert!(
+        error.ends_with(r##" Also, 1 section(s) show code but cite no source lines: line 7 "# Finish" (js code at line 10). Read where that code is defined, make the block match it and cite its path:start-end in the section, or say in the text that the block is only an example."##),
+        "{error}"
+    );
+
     // A document that already covers the request just answers again; the
     // check is not repeated.
     let (_dir, mut s) = saved_fixture();

@@ -1692,6 +1692,20 @@ fn an_update_carrying_a_result_says_the_item_is_still_unfinished() {
             .contains(r#"send {"op":"complete","id":"T1""#),
         "{result}"
     );
+    // Live run 2026-10-12: update with a result and no text was refused
+    // only for the missing text; the refusal now names complete.
+    let result = apply(
+        &mut s,
+        json!([{"op":"update","id":"T1","result":"Completed reading main.rs entry points"}]),
+    );
+    assert_eq!(result["applied"], false, "{result}");
+    let reason = result["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("update changes an item's text and has none here")
+            && reason.contains(r#"send {"op":"complete","id":"T1","result":"<observed result>"}"#),
+        "{reason}"
+    );
+    assert!(!s.task.todos[0].done);
     // A placeholder result from schema-filling providers stays silent.
     let result = apply(
         &mut s,

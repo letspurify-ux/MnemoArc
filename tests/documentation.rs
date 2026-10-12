@@ -4774,6 +4774,27 @@ The loop inside `drive` repeats (src.rs:2-4).\n\
     );
 }
 
+// Live run 2026-10-12: a section showed two unread functions as code and
+// cited nothing, and the document passed every check. A citation in the
+// heading, a code comment, a footnote or the parent section's own text
+// counts; the document title's intro does not, nor does a command block
+// need one.
+#[test]
+fn sections_showing_code_without_any_citation_are_named() {
+    let (_dir, s) = source_setup();
+    let doc = "# Guide\nIntro cites src.rs:1-2.\n\
+## Shown\n```rust\nfn drive() {}\n```\n\
+## Commented\n```rust\nfn drive() {} // src.rs:1\n```\n\
+## Noted\nThe loop[^1].\n```rust\nloop {}\n```\n\
+## Parent src.rs:2-4\n### Excerpt\n```rust\nstep(state);\n```\n\
+## Usage\n```bash\ncargo run\n```\n\n[^1]: src.rs:2-4\n";
+    std::fs::write(&s.project.output, doc).unwrap();
+    assert_eq!(
+        tools::uncited_code(&s).unwrap(),
+        json!({"flagged":1,"items":[{"line":3,"heading":"## Shown","code_line":4,"language":"rust"}]})
+    );
+}
+
 // Live run 2026-10-11: a section edit sent expected_section_hash without
 // expected_hash, then expected_hash without expected_section_hash, and was
 // refused four times. Either hash pins the section it replaces.

@@ -491,8 +491,33 @@ fn coverage_check(s: &mut Session) -> Option<String> {
             )
         })
         .unwrap_or_default();
+    // A live document finished with unread functions shown as code in a
+    // section that cited nothing.
+    let uncited = tools::uncited_code(s)
+        .map(|check| {
+            let items: Vec<String> = check["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|item| {
+                    format!(
+                        "line {} {} ({} code at line {})",
+                        item["line"],
+                        item["heading"],
+                        item["language"].as_str().unwrap_or(""),
+                        item["code_line"]
+                    )
+                })
+                .collect();
+            format!(
+                " Also, {} section(s) show code but cite no source lines: {}. Read where that code is defined, make the block match it and cite its path:start-end in the section, or say in the text that the block is only an example.",
+                check["flagged"],
+                items.join("; ")
+            )
+        })
+        .unwrap_or_default();
     Some(format!(
-        "request_coverage_check: before finishing, compare the saved document with latest_request. Its headings are: {}{more}. Check that a section explains each part the request asks for; for a flow or procedure, every step from its start to its end. If a part has no section, add a task_plan item for it and write that section from source you have read (read more first if needed). If every part is covered, give the final answer again. Do not add a section that only lists coverage or checks.{mismatches}",
+        "request_coverage_check: before finishing, compare the saved document with latest_request. Its headings are: {}{more}. Check that a section explains each part the request asks for; for a flow or procedure, every step from its start to its end. If a part has no section, add a task_plan item for it and write that section from source you have read (read more first if needed). If every part is covered, give the final answer again. Do not add a section that only lists coverage or checks.{mismatches}{uncited}",
         headings.join(" | ")
     ))
 }

@@ -6562,6 +6562,13 @@ pub fn citation_mismatches(s: &Session) -> Option<Value> {
     documentation::citation_mismatch_check(s, &path, &doc)
 }
 
+/// Changed sections showing source code with no citation (advice).
+pub fn uncited_code(s: &Session) -> Option<Value> {
+    let path = output_path(&s.project).ok()?;
+    let doc = read_text(&path).ok()?;
+    documentation::uncited_code_check(s, &path, &doc)
+}
+
 pub fn unread_citations(s: &Session) -> Result<Vec<Value>> {
     let doc = read_text(&output_path(&s.project)?)?;
     documentation::unread_citations(s, &doc)

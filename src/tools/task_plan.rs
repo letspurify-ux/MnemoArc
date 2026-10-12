@@ -673,11 +673,22 @@ fn parse_operations(value: &Value) -> Result<Parsed> {
                     json!({"code":"invalid_operations","operation_index":i,"operation":"update","target_id":id}),
                 ));
             }
-            if object
+            let has_result = object
                 .get("result")
                 .and_then(Value::as_str)
-                .is_some_and(|result| result.trim().chars().count() >= 8)
-            {
+                .is_some_and(|result| result.trim().chars().count() >= 8);
+            // A live model recorded a result with update and no text; the
+            // error only said text was missing, so it took another request
+            // to find complete.
+            if has_result && object.get("text").is_none_or(filler) {
+                return Err(operation_error(
+                    format!(
+                        "operations[{i}]: update changes an item's text and has none here; result belongs to complete, so to finish {id} after doing its work, send {{\"op\":\"complete\",\"id\":\"{id}\",\"result\":\"<observed result>\"}}"
+                    ),
+                    json!({"code":"invalid_operations","operation_index":i,"operation":"update","target_id":id}),
+                ));
+            }
+            if has_result {
                 notices.push(format!(
                     "operations[{i}]: update changes only an item's text, so result was ignored and {id} is still unfinished; to finish it after doing its work, send {{\"op\":\"complete\",\"id\":\"{id}\",\"result\":...}}"
                 ));

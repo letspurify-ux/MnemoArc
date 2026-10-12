@@ -1327,6 +1327,142 @@ pub(super) fn citation_mismatch_check(s: &Session, output: &Path, doc: &str) -> 
         .then(|| json!({"flagged":total,"items":items,"guidance":CITATION_MISMATCH_GUIDANCE}))
 }
 
+const UNCITED_CODE_LIMIT: usize = 8;
+
+/// Fence languages for commands, output, data and diagrams rather than code.
+const NON_SOURCE_FENCES: &[&str] = &[
+    "mermaid",
+    "text",
+    "txt",
+    "plain",
+    "plaintext",
+    "console",
+    "terminal",
+    "shell",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "powershell",
+    "ps1",
+    "cmd",
+    "bat",
+    "output",
+    "log",
+    "json",
+    "jsonc",
+    "json5",
+    "toml",
+    "yaml",
+    "yml",
+    "ini",
+    "env",
+    "csv",
+    "markdown",
+    "md",
+    "http",
+];
+
+/// Sections this task wrote or changed that show code in a source-language
+/// fence and cite no lines in their own text, up to the next heading of any
+/// level. A live document finished with a section showing two functions it
+/// had never read, then "source: `src/agent.rs` (these functions still need
+/// reading)", and passed every check, since checks only look at citations.
+/// A citation anywhere in the section counts, including its heading, code
+/// comments (`// src/session.rs:431-442`) and footnotes it refers to: other
+/// live documents cite code that way. So does one in its parent's own text,
+/// below the title level, as when a `### ... src/session.rs:330-386`
+/// heading leads a `#### Fields` excerpt. Advice only; None when nothing is
+/// flagged.
+pub(super) fn uncited_code_check(s: &Session, output: &Path, doc: &str) -> Option<Value> {
+    let pattern = regex::Regex::new(CITATION_PATTERN).ok()?;
+    let note = regex::Regex::new(r"^ {0,3}\[\^([^\]]+)\]:").ok()?;
+    let lines: Vec<&str> = doc.lines().collect();
+    let cited_notes: Vec<String> = lines
+        .iter()
+        .filter_map(|line| {
+            let label = note.captures(line)?;
+            let rest = &line[label.get(0)?.end()..];
+            pattern.is_match(rest).then(|| format!("[^{}]", &label[1]))
+        })
+        .collect();
+    let cites = |line: &&str| {
+        pattern.is_match(line)
+            || cited_notes
+                .iter()
+                .any(|label| line.contains(label.as_str()))
+    };
+    let unchanged = unchanged_sections(s, output, doc);
+    let headings = headings(doc);
+    let mut items = Vec::new();
+    let mut total = 0usize;
+    // One-based lines of a heading and its own text.
+    let own = |index: usize| {
+        headings[index].line
+            ..headings
+                .get(index + 1)
+                .map_or(lines.len() + 1, |next| next.line)
+    };
+    let cited = |index: usize| {
+        let lines_of = own(index);
+        lines[lines_of.start - 1..lines_of.end - 1]
+            .iter()
+            .any(cites)
+    };
+    for (index, heading) in headings.iter().enumerate() {
+        let parent = headings[..index]
+            .iter()
+            .rposition(|prior| prior.level < heading.level)
+            .filter(|&parent| headings[parent].level >= 2);
+        if unchanged(heading.line) || cited(index) || parent.is_some_and(cited) {
+            continue;
+        }
+        let own = own(index);
+        let mut fence: Option<(char, usize)> = None;
+        let mut code = None;
+        for number in own.skip(1) {
+            let Some(line) = lines.get(number - 1) else {
+                break;
+            };
+            let trimmed = line.trim_start_matches(' ');
+            if line.len() - trimmed.len() > 3 {
+                continue;
+            }
+            let first = trimmed.chars().next().unwrap_or(' ');
+            if first != '`' && first != '~' {
+                continue;
+            }
+            let run = trimmed.chars().take_while(|c| *c == first).count();
+            if let Some((marker, width)) = fence {
+                if first == marker && run >= width && trimmed[run..].trim().is_empty() {
+                    fence = None;
+                }
+            } else if run >= 3 {
+                fence = Some((first, run));
+                let language = trimmed[run..]
+                    .trim()
+                    .trim_start_matches(['{', '.'])
+                    .split(|c: char| c.is_whitespace() || matches!(c, ',' | '}'))
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if !language.is_empty() && !NON_SOURCE_FENCES.contains(&language.as_str()) {
+                    code = Some((number, language));
+                    break;
+                }
+            }
+        }
+        if let Some((code_line, language)) = code {
+            total += 1;
+            if items.len() < UNCITED_CODE_LIMIT {
+                items.push(json!({"line":heading.line,"heading":heading.heading,
+                    "code_line":code_line,"language":language}));
+            }
+        }
+    }
+    (total > 0).then(|| json!({"flagged":total,"items":items}))
+}
+
 struct CitationFence {
     marker: char,
     width: usize,
