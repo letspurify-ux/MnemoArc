@@ -1,7 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { fieldKeys, parseValue, inputValue } from "../src/fields.js";
+import {
+  autoBudget,
+  fieldKeys,
+  parseValue,
+  inputValue,
+} from "../src/fields.js";
 import {
   linkTarget,
   imageTarget,
@@ -74,6 +79,18 @@ test("UI units and optional values round trip without silent zeroes", () => {
   assert.equal(parseValue("0.1", "kib"), 102);
   for (const bytes of [1, 102, 104858, 16777217])
     assert.equal(parseValue(inputValue(bytes, "mib"), "mib"), bytes);
+});
+test("empty result budgets show the value the server derives", () => {
+  // Config::result_budget and batch_budget: context_tokens / 32 and / 16,
+  // at least 200. The placeholder must show the same numbers.
+  assert.equal(autoBudget("result_tokens", { context_tokens: 230000 }), 7187);
+  assert.equal(autoBudget("batch_tokens", { context_tokens: 230000 }), 14375);
+  assert.equal(autoBudget("result_tokens", { context_tokens: 64000 }), 2000);
+  assert.equal(autoBudget("batch_tokens", { context_tokens: 64000 }), 4000);
+  assert.equal(autoBudget("result_tokens", { context_tokens: 1000 }), 200);
+  assert.equal(autoBudget("state_tokens", { context_tokens: 230000 }), null);
+  assert.equal(autoBudget("batch_tokens", { context_tokens: "" }), null);
+  assert.equal(autoBudget("batch_tokens", undefined), null);
 });
 test("reused chat preserves unicode and blocks executable links", () => {
   assert.equal(sliceSafe("a😀b", 2), "a");

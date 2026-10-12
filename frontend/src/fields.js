@@ -119,12 +119,17 @@ export const groups = [
         "number",
         "기억 인덱스의 기본 예산은 최신 항목당 160 토큰 + 공통 128 토큰이며, 큰 항목은 예산에 맞춰 상태에서 생략되고 memory_find/read로 조회할 수 있습니다.",
       ],
-      ["result_tokens", "조회 결과 한도", "number", "도구 한 번의 결과 토큰"],
+      [
+        "result_tokens",
+        "조회 결과 한도",
+        "optionalNumber",
+        "도구 한 번의 결과 토큰. 비우면 요청 컨텍스트 예산의 1/32로 자동 계산합니다.",
+      ],
       [
         "batch_tokens",
         "도구 묶음 결과 한도",
-        "number",
-        "한 응답의 전체 도구 결과 토큰",
+        "optionalNumber",
+        "한 응답의 전체 도구 결과 토큰. 비우면 요청 컨텍스트 예산의 1/16로 자동 계산합니다.",
       ],
       [
         "checkpoint_tokens",
@@ -197,6 +202,16 @@ export const groups = [
   },
 ];
 export const fieldKeys = ["database", ...groups.flatMap((g) => g.fields.map((f) => f[0]))];
+// Budgets the server derives from context_tokens when they are left empty
+// (Config::result_budget and Config::batch_budget in src/config.rs).
+export const AUTO_BUDGET_SHARES = { result_tokens: 32, batch_tokens: 16 };
+export function autoBudget(name, draft) {
+  const share = AUTO_BUDGET_SHARES[name];
+  const context = Number(draft?.context_tokens);
+  if (!share || draft?.context_tokens === "" || !Number.isFinite(context) || context <= 0)
+    return null;
+  return Math.max(200, Math.floor(context / share));
+}
 export const unitScale = (type) =>
   type === "kib"
     ? 1024

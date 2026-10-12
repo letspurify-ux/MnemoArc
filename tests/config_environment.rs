@@ -226,6 +226,87 @@ fn a_missing_config_file_loads_the_live_tested_settings() {
 }
 
 #[test]
+fn unset_result_budgets_follow_the_context_and_set_ones_are_kept() {
+    use mnemoarc::config::{BATCH_SHARE, Config, MIN_RESULT_TOKENS, RESULT_SHARE};
+
+    // The live-tested defaults derive both budgets from the context: the
+    // fixed 8,000 / 4,000 held a 230K request to 3.5% of new results.
+    let config = Config::default();
+    assert_eq!((config.result_tokens, config.batch_tokens), (None, None));
+    assert_eq!(config.batch_budget(), 230000 / BATCH_SHARE);
+    assert_eq!(config.result_budget(), 230000 / RESULT_SHARE);
+    assert_eq!(
+        (config.batch_budget(), config.result_budget()),
+        (14375, 7187)
+    );
+    config.validate().unwrap();
+    // The compact 64K test profile keeps its explicit values.
+    let compact = support::compact_config();
+    assert_eq!(
+        (compact.batch_budget(), compact.result_budget()),
+        (8000, 4000)
+    );
+    // A set value wins over the derived one; a tiny context still gets the
+    // minimum, which validate then rejects against the other limits.
+    let fixed = Config {
+        result_tokens: Some(1000),
+        ..Config::default()
+    };
+    assert_eq!(fixed.result_budget(), 1000);
+    assert_eq!(fixed.batch_budget(), 14375);
+    let tiny = Config {
+        context_tokens: 3200,
+        ..Config::default()
+    };
+    assert_eq!(tiny.result_budget(), MIN_RESULT_TOKENS);
+    assert_eq!(tiny.batch_budget(), MIN_RESULT_TOKENS);
+    assert!(tiny.validate().is_err());
+    // A set result larger than the derived batch names both values.
+    let error = Config {
+        result_tokens: Some(20000),
+        ..Config::default()
+    }
+    .validate()
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("result_tokens 20000 exceeds batch_tokens 14375"),
+        "{error}"
+    );
+    // Unset budgets save as omitted keys and load unset; set ones round trip.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    Config::default().save(&path).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains("result_tokens"), "{saved}");
+    assert!(!saved.contains("batch_tokens"), "{saved}");
+    let loaded = Config::load(&path, &Default::default()).unwrap();
+    assert_eq!((loaded.result_tokens, loaded.batch_tokens), (None, None));
+    Config {
+        result_tokens: Some(6000),
+        batch_tokens: Some(12000),
+        ..Config::default()
+    }
+    .save(&path)
+    .unwrap();
+    let loaded = Config::load(&path, &Default::default()).unwrap();
+    assert_eq!(
+        (loaded.result_tokens, loaded.batch_tokens),
+        (Some(6000), Some(12000))
+    );
+    // A larger context leaves more room in each request than before.
+    let large = Config {
+        context_tokens: 1_000_000,
+        ..Config::default()
+    };
+    assert_eq!(
+        (large.batch_budget(), large.result_budget()),
+        (62500, 31250)
+    );
+    large.validate().unwrap();
+}
+
+#[test]
 fn cleared_optional_settings_survive_save_and_load() {
     use mnemoarc::config::Config;
 

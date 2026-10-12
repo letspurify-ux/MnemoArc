@@ -214,7 +214,7 @@ fn small_results_keep_the_operation_correction_visible() {
         apply(&mut s, json!([{"op":"insert","texts":descriptions}]))["applied"],
         true
     );
-    s.config.result_tokens = 200;
+    s.config.result_tokens = Some(200);
     let call = ToolCall {
         id: "bad-shape".into(),
         name: "task_plan".into(),
@@ -237,7 +237,7 @@ fn small_results_keep_the_operation_correction_visible() {
 fn small_result_budget_preserves_successful_plan_revision() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
-    s.config.result_tokens = 200;
+    s.config.result_tokens = Some(200);
     let call = ToolCall {
         id: "long-success".into(),
         name: "task_plan".into(),
@@ -496,7 +496,7 @@ fn full_plan_and_stale_revision_do_not_fail_or_lose_work() {
     assert_eq!(listed.len(), 100);
     assert_eq!(listed.first().unwrap(), "T1");
     assert_eq!(listed.last().unwrap(), "T100");
-    s.config.result_tokens = 1000;
+    s.config.result_tokens = Some(1000);
     let page_call = ToolCall {
         id: "bounded-plan-page".into(),
         name: "task_plan".into(),
@@ -1353,7 +1353,7 @@ fn small_plan_conflicts_preserve_machine_fields_and_archive_all_blockers() {
     let mut s = session(dir.path());
     let texts: Vec<_> = (1..=100).map(|n| format!("Finish outcome {n}")).collect();
     apply(&mut s, json!([{"op":"insert","texts":texts}]));
-    s.config.result_tokens = 200;
+    s.config.result_tokens = Some(200);
     let call = ToolCall {
         id: "many-blockers".into(),
         name: "task_plan".into(),

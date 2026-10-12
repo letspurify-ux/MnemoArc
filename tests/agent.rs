@@ -956,8 +956,8 @@ async fn summary_reads_share_budget_and_continue_without_history_or_writes() {
     }
     let mut session = s(dir.path());
     session.config.context_tokens = 128000;
-    session.config.result_tokens = 4000;
-    session.config.batch_tokens = 8000;
+    session.config.result_tokens = Some(4000);
+    session.config.batch_tokens = Some(8000);
     session.add_user("기존 문서에서 backend 부분만 mermaid로 요약해줘".into());
     let (tx, mut rx) = mpsc::channel(128);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });

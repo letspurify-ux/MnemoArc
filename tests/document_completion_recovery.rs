@@ -1000,8 +1000,8 @@ impl LlmClient for OversizedToolBatch {
 async fn oversized_tool_batch_can_be_split_without_executing_rejected_writes() {
     for (batch_size, provider_rejects) in [(3, false), (33, false), (33, true)] {
         let (_dir, mut s) = fixture();
-        s.config.batch_tokens = 400;
-        s.config.result_tokens = 400;
+        s.config.batch_tokens = Some(400);
+        s.config.result_tokens = Some(400);
         let client = Arc::new(OversizedToolBatch {
             client: DocumentClient {
                 path: s.project.output.clone(),
@@ -1085,8 +1085,8 @@ async fn oversized_batch_before_any_workflow_is_retried_not_fatal() {
             context_tokens: 128_000,
             run_tokens: 1_000_000,
             output_tokens: 1024,
-            batch_tokens: 400,
-            result_tokens: 400,
+            batch_tokens: Some(400),
+            result_tokens: Some(400),
             ..support::compact_config()
         },
     );

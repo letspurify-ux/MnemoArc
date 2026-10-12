@@ -12,6 +12,8 @@ pub fn compact_config() -> Config {
         model_context: None,
         context_tokens: 64000,
         output_tokens: 8000,
+        result_tokens: Some(4000),
+        batch_tokens: Some(8000),
         reasoning_effort: None,
         memory_body_bytes: 8192,
         memory_bytes: 16 * 1024 * 1024,

@@ -404,3 +404,12 @@ apodex(apodex/apodex-1.1-mini:free)로 같은 요청을 실행했을 때(192라�
 - 세션 API와 모델 상태에서 `document_review`를, 실행 기록에서 `document_review_failure`를 뺐다. 화면의 **소스 문서 검토**·**문서 검토 집중 복구 기준** 설정과 `문서 검토` 진행 단계 표시도 없앴다.
 - 기존 설정 파일의 `source_document_review`·`review_limit` 항목은 읽을 때 무시하고 다음 저장에서 지운다.
 - 검토 전용 회귀 테스트(`tests/document_review.rs`, `tests/document_review_findings.rs`), 유료 검토 평가(`glm_rejects_missing_required_ui_steps`, `registered_user_manual_review_preserves_citations`), 기존 문서 검토 예제(`examples/verify_existing_document.rs`)를 지웠다. 위 날짜별 기록의 검토 관련 회귀 테스트 이름은 당시 기록이다. 요청 사용량 집계 테스트는 일반 모델 요청으로 옮겼다(`agent::usage_tests`).
+
+## 도구 결과 예산의 컨텍스트 비례 기본값과 답변 프롬프트 파생 검사 (2026-10-12)
+
+2026-10-12 라이브 실행 두 건(nemotron, qwen, 컨텍스트 230K·출력 32K)을 라운드별로 보면, 요청당 고정 접두(시스템 프롬프트·도구 정의·상태)는 12.5K~14.1K 토큰, 요청당 입력은 초반 약 45K에서 후반 약 80K로 늘고, 체크포인트는 약 116K 요청에서 한 번 걸려 다음 요청을 약 62K로 줄였다. 200~500줄 문서에 45~47회 요청, 입력 3.4M 토큰이 들었고 캐시 토큰은 보고되지 않았다. 매 요청이 히스토리 전체를 다시 보내므로 라운드 수가 총비용을 정하는데, 도구 결과 예산 `batch_tokens` 8,000·`result_tokens` 4,000은 64K 컨텍스트 때 정한 값이라 230K에서는 요청마다 컨텍스트의 3.5%만 새 결과로 채우고 2,000줄 읽기가 항상 잘려 커서 이어 읽기 라운드를 만들었다(두 실행의 `file_read` 30회 이상).
+
+- 두 설정을 선택 값으로 바꿨다. 비워 두면 `Config::batch_budget`·`result_budget`이 `context_tokens / 16`과 `/ 32`(`BATCH_SHARE`·`RESULT_SHARE`, 최소 200)로 계산하고, 숫자를 적으면 그대로 쓴다. 128K에서 이전 고정값 8,000·4,000과 같고, 64K에서는 그 절반(4,000·2,000)이며, 230K에서는 14,375·7,187이다. 입력 예산 계산(`input_budget`)이 묶음 예산을 예약하므로 묶음이 커진 만큼 체크포인트 전 사용 가능 입력이 줄지만, 230K에서 약 6K 차이다. 1/8·1/16(64K에서 옛 값과 같아짐)도 검토했으나 230K에서 입력 예산이 2만 토큰 더 줄고 무거운 요청 두 번이면 체크포인트가 걸리므로, 라이브 실행으로 효과를 확인한 뒤 조정하기로 했다. 검증은 계산된 값으로 하며, 명시한 `result_tokens`가 묶음 예산을 넘으면 계산 방식을 적어 거절한다.
+- 테스트의 64K 프로필(`Config::compact_test`, `tests/support::compact_config`)은 4,000·8,000을 명시해 기존 시나리오를 보존한다.
+- 설정 화면의 두 칸은 비울 수 있고, 비우면 현재 컨텍스트 예산으로 계산한 자동 값을 자리표시로 보여 준다(`fields.js` `autoBudget`). 저장 설정 파일에서 두 키를 지우면 자동 값을 쓴다.
+- 답변 워크플로의 시스템 프롬프트는 `SYSTEM`의 줄을 첫 단어로 찾아 바꾸거나 빼고, 특정 구절을 글자 그대로 찾아 지워 만든다. 그 규칙을 `ANSWER_LINE_EDITS`·`ANSWER_PHRASE_EDITS` 표로 분리하고, 각 줄 접두어가 SYSTEM에서 정확히 한 줄과 맞고 각 구절이 SYSTEM에 있으며 답변 프롬프트에는 남지 않는지 검사하는 테스트를 두었다(`core::the_answer_prompt_derivation_still_finds_every_edit_in_the_source_prompt`). 전에는 SYSTEM 문구를 고치면 치환이 조용히 빠져 소스 문서 규칙이 답변 프롬프트에 남을 수 있었다. 이 테스트의 첫 실행이 바로 그런 경우 하나를 잡았다. 세 구절 치환 중 `"audit citations, "`는 34870a9가 SYSTEM 문구를 고친 뒤로 대상이 없어 아무 일도 하지 않았고, 이번에 뺐다(남은 두 구절은 모두 SYSTEM에 있다).

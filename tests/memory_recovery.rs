@@ -352,7 +352,7 @@ fn argument_and_revision_hints_remain_available_inside_a_checkpoint() {
 fn small_memory_results_keep_revision_and_argument_causes_with_full_recovery_in_history() {
     let dir = tempfile::tempdir().unwrap();
     let (mut s, input, memory, _) = fixture(dir.path());
-    s.config.result_tokens = 200;
+    s.config.result_tokens = Some(200);
     for (id, args) in [
         ("small-revision", input),
         (

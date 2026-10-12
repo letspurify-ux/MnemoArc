@@ -792,7 +792,7 @@ fn recover_unexecuted_batch(s: &mut Session, reason: &str) -> bool {
     let budget = if s.checkpoint.is_some() {
         ContextManager::cleanup_result_budget(&s.config)
     } else {
-        s.config.batch_tokens
+        s.config.batch_budget()
     };
     let limit = crate::llm::MAX_TOOL_CALLS.min(budget / 200);
     let guidance = if code == "response_size_limit" {
@@ -1734,7 +1734,7 @@ pub async fn run_session_controlled(
             "recovery_reason":s.progress_recovery.recovery_reason,"action_required":s.progress_recovery.action_required,
             "progress_recovery":{"active":progress_recovery,"focused":focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus,"rounds_without_substantive_progress":s.progress_recovery.rounds_without_substantive_progress,"repeated_outcome_rounds":s.progress_recovery.repeated_outcome_rounds,"artifact_edits_without_milestone":s.progress_recovery.artifact_edits_without_milestone,"repeated_read":repeated_read_detected},
             "current_todo":s.task.current_todo(),
-            "max_tool_calls":32.min(if s.checkpoint.is_some() { ContextManager::cleanup_result_budget(&s.config) } else { s.config.batch_tokens } / 200),
+            "max_tool_calls":32.min(if s.checkpoint.is_some() { ContextManager::cleanup_result_budget(&s.config) } else { s.config.batch_budget() } / 200),
             "plan_pending_count":s.task.todos.iter().filter(|item| !item.done).count(),
             "finalization_error":s.last_error.as_deref().filter(|error| finalization_attempts > 0 || error.starts_with("task_plan_pending:") || error.starts_with("task_unresolved_open:") || error.starts_with("request_coverage_check:")),
             "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: the last requests produced no new evidence, document change or resolved citation. Change approach instead of repeating them: read sources the document still needs and has not read, write or correct a section, or file_read a cited range reported as unread. Do not repeat an unchanged read, plan rewrite or memory save. If a claim cannot be supported, mark that gap in the relevant section and continue with supported work; do not invent evidence." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"For source documentation, batch reads for missing evidence, then repair known issues in their original locations with targeted section or text edits when safe. Corrections are edits, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Keep correcting the original requirements within the remaining run tokens and time.","draft"=>"Half of the run budget is spent: plan the remaining reading and writing so the requested document is complete and verified within remaining_tokens and remaining_seconds. Save sections in separate edits; place each from the outline in the last save result, use insert_before/insert_after for siblings and insert_first_child/insert_last_child for nested sections when that preserves the document flow, and copy section_path when headings repeat.",_=>if answer_workflow { ANSWER_INVESTIGATE_INSTRUCTION } else { "For source documentation, judge from the request and the evidence how much to read and when the document is complete. When a section's evidence is in context, write that section with its path:start-end citations right away, then read for the next one; save sections in separate edits rather than one full-file write; place each from the outline in the last save result (document_inspect only when none is in context), copy section_path when headings repeat, and use sibling or child insertion to place it within the hierarchy. Batch independent searches or reads together instead of paying a model round per file." }} }});
@@ -2241,7 +2241,7 @@ pub async fn run_session_controlled(
         let batch_limit = if s.checkpoint.is_some() {
             ContextManager::cleanup_result_budget(&s.config)
         } else {
-            s.config.batch_tokens
+            s.config.batch_budget()
         };
         let call_limit = 32.min(batch_limit / 200);
         if completion.calls.len() > call_limit {
@@ -2763,7 +2763,7 @@ pub async fn run_session_controlled(
                 let budget = remaining
                     .checked_div(slots)
                     .unwrap_or(0)
-                    .min(s.config.result_tokens)
+                    .min(s.config.result_budget())
                     .max(200);
                 let result = tools::limit_result(&mut s, call, result, budget);
                 let result = suppress_unchanged_repeat(&s, &messages, call, result);
@@ -3459,7 +3459,7 @@ mod worker_wait_tests {
         let mut s = session();
         s.project.root = dir.path().canonicalize().unwrap();
         s.config.model = "gpt-4o".into();
-        s.config.result_tokens = 700;
+        s.config.result_tokens = Some(700);
         s.config.read_parallelism = 2;
         let calls: Vec<_> = (0..2)
             .map(|index| ToolCall {

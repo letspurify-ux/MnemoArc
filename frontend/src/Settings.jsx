@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { groups, inputValue, parseValue } from "./fields.js";
+import { autoBudget, groups, inputValue, parseValue } from "./fields.js";
 import { api, send } from "./api.js";
 import { useServerDraft } from "./use-server-draft.js";
 import { displayPath, displayPathText } from "./paths.js";
@@ -523,7 +523,11 @@ export default function Settings({
                     }
                     value={inputValue(name === "max_concurrent_sessions" && scope === "session" ? config[name] : draft[name], type)}
                     placeholder={
-                      type.startsWith("optional") ? "사용 안 함" : ""
+                      autoBudget(name, draft) != null
+                        ? `자동 ${autoBudget(name, draft)}`
+                        : type.startsWith("optional")
+                          ? "사용 안 함"
+                          : ""
                     }
                     onChange={(e) =>
                       change(name, parseValue(e.target.value, type))

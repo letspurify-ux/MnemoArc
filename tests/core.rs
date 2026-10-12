@@ -500,7 +500,7 @@ fn bounded_file_results_keep_sources_offsets_and_fit_serialized_message_budget()
     std::fs::write(dir.path().join("main.js"), &text).unwrap();
     let mut s = session(dir.path());
     s.config.model = "z-ai/glm-5.3-flash".into();
-    s.config.result_tokens = 1200;
+    s.config.result_tokens = Some(1200);
     s.active_tools.insert("file_read".into());
     let call = mnemoarc::llm::ToolCall {
         id: "file-1".into(),
@@ -614,7 +614,7 @@ fn history_continuations_do_not_recursively_archive_previews() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     s.config.model = "unknown-model".into();
-    s.config.result_tokens = 500;
+    s.config.result_tokens = Some(500);
     let id = s.history.push(
         vec![json!({"role":"tool_archive","result":{"text":"\\\"한국어\\\"\n".repeat(400)}})],
         true,
@@ -1091,6 +1091,49 @@ fn both_workflow_prompts_follow_the_request_language() {
 }
 
 #[test]
+fn the_answer_prompt_derivation_still_finds_every_edit_in_the_source_prompt() {
+    // system_prompt derives the answer workflow's prompt from SYSTEM by
+    // replacing lines found by their opening words and shortening phrases
+    // found verbatim. Rewording a SYSTEM line turns its edit into a silent
+    // no-op that leaves a source-document rule in the answer prompt, so every
+    // edit must still find exactly its target.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.select_workflow("answer").unwrap();
+    s.add_user("Answer a question".into());
+    let answer = context::system_prompt(&s);
+    assert_eq!(answer, context::answer_prompt());
+    let mut dropped = 0;
+    for (prefix, replacement) in context::ANSWER_LINE_EDITS {
+        let lines: Vec<_> = context::SYSTEM
+            .lines()
+            .filter(|line| line.starts_with(prefix))
+            .collect();
+        assert_eq!(lines.len(), 1, "{prefix}");
+        assert!(!answer.contains(lines[0]), "{prefix}");
+        match replacement {
+            Some(text) => assert!(answer.lines().any(|line| line == text), "{prefix}"),
+            None => dropped += 1,
+        }
+    }
+    for (old, _) in context::ANSWER_PHRASE_EDITS {
+        assert!(context::SYSTEM.contains(old), "{old}");
+        assert!(!answer.contains(old), "{old}");
+    }
+    assert_eq!(
+        answer.lines().count(),
+        context::SYSTEM.lines().count() - dropped
+    );
+    for term in [
+        "workflow=\"source_document\"",
+        "document_readiness",
+        "unread_citation",
+    ] {
+        assert!(!answer.contains(term), "{term}");
+    }
+}
+
+#[test]
 fn the_call_ledger_keeps_a_recent_window() {
     // Every successful result stayed in the ledger for the whole task and
     // counted toward the metadata cap that stops a run; a provider replays a
@@ -1195,7 +1238,7 @@ fn relimiting_reads_preserves_immutable_cursor_positions() {
     )
     .unwrap();
     let mut s = session(dir.path());
-    s.config.result_tokens = 1000;
+    s.config.result_tokens = Some(1000);
     let call = mnemoarc::llm::ToolCall {
         id: "repeated-position".into(),
         name: "file_read".into(),
@@ -1235,7 +1278,7 @@ fn opaque_file_cursor_survives_relimiting_without_skips_or_overlap() {
     std::fs::write(dir.path().join("pages.md"), lines.join("\n")).unwrap();
     let expected = lines[6..31].join("\n");
     let mut s = session(dir.path());
-    s.config.result_tokens = 1400;
+    s.config.result_tokens = Some(1400);
     let mut args = json!({"path":"pages.md","start_line":7,"max_lines":25});
     let mut joined = String::new();
     let mut completed = false;
@@ -1297,7 +1340,7 @@ fn file_cursors_reject_mixed_ranges_changed_files_and_other_sessions() {
     let path = dir.path().join("pages.md");
     std::fs::write(&path, "긴 문서와 정확한 위치😀\n".repeat(200)).unwrap();
     let mut s = session(dir.path());
-    s.config.result_tokens = 1000;
+    s.config.result_tokens = Some(1000);
     let call = mnemoarc::llm::ToolCall {
         id: "initial".into(),
         name: "file_read".into(),
@@ -1386,7 +1429,7 @@ fn a_whole_next_cursor_sent_as_the_cursor_continues_the_read() {
     )
     .unwrap();
     let mut s = session(dir.path());
-    s.config.result_tokens = 1000;
+    s.config.result_tokens = Some(1000);
     let call = mnemoarc::llm::ToolCall {
         id: "initial".into(),
         name: "file_read".into(),
@@ -1420,7 +1463,7 @@ fn a_cursor_dropped_for_a_start_line_is_reported_with_its_continuation() {
     let path = dir.path().join("pages.md");
     std::fs::write(&path, "긴 문서와 정확한 위치😀\n".repeat(200)).unwrap();
     let mut s = session(dir.path());
-    s.config.result_tokens = 1000;
+    s.config.result_tokens = Some(1000);
     let call = mnemoarc::llm::ToolCall {
         id: "initial".into(),
         name: "file_read".into(),
@@ -1486,7 +1529,7 @@ fn a_cursor_beside_a_placeholder_first_line_is_continued() {
     )
     .unwrap();
     let mut s = session(dir.path());
-    s.config.result_tokens = 1000;
+    s.config.result_tokens = Some(1000);
     let call = mnemoarc::llm::ToolCall {
         id: "initial".into(),
         name: "file_read".into(),

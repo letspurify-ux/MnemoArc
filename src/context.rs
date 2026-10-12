@@ -35,6 +35,60 @@ const ANSWER_WORKFLOW: &str = r#"The user selects this session's workflow and it
 /// The answer workflow's subset of SYSTEM's run and citation rules.
 const ANSWER_RUN_RULES: &str = "If run_guidance.finalization_error is present, your previous final response left unfinished work: finish it with tools instead of repeating a final response. Consult run_guidance every request. Avoid unchanged repeated reads; force_read is for deliberate repeat reads or lost context. Follow request data through normalization helpers, not just the route call site. Use project-relative path:line-line for EVERY citation, including Mermaid labels; repeat the path for separate ranges instead of comma-only line lists. Check API examples against actual schemas, event producers/consumers and tests; do not infer contracts from names. A tool rejection is not success. Fix arguments using the tool schema instead of repeating them. No need to reread a whole document just to obtain its hash.";
 
+/// How the answer workflow's prompt is derived from SYSTEM, line by line: a
+/// line that starts with the first text is replaced by the second, or dropped
+/// when that is None. Each prefix must match exactly one SYSTEM line, and
+/// tests/core.rs checks that: a reworded SYSTEM line would otherwise turn its
+/// edit into a silent no-op and leave a source-document rule in the answer
+/// prompt.
+pub const ANSWER_LINE_EDITS: [(&str, Option<&str>); 4] = [
+    (
+        "The user selects this session's workflow",
+        Some(ANSWER_WORKFLOW),
+    ),
+    ("If run_guidance.finalization_error", Some(ANSWER_RUN_RULES)),
+    (
+        "Do not claim completion while",
+        Some("Report partial results when budgets stop the work."),
+    ),
+    ("For source documentation,", None),
+];
+/// Phrases of the remaining SYSTEM lines that the answer workflow shortens.
+/// Each must occur in SYSTEM, checked by the same test: the first run of that
+/// test found a third edit, "audit citations, ", whose phrase 34870a9 had
+/// reworded out of SYSTEM, so it had been a no-op since.
+pub const ANSWER_PHRASE_EDITS: [(&str, &str); 2] = [
+    (
+        " The source_document workflow already activates the documentation tools.",
+        "",
+    ),
+    (
+        "; citation audits are not prerequisites unless the user requests source-evidence verification.",
+        ".",
+    ),
+];
+
+/// SYSTEM with ANSWER_LINE_EDITS and ANSWER_PHRASE_EDITS applied.
+pub fn answer_prompt() -> String {
+    SYSTEM
+        .lines()
+        .filter_map(|line| {
+            if let Some((_, replacement)) = ANSWER_LINE_EDITS
+                .iter()
+                .find(|(prefix, _)| line.starts_with(prefix))
+            {
+                return replacement.map(str::to_owned);
+            }
+            Some(
+                ANSWER_PHRASE_EDITS
+                    .iter()
+                    .fold(line.to_owned(), |text, (old, new)| text.replace(old, new)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The system prompt for this session's workflow. The answer workflow runs
 /// no audit or verification, so its prompt leaves out the
 /// source-documentation and verification rules.
@@ -43,28 +97,7 @@ pub fn system_prompt(s: &Session) -> &'static str {
     if s.task.workflow != "answer" {
         return SYSTEM;
     }
-    ANSWER.get_or_init(|| {
-        let mut lines = Vec::new();
-        for line in SYSTEM.lines() {
-            if line.starts_with("The user selects this session's workflow") {
-                lines.push(ANSWER_WORKFLOW.to_owned());
-            } else if line.starts_with("If run_guidance.finalization_error") {
-                lines.push(ANSWER_RUN_RULES.to_owned());
-            } else if line.starts_with("Do not claim completion while") {
-                lines.push("Report partial results when budgets stop the work.".to_owned());
-            } else if !line.starts_with("For source documentation,") {
-                lines.push(
-                    line.replace("audit citations, ", "")
-                        .replace(" The source_document workflow already activates the documentation tools.", "")
-                        .replace(
-                            "; citation audits are not prerequisites unless the user requests source-evidence verification.",
-                            ".",
-                        ),
-                );
-            }
-        }
-        lines.join("\n")
-    })
+    ANSWER.get_or_init(answer_prompt)
 }
 
 fn tokenizer(model: &str) -> &'static tiktoken_rs::CoreBPE {
@@ -469,7 +502,7 @@ impl ContextManager {
         Ok(json!({"model":s.config.model,"messages":messages,"tools":tools}))
     }
     pub fn cleanup_result_budget(c: &Config) -> usize {
-        c.batch_tokens.min(c.checkpoint_tokens).min(1024)
+        c.batch_budget().min(c.checkpoint_tokens).min(1024)
     }
     /// Output allowance of one cleanup request. Cleanup saves concise
     /// memories and a progress note, so a very large configured output limit
@@ -489,7 +522,7 @@ impl ContextManager {
             .saturating_add(1024);
         c.context_tokens.saturating_sub(
             c.output_tokens
-                .saturating_add(c.batch_tokens)
+                .saturating_add(c.batch_budget())
                 .saturating_add(cleanup_round.saturating_mul(3))
                 .saturating_add(1024),
         )

@@ -405,15 +405,15 @@ async fn answer(
         if completion.length_limited {
             bail!("question_answer_truncated: incomplete tool response; no tools executed");
         }
-        if completion.calls.len() > s.config.batch_tokens / 200 {
+        if completion.calls.len() > s.config.batch_budget() / 200 {
             bail!(
                 "tool_call_batch_limit: follow-up batch exceeds the result budget; no tools executed"
             );
         }
         let result_budget = s
             .config
-            .result_tokens
-            .min(s.config.batch_tokens / completion.calls.len());
+            .result_budget()
+            .min(s.config.batch_budget() / completion.calls.len());
         let mut messages = vec![assistant(&completion.text, &completion.calls)];
         work.history = s.history.clone();
         for call in completion.calls {

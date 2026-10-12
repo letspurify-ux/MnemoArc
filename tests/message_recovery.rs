@@ -349,8 +349,8 @@ async fn a_large_old_conversation_cannot_overflow_the_classification_request() {
     let mut s = cancelled(dir.path()).await;
     s.config.context_tokens = 16000;
     s.config.output_tokens = 1000;
-    s.config.batch_tokens = 2000;
-    s.config.result_tokens = 1000;
+    s.config.batch_tokens = Some(2000);
+    s.config.result_tokens = Some(1000);
     s.config.checkpoint_tokens = 500;
     s.config.validate().unwrap();
     for _ in 0..8 {

@@ -36,6 +36,23 @@ struct SavedConfig<'a> {
 const UNSET_MODEL_CONTEXT: usize = 0;
 const UNSET_REASONING_EFFORT: &str = "";
 
+/// Shares of `context_tokens` that the tool results of one response, and one
+/// result, may fill when `batch_tokens` or `result_tokens` is unset. The
+/// fixed 8,000 and 4,000 defaults were sized for 64K contexts; at 230K they
+/// let each request add 3.5% of the context in new results and cut every
+/// 2,000-line read, so live runs spent 45 to 47 model requests on a 200-line
+/// document, each request resending the whole history. 1/16 and 1/32 equal
+/// the old values at 128K, halve them at 64K (where the smaller reservation
+/// leaves the small input budget more room) and read more per request as
+/// the context grows. input_budget in context.rs reserves the batch budget,
+/// so a larger share also shortens the stretch between checkpoints: 1/8
+/// would take 20K more from a 230K budget and let two heavy requests start
+/// a checkpoint. Tune after a live run; a set value always wins.
+pub const BATCH_SHARE: usize = 16;
+pub const RESULT_SHARE: usize = 32;
+/// Smallest result, batch or checkpoint budget validate() accepts.
+pub const MIN_RESULT_TOKENS: usize = 200;
+
 #[derive(Clone)]
 pub struct Secret(pub String);
 impl std::fmt::Debug for Secret {
@@ -72,8 +89,12 @@ pub struct Config {
     pub history_bytes: usize,
     pub state_tokens: usize,
     pub index_tokens: usize,
-    pub result_tokens: usize,
-    pub batch_tokens: usize,
+    /// Tokens one tool result may carry into the next request. Unset, it is
+    /// `context_tokens / RESULT_SHARE`; see `result_budget`.
+    pub result_tokens: Option<usize>,
+    /// Tokens all tool results of one response may carry together. Unset,
+    /// it is `context_tokens / BATCH_SHARE`; see `batch_budget`.
+    pub batch_tokens: Option<usize>,
     pub checkpoint_tokens: usize,
     pub high_water: f64,
     pub low_water: f64,
@@ -194,8 +215,8 @@ impl Default for Config {
             history_bytes: 64 * 1024 * 1024,
             state_tokens: 2000,
             index_tokens: 4000,
-            result_tokens: 4000,
-            batch_tokens: 8000,
+            result_tokens: None,
+            batch_tokens: None,
             checkpoint_tokens: 4000,
             high_water: 0.9,
             low_water: 0.5,
@@ -234,6 +255,8 @@ impl Config {
             model_context: None,
             context_tokens: 64000,
             output_tokens: 8000,
+            result_tokens: Some(4000),
+            batch_tokens: Some(8000),
             reasoning_effort: None,
             memory_body_bytes: 8192,
             memory_bytes: 16 * 1024 * 1024,
@@ -244,6 +267,20 @@ impl Config {
             run_tokens: 500000,
             ..Self::default()
         }
+    }
+
+    /// Tokens all tool results of one response may carry together: the
+    /// configured `batch_tokens`, else `context_tokens / BATCH_SHARE`.
+    pub fn batch_budget(&self) -> usize {
+        self.batch_tokens
+            .unwrap_or_else(|| (self.context_tokens / BATCH_SHARE).max(MIN_RESULT_TOKENS))
+    }
+
+    /// Tokens one tool result may carry into the next request: the
+    /// configured `result_tokens`, else `context_tokens / RESULT_SHARE`.
+    pub fn result_budget(&self) -> usize {
+        self.result_tokens
+            .unwrap_or_else(|| (self.context_tokens / RESULT_SHARE).max(MIN_RESULT_TOKENS))
     }
 
     pub(crate) fn ensure_project_ids(&mut self) -> Result<()> {
@@ -301,7 +338,7 @@ impl Config {
         }
         if self
             .output_tokens
-            .saturating_add(self.batch_tokens)
+            .saturating_add(self.batch_budget())
             .saturating_add(self.checkpoint_tokens)
             .saturating_add(1024)
             >= self.context_tokens
@@ -314,16 +351,28 @@ impl Config {
                 "Context must reserve 4096 input tokens plus three cleanup rounds; reduce output/batch/checkpoint limits or increase context"
             );
         }
-        if self.result_tokens < 200 || self.batch_tokens < 200 || self.checkpoint_tokens < 200 {
-            bail!("Result, batch and checkpoint limits must be at least 200 tokens");
+        if self.result_budget() < MIN_RESULT_TOKENS
+            || self.batch_budget() < MIN_RESULT_TOKENS
+            || self.checkpoint_tokens < MIN_RESULT_TOKENS
+        {
+            bail!(
+                "Result, batch and checkpoint limits must be at least {MIN_RESULT_TOKENS} tokens"
+            );
         }
         if let Some(n) = self.model_context
             && self.context_tokens > n
         {
             bail!("Context exceeds model_context");
         }
-        if self.memory_body_bytes > self.memory_bytes || self.result_tokens > self.batch_tokens {
+        if self.memory_body_bytes > self.memory_bytes {
             bail!("Individual limits exceed total limits");
+        }
+        if self.result_budget() > self.batch_budget() {
+            bail!(
+                "result_tokens {} exceeds batch_tokens {} (an unset value is context_tokens / {RESULT_SHARE} or / {BATCH_SHARE})",
+                self.result_budget(),
+                self.batch_budget()
+            );
         }
         if [
             self.memory_count,
@@ -331,7 +380,6 @@ impl Config {
             self.memory_body_bytes,
             self.history_bytes,
             self.state_tokens,
-            self.result_tokens,
             self.read_parallelism,
             self.output_tokens,
             self.run_tokens,

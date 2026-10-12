@@ -5218,9 +5218,9 @@ fn bounded_text(s: &Session, content: &str, offset: usize) -> Value {
     let (body, truncated) = context::truncate(
         &content[byte_offset..],
         s.config
-            .result_tokens
+            .result_budget()
             .saturating_sub(500)
-            .max(s.config.result_tokens / 2)
+            .max(s.config.result_budget() / 2)
             .max(1),
         &s.config.model,
     );
@@ -7181,7 +7181,7 @@ pub fn run_call_cancellable(
         cp.failed = true;
         cp.acknowledged = false;
     }
-    limit_result(s, call, result, s.config.result_tokens)
+    limit_result(s, call, result, s.config.result_budget())
 }
 
 /// Whether a failed call fails the pending checkpoint's batch. A failed
@@ -7280,7 +7280,7 @@ fn run_call_inner(
         return result;
     }
     let unapplied_plan = call.name == "task_plan" && result["data"]["applied"] == false;
-    let output = limit_result(s, call, result, s.config.result_tokens);
+    let output = limit_result(s, call, result, s.config.result_budget());
     // Failed mutations are not cached, allowing deliberate recovery with corrected arguments.
     if output["status"] == "ok" && !unapplied_plan {
         s.remember_call(call.id.clone(), signature, output.clone());
