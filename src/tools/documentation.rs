@@ -1393,13 +1393,39 @@ fn unclosed_fence_issue(fence: &CitationFence) -> Value {
 const CITATION_PATTERN: &str =
     r"([\p{L}\p{N}_./@-]+\.[A-Za-z][A-Za-z0-9]*)(:|#L)([0-9]+)(?:[-–]L?([0-9]+))?";
 
-/// Whether the text before a citation match makes it part of a URL.
-fn url_prefix(before: &str) -> bool {
-    before
+/// Whether a citation match is the label of a Markdown link whose target is
+/// itself a citation, `…](src/agent.rs:10-20)`: the target is the citation
+/// and the label only shows it. Label text may go on after the match, but
+/// not across another bracket; a URL or plain-path target keeps the label
+/// as the citation.
+fn link_label_of_citation(line: &str, from: usize, pattern: &regex::Regex) -> bool {
+    let rest = &line[from..];
+    let Some(close) = rest.find("](") else {
+        return false;
+    };
+    if rest[..close].contains(['[', ']']) {
+        return false;
+    }
+    let target = &rest[close + 2..];
+    let Some(end) = target.find(')') else {
+        return false;
+    };
+    let target = target[..end].trim();
+    !target.contains("://")
+        && pattern
+            .find(target)
+            .is_some_and(|m| m.start() == 0 && m.end() == target.len())
+}
+
+/// Whether the text before a citation match makes it part of a URL. The
+/// match itself may start with the `//` of the scheme, since `/` is a path
+/// character: `https://example.com/agent.rs#L25` matches from `//`.
+fn url_prefix(before: &str, matched: &str) -> bool {
+    let head = before
         .rsplit(|ch: char| ch.is_whitespace() || ['`', '(', '"'].contains(&ch))
         .next()
-        .unwrap_or("")
-        .contains("://")
+        .unwrap_or("");
+    head.contains("://") || (head.ends_with(':') && matched.starts_with("//"))
 }
 
 fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
@@ -1465,7 +1491,16 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
             visible_without_html_comments(line, &mut in_comment)
         };
         for c in pattern.captures_iter(&visible) {
-            if url_prefix(&visible[..c.get(0).unwrap().start()]) {
+            let whole = c.get(0).unwrap();
+            if url_prefix(&visible[..whole.start()], whole.as_str()) {
+                continue;
+            }
+            // A Markdown link whose label and target are both citations,
+            // `[main.rs:55-106](src/main.rs:55-106)`: the label is display
+            // text. Checked as a citation it reported a missing main.rs on
+            // every such link, and a live run spent twelve requests rewriting
+            // labels whose targets already resolved.
+            if link_label_of_citation(&visible, whole.end(), &pattern) {
                 continue;
             }
             let begin = c[3].parse().unwrap_or(0);
@@ -1473,7 +1508,6 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
                 .get(4)
                 .map(|v| v.as_str().parse().unwrap_or(0))
                 .unwrap_or(begin);
-            let whole = c.get(0).unwrap();
             spans.push(Citation {
                 raw: c[0].into(),
                 path: c[1].into(),
@@ -1777,7 +1811,7 @@ fn citation_fixes(doc: &str, fixable: &[(usize, String, String)]) -> BTreeMap<us
             let Some(file) = paths.get(path.as_str()) else {
                 continue;
             };
-            if url_prefix(&line[..whole.start()]) {
+            if url_prefix(&line[..whole.start()], whole.as_str()) {
                 continue;
             }
             rewrites.push((path.start(), path.end(), *file));

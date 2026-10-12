@@ -1723,3 +1723,48 @@ async fn empty_arguments_are_an_empty_object_and_rejected_calls_are_named() {
         "{error}"
     );
 }
+
+// Live run 2026-10-12: OpenRouter relayed two Nvidia 503 overloads as error
+// events before any output, and both were charged as full request inputs.
+#[tokio::test]
+async fn a_gateway_error_before_any_output_is_not_a_billable_attempt() {
+    use std::sync::atomic::Ordering;
+    let overloaded = event(
+        json!({"error":{"code":503,"message":"Upstream error from Nvidia: Service temporarily overloaded","metadata":{"error_type":"provider_overloaded"}}}),
+    );
+    let after_reasoning = format!(
+        "{}{overloaded}",
+        event(json!({"choices":[{"delta":{"reasoning":"thinking"}}]}))
+    );
+    let ok = format!(
+        "{}data: [DONE]\n\n",
+        event(json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}))
+    );
+    for (first, billable) in [(overloaded.clone(), 0), (after_reasoning, 1)] {
+        let (url, server, calls) = sequenced_server(vec![first, ok.clone()]).await;
+        let c = Config {
+            base_url: url,
+            retries: 1,
+            ..support::compact_config()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let completion = OpenAiClient
+            .complete(json!({"messages":[]}), &c, CancellationToken::new(), tx)
+            .await
+            .unwrap();
+        assert_eq!(completion.text, "OK");
+        assert_eq!(completion.attempts, 2);
+        assert_eq!(
+            completion.attempt_diagnostics[0].code,
+            "provider_stream_error"
+        );
+        assert_eq!(
+            completion.billable_failed_attempts(),
+            billable,
+            "{:?}",
+            completion.attempt_diagnostics
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+}

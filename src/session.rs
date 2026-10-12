@@ -62,9 +62,12 @@ pub struct TaskState {
     pub todo_sequence: u64,
     pub todos_completed_total: usize,
     pub checkpoint_summary: String,
-    pub findings: Vec<String>,
     // Read old snapshots, then migrate once before running. These fields are
     // neither exposed to the model nor maintained alongside the ordered plan.
+    // `findings` held free-form progress notes that duplicated checkpoint
+    // progress and memories; `unresolved` and `details` remain.
+    #[serde(skip_serializing)]
+    pub findings: Vec<String>,
     #[serde(skip_serializing)]
     pub done: Vec<String>,
     #[serde(skip_serializing)]

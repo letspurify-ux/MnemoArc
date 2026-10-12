@@ -228,7 +228,7 @@ impl LlmClient for ConfigureDuringCall {
             Ok(call(
                 "goals",
                 "task_state",
-                json!({"action":"update","patch":{"findings":["compare documents"]}}),
+                json!({"action":"update","patch":{"scope":"compare documents"}}),
             ))
         } else {
             assert_eq!(config.output_tokens, 4000);
@@ -264,7 +264,7 @@ async fn settings_apply_at_next_request_and_generic_tasks_work() {
     .await;
     drain.await.unwrap();
     assert_eq!(result.config.output_tokens, 4000);
-    assert_eq!(result.task.findings, ["compare documents"]);
+    assert_eq!(result.task.scope, "compare documents");
     assert!(result.active_tools.contains("file_read"));
     assert!(!result.active_tools.contains("document_audit"));
     assert_eq!(result.status, "complete");
@@ -317,7 +317,7 @@ impl LlmClient for RetryCleanup {
                 Completion {
                     calls: vec![
                         ToolCall{id:format!("ack-{}",state["checkpoint"]["id"]),name:"checkpoint_complete".into(),arguments:json!({"id":state["checkpoint"]["id"],"progress":"필요한 기억을 보존했고 원본 수정 금지를 유지한다. 다음은 문서 작성이다."}).to_string()},
-                        ToolCall{id:format!("progress-{}",state["checkpoint"]["id"]),name:"task_state".into(),arguments:json!({"action":"update","patch":{"findings":["실패 근거와 다음 작업 저장 완료"]}}).to_string()},
+                        ToolCall{id:format!("progress-{}",state["checkpoint"]["id"]),name:"task_state".into(),arguments:json!({"action":"update","patch":{"scope":"실패 근거와 다음 작업 저장 완료"}}).to_string()},
                     ], ..Default::default()
                 }
             }
@@ -1729,7 +1729,7 @@ impl LlmClient for ChangingBadSources {
         response.calls.push(ToolCall {
             id: format!("progress-{round}"),
             name: "task_state".into(),
-            arguments: json!({"action":"update","patch":{"findings":[format!("round {round}")]}})
+            arguments: json!({"action":"update","patch":{"scope":format!("round {round}")}})
                 .to_string(),
         });
         Ok(response)
@@ -1754,7 +1754,7 @@ async fn changing_bad_arguments_and_unrelated_writes_cannot_evade_recovery_limit
             .contains("tool_recovery_limit: memory_write")
     );
     assert_eq!(result.memory.entries.len(), 0);
-    assert_eq!(result.task.findings, ["round 2"]); // No later writes after terminal failure.
+    assert_eq!(result.task.scope, "round 2"); // No later writes after terminal failure.
 }
 
 struct TwoEditsWithOldHash {

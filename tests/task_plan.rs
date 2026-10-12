@@ -6,7 +6,7 @@ use mnemoarc::{
     config::{Config, Project},
     context::ContextManager,
     llm::{Completion, LlmClient, ToolCall},
-    session::{Session, TaskState},
+    session::{Session, TaskState, TodoWatch},
     tools,
 };
 use serde_json::{Value, json};
@@ -542,7 +542,7 @@ fn full_plan_and_stale_revision_do_not_fail_or_lose_work() {
     tools::execute(
         &mut s,
         "task_state",
-        json!({"action":"update","patch":{"findings":["The first outcome is saved"]}}),
+        json!({"action":"update","patch":{"scope":"The first outcome is saved"}}),
     )
     .unwrap();
     s.add_user("계속".into());
@@ -1789,4 +1789,70 @@ fn closing_mode_does_not_add_open_to_dos() {
         json!([{"op":"complete","id":id,"result":"Read the sources."}]),
     );
     assert_eq!(done["applied"], true, "{done}");
+}
+
+// Live run 2026-10-12: four section to-dos were completed as "analysed" over
+// 44 requests before any document existed; the whole document then came at
+// once from summaries.
+#[test]
+fn completing_a_to_do_before_the_first_save_points_out_the_missing_document() {
+    for save_first in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.js"), "function run() {}\n").unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            Config {
+                model: "gpt-4o".into(),
+                model_context: Some(128000),
+                ..support::compact_config()
+            },
+        );
+        s.add_user("Write a source document covering the entry point.".into());
+        s.select_workflow("source_document").unwrap();
+        apply(
+            &mut s,
+            json!([{"op":"insert","texts":["Entry point (main.js)"]}]),
+        );
+        let id = s.task.todos[0].id.clone();
+        // What the runtime records when the to-do becomes current before any output exists.
+        s.progress_recovery.todo_watch = Some(TodoWatch {
+            id: id.clone(),
+            since_round: 1,
+            sections: 0,
+            from_round: 1,
+            document: None,
+        });
+        tools::execute(
+            &mut s,
+            "file_read",
+            json!({"path":"main.js","start_line":1,"max_lines":1}),
+        )
+        .unwrap();
+        if save_first {
+            tools::execute(
+                &mut s,
+                "document_edit",
+                json!({"action":"create","text":"# Entry\nrun starts the program. main.js:1-1\n"}),
+            )
+            .unwrap();
+        }
+        let result = apply(
+            &mut s,
+            json!([{"op":"complete","id":id,"result":"main.js read"}]),
+        );
+        let pointed_out = result["notices"].as_array().is_some_and(|notices| {
+            notices.iter().any(|notice| {
+                notice.as_str().is_some_and(|text| {
+                    text.contains(&format!(
+                        "No document is saved yet, and {id} is being completed"
+                    ))
+                })
+            })
+        });
+        assert_eq!(pointed_out, !save_first, "{result}");
+    }
 }

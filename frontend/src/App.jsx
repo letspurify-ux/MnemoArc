@@ -1695,24 +1695,20 @@ function Inspector({
                 </ol>
               </details>
             )}
-            {["constraints", "completion", "findings", "unresolved"].map(
-              (key, i) => (
-                <section className="progress-section" key={key}>
-                  <h4>
-                    {["제약", "완료 조건", "발견한 내용", "미확인 사항"][i]}
-                  </h4>
-                  {session.task[key].length ? (
-                    <ul>
-                      {session.task[key].map((v, i) => (
-                        <li key={i}>{displayPathText(v)}</li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="subtle">아직 등록된 내용이 없습니다.</p>
-                  )}
-                </section>
-              ),
-            )}
+            {["constraints", "completion", "unresolved"].map((key, i) => (
+              <section className="progress-section" key={key}>
+                <h4>{["제약", "완료 조건", "미확인 사항"][i]}</h4>
+                {session.task[key].length ? (
+                  <ul>
+                    {session.task[key].map((v, i) => (
+                      <li key={i}>{displayPathText(v)}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="subtle">아직 등록된 내용이 없습니다.</p>
+                )}
+              </section>
+            ))}
           </>
         )}
         {tab === "tools" && (

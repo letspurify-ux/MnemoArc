@@ -1059,7 +1059,7 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
     if context::count(&compact, &s.config.model) > s.config.state_tokens
         || serde_json::to_vec(&next)?.len() > s.config.memory_bytes
     {
-        return Ok(unchanged(&s.task, "Task state budget is full; shorten item text or task_state findings/details before extending the plan".into(), expected_revision, json!({"code":"state_limit"})));
+        return Ok(unchanged(&s.task, "Task state budget is full; shorten item text or task_state details before extending the plan".into(), expected_revision, json!({"code":"state_limit"})));
     }
     let mut notices = notices;
     notices.extend(completed_without_edit(s, &next));
@@ -1071,12 +1071,14 @@ pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {
 }
 
 /// A to-do of document work completed while the document stayed exactly as
-/// it was when the to-do became current. A live correction completed five
-/// section to-dos as "corrected against the code" without one saved edit.
-/// Checking a part may rightly change nothing, so this is a notice.
+/// it was when the to-do became current, or before any document was saved.
+/// A live correction completed five section to-dos as "corrected against the
+/// code" without one saved edit; another run closed four section to-dos as
+/// "analysed" over 44 requests with no document, then wrote every section at
+/// once from summaries. Checking a part may rightly change nothing, so this
+/// is a notice.
 fn completed_without_edit(s: &Session, next: &TaskState) -> Option<String> {
     let watch = s.progress_recovery.todo_watch.as_ref()?;
-    let before = watch.document.as_deref()?;
     let was_open = s
         .task
         .todos
@@ -1089,6 +1091,16 @@ fn completed_without_edit(s: &Session, next: &TaskState) -> Option<String> {
     if !s.is_document_work() || !was_open || !now_done {
         return None;
     }
+    let Some(before) = watch.document.as_deref() else {
+        // No output existed when the to-do became current; one saved since
+        // is this to-do's work.
+        return (!s.document_written).then(|| {
+            format!(
+                "No document is saved yet, and {id} is being completed: a section to-do is done when its section is in the document, not when its sources are read. Save that section now from the evidence in this context with document_edit (action=create for the first section), then complete the to-do.",
+                id = watch.id
+            )
+        });
+    };
     let current = super::read_text(&super::output_path(&s.project).ok()?).ok()?;
     (super::hash(current.as_bytes()) == before).then(|| {
         format!(

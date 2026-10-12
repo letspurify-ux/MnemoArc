@@ -928,10 +928,32 @@ fn completion_cannot_be_emptied_by_task_state_update() {
     tools::execute(
         &mut s,
         "task_state",
-        json!({"action":"update","patch":{"findings":["Reading route code"]}}),
+        json!({"action":"update","patch":{"scope":"Reading route code"}}),
     )
     .unwrap();
     assert_eq!(s.task.completion, original);
+}
+
+#[test]
+fn the_task_state_has_no_findings_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.add_user("Document the routes".into());
+    let error = tools::execute(
+        &mut s,
+        "task_state",
+        json!({"action":"update","patch":{"findings":["Reading route code"]}}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("unknown_argument: patch.findings"),
+        "{error}"
+    );
+    assert!(s.task.findings.is_empty());
+    let snapshot = tools::execute(&mut s, "task_state", json!({"action":"read"})).unwrap();
+    assert!(snapshot.get("findings").is_none());
+    assert!(snapshot.get("unresolved").is_some());
 }
 
 #[test]

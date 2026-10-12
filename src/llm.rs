@@ -75,13 +75,27 @@ pub struct AttemptDiagnostic {
     pub action: AttemptAction,
 }
 
-/// An attempt the provider refused with an HTTP status never started
-/// generating, so it is not billed and needs no usage estimate. In-stream
-/// failures, timeouts and invalid output may have consumed tokens.
+/// Marks a gateway error event that arrived before any output; see
+/// [`unstarted_stream_error`].
+const UNSTARTED_STREAM: &str = "no output yet;";
+
+/// An in-stream 429 or 5xx error event received before any output, tool call
+/// or usage: the gateway relayed a refusal, nothing was generated.
+fn unstarted_stream_error(text: &str) -> bool {
+    text.strip_prefix("provider_stream_error: ")
+        .is_some_and(|rest| rest.starts_with(UNSTARTED_STREAM))
+}
+
+/// An attempt the provider refused with an HTTP status, or with an error
+/// event before any output, never started generating, so it is not billed
+/// and needs no usage estimate. Later in-stream failures, timeouts and
+/// invalid output may have consumed tokens.
 fn unbilled_attempts(diagnostics: &[AttemptDiagnostic]) -> usize {
     diagnostics
         .iter()
-        .filter(|attempt| attempt.code.starts_with("http_"))
+        .filter(|attempt| {
+            attempt.code.starts_with("http_") || unstarted_stream_error(&attempt.reason)
+        })
         .count()
 }
 
@@ -581,6 +595,18 @@ impl OpenAiClient {
                         .as_u64()
                         .or_else(|| v["error"]["code"].as_str().and_then(|c| c.parse().ok()));
                     if code.is_some_and(|code| code == 429 || (500..600).contains(&code)) {
+                        // Before any output, tool call or usage arrived the
+                        // gateway refused as an HTTP status would have, so
+                        // nothing was generated or billed. A live run charged
+                        // two such 503 events as full request inputs.
+                        let unstarted = out.text.is_empty()
+                            && calls.is_empty()
+                            && out.usage.is_none()
+                            && out.reasoning_chars == 0
+                            && finish_reason.is_none();
+                        if unstarted {
+                            bail!("provider_stream_error: {UNSTARTED_STREAM} {}", v["error"]);
+                        }
                         bail!("provider_stream_error: {}", v["error"]);
                     }
                     bail!("provider_error: {}", v["error"]);

@@ -41,7 +41,6 @@ const diagnosticFields = new Set([
   "progress",
   "summary",
   "title",
-  "findings",
   "unresolved",
   "verification_note",
 ]);

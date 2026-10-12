@@ -110,7 +110,6 @@ fn task_patch_schema() -> Value {
         "deliverables",
         "constraints",
         "completion",
-        "findings",
         "unresolved",
         "memory_ids",
     ] {

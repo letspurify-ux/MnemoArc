@@ -4835,3 +4835,45 @@ fn a_section_edit_needs_either_its_section_hash_or_the_document_hash() {
         assert!(error.starts_with(refused), "{error}");
     }
 }
+
+// Live run 2026-10-12: every citation was a link `[agent.rs:25](src/agent.rs:25)`
+// and each label was reported as a missing agent.rs; twelve requests went
+// into rewriting the labels.
+#[test]
+fn a_link_label_whose_target_is_the_citation_is_display_text() {
+    let (dir, mut s) = source_setup();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/agent.rs"), "fn a() {}\n".repeat(30)).unwrap();
+    run(
+        &mut s,
+        "file_read",
+        json!({"path":"src/agent.rs","start_line":25,"max_lines":1}),
+    );
+    let doc = "# Flow\n\nThe loop starts here. [agent.rs:25](src/agent.rs:25) and [see the loop (agent.rs:25)](src/agent.rs#L25)\nA URL target keeps its label: [agent.rs:25](https://example.com/agent.rs#L25).\nA plain-path target too: [agent.rs:25](docs/notes.md).\n";
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":doc}),
+    );
+    let issues: Vec<_> = saved["citation_check"]["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| issue["kind"] == "citation_path")
+        .cloned()
+        .collect();
+    assert_eq!(issues.len(), 2, "{saved}");
+    assert_eq!(issues[0]["line"], 4, "{saved}");
+    assert_eq!(issues[1]["line"], 5, "{saved}");
+    assert!(
+        saved["citation_check"]["unread_citations"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "{saved}"
+    );
+    let audit = run(&mut s, "document_audit", json!({}));
+    // Two link targets on line 3, then the two labels whose targets are
+    // not citations.
+    assert_eq!(audit["citations_checked"], 4, "{audit}");
+    assert_eq!(audit["issue_kinds"]["citation_path"], 2, "{audit}");
+}
