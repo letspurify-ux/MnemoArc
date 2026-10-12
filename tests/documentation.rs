@@ -4877,3 +4877,129 @@ fn a_link_label_whose_target_is_the_citation_is_display_text() {
     assert_eq!(audit["citations_checked"], 4, "{audit}");
     assert_eq!(audit["issue_kinds"]["citation_path"], 2, "{audit}");
 }
+
+// Live run 2026-10-12: sections 7 and 8 were written with the next
+// section's heading as the last line of their text. Each pointer became an
+// empty section, and "## 8. 워커 백그라운드 작업" stayed in the finished
+// document beside the written "## 8. 워커 백그라운드 태스크".
+#[test]
+fn a_section_edit_leaves_out_headings_with_nothing_under_them() {
+    let (_dir, mut s) = setup();
+    let original = "# Guide\n## 7. Web\nOld.\n## 8. Worker tasks\nBody.\n";
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":original}),
+    );
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":"## 7. Web","expected_hash":created["hash"],"text":"## 7. Web\nNew.\n\n---\n\n## 8. Worker jobs\n"}),
+    );
+    assert_eq!(
+        saved["dropped_headings"]["headings"],
+        json!(["## 8. Worker jobs"]),
+        "{saved}"
+    );
+    assert!(saved.get("inserted_sections").is_none(), "{saved}");
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\n## 7. Web\nNew.\n\n---\n\n## 8. Worker tasks\nBody.\n"
+    );
+    // An empty pointer to a heading the document has is left out too,
+    // instead of refusing the whole section.
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":"## 7. Web","expected_hash":saved["hash"],"text":"## 7. Web\nNewer.\n## 8. Worker tasks\n"}),
+    );
+    assert_eq!(
+        saved["dropped_headings"]["headings"],
+        json!(["## 8. Worker tasks"])
+    );
+    // The replaced section ended with a blank line, which is kept.
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        "# Guide\n## 7. Web\nNewer.\n\n## 8. Worker tasks\nBody.\n"
+    );
+    // The same in a batch.
+    let batch = run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":saved["hash"],"edits":[{"action":"section","section":"## 7. Web","text":"## 7. Web\nNewest.\n\n## 9. Docs\n\n"}]}),
+    );
+    assert_eq!(
+        batch["operations"][0]["dropped_headings"],
+        json!(["## 9. Docs"]),
+        "{batch}"
+    );
+    assert!(batch["dropped_headings_guidance"].is_string(), "{batch}");
+    assert!(
+        !std::fs::read_to_string(&s.project.output)
+            .unwrap()
+            .contains("## 9. Docs")
+    );
+}
+
+#[test]
+fn a_section_edit_cannot_add_a_second_section_with_an_existing_number() {
+    let (_dir, mut s) = setup();
+    let original = "# Guide\n## 7. Web\nOld.\n## 8. Worker tasks\nBody.\n";
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":original}),
+    );
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":"## 7. Web","expected_hash":created["hash"],"text":"## 7. Web\nNew.\n## 8. Worker jobs\nJobs.\n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains(
+            "the document already has section 8 as \"## 8. Worker tasks\" at document line 4"
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        original
+    );
+    // A new number is still a new section after this one.
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":"## 8. Worker tasks","expected_hash":created["hash"],"text":"## 8. Worker tasks\nBody.\n## 9. Docs\nDocs.\n"}),
+    );
+    assert_eq!(saved["inserted_sections"], json!(["## 9. Docs"]), "{saved}");
+}
+
+// Live run 2026-10-12: a document explaining the citation format wrote the
+// example `file.rs:10, 20-30`; with no fix and no guidance the model re-read
+// that line eleven times, then turned the example into a citation.
+#[test]
+fn a_missing_cited_file_without_a_suggestion_mentions_format_examples() {
+    let (_dir, mut s) = source_setup();
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Format\nGrouped citations such as `file.rs:10, 20-30` are supported.\n"}),
+    );
+    let issue = saved["citation_check"]["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|issue| issue["kind"] == "citation_path")
+        .cloned()
+        .unwrap_or_else(|| panic!("{saved}"));
+    assert!(issue.get("suggested").is_none(), "{issue}");
+    assert!(
+        issue["guidance"]
+            .as_str()
+            .is_some_and(|text| text.contains("example of the citation format")
+                && text.contains("<path>:<start>-<end>")),
+        "{issue}"
+    );
+}

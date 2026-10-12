@@ -1737,9 +1737,12 @@ fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<
                 } else {
                     error.clone()
                 };
+                let missing_file = !*relative_link && error.starts_with("file_not_found");
                 let mut issue = json!({"kind":"citation_path","citation":raw,"line":document_line,"error":error});
                 if let Some(guidance) = guidance {
                     issue["guidance"] = json!(guidance);
+                } else if missing_file && suggested.is_none() {
+                    issue["guidance"] = json!(FORMAT_EXAMPLE_GUIDANCE);
                 }
                 if let Some(file) = suggested {
                     issue["suggested"] = json!(format!("{file}{}", &raw[cited.len()..]));
@@ -1851,6 +1854,12 @@ fn citation_fixes(doc: &str, fixable: &[(usize, String, String)]) -> BTreeMap<us
 
 /// A cited file the tools refuse to read fails every audit until the
 /// citation goes. The bare read error gave a model nothing to act on.
+/// A missing cited file with no project file to suggest may be no citation
+/// at all: a live document explaining the citation format wrote the example
+/// `file.rs:10, 20-30`, then re-read that line eleven times and finally
+/// turned the example into a citation of unrelated lines to pass the check.
+const FORMAT_EXAMPLE_GUIDANCE: &str = "No project file has this name. If this is an example of the citation format rather than a citation, write it so it is not path:line (for example <path>:<start>-<end>) or move it into a fenced code block, which the check skips; do not turn an example into a citation. Otherwise cite the project file that holds the claim as path:start-end.";
+
 fn unreadable_citation_guidance(error: &str) -> Option<&'static str> {
     if error.starts_with("unsupported_large_file") {
         Some(

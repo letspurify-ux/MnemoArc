@@ -2669,6 +2669,10 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             let heading = text(args, "section")?;
             let resolved = documentation::resolve_heading(old, heading)?;
             let target = &old[resolved.start..resolved.end];
+            // Headings with nothing under them only point at the next
+            // section; they are left out instead of becoming empty sections.
+            let stripped = without_empty_peer_headings(new, resolved.level);
+            let new = stripped.as_str();
             // Without a section hash the caller pinned the whole document
             // with expected_hash (section_edit_needs).
             if let Some(expected) = args["expected_section_hash"].as_str() {
@@ -2721,6 +2725,29 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                 );
             }
             let existing = documentation::headings(old);
+            // A new heading numbered like a section the document already has
+            // duplicates it under another title: a live document kept
+            // "## 8. 워커 백그라운드 작업" beside "## 8. 워커 백그라운드 태스크".
+            if let Some((extra, present, number)) = peers.iter().find_map(|peer| {
+                let number = section_number(documentation::bare_heading_title(&peer.heading))?;
+                existing
+                    .iter()
+                    .find(|heading| {
+                        heading.level == peer.level
+                            && heading.heading.trim() != peer.heading.trim()
+                            && section_number(documentation::bare_heading_title(&heading.heading))
+                                == Some(number)
+                    })
+                    .map(|present| (peer, present, number))
+            }) {
+                bail!(
+                    "invalid_argument_value: section replacement cannot add {:?} (line {} of text): the document already has section {number} as {:?} at document line {}, so two sections would share that number. If the text continues that section, rewrite it with its own action=section edit using its exact heading; if it is a new section, renumber it, or place it with action=insert_after",
+                    extra.heading,
+                    extra.line,
+                    present.heading,
+                    present.line
+                );
+            }
             if let Some((extra, present)) = peers.iter().find_map(|peer| {
                 existing
                     .iter()
@@ -3093,6 +3120,63 @@ fn check_whole_write(s: &Session, name: &str, args: &Value) -> Result<()> {
     }
     Ok(())
 }
+
+/// A Markdown thematic break: three or more `-`, `*` or `_`, spaces allowed.
+fn thematic_break(line: &str) -> bool {
+    let marks: Vec<char> = line.chars().filter(|c| !c.is_whitespace()).collect();
+    marks.len() >= 3
+        && ['-', '*', '_']
+            .iter()
+            .any(|mark| marks.iter().all(|c| c == mark))
+}
+
+/// Headings after the first in a section replacement, at the replaced
+/// section's level or above, whose sections hold nothing but blank lines and
+/// thematic breaks. A live model ended each section's text with the next
+/// section's heading; every such pointer became an empty section, and one
+/// stayed in the finished document between sections 9 and 10.
+fn empty_peer_headings(text: &str, level: usize) -> Vec<documentation::Heading> {
+    documentation::headings(text)
+        .into_iter()
+        .skip(1)
+        .filter(|heading| heading.level <= level)
+        .filter(|heading| {
+            text[heading.start..heading.end]
+                .lines()
+                .skip(1)
+                .all(|line| line.trim().is_empty() || thematic_break(line))
+        })
+        .collect()
+}
+
+/// The replacement text without its empty peer headings.
+fn without_empty_peer_headings(text: &str, level: usize) -> String {
+    let mut kept = text.to_string();
+    for heading in empty_peer_headings(text, level).iter().rev() {
+        kept.replace_range(heading.start..heading.end, "");
+    }
+    kept
+}
+
+/// The headings a section edit leaves out as empty, for its result.
+fn dropped_peer_headings(old: &str, edit: &Value) -> Vec<String> {
+    if edit["action"] != "section" {
+        return Vec::new();
+    }
+    let (Some(section), Some(text)) = (edit["section"].as_str(), edit["text"].as_str()) else {
+        return Vec::new();
+    };
+    documentation::resolve_heading(old, section)
+        .map(|resolved| {
+            empty_peer_headings(text, resolved.level)
+                .into_iter()
+                .map(|heading| heading.heading)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+const DROPPED_HEADINGS_GUIDANCE: &str = "These headings had nothing under them, so they were not saved as sections. Write each such section with its own edit once its evidence is read: action=insert_after with this section, or append.";
 
 /// Headings of the replaced section's level that the replacement added
 /// after it, so the result names the new sections.
@@ -5866,9 +5950,14 @@ fn execute_repaired(
             } else {
                 Vec::new()
             };
+            let dropped = dropped_peer_headings(&old, &args);
             let mut saved = persist_document_edit(s, &path, &old, exists, result, cancel)?;
             if !inserted.is_empty() {
                 saved["inserted_sections"] = json!(inserted);
+            }
+            if !dropped.is_empty() {
+                saved["dropped_headings"] =
+                    json!({"headings":dropped,"guidance":DROPPED_HEADINGS_GUIDANCE});
             }
             Ok(saved)
         }
@@ -5914,6 +6003,7 @@ fn execute_repaired(
                 let before_hash = hash(current.as_bytes());
                 let rebased = rebase_document_hash(edit, &old, &digest, &current);
                 let edit = rebased.as_ref().unwrap_or(edit);
+                let dropped = dropped_peer_headings(&current, edit);
                 let next = match apply_document_edit_operation(&current, edit) {
                     Ok(next) => next,
                     Err(error) => {
@@ -5931,12 +6021,16 @@ fn execute_repaired(
                 current = next;
                 states.push(current.clone());
                 applied.push(index);
-                operations.push(json!({
+                let mut operation = json!({
                     "index":index,
                     "action":action,
                     "changed":before_hash != hash(current.as_bytes()),
                     "hash":hash(current.as_bytes())
-                }));
+                });
+                if !dropped.is_empty() {
+                    operation["dropped_headings"] = json!(dropped);
+                }
+                operations.push(operation);
             }
             if hash_missing {
                 return Err(missing_document_hash(
@@ -5981,6 +6075,12 @@ fn execute_repaired(
             let result = persist_document_edit(s, &path, &old, exists, current, cancel)?;
             let final_hash = result["hash"].clone();
             let mut result = result;
+            if operations
+                .iter()
+                .any(|operation| operation.get("dropped_headings").is_some())
+            {
+                result["dropped_headings_guidance"] = json!(DROPPED_HEADINGS_GUIDANCE);
+            }
             result["operations"] = json!(operations);
             result["operation_count"] = json!(edits.len());
             result["batch"] =
