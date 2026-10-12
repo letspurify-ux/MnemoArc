@@ -4072,6 +4072,37 @@ fn appended_heading_follows_the_document_heading_spacing() {
         let written = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
         assert_eq!(written, expected, "{original:?}");
     }
+    // Blank lines sent before the heading neither place it nor add up: a
+    // live batch appended "\n## 2. ..." to a document without a final
+    // newline, and the heading landed right under the last paragraph.
+    for (original, text) in [
+        ("# Guide\n\n## One\nText.", "\n## Two\nMore.\n"),
+        ("# Guide\n\n## One\nText.\n\n", "\n\n## Two\nMore.\n"),
+        ("# Guide\r\n\r\n## One\r\nText.", "\r\n## Two\nMore.\n"),
+    ] {
+        let (dir, mut s) = setup();
+        std::fs::write(dir.path().join("summary.md"), original).unwrap();
+        let hash = tools::hash(original.as_bytes());
+        run(
+            &mut s,
+            "document_edit_batch",
+            json!({"expected_hash":hash,"edits":[{"action":"append","text":text}]}),
+        );
+        let written = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+        let delimiter = if original.contains('\r') {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        assert_eq!(
+            written,
+            format!(
+                "{}{delimiter}{delimiter}## Two\nMore.\n",
+                original.trim_end()
+            ),
+            "{original:?} + {text:?}"
+        );
+    }
     // Appended prose still joins the document as given.
     let (dir, mut s) = setup();
     std::fs::write(dir.path().join("summary.md"), "# Guide\n\n## One\nText.\n").unwrap();

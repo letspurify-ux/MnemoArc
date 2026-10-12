@@ -2388,6 +2388,18 @@ fn ends_with_blank_line(text: &str) -> bool {
         .is_some_and(|line| line.trim().is_empty())
 }
 
+/// Blank lines before a heading carry no content; the text from its first
+/// line of content on.
+fn without_leading_blank_lines(text: &str) -> &str {
+    let mut text = text;
+    while let Some((line, rest)) = text.split_once('\n')
+        && line.trim().is_empty()
+    {
+        text = rest;
+    }
+    text
+}
+
 /// Whether the document sets its headings off with a blank line; None when
 /// it shows no spacing yet. Before any heading follows other content, the
 /// line after the first heading shows it: a live manual began
@@ -2524,7 +2536,16 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
         // An appended heading starts a new block. Without a line break it
         // would join the previous sentence and stop being a heading, and it
         // follows the document's heading spacing like an inserted section.
-        "append" if !old.is_empty() && new.trim_start_matches(' ').starts_with('#') => {
+        // Blank lines sent before the heading do not place it: a live model
+        // appended "\n## 2. ..." to a document without a final newline, and
+        // the heading landed right under the last paragraph.
+        "append"
+            if !old.is_empty()
+                && without_leading_blank_lines(new)
+                    .trim_start_matches(' ')
+                    .starts_with('#') =>
+        {
+            let new = without_leading_blank_lines(new);
             let delimiter = line_delimiter_at(old, old.len());
             let mut prefix = old.to_string();
             if !prefix.ends_with('\n') {
@@ -2543,14 +2564,9 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             Ok(candidate)
         }
         "insert_before" | "insert_after" | "insert_first_child" | "insert_last_child" => {
-            // Blank lines before the heading carry no content; drop them so
-            // the section still starts on its first line.
-            let mut new = new;
-            while let Some((line, rest)) = new.split_once('\n')
-                && line.trim().is_empty()
-            {
-                new = rest;
-            }
+            // Drop blank lines before the heading so the section still
+            // starts on its first line.
+            let new = without_leading_blank_lines(new);
             let anchor = documentation::resolve_heading(old, text(args, "section")?)?;
             let new_headings = documentation::headings(new);
             let child = matches!(action, "insert_first_child" | "insert_last_child");
