@@ -5012,3 +5012,88 @@ fn a_missing_cited_file_without_a_suggestion_mentions_format_examples() {
         "{issue}"
     );
 }
+
+// Live run 2026-10-12: sections 4.6-4.9, 5 and 6 were each appended a second
+// time as revised copies, and the finished document held all of them twice.
+#[test]
+fn an_append_cannot_repeat_a_section_under_the_same_parent() {
+    let (_dir, mut s) = setup();
+    let original = "# Guide\n## 4. Loop\n### 4.6 Batch\nA.\n## 6. Final (agent.rs)\nB.\n";
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":original}),
+    );
+    let hash = created["hash"].clone();
+    for (text, details) in [
+        // The same title under the same parent: the last "## 6." section.
+        (
+            "## 6. Final (agent.rs)\nRevised.\n",
+            vec![
+                "append adds \"## 6. Final (agent.rs)\", which the document already has under the same parent at line 5",
+                "use action=section with section \"# Guide\\n## 6. Final (agent.rs)\"",
+            ],
+        ),
+        // Another title with a sibling's number.
+        (
+            "## 6. Final\nRevised.\n",
+            vec![
+                "the document already has section 6 as \"## 6. Final (agent.rs)\" under the same parent at line 5",
+            ],
+        ),
+    ] {
+        let error = tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"append","expected_hash":hash,"text":text}),
+        )
+        .unwrap_err()
+        .to_string();
+        for detail in details {
+            assert!(error.contains(detail), "missing {detail:?}: {error}");
+        }
+    }
+    // The same in a batch.
+    let error = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":hash,"edits":[{"action":"append","text":"## 6. Final\nRevised.\n"}]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("already has section 6"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(&s.project.output).unwrap(),
+        original
+    );
+    // A new number is appended, and a subsection title another chapter
+    // uses is fine under a different parent.
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":hash,"text":"## 7. Recovery\nC.\n### 4.6 Batch\nD.\n"}),
+    );
+    assert!(saved["hash"].is_string(), "{saved}");
+}
+
+#[test]
+fn a_section_edit_compares_section_numbers_only_among_siblings() {
+    let (_dir, mut s) = setup();
+    let original = "# Guide\n## 1. A\n### 1. Goal\nx\n### 2. Scope\ny\n## 2. B\n### 1. Goal\nz\n";
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":original}),
+    );
+    // "### 2." exists only under "## 1. A"; under "## 2. B" it is new.
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":"# Guide\n## 2. B\n### 1. Goal","expected_hash":created["hash"],"text":"### 1. Goal\nz2\n### 2. Limits\nw\n"}),
+    );
+    assert_eq!(
+        saved["inserted_sections"],
+        json!(["### 2. Limits"]),
+        "{saved}"
+    );
+}

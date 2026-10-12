@@ -2533,9 +2533,15 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             if heading_spacing(old).unwrap_or(false) && !ends_with_blank_line(&prefix) {
                 prefix.push_str(delimiter);
             }
-            Ok(format!("{prefix}{new}"))
+            let candidate = format!("{prefix}{new}");
+            check_appended_headings(&candidate, prefix.len())?;
+            Ok(candidate)
         }
-        "append" => Ok(format!("{old}{new}")),
+        "append" => {
+            let candidate = format!("{old}{new}");
+            check_appended_headings(&candidate, old.len())?;
+            Ok(candidate)
+        }
         "insert_before" | "insert_after" | "insert_first_child" | "insert_last_child" => {
             // Blank lines before the heading carry no content; drop them so
             // the section still starts on its first line.
@@ -2729,20 +2735,29 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                 );
             }
             let existing = documentation::headings(old);
-            // A new heading numbered like a section the document already has
+            // A new heading numbered like a sibling the document already has
             // duplicates it under another title: a live document kept
             // "## 8. 워커 백그라운드 작업" beside "## 8. 워커 백그라운드 태스크".
+            // The new headings follow this section under its parent, so only
+            // its siblings count; "### 1. 목적" may open every chapter.
+            let paths = documentation::heading_paths(&existing);
+            let target_parent = existing
+                .iter()
+                .position(|heading| heading.start == resolved.start)
+                .map(|index| parent_of(&paths[index]));
             if let Some((extra, present, number)) = peers.iter().find_map(|peer| {
                 let number = section_number(documentation::bare_heading_title(&peer.heading))?;
                 existing
                     .iter()
-                    .find(|heading| {
+                    .zip(&paths)
+                    .find(|(heading, path)| {
                         heading.level == peer.level
                             && heading.heading.trim() != peer.heading.trim()
                             && section_number(documentation::bare_heading_title(&heading.heading))
                                 == Some(number)
+                            && Some(parent_of(path)) == target_parent
                     })
-                    .map(|present| (peer, present, number))
+                    .map(|(present, _)| (peer, present, number))
             }) {
                 bail!(
                     "invalid_argument_value: section replacement cannot add {:?} (line {} of text): the document already has section {number} as {:?} at document line {}, so two sections would share that number. If the text continues that section, rewrite it with its own action=section edit using its exact heading; if it is a new section, renumber it, or place it with action=insert_after",
@@ -3121,6 +3136,67 @@ fn check_whole_write(s: &Session, name: &str, args: &Value) -> Result<()> {
         bail!(
             "whole_write_withheld: a previous response exceeded the output limit while the document is large; rewrite one section at a time with document_edit action=section (or replace_text for a passage). Whole-document write is available again after a smaller edit succeeds"
         );
+    }
+    Ok(())
+}
+
+/// The heading path of a section's parent: its own path without its title.
+fn parent_of(path: &str) -> &str {
+    path.rsplit_once('\n').map_or("", |(parent, _)| parent)
+}
+
+/// Headings an append adds must not repeat a section under the same parent,
+/// by title or by section number: a live model appended revised copies of
+/// sections 4.6-4.9, 5 and 6 right after writing them, and the finished
+/// document held each twice. `from` is where the appended text starts.
+fn check_appended_headings(candidate: &str, from: usize) -> Result<()> {
+    let headings = documentation::headings(candidate);
+    let paths = documentation::heading_paths(&headings);
+    for (index, heading) in headings.iter().enumerate() {
+        if heading.start < from {
+            continue;
+        }
+        let path = &paths[index];
+        let parent = parent_of(path);
+        let fix = |existing: &str| {
+            format!(
+                "To revise that section, use action=section with section {existing:?}; to add a subsection under it, use insert_last_child; to add a new section, give it a title and number its siblings do not have"
+            )
+        };
+        if let Some(present) = headings
+            .iter()
+            .zip(&paths)
+            .find(|(other, other_path)| other.start != heading.start && *other_path == path)
+            .map(|(other, _)| other)
+        {
+            bail!(
+                "invalid_argument_value: append adds {:?}, which the document already has under the same parent at line {}; appending would duplicate that section. {}",
+                heading.heading,
+                present.line,
+                fix(path)
+            );
+        }
+        let Some(number) = section_number(documentation::bare_heading_title(&heading.heading))
+        else {
+            continue;
+        };
+        if let Some((present, present_path)) =
+            headings.iter().zip(&paths).find(|(other, other_path)| {
+                other.start != heading.start
+                    && other.level == heading.level
+                    && section_number(documentation::bare_heading_title(&other.heading))
+                        == Some(number)
+                    && parent_of(other_path) == parent
+            })
+        {
+            bail!(
+                "invalid_argument_value: append adds {:?}, but the document already has section {number} as {:?} under the same parent at line {}, so two sections would share that number. {}",
+                heading.heading,
+                present.heading,
+                present.line,
+                fix(present_path)
+            );
+        }
     }
     Ok(())
 }
