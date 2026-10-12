@@ -1603,17 +1603,29 @@ fn a_directory_path_with_a_glob_names_the_one_glob_that_means_both() {
         (
             "source_search",
             json!({"query":"a","path":"src","pattern":"backend/*.rs"}),
-            r#"send only path_glob:"src/backend/*.rs""#,
+            r#"send only path_glob:"src/backend/*.rs" instead of pattern (relative to project.root; ** includes subdirectories) (pattern is a file glob, the legacy alias of path_glob, not the text to find); the text to find goes in query"#,
         ),
         (
             "symbol_search",
             json!({"query":"api","path":"src","path_glob":"*.rs"}),
-            r#"send only path_glob:"src/**/*.rs""#,
+            r#"send only path_glob:"src/**/*.rs" (relative to project.root; ** includes subdirectories)"#,
         ),
         (
             "source_search",
             json!({"query":"a","path":"src/main.rs","path_glob":"*.rs"}),
-            "path already names one file, so drop path_glob",
+            r#"path already names one file, so drop path_glob "*.rs""#,
+        ),
+        // A live run sent pattern as the text to find beside path and query;
+        // the hint named path_glob, an argument it never sent.
+        (
+            "source_search",
+            json!({"path":"src/main.rs","pattern":"async fn","query":"async fn run"}),
+            r#"path already names one file, so drop pattern "async fn" (pattern is a file glob, the legacy alias of path_glob, not the text to find); the text to find goes in query"#,
+        ),
+        (
+            "file_list",
+            json!({"path":"src/main.rs","pattern":"*.rs"}),
+            r#"path already names one file, so drop pattern "*.rs" (pattern is a file glob, the legacy alias of path_glob, not the text to find)"#,
         ),
     ] {
         let result = tools::run_call(&mut s, &call_id(name, args));

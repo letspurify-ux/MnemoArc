@@ -123,8 +123,16 @@ pub(super) fn execute(
     if args.get("path").is_some()
         && (args.get("path_glob").is_some() || args.get("pattern").is_some())
     {
+        // pattern sent beside path is usually meant as the text to find (a
+        // live run sent path, pattern:"async fn" and query together), so say
+        // where that text belongs.
+        let query_field = if args.get("path_glob").is_none() && args.get("pattern").is_some() {
+            "; the text to find goes in query"
+        } else {
+            ""
+        };
         bail!(
-            "conflicting_arguments: use path for one exact file or directory OR path_glob/pattern for a file glob{}",
+            "conflicting_arguments: use path for one exact file or directory OR path_glob/pattern for a file glob{}{query_field}",
             super::path_glob_conflict_hint(s, args)
         );
     }

@@ -3758,13 +3758,27 @@ fn path_glob(args: &Value) -> Result<Option<&str>> {
 }
 /// path is literal (a directory may be named `[slug]`), so it is never
 /// joined with path_glob silently. Name the one glob that means both: a live
-/// run resent `path` + `path_glob:"*.css"` five times without it.
+/// run resent `path` + `path_glob:"*.css"` five times without it. The hint
+/// names the field the model sent: pattern is the legacy file-glob alias of
+/// path_glob, and a live run sent `pattern:"async fn"` as the text to find,
+/// so a hint about path_glob would name an argument it never sent.
 fn path_glob_conflict_hint(s: &Session, args: &Value) -> String {
-    let glob = args["path_glob"]
-        .as_str()
-        .or_else(|| args["pattern"].as_str())
-        .unwrap_or("")
-        .trim_start_matches("./");
+    let (field, glob) = match (args["path_glob"].as_str(), args["pattern"].as_str()) {
+        (Some(glob), _) => ("path_glob", glob),
+        (None, Some(glob)) => ("pattern", glob),
+        (None, None) => ("path_glob", ""),
+    };
+    let glob = glob.trim_start_matches("./");
+    let legacy = if field == "pattern" {
+        " (pattern is a file glob, the legacy alias of path_glob, not the text to find)"
+    } else {
+        ""
+    };
+    let instead = if field == "pattern" {
+        " instead of pattern"
+    } else {
+        ""
+    };
     let (Some(path), Ok(root)) = (args["path"].as_str(), s.project.root.canonicalize()) else {
         return String::new();
     };
@@ -3772,7 +3786,7 @@ fn path_glob_conflict_hint(s: &Session, args: &Value) -> String {
         return String::new();
     };
     if resolved.is_file() {
-        return format!("; path already names one file, so drop path_glob {glob:?}");
+        return format!("; path already names one file, so drop {field} {glob:?}{legacy}");
     }
     let Some(relative) = resolved
         .strip_prefix(&root)
@@ -3794,7 +3808,7 @@ fn path_glob_conflict_hint(s: &Session, args: &Value) -> String {
         format!("{}/{below}", globset::escape(&relative))
     };
     format!(
-        "; to match {glob:?} below {path}, send only path_glob:{combined:?} (relative to project.root; ** includes subdirectories)"
+        "; to match {glob:?} below {path}, send only path_glob:{combined:?}{instead} (relative to project.root; ** includes subdirectories){legacy}"
     )
 }
 
