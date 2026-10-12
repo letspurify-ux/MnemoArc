@@ -106,3 +106,23 @@ test("documents without citations and line endings are preserved", () => {
     "# 안내\r\n본문.\r\n",
   );
 });
+
+// Live run 2026-10-12: every citation was wrapped in 【】 and the clean export
+// left 64 lines ending in an empty 【】.
+test("fullwidth citation wrappers disappear with their citations", () => {
+  assert.equal(
+    cleanDocument(
+      "웹 서버를 기동합니다【src/main.rs:55-106】. 기본값입니다【src/main.rs:20】【src/main.rs:30-31】.\n",
+    ),
+    "웹 서버를 기동합니다. 기본값입니다.\n",
+  );
+  assert.equal(
+    cleanDocument("근거 문장（src/a.rs:1-2）과 표시［근거: src/b.rs:3］.\n"),
+    "근거 문장과 표시.\n",
+  );
+  // A fullwidth bracket around prose stays.
+  assert.equal(
+    cleanDocument("【주의】 저장합니다.\n"),
+    "【주의】 저장합니다.\n",
+  );
+});

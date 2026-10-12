@@ -91,6 +91,7 @@ export function cleanDocument(markdown) {
   const markers = `${marker}(?:[ \\t]*[,;·]?[ \\t]*${marker})*`;
   const label = `(?:${sourceLabel}[ \\t]*[:：]?[ \\t]*)?`;
   // Remove wrappers only when their entire contents were citation annotations.
+  // Fullwidth brackets too: a live document wrapped every citation in 【】.
   let previous;
   do {
     previous = result;
@@ -98,6 +99,9 @@ export function cleanDocument(markdown) {
       ["\\(", "\\)"],
       ["\\[", "\\]"],
       ["\\{", "\\}"],
+      ["【", "】"],
+      ["（", "）"],
+      ["［", "］"],
     ])
       result = result.replace(
         new RegExp(`${open}[ \\t]*${label}${markers}[ \\t]*${close}`, "gi"),
@@ -119,8 +123,8 @@ export function cleanDocument(markdown) {
         return match.length > marker.length &&
           before &&
           after &&
-          !/[\s([{]/.test(before) &&
-          !/[\s)\]},.;:!?"']/.test(after)
+          !/[\s([{【（［]/.test(before) &&
+          !/[\s)\]},.;:!?"'】）］]/.test(after)
           ? " "
           : "";
       },

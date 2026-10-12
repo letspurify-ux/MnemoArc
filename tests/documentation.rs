@@ -4683,6 +4683,15 @@ fn an_edit_that_changes_nothing_is_refused_once_the_document_is_saved() {
         error.starts_with("document_unchanged: these edits leave the document exactly as it is (every text equals its old_text)"),
         "{error}"
     );
+    // Live run 2026-10-12: the fixed lines were re-sent four times; say
+    // they are already saved.
+    for detail in [
+        "each text is already in the document, so these edits are already saved",
+        "Do not send them again",
+        "run_guidance.document_readiness",
+    ] {
+        assert!(error.contains(detail), "missing {detail:?}: {error}");
+    }
     let hash = saved["hash"].as_str().unwrap();
     assert!(error.contains(hash), "{error}");
     let error = tools::execute(

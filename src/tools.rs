@@ -2097,13 +2097,17 @@ fn document_unchanged(digest: &str, edits: &[Value]) -> anyhow::Error {
     let identical = edits
         .iter()
         .all(|edit| edit["old_text"].is_string() && edit["old_text"] == edit["text"]);
-    let cause = if identical {
-        " (every text equals its old_text)"
-    } else {
-        ""
-    };
+    // Each old_text matched, so its text is what the document already has. A
+    // live model fixed four citations, then re-sent the fixed lines as
+    // identical edits four times over 20 requests, following its own
+    // checkpoint note to fix them.
+    if identical {
+        return anyhow::anyhow!(
+            "document_unchanged: these edits leave the document exactly as it is (every text equals its old_text): each text is already in the document, so these edits are already saved and nothing was written; its hash is still {digest}. Do not send them again: if they were fixes for earlier problems, those fixes are in the document. Take any remaining problems from run_guidance.document_readiness and the open to-dos"
+        );
+    }
     anyhow::anyhow!(
-        "document_unchanged: these edits leave the document exactly as it is{cause}, so nothing was written and its hash is still {digest}. To change text, send text that differs from what the document has; to check wording, read it with document_inspect instead of rewriting it"
+        "document_unchanged: these edits leave the document exactly as it is, so nothing was written and its hash is still {digest}. To change text, send text that differs from what the document has; to check wording, read it with document_inspect instead of rewriting it"
     )
 }
 
