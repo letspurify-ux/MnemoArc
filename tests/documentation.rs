@@ -5176,3 +5176,55 @@ fn an_append_cannot_put_a_numbered_section_after_a_higher_sibling() {
         "{doc}"
     );
 }
+
+// Live run 2026-10-12: an append of "## 6. ... (agent.rs, session.rs,
+// tools/recovery.rs)" was refused for repeating section 6 and pointed to
+// action=section, which then refused the retitled heading three times.
+#[test]
+fn a_section_edit_may_retitle_a_numbered_heading_at_its_level_and_number() {
+    let (_dir, mut s) = setup();
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n## 6. Recovery (agent.rs)\nOld.\n## 7. Close\nEnd.\n## Notes\nN.\n"}),
+    );
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":"# Guide\n## 6. Recovery (agent.rs)","expected_hash":created["hash"],"text":"## 6. Recovery (agent.rs, tools/recovery.rs)\nNew.\n## Extra\nMore.\n"}),
+    );
+    let doc = std::fs::read_to_string(&s.project.output).unwrap();
+    assert_eq!(
+        doc,
+        "# Guide\n## 6. Recovery (agent.rs, tools/recovery.rs)\nNew.\n## Extra\nMore.\n## 7. Close\nEnd.\n## Notes\nN.\n"
+    );
+    // The retitled heading is not reported as a new section.
+    assert_eq!(saved["inserted_sections"], json!(["## Extra"]), "{saved}");
+    let hash = saved["hash"].clone();
+    for (section, text) in [
+        // Another number.
+        ("# Guide\n## 7. Close", "## 8. Close\nEnd.\n"),
+        // Another level.
+        ("# Guide\n## 7. Close", "### 7. Close\nEnd.\n"),
+        // An unnumbered heading.
+        ("# Guide\n## Notes", "## Remarks\nN.\n"),
+        // No heading at all.
+        ("# Guide\n## 7. Close", "7. Close\nEnd.\n"),
+    ] {
+        let error = tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"section","section":section,"expected_hash":hash,"text":text}),
+        )
+        .unwrap_err()
+        .to_string();
+        let current = section.lines().last().unwrap();
+        let first = text.lines().next().unwrap();
+        assert!(
+            error.contains(&format!(
+                "must retain its heading: the section starts with {current:?}, but text starts with {first:?}"
+            )) && error.contains("use replace_text on the heading line"),
+            "{error}"
+        );
+    }
+}

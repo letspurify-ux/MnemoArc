@@ -388,7 +388,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit",
-                description: "Edit ONLY configured Markdown output. Save one section at a time as its evidence is read. Every save returns the outline; copy section_path from it when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition (a supplied hash is still checked). Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and needs expected_section_hash (its section_hash) or the current expected_hash; its text must retain the original full heading. fix_word replaces one garbled word reported as a mixed_script_word issue: send its fix_id and the whole word rewritten as text, without copying the garbled characters. In the source_document workflow every save returns citation_check with unread cited ranges; do not patch workflow. Returns measured lines, new hash and the outline",
+                description: "Edit ONLY configured Markdown output. Save one section at a time as its evidence is read. Every save returns the outline; copy section_path from it when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition (a supplied hash is still checked). Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and needs expected_section_hash (its section_hash) or the current expected_hash; its text must start with the original full heading; a numbered heading may be retitled at the same level and number. fix_word replaces one garbled word reported as a mixed_script_word issue: send its fix_id and the whole word rewritten as text, without copying the garbled characters. In the source_document workflow every save returns citation_check with unread cited ranges; do not patch workflow. Returns measured lines, new hash and the outline",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -2688,10 +2688,29 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             if let Some(expected) = args["expected_section_hash"].as_str() {
                 check_section_hash(old, target, &resolved.heading, expected)?;
             }
-            if new.lines().next().map(str::trim) != target.lines().next().map(str::trim) {
-                bail!("invalid_argument_value: section replacement must retain its heading");
-            }
             let new_headings = documentation::headings(new);
+            let current_line = target.lines().next().unwrap_or("").trim();
+            let first_line = new.lines().next().unwrap_or("").trim();
+            if first_line != current_line {
+                let shown: String = first_line.chars().take(160).collect();
+                // A numbered heading may be retitled at its own level and
+                // number: a live model was told to use action=section for a
+                // retitled "## 6." its append duplicated, then was refused
+                // three times for changing the heading.
+                let number = section_number(documentation::bare_heading_title(&resolved.heading));
+                let retitled = new_headings.first().is_some_and(|heading| {
+                    heading.start == 0
+                        && heading.level == resolved.level
+                        && number.is_some()
+                        && section_number(documentation::bare_heading_title(&heading.heading))
+                            == number
+                });
+                if !retitled {
+                    bail!(
+                        "invalid_argument_value: section replacement must retain its heading: the section starts with {current_line:?}, but text starts with {shown:?}. Start text with that heading line; a numbered heading may be retitled only at the same level with the same number. To rename this heading otherwise, use replace_text on the heading line"
+                    );
+                }
+            }
             let peers: Vec<_> = new_headings
                 .iter()
                 .skip(1)
@@ -2813,7 +2832,15 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                 replacement,
                 &old[resolved.end..]
             );
-            section_text(&candidate, heading)?;
+            // A retitled section is found by its new heading.
+            if first_line == current_line {
+                section_text(&candidate, heading)?;
+            } else {
+                section_text(
+                    &candidate,
+                    &documentation::heading_path(&candidate, resolved.start)?,
+                )?;
+            }
             Ok(candidate)
         }
         "patch" | "replace_text" | "delete_text" | "insert_before_text" | "insert_after_text" => {
@@ -3287,9 +3314,10 @@ fn dropped_peer_headings(old: &str, edit: &Value) -> Vec<String> {
 const DROPPED_HEADINGS_GUIDANCE: &str = "These headings had nothing under them, so they were not saved as sections. Write each such section with its own edit once its evidence is read: action=insert_after with this section, or append.";
 
 /// Headings of the replaced section's level that the replacement added
-/// after it, so the result names the new sections.
+/// after it, so the result names the new sections. The replacement starts
+/// where the section did, also when it retitled the heading.
 fn inserted_sibling_sections(old: &str, new: &str, section: &str) -> Vec<String> {
-    let Ok(resolved) = documentation::resolve_heading(new, section) else {
+    let Ok(resolved) = documentation::resolve_heading(old, section) else {
         return Vec::new();
     };
     let existing = documentation::headings(old);

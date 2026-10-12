@@ -138,6 +138,48 @@ pub fn view(task: &TaskState, offset: usize, limit: usize) -> Value {
     page
 }
 
+/// An item's text, refused when it names only files: a live model sent
+/// texts ["Entry point: main.rs - CLI parsing", "src/main.rs"] per step and
+/// half of its 20 to-dos were bare paths.
+fn item_text(value: &str) -> Result<&str> {
+    let text = nonempty(value, MAX_TEXT_CHARS)?;
+    if paths_only(text) {
+        bail!(
+            "{text:?} names only files, and each string in texts becomes its own to-do. Put the files in the text of the step that reads them, e.g. \"Entry point: CLI parsing and mode selection (src/main.rs)\""
+        );
+    }
+    Ok(text)
+}
+
+/// Whether every word of a text is a file path such as `src/main.rs`,
+/// `main.rs` or `src/agent.rs:10-40`.
+fn paths_only(text: &str) -> bool {
+    let mut paths = 0;
+    for word in text.split(|c: char| c.is_whitespace() || c == ',') {
+        let word = word
+            .trim_matches(|c: char| matches!(c, '`' | '"' | '\'' | '(' | ')' | '[' | ']' | ';'))
+            .trim_end_matches(['.', ':']);
+        if !word.chars().any(char::is_alphanumeric) {
+            continue;
+        }
+        let path = match word.split_once(':') {
+            Some((path, range)) if range.chars().all(|c| c.is_ascii_digit() || c == '-') => path,
+            _ => word,
+        };
+        let named_file = path.rsplit_once('.').is_some_and(|(name, extension)| {
+            !name.is_empty()
+                && (1..=5).contains(&extension.len())
+                && extension.chars().all(|c| c.is_ascii_alphanumeric())
+                && extension.chars().any(|c| c.is_ascii_alphabetic())
+        });
+        if !(named_file || path.contains('/')) {
+            return false;
+        }
+        paths += 1;
+    }
+    paths > 0
+}
+
 fn nonempty(value: &str, limit: usize) -> Result<&str> {
     let value = value.trim();
     if value.is_empty() {
@@ -216,7 +258,7 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
             }
             let start = position(task, before.as_deref())?;
             for (at, text) in (start..).zip(texts) {
-                let text = nonempty(&text, MAX_TEXT_CHARS)?;
+                let text = item_text(&text)?;
                 unique(task, text, None)?;
                 task.todo_sequence = task
                     .todo_sequence
@@ -239,7 +281,7 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
             if task.todos[at].done {
                 bail!("Reopen a completed item before changing its work");
             }
-            let text = nonempty(&text, MAX_TEXT_CHARS)?;
+            let text = item_text(&text)?;
             unique(task, text, Some(&id))?;
             task.todos[at].text = text.into();
         }
@@ -255,7 +297,7 @@ fn apply(task: &mut TaskState, operation: Operation) -> Result<()> {
             let mut parts = Vec::with_capacity(texts.len());
             let mut seen = std::collections::BTreeSet::new();
             for text in texts {
-                let text = nonempty(&text, MAX_TEXT_CHARS)?;
+                let text = item_text(&text)?;
                 if text == original.as_str() {
                     bail!("Each split item must be more specific than the original item");
                 }
@@ -560,8 +602,20 @@ fn parse_operations(value: &Value) -> Result<Parsed> {
     };
     let items: Vec<&Value> = match value {
         Value::Array(items) => {
-            if items.is_empty() || items.len() > MAX_OPERATIONS {
+            if items.is_empty() {
                 bail!("Use 1..{MAX_OPERATIONS} operation objects in a batch");
+            }
+            // Say how to split, or the model resends the whole batch: a live
+            // model sent 17-20 completes six times over 76 rounds.
+            if items.len() > MAX_OPERATIONS {
+                let count = items.len();
+                return Err(operation_error(
+                    format!(
+                        "Use 1..{MAX_OPERATIONS} operation objects in a batch; this batch has {count}. Send the first {MAX_OPERATIONS} now and the other {} in a second apply with the plan revision this one returns",
+                        count - MAX_OPERATIONS
+                    ),
+                    json!({"code":"invalid_operations","operation_count":count,"limit":MAX_OPERATIONS}),
+                ));
             }
             items.iter().collect()
         }

@@ -270,7 +270,7 @@ fn plan_check(s: &mut Session) -> Option<String> {
         if rounds < PLAN_CHECK_START {
             return None;
         }
-        (format!("empty:{}", s.task.plan_revision), "task_plan is empty. Add one short item per section the request needs, in the order the document presents them (for a flow or procedure, one per step in the order it happens; otherwise one per requested area), each naming its step or area first and then its main source files, plus final verification, using task_plan action=apply with expected_revision 0; then work through them.".to_owned())
+        (format!("empty:{}", s.task.plan_revision), "task_plan is empty. Add one short item per section the request needs, in the order the document presents them (for a flow or procedure, one per step in the order it happens; otherwise one per requested area), each one text naming its step or area first and then its main source files, plus final verification, using task_plan action=apply with expected_revision 0; then work through them.".to_owned())
     } else if !s
         .progress_recovery
         .plan_checks_shown

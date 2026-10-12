@@ -1870,3 +1870,84 @@ fn completing_a_to_do_before_the_first_save_points_out_the_missing_document() {
         assert_eq!(pointed_out, !save_first, "{result}");
     }
 }
+
+#[test]
+fn an_item_naming_only_files_is_refused_with_the_step_form() {
+    // Live run 2026-10-12: each insert sent texts ["<step>: main.rs - ...",
+    // "src/main.rs"], so half of the 20 to-dos were bare paths and the
+    // plan could later be completed only in batches over the limit.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let result = apply(
+        &mut s,
+        json!([{"op":"insert","texts":["Entry point: main.rs - CLI parsing, config loading","src/main.rs"]}]),
+    );
+    assert_eq!(result["applied"], false, "{result}");
+    let reason = result["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(
+            "\"src/main.rs\" names only files, and each string in texts becomes its own to-do"
+        ) && reason.contains("(src/main.rs)"),
+        "{reason}"
+    );
+    assert!(s.task.todos.is_empty());
+    for text in [
+        "main.rs",
+        "`src/main.rs`, `src/agent.rs`",
+        "src/agent.rs:10-40",
+        "- src/agent/question/routing.rs",
+    ] {
+        let result = apply(&mut s, json!([{"op":"insert","texts":[text]}]));
+        assert_eq!(result["applied"], false, "{text}: {result}");
+    }
+    // Paths beside the step's own words, and numbers, stay items.
+    let result = apply(
+        &mut s,
+        json!([{"op":"insert","texts":[
+            "Entry point: CLI parsing and mode selection (src/main.rs)",
+            "Section 2.3 checkpoint flow",
+            "Final verification"
+        ]}]),
+    );
+    assert_eq!(result["applied"], true, "{result}");
+    // update and split refuse the same.
+    let result = apply(
+        &mut s,
+        json!([{"op":"update","id":"T1","text":"src/main.rs"}]),
+    );
+    assert_eq!(result["applied"], false, "{result}");
+    let result = apply(
+        &mut s,
+        json!([{"op":"split","id":"T2","texts":["Section 2.3 checkpoint trigger","src/session.rs"]}]),
+    );
+    assert_eq!(result["applied"], false, "{result}");
+    assert_eq!(s.task.todos.len(), 3);
+}
+
+#[test]
+fn a_batch_over_the_operation_limit_says_how_to_split_it() {
+    // Live run 2026-10-12: completes of 17-20 items were refused six times
+    // with only the limit, and T1 stayed current for 103 requests.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    let texts: Vec<String> = (1..=20).map(|i| format!("Step {i} of the flow")).collect();
+    apply(&mut s, json!([{"op":"insert","texts":texts}]));
+    let completes: Vec<Value> = (1..=20)
+        .map(|i| json!({"op":"complete","id":format!("T{i}"),"result":format!("Step {i} written")}))
+        .collect();
+    let result = apply(&mut s, json!(completes));
+    assert_eq!(result["applied"], false, "{result}");
+    let reason = result["reason"].as_str().unwrap();
+    assert!(
+        reason
+            .contains("this batch has 20. Send the first 16 now and the other 4 in a second apply"),
+        "{reason}"
+    );
+    assert_eq!(result["conflict"]["operation_count"], 20, "{result}");
+    assert!(s.task.todos.iter().all(|item| !item.done));
+    // Following the advice completes everything.
+    assert_eq!(apply(&mut s, json!(completes[..16]))["applied"], true);
+    assert_eq!(apply(&mut s, json!(completes[16..]))["applied"], true);
+    assert!(s.task.todos.iter().all(|item| item.done));
+    assert_eq!(s.task.todos_completed_total, 20);
+}
