@@ -3140,6 +3140,11 @@ fn check_whole_write(s: &Session, name: &str, args: &Value) -> Result<()> {
     Ok(())
 }
 
+/// A section number's parts for ordering, so 4.10 follows 4.9.
+fn number_rank(number: &str) -> Option<Vec<u64>> {
+    number.split('.').map(|part| part.parse().ok()).collect()
+}
+
 /// The heading path of a section's parent: its own path without its title.
 fn parent_of(path: &str) -> &str {
     path.rsplit_once('\n').map_or("", |(parent, _)| parent)
@@ -3195,6 +3200,29 @@ fn check_appended_headings(candidate: &str, from: usize) -> Result<()> {
                 present.heading,
                 present.line,
                 fix(present_path)
+            );
+        }
+        // An append lands after every sibling: a live document wrote
+        // section 8, then appended 6 and 7 after it.
+        let Some(rank) = number_rank(number) else {
+            continue;
+        };
+        if let Some((later, later_path)) =
+            headings.iter().zip(&paths).find(|(other, other_path)| {
+                other.start < heading.start
+                    && other.level == heading.level
+                    && parent_of(other_path) == parent
+                    && section_number(documentation::bare_heading_title(&other.heading))
+                        .and_then(number_rank)
+                        .is_some_and(|other_rank| other_rank > rank)
+            })
+        {
+            bail!(
+                "invalid_argument_value: append adds {:?} after its sibling {:?} at line {}, so numbered sections would be out of order. Place it before that sibling with action=insert_before and section {:?}, or renumber it",
+                heading.heading,
+                later.heading,
+                later.line,
+                later_path
             );
         }
     }

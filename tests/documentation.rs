@@ -5097,3 +5097,61 @@ fn a_section_edit_compares_section_numbers_only_among_siblings() {
         "{saved}"
     );
 }
+
+// Live run 2026-10-12: section 8 was appended, then sections 6 and 7 were
+// appended after it, and the finished document read 5, 8, 6, 7.
+#[test]
+fn an_append_cannot_put_a_numbered_section_after_a_higher_sibling() {
+    let (_dir, mut s) = setup();
+    let original = "# Guide\n## 5. A\nx\n## 8. C\ny\n### 4.9 Nine\nz\n";
+    let created = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":original}),
+    );
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":created["hash"],"text":"## 6. B\nw\n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    for detail in [
+        "append adds \"## 6. B\" after its sibling \"## 8. C\" at line 4, so numbered sections would be out of order",
+        "action=insert_before and section \"# Guide\\n## 8. C\"",
+    ] {
+        assert!(error.contains(detail), "missing {detail:?}: {error}");
+    }
+    // The suggested placement works, and later numbers still append,
+    // compared part by part (4.10 follows 4.9).
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_before","section":"# Guide\n## 8. C","expected_hash":created["hash"],"text":"## 6. B\nw\n"}),
+    );
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":saved["hash"],"text":"### 4.10 Ten\nv\n"}),
+    );
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":saved["hash"],"text":"## 9. D\nu\n"}),
+    );
+    let doc = std::fs::read_to_string(&s.project.output).unwrap();
+    let order: Vec<_> = doc.lines().filter(|line| line.starts_with('#')).collect();
+    assert_eq!(
+        order,
+        [
+            "# Guide",
+            "## 5. A",
+            "## 6. B",
+            "## 8. C",
+            "### 4.9 Nine",
+            "### 4.10 Ten",
+            "## 9. D"
+        ],
+        "{doc}"
+    );
+}
