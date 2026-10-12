@@ -278,6 +278,20 @@ async fn registered_source_documentation() {
                                 data["plan"]["pending_count"],
                                 arguments.chars().take(200).collect::<String>()
                             );
+                            // Notices such as a to-do completed before the
+                            // first save; a live run could not show whether
+                            // the model was told.
+                            for notice in data["notices"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str)
+                            {
+                                eprintln!(
+                                    "[live] task_plan notice={}",
+                                    notice.chars().take(200).collect::<String>()
+                                );
+                            }
                         }
                         if message["role"] == "tool"
                             && let Some(id) = message["tool_call_id"].as_str()
