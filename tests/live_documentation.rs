@@ -355,9 +355,14 @@ async fn registered_source_documentation() {
                             s.output_tokens,
                             s.document_written,
                             unread,
+                            // A pending checkpoint with its cleanup requests so
+                            // far; attempts alone read 0 for a checkpoint that
+                            // is acknowledged in its first request.
                             s.checkpoint
                                 .as_ref()
-                                .map_or(0, |checkpoint| checkpoint.attempts),
+                                .map_or("none".to_owned(), |checkpoint| {
+                                    format!("pending:{}", checkpoint.attempts)
+                                }),
                             // Progress ladder state: rounds without a better
                             // score / closing threshold, and why closing began.
                             s.progress_recovery.rounds_since_best,

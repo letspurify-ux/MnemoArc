@@ -486,9 +486,10 @@ impl ToolRegistry {
     /// Document edits allowed while a checkpoint is pending.
     const CHECKPOINT_DOCUMENT_TOOLS: [&str; 2] = ["document_edit", "document_edit_batch"];
     /// Tools a pending checkpoint allows in this session. Document work may
-    /// also save sections: the checkpoint request is the last one with the
-    /// current reads in context, and a live model sent a whole section then
-    /// that the checkpoint refused.
+    /// also save sections and corrections: the checkpoint request is the last
+    /// one with the current reads in context, a live model sent a whole
+    /// section then that the checkpoint refused, and a correction run told to
+    /// save only missing sections re-read its evidence after the checkpoint.
     pub fn checkpoint_allows(s: &Session, name: &str) -> bool {
         Self::checkpoint_allowed(name)
             || (Self::CHECKPOINT_DOCUMENT_TOOLS.contains(&name) && Self::checkpoint_writes_open(s))

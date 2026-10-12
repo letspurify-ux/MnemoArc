@@ -1587,6 +1587,41 @@ fn document_checkpoint_session(dir: &std::path::Path) -> Session {
     session
 }
 
+#[test]
+fn document_checkpoint_request_offers_corrections_while_edits_are_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = document_checkpoint_session(dir.path());
+    let header = |session: &Session| -> String {
+        let request = mnemoarc::context::ContextManager::request(session, vec![]).unwrap();
+        request["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    // The first cleanup request is the last one with the current reads in
+    // context, so a missing section or a correction they support may be saved
+    // before the acknowledgement: a correction run told to save only missing
+    // sections re-read its evidence after the checkpoint.
+    let open = header(&session);
+    assert!(open.contains("CHECKPOINT CONTROL REQUEST"), "{open}");
+    assert!(
+        open.contains("a section not yet written, or a correction to an existing section"),
+        "{open}"
+    );
+    assert!(open.contains("make no other document edits"), "{open}");
+    // After the first write batch, document edits are closed.
+    session.progress_recovery.checkpoint_write_batches = ("expected-checkpoint-id".into(), 1);
+    let closed = header(&session);
+    assert!(
+        closed.contains("document edits are closed for this checkpoint"),
+        "{closed}"
+    );
+    assert!(
+        !closed.contains("correction to an existing section"),
+        "{closed}"
+    );
+}
+
 #[tokio::test]
 async fn document_checkpoint_wrong_id_retries_are_bounded() {
     let dir = tempfile::tempdir().unwrap();
