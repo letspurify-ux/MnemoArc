@@ -224,8 +224,13 @@ async fn registered_source_documentation() {
         let mut signature_counts = BTreeMap::<(String, String), usize>::new();
         while let Some(event) = rx.recv().await {
             match event {
-                AgentEvent::Tool { name, status, .. } => {
-                    eprintln!("[live] tool={name} status={status}");
+                AgentEvent::Tool {
+                    name,
+                    status,
+                    summary,
+                    ..
+                } => {
+                    eprintln!("[live] tool={name} status={status} step={summary}");
                 }
                 AgentEvent::Notice { text, .. } => {
                     eprintln!("[live] notice={text}");

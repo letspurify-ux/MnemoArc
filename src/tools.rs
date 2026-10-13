@@ -9,6 +9,7 @@ pub mod recovery;
 mod search;
 mod structure;
 mod suggest;
+mod summary;
 mod writes;
 pub(crate) use writes::{external_write, uncertain_write_error};
 pub mod task_plan;
@@ -27,6 +28,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
+pub use summary::call_summary;
 
 #[derive(Clone, Debug)]
 pub struct ToolSpec {

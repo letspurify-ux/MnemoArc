@@ -9,6 +9,7 @@ import {
 import { Message, StreamingMessage } from "./chat/Message.jsx";
 import { continuationMessages } from "./chat/continuation.js";
 import { toolLabels } from "./api.js";
+import { recentSteps, toolProgress } from "./activity.js";
 import { displayPathText, displayToolResult } from "./paths.js";
 
 export default function Chat({
@@ -41,7 +42,7 @@ export default function Chat({
       : stage === "question"
         ? "기존 작업을 보존하고 질문 답변 중"
         : stage === "tools"
-          ? `${(session.activity.tools || []).map((name) => toolLabels[name] || name).join(" · ")} 실행 중`
+          ? toolProgress(session.activity, toolLabels)
           : session?.stream
             ? "답변 생성 중"
             : stage === "model"
@@ -210,6 +211,16 @@ export default function Chat({
                 : ""}
             </div>
           )}
+          {session?.status === "running" &&
+            recentSteps(session.activity).length > 0 && (
+              <ol className="activity-steps" aria-label="최근 실행 단계">
+                {recentSteps(session.activity).map((step, index) => (
+                  <li key={index} className={step.ok ? undefined : "failed"}>
+                    {step.ok ? "✓" : "✗"} {step.text}
+                  </li>
+                ))}
+              </ol>
+            )}
           {session?.status !== "running" &&
             ["follow_up", "message_routing"].includes(lastRun?.workflow) && (
               <div

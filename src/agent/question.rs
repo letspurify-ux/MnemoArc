@@ -428,6 +428,7 @@ async fn answer(
                     session: s.id.clone(),
                     name: call.name.clone(),
                     status: result["status"].as_str().unwrap_or("error").into(),
+                    summary: tools::call_summary(&work.project.root, &call.name, &call.arguments),
                 },
                 cancel,
                 deadline,

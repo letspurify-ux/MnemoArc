@@ -969,6 +969,8 @@ pub enum AgentEvent {
         session: String,
         name: String,
         status: String,
+        /// What the call read, searched or changed (tools::call_summary).
+        summary: String,
     },
     Notice {
         session: String,
@@ -2092,7 +2094,7 @@ pub async fn run_session_controlled(
             break;
         }
         s.task_rounds += 1;
-        s.activity = json!({"stage":"model","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds()});
+        s.set_activity(json!({"stage":"model","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds()}));
         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
         let deadline = run_deadline(started, &s.config);
         if tokio::time::Instant::now() >= deadline {
@@ -2412,7 +2414,7 @@ pub async fn run_session_controlled(
             if s.is_document_work() && document_tokens >= s.config.output_tokens / 4 {
                 s.progress_recovery.whole_write_withheld = true;
             }
-            s.activity = json!({"stage":"continuing","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds()});
+            s.set_activity(json!({"stage":"continuing","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds()}));
             snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
             if length_recoveries >= LENGTH_RECOVERY_LIMIT {
                 // The advice follows what the next edit can be: with no
@@ -2771,7 +2773,11 @@ pub async fn run_session_controlled(
                     group += 1
                 }
             }
-            s.activity = json!({"stage":"tools","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds(),"tools":execution_calls[i..i+group].iter().map(|c| c.name.clone()).collect::<Vec<_>>()});
+            let steps: Vec<String> = execution_calls[i..i + group]
+                .iter()
+                .map(|c| tools::call_summary(&s.project.root, &c.name, &c.arguments))
+                .collect();
+            s.set_activity(json!({"stage":"tools","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds(),"tools":execution_calls[i..i+group].iter().map(|c| c.name.clone()).collect::<Vec<_>>(),"steps":steps}));
             snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
             // A single completion can contain many groups. Stop before the
             // next group when earlier archives or receipts exhausted capacity.
@@ -3014,12 +3020,16 @@ pub async fn run_session_controlled(
                 }
                 remaining =
                     remaining.saturating_sub(tools::result_tokens(call, &result, &s.config.model));
+                let status = result["status"].as_str().unwrap_or("error").to_owned();
+                let summary = tools::call_summary(&s.project.root, &call.name, &call.arguments);
+                s.record_step(summary.clone(), &status);
                 emit(
                     &events,
                     AgentEvent::Tool {
                         session: s.id.clone(),
                         name: call.name.clone(),
-                        status: result["status"].as_str().unwrap_or("error").into(),
+                        status,
+                        summary,
                     },
                     &cancel,
                     run_deadline(started, &s.config),
@@ -3183,6 +3193,9 @@ pub async fn run_session_controlled(
             s.last_error = Some(ARTIFACT_CHURN_ERROR.into());
             break;
         }
+        // The batch is over: its progress line must not still read as
+        // running while its calls are listed as finished.
+        s.set_activity(json!({"stage":"preparing","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds()}));
         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
     }
     if pending_reply {
@@ -3235,9 +3248,15 @@ pub async fn headless(mut s: Session, prompt: String) -> Result<Session> {
             };
             let (target, text) = match event {
                 AgentEvent::Delta { text, .. } => (console::Target::Stdout, text),
-                AgentEvent::Tool { name, status, .. } => {
-                    (console::Target::Stderr, format!("\n[{name}: {status}]\n"))
-                }
+                AgentEvent::Tool {
+                    name,
+                    status,
+                    summary,
+                    ..
+                } => (
+                    console::Target::Stderr,
+                    format!("\n[{name}: {status}] {summary}\n"),
+                ),
                 _ => continue,
             };
             if !output.write(target, &text, &render_cancel).await {
