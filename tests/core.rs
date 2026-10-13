@@ -1407,6 +1407,14 @@ fn pending_settings_name_what_blocks_them() {
     smaller.memory_count = 10;
     s.pending_config = Some(smaller);
     assert!(ContextManager::state(&s).unwrap()["pending_settings"].is_null());
+    // A failure the limits do not cover (applying them at the request
+    // boundary) is named too, so the refusal's "what blocked_by names" has
+    // a field to point at.
+    s.pending_config_error = Some("context_budget: settings exceed the context".into());
+    assert_eq!(
+        ContextManager::state(&s).unwrap()["pending_settings"]["blocked_by"],
+        "context_budget: settings exceed the context"
+    );
 }
 
 #[test]
@@ -1490,6 +1498,24 @@ fn request_headers_rank_no_direction_and_leave_rules_to_the_prompt() {
         "{suffix}"
     );
     assert!(!suffix.contains("Document edits"), "{suffix}");
+    // A cleanup request states its own call limit and defers the plan and
+    // finishing directions it cannot act on; the guidance was computed
+    // before the checkpoint began.
+    s.run_guidance = json!({"instruction":"Draft phase","max_tool_calls":32,
+        "plan_check":"task_plan is empty","plan_closeout":{"items":[]},"ready_for_final":true});
+    let guidance = &ContextManager::state(&s).unwrap()["run_guidance"];
+    assert_eq!(
+        guidance["max_tool_calls"],
+        32.min(ContextManager::cleanup_result_budget(&s.config) / 200)
+    );
+    assert!(
+        guidance["max_tool_calls"].as_u64().unwrap() < 32,
+        "{guidance}"
+    );
+    for deferred in ["plan_check", "plan_closeout", "ready_for_final"] {
+        assert!(guidance.get(deferred).is_none(), "{deferred}: {guidance}");
+    }
+    assert_ne!(guidance["instruction"], "Draft phase");
 }
 
 #[test]
@@ -2344,6 +2370,18 @@ fn checkpoint_completes_without_a_memory_write_or_no_save_reason() {
     ContextManager::prepare(&mut s, 60000).unwrap();
     let cp = s.checkpoint.as_ref().unwrap().id.clone();
     let generation = s.memory.generation;
+    // The definition does not advertise next or no_save_reason, so an input
+    // error neither lists them nor suggests them ("reason" was an alias of
+    // no_save_reason).
+    let error = tools::execute(
+        &mut s,
+        "checkpoint_complete",
+        json!({"id":cp,"progress":"p","reason":"nothing new"}),
+    )
+    .unwrap_err();
+    let shown = format!("{error:#} {:?}", error);
+    assert!(!shown.contains("no_save_reason"), "{shown}");
+    assert!(!shown.contains("\"next\""), "{shown}");
     // Saving a memory is optional: progress alone acknowledges the checkpoint.
     tools::execute(
         &mut s,

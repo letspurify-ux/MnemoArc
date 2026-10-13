@@ -947,7 +947,10 @@ fn model_line_labels_preserve_blank_lines_pipes_and_partial_boundaries() {
     assert!(shown["data"]["content"].get("line_offsets").is_none());
     assert_eq!(shown["data"]["content"]["first_line_complete"], false);
     assert_eq!(shown["next_cursor"], raw["next_cursor"]);
-    assert_eq!(shown["data"]["read_offset"], 3);
+    // Character offsets stay with the runtime; the model continues with
+    // next_cursor.
+    assert!(shown["data"].get("read_offset").is_none());
+    assert_eq!(raw["data"]["read_offset"], 3);
     assert_eq!(raw["data"]["content"]["text"], "한글|x\n\n끝\n");
     assert_eq!(tools::model_result(&shown), shown);
     for raw in [

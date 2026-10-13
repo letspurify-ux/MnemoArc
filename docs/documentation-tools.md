@@ -507,4 +507,20 @@ apodex(apodex/apodex-1.1-mini:free)로 같은 요청을 실행했을 때(192라�
 - **중복.** 체크포인트 첫 정리 요청의 편집 규칙(제어 요청 머리말이 매번 말한다), `source_lookup` 설명 반복, 체크포인트 머리말·안내의 "Checkpoints 절을 따르라" 반복, 단계 안내가 Write 절을 되풀이하던 문장, 감사 페이지 안내 반복, 복구 사유가 집중 복구 안내를 되풀이하던 문장, 판별 요청의 `context_note`, `document_edit_batch` 설명의 `document_edit` 반복(이제 "각 동작은 document_edit와 같은 뜻"), 도구 설명이 자기 매개변수 설명을 되풀이하던 문장(`task_plan`·`file_read`·`symbol_read`), 파일 편집 도구 세 개의 "출력은 document_edit로"(런타임이 막는다), 기억 도구의 순위 방식·재검증·종류 목록, `task_state`의 보이지 않는 옛 필드 이름, `checkpoint_complete`의 읽지 않는 `no_save_reason`(받기는 하되 안내하지 않는다)을 정리했다. 후속 답변은 화면의 실제 버튼 이름 "재개 (Resume)"를 쓴다.
 - **채택하지 않은 지적.** 판별 요청의 고정 플래그(모의 서버와 테스트가 판별 요청을 알아보는 데 쓴다), 진척 카운터 묶음 `progress_recovery`와 마감 카운터(테스트가 요청 상태로 관찰한다), 계획 구조 점검과 마감 안내의 흐름·인용 수정 문구(라이브 실패 뒤 일부러 넣었고 테스트가 지킨다), 체크포인트 요청·실패 수(모의 클라이언트가 읽는다), `task_state` 읽기의 revision(도구 계약), 커서 이어 읽기 원칙(가장 잦던 라이브 실패라 여러 도구에 걸친 원칙으로 둔다), 옛 인자 별칭(호환용).
 
+아홉 번째 전체 재검토도 모델이 받는 문구(두 프롬프트, 도구 설명, 요청 상태, 안내·오류 문구)를 내보내 독립 검토자 넷에게 나눠 맡기고, 지적마다 코드로 확인한 것만 고쳤다.
+
+- **답변 워크플로의 열린 할 일(모순).** answer 단계 안내는 열린 할 일이 있어도 "지금 답하라"고 했지만, 열린 할 일이 있으면 최종 답변이 거절된다. 할 일이 열려 있으면 모은 근거로 할 일을 끝낸 뒤 답하라고 안내한다(`agent::plan_check_tests::phase_guidance_matches_the_workflow_and_where_the_phase_came_from`).
+- **체크포인트 정리 요청의 상태(모순).** 정리 요청의 호출 한도는 5인데 run_guidance는 `max_tool_calls` 32를 실었고, 정리 중에 할 수 없는 `plan_check`·`plan_closeout`·`ready_for_final`도 남아 있었다. 정리 요청은 체크포인트 안내와 정리 한도를 싣고, 미뤄지는 지시를 뺀다(`core::request_headers_rank_no_direction_and_leave_rules_to_the_prompt`).
+- **대기 설정(모순).** 설정 대기 거절문은 "pending_settings.blocked_by가 적은 것을 기다린다"고 하는데, 요청 경계에서 설정 적용이 실패한 이유(한도 검사 밖의 실패)는 상태에 없었다. 그 실패를 세션에 남겨 `blocked_by`에 싣는다(`core::pending_settings_name_what_blocks_them`).
+- **document_readiness가 오는 때(사실과 다름).** 프롬프트와 `document_audit` 설명은 감사 결과가 매 요청 온다고 했지만, 이 작업이 문서를 처음 저장하기 전에는 오지 않는다. 그 전에는 `document_audit`로 기존 출력의 문제를 본다고 고쳤다.
+- **안내의 우선순위(모순).** 감사 실패 안내가 집중 복구 안내를 덮었고, 할 일 마감 목록은 집중 복구 중에 instruction에서 사라졌다. 집중 복구 안내를 남기고 마감 목록을 한 문장으로 덧붙인다(`closing::a_recovery_instruction_is_not_replaced_by_the_plan_closeout`).
+- **finalization_error(모순).** 프롬프트는 이 필드를 최종 답변이 거절된 이유로 설명하는데, 수정 중에 생긴 호출 한도 초과나 빈 응답 오류도 실렸다. 최종 답변 거절 사유만 싣고, 진척으로 시도 수가 초기화되면 더는 싣지 않는다(`closing::a_source_document_finishes_only_once_it_cites_a_source`).
+- **마감 단계의 할 일 완료 알림(모순).** 마감 안내는 끝난 할 일을 닫으라고 하는데, 문서 수정 없이 할 일을 닫으면 "다시 열라"는 알림이 붙었다. 마감 단계에서는 이 알림을 싣지 않는다(`task_plan::completing_a_to_do_before_the_first_save_points_out_the_missing_document`).
+- **제공되지 않는 도구를 가리키던 문구.** 빈 출력 조회는 `document_edit`가 없을 때도 "document_edit로 만들라"고 했다. 이제 그 도구가 제공될 때만 이렇게 안내한다. 인용 없음 안내는 `memory_read`를 "제공될 때"로 한정하고 마감 단계의 예외를 적었다. `checkpoint_complete`가 안내하지 않는 `next`·`no_save_reason`이 입력 오류의 허용 필드 목록과 추천("reason" → no_save_reason)에 나오던 것을 뺐다(`core::checkpoint_completes_without_a_memory_write_or_no_save_reason`).
+- **모델이 쓰지 않는 결과 필드.** `file_read`·`symbol_read` 결과의 문자 위치 `read_offset`·`next_offset`은 런타임 커서용이고, 모델은 `next_cursor`로 이어 읽는다(`structure::model_line_labels_preserve_blank_lines_pipes_and_partial_boundaries`). 그 밖에 계획 목록의 `completed_total`·`limits`, 범위 결과의 `scope`·`hash`·`total_lines`, 통과한 readiness의 `issue_count`, 할 일 마감의 `batch_limit`, 기억 색인 알림의 `budget_tokens`, 읽지 않은 인용 항목의 `next` 문장, 빈 `unread_citation_error`를 뺐다. 상태의 할 일은 ID·문장·재개 사유만 싣는다.
+- **중복과 불필요한 문장.** Reading 절과 Judgement 절의 같은 뜻 문장을 합쳤다. 도구 설명에서는 자기 매개변수 설명을 되풀이하던 문장(`file_read`의 offset, `code_outline`의 symbol_id 복사, `symbol_read`의 긴 함수 안내, `task_plan`의 "현재 일을 계속하라"와 texts 설명)을 정리했다. 형식 검사의 깨진 단어 안내와 저장 결과 안내, 계획 변경 거절의 "100개 한도"(설명에 있다), 빈 응답·탐색 정체·길이 복구 사유의 반복 문장, 인용 점검 안내의 긴 범위 설명을 줄였다. 인용 점검 안내는 보여 준 문제(앞 8개)로만 판단한다.
+- **채택하지 않은 지적.** 상태 머리말의 "run_guidance가 런타임의 지시를 담는다"는 지난 재구성 때 일부러 남긴 유일한 안내라 그대로 둔다(`core::request_headers_rank_no_direction_and_leave_rules_to_the_prompt`). 여덟 번째 검토에서 채택하지 않은 항목도 같은 이유로 그대로다.
+
+소스 문서 프롬프트는 약 11.4K자, 답변 프롬프트는 약 8.4K자다.
+
 프롬프트 길이는 약 21.7K자에서 줄었고 요청당 고정 접두가 그만큼 작아진다. 라이브 실행 비교는 아직 하지 않았으므로, 같은 요청의 실행 한 번으로 섹션 저장 시점과 인용 오류 수가 나빠지지 않았는지 확인해야 한다.

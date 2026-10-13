@@ -616,8 +616,15 @@ pub(super) fn execute(
                 (None, _) => output?,
             };
             if !path.exists() {
-                return Ok(json!({"exists":false,"path":path,"total_lines":0,
-                    "guidance":"Nothing has been written to the configured output yet. Create it with document_edit action=create before reading or auditing it."}));
+                // Advise creation only when the edit tool is offered: the
+                // answer workflow writes the output only if the user enabled
+                // document_edit.
+                let guidance = if s.is_document_work() || s.active_tools.contains("document_edit") {
+                    "Nothing has been written to the configured output yet. Create it with document_edit action=create before reading or auditing it."
+                } else {
+                    "Nothing has been written to the configured output yet."
+                };
+                return Ok(json!({"exists":false,"path":path,"total_lines":0,"guidance":guidance}));
             }
             let doc = read_text(&path)?;
             let digest = hash(doc.as_bytes());
@@ -1059,13 +1066,13 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
         }
         let path = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
         for (start, end) in merged {
-            let mut issue = json!({"kind":"unread_citation","path":path,"start_line":start,"end_line":end,
-                "next":format!("file_read {path} with start_line {start} through line {end} (complete lines of the current file version), or narrow the citation to the lines already read")});
+            let mut issue =
+                json!({"kind":"unread_citation","path":path,"start_line":start,"end_line":end});
             // A live run read 900 lines in pages because an opening cited a
             // whole screen component as a pointer; offer the cheaper repair.
             if end + 1 - start >= BROAD_CITATION_LINES {
                 issue["note"] = json!(
-                    "This range is long: if the citation only points at where a screen, component or feature lives, cite its entry lines (for example the declaration) instead of its whole span"
+                    "This range is long; a pointer to where something lives cites its entry lines."
                 );
             }
             issues.push(issue);
@@ -2088,7 +2095,7 @@ fn project_file_for_link(s: &Session, target: &str) -> Option<String> {
 /// A source document without a machine-readable citation cannot be
 /// finished: say so on every save and audit, not only when the final answer
 /// is refused.
-const NO_CITATIONS_GUIDANCE: &str = "The document cites no project source as relative/path.ext:start-end. Cite the sources of its claims next to them (for example backend/src/server.js:12-30); the final answer is refused while the document cites no project source. memory_read returns the path and lines of each source saved with a memory.";
+const NO_CITATIONS_GUIDANCE: &str = "The document cites no project source as relative/path.ext:start-end. Cite the sources of its claims next to them (for example backend/src/server.js:12-30); the final answer is refused while the document cites no project source (closing mode accepts a second final answer and reports it). When memory_read is offered, it returns the path and lines of each source saved with a memory.";
 
 pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Value> {
     let (checked, issues) = citation_issues(s, output, doc)?;
@@ -2098,13 +2105,16 @@ pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Va
         Ok(unread) => (unread, None),
         Err(error) => (vec![], Some(error.to_string())),
     };
-    let mut check = json!({"citations_checked":checked,"issue_count":issues.len(),"issues":issues.iter().take(8).collect::<Vec<_>>(),
-        "unread_citation_count":unread.len(),"unread_citations":unread.iter().take(8).collect::<Vec<_>>(),
-        "unread_citation_error":unread_error});
+    let listed: Vec<_> = issues.iter().take(8).collect();
+    let mut check = json!({"citations_checked":checked,"issue_count":issues.len(),"issues":listed,
+        "unread_citation_count":unread.len(),"unread_citations":unread.iter().take(8).collect::<Vec<_>>()});
+    if let Some(error) = unread_error {
+        check["unread_citation_error"] = json!(error);
+    }
     // Every save result stays in context: a clean save carries no guidance,
     // and the unread-citation rule is the prompt's. Only a ready path fix
     // needs saying how to send it.
-    if issues.iter().any(|issue| issue.get("fix").is_some()) {
+    if listed.iter().any(|issue| issue.get("fix").is_some()) {
         check["guidance"] = json!(
             "Send the fixes of the listed citation_path issues together in one document_edit_batch; an issue marked covered_by_line_fix needs no edit of its own."
         );

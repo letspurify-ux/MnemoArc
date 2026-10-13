@@ -531,6 +531,8 @@ pub struct Session {
     /// unknown outcome. Further runs require review and a process restart.
     pub write_outcome_uncertain: Arc<AtomicBool>,
     pub pending_config: Option<Config>,
+    /// Why pending_config did not apply at the last request boundary.
+    pub pending_config_error: Option<String>,
     pub task: TaskState,
     pub user_criteria: UserCriteria,
     /// Workflow selected when the session is created (one of WORKFLOW_MODES).
@@ -700,6 +702,7 @@ impl Session {
             config,
             write_outcome_uncertain: Arc::new(AtomicBool::new(false)),
             pending_config: None,
+            pending_config_error: None,
             task,
             user_criteria: Default::default(),
             memory: Default::default(),

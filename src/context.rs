@@ -88,7 +88,7 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     source(
         "Citations",
-        "Every save returns citation_check.unread_citations, the cited ranges that break this rule, and the final audit refuses the document while any remains (closing mode reports them instead): file_read such a range or narrow the citation to the lines you read. document_audit checks citations and format, not semantic accuracy: compare each claim with its cited source yourself.",
+        "Every save returns citation_check.unread_citations, the cited ranges that break this rule, and the final audit refuses the document while any remains (closing mode accepts a second final answer and reports them): file_read such a range or narrow the citation to the lines you read. document_audit checks citations and format, not semantic accuracy: compare each claim with its cited source yourself.",
     ),
     source(
         "Write as you read",
@@ -128,7 +128,7 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     both(
         "Reading the project",
-        "Locate before you read: find the identifier, route or dispatch branch with a scoped source_search, code_outline or symbol_search, then read that range with explicit start_line and max_lines, or read a whole file when the work covers it; once a search has located the branch, read it instead of searching again. Batch independent searches and reads in one response instead of paying a model request per file. When a full file path is supplied, scope navigation to it. Search a user-supplied route string or identifier before guessing its implementation syntax; an empty literal search does not prove absence, so keep the file scope and shorten the query. Search context and symbol excerpts are navigation, not evidence: read call sites and target bodies with file_read or symbol_read before explaining behavior, including guards and early returns.",
+        "Locate before you read: find the identifier, route or dispatch branch with a scoped source_search, code_outline or symbol_search, then read that range with explicit start_line and max_lines, or read a whole file when the work covers it; once a search has located the branch, read it instead of searching again. Batch independent searches and reads in one response instead of paying a model request per file. When a full file path is supplied, scope navigation to it. Search a user-supplied route string or identifier before guessing its implementation syntax; an empty literal search does not prove absence, so keep the file scope and shorten the query. Search context and symbol excerpts are navigation, not evidence: read the code with file_read or symbol_read before explaining it.",
     ),
     both(
         "Reading the project",
@@ -156,7 +156,7 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     source(
         "Each request",
-        "run_guidance.document_readiness is the saved document's audit, refreshed by the runtime on every request: while structural_ok is false, resolve the issues it lists, unread citations as the Citations section says and the reported format or citation problems at their lines. structural_ok true only lets the final answer pass the audit; it does not mean the requested document is complete.",
+        "run_guidance.document_readiness is the saved document's audit, refreshed by the runtime on every request once this task has saved the document (before that, document_audit shows an existing output's issues): while structural_ok is false, resolve the issues it lists, unread citations as the Citations section says and the reported format or citation problems at their lines. structural_ok true only lets the final answer pass the audit; it does not mean the requested document is complete.",
     ),
     both(
         "Each request",
@@ -168,7 +168,7 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     both(
         "Judgement",
-        "Claim only what the delivered lines show. Conditions, execution order, error types, loop bounds, defaults and required inputs come from the lines you read, not from names, a partial read or a call site alone: inspect a helper's definition before asserting its behavior or limit the claim to the observed call site, follow request data through normalization helpers, preserve conditional rethrows and early exits, and check API examples against actual schemas, event producers and consumers. A read that covers part of an implementation does not establish the whole; say when a fact is unconfirmed instead of guessing, and never invent source hashes or claim that tests ran without tool results.",
+        "Conditions, execution order, error types, loop bounds, defaults and required inputs come from the lines you read, not from names, a partial read or a call site alone: inspect a helper's definition before asserting its behavior or limit the claim to the observed call site, follow request data through normalization helpers, preserve conditional rethrows and early exits, and check API examples against actual schemas, event producers and consumers. Say when a fact is unconfirmed instead of guessing, and never invent source hashes or claim that tests ran without tool results.",
     ),
 ];
 
@@ -492,6 +492,17 @@ fn fit_memory_index(
     (index, omitted)
 }
 
+/// A pending to-do as the model sees it: done is always false there and the
+/// result empty (reopen clears it), so only the ID, the text and a reopen
+/// reason remain.
+fn todo_view(item: &Value) -> Value {
+    let mut view = json!({"id":item["id"],"text":item["text"]});
+    if let Some(reason) = item["reopen_reason"].as_str().filter(|r| !r.is_empty()) {
+        view["reopen_reason"] = json!(reason);
+    }
+    view
+}
+
 impl ContextManager {
     /// Keep the full plan in the session, but bound the model-facing preview so
     /// a long plan cannot consume the entire task-state token budget.
@@ -506,7 +517,13 @@ impl ContextManager {
         }
         let mut shown = pending.len().min(PREVIEW_PENDING);
         loop {
-            snapshot["todos"] = json!(pending.iter().take(shown).collect::<Vec<_>>());
+            snapshot["todos"] = json!(
+                pending
+                    .iter()
+                    .take(shown)
+                    .map(|item| todo_view(&json!(item)))
+                    .collect::<Vec<_>>()
+            );
             snapshot["todo_window"] = json!({
                 "pending_count":pending.len(),
                 "shown_pending":shown
@@ -600,7 +617,22 @@ impl ContextManager {
         // request says to pause; the control request is the instruction then.
         let mut run_guidance = s.run_guidance.clone();
         if s.checkpoint.is_some() && run_guidance.is_object() {
+            // The guidance was computed for a normal request: a cleanup
+            // request has its own call limit, and plan checks wait.
             run_guidance["instruction"] = json!(CHECKPOINT_INSTRUCTION);
+            run_guidance["max_tool_calls"] =
+                json!(32.min(Self::cleanup_result_budget(&s.config) / 200));
+            if let Some(fields) = run_guidance.as_object_mut() {
+                for deferred in ["plan_check", "plan_closeout", "ready_for_final"] {
+                    fields.remove(deferred);
+                }
+            }
+        }
+        if let Some(todo) = run_guidance
+            .get_mut("current_todo")
+            .filter(|todo| todo.is_object())
+        {
+            *todo = todo_view(todo);
         }
         // Run counters for the progress panel and run history; no prompt or
         // guidance text refers to them, and plan_pending_count repeats
@@ -629,11 +661,12 @@ impl ContextManager {
         });
         // New settings that wait for cleanup, by what they would break; they
         // apply at the next request boundary once the session fits them.
-        let pending_settings = s
-            .pending_config
-            .as_ref()
-            .and_then(|config| s.check_limits(config).err())
-            .map(|error| json!({"blocked_by":error.to_string()}));
+        let pending_settings = s.pending_config.as_ref().and_then(|config| {
+            s.pending_config_error
+                .clone()
+                .or_else(|| s.check_limits(config).err().map(|error| error.to_string()))
+                .map(|blocked_by| json!({"blocked_by":blocked_by}))
+        });
         let mut state = json!({"run_guidance":run_guidance,"pending_settings":pending_settings,"task":task,"task_detail_count":s.task.details.len(),"recent_memories":recent,"related_memories":related,"referenced_memories":pinned,"project":project,"user_criteria":s.user_criteria,"checkpoint":checkpoint,"user_sources":source_ids});
         state.as_object_mut().unwrap().extend(request_fields);
         // After a checkpoint cleared the context, a live model read its own
@@ -650,8 +683,7 @@ impl ContextManager {
                 "omitted": omitted_id_set.len(),
                 "omitted_ids": omitted_ids,
                 "omitted_ids_truncated": omitted_id_set.len() > 50,
-                "budget_tokens": s.config.index_tokens,
-                "guidance": "Some memory metadata was omitted from this state because it exceeds index_tokens; use memory_read with an omitted ID, memory_find, or memory_manage if needed"
+                "guidance": "Some memory metadata was omitted to fit the state budget; use memory_read with an omitted ID, memory_find, or memory_manage if needed"
             });
         }
         Ok(state)

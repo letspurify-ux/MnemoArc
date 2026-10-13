@@ -201,18 +201,30 @@ fn declared_phase(phase: &str, document_work: bool) -> &str {
 /// instruction replaces it. budget_phase tells a draft the budget reached
 /// from one kept from earlier in the task: the task phase persists across
 /// runs, so a resumed run starts in draft without spending half its budget.
-fn phase_instruction(phase: &str, budget_phase: &str, answer_workflow: bool) -> &'static str {
+fn phase_instruction(
+    phase: &str,
+    budget_phase: &str,
+    answer_workflow: bool,
+    todo_open: bool,
+) -> &'static str {
     match phase {
+        // An open to-do refuses the final answer, so "answer now" would be
+        // refused until it is done.
+        "answer" if todo_open => {
+            "Finish the open to-dos from the evidence already gathered, reading only a concrete missing fact, then answer."
+        }
         "answer" => {
             "Answer the user now from gathered evidence; read further only for a concrete missing fact the question requires."
         }
         "verify" => {
-            "Verify: read the evidence still missing and repair known issues in their original sections; qualify a fact that stays unverified where its claim appears."
+            "Verify: read the evidence still missing and repair known issues; qualify a fact that stays unverified where its claim appears."
         }
         "draft" if budget_phase == "draft" => {
-            "Half of the run budget is spent: read only what the unwritten sections still need."
+            "Half of the run budget is spent: write the sections whose evidence is in context, and read only what the unwritten sections still need."
         }
-        "draft" => "Draft phase: read only what the unwritten sections still need.",
+        "draft" => {
+            "Draft phase: write the sections whose evidence is in context, and read only what the unwritten sections still need."
+        }
         _ if answer_workflow => {
             "Investigate: locate and read what the question needs, then answer once the evidence is sufficient."
         }
@@ -423,7 +435,10 @@ fn collect_gaps(s: &mut Session) -> Vec<String> {
 // A document that passes its audit can still lack requested sections; a live
 // run read an older wording as permission to remove the to-dos for unwritten
 // sections.
-const PLAN_CLOSEOUT_INSTRUCTION: &str = "The saved document passes its audit, and the to-dos in plan_closeout are open. A to-do whose work is not done yet, such as a requested section still missing from the document, is NOT obsolete: do that work first. When several listed to-dos are done, close them in ONE task_plan apply using plan_closeout.expected_revision, one operation per item in the listed order: complete with the actual observed result, or remove with a reason only when the item is genuinely obsolete, never merely unstarted. Give the final answer only when the requested document is complete.";
+const PLAN_CLOSEOUT_INSTRUCTION: &str = "The saved document passes its audit, and the to-dos in plan_closeout are open. A to-do whose work is not done yet, such as a requested section still missing from the document, is NOT obsolete: do that work first. When several listed to-dos are done, close them in ONE task_plan apply using plan_closeout.expected_revision, one operation per item in the listed order.";
+
+/// Added to a focused recovery instruction when plan_closeout is present.
+const CLOSEOUT_AFTER_RECOVERY: &str = "plan_closeout lists the open to-dos: close those whose work is done in one task_plan apply with plan_closeout.expected_revision.";
 
 /// The final answer of a source document that cites no project source.
 const DOCUMENT_CITATIONS_MISSING: &str = "document_citations_missing: the saved document cites no project source as path:start-end (for example backend/src/server.js:12-30), so it cannot be checked against the source and the final answer is refused. Cite the sources next to the claims they support, from ranges you have read (file_read a range first if needed), then give the final answer.";
@@ -463,7 +478,7 @@ fn ready_except_plan(s: &mut Session) -> bool {
         // its final answer is refused, so it is not ready either.
         Ok(audit) if audit["structural_ok"] == true && tools::citation_count(s) == 0 => {
             s.run_guidance["document_readiness"] = json!({"structural_ok":true,
-                "citations_checked":0,"error":DOCUMENT_CITATIONS_MISSING});
+                "citations_checked":0,"error":"document_citations_missing"});
             false
         }
         // A passing audit is stated as a fact, so the model need not call
@@ -472,7 +487,7 @@ fn ready_except_plan(s: &mut Session) -> bool {
         // sections.
         Ok(audit) if audit["structural_ok"] == true => {
             s.run_guidance["document_readiness"] = json!({"structural_ok":true,
-                "citations_checked":audit["citations_checked"],"issue_count":audit["issue_count"]});
+                "citations_checked":audit["citations_checked"]});
             true
         }
         // issue_kinds (from the audit) still shows the whole set: a live
@@ -612,8 +627,7 @@ fn plan_closeout(s: &Session) -> Value {
     json!({
         "expected_revision":s.task.plan_revision,
         "pending_count":pending.len(),
-        "items":pending.iter().take(16).map(|item| json!({"id":item.id,"text":item.text})).collect::<Vec<_>>(),
-        "batch_limit":16
+        "items":pending.iter().take(16).map(|item| json!({"id":item.id,"text":item.text})).collect::<Vec<_>>()
     })
 }
 
@@ -649,6 +663,31 @@ fn suppress_unchanged_repeat(
     json!({"status":"ok","data":{"unchanged":true,"suppressed":true,
         "hash":result["data"]["hash"],
         "guidance":"Identical result is already in active context: the document and its evidence have not changed since. Use that result and act on it: edit, read an unread cited range, or give the final answer. Do not repeat this check until something changes."}})
+}
+
+/// last_error prefixes of a refused final answer: only these reach the model
+/// as run_guidance.finalization_error, which the prompt describes as the
+/// reason a final answer was not accepted. A batch-limit or empty-reply error
+/// set later in the same repair stretch is not one. A refusal also stops
+/// showing once progress resets the finalization attempts, so a citation
+/// added after document_citations_missing is not refused again in state.
+const FINAL_REFUSALS: [&str; 10] = [
+    "task_plan_pending:",
+    "task_unresolved_open:",
+    "request_coverage_check:",
+    "document_citations_missing:",
+    "Document format/evidence audit",
+    "Document audit failed",
+    "The requested source document has not been saved",
+    "document_write_verification_failed",
+    "document_changed_after_write",
+    "New settings are waiting",
+];
+
+fn final_refusal(error: &str) -> bool {
+    FINAL_REFUSALS
+        .iter()
+        .any(|prefix| error.starts_with(prefix))
 }
 
 /// Why a final answer went back to work.
@@ -1508,6 +1547,7 @@ pub async fn run_session_controlled(
         consume_commands(&mut s, &mut commands);
         match apply_pending_config(&mut s, true) {
             Ok(true) => {
+                s.pending_config_error = None;
                 emit(
                     &events,
                     AgentEvent::Notice {
@@ -1520,6 +1560,7 @@ pub async fn run_session_controlled(
                 .await;
             }
             Err(error) => {
+                s.pending_config_error = Some(error.to_string());
                 emit(
                     &events,
                     AgentEvent::Notice {
@@ -1733,6 +1774,8 @@ pub async fn run_session_controlled(
             >= artifact_focus_limit(&s.config);
         let artifact_focus =
             s.progress_recovery.artifact_edits_without_milestone >= artifact_focus_limit(&s.config);
+        let focused = s.checkpoint.is_none()
+            && (focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus);
         let progress_recovery = s.checkpoint.is_none()
             && (repeated_read_detected
                 || (document_work && stall_rounds >= s.config.stall_round_limit)
@@ -1773,16 +1816,16 @@ pub async fn run_session_controlled(
         } else {
             DOCUMENT_FOCUSED_INSTRUCTION
         };
-        const DOCUMENT_FOCUSED_INSTRUCTION: &str = "Focused recovery: recovery_reason says what stalled. Choose the current to-do and perform one concrete action, different from the one that failed, that changes the requested result or verifies specific missing evidence; a task_plan result with applied=false or unchanged=true did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, repeat an unchanged plan or save another summary. After a real edit, advance its to-do or read any cited range it left unread; if the result already exists, take its remaining problems from run_guidance.document_readiness.";
-        const ANSWER_FOCUSED_INSTRUCTION: &str = "Focused recovery: recovery_reason says what stalled. Choose the current to-do, or the question itself, and perform one concrete action, different from the one that failed, that changes the requested result; a task_plan result with applied=false or unchanged=true did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, repeat an unchanged plan or save another summary. If the requested result already exists, complete only the actual remaining work, then answer.";
+        const DOCUMENT_FOCUSED_INSTRUCTION: &str = "Focused recovery: recovery_reason says what stalled. Choose the current to-do and perform one concrete action, different from the one that failed, that changes the requested result or verifies specific missing evidence; do not cycle between earlier file versions. After a real edit, advance its to-do or read any cited range it left unread.";
+        const ANSWER_FOCUSED_INSTRUCTION: &str = "Focused recovery: recovery_reason says what stalled. Choose the current to-do, or the question itself, and perform one concrete action, different from the one that failed, that changes the requested result; do not cycle between earlier file versions. If the requested result already exists, complete only the actual remaining work, then answer.";
         s.run_guidance = json!({"task_rounds":s.task_rounds,"run_rounds":s.run_rounds(),"finalization_attempts":finalization_attempts,"phase":phase,"remaining_tokens":remaining,"remaining_seconds":seconds_remaining,"unread_citation_count":unread_count,
             "recovery_reason":s.progress_recovery.recovery_reason,"action_required":s.progress_recovery.action_required,
             "progress_recovery":{"active":progress_recovery,"focused":focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus,"rounds_without_substantive_progress":s.progress_recovery.rounds_without_substantive_progress,"repeated_outcome_rounds":s.progress_recovery.repeated_outcome_rounds,"artifact_edits_without_milestone":s.progress_recovery.artifact_edits_without_milestone,"repeated_read":repeated_read_detected},
             "current_todo":s.task.current_todo(),
             "max_tool_calls":32.min(if s.checkpoint.is_some() { ContextManager::cleanup_result_budget(&s.config) } else { s.config.batch_budget() } / 200),
             "plan_pending_count":s.task.todos.iter().filter(|item| !item.done).count(),
-            "finalization_error":s.last_error.as_deref().filter(|error| finalization_attempts > 0 || error.starts_with("task_plan_pending:") || error.starts_with("task_unresolved_open:") || error.starts_with("request_coverage_check:")),
-            "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: the last requests produced no new evidence, document change or resolved citation. Change approach instead of repeating them: read sources the document still needs and has not read, write or correct a section, or file_read a cited range reported as unread. Do not repeat an unchanged read, plan rewrite or memory save." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { phase_instruction(&phase, budget_phase, answer_workflow) } });
+            "finalization_error":s.last_error.as_deref().filter(|error| final_refusal(error) && (finalization_attempts > 0 || error.starts_with("task_plan_pending:") || error.starts_with("task_unresolved_open:") || error.starts_with("request_coverage_check:"))),
+            "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: the last requests produced no new evidence, document change or resolved citation. Change approach instead of repeating them: read sources the document still needs and has not read, write or correct a section, or file_read a cited range reported as unread." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { phase_instruction(&phase, budget_phase, answer_workflow, planned_work) } });
         if s.checkpoint.is_none() && !s.progress_recovery.checkpoint_document_edits.is_empty() {
             let hash = tools::output_path(&s.project)
                 .and_then(|path| tools::read_text(&path))
@@ -1817,16 +1860,25 @@ pub async fn run_session_controlled(
             s.run_guidance["plan_closeout"] = plan_closeout(&s);
             // The audit passes as soon as one section cites read lines, so
             // this held from the first clean save on and replaced every
-            // later instruction, including the recovery that names what
-            // stalled. A recovery instruction keeps its place.
-            if !progress_recovery {
+            // later instruction. A focused recovery names what stalled and
+            // keeps its place, with the closeout added; a plain stall on a
+            // written document is usually the open to-dos, so the closeout
+            // replaces it.
+            if focused {
+                let text = format!(
+                    "{} {CLOSEOUT_AFTER_RECOVERY}",
+                    s.run_guidance["instruction"].as_str().unwrap_or("")
+                );
+                s.run_guidance["instruction"] = json!(text);
+            } else {
                 s.run_guidance["instruction"] = json!(PLAN_CLOSEOUT_INSTRUCTION);
             }
         } else if s.progress_recovery.closing.is_none()
+            && !focused
             && s.run_guidance["document_readiness"]["structural_ok"] == false
         {
             s.run_guidance["instruction"] = json!(
-                "The saved document does not pass its audit yet: before another final answer, file_read each unread_citation range or narrow that citation, send the fixes of all citation_path issues together in one document_edit_batch, and repair any other listed problem at its line."
+                "The saved document does not pass its audit yet: resolve its unread_citation and other document_readiness issues before another final answer."
             );
         }
         if let Some(closing) = &s.progress_recovery.closing {
@@ -2172,7 +2224,7 @@ pub async fn run_session_controlled(
             // Change the next request: an identical one tends to produce the
             // same empty reply again. recovery_reason reaches run_guidance.
             let reason = format!(
-                "The model returned {empty_completions} empty response(s) in a row (no text and no tool call). Call one concrete tool that advances the document, such as reading missing evidence or editing a section, or give the final answer if the document is finished."
+                "The model returned {empty_completions} empty response(s) in a row (no text and no tool call)."
             );
             if recover_document(&mut s, &reason) {
                 empty_reply_reason = Some(reason);
@@ -2270,7 +2322,7 @@ pub async fn run_session_controlled(
             snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
             if length_recoveries >= LENGTH_RECOVERY_LIMIT {
                 let reason = format!(
-                    "length_recovery_limit: {length_recoveries} consecutive output-limit responses. Split document edits into smaller complete calls (one section per document_edit action=section or replace_text; whole-document write is withheld for a large document) and keep final reports concise; discarded tool batches did not execute."
+                    "length_recovery_limit: {length_recoveries} consecutive output-limit responses; edit one section per document_edit action=section or replace_text, since whole-document write is withheld for a large document."
                 );
                 if !recover_document(&mut s, &reason) {
                     failure = Some(format!(
@@ -2321,7 +2373,7 @@ pub async fn run_session_controlled(
                 continue;
             }
             if s.pending_config.is_some() {
-                let reason = "Pending settings still require cleanup; use the current settings to finish the cleanup and apply the pending update before the final answer";
+                let reason = "New settings are waiting for what pending_settings.blocked_by names; the runtime applies them at the next request once the session fits them (a checkpoint frees context, memory_manage frees memories)";
                 if s.is_document_work() {
                     s.last_error = Some(reason.into());
                     s.progress_recovery.action_required = true;
@@ -2342,7 +2394,7 @@ pub async fn run_session_controlled(
                 && document_saved(&s);
             // Closing reports open to-dos as unfinished, as its instruction
             // says; refusing its final for them only forced another round.
-            let closing_reports_todos = closing_attempt.is_some() && document_saved(&s);
+            let closing_reports_todos = closing_attempt.is_some() && s.document_written;
             if !accept_gaps
                 && !closing_reports_todos
                 && let Some(item) = s.task.current_todo()
@@ -3008,7 +3060,7 @@ pub async fn run_session_controlled(
                 >= substantive_progress_limit(&s.config)
             && !recover_document(
                 &mut s,
-                "Navigation and bookkeeping alone have not advanced the document for many requests. Read the sources the document still needs, or write or correct a section.",
+                "Navigation and bookkeeping alone have not advanced the document for many requests.",
             )
         {
             s.status = "partial".into();
@@ -3217,23 +3269,23 @@ mod plan_check_tests {
         assert_eq!(declared_phase("draft", true), "draft");
         // A draft phase kept from an earlier run is not attributed to a
         // declaration or to the budget of this run.
-        let kept = phase_instruction("draft", "investigate", false);
+        let kept = phase_instruction("draft", "investigate", false, false);
         assert!(kept.starts_with("Draft phase"), "{kept}");
         assert!(
             !kept.contains("declared") && !kept.contains("budget"),
             "{kept}"
         );
-        let budget = phase_instruction("draft", "draft", false);
+        let budget = phase_instruction("draft", "draft", false, false);
         assert!(
             budget.starts_with("Half of the run budget is spent"),
             "{budget}"
         );
         for phase in ["investigate", "draft", "verify"] {
-            let text = phase_instruction(phase, "investigate", false);
+            let text = phase_instruction(phase, "investigate", false, false);
             assert!(!text.contains("Answer the user now"), "{phase}: {text}");
         }
         assert!(
-            phase_instruction("investigate", "investigate", false)
+            phase_instruction("investigate", "investigate", false, false)
                 .contains("when the document is complete")
         );
         // A phase instruction says what this phase changes; the standing
@@ -3251,7 +3303,7 @@ mod plan_check_tests {
             } else {
                 crate::context::SYSTEM.as_str()
             };
-            for sentence in phase_instruction(phase, budget, answer)
+            for sentence in phase_instruction(phase, budget, answer, false)
                 .split(". ")
                 .map(|sentence| sentence.trim_end_matches('.'))
                 .filter(|sentence| sentence.len() >= 40)
@@ -3259,8 +3311,26 @@ mod plan_check_tests {
                 assert!(!prompt.contains(sentence), "{phase}: {sentence}");
             }
         }
+        // An open to-do refuses the final answer, so the answer phase does
+        // not tell the model to answer now while one is open.
+        let open = phase_instruction("answer", "investigate", true, true);
+        assert!(!open.contains("Answer the user now"), "{open}");
+        assert!(open.contains("open to-dos"), "{open}");
+        assert!(
+            phase_instruction("answer", "investigate", true, false).contains("Answer the user now")
+        );
         // The final answer's contents are listed once, in the prompt.
         assert!(!READY_FOR_FINAL_INSTRUCTION.contains("verification scope"));
+        // finalization_error explains a refused final answer; a batch-limit
+        // or empty-reply error set later in the same stretch is not one.
+        assert!(final_refusal(DOCUMENT_CITATIONS_MISSING));
+        assert!(final_refusal("task_plan_pending: 2 to-dos are open"));
+        for other in [
+            "batch_limit: 40 calls exceed max_tool_calls 32",
+            "model_empty_reply: no text and no tool call",
+        ] {
+            assert!(!final_refusal(other), "{other}");
+        }
     }
 
     #[test]
@@ -3494,7 +3564,7 @@ mod readiness_tests {
         // to confirm it (3.2 confirmation audits per live run).
         assert_eq!(
             s.run_guidance["document_readiness"],
-            json!({"structural_ok":true,"citations_checked":2,"issue_count":0})
+            json!({"structural_ok":true,"citations_checked":2})
         );
         // A changed source makes the read stale and blocks the ready instruction.
         std::fs::write(dir.path().join("a.rs"), "fn changed() {}\nfn b() {}\n").unwrap();

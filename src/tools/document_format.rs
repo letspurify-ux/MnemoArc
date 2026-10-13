@@ -57,9 +57,7 @@ impl FormatCheck {
         // Every save result stays in context: only one with errors says how
         // to fix them.
         if !self.issues.is_empty() {
-            result["guidance"] = json!(
-                "Fix Markdown/Mermaid errors in the next edit, and each garbled word with document_edit action=fix_word and its fix_id."
-            );
+            result["guidance"] = json!("Fix Markdown/Mermaid errors in the next edit.");
         }
         result
     }
@@ -298,7 +296,7 @@ fn report_garbled_words(result: &mut FormatCheck) {
         scripts.sort_unstable();
         scripts.dedup();
         let mut issue = json!({"kind":"mixed_script_word","line":garbled.line,"word":garbled.word,"scripts":scripts,
-            "guidance":"This Korean word runs into characters of another script, which is a garbled word. Replace it with document_edit action=fix_word, this fix_id and text set to the whole word rewritten correctly; the garbled characters need not be copied. If the foreign text is intended, set it apart from the Korean text with parentheses or quotes, or put it in inline code."});
+            "guidance":"This Korean word runs into characters of another script (a garbled word): fix it with action=fix_word, or, if the foreign text is intended, set it apart with parentheses or quotes, or put it in inline code."});
         if garbled.column.is_some() {
             issue["fix_id"] = json!(garbled.fix_id);
         }

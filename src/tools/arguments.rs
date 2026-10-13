@@ -60,17 +60,23 @@ pub(super) fn unknown_field(
         None => ("", path),
     };
     let fields = properties.as_object();
+    let hidden = if scope.is_empty() {
+        super::unadvertised_fields(name)
+    } else {
+        &[]
+    };
     let allowed: Vec<&str> = fields
         .into_iter()
         .flat_map(|fields| fields.keys())
         .map(String::as_str)
+        .filter(|key| !hidden.contains(key))
         .collect();
     // Prefer a field whose type accepts the value sent ("querys":[...]
     // means queries, not query).
     let compatible: Vec<&str> = fields
         .into_iter()
         .flatten()
-        .filter(|(_, schema)| accepts_type(schema, value))
+        .filter(|(key, schema)| !hidden.contains(&key.as_str()) && accepts_type(schema, value))
         .map(|(key, _)| key.as_str())
         .collect();
     let allowed = &allowed[..];

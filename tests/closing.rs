@@ -454,6 +454,41 @@ async fn a_recovery_instruction_is_not_replaced_by_the_plan_closeout() {
     assert!(guidance[0]["plan_closeout"].is_object(), "{}", guidance[0]);
     let instruction = guidance[0]["instruction"].as_str().unwrap();
     assert!(instruction.starts_with("Focused recovery"), "{instruction}");
+    // The closeout is added after the recovery, not lost.
+    assert!(
+        instruction.ends_with(
+            "plan_closeout lists the open to-dos: close those whose work is done in one task_plan apply with plan_closeout.expected_revision."
+        ),
+        "{instruction}"
+    );
+
+    // A failing audit's instruction does not replace a focused recovery
+    // either; document_readiness still carries the audit.
+    let (_dir, mut s, _) = fixture();
+    std::fs::write(s.project.root.join("extra.js"), "export const x = 1;\n").unwrap();
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":hash,"text":"\n# Extra\nUnread. extra.js:1\n"}),
+    )
+    .unwrap();
+    s.progress_recovery.recovery_reason = Some("The same read returned the same lines.".into());
+    let (_, guidance) = run_scripted(
+        s,
+        vec![Completion {
+            text: "Saved out.md".into(),
+            ..Default::default()
+        }],
+    )
+    .await;
+    assert_eq!(
+        guidance[0]["document_readiness"]["structural_ok"], false,
+        "{}",
+        guidance[0]
+    );
+    let instruction = guidance[0]["instruction"].as_str().unwrap();
+    assert!(instruction.starts_with("Focused recovery"), "{instruction}");
 }
 
 #[tokio::test]

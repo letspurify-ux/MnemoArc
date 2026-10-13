@@ -298,7 +298,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "symbol_search",
-                description: "Search Tree-sitter declarations across Rust, JS/JSX, TS/TSX, Python, Java and C# files. query matches symbol names (case-insensitive substring by default); use match=exact for an exact name. path scopes one file/directory; path_glob filters files (pattern is a legacy alias); do not combine them. kind, container and max_depth follow code_outline. Returns path, hash, exact symbol_id and location; copy path/symbol_id into symbol_read or symbol_relations. Unsupported files and parse errors are reported. Follow next_cursor with unchanged filters; file changes expire cursors/IDs.",
+                description: "Search Tree-sitter declarations across Rust, JS/JSX, TS/TSX, Python, Java and C# files. query matches symbol names (case-insensitive substring by default); use match=exact for an exact name. path scopes one file/directory; path_glob filters files (pattern is a legacy alias); do not combine them. kind, container and max_depth follow code_outline. Returns path, hash, exact symbol_id and location. Unsupported files and parse errors are reported. Follow next_cursor with unchanged filters; file changes expire cursors/IDs.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -318,7 +318,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "code_outline",
-                description: "Explore one Rust, JS/JSX, TS/TSX, Python, Java or C# file. For a function list use {path,view:\"compact\",max_depth:0,kind:\"function\"}; use kind:\"method\" with container and without max_depth:0 for class methods. Omit kind only for a mixed overview. Find a name with {path,query:\"handleQuestion\",match:\"exact\",kind:\"function\"}. query defaults to case-insensitive substring matching. kind filters normalized symbol_kind; container is an exact enclosing path: copy the parent class qualified_name, e.g. Store or Outer::Inner, never convert :: to Java or C# member dots. qualified_name is navigation, not a unique ID for overloaded methods. max_depth uses symbol nesting (0=top level, 1=direct members), not AST depth. Defaults: all kinds/depths, view=detailed. Compact returns names, kinds, containers, positions, a ready-to-copy location and symbol IDs, without source evidence. For parameters, defaults and declared return types use view=detailed with query and match=exact; an untruncated signature often answers without a body read. Detailed includes signature_source and signature_truncated; if truncated, read only the missing signature lines. When signature_context_start_line is present, shared declaration modifiers were omitted; use file_read there for the common prefix. Copy symbol_id into symbol_read for the body. Follow next_cursor preserving ALL filters and view; limit may change. Edits expire cursors/IDs. Positions are 1-based Unicode. Syntax structure does not resolve semantic references.",
+                description: "Explore one Rust, JS/JSX, TS/TSX, Python, Java or C# file. For a function list use {path,view:\"compact\",max_depth:0,kind:\"function\"}; use kind:\"method\" with container and without max_depth:0 for class methods. Omit kind only for a mixed overview. Find a name with {path,query:\"handleQuestion\",match:\"exact\",kind:\"function\"}. query defaults to case-insensitive substring matching. kind filters normalized symbol_kind; container is an exact enclosing path: copy the parent class qualified_name, e.g. Store or Outer::Inner, never convert :: to Java or C# member dots. qualified_name is navigation, not a unique ID for overloaded methods. max_depth uses symbol nesting (0=top level, 1=direct members), not AST depth. Defaults: all kinds/depths, view=detailed. Compact returns names, kinds, containers, positions, a ready-to-copy location and symbol IDs, without source evidence. For parameters, defaults and declared return types use view=detailed with query and match=exact; an untruncated signature often answers without a body read. Detailed includes signature_source and signature_truncated; if truncated, read only the missing signature lines. When signature_context_start_line is present, shared declaration modifiers were omitted; use file_read there for the common prefix. Follow next_cursor preserving ALL filters and view; limit may change. Edits expire cursors/IDs. Positions are 1-based Unicode. Syntax structure does not resolve semantic references.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -328,7 +328,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "symbol_read",
-                description: "Read implementation only when the requested fact is missing from code_outline's detailed signature. Use {path,symbol_id,max_lines:30} for the start of a function; do not read a whole long function just to list arguments. A range is capped at the symbol end; omit start_line and max_lines to read the whole symbol subject to file_read limits. Copy exact symbol_id from code_outline or symbol_search; stale IDs are rejected. If text is truncated, finish that requested range with file_read cursor before starting another range at next_line, at most symbol.end_line. Shared declaration lines can include neighboring declarations.",
+                description: "Read implementation only when the requested fact is missing from code_outline's detailed signature. Use {path,symbol_id,max_lines:30} for the start of a function. A range is capped at the symbol end; omit start_line and max_lines to read the whole symbol subject to file_read limits. Copy exact symbol_id from code_outline or symbol_search; stale IDs are rejected. If text is truncated, finish that requested range with file_read cursor before starting another range at next_line, at most symbol.end_line. Shared declaration lines can include neighboring declarations.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -338,7 +338,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_audit",
-                description: "run_guidance.document_readiness already carries this audit of the saved document on every request; call this only to page its remaining issues with offset. Check output citations path:line[-line], cited ranges not yet read as complete lines of the current file version (unread_citation), Markdown tables/code fences and fenced Mermaid syntax in one call. Paginated errors; the first result returns revision, and offset > 0 requires expected_revision copied from that result. Restart from offset 0 when the revision changes.",
+                description: "Audits the configured output: citation format path:line[-line], unread_citation, Markdown tables/code fences and fenced Mermaid syntax. Once this task has saved the document, run_guidance.document_readiness carries this audit with its first issues; call this to page further issues with offset, or to see an existing output's issues before this task's first save. Paginated errors; the first result returns revision, and offset > 0 requires expected_revision copied from that result. Restart from offset 0 when the revision changes.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -348,7 +348,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "file_read",
-                description: "Read a new range with path, 1-based start_line and max_lines (line count). Do not use offset as a line number. Example: {path:\"src/agent.rs\",start_line:160,max_lines:140}. file_read always needs path, or cursor alone; to view sections of the configured output, call document_inspect instead. If truncated, continue ONLY with {cursor: next_cursor.cursor}; never combine cursor with path/start_line/max_lines/offset. A cursor completes the original requested range and expires if the file changes. Once that range is complete, next_line indicates where a NEW range can start. Returned line_start/line_end describe delivered text; boundary flags mark partial lines, and partial boundary lines do not satisfy citation coverage. Use force_read=true only to re-read the same file range on purpose; a document edit already returns the output's new hash and checks.",
+                description: "Read a new range with path, 1-based start_line and max_lines (line count). Example: {path:\"src/agent.rs\",start_line:160,max_lines:140}. file_read always needs path, or cursor alone; to view sections of the configured output, call document_inspect instead. If truncated, continue ONLY with {cursor: next_cursor.cursor}; never combine cursor with path/start_line/max_lines. A cursor completes the original requested range and expires if the file changes. Once that range is complete, next_line indicates where a NEW range can start. Returned line_start/line_end describe delivered text; boundary flags mark partial lines, and partial boundary lines do not satisfy citation coverage. Use force_read=true only to re-read the same file range on purpose; a document edit already returns the output's new hash and checks.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -388,7 +388,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit",
-                description: "Edit ONLY configured Markdown output. Every save returns the outline; copy section_path from it when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition (a supplied hash is still checked). Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash. section replaces an existing section INCLUDING all descendants and needs expected_section_hash (its section_hash) or the current expected_hash; its text must start with the original full heading; a numbered heading may be retitled at the same level and number. fix_word replaces one garbled word reported as a mixed_script_word issue: send its fix_id and the whole word rewritten as text, without copying the garbled characters. Returns measured lines, new hash and the outline",
+                description: "Edit ONLY configured Markdown output. Every save returns the outline; copy section_path from it when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition (a supplied hash is still checked). Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash. section replaces an existing section INCLUDING all descendants and needs expected_section_hash (its section_hash) or the current expected_hash; its text must start with the original full heading; a numbered heading may be retitled at the same level and number. fix_word replaces one garbled word reported as a mixed_script_word issue: send its fix_id and the whole word rewritten as text, without copying the garbled characters. Returns measured lines and the new hash",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -713,13 +713,8 @@ impl ToolRegistry {
                         {"properties":{"action":{"const":"update"}},"required":["action","patch"],"not":{"anyOf":[{"required":["offset"]},{"required":["limit"]}]}}
                     ]);
                 }
-                if t.name == "checkpoint_complete" {
-                    // Accept old callers' next summaries, but new plans have
-                    // one ordered source of truth through task_plan; nothing
-                    // reads no_save_reason, so it is accepted unadvertised.
-                    for hidden in ["next", "no_save_reason"] {
-                        t.parameters["properties"].as_object_mut().unwrap().remove(hidden);
-                    }
+                for hidden in unadvertised_fields(t.name) {
+                    t.parameters["properties"].as_object_mut().unwrap().remove(*hidden);
                 }
                 if t.name == "memory_manage" {
                     t.parameters["oneOf"] = json!([
@@ -4111,7 +4106,7 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
         // suggesting a different project file (a live run asked three times).
         let is_output = output_path(p).is_ok_and(|output| output == candidate);
         let hint = if e.kind() == std::io::ErrorKind::NotFound && is_output {
-            " The configured output does not exist yet: nothing has been written to it. Create it with document_edit action=create (or document_edit_batch) before reading or auditing it.".to_owned()
+            " The configured output does not exist yet: nothing has been written to it.".to_owned()
         } else if e.kind() == std::io::ErrorKind::NotFound {
             if let Some(shape) = path_shape_hint(&root, path) {
                 shape
@@ -6653,6 +6648,17 @@ pub fn result_tokens(call: &crate::llm::ToolCall, result: &Value, model: &str) -
     raw.max(shown)
 }
 
+/// Fields a tool still accepts from old callers but no longer advertises:
+/// checkpoint_complete's next summaries gave way to task_plan as the one
+/// ordered source of truth, and nothing reads no_save_reason. Definitions
+/// and input errors both leave them out.
+fn unadvertised_fields(tool: &str) -> &'static [&'static str] {
+    match tool {
+        "checkpoint_complete" => &["next", "no_save_reason"],
+        _ => &[],
+    }
+}
+
 /// Present absolute line labels to the model without changing source text,
 /// Unicode cursor offsets, archives or delivery coverage in the session.
 pub fn model_result(result: &Value) -> Value {
@@ -6676,7 +6682,14 @@ pub fn model_result(result: &Value) -> Value {
     let fields = content.as_object_mut().unwrap();
     fields.remove("text");
     fields.remove("line_offsets");
+    // Character offsets drive the runtime's cursor; the model continues
+    // with next_cursor and must never compute offsets.
+    fields.remove("next_offset");
     fields.insert("numbered_text".into(), json!(numbered));
+    if let Some(data) = shown["data"].as_object_mut() {
+        data.remove("read_offset");
+        data.remove("next_offset");
+    }
     shown
 }
 

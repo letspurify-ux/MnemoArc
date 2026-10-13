@@ -96,7 +96,7 @@ pub fn spec() -> ToolSpec {
                 // still enforces each operation's required/allowed fields.
                 "items":schema(json!({
                     "op":action(&["insert","update","split","move","remove","complete","reopen"]),
-                    "texts":{"type":"array","minItems":1,"maxItems":MAX_PENDING,"items":short,"description":"insert or split; split needs at least two smaller outcomes in execution order"},
+                    "texts":{"type":"array","minItems":1,"maxItems":MAX_PENDING,"items":short,"description":"insert or split, in execution order"},
                     "before":id,"id":id,"text":short,"result":note,"reason":note
                 }), &["op"])
             }
@@ -109,7 +109,7 @@ pub fn spec() -> ToolSpec {
     ]);
     ToolSpec {
         name: "task_plan",
-        description: "Manage an ordered to-do list; the first unfinished item is current. apply applies its operations atomically. insert: texts, optional before; update: id/text; split: unfinished id and 2..100 specific texts preserving its goal, keeping its ID for the first part; move: unfinished id, optional before. Omit before to append. complete: CURRENT id/result. remove: unfinished id/reason; reopen: completed id/reason, placed before current. Keep at most 100 unfinished small outcomes. Recoverable conflicts return applied=false; the whole batch remains unapplied. conflict reports code, zero-based operation_index, target/current IDs, blocking_ids, expected/current revisions and correction. Continue current work.",
+        description: "Manage an ordered to-do list; the first unfinished item is current. apply applies its operations atomically. insert: texts, optional before; update: id/text; split: unfinished id and 2..100 specific texts preserving its goal, keeping its ID for the first part; move: unfinished id, optional before. Omit before to append. complete: CURRENT id/result. remove: unfinished id/reason; reopen: completed id/reason, placed before current. Keep at most 100 unfinished small outcomes. Recoverable conflicts return applied=false; the whole batch remains unapplied. conflict reports code, zero-based operation_index, target/current IDs, blocking_ids, expected/current revisions and correction.",
         optional: false,
         read_only: false,
         parameters,
@@ -124,9 +124,7 @@ pub fn view(task: &TaskState, offset: usize, limit: usize) -> Value {
         "revision":task.plan_revision,"items":items,"current":task.current_todo(),
         "offset":offset,"total_items":task.todos.len(),
         "next_offset":(end < task.todos.len()).then_some(end),
-        "pending_count":task.todos.iter().filter(|item| !item.done).count(),
-        "completed_total":task.todos_completed_total,
-        "limits":{"pending":MAX_PENDING,"retained_completed":MAX_COMPLETED}
+        "pending_count":task.todos.iter().filter(|item| !item.done).count()
     });
     // An empty page past the end is not an empty plan.
     if offset >= task.todos.len() && !task.todos.is_empty() {
@@ -420,7 +418,7 @@ fn unchanged(
         _ =>
             "Correct the reported operation using the returned IDs and current_revision, then resend the whole batch. No earlier operation was committed.",
     });
-    json!({"applied":false,"reason":reason,"conflict":conflict,"plan":view(task, 0, DEFAULT_PAGE),"guidance":"This result does not stop the task. Continue the current item's concrete work. Use the returned revision/IDs for a necessary plan correction; keep at most 100 unfinished items by completing or removing obsolete work. Do not repeat the unchanged request."})
+    json!({"applied":false,"reason":reason,"conflict":conflict,"plan":view(task, 0, DEFAULT_PAGE),"guidance":"This result does not stop the task. Continue the current item's concrete work. Use the returned revision/IDs for a necessary plan correction. Do not repeat the unchanged request."})
 }
 
 pub(super) fn compact_conflict(conflict: &Value) -> Value {
@@ -1153,7 +1151,9 @@ fn completed_without_edit(s: &Session, next: &TaskState) -> Option<String> {
         .todos
         .iter()
         .any(|item| item.id == watch.id && item.done);
-    if !s.is_document_work() || !was_open || !now_done {
+    // Closing mode asks for completions without further edits; a reopen
+    // request would contradict it.
+    if !s.is_document_work() || !was_open || !now_done || s.progress_recovery.closing.is_some() {
         return None;
     }
     let Some(before) = watch.document.as_deref() else {

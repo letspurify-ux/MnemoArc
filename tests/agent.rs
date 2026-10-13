@@ -898,20 +898,18 @@ impl LlmClient for SummaryReads {
                     .collect();
                 assert!(
                     text == expected,
-                    "step={} part={i} expected_offset={} read_offset={} first={:?} expected={:?}",
+                    "step={} part={i} expected_offset={} first={:?} expected={:?}",
                     *step,
                     offsets[i],
-                    result["data"]["read_offset"],
                     text.chars().take(30).collect::<String>(),
                     expected.chars().take(30).collect::<String>()
                 );
                 offsets[i] += text.chars().count();
                 let cursor = &result["next_cursor"];
                 assert_eq!(cursor["tool"], "file_read");
-                assert_eq!(
-                    result["data"]["next_offset"].as_u64().unwrap() as usize,
-                    offsets[i]
-                );
+                // The continuation is the cursor; character offsets are the
+                // runtime's and stay out of the model's view.
+                assert!(result["data"].get("next_offset").is_none());
                 assert!(cursor["cursor"].as_str().unwrap().starts_with('R'));
                 assert!(cursor.get("offset").is_none());
                 total += mnemoarc::tools::result_tokens(

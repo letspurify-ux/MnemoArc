@@ -1818,7 +1818,9 @@ fn closing_mode_does_not_add_open_to_dos() {
 // once from summaries.
 #[test]
 fn completing_a_to_do_before_the_first_save_points_out_the_missing_document() {
-    for save_first in [false, true] {
+    // Closing mode asks to close finished to-dos without more edits, so the
+    // notice's reopen request would contradict it there.
+    for (save_first, closing) in [(false, false), (true, false), (false, true)] {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.js"), "function run() {}\n").unwrap();
         let mut s = Session::new(
@@ -1854,6 +1856,10 @@ fn completing_a_to_do_before_the_first_save_points_out_the_missing_document() {
             json!({"path":"main.js","start_line":1,"max_lines":1}),
         )
         .unwrap();
+        // Closing mode withholds source reads until a document exists.
+        if closing {
+            s.progress_recovery.closing = Some(Default::default());
+        }
         if save_first {
             tools::execute(
                 &mut s,
@@ -1875,7 +1881,7 @@ fn completing_a_to_do_before_the_first_save_points_out_the_missing_document() {
                 })
             })
         });
-        assert_eq!(pointed_out, !save_first, "{result}");
+        assert_eq!(pointed_out, !save_first && !closing, "{result}");
     }
 }
 
