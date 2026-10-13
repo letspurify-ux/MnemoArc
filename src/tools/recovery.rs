@@ -89,6 +89,8 @@ pub fn describe(message: &str) -> Value {
         "checkpoint_id_mismatch" | "checkpoint_not_confirmed" | "incomplete_group"
     ) {
         (Class::Prerequisite, "repair_checkpoint_on_next_request")
+    } else if code == "checkpoint_citations_missing" {
+        (Class::MissingEvidence, "cite_before_checkpoint")
     } else if code == "memory_sources_required" {
         (Class::MissingEvidence, "restore_memory_evidence")
     } else if code == "memory_revision_missing" {
@@ -345,6 +347,11 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             "history",
         ],
         "repair_checkpoint_on_next_request" => &["history", "checkpoint_complete"],
+        "cite_before_checkpoint" => &[
+            "document_edit_batch",
+            "document_edit",
+            "checkpoint_complete",
+        ],
         "inspect_checkpoint_state" => &["history", "task_state"],
         "lookup_observed_evidence" => &["source_lookup", "history", "file_read"],
         "resolve_path" if matches!(call.name.as_str(), "document_edit" | "document_edit_batch") => {

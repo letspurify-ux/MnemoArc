@@ -640,6 +640,14 @@ impl LlmClient for LateCheckpoint {
 #[tokio::test]
 async fn document_checkpoint_recovers_after_twelve_failures_below_extended_limit() {
     let (_dir, mut s) = fixture();
+    // A document citing nothing is refused once at a checkpoint (tested in
+    // closing.rs); this test counts only the scripted failures.
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","old_text":"Draft.","text":"Draft. report.rs:1-1"}),
+    )
+    .unwrap();
     mnemoarc::context::ContextManager::prepare(&mut s, 120_000).unwrap();
     assert!(s.checkpoint.is_some());
     let client = Arc::new(LateCheckpoint {

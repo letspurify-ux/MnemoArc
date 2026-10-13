@@ -507,6 +507,10 @@ impl ToolRegistry {
         batches == 0
             || (batches == 1
                 && s.progress_recovery.checkpoint_edit_held.as_deref() == Some(cp.id.as_str()))
+            || s.progress_recovery
+                .checkpoint_citations_held
+                .as_ref()
+                .is_some_and(|(held, at)| *held == cp.id && batches == at + 1)
     }
     fn workflow_required_tools(s: &Session) -> &'static [&'static str] {
         if s.task.workflow == "source_document" {
@@ -6053,6 +6057,26 @@ fn execute_repaired(
             let progress = text(&args, "progress")?;
             if progress.trim().is_empty() {
                 bail!("invalid_argument_value: checkpoint progress must be nonempty");
+            }
+            // A live run saved its first document, citing nothing, during a
+            // checkpoint and acknowledged it at once; the reads left context,
+            // and citing them later took 165 requests of reading them again.
+            // Refused once per checkpoint, with one more batch open to save.
+            if s.is_document_work() && s.document_written && citation_count(s) == 0 {
+                let id = cp.id.clone();
+                let recovery = &mut s.progress_recovery;
+                if recovery
+                    .checkpoint_citations_held
+                    .as_ref()
+                    .is_none_or(|(held, _)| *held != id)
+                {
+                    let (batch_id, batches) = &recovery.checkpoint_write_batches;
+                    let at = if *batch_id == id { *batches } else { 0 };
+                    recovery.checkpoint_citations_held = Some((id, at));
+                    bail!(
+                        "checkpoint_citations_missing: the saved document cites no project source as path:start-end. The reads in this context still show their line numbers; after checkpoint_complete they leave context and would have to be read again. On the next request, save citations next to the claims these reads support with document_edit_batch, then call checkpoint_complete in the same batch. It is accepted then even if nothing could be cited"
+                    );
+                }
             }
             let mut task = s.task.clone();
             task.checkpoint_summary = progress.to_string();

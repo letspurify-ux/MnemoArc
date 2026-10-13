@@ -2846,6 +2846,96 @@ async fn a_failed_edit_holds_a_checkpoint_only_once() {
     );
 }
 
+// Live run 2026-10-13: the first document, citing nothing, was saved in a
+// checkpoint's cleanup and the checkpoint acknowledged at once; citing it
+// later took 165 requests of reading the same sources again.
+#[tokio::test]
+async fn a_checkpoint_is_refused_once_while_the_document_cites_nothing() {
+    let uncited =
+        "# Flow\nA for loop runs work five times.\n\n# History\nHistory is normalized first.\n";
+    let cited = "# Flow\nA for loop runs work five times. main.js:3-5\n\n# History\nHistory is normalized first.\n";
+    for cite in [true, false] {
+        let (_dir, s, id) = checkpoint_fixture();
+        let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+        let ack = |n: &str| {
+            (
+                format!("ack-{n}"),
+                "checkpoint_complete",
+                json!({"id":id,"progress":"Saved the flow and history sections."}),
+            )
+        };
+        let mut second = vec![ack("2")];
+        if cite {
+            second.insert(
+                0,
+                (
+                    "cite".into(),
+                    "document_edit_batch",
+                    json!({"expected_hash":tools::hash(uncited.as_bytes()),"edits":[{"action":"replace_text","old_text":"five times.","text":"five times. main.js:3-5"}]}),
+                ),
+            );
+        }
+        let as_calls = |batch: Vec<(String, &'static str, Value)>| {
+            calls(
+                batch
+                    .iter()
+                    .map(|(call_id, name, args)| (call_id.as_str(), *name, args.clone()))
+                    .collect(),
+            )
+        };
+        let first = vec![
+            (
+                "drop-citations".to_owned(),
+                "document_edit_batch",
+                json!({"expected_hash":hash,"edits":[
+                    {"action":"replace_text","old_text":"five times. main.js:3-5","text":"five times."},
+                    {"action":"replace_text","old_text":"first. main.js:2-2","text":"first."}]}),
+            ),
+            ack("1"),
+        ];
+        let (result, _, tools_offered) =
+            run_scripted_tools(s, vec![as_calls(first), as_calls(second)]).await;
+        let tool_results: Vec<&str> = result
+            .history
+            .bundles
+            .iter()
+            .flat_map(|b| b.messages.iter())
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert_eq!(
+            tool_results
+                .iter()
+                .filter(|r| r.contains("checkpoint_citations_missing"))
+                .count(),
+            1,
+            "{tool_results:#?}"
+        );
+        // The batch after the refusal may still save the citations.
+        assert!(
+            tools_offered[1].contains(&"document_edit_batch".to_owned()),
+            "{tools_offered:?}"
+        );
+        assert_eq!(result.checkpoints_completed, 1, "{:?}", result.last_error);
+        assert_eq!(
+            std::fs::read_to_string(&result.project.output).unwrap(),
+            if cite { cited } else { uncited }
+        );
+    }
+}
+
+#[test]
+fn a_checkpoint_is_acknowledged_at_once_when_the_document_cites_a_source() {
+    let (_dir, mut s, id) = checkpoint_fixture();
+    let result = tools::execute(
+        &mut s,
+        "checkpoint_complete",
+        json!({"id":id,"progress":"Saved the flow and history sections."}),
+    )
+    .unwrap();
+    assert_eq!(result["acknowledged"], true);
+}
+
 #[tokio::test]
 async fn checkpoint_document_edits_close_after_the_first_cleanup_request() {
     // A live model offered edits on every cleanup request kept writing for
