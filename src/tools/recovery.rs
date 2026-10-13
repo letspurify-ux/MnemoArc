@@ -177,7 +177,8 @@ pub fn describe(message: &str) -> Value {
     } else if code == "database_query_disabled_or_unknown" {
         (Class::InvalidInput, "select_enabled_database_query")
     } else if code == "verification_reserve" {
-        (Class::Prerequisite, "complete_prerequisite")
+        // The same search, narrowed, is the recovery.
+        (Class::InvalidInput, "correct_arguments")
     } else if matches!(
         code,
         "invalid_database_query_arguments" | "invalid_database_execution_arguments"
@@ -346,7 +347,6 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "repair_checkpoint_on_next_request" => &["history", "checkpoint_complete"],
         "inspect_checkpoint_state" => &["history", "task_state"],
         "lookup_observed_evidence" => &["source_lookup", "history", "file_read"],
-        "complete_prerequisite" => &["document_inspect", "document_edit"],
         "resolve_path" if matches!(call.name.as_str(), "document_edit" | "document_edit_batch") => {
             &["document_inspect", "document_edit", "document_edit_batch"]
         }
@@ -512,6 +512,13 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             "task_state",
             "history",
             "checkpoint_complete",
+        ],
+        // Closing withholds the catalog too; the document tools finish it.
+        "use_available_tools" if result["recovery"]["code"] == "closing_mode" => &[
+            "document_edit",
+            "document_edit_batch",
+            "document_inspect",
+            "file_read",
         ],
         "use_available_tools" => &["tool_catalog", "tool_select", "checkpoint_complete"],
         "stop" => &[],

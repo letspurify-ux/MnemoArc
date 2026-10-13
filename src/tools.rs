@@ -150,7 +150,7 @@ impl ToolRegistry {
         let mut specs = vec![
             ToolSpec {
                 name: "db_query",
-                description: "Read user-approved Oracle queries. First use action=list to discover enabled query IDs, purpose and bind parameters; then action=run with an ID and params. SQL and activation are controlled only by the user in Settings. Results use a read-only transaction, bound rows and cells; truncated=true includes shortened cells. RAW/BLOB cells are hexadecimal strings.",
+                description: "Read user-approved Oracle queries. First use action=list to discover enabled query IDs, purpose and bind parameters; then action=run with an ID and params. Results use a read-only transaction, bound rows and cells; truncated=true includes shortened cells. RAW/BLOB cells are hexadecimal strings.",
                 optional: false,
                 read_only: true,
                 parameters: schema(
@@ -160,7 +160,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "db_execute",
-                description: "Execute manually enabled ad hoc Oracle operations. mode=query runs a SELECT/WITH with read-only transaction; mode=statement runs SQL and commits; mode=procedure calls a named PL/SQL procedure and commits; mode=function calls a named PL/SQL function and commits. Use named binds. Procedure/function args are ordered positional parameters with name, direction=in|out|inout, type=string|number|boolean|cursor, and value for IN/INOUT. Function requires return_type. Result rows and cells are bounded; truncated=true includes shortened cells, and RAW/BLOB cells are hexadecimal strings. These modes are enabled only by the user in Settings; procedures/functions can have side effects.",
+                description: "Execute manually enabled ad hoc Oracle operations. mode=query runs a SELECT/WITH with read-only transaction; mode=statement runs SQL and commits; mode=procedure calls a named PL/SQL procedure and commits; mode=function calls a named PL/SQL function and commits. Use named binds. Procedure/function args are ordered positional parameters with name, direction=in|out|inout, type=string|number|boolean|cursor, and value for IN/INOUT. Function requires return_type. Result rows and cells are bounded; truncated=true includes shortened cells, and RAW/BLOB cells are hexadecimal strings. Procedures/functions can have side effects.",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -183,7 +183,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "tool_select",
-                description: "Add, remove or replace optional tools/groups. Takes effect after this call batch; basic tools cannot be removed",
+                description: "Add, remove or replace optional tools/groups. Takes effect after this call batch.",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -193,21 +193,21 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_write",
-                description: "Save one self-contained finding useful beyond the current step: an observed fact, decision with rationale, reusable procedure, failure lesson with its conditions, or question with lasting relevance. title/summary/body/kind are required plain JSON fields. Same key requires expected_revision; a new key omits it (not even 0). Updates replace evidence: resupply observed source_ids; sources are not inherited. Never omit source_ids after unknown_source. A project path (or path:start-end) stands in for the evidence already delivered from it. For failure lessons, separate the observed tool/input conditions and actual result from a suspected cause. One failed call does not establish a universal limitation. Set inferred=true for unconfirmed explanations or generalizations, even with source_ids. Unsourced facts, inferred memories and changed evidence are needs_review. Keep metadata concise and put details in body.",
+                description: "Save one self-contained finding: an observed fact, decision with rationale, reusable procedure, failure lesson with its conditions, or question with lasting relevance. Send plain JSON fields. Same key requires expected_revision; a new key omits it (not even 0). Updates replace evidence: resupply observed source_ids; sources are not inherited. A project path (or path:start-end) stands in for the evidence already delivered from it. For failure lessons, separate the observed tool/input conditions and actual result from a suspected cause. One failed call does not establish a universal limitation. Set inferred=true for unconfirmed explanations or generalizations, even with source_ids. Unsourced facts, inferred memories and changed evidence are needs_review. Keep metadata concise and put details in body.",
                 optional: false,
                 read_only: false,
                 parameters: memory_input_schema(),
             },
             ToolSpec {
                 name: "memory_read",
-                description: "Load memory by ID/key; offset is character offset for bounded continuation. Returns compact metadata plus custom_metadata exactly as written",
+                description: "Load memory by ID/key; offset is character offset for bounded continuation.",
                 optional: false,
                 read_only: true,
                 parameters: schema(json!({"id":string(),"offset":number()}), &["id"]),
             },
             ToolSpec {
                 name: "memory_find",
-                description: "Search memories by ID/key, title, tags, summary, source path or body. Tags are exact AND filters. An empty query lists every status by recency. Needs-review/superseded results remain discoverable. Use next cursor until exhausted; it expires when memories, the query or the tag filters change",
+                description: "Search memories by ID/key, title, tags, summary, source path or body. Tags are exact AND filters. An empty query lists every status by recency. Use next cursor until exhausted.",
                 optional: false,
                 read_only: true,
                 parameters: schema(
@@ -217,7 +217,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_manage",
-                description: "List cleanup candidates, delete unreferenced memories, or atomically replace IDs and redirect references. delete requires ids; replace requires ids and replacement; duplicate IDs are ignored. replacement follows the same reusable-knowledge and inference rules as memory_write. It uses memory_write fields and must use a new key or a key among the replaced IDs; when it reuses a replaced key, expected_revision and observed-source rules are checked before removal",
+                description: "List cleanup candidates, delete unreferenced memories, or atomically replace IDs and redirect references. delete requires ids; replace requires ids and replacement; duplicate IDs are ignored. replacement follows the same reusable-knowledge and inference rules as memory_write. It must use a new key or a key among the replaced IDs; when it reuses a replaced key, expected_revision and observed-source rules are checked before removal",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -227,7 +227,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "task_state",
-                description: "Read or update your task bookkeeping: phase, unresolved items, details and working notes (purpose, scope, constraints, completion, deliverables) go inside patch, e.g. {action:update,patch:{phase:verify}}. Manage the ordered to-dos with task_plan. Do not send empty patches or completion:[]. Updates preserve omitted fields.",
+                description: "Read or update your task bookkeeping: phase, unresolved items, details and working notes go inside patch, e.g. {action:update,patch:{phase:verify}}. Updates preserve omitted fields.",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -238,7 +238,7 @@ impl ToolRegistry {
             task_plan::spec(),
             ToolSpec {
                 name: "history",
-                description: "Search retained raw conversation/tool bundles, or read one by ID and character offset (read requires id); unavailable/pruned ranges are explicit",
+                description: "Search retained raw conversation/tool bundles, or read one by ID and character offset (read requires id).",
                 optional: false,
                 read_only: true,
                 parameters: schema(
@@ -248,7 +248,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "source_lookup",
-                description: "Recover exact IDs from already observed sources, including stored memory evidence. Optional path is a path substring, id is an exact source ID. Returns paginated excerpts; does NOT read files or establish unseen facts. Available during checkpoints. If no matching evidence exists, record the pending read in checkpoint_complete progress and investigate after the checkpoint. Never substitute an unrelated ID.",
+                description: "Recover exact IDs from already observed sources, including stored memory evidence. Optional path is a path substring, id is an exact source ID. Returns paginated excerpts; does NOT read files or establish unseen facts. Never substitute an unrelated ID.",
                 optional: false,
                 read_only: true,
                 parameters: schema(
@@ -258,7 +258,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "checkpoint_complete",
-                description: "Acknowledge the pending checkpoint in ONE call: id is the ID from the CHECKPOINT CONTROL REQUEST, and progress (required) a concise summary of current blockers, pending reads and retry instructions. It preserves the ordered task_plan and does not complete or replace plan items; it is evaluated after the other calls of its batch.",
+                description: "Acknowledge the pending checkpoint in ONE call: id is the ID from the CHECKPOINT CONTROL REQUEST, and progress (required) a concise progress summary. It preserves the ordered task_plan and does not complete or replace plan items; it is evaluated after the other calls of its batch.",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -278,7 +278,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "source_search",
-                description: "Search source lines: query is literal text by default. Prefer queries:[\"agent\",\"run\",\"db\"] for literal OR without regex escaping. Supply exactly one of query or queries. Use regex:true only for intentional regular expressions; punctuation such as .on( is literal unless regex:true. case_sensitive defaults true; whole_word defaults false (Unicode word boundaries). path selects one exact file, or a directory to search everything below it (no glob syntax); path_glob filters multiple files (pattern is a legacy alias). Do not combine path with path_glob or pattern. mode=matches (default) returns matching lines and source IDs; files returns matching paths; count returns matching-line counts per file. before/after add up to 20 context lines each in matches mode. Each displayed line is capped at 500 characters with truncation marked; truncated matches are navigation only and do not satisfy citation coverage, so read the full line with file_read. Reuse the same search options with cursor for pagination; limit may change. Hashes detect source changes",
+                description: "Search source lines: query is literal text by default. Prefer queries:[\"agent\",\"run\",\"db\"] for literal OR without regex escaping. Supply exactly one of query or queries. Use regex:true only for intentional regular expressions; punctuation such as .on( is literal unless regex:true. case_sensitive defaults true; whole_word defaults false (Unicode word boundaries). path selects one exact file, or a directory to search everything below it (no glob syntax); path_glob filters multiple files. Do not combine path with path_glob or pattern. mode=matches (default) returns matching lines and source IDs; files returns matching paths; count returns matching-line counts per file. before/after add up to 20 context lines each in matches mode. Each displayed line is capped at 500 characters with truncation marked. Reuse the same search options with cursor for pagination; limit may change.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -288,7 +288,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_inspect",
-                description: "Inspect a document using path (relative to project.root); omit path for project.output. Uses file_read path restrictions. Returns session delivery coverage for the current hash, not proof of understanding or current context retention. coverage_offset pages missing line ranges; copy coverage.revision as expected_coverage_revision on continuation to detect intervening reads. With no section, offset is an OUTLINE HEADING INDEX, not a document line number; copy next_offset from the prior outline page. Outline entries provide level and section_path (newline-separated ancestor headings); copy section_path into section for nested or repeated headings. With section, offset is a CHARACTER INDEX inside that section; copy content.next_offset or the returned next_cursor arguments. For a document line number use file_read with start_line. section also accepts a full Markdown heading or a unique title without #; ambiguous headings are rejected. For any offset or coverage_offset > 0, copy expected_hash from the first result's hash; if unavailable, restart at offset 0 with coverage_offset 0.",
+                description: "Inspect a document using path (relative to project.root); omit path for project.output. coverage_offset pages the missing line ranges of the session's delivery coverage. With no section, offset is an OUTLINE HEADING INDEX, not a document line number; copy next_offset from the prior outline page. Outline entries provide level and section_path (newline-separated ancestor headings); copy section_path into section for nested or repeated headings. With section, offset is a CHARACTER INDEX inside that section; copy content.next_offset or the returned next_cursor arguments. For a document line number use file_read with start_line. section also accepts a full Markdown heading or a unique title without #; ambiguous headings are rejected.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -298,7 +298,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "symbol_search",
-                description: "Search Tree-sitter declarations across Rust, JS/JSX, TS/TSX, Python, Java and C# files. query matches symbol names (case-insensitive substring by default); use match=exact for an exact name. path scopes one file/directory; path_glob filters files (pattern is a legacy alias); do not combine them. kind, container and max_depth follow code_outline. Returns path, hash, exact symbol_id and location. Unsupported files and parse errors are reported. Follow next_cursor with unchanged filters; file changes expire cursors/IDs.",
+                description: "Search Tree-sitter declarations across Rust, JS/JSX, TS/TSX, Python, Java and C# files. query matches symbol names (case-insensitive substring by default); use match=exact for an exact name. path scopes one file/directory; path_glob filters files; do not combine them. kind, container and max_depth follow code_outline. File changes expire cursors/IDs.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -308,7 +308,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "symbol_relations",
-                description: "Trace syntax calls/references without external language servers. Copy path and symbol_id from symbol_search/code_outline. relation=calls lists outgoing call sites in the symbol (nested functions have their own calls); callers finds incoming calls; references includes call and non-call uses. Optional path_glob limits scanned files; the target file is always included. resolved means a unique local syntax binding, NOT guaranteed runtime execution. Explicit imports/module paths and member access return candidate/ambiguous targets; unknown receivers or shadowed bindings remain unresolved. Never infer links from matching names alone. Results include source locations, hashes, candidate IDs, reasons and scan limitations, but no source evidence IDs. Inbound results omit unresolved targets: an empty page is not proof of no callers. Follow next_cursor with all original arguments; source changes expire cursors/IDs.",
+                description: "Trace syntax calls/references without external language servers. Copy path and symbol_id from symbol_search/code_outline. relation=calls lists outgoing call sites in the symbol (nested functions have their own calls); callers finds incoming calls; references includes call and non-call uses. Optional path_glob limits scanned files; the target file is always included. resolved means a unique local syntax binding, NOT guaranteed runtime execution. Explicit imports/module paths and member access return candidate/ambiguous targets; unknown receivers or shadowed bindings remain unresolved. Never infer links from matching names alone. Results carry no source evidence IDs. Inbound results omit unresolved targets: an empty page is not proof of no callers. Source changes expire cursors/IDs.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -318,27 +318,27 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "code_outline",
-                description: "Explore one Rust, JS/JSX, TS/TSX, Python, Java or C# file. For a function list use {path,view:\"compact\",max_depth:0,kind:\"function\"}; use kind:\"method\" with container and without max_depth:0 for class methods. Omit kind only for a mixed overview. Find a name with {path,query:\"handleQuestion\",match:\"exact\",kind:\"function\"}. query defaults to case-insensitive substring matching. kind filters normalized symbol_kind; container is an exact enclosing path: copy the parent class qualified_name, e.g. Store or Outer::Inner, never convert :: to Java or C# member dots. qualified_name is navigation, not a unique ID for overloaded methods. max_depth uses symbol nesting (0=top level, 1=direct members), not AST depth. Defaults: all kinds/depths, view=detailed. Compact returns names, kinds, containers, positions, a ready-to-copy location and symbol IDs, without source evidence. For parameters, defaults and declared return types use view=detailed with query and match=exact; an untruncated signature often answers without a body read. Detailed includes signature_source and signature_truncated; if truncated, read only the missing signature lines. When signature_context_start_line is present, shared declaration modifiers were omitted; use file_read there for the common prefix. Follow next_cursor preserving ALL filters and view; limit may change. Edits expire cursors/IDs. Positions are 1-based Unicode. Syntax structure does not resolve semantic references.",
+                description: "Explore one Rust, JS/JSX, TS/TSX, Python, Java or C# file. For a function list use {path,view:\"compact\",max_depth:0,kind:\"function\"}; use kind:\"method\" with container and without max_depth:0 for class methods. Omit kind only for a mixed overview. Find a name with {path,query:\"handleQuestion\",match:\"exact\",kind:\"function\"}. query defaults to case-insensitive substring matching. kind filters normalized symbol_kind; for container copy the parent class qualified_name, e.g. Store or Outer::Inner, never converting :: to Java or C# member dots. qualified_name is navigation, not a unique ID for overloaded methods. Defaults: all kinds/depths, view=detailed. Compact returns names, kinds, containers, positions, a ready-to-copy location and symbol IDs, without source evidence. For parameters, defaults and declared return types use view=detailed with query and match=exact; an untruncated signature often answers without a body read. Detailed includes signature_source and signature_truncated; if truncated, read only the missing signature lines. When signature_context_start_line is present, shared declaration modifiers were omitted; use file_read there for the common prefix. Edits expire cursors/IDs.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"path":string(),"query":string(),"match":action(&["contains","exact"]),"case_sensitive":{"type":"boolean"},"kind":action(&["function","method","constructor","class","struct","interface","trait","impl","enum","enum_member","record","annotation","field","variable","constant","type","module","macro","property","accessor","event","delegate","operator","destructor"]),"container":{"type":"string","description":"Exact enclosing symbol path, case-sensitive. Empty string selects top-level symbols."},"max_depth":{"type":"integer","minimum":0,"description":"Maximum symbol nesting depth; 0 selects top-level declarations."},"view":action(&["compact","detailed"]),"cursor":string(),"limit":number()}),
+                    json!({"path":string(),"query":string(),"match":action(&["contains","exact"]),"case_sensitive":{"type":"boolean"},"kind":action(&["function","method","constructor","class","struct","interface","trait","impl","enum","enum_member","record","annotation","field","variable","constant","type","module","macro","property","accessor","event","delegate","operator","destructor"]),"container":{"type":"string","description":"Exact enclosing symbol path, case-sensitive. Empty string selects top-level symbols."},"max_depth":{"type":"integer","minimum":0,"description":"Maximum symbol nesting depth: 0 top level, 1 direct members (not AST depth)."},"view":action(&["compact","detailed"]),"cursor":string(),"limit":number()}),
                     &["path"],
                 ),
             },
             ToolSpec {
                 name: "symbol_read",
-                description: "Read implementation only when the requested fact is missing from code_outline's detailed signature. Use {path,symbol_id,max_lines:30} for the start of a function. A range is capped at the symbol end; omit start_line and max_lines to read the whole symbol subject to file_read limits. Copy exact symbol_id from code_outline or symbol_search; stale IDs are rejected. If text is truncated, finish that requested range with file_read cursor before starting another range at next_line, at most symbol.end_line. Shared declaration lines can include neighboring declarations.",
+                description: "Read a symbol's lines, e.g. {path,symbol_id,max_lines:30} for the start of a function. A range is capped at the symbol end; omit start_line and max_lines to read the whole symbol subject to file_read limits. Copy exact symbol_id from code_outline or symbol_search; stale IDs are rejected. If text is truncated, finish that requested range with file_read cursor before starting another range at next_line, at most symbol.end_line. Shared declaration lines can include neighboring declarations.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
-                    json!({"path":string(),"symbol_id":string(),"start_line":{"type":"integer","minimum":1,"description":"Absolute file line inside the symbol, NOT a relative offset. Omit to start at the symbol's first line."},"max_lines":{"type":"integer","minimum":1,"maximum":2000,"description":"Requested line count; prefer a small range such as 30 for a function prologue."},"force_read":{"type":"boolean"}}),
+                    json!({"path":string(),"symbol_id":string(),"start_line":{"type":"integer","minimum":1,"description":"Absolute file line inside the symbol, NOT a relative offset. Omit to start at the symbol's first line."},"max_lines":{"type":"integer","minimum":1,"maximum":2000,"description":"Requested line count."},"force_read":{"type":"boolean"}}),
                     &["path", "symbol_id"],
                 ),
             },
             ToolSpec {
                 name: "document_audit",
-                description: "Audits the configured output: citation format path:line[-line], unread_citation, Markdown tables/code fences and fenced Mermaid syntax. Once this task has saved the document, run_guidance.document_readiness carries this audit with its first issues; call this to page further issues with offset, or to see an existing output's issues before this task's first save. Paginated errors; the first result returns revision, and offset > 0 requires expected_revision copied from that result. Restart from offset 0 when the revision changes.",
+                description: "Audits the configured output: citation format path:line[-line], unread_citation, Markdown tables/code fences and fenced Mermaid syntax. After this task's first save, run_guidance.document_readiness carries its first issues; offset pages the rest.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -388,7 +388,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit",
-                description: "Edit ONLY configured Markdown output. Every save returns the outline; copy section_path from it when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition (a supplied hash is still checked). Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash. section replaces an existing section INCLUDING all descendants and needs expected_section_hash (its section_hash) or the current expected_hash; its text must start with the original full heading; a numbered heading may be retitled at the same level and number. fix_word replaces one garbled word reported as a mixed_script_word issue: send its fix_id and the whole word rewritten as text, without copying the garbled characters. Returns measured lines and the new hash",
+                description: "Edit ONLY configured Markdown output. Every save returns the outline; copy section_path from it when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Prefer replace_text for rewrites. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition. Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash. section replaces an existing section INCLUDING all descendants and needs expected_section_hash (its section_hash) or the current expected_hash; its text must start with the original full heading; a numbered heading may be retitled at the same level and number. fix_word replaces one garbled word reported as a mixed_script_word issue: send its fix_id and the whole word rewritten as text, without copying the garbled characters.",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -507,13 +507,6 @@ impl ToolRegistry {
         batches == 0
             || (batches == 1
                 && s.progress_recovery.checkpoint_edit_held.as_deref() == Some(cp.id.as_str()))
-    }
-    fn checkpoint_tool_names(s: &Session) -> Vec<&'static str> {
-        let mut names = Self::CHECKPOINT_TOOLS.to_vec();
-        if Self::checkpoint_writes_open(s) {
-            names.extend(Self::CHECKPOINT_DOCUMENT_TOOLS);
-        }
-        names
     }
     fn workflow_required_tools(s: &Session) -> &'static [&'static str] {
         if s.task.workflow == "source_document" {
@@ -658,11 +651,6 @@ impl ToolRegistry {
                 // OpenAI-compatible providers reject a top-level anyOf in a
                 // function parameter schema. Runtime verification-reserve
                 // checks still reject broad discovery in this state.
-                if s.progress_recovery.whole_write_withheld
-                    && matches!(t.name, "document_edit" | "document_edit_batch")
-                {
-                    withhold_write_action(&mut t.parameters);
-                }
                 if s.task.workflow == "answer" {
                     t.description = Self::answer_description(t.name, t.description);
                 }
@@ -699,6 +687,20 @@ impl ToolRegistry {
                             {"type":"object","properties":{"action":{"const":"fix_word"},"fix_id":item_fields["fix_id"],"text":item_fields["text"]},"required":["action","fix_id","text"],"additionalProperties":false}
                         ]
                     });
+                }
+                if matches!(t.name, "document_edit" | "document_edit_batch") {
+                    // After the branches are built: they list every action.
+                    if s.progress_recovery.whole_write_withheld {
+                        strip_action(&mut t.parameters, "write");
+                    }
+                    // Answer saves run no format check, so no garbled-word
+                    // issue gives a fix_id.
+                    if s.task.workflow == "answer" {
+                        strip_action(&mut t.parameters, "fix_word");
+                        if let Some(fields) = t.parameters["properties"].as_object_mut() {
+                            fields.remove("fix_id");
+                        }
+                    }
                 }
                 if t.name == "source_search" {
                     t.parameters["oneOf"] = json!([
@@ -793,6 +795,8 @@ impl ToolRegistry {
         if Self::closing_withholds(s, name) {
             bail!(if s.document_written {
                 "closing_mode: {name} is withheld while the document is finalized; use gathered evidence, or file_read one specific cited range reported as unread"
+            } else if output_path(&s.project).is_ok_and(|path| path.is_file()) {
+                "closing_mode: {name} is withheld until this task saves the requested corrections; save them now in the existing document with document_edit or document_edit_batch (replace_text or section, not create) from the evidence already gathered"
             } else {
                 "closing_mode: {name} is withheld until the document is saved; create it now with document_edit action=create from the evidence already gathered"
             }
@@ -2986,28 +2990,25 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
 }
 
 /// Remove the whole-document `write` action from an edit tool schema.
-fn withhold_write_action(schema: &mut Value) {
-    fn strip(value: &mut Value) {
-        match value {
-            Value::Object(map) => {
-                if let Some(Value::Array(actions)) = map.get_mut("enum")
-                    && actions.iter().any(|a| a == "write")
-                    && actions.iter().any(|a| a == "section")
-                {
-                    actions.retain(|a| a != "write");
-                }
-                if let Some(Value::Array(branches)) = map.get_mut("oneOf") {
-                    branches.retain(|b| b["properties"]["action"]["const"] != "write");
-                }
-                for child in map.values_mut() {
-                    strip(child);
-                }
+/// Remove one action from a document edit schema: from every action enum
+/// and every oneOf branch that offers only it. The edit schemas have no other
+/// enums.
+fn strip_action(schema: &mut Value, action: &str) {
+    match schema {
+        Value::Object(map) => {
+            if let Some(Value::Array(actions)) = map.get_mut("enum") {
+                actions.retain(|a| a != action);
             }
-            Value::Array(items) => items.iter_mut().for_each(strip),
-            _ => {}
+            if let Some(Value::Array(branches)) = map.get_mut("oneOf") {
+                branches.retain(|b| b["properties"]["action"]["const"] != action);
+            }
+            for child in map.values_mut() {
+                strip_action(child, action);
+            }
         }
+        Value::Array(items) => items.iter_mut().for_each(|item| strip_action(item, action)),
+        _ => {}
     }
-    strip(schema);
 }
 
 /// Where a heading above the anchor's level goes: beside the section of its
@@ -5390,7 +5391,13 @@ fn execute_repaired(
         bail!(
             "checkpoint_pending: {name} is withheld while checkpoint {} is pending; nothing was executed. Call checkpoint_complete with this id and progress (memory_write first only for a reusable finding not saved yet); {name} is available again afterwards. Allowed now: {}",
             cp.id,
-            ToolRegistry::checkpoint_tool_names(s).join(", ")
+            // What this request offers: memory reuse and the lookup limit
+            // narrow the checkpoint tools further.
+            ToolRegistry::definitions(s)
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     if s.run_guidance["phase"] == "verify"
@@ -5718,7 +5725,7 @@ fn execute_repaired(
                         "phase stays {}: {}; other fields were saved",
                         if s.task.phase.is_empty() { "investigate" } else { s.task.phase.as_str() },
                         if s.document_written {
-                            format!("{pending} task_plan items are pending; finish or remove them first")
+                            format!("{pending} task_plan items are pending; finish them first, or remove only obsolete ones with a reason")
                         } else {
                             "the document has not been written yet".into()
                         }
@@ -5803,7 +5810,14 @@ fn execute_repaired(
             // An empty lookup is not proof that the ID is valid or that the
             // file has no content; name where evidence IDs come from.
             let notice = if matches.is_empty() && (id.is_some() || !path.is_empty()) {
-                Some("No observed source matches this id/path. Source IDs are created only by delivered file_read, symbol_read, source_search or detailed code_outline results in this session; copy one exactly, or read the file to observe new evidence. Do not invent an ID.".to_owned())
+                Some(format!(
+                    "No observed source matches this id/path. Source IDs are created only by delivered file_read, symbol_read, source_search or detailed code_outline results in this session; copy one exactly, or {}. Do not invent an ID.",
+                    if s.checkpoint.is_some() {
+                        "record the pending read in checkpoint_complete progress"
+                    } else {
+                        "read the file to observe new evidence"
+                    }
+                ))
             } else if offset >= matches.len() && !matches.is_empty() {
                 Some(format!(
                     "offset {offset} is past the {} matching sources; use offset 0 to {}",
@@ -5813,9 +5827,16 @@ fn execute_repaired(
             } else {
                 None
             };
-            let mut page = json!({"items":items,"total":matches.len(),"next_offset":(next < matches.len()).then_some(next),
-                    "checkpoint_lookup_remaining":s.checkpoint.as_ref().map(|cp| crate::context::CHECKPOINT_SOURCE_LOOKUP_LIMIT.saturating_sub(cp.source_lookup_calls)),
-                    "checkpoint_next_action":s.checkpoint.as_ref().map(|_| "Use delivered source IDs in memory_write, then call checkpoint_complete; repeated lookup does not preserve findings")});
+            let mut page = json!({"items":items,"total":matches.len(),"next_offset":(next < matches.len()).then_some(next)});
+            if let Some(cp) = &s.checkpoint {
+                page["checkpoint_lookup_remaining"] = json!(
+                    crate::context::CHECKPOINT_SOURCE_LOOKUP_LIMIT
+                        .saturating_sub(cp.source_lookup_calls)
+                );
+                page["checkpoint_next_action"] = json!(
+                    "Use delivered source IDs in memory_write, then call checkpoint_complete; repeated lookup does not preserve findings"
+                );
+            }
             if let Some(notice) = notice {
                 page["notice"] = json!(notice);
             }
@@ -6445,7 +6466,7 @@ fn read_file(
             )
         };
         return Ok(
-            json!({"path":path,"hash":digest,"total_lines":total_lines,"content":{"text":"","truncated":false,"next_offset":null},"source":null,"eof":true,"next_line":null,"next_offset":0,"notice":notice}),
+            json!({"path":path,"hash":digest,"total_lines":total_lines,"content":{"text":"","truncated":false},"source":null,"eof":true,"next_line":null,"notice":notice}),
         );
     }
     let byte_start = contents
@@ -6661,10 +6682,26 @@ fn unadvertised_fields(tool: &str) -> &'static [&'static str] {
 
 /// Present absolute line labels to the model without changing source text,
 /// Unicode cursor offsets, archives or delivery coverage in the session.
+/// Source observations next to delivered text keep only what the model uses:
+/// their ID for memory_write and their line range; the excerpt repeats the
+/// delivered text, and path and hash are on the result or its row.
 pub fn model_result(result: &Value) -> Value {
     let mut shown = result.clone();
-    if result["status"] != "ok" || !result["data"]["read_start"].is_u64() {
+    if result["status"] != "ok" {
         return shown;
+    }
+    compact_sources(&mut shown);
+    if !result["data"]["read_start"].is_u64() {
+        return shown;
+    }
+    // Character offsets drive the runtime's cursor; the model continues
+    // with next_cursor and must never compute offsets.
+    if let Some(data) = shown["data"].as_object_mut() {
+        data.remove("read_offset");
+        data.remove("next_offset");
+        if let Some(content) = data.get_mut("content").and_then(Value::as_object_mut) {
+            content.remove("next_offset");
+        }
     }
     let content = &mut shown["data"]["content"];
     let (Some(text), Some(start)) = (content["text"].as_str(), content["line_start"].as_u64())
@@ -6682,15 +6719,42 @@ pub fn model_result(result: &Value) -> Value {
     let fields = content.as_object_mut().unwrap();
     fields.remove("text");
     fields.remove("line_offsets");
-    // Character offsets drive the runtime's cursor; the model continues
-    // with next_cursor and must never compute offsets.
-    fields.remove("next_offset");
     fields.insert("numbered_text".into(), json!(numbered));
-    if let Some(data) = shown["data"].as_object_mut() {
-        data.remove("read_offset");
-        data.remove("next_offset");
-    }
     shown
+}
+
+/// The model view of the source observations a read, search match or
+/// outline symbol carries (memory and source_lookup results keep theirs:
+/// there the excerpt is the content).
+fn compact_sources(shown: &mut Value) {
+    fn compact(source: Option<&mut Value>) {
+        if let Some(fields) = source
+            .and_then(Value::as_object_mut)
+            .filter(|fields| fields.contains_key("observed_at") && fields.contains_key("origin"))
+        {
+            for internal in ["observed_at", "origin", "path", "hash", "excerpt"] {
+                fields.remove(internal);
+            }
+        }
+    }
+    let Some(data) = shown.get_mut("data").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if data.get("read_start").is_some_and(Value::is_u64) {
+        compact(data.get_mut("source"));
+    }
+    for (rows, keys) in [
+        ("matches", &["source"][..]),
+        ("symbols", &["source", "signature_source"][..]),
+    ] {
+        if let Some(rows) = data.get_mut(rows).and_then(Value::as_array_mut) {
+            for row in rows {
+                for key in keys {
+                    compact(row.get_mut(*key));
+                }
+            }
+        }
+    }
 }
 
 fn new_file_cursor_id() -> String {

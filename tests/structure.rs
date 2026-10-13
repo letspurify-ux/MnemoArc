@@ -934,6 +934,33 @@ fn budgeted_symbol_slice_cursors_complete_only_the_requested_range() {
 }
 
 #[test]
+fn the_model_view_keeps_a_source_id_and_lines_not_a_second_copy_of_the_text() {
+    let source = json!({"id":"S1","observed_at":"2026-10-13T00:00:00Z","origin":"file",
+        "path":"a.rs","start_line":1,"end_line":2,"hash":"h","excerpt":"fn a() {}\n"});
+    let compact = json!({"id":"S1","start_line":1,"end_line":2});
+    let read = json!({"status":"ok","data":{"read_start":1,"source":source,
+        "content":{"text":"fn a() {}\n","line_start":1}}});
+    let shown = tools::model_result(&read);
+    assert_eq!(shown["data"]["source"], compact);
+    let search = json!({"status":"ok","data":{"matches":[{"path":"a.rs","line":1,"text":"fn a() {}","source":source}]}});
+    assert_eq!(
+        tools::model_result(&search)["data"]["matches"][0]["source"],
+        compact
+    );
+    let outline = json!({"status":"ok","data":{"symbols":[{"name":"a","source":source,"signature_source":source}]}});
+    let shown_outline = tools::model_result(&outline);
+    assert_eq!(shown_outline["data"]["symbols"][0]["source"], compact);
+    assert_eq!(
+        shown_outline["data"]["symbols"][0]["signature_source"],
+        compact
+    );
+    assert_eq!(tools::model_result(&shown_outline), shown_outline);
+    // Memory and lookup results keep their excerpts: there they are the content.
+    let lookup = json!({"status":"ok","data":{"items":[source]}});
+    assert_eq!(tools::model_result(&lookup), lookup);
+}
+
+#[test]
 fn model_line_labels_preserve_blank_lines_pipes_and_partial_boundaries() {
     let raw = json!({"status":"ok","data":{"read_start":10,"read_offset":3,
         "content":{"text":"한글|x\n\n끝\n","line_start":12,"line_end":14,

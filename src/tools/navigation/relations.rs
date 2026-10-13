@@ -2584,13 +2584,10 @@ pub(super) fn execute(s: &Session, args: &Value, cancel: &CancellationToken) -> 
     let mut metadata = workspace.metadata();
     metadata["relation"] = json!(relation);
     metadata["symbol"] = workspace.symbol(file, symbol);
-    metadata["scope"] = json!({"path_glob":path_glob(args)?,"target_file_always_included":true});
+    metadata["scope"] = json!({"path_glob":path_glob(args)?});
     metadata["unresolved_sites"] = json!(unresolved);
     metadata["unsupported_call_expressions"] = json!(unsupported_calls);
     metadata["complete_call_graph"] = json!(false);
-    metadata["limitations"] = json!(
-        "Syntax navigation only. resolved means a unique local declaration, not runtime execution. Imports/module paths and member dispatch yield candidates. No type inference, package/config resolution, wildcard/re-export traversal, macro expansion, reflection or dependency injection. Inbound results omit unresolved targets; empty results do not prove no callers/references. Read call sites and candidate bodies, including guards, before documenting behavior."
-    );
     // Module roots can depend on a lib.rs/main.rs outside path_glob. Its
     // addition or removal changes links even when scanned source is unchanged.
     let fingerprint = hash(

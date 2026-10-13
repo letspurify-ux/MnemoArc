@@ -815,7 +815,7 @@ pub(super) fn execute(
             // (where it was written), which belongs in the final answer.
             if let Some(line) = output_path_line(&path, &doc) {
                 issues.push(json!({"kind":"output_path_in_document","line":line,
-                    "guidance":"The document states its own output path, a report of how it was produced. Remove that text; give the path, verification scope and limitations in the final chat answer instead."}));
+                    "guidance":"The document states its own output path, a report of how it was produced. Remove that text; the final chat answer reports it."}));
             }
             issues.extend(unread_citations(s, &doc)?);
             // The issue list includes delivered-evidence state as well as

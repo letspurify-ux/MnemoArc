@@ -68,7 +68,7 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     answer(
         "Workflow",
-        "The user selected workflow=\"answer\" for this session: answer in chat; collect and read files and documents on initial and follow-up messages; create and edit project UTF-8 files with file_edit, file_write and file_patch; create or edit the configured Markdown output only with document_edit and document_edit_batch. The project output path is a default location, not an instruction to create a document on every turn. For a simple question, answer directly after the necessary reads. For summarizing or explaining an existing document (including Mermaid diagrams), use the document as the requested evidence, read only the relevant sections and respond in chat; do not inspect source code or edit the document unless the user requests that work. For a requested document edit, inspect the target section, make a targeted text or section edit and check the saved result. For a source-flow question, inspect the entry or dispatch point and only the necessary helpers, then answer with a concise diagram. If the user requests JSON only, emit exactly the requested JSON object without fences or trailing explanation; identifier fields contain only the identifier, and every required citation goes in the requested citations array, because prose outside it does not satisfy it.",
+        "The user selected workflow=\"answer\" for this session: answer in chat; read files and documents; create and edit project UTF-8 files with file_edit, file_write and file_patch; create or edit the configured Markdown output only with document_edit and document_edit_batch. The project output path is a default location, not an instruction to create a document on every turn. For a simple question, answer directly after the necessary reads. For summarizing or explaining an existing document (including Mermaid diagrams), use the document as the requested evidence, read only the relevant sections and respond in chat; do not inspect source code or edit the document unless the user requests that work. For a requested document edit, inspect the target section, make a targeted text or section edit and check the saved result. For a source-flow question, inspect the entry or dispatch point and only the necessary helpers, then answer with a concise diagram. If the user requests JSON only, emit exactly the requested JSON object without fences or trailing explanation; identifier fields contain only the identifier, and every required citation goes in the requested citations array.",
     ),
     both(
         "Requirements",
@@ -92,7 +92,7 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     source(
         "Write as you read",
-        "Line numbers are visible only while a read is in active context: as soon as a section's evidence is in hand, write that section with its citations in its own save, then read for the next one. A document written at the end from summaries cannot be cited without reading again.",
+        "Line numbers are visible only while a read is in active context: as soon as a section's evidence is in hand, write that section with its citations in its own save, then read for the next one.",
     ),
     source(
         "Write as you read",
@@ -124,11 +124,11 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     source(
         "Reading the project",
-        "The offered tool list can shrink during a run: broad discovery tools are withdrawn after a long stall and in closing mode, so use the tools offered on each request.",
+        "The offered tool list can shrink during a run: broad discovery tools are withdrawn after a long stall and in closing mode.",
     ),
     both(
         "Reading the project",
-        "Locate before you read: find the identifier, route or dispatch branch with a scoped source_search, code_outline or symbol_search, then read that range with explicit start_line and max_lines, or read a whole file when the work covers it; once a search has located the branch, read it instead of searching again. Batch independent searches and reads in one response instead of paying a model request per file. When a full file path is supplied, scope navigation to it. Search a user-supplied route string or identifier before guessing its implementation syntax; an empty literal search does not prove absence, so keep the file scope and shorten the query. Search context and symbol excerpts are navigation, not evidence: read the code with file_read or symbol_read before explaining it.",
+        "Locate before you read: find the identifier, route or dispatch branch with a scoped source_search, code_outline or symbol_search, then read that range with explicit start_line and max_lines, or read a whole file when the work covers it; once a search has located the branch, read it instead of searching again. Batch independent searches and reads in one response instead of paying a model request per file. When a full file path is supplied, scope navigation to it. Search a user-supplied route string or identifier before guessing its implementation syntax. Search context and symbol excerpts are navigation, not evidence: read the code with file_read or symbol_read before explaining it.",
     ),
     both(
         "Reading the project",
@@ -140,15 +140,23 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     both(
         "Memory and progress",
-        "Transient progress, pending reads, retry instructions and current blockers belong in task_state details or in checkpoint_complete progress, not in a memory; update them when a blocker is resolved. task_state unresolved lists only what may stay unconfirmed in the result: every item left there is reported to the user as unconfirmed.",
+        "Transient progress, pending reads, retry instructions and current blockers belong in task_state details or in checkpoint_complete progress, not in a memory; update them when a blocker is resolved.",
+    ),
+    source(
+        "Memory and progress",
+        "task_state unresolved lists only what may stay unconfirmed in the result: every item left there is reported to the user as unconfirmed.",
+    ),
+    answer(
+        "Memory and progress",
+        "task_state unresolved is not added to your answer: state what stays unconfirmed in the answer itself.",
     ),
     both(
         "Checkpoints",
-        "When the context fills, the runtime sends a CHECKPOINT CONTROL REQUEST while the current reads are still in context; once the checkpoint completes, the older reads it retires leave active context, so their line labels are gone, while citations of ranges already read stay valid. Memories, the task plan, the progress note and saved files carry the work on. On that request do not read sources.",
+        "When the context fills, the runtime sends a CHECKPOINT CONTROL REQUEST while the current reads are still in context; once the checkpoint completes, the older reads it retires leave active context, so their line labels are gone, while citations of ranges already read stay valid. Memories, the task plan, the progress note and saved files carry the work on.",
     ),
     both(
         "Checkpoints",
-        "If later work needs a finding that is not saved yet, save it first, then call checkpoint_complete in the same batch with a concise progress summary; prose does not commit a checkpoint, and a separate task_state call is not required. source_lookup allows at most 3 calls per checkpoint. If cleanup cannot succeed, explain the blocker. If pending_settings is present, it names the limits the new settings would break: delete obsolete memories with memory_manage when memories exceed them.",
+        "If later work needs a finding that is not saved yet, save it first, then call checkpoint_complete in the same batch with a concise progress summary; prose does not commit a checkpoint, and a separate task_state call is not required. source_lookup allows at most 3 calls per checkpoint.",
     ),
     both(
         "Each request",
@@ -160,7 +168,7 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     both(
         "Each request",
-        "Every tool failure carries a recovery contract with code, class, action and the tools available for recovery: follow that action, correct the cause before retrying, inspect partial batch results to retry only the failed items, and never repeat a write after an uncertain outcome.",
+        "Follow a failed call's recovery.action and its recovery.tools, correct the cause before retrying, inspect partial batch results to retry only the failed items, and never repeat a write after an uncertain outcome.",
     ),
     source(
         "Each request",
@@ -618,12 +626,18 @@ impl ContextManager {
         let mut run_guidance = s.run_guidance.clone();
         if s.checkpoint.is_some() && run_guidance.is_object() {
             // The guidance was computed for a normal request: a cleanup
-            // request has its own call limit, and plan checks wait.
+            // request has its own call limit, and plan checks and a refused
+            // final's repair (reads, new sections) wait.
             run_guidance["instruction"] = json!(CHECKPOINT_INSTRUCTION);
             run_guidance["max_tool_calls"] =
                 json!(32.min(Self::cleanup_result_budget(&s.config) / 200));
             if let Some(fields) = run_guidance.as_object_mut() {
-                for deferred in ["plan_check", "plan_closeout", "ready_for_final"] {
+                for deferred in [
+                    "plan_check",
+                    "plan_closeout",
+                    "ready_for_final",
+                    "finalization_error",
+                ] {
                     fields.remove(deferred);
                 }
             }
@@ -634,9 +648,27 @@ impl ContextManager {
         {
             *todo = todo_view(todo);
         }
+        // task.todos already lists the first open to-dos; the closeout adds
+        // its revision and the open to-dos beyond that window.
+        if let Some(closeout) = run_guidance
+            .get_mut("plan_closeout")
+            .filter(|closeout| closeout.is_object())
+        {
+            let shown = task["todo_window"]["shown_pending"].as_u64().unwrap_or(0) as usize;
+            let more: Vec<Value> = closeout["items"]
+                .as_array()
+                .map(|items| items.iter().skip(shown).cloned().collect())
+                .unwrap_or_default();
+            let mut view = json!({"expected_revision":closeout["expected_revision"]});
+            if !more.is_empty() {
+                view["more_items"] = json!(more);
+            }
+            *closeout = view;
+        }
         // Run counters for the progress panel and run history; no prompt or
         // guidance text refers to them, and plan_pending_count repeats
-        // task.todo_window.pending_count.
+        // task.todo_window.pending_count. An empty reason or refusal is
+        // absent, as the prompt's "when present" reads.
         if let Some(fields) = run_guidance.as_object_mut() {
             for counter in [
                 "task_rounds",
@@ -647,11 +679,21 @@ impl ContextManager {
             ] {
                 fields.remove(counter);
             }
+            fields.retain(|_, value| !value.is_null());
         }
         // The project as the model uses it: where to read and where to write.
         let mut project = json!(s.project);
         if let Some(fields) = project.as_object_mut() {
             fields.remove("id");
+            fields.remove("name");
+        }
+        // task.revision counts every task change, which no call takes (models
+        // copied it into patches); the completed total is the progress
+        // panel's. The task_state read result keeps both.
+        let mut task = task;
+        if let Some(fields) = task.as_object_mut() {
+            fields.remove("revision");
+            fields.remove("todos_completed_total");
         }
         // A pending checkpoint by its ID, its request counts and the cause of
         // a failed acknowledgement; its bundle bookkeeping is the runtime's.
@@ -661,13 +703,24 @@ impl ContextManager {
         });
         // New settings that wait for cleanup, by what they would break; they
         // apply at the next request boundary once the session fits them.
+        // Rare, so the remedy rides with the field rather than the prompt.
         let pending_settings = s.pending_config.as_ref().and_then(|config| {
             s.pending_config_error
                 .clone()
                 .or_else(|| s.check_limits(config).err().map(|error| error.to_string()))
-                .map(|blocked_by| json!({"blocked_by":blocked_by}))
+                .map(|blocked_by| json!({"blocked_by":blocked_by,
+                    "resolve":"The runtime applies them once the session fits: delete obsolete memories with memory_manage when memories exceed a limit; a checkpoint frees context."}))
         });
-        let mut state = json!({"run_guidance":run_guidance,"pending_settings":pending_settings,"task":task,"task_detail_count":s.task.details.len(),"recent_memories":recent,"related_memories":related,"referenced_memories":pinned,"project":project,"user_criteria":s.user_criteria,"checkpoint":checkpoint,"user_sources":source_ids});
+        let mut state = json!({"run_guidance":run_guidance,"task":task,"recent_memories":recent,"related_memories":related,"referenced_memories":pinned,"project":project,"user_criteria":s.user_criteria,"user_sources":source_ids});
+        if let Some(pending) = pending_settings {
+            state["pending_settings"] = pending;
+        }
+        if let Some(checkpoint) = checkpoint {
+            state["checkpoint"] = checkpoint;
+        }
+        if !s.task.details.is_empty() {
+            state["task_detail_count"] = json!(s.task.details.len());
+        }
         state.as_object_mut().unwrap().extend(request_fields);
         // After a checkpoint cleared the context, a live model read its own
         // saved progress ("stopped source reads as the checkpoint
@@ -678,7 +731,8 @@ impl ContextManager {
             );
         }
         let omitted_ids: Vec<_> = omitted_id_set.iter().take(50).cloned().collect();
-        if !omitted_id_set.is_empty() {
+        // Closing withholds the memory tools the notice points to.
+        if !omitted_id_set.is_empty() && s.progress_recovery.closing.is_none() {
             state["memory_index_notice"] = json!({
                 "omitted": omitted_id_set.len(),
                 "omitted_ids": omitted_ids,

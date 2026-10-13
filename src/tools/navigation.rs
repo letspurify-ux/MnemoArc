@@ -139,8 +139,8 @@ impl Workspace {
             .as_object_mut()
             .unwrap()
             .retain(|key, _| !key.starts_with("signature") && key != "kind");
+        // The file hash already opens symbol_id.
         result["path"] = json!(path);
-        result["hash"] = json!(self.files[file].syntax.digest);
         result["location"] = json!(format!(
             "{path}:{}-{}",
             symbol["start_line"], symbol["end_line"]
@@ -157,7 +157,7 @@ impl Workspace {
             .collect();
         json!({"engine":"tree-sitter","matched_files":self.matched_files,"scanned_files":self.files.len(),
             "skipped_files":self.skipped_files,"parse_error_count":errors.len(),"parse_error_files":errors.iter().take(12).collect::<Vec<_>>(),
-            "navigation_only":true,"semantic_verified":false})
+            "navigation_only":true})
     }
 }
 
@@ -238,10 +238,6 @@ pub(super) fn search(s: &mut Session, args: &Value, cancel: &CancellationToken) 
         );
     }
     let mut metadata = workspace.metadata();
-    metadata["heuristic"] = json!(false);
-    metadata["limitations"] = json!(
-        "Syntax declarations only; no type inference or reference resolution. Unsupported files and parse errors can hide declarations. Read symbol bodies for behavior."
-    );
     if rows.is_empty() {
         metadata["empty_reason"] = json!(if workspace.matched_files == 0 {
             "no_matching_files"

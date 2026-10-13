@@ -523,4 +523,38 @@ apodex(apodex/apodex-1.1-mini:free)로 같은 요청을 실행했을 때(192라�
 
 소스 문서 프롬프트는 약 11.4K자, 답변 프롬프트는 약 8.4K자다.
 
+열 번째 전체 재검토도 모델이 받는 문구 전부(두 프롬프트, 도구 정의, 요청 상태 예시, 소스의 안내·오류 문자열)를 내보내 독립 검토자 넷(코드와의 모순, 중복, 불필요한 설명, 런타임 안내문)에게 맡겼다. 지적은 모두 코드로 확인한 뒤 고쳤다.
+
+- **마감 단계의 모순.** 이 작업이 아직 고치지 않은 기존 출력이 있을 때, 읽기 거절문은 "create로 만들라"고 했고 복구 도구 목록은 비어 있었다. 이제 기존 문서를 replace_text나 section으로 고치라고 하고 문서 도구를 가리킨다(`closing::closing_rejects_reads_toward_the_repair_the_output_needs`). 마감 전에 받은 task_plan_pending·request_coverage_check 거절은 마감 단계에서 싣지 않는다(`closing::closing_drops_plan_refusals_it_no_longer_applies`). 문서가 없을 때의 마감 안내는 첫 섹션으로 만들고 나머지를 섹션마다 저장하라고 고쳤다. 마감 중에는 대기 설정 때문에 최종 답변을 거절하지 않는다(memory_manage가 빠지고, 강제 종료도 대기 설정을 무시한다). 계획 거절 결과의 고정 문구 "현재 일을 계속하라"는 마감 단계의 정정 문구와 어긋나 지웠다.
+- **복구 안내의 모순.** 집중 복구 안내는 "recovery_reason이 무엇이 멈췄는지 말한다"고 하지만, 반복·정체 계수기는 소진될 때만 사유를 적어 그 칸이 비어 있었다. 이제 계수기가 사유를 적는다(`closing::a_stall_counter_names_its_reason_with_the_focused_instruction`). 실행되지 않은 배치의 사유는 다음 배치가 실행되면 지운다. 전에는 다음 문서 편집까지 집중 복구가 이어졌다(`closing::a_rejected_batch_reason_ends_with_the_next_executed_batch`). 저장 전에 거절된 최종 답변은 verify가 아니라 draft로 돌아간다(`closing::a_refused_final_before_any_save_returns_to_drafting`). 연속 출력 한도 사유는 상태에 맞춰, 문서가 없으면 첫 섹션만으로 만들라고 안내한다.
+- **체크포인트 정리 요청.** 거절 사유(finalization_error)가 정리 요청에도 실려 "소스를 더 읽으라"고 했다. 이제 다른 미뤄지는 지시처럼 뺀다. `source_lookup`의 결과 없음 알림과 unknown_source 오류는 체크포인트 중에만 checkpoint_complete 진행 메모를 가리키고, 그 밖에는 먼저 file_read하라고 한다(`core::an_unknown_source_outside_a_checkpoint_asks_for_a_read_not_a_checkpoint`). checkpoint_pending 오류의 "지금 쓸 수 있는 도구" 목록은 실제로 제공되는 도구만 적는다. 정리 요청 중에는 할 일 완료 알림을 싣지 않고, 마감 단계에서는 기억 색인 알림을 싣지 않는다.
+- **워크플로와 어긋난 도구 정보.** 소스 문서 작업에서 tool_catalog가 `file_edit`·`file_write`·`file_patch`를 활성·선택 가능으로 보여 줬다. 이제 이 워크플로의 금지 도구로 둔다(`core::source_documentation_offers_no_project_file_tools_anywhere`). 답변 워크플로에는 형식 검사가 없어 `fix_word`와 `fix_id`를 스키마에서 뺐다. 큰 문서에서 전체 쓰기를 막을 때 `write`를 지운 뒤 동작 분기를 새로 만들면서 다시 실렸던 것을 고쳤다(`closing.rs`의 whole_write 테스트). verification_reserve 거절의 복구 도구는 문서 편집이 아니라 같은 검색을 좁혀 다시 보내도록 바꿨다. phase_deferred 문구는 "끝내거나 지우라"에서 "끝내거나, 쓸모없어진 것만 이유를 달아 지우라"로 바꿨다. answer 프롬프트는 task_state unresolved가 사용자에게 보고된다고 했지만 답변 워크플로는 보고하지 않는다. 그래서 확인하지 못한 점은 답변에 직접 적으라고 고쳤다. 후속 답변 프롬프트는 스냅숏과 그 안의 run_guidance도 지시가 아닌 데이터라고 적는다.
+- **매 요청 상태에서 뺀 것.** 할 일 마감의 할 일 목록은 task.todos와 겹친다. 이제 그 창 밖의 할 일만 `more_items`로 싣는다(`core::the_state_omits_what_says_nothing_and_what_task_todos_already_lists`). draft·verify 단계 안내는 마감 안내에 덮이지 않고 한 문장을 덧붙인다. 그 밖에 뺀 것:
+  - null 필드: `recovery_reason`, `finalization_error`, `pending_settings`, `checkpoint`
+  - 0인 `task_detail_count`, `project.name`
+  - `task.revision`(어떤 호출도 받지 않고, 모델이 patch에 복사하곤 했다)과 `task.todos_completed_total`
+  - 답변 워크플로의 늘 0인 `unread_citation_count`
+  - 실패한 readiness의 해시·리비전·줄 수·검사 계수(형식 경고는 있을 때만)
+  - 체크포인트 밖 source_lookup의 null 필드
+
+  `task.scope`는 프로젝트 루트로 미리 채우지 않는다. 대기 설정의 해결 방법은 프롬프트 대신 그 필드(`resolve`)에 싣는다.
+- **도구 결과에서 뺀 것.** 파일 읽기·검색 결과·상세 목차의 출처 객체가 전달한 본문을 최대 2,000자 한 번 더 담고 있었다. 모델 화면에서는 ID와 줄 범위만 남긴다. 저장된 결과와 기억·source_lookup의 발췌는 그대로다(`structure::the_model_view_keeps_a_source_id_and_lines_not_a_second_copy_of_the_text`). 탐색 결과에서는 매번 붙던 설명문 `limitations`, 상수 `heuristic`·`semantic_verified`·`target_file_always_included`, symbol_id 앞부분과 같은 행 해시를 뺐다. 파일 끝 결과에서는 문자 위치를 뺐다.
+- **중복과 불필요한 설명.** 프롬프트에서 뺀 것:
+  - 빈 검색 규칙(빈 결과 안내가 말한다)
+  - 대기 설정 문장
+  - 체크포인트의 "소스를 읽지 말라"(도구가 없다)와 "정리할 수 없으면 이유를 설명하라"(산문은 반영되지 않는다)
+  - 요약으로 쓴 문서에 관한 이유 문장
+  - 답변 프롬프트의 군더더기
+
+  복구 계약 문장도 줄였다. 도구 설명에서는 결과가 스스로 말하는 필드 설명과 오류가 그때 말하는 규칙을 정리했다. 대상은 `source_search`, `symbol_search`, `symbol_relations`, `code_outline`, `symbol_read`, `document_inspect`(페이지 해시는 런타임이 기억한다), `document_audit`, `document_edit`, `task_plan`, `task_state`, 기억 도구, `history`, `source_lookup`, `checkpoint_complete`, `tool_select`, DB 도구다. 마침 출력 경로 감사 안내의 최종 답변 내용 목록은 프롬프트 한 곳에만 둔다.
+- **채택하지 않은 지적.** 아래 항목은 그대로 둔다.
+  - "Half of the run budget"는 고정 문구지만 기본 비율이 0.5다.
+  - 인용이 없는 readiness의 structural_ok:true는 같은 요청의 error 필드와 거절 사유가 설명한다.
+  - 공급자 한도 오류의 "32"는 뒤따르는 안내가 실제 한도를 적는다.
+  - 전체 쓰기를 권하는 오류 힌트(WHOLE_DOCUMENT_HINT 등)는 막힌 경우 쓰기 거절이 곧 안내한다.
+  - 마감·체크포인트 중의 tool_not_active 안내는 제공되지 않는 도구를 부른 드문 경우다.
+  - 같은 편집 반복 실패의 고정 도구 목록은 드물다.
+
+소스 문서 프롬프트는 약 10.9K자, 답변 프롬프트는 약 7.8K자다. 소스 문서 작업의 도구 정의는 약 25.2K자에서 22.7K자로 줄었다.
+
 프롬프트 길이는 약 21.7K자에서 줄었고 요청당 고정 접두가 그만큼 작아진다. 라이브 실행 비교는 아직 하지 않았으므로, 같은 요청의 실행 한 번으로 섹션 저장 시점과 인용 오류 수가 나빠지지 않았는지 확인해야 한다.

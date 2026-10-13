@@ -86,7 +86,7 @@ pub fn spec() -> ToolSpec {
         json!({
             "action":action(&["list","apply"]),
             "offset":{"type":"integer","minimum":0,"description":"list only; zero-based item offset, including retained completed items"},
-            "limit":{"type":"integer","minimum":1,"maximum":MAX_PAGE,"description":"list only; page size (default 10, maximum 20)"},
+            "limit":{"type":"integer","minimum":1,"maximum":MAX_PAGE,"description":"list only; page size (default 10)"},
             "expected_revision":{"type":"integer","minimum":0,"description":"Required for apply. Copy plan_revision from task state or revision from task_plan list."},
             "operations":{
                 "type":"array","minItems":1,"maxItems":MAX_OPERATIONS,
@@ -109,7 +109,7 @@ pub fn spec() -> ToolSpec {
     ]);
     ToolSpec {
         name: "task_plan",
-        description: "Manage an ordered to-do list; the first unfinished item is current. apply applies its operations atomically. insert: texts, optional before; update: id/text; split: unfinished id and 2..100 specific texts preserving its goal, keeping its ID for the first part; move: unfinished id, optional before. Omit before to append. complete: CURRENT id/result. remove: unfinished id/reason; reopen: completed id/reason, placed before current. Keep at most 100 unfinished small outcomes. Recoverable conflicts return applied=false; the whole batch remains unapplied. conflict reports code, zero-based operation_index, target/current IDs, blocking_ids, expected/current revisions and correction.",
+        description: "Manage an ordered to-do list; the first unfinished item is current. apply applies its operations atomically. insert: texts, optional before; update: id/text; split: unfinished id and 2..100 specific texts preserving its goal, keeping its ID for the first part; move: unfinished id, optional before. Omit before to append. complete: CURRENT id/result. remove: unfinished id/reason; reopen: completed id/reason, placed before current. Keep at most 100 unfinished small outcomes.",
         optional: false,
         read_only: false,
         parameters,
@@ -418,7 +418,7 @@ fn unchanged(
         _ =>
             "Correct the reported operation using the returned IDs and current_revision, then resend the whole batch. No earlier operation was committed.",
     });
-    json!({"applied":false,"reason":reason,"conflict":conflict,"plan":view(task, 0, DEFAULT_PAGE),"guidance":"This result does not stop the task. Continue the current item's concrete work. Use the returned revision/IDs for a necessary plan correction. Do not repeat the unchanged request."})
+    json!({"applied":false,"reason":reason,"conflict":conflict,"plan":view(task, 0, DEFAULT_PAGE)})
 }
 
 pub(super) fn compact_conflict(conflict: &Value) -> Value {
@@ -1153,7 +1153,14 @@ fn completed_without_edit(s: &Session, next: &TaskState) -> Option<String> {
         .any(|item| item.id == watch.id && item.done);
     // Closing mode asks for completions without further edits; a reopen
     // request would contradict it.
-    if !s.is_document_work() || !was_open || !now_done || s.progress_recovery.closing.is_some() {
+    // A checkpoint cleanup request may have document edits closed; the
+    // to-do's state is checked again on the next ordinary completion.
+    if !s.is_document_work()
+        || !was_open
+        || !now_done
+        || s.progress_recovery.closing.is_some()
+        || s.checkpoint.is_some()
+    {
         return None;
     }
     let Some(before) = watch.document.as_deref() else {

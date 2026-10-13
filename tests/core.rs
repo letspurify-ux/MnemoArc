@@ -1015,6 +1015,19 @@ fn answer_workflow_hides_the_audit_tool() {
             "{name}"
         );
     }
+    // Answer saves run no format check, so no garbled-word issue can give
+    // fix_word its fix_id.
+    for edit in ["document_edit", "document_edit_batch"] {
+        let schema = tools::ToolRegistry::definitions(&s)
+            .into_iter()
+            .find(|t| t["function"]["name"] == edit)
+            .unwrap()["function"]["parameters"]
+            .to_string();
+        assert!(
+            !schema.contains("fix_word") && !schema.contains("fix_id"),
+            "{edit}: {schema}"
+        );
+    }
     let error = tools::execute(
         &mut s,
         "tool_select",
@@ -1290,8 +1303,13 @@ fn prompts_and_tool_descriptions_state_each_rule_once_and_agree() {
     // Every item left in task.unresolved is reported to the user as
     // unconfirmed, so neither the prompt nor source_lookup may send pending
     // reads there.
+    // Only document work reports them; an answer states them itself.
+    assert!(
+        context::SYSTEM.contains("every item left there is reported to the user as unconfirmed")
+    );
+    assert!(!context::ANSWER_SYSTEM.contains("reported to the user as unconfirmed"));
+    assert!(context::ANSWER_SYSTEM.contains("state what stays unconfirmed in the answer itself"));
     for prompt in [context::SYSTEM.as_str(), context::ANSWER_SYSTEM.as_str()] {
-        assert!(prompt.contains("every item left there is reported to the user as unconfirmed"));
         assert!(!prompt.contains("patch phase, unresolved or details"));
         // The to-do gate refuses the final answer in both workflows.
         assert!(prompt.contains("the final answer is refused while any to-do is open"));
@@ -1411,10 +1429,109 @@ fn pending_settings_name_what_blocks_them() {
     // boundary) is named too, so the refusal's "what blocked_by names" has
     // a field to point at.
     s.pending_config_error = Some("context_budget: settings exceed the context".into());
+    let pending = &ContextManager::state(&s).unwrap()["pending_settings"];
     assert_eq!(
-        ContextManager::state(&s).unwrap()["pending_settings"]["blocked_by"],
+        pending["blocked_by"],
         "context_budget: settings exceed the context"
     );
+    // The remedy rides with the rare field, not in the prompt.
+    assert!(
+        pending["resolve"]
+            .as_str()
+            .unwrap()
+            .contains("memory_manage")
+    );
+    assert!(!context::SYSTEM.contains("pending_settings"));
+}
+
+#[test]
+fn the_state_omits_what_says_nothing_and_what_task_todos_already_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.select_workflow("source_document").unwrap();
+    s.add_user("Document the project".into());
+    let state = ContextManager::state(&s).unwrap();
+    for absent in ["pending_settings", "checkpoint", "task_detail_count"] {
+        assert!(state.get(absent).is_none(), "{absent}: {state}");
+    }
+    for absent in ["revision", "todos_completed_total"] {
+        assert!(state["task"].get(absent).is_none(), "{absent}");
+    }
+    assert!(state["project"].get("name").is_none());
+    // An empty reason or refusal is absent, as the prompt's "when present".
+    s.run_guidance = json!({"instruction":"x","recovery_reason":null,"finalization_error":null});
+    let guidance = &ContextManager::state(&s).unwrap()["run_guidance"];
+    assert_eq!(guidance, &json!({"instruction":"x"}));
+    // The closeout lists only open to-dos beyond the task.todos window.
+    let texts: Vec<String> = (1..=8)
+        .map(|i| format!("Write section {i} from main.rs"))
+        .collect();
+    tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":texts}]}),
+    )
+    .unwrap();
+    let items: Vec<serde_json::Value> = s
+        .task
+        .todos
+        .iter()
+        .map(|item| json!({"id":item.id,"text":item.text}))
+        .collect();
+    s.run_guidance =
+        json!({"plan_closeout":{"expected_revision":1,"pending_count":8,"items":items}});
+    let state = ContextManager::state(&s).unwrap();
+    let shown = state["task"]["todo_window"]["shown_pending"]
+        .as_u64()
+        .unwrap() as usize;
+    assert!(shown < 8);
+    assert_eq!(
+        state["run_guidance"]["plan_closeout"],
+        json!({"expected_revision":1,"more_items":items[shown..]})
+    );
+}
+
+#[test]
+fn an_unknown_source_outside_a_checkpoint_asks_for_a_read_not_a_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.add_user("Document the project".into());
+    let error = tools::execute(
+        &mut s,
+        "memory_write",
+        json!({"title":"t","summary":"s","body":"b","kind":"fact","source_ids":["S999"]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("unknown_source"), "{error}");
+    assert!(error.contains("file_read the range first"), "{error}");
+    assert!(!error.contains("checkpoint_complete"), "{error}");
+}
+
+#[test]
+fn source_documentation_offers_no_project_file_tools_anywhere() {
+    // tool_catalog showed file_write active and selectable in the workflow
+    // that refuses it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.select_workflow("source_document").unwrap();
+    let catalog = tools::execute(&mut s, "tool_catalog", json!({"query":"file"})).unwrap();
+    let write = catalog["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "file_write")
+        .unwrap();
+    assert_eq!(write["selectable"], false, "{write}");
+    assert_eq!(write["active"], false, "{write}");
+    let error = tools::execute(
+        &mut s,
+        "tool_select",
+        json!({"action":"add","names":["file_write"]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("workflow_forbidden"), "{error}");
 }
 
 #[test]
@@ -1502,7 +1619,8 @@ fn request_headers_rank_no_direction_and_leave_rules_to_the_prompt() {
     // finishing directions it cannot act on; the guidance was computed
     // before the checkpoint began.
     s.run_guidance = json!({"instruction":"Draft phase","max_tool_calls":32,
-        "plan_check":"task_plan is empty","plan_closeout":{"items":[]},"ready_for_final":true});
+        "plan_check":"task_plan is empty","plan_closeout":{"items":[]},"ready_for_final":true,
+        "finalization_error":"request_coverage_check: read more first if needed"});
     let guidance = &ContextManager::state(&s).unwrap()["run_guidance"];
     assert_eq!(
         guidance["max_tool_calls"],
@@ -1512,7 +1630,12 @@ fn request_headers_rank_no_direction_and_leave_rules_to_the_prompt() {
         guidance["max_tool_calls"].as_u64().unwrap() < 32,
         "{guidance}"
     );
-    for deferred in ["plan_check", "plan_closeout", "ready_for_final"] {
+    for deferred in [
+        "plan_check",
+        "plan_closeout",
+        "ready_for_final",
+        "finalization_error",
+    ] {
         assert!(guidance.get(deferred).is_none(), "{deferred}: {guidance}");
     }
     assert_ne!(guidance["instruction"], "Draft phase");

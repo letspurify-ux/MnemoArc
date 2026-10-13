@@ -244,7 +244,7 @@ fn closing_instruction(s: &Session) -> String {
     }
     if !s.document_written {
         return format!(
-            "Closing mode: no document is saved yet and source reading is withheld. Create the requested document NOW with document_edit action=create from the evidence already gathered. Write every requested section, then give a concise final answer. At most {remaining} requests remain; without a saved document the run stops unfinished."
+            "Closing mode: no document is saved yet and source reading is withheld. Create the document NOW with document_edit action=create holding its first requested section, from the evidence already gathered; add each other requested section with its own save, then give a concise final answer. At most {remaining} requests remain; without a saved document the run stops unfinished."
         );
     }
     format!(
@@ -435,10 +435,11 @@ fn collect_gaps(s: &mut Session) -> Vec<String> {
 // A document that passes its audit can still lack requested sections; a live
 // run read an older wording as permission to remove the to-dos for unwritten
 // sections.
-const PLAN_CLOSEOUT_INSTRUCTION: &str = "The saved document passes its audit, and the to-dos in plan_closeout are open. A to-do whose work is not done yet, such as a requested section still missing from the document, is NOT obsolete: do that work first. When several listed to-dos are done, close them in ONE task_plan apply using plan_closeout.expected_revision, one operation per item in the listed order.";
+const PLAN_CLOSEOUT_INSTRUCTION: &str = "The saved document passes its audit, and to-dos are open: task.todos lists them, and plan_closeout.more_items any beyond that list. A to-do whose work is not done yet, such as a requested section still missing from the document, is NOT obsolete: do that work first. When several listed to-dos are done, close them in ONE task_plan apply using plan_closeout.expected_revision, one operation per item in the listed order.";
 
-/// Added to a focused recovery instruction when plan_closeout is present.
-const CLOSEOUT_AFTER_RECOVERY: &str = "plan_closeout lists the open to-dos: close those whose work is done in one task_plan apply with plan_closeout.expected_revision.";
+/// Added to a focused recovery or a draft/verify instruction when
+/// plan_closeout is present.
+const CLOSEOUT_NOTE: &str = "Open to-dos are in task.todos: close those whose work is done in one task_plan apply with plan_closeout.expected_revision.";
 
 /// The final answer of a source document that cites no project source.
 const DOCUMENT_CITATIONS_MISSING: &str = "document_citations_missing: the saved document cites no project source as path:start-end (for example backend/src/server.js:12-30), so it cannot be checked against the source and the final answer is refused. Cite the sources next to the claims they support, from ranges you have read (file_read a range first if needed), then give the final answer.";
@@ -498,6 +499,21 @@ fn ready_except_plan(s: &mut Session) -> bool {
             }
             audit["next_offset"] =
                 json!((audit["issue_count"].as_u64().unwrap_or(0) > 5).then_some(5));
+            // Repeated on every request until fixed: the issues, not the
+            // audit's hash, revision (the runtime pages with it) and check
+            // counters; format warnings stay when there are any.
+            let warnings = audit["format_check"]["warnings"].clone();
+            if let Some(fields) = audit.as_object_mut() {
+                for internal in ["hash", "revision", "total_lines", "format_check"] {
+                    fields.remove(internal);
+                }
+            }
+            if warnings
+                .as_array()
+                .is_some_and(|warnings| !warnings.is_empty())
+            {
+                audit["format_warnings"] = warnings;
+            }
             s.run_guidance["document_readiness"] = audit;
             false
         }
@@ -801,6 +817,13 @@ async fn publish_final(
     )
     .await;
 }
+
+/// What each stall counter reports in recovery_reason, from focus to
+/// exhaustion.
+const REPEATED_OUTCOME_REASON: &str = "Repeated actions produced no new result.";
+const NAVIGATION_STALL_REASON: &str =
+    "Navigation and bookkeeping alone have not advanced the result for many requests.";
+const ARTIFACT_CHURN_REASON: &str = "Different rewrites have not completed a milestone; fix the current section's specific problems instead of another general rewrite.";
 
 fn repeated_outcome_limit(config: &Config) -> usize {
     config.stall_round_limit.saturating_mul(4).max(12)
@@ -1504,6 +1527,10 @@ pub async fn run_session_controlled(
     // The recovery reason the last empty reply set, cleared with its error
     // once a reply carries text or calls again.
     let mut empty_reply_reason: Option<String> = None;
+    // The recovery reason a rejected batch set; it describes only that
+    // batch, so the next executed batch clears it (left in place, it kept
+    // focused recovery on until the next document edit).
+    let mut batch_reason: Option<String> = None;
     // A reply without calls whose outcome is recorded at the next request
     // or the end of the run, once the runtime has handled it.
     let mut pending_reply = false;
@@ -1660,9 +1687,16 @@ pub async fn run_session_controlled(
             && s.task.deliverables.is_empty()
             && !s.document_written;
         if finalization_attempts > 0 {
-            // A rejected document completion always returns to verification,
-            // even if the model previously declared itself ready to answer.
-            phase = "verify".into();
+            // A rejected document completion returns to verification, even if
+            // the model previously declared itself ready to answer; before
+            // any save there is nothing to verify, and the refusal asks for
+            // the document.
+            phase = if s.is_document_work() && !s.document_written {
+                "draft"
+            } else {
+                "verify"
+            }
+            .into();
         }
         // One progress ladder for document work: focus (1x), narrowed tools
         // (2x), then closing mode (3x) or the closing budget reserve.
@@ -1816,15 +1850,28 @@ pub async fn run_session_controlled(
         } else {
             DOCUMENT_FOCUSED_INSTRUCTION
         };
+        // The focused instruction points at recovery_reason, which the
+        // counters set only when they are exhausted; name their stall here.
+        let shown_reason = s.progress_recovery.recovery_reason.clone().or_else(|| {
+            if repeated_outcome_focus {
+                Some(REPEATED_OUTCOME_REASON.into())
+            } else if substantive_focus {
+                Some(NAVIGATION_STALL_REASON.into())
+            } else if artifact_focus {
+                Some(ARTIFACT_CHURN_REASON.into())
+            } else {
+                None
+            }
+        });
         const DOCUMENT_FOCUSED_INSTRUCTION: &str = "Focused recovery: recovery_reason says what stalled. Choose the current to-do and perform one concrete action, different from the one that failed, that changes the requested result or verifies specific missing evidence; do not cycle between earlier file versions. After a real edit, advance its to-do or read any cited range it left unread.";
         const ANSWER_FOCUSED_INSTRUCTION: &str = "Focused recovery: recovery_reason says what stalled. Choose the current to-do, or the question itself, and perform one concrete action, different from the one that failed, that changes the requested result; do not cycle between earlier file versions. If the requested result already exists, complete only the actual remaining work, then answer.";
         s.run_guidance = json!({"task_rounds":s.task_rounds,"run_rounds":s.run_rounds(),"finalization_attempts":finalization_attempts,"phase":phase,"remaining_tokens":remaining,"remaining_seconds":seconds_remaining,"unread_citation_count":unread_count,
-            "recovery_reason":s.progress_recovery.recovery_reason,"action_required":s.progress_recovery.action_required,
+            "recovery_reason":shown_reason,"action_required":s.progress_recovery.action_required,
             "progress_recovery":{"active":progress_recovery,"focused":focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus,"rounds_without_substantive_progress":s.progress_recovery.rounds_without_substantive_progress,"repeated_outcome_rounds":s.progress_recovery.repeated_outcome_rounds,"artifact_edits_without_milestone":s.progress_recovery.artifact_edits_without_milestone,"repeated_read":repeated_read_detected},
             "current_todo":s.task.current_todo(),
             "max_tool_calls":32.min(if s.checkpoint.is_some() { ContextManager::cleanup_result_budget(&s.config) } else { s.config.batch_budget() } / 200),
             "plan_pending_count":s.task.todos.iter().filter(|item| !item.done).count(),
-            "finalization_error":s.last_error.as_deref().filter(|error| final_refusal(error) && (finalization_attempts > 0 || error.starts_with("task_plan_pending:") || error.starts_with("task_unresolved_open:") || error.starts_with("request_coverage_check:"))),
+            "finalization_error":s.last_error.as_deref().filter(|error| final_refusal(error) && (finalization_attempts > 0 || error.starts_with("task_plan_pending:") || error.starts_with("task_unresolved_open:") || error.starts_with("request_coverage_check:")) && !(closing_active && (error.starts_with("request_coverage_check:") || (s.document_written && error.starts_with("task_plan_pending:"))))),
             "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: the last requests produced no new evidence, document change or resolved citation. Change approach instead of repeating them: read sources the document still needs and has not read, write or correct a section, or file_read a cited range reported as unread." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { phase_instruction(&phase, budget_phase, answer_workflow, planned_work) } });
         if s.checkpoint.is_none() && !s.progress_recovery.checkpoint_document_edits.is_empty() {
             let hash = tools::output_path(&s.project)
@@ -1841,11 +1888,16 @@ pub async fn run_session_controlled(
         s.run_guidance["progress_recovery"]["closing_after"] =
             json!(closing_stall_limit(&s.config));
         if answer_workflow {
-            // Closing belongs to document work, which answer never enters.
+            // Closing and citation audits belong to document work, which
+            // answer never enters.
             s.run_guidance["progress_recovery"]
                 .as_object_mut()
                 .unwrap()
                 .remove("closing_after");
+            s.run_guidance
+                .as_object_mut()
+                .unwrap()
+                .remove("unread_citation_count");
         }
         if let Some(check) = plan_check(&mut s) {
             s.run_guidance["plan_check"] = json!(check);
@@ -1861,12 +1913,14 @@ pub async fn run_session_controlled(
             // The audit passes as soon as one section cites read lines, so
             // this held from the first clean save on and replaced every
             // later instruction. A focused recovery names what stalled and
-            // keeps its place, with the closeout added; a plain stall on a
-            // written document is usually the open to-dos, so the closeout
-            // replaces it.
-            if focused {
+            // a draft or verify instruction says what the budget asks now:
+            // both keep their place, with the closeout added. A plain stall
+            // on a written document is usually the open to-dos, and the
+            // investigate instruction says nothing the closeout does not,
+            // so the closeout replaces those.
+            if focused || (!progress_recovery && phase != "investigate") {
                 let text = format!(
-                    "{} {CLOSEOUT_AFTER_RECOVERY}",
+                    "{} {CLOSEOUT_NOTE}",
                     s.run_guidance["instruction"].as_str().unwrap_or("")
                 );
                 s.run_guidance["instruction"] = json!(text);
@@ -2063,6 +2117,9 @@ pub async fn run_session_controlled(
         let response_error = response.as_ref().err().or(invalid_completion.as_ref());
         let recovered_batch = response_error
             .is_some_and(|error| recover_unexecuted_batch(&mut s, &error.to_string()));
+        if recovered_batch {
+            batch_reason = s.progress_recovery.recovery_reason.clone();
+        }
 
         // Attribute every charged request before any retry or stop can leave
         // this iteration, including failed provider calls and invalid output.
@@ -2321,8 +2378,17 @@ pub async fn run_session_controlled(
             s.activity = json!({"stage":"continuing","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds()});
             snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
             if length_recoveries >= LENGTH_RECOVERY_LIMIT {
+                // The advice follows what the next edit can be: with no
+                // output yet, a smaller create; with one, section edits.
+                let advice = if s.progress_recovery.whole_write_withheld {
+                    "edit one section per document_edit action=section or replace_text, since whole-document write is withheld for a large document"
+                } else if document_tokens == 0 {
+                    "create the document with its first section only, then add each other section with its own save"
+                } else {
+                    "save one section per document_edit call instead of rewriting the document"
+                };
                 let reason = format!(
-                    "length_recovery_limit: {length_recoveries} consecutive output-limit responses; edit one section per document_edit action=section or replace_text, since whole-document write is withheld for a large document."
+                    "length_recovery_limit: {length_recoveries} consecutive output-limit responses; {advice}."
                 );
                 if !recover_document(&mut s, &reason) {
                     failure = Some(format!(
@@ -2351,6 +2417,7 @@ pub async fn run_session_controlled(
             let reason =
                 format!("tool_call_batch_limit: maximum {call_limit} calls at this result budget");
             if recover_unexecuted_batch(&mut s, &reason) {
+                batch_reason = s.progress_recovery.recovery_reason.clone();
                 continue;
             }
             failure = Some(reason);
@@ -2372,8 +2439,10 @@ pub async fn run_session_controlled(
                 cp.maintenance_bundle_ids.push(id);
                 continue;
             }
-            if s.pending_config.is_some() {
-                let reason = "New settings are waiting for what pending_settings.blocked_by names; the runtime applies them at the next request once the session fits them (a checkpoint frees context, memory_manage frees memories)";
+            // Closing withholds memory_manage, and its forced finish ignores
+            // pending settings too, so it does not refuse for them.
+            if s.pending_config.is_some() && s.progress_recovery.closing.is_none() {
+                let reason = "New settings are waiting: pending_settings names what blocks them and how to resolve it";
                 if s.is_document_work() {
                     s.last_error = Some(reason.into());
                     s.progress_recovery.action_required = true;
@@ -2967,6 +3036,10 @@ pub async fn run_session_controlled(
             // Outside document work the reason only explains the rejected batch.
             s.progress_recovery.recovery_reason = None;
         }
+        if batch_reason.is_some() && s.progress_recovery.recovery_reason == batch_reason {
+            s.progress_recovery.recovery_reason = None;
+        }
+        batch_reason = None;
         // No separate count of requests without an edit or a resolved
         // citation: reading new sources is progress too, and that count sent
         // a live run toward writing after eight requests of new reads. The
@@ -3049,7 +3122,7 @@ pub async fn run_session_controlled(
         }
         if !checkpoint_batch
             && repeated_outcome_exhausted(&s)
-            && !recover_document(&mut s, "Repeated actions produced no new result.")
+            && !recover_document(&mut s, REPEATED_OUTCOME_REASON)
         {
             s.status = "partial".into();
             s.last_error = Some(REPEATED_OUTCOME_ERROR.into());
@@ -3058,10 +3131,7 @@ pub async fn run_session_controlled(
         if !checkpoint_batch
             && s.progress_recovery.rounds_without_substantive_progress
                 >= substantive_progress_limit(&s.config)
-            && !recover_document(
-                &mut s,
-                "Navigation and bookkeeping alone have not advanced the document for many requests.",
-            )
+            && !recover_document(&mut s, NAVIGATION_STALL_REASON)
         {
             s.status = "partial".into();
             s.last_error = Some(NAVIGATION_STALL_ERROR.into());
@@ -3070,10 +3140,7 @@ pub async fn run_session_controlled(
         if !checkpoint_batch
             && s.progress_recovery.artifact_edits_without_milestone
                 >= artifact_exhaust_limit(&s.config)
-            && !recover_document(
-                &mut s,
-                "Different rewrites have not completed a milestone; fix the current section's specific problems instead of another general rewrite.",
-            )
+            && !recover_document(&mut s, ARTIFACT_CHURN_REASON)
         {
             s.status = "partial".into();
             s.last_error = Some(ARTIFACT_CHURN_ERROR.into());

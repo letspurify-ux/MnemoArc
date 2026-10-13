@@ -501,7 +501,14 @@ fn incomplete_source_keeps_search_and_symbol_reads_bounded() {
                 "symbol_read",
                 json!({"path":path,"symbol_id":symbol["symbol_id"]}),
             );
-            assert_eq!(body["hash"], symbol["hash"]);
+            // The row carries no separate hash: the file hash opens its
+            // symbol_id, and the read is of that same file version.
+            assert!(
+                symbol["symbol_id"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(body["hash"].as_str().unwrap())
+            );
             assert_eq!(body["read_start"], symbol["start_line"]);
             assert!(
                 body["source"]["end_line"].as_u64().unwrap()

@@ -457,7 +457,7 @@ async fn a_recovery_instruction_is_not_replaced_by_the_plan_closeout() {
     // The closeout is added after the recovery, not lost.
     assert!(
         instruction.ends_with(
-            "plan_closeout lists the open to-dos: close those whose work is done in one task_plan apply with plan_closeout.expected_revision."
+            "Open to-dos are in task.todos: close those whose work is done in one task_plan apply with plan_closeout.expected_revision."
         ),
         "{instruction}"
     );
@@ -568,10 +568,10 @@ async fn open_todos_on_a_finished_document_are_closed_in_one_batch() {
     )
     .await;
     assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    // The three open to-dos are in task.todos; the closeout adds only its
+    // revision (more_items lists open to-dos beyond that window).
     let closeout = &guidance[0]["plan_closeout"];
-    assert_eq!(closeout["expected_revision"], 1);
-    assert_eq!(closeout["pending_count"], 3);
-    assert_eq!(closeout["items"][0]["id"], "T1");
+    assert_eq!(closeout, &json!({"expected_revision":1}));
     assert!(guidance[0]["ready_for_final"].is_null());
     let instruction = guidance[0]["instruction"].as_str().unwrap();
     assert!(instruction.contains("close them in ONE task_plan apply"));
@@ -1252,6 +1252,17 @@ async fn an_output_limit_truncation_withholds_whole_document_writes() {
         "{actions}"
     );
     assert!(actions.as_array().unwrap().iter().any(|a| a == "section"));
+    // Nor does any action branch, of either edit tool (the branches were
+    // built after write was stripped and offered it again).
+    for name in ["document_edit", "document_edit_batch"] {
+        let schema = ToolRegistry::definitions(&s)
+            .into_iter()
+            .find(|tool| tool["function"]["name"] == name)
+            .unwrap()["function"]["parameters"]
+            .to_string();
+        assert!(!schema.contains("\"write\""), "{name}: {schema}");
+        assert!(schema.contains("\"section\""), "{name}");
+    }
     let path = dir.path().join("out.md");
     let hash = tools::hash(&std::fs::read(&path).unwrap());
     let error = tools::execute(
@@ -2874,4 +2885,188 @@ async fn checkpoint_document_edits_close_after_the_first_cleanup_request() {
     assert_eq!(result.checkpoints_completed, 1, "{:?}", result.last_error);
     let doc = std::fs::read_to_string(&result.project.output).unwrap();
     assert!(doc.contains("# Loop") && !doc.contains("# Late"), "{doc}");
+}
+
+/// A source-document session over main.js with nothing saved by this task;
+/// `existing` puts a document at the output path first.
+fn unsaved_fixture(existing: bool) -> (tempfile::TempDir, Session) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.js"), "function run() {}\n").unwrap();
+    if existing {
+        std::fs::write(dir.path().join("out.md"), "# Flow\nThe run starts.\n").unwrap();
+    }
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128_000),
+            ..support::compact_config()
+        },
+    );
+    s.add_user("Write a source document covering the run function.".into());
+    s.select_workflow("source_document").unwrap();
+    (dir, s)
+}
+
+#[test]
+fn closing_rejects_reads_toward_the_repair_the_output_needs() {
+    // Closing told a correction of an existing output to create it; create
+    // then failed, and the recovery listed no tool at all.
+    for (existing, expected) in [(true, "not create"), (false, "action=create")] {
+        let (_dir, mut s) = unsaved_fixture(existing);
+        s.progress_recovery.closing = Some(Default::default());
+        let result = tools::run_call(
+            &mut s,
+            &ToolCall {
+                id: "read".into(),
+                name: "file_read".into(),
+                arguments: json!({"path":"main.js"}).to_string(),
+            },
+        );
+        let error = result["error"].as_str().unwrap();
+        assert!(error.starts_with("closing_mode:"), "{error}");
+        assert!(error.contains(expected), "{error}");
+        let tools = result["recovery"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|tool| tool == "document_edit"), "{result}");
+    }
+}
+
+#[tokio::test]
+async fn a_refused_final_before_any_save_returns_to_drafting() {
+    // Verification has nothing to check before the document exists, and the
+    // refusal asks for the document.
+    let (_dir, s) = unsaved_fixture(false);
+    let (_, guidance) = run_scripted(
+        s,
+        vec![
+            Completion {
+                text: "Done.".into(),
+                ..Default::default()
+            },
+            Completion {
+                text: "Done.".into(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await;
+    assert_eq!(guidance[1]["phase"], "draft", "{}", guidance[1]);
+    let instruction = guidance[1]["instruction"].as_str().unwrap();
+    assert!(!instruction.starts_with("Verify"), "{instruction}");
+}
+
+#[tokio::test]
+async fn a_stall_counter_names_its_reason_with_the_focused_instruction() {
+    // The focused instruction points at recovery_reason, which the counters
+    // set only once exhausted.
+    let (_dir, mut s) = saved_fixture();
+    s.progress_recovery.repeated_outcome_rounds = s.config.stall_round_limit;
+    let (_, guidance) = run_scripted(
+        s,
+        vec![Completion {
+            text: "Saved out.md".into(),
+            ..Default::default()
+        }],
+    )
+    .await;
+    let instruction = guidance[0]["instruction"].as_str().unwrap();
+    assert!(instruction.starts_with("Focused recovery"), "{instruction}");
+    assert_eq!(
+        guidance[0]["recovery_reason"],
+        "Repeated actions produced no new result."
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_batch_reason_ends_with_the_next_executed_batch() {
+    // The reason describes only the rejected batch; kept, it held focused
+    // recovery until the next document edit.
+    let (_dir, s) = saved_fixture();
+    let oversized = Completion {
+        calls: (0..33)
+            .map(|i| ToolCall {
+                id: format!("r{i}"),
+                name: "file_read".into(),
+                arguments: json!({"path":"main.js","start_line":1,"max_lines":1}).to_string(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let (_, guidance) = run_scripted(
+        s,
+        vec![
+            oversized,
+            call(
+                "read",
+                "file_read",
+                json!({"path":"main.js","start_line":2,"max_lines":1}),
+            ),
+            Completion {
+                text: "Saved out.md".into(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await;
+    assert!(
+        guidance[1]["recovery_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with("tool_call_batch_limit")),
+        "{}",
+        guidance[1]
+    );
+    assert!(
+        guidance[2].get("recovery_reason").is_none(),
+        "{}",
+        guidance[2]
+    );
+    let instruction = guidance[2]["instruction"].as_str().unwrap();
+    assert!(
+        !instruction.starts_with("Focused recovery"),
+        "{instruction}"
+    );
+}
+
+#[tokio::test]
+async fn closing_drops_plan_refusals_it_no_longer_applies() {
+    // A task_plan_pending refusal from before closing told the model to
+    // continue the to-do's work while closing said to leave it open.
+    let (_dir, mut s) = saved_fixture();
+    tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Write the error-handling section from main.js"]}]}),
+    )
+    .unwrap();
+    s.config.stall_round_limit = 2;
+    let mut steps = vec![Completion {
+        text: "Saved out.md".into(),
+        ..Default::default()
+    }];
+    steps
+        .extend((0..6).map(|i| call(&format!("idle-{i}"), "task_state", json!({"action":"read"}))));
+    steps.push(Completion {
+        text: "Saved out.md".into(),
+        ..Default::default()
+    });
+    let (_, guidance) = run_scripted(s, steps).await;
+    assert!(
+        guidance[1]["finalization_error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("task_plan_pending:")),
+        "{}",
+        guidance[1]
+    );
+    let closing: Vec<_> = guidance
+        .iter()
+        .filter(|guidance| guidance["closing"]["active"] == true)
+        .collect();
+    assert!(!closing.is_empty());
+    for guidance in closing {
+        assert!(guidance.get("finalization_error").is_none(), "{guidance}");
+    }
 }

@@ -631,11 +631,13 @@ impl Session {
 
     /// Optional tools the user's workflow selection excludes. Chat answers
     /// run no citation audit, so `document_audit` is withheld.
+    /// Source documentation writes only its configured output, so the project
+    /// file tools are excluded there (catalog, selection and settings alike).
     pub fn workflow_forbidden_tools(&self) -> &'static [&'static str] {
         if self.workflow_mode == "answer" {
             &["document_audit"]
         } else {
-            &[]
+            &["file_edit", "file_write", "file_patch"]
         }
     }
 
@@ -689,7 +691,7 @@ impl Session {
     pub fn new(mut project: Project, config: Config) -> Self {
         project.ensure_id();
         let task = TaskState {
-            scope: project.root.display().to_string(),
+            scope: String::new(),
             // A configured output is a possible destination, not a requested deliverable.
             deliverables: vec![],
             // The default selection; see workflow_mode.
@@ -805,7 +807,7 @@ impl Session {
                         let mut candidates: Vec<_> = self.sources.values().collect();
                         candidates.sort_by_key(|s| std::cmp::Reverse(s.observed_at));
                         let choices: Vec<_> = candidates.into_iter().take(8).map(|s| json!({"id":s.id,"path":s.path,"start_line":s.start_line,"end_line":s.end_line})).collect();
-                        anyhow::anyhow!("unknown_source: {id}; Use source_lookup with the matching path to recover an observed ID, or history to inspect the original result. A compact code_outline is navigation only and supplies no evidence ID. If no matching evidence exists, record missing evidence in checkpoint_complete.progress and the current task_plan item and read the source after checkpoint completion; do not save an unsupported fact. Do not substitute unrelated IDs or remove source_ids to bypass this error. Recent sources (not automatic replacements): {}", json!(choices))
+                        anyhow::anyhow!("unknown_source: {id}; Use source_lookup with the matching path to recover an observed ID, or history to inspect the original result. A compact code_outline is navigation only and supplies no evidence ID. If no matching evidence exists, {}; do not save an unsupported fact. Do not substitute unrelated IDs or remove source_ids to bypass this error. Recent sources (not automatic replacements): {}", if self.checkpoint.is_some() { "record the pending read in checkpoint_complete progress and read the source after the checkpoint" } else { "file_read the range first and use the source ID it returns" }, json!(choices))
                     })
             })
             .collect()
@@ -1021,7 +1023,7 @@ impl Session {
                 let revision = self.task.revision.saturating_add(1);
                 let constraints = std::mem::take(&mut self.task.constraints);
                 self.task = TaskState {
-                    scope: self.project.root.display().to_string(),
+                    scope: String::new(),
                     constraints,
                     revision,
                     ..Default::default()
