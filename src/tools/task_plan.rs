@@ -12,7 +12,8 @@ const MAX_PAGE: usize = 20;
 /// live model wrote 237- and 244-character items and its plan was refused.
 const MAX_TEXT_CHARS: usize = 500;
 /// A live model's 382-character result was refused and it wrote the result
-/// into the item text instead of completing the item.
+/// into the item text instead of completing the item. A longer complete
+/// result is cut to this length rather than refused (parse_operations).
 const MAX_RESULT_CHARS: usize = 500;
 const MAX_OPERATIONS: usize = 16;
 const MAX_ENCODED_BYTES: usize = 128 * 1024;
@@ -766,6 +767,23 @@ fn parse_operations(value: &Value) -> Result<Parsed> {
                 }
                 normalized = true;
             }
+        }
+        // A live model kept its findings in complete results and lost six
+        // requests to the length refusal (503 to 845 characters). The result
+        // is a record of the item, so keep its start and say so.
+        if item["op"] == "complete"
+            && let Some(result) = item.get("result").and_then(Value::as_str)
+            && result.trim().chars().count() > MAX_RESULT_CHARS
+        {
+            let count = result.trim().chars().count();
+            let mut kept: String = result.trim().chars().take(MAX_RESULT_CHARS - 1).collect();
+            kept.truncate(kept.trim_end().len());
+            kept.push('…');
+            notices.push(format!(
+                "operations[{i}]: the result had {count} characters, so its first {MAX_RESULT_CHARS} were kept; keep a result to one short sentence of what was done"
+            ));
+            item["result"] = json!(kept);
+            normalized = true;
         }
         // The published item schema is shared by all operation variants.
         // Providers can populate every optional field, so discard fields

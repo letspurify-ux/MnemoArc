@@ -93,29 +93,43 @@ fn operation_encodings_are_normalized_and_replayed_without_duplicate_items() {
 }
 
 #[test]
-fn an_oversized_result_is_told_its_length() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = session(dir.path());
-    apply(&mut s, json!([{"op":"insert","texts":["문서 감사"]}]));
-    let id = s.task.current_todo().unwrap().id.clone();
-    // Live run: results carrying a full hash and audit dump were refused
-    // four times in a row without saying how long they were.
-    let result = format!("현재 해시 {} 문서 audit 통과", "5".repeat(600));
-    let refused = apply(&mut s, json!([{"op":"complete","id":id,"result":result}]));
-    assert_eq!(refused["applied"], false, "{refused}");
-    let reason = refused["reason"].as_str().unwrap();
-    assert!(
-        reason.contains(&format!("this text has {}", result.chars().count())),
-        "{reason}"
-    );
-    assert!(!s.task.todos[0].done);
+fn an_oversized_result_is_cut_and_told_its_length() {
     // A live model's 382-character result was refused and it wrote the
     // result into the item text instead; results up to 500 are accepted.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    apply(
+        &mut s,
+        json!([{"op":"insert","texts":["조사","문서 감사"]}]),
+    );
+    let id = s.task.current_todo().unwrap().id.clone();
     let result = "조사 결과 ".repeat(70);
     assert!(result.chars().count() > 240 && result.chars().count() <= 500);
     let applied = apply(&mut s, json!([{"op":"complete","id":id,"result":result}]));
     assert_eq!(applied["applied"], true, "{applied}");
-    assert!(s.task.todos[0].done);
+    assert_eq!(s.task.todos[0].result, result.trim());
+    // Live run 2026-10-13: a model kept its findings in results and lost six
+    // requests to refusals of 503 to 845 characters. A longer result is cut
+    // to 500 and the notice says how long it was.
+    let id = s.task.current_todo().unwrap().id.clone();
+    let result = format!("현재 해시 {} 문서 audit 통과", "5".repeat(600));
+    let cut = apply(&mut s, json!([{"op":"complete","id":id,"result":result}]));
+    assert_eq!(cut["applied"], true, "{cut}");
+    assert!(s.task.todos[1].done);
+    let kept = &s.task.todos[1].result;
+    assert_eq!(kept.chars().count(), 500, "{kept}");
+    assert!(
+        kept.starts_with("현재 해시 5") && kept.ends_with('…'),
+        "{kept}"
+    );
+    let notices = cut["notices"].to_string();
+    assert!(
+        notices.contains(&format!(
+            "the result had {} characters",
+            result.chars().count()
+        )),
+        "{notices}"
+    );
 }
 
 #[test]
