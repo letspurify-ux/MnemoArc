@@ -919,6 +919,9 @@ button:hover {
 .tool-result summary {
   cursor: pointer;
 }
+.tool-result-summary {
+  overflow-wrap: anywhere;
+}
 .tool-result small {
   float: right;
 }

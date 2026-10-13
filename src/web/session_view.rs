@@ -130,7 +130,51 @@ fn page_view(session: &Snapshot, revision: u64, stream: Option<String>, page: Pa
         })
         .map(|bundle| bundle.id);
     let (memory_bytes, history_bytes) = session.usage();
-    json!({"revision":revision,"id":session.id,"project":session.project,"config":session.config,"pending_config":session.pending_config,"credential_configured":OpenAiClient::has_key(&session.config),"status":session.status,"error":session.last_error,"run_history":session.run_history,"has_task":!session.latest_request.is_empty(),"can_resume":session.can_resume(),"original_request":session.original_request,"current_goal":session.latest_request,"task_amendments":session.task_amendments,"question_running":session.question.is_some(),"task":session.task,"workflow_mode":session.workflow_mode,"workflow_forbidden_tools":session.workflow_forbidden_tools(),"completion_gaps":session.completion_gaps,"run_guidance":session.run_guidance,"activity":session.activity,"continuation_pending":session.continuation.is_some(),"bundles":bundles,"previous":previous,"pruned_through":session.history.pruned_through,"stream":stream,"memories":session.memory.recent(session.config.memory_count),"active_tools":session.active_tools,"usage":{"input":session.input_tokens,"output":session.output_tokens,"cached":session.cached_tokens,"estimated":session.usage_incomplete,"context_estimated":crate::context::is_estimated(&session.config.model),"memory_bytes":memory_bytes,"history_bytes":history_bytes,"checkpoints":session.checkpoints_completed},"checkpoint":session.checkpoint})
+    let mut value = json!({"revision":revision,"id":session.id,"project":session.project,"config":session.config,"pending_config":session.pending_config,"credential_configured":OpenAiClient::has_key(&session.config),"status":session.status,"error":session.last_error,"run_history":session.run_history,"has_task":!session.latest_request.is_empty(),"can_resume":session.can_resume(),"original_request":session.original_request,"current_goal":session.latest_request,"task_amendments":session.task_amendments,"question_running":session.question.is_some(),"task":session.task,"workflow_mode":session.workflow_mode,"workflow_forbidden_tools":session.workflow_forbidden_tools(),"completion_gaps":session.completion_gaps,"run_guidance":session.run_guidance,"activity":session.activity,"continuation_pending":session.continuation.is_some(),"bundles":bundles,"previous":previous,"pruned_through":session.history.pruned_through,"stream":stream,"memories":session.memory.recent(session.config.memory_count),"active_tools":session.active_tools,"usage":{"input":session.input_tokens,"output":session.output_tokens,"cached":session.cached_tokens,"estimated":session.usage_incomplete,"context_estimated":crate::context::is_estimated(&session.config.model),"memory_bytes":memory_bytes,"history_bytes":history_bytes,"checkpoints":session.checkpoints_completed},"checkpoint":session.checkpoint});
+    describe_tool_calls(&session.project.root, &mut value["bundles"]);
+    value
+}
+
+/// Adds each tool call's description (tools::call_summary) to the history
+/// the UI shows: on the call, and on its result by tool_call_id. The view is
+/// built from the session's history for this response only; the history the
+/// model receives is unchanged.
+fn describe_tool_calls(root: &std::path::Path, bundles: &mut Value) {
+    let mut summaries = std::collections::HashMap::new();
+    let messages = || {
+        bundles
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|bundle| bundle["messages"].as_array())
+            .flatten()
+    };
+    for message in messages() {
+        for call in message["tool_calls"].as_array().into_iter().flatten() {
+            if let (Some(id), Some(name)) = (call["id"].as_str(), call["function"]["name"].as_str())
+            {
+                let arguments = call["function"]["arguments"].as_str().unwrap_or("");
+                summaries.insert(id.to_owned(), tools::call_summary(root, name, arguments));
+            }
+        }
+    }
+    for bundle in bundles.as_array_mut().into_iter().flatten() {
+        for message in bundle["messages"].as_array_mut().into_iter().flatten() {
+            if let Some(calls) = message["tool_calls"].as_array_mut() {
+                for call in calls {
+                    if let Some(summary) = call["id"].as_str().and_then(|id| summaries.get(id)) {
+                        call["summary"] = json!(summary);
+                    }
+                }
+            } else if message["role"] == "tool"
+                && let Some(summary) = message["tool_call_id"]
+                    .as_str()
+                    .and_then(|id| summaries.get(id))
+            {
+                message["summary"] = json!(summary);
+            }
+        }
+    }
 }
 
 /// Keep the authoritative agent snapshot even if validation is interrupted.
@@ -178,6 +222,28 @@ mod tests {
             Arc::new(OpenAiClient),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn history_calls_and_their_results_carry_what_the_call_did() {
+        let mut bundles = json!([{"id":1,"messages":[
+            {"role":"assistant","content":"","tool_calls":[
+                {"id":"r1","type":"function","function":{"name":"file_read","arguments":"{\"path\":\"/work/app/src/main.rs\",\"start_line\":3,\"max_lines\":2}"}},
+                {"id":"r2","type":"function","function":{"name":"file_read","arguments":"{\"path\":\"missing.rs\"}"}}]},
+            {"role":"tool","tool_call_id":"r1","content":"{\"status\":\"ok\"}"},
+            {"role":"tool","tool_call_id":"r2","content":"{\"status\":\"error\"}"},
+            {"role":"tool","tool_call_id":"unknown","content":"{}"},
+            {"role":"assistant","content":"done"}]}]);
+        describe_tool_calls(FsPath::new("/work/app"), &mut bundles);
+        let messages = &bundles[0]["messages"];
+        assert_eq!(
+            messages[0]["tool_calls"][0]["summary"],
+            "파일 읽기 src/main.rs:3-4"
+        );
+        assert_eq!(messages[1]["summary"], "파일 읽기 src/main.rs:3-4");
+        assert_eq!(messages[2]["summary"], "파일 읽기 missing.rs");
+        assert!(messages[3].get("summary").is_none());
+        assert!(messages[4].get("summary").is_none());
     }
 
     struct Release(Option<std::sync::mpsc::Sender<()>>);

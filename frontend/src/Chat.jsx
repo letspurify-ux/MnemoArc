@@ -342,7 +342,11 @@ function ToolResult({ message }) {
       className={`tool-result ${result.status === "ok" ? "" : "failed"}`}
     >
       <summary>
-        <span>{result.status === "ok" ? "✓" : "!"}</span> 도구 결과{" "}
+        <span>{result.status === "ok" ? "✓" : "!"}</span>{" "}
+        {/* What the call did (tools::call_summary); older servers send none. */}
+        <span className="tool-result-summary">
+          {message.summary || "도구 결과"}
+        </span>{" "}
         <small>{result.status}</small>
       </summary>
       <pre>{JSON.stringify(displayed, null, 2)}</pre>
