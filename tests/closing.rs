@@ -2634,6 +2634,15 @@ async fn the_first_final_compares_the_document_with_the_request_once() {
         error.contains(r#"1 claim(s) name code that the lines they cite never mention: line 8 ["main.js:3-5"] names ["retry_later"]"#),
         "{error}"
     );
+    // Live run 2026-10-13: a correct citation inside `const refresh =
+    // useCallback(` was flagged and re-read for 30 requests; a claim the
+    // lines support may stay.
+    for exit in [
+        "if they do support it (for example they lie inside the named function), leave it as it is",
+        "do not read the same lines again for it",
+    ] {
+        assert!(error.contains(exit), "missing {exit:?}: {error}");
+    }
 
     // And sections showing code that cite no lines (live run 2026-10-12:
     // unread functions shown as code beside "these functions still need

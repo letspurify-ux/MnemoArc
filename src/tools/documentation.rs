@@ -1209,22 +1209,42 @@ fn code_names(span: &str) -> (Vec<String>, Vec<String>) {
     (names, qualifiers)
 }
 
-/// The name of the nearest definition (fn, struct, class, ...) that starts
-/// above a line: a claim may cite lines inside a function by that
-/// function's name, as in "the loop inside `run_session_controlled`".
-fn enclosing_definition(source: &[String], line: usize) -> Option<String> {
-    static DEFINITION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"\b(?:fn|function|def|struct|enum|trait|class|interface|mod)\s+([A-Za-z_][A-Za-z0-9_]*)")
-            .expect("definition pattern")
-    });
-    source[..line.saturating_sub(1).min(source.len())]
+/// Whether a definition of `name` above the cited lines encloses them: a
+/// claim may cite lines inside a function by that function's name, as in
+/// "the loop inside `run_session_controlled`". Definitions are keyword forms
+/// (fn, function, def, class, ...), JavaScript bindings and properties
+/// (`const refresh = useCallback(`, `load: async () =>`) and method
+/// shorthand (`async load() {`). A live run cited lines inside `const
+/// refresh = useCallback(` as `refresh()`; only keyword forms were known,
+/// so the claim was flagged and the model re-read those lines for 30
+/// requests. The definition encloses the cited lines while every nonblank
+/// line from it through the last cited line is indented deeper, except a
+/// line that starts with `)` (a signature continued over several lines).
+fn defined_around(source: &[String], name: &str, begin: usize, end: usize) -> bool {
+    let name = regex::escape(name);
+    let Ok(definition) = regex::Regex::new(&format!(
+        r"\b(?:fn|function|def|struct|enum|trait|class|interface|mod|impl)\s+{name}\b|\b(?:const|let|var)\s+{name}\s*(?::[^=]*)?=[^=]|(?:^|[\s,{{]){name}\s*:\s*(?:async\s+)?(?:function\b|\(|[A-Za-z_$][\w$]*\s*=>)|^\s*(?:(?:async|static|get|set|public|private|protected)\s+)*{name}\s*\([^()]*\)\s*\{{\s*$"
+    )) else {
+        return false;
+    };
+    let indent = |text: &str| text.len() - text.trim_start().len();
+    let last = end.min(source.len());
+    source[..begin.saturating_sub(1).min(source.len())]
         .iter()
+        .enumerate()
         .rev()
-        .find_map(|text| DEFINITION.captures(text).map(|found| found[1].to_owned()))
+        .filter(|(_, text)| definition.is_match(text))
+        .any(|(at, text)| {
+            let depth = indent(text);
+            source[at + 1..last].iter().all(|line| {
+                let trimmed = line.trim_start();
+                trimmed.is_empty() || indent(line) > depth || trimmed.starts_with(')')
+            })
+        })
 }
 
 const CITATION_MISMATCH_LIMIT: usize = 8;
-const CITATION_MISMATCH_GUIDANCE: &str = "None of the code names written before these citations occurs in the lines they cite: the claim may describe other code, or the cited lines may have moved. Read the cited lines, then correct the claim or cite the lines that hold that code. Advice only; it does not block the final answer.";
+const CITATION_MISMATCH_GUIDANCE: &str = "None of the code names written before these citations occurs in the lines they cite: the claim may describe other code, or the cited lines may have moved. Read the cited lines once, then correct the claim or cite the lines that hold that code; if they do support the claim, leave it as it is. This check only compares names, so a correct claim may stay flagged: do not read the same lines again for it. Advice only; it does not block the final answer.";
 
 /// Citations whose claim names code that the cited lines never mention, such
 /// as `checkpoint_complete` cited at lines that hold other code. A live
@@ -1346,8 +1366,9 @@ pub(super) fn citation_mismatch_check(s: &Session, output: &Path, doc: &str) -> 
                     cited_text
                         .iter()
                         .any(|cited_line| cited_line.contains(name.as_str()))
-                }) || enclosing_definition(source, citation.begin)
-                    .is_some_and(|enclosing| names.contains(&enclosing));
+                }) || names
+                    .iter()
+                    .any(|name| defined_around(source, name, citation.begin, citation.end));
             }
             if checked && !found {
                 total += 1;

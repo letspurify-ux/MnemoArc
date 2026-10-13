@@ -5255,6 +5255,56 @@ The loop inside `drive` repeats (src.rs:2-4).\n\
     );
 }
 
+// Live run 2026-10-13: `refresh()` cited lines inside `const refresh =
+// useCallback(`; only keyword definitions were known, so the claim was
+// flagged and the model re-read those lines for 30 requests.
+#[test]
+fn javascript_bindings_and_methods_enclose_the_lines_cited_by_their_name() {
+    let (dir, mut s) = source_setup();
+    std::fs::write(
+        dir.path().join("app.js"),
+        "export default function App() {\n  const refresh = useCallback(\n    (restart = false) => {\n      const isCurrent = () =>\n        alive;\n      setTimeout(() => {\n        abort();\n      }, 15000);\n    },\n    [],\n  );\n  const other = 1;\n  return null;\n}\nclass Store {\n  async load(id) {\n    fetchIt(id);\n  }\n}\n",
+    )
+    .unwrap();
+    let doc = "# Guide\n\
+`refresh()` retries after 15 seconds (app.js:6-8).\n\
+`load()` fetches by id (app.js:17).\n\
+`refresh()` returns nothing (app.js:13).\n";
+    let written = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":doc}),
+    );
+    // Line 13 follows the `);` that closes refresh at its own indentation.
+    assert_eq!(
+        written["citation_mismatch_check"]["items"],
+        json!([{"line":4,"citations":["app.js:13"],"names":["refresh"]}]),
+        "{written}"
+    );
+}
+
+// Live run 2026-10-13: a saved replacement was re-sent two requests later
+// and the refusal offered a two-line passage around the new line to copy.
+#[test]
+fn a_replacement_sent_again_after_it_was_saved_is_named_as_saved() {
+    let (_dir, mut s) = source_setup();
+    std::fs::write(
+        &s.project.output,
+        "# Guide\n- `memory_write()` saves memory (src.rs:1)\n- `memory_search()` searches memory (src.rs:1)\n",
+    )
+    .unwrap();
+    let edit = json!({"action":"replace_text","old_text":"- `memory_search()` searches memory (src.rs:1)","text":"- `memoryMatchesQuery()` searches memory (src.rs:1)"});
+    run(&mut s, "document_edit", edit.clone());
+    let error = tools::execute(&mut s, "document_edit", edit)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.starts_with("patch_target_must_match_once: old_text is not in the current document, but this edit's text is, once, at line 3: the replacement is already saved"),
+        "{error}"
+    );
+    assert!(!error.contains("memory_write"), "{error}");
+}
+
 // Live run 2026-10-12: a section showed two unread functions as code and
 // cited nothing, and the document passed every check. A citation in the
 // heading, a code comment, a footnote or the parent section's own text

@@ -3056,6 +3056,24 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                 }
                 None => (target, new),
             };
+            // A live model re-sent a saved replacement two requests later and
+            // was told to copy a two-line passage around its new line: the
+            // old text is gone because this edit already replaced it. Short
+            // texts are left to the passage hints; they may occur by chance.
+            if !insertion && !scope.contains(target) {
+                let applied = [new, new.trim()]
+                    .into_iter()
+                    .find(|text| text.chars().count() >= 12 && scope.matches(*text).count() == 1);
+                if let Some(text) = applied {
+                    let line = old[..base + scope.find(text).unwrap()]
+                        .matches('\n')
+                        .count()
+                        + 1;
+                    bail!(
+                        "patch_target_must_match_once: old_text is not in the current document, but this edit's text is, once, at line {line}: the replacement is already saved, so nothing was written. Do not send it again; take the current hash from the last document_edit result or document_inspect before the next edit"
+                    );
+                }
+            }
             let (relative_start, relative_end) =
                 unique_document_text_span(scope, target).map_err(|error| {
                     scoped
@@ -4434,7 +4452,7 @@ impl std::fmt::Display for DirectoryPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "path_is_directory: {} is a directory; use file_list with path_glob (e.g. backend/**), then file_read with a file path",
+            "path_is_directory: {} is a directory; use file_list with path_glob set to its project-relative path followed by /**, then file_read with a file path",
             self.0.display()
         )
     }
@@ -4488,6 +4506,26 @@ fn directory_error(p: &Project, directory: &DirectoryPath, tool: &str) -> anyhow
         0 => format!(" containing {}", entries.join(", ")),
         more => format!(" containing {} and {more} more", entries.join(", ")),
     };
+    // The example glob is this directory's own: a fixed "backend/**" sent a
+    // live model to list a backend/ directory the project does not have.
+    let glob = std::fs::canonicalize(&p.root)
+        .ok()
+        .and_then(|root| {
+            let directory = directory.0.canonicalize().ok()?;
+            Some(directory.strip_prefix(root).ok()?.to_path_buf())
+        })
+        .or_else(|| Some(directory.0.strip_prefix(&p.root).ok()?.to_path_buf()))
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .map_or_else(
+            || "**".to_owned(),
+            |relative| {
+                if relative.is_empty() {
+                    "**".to_owned()
+                } else {
+                    format!("{relative}/**")
+                }
+            },
+        );
     // The next call is the same tool on one file: a live model sent
     // code_outline the project root twice and was told to use file_read.
     let next = match tool {
@@ -4499,11 +4537,10 @@ fn directory_error(p: &Project, directory: &DirectoryPath, tool: &str) -> anyhow
         ),
         "code_outline" | "symbol_read" | "symbol_relations" | "file_read" => {
             format!(
-                "{tool} reads one file: find it with file_list and path_glob (e.g. backend/**), then call {tool} with that file path"
+                "{tool} reads one file: find it with file_list and path_glob (e.g. {glob}), then call {tool} with that file path"
             )
         }
-        _ => "use file_list with path_glob (e.g. backend/**), then file_read with a file path"
-            .to_owned(),
+        _ => format!("use file_list with path_glob (e.g. {glob}), then file_read with a file path"),
     };
     anyhow::anyhow!(
         "path_is_directory: {} is a directory{listing}; {next}",
@@ -6875,7 +6912,7 @@ pub fn audit_document(s: &mut Session) -> Result<Value> {
 }
 
 /// The configured output's hash and the number of issues document_audit
-/// reports for it; None when the output is missing or still has the hash
+/// reports for it plus the claims citation_mismatch_check flags; None when the output is missing or still has the hash
 /// `known`, so an unchanged document is not checked again.
 pub fn document_issue_count(s: &Session, known: Option<&str>) -> Option<(String, usize)> {
     let path = output_path(&s.project).ok()?;
@@ -6885,7 +6922,13 @@ pub fn document_issue_count(s: &Session, known: Option<&str>) -> Option<(String,
         return None;
     }
     let count = documentation::open_issue_count(s, &path, &doc).ok()?;
-    Some((digest, count))
+    // Claims whose cited lines never mention their code count too: the
+    // coverage check asks for them, and a live run's saved fix of one was
+    // not credited while its stall count kept rising.
+    let mismatched = documentation::citation_mismatch_check(s, &path, &doc)
+        .and_then(|check| check["flagged"].as_u64())
+        .unwrap_or(0) as usize;
+    Some((digest, count + mismatched))
 }
 
 pub fn run_call(s: &mut Session, call: &crate::llm::ToolCall) -> Value {

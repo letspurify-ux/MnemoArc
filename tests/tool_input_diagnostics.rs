@@ -1715,6 +1715,31 @@ fn a_directory_given_to_a_file_tool_names_that_tool_for_the_next_call() {
     }
 }
 
+// Live run 2026-10-13: the hint's fixed "backend/**" example sent the model
+// to list a backend/ directory the project does not have.
+#[test]
+fn a_directory_error_suggests_a_glob_for_that_directory() {
+    let (dir, mut s) = project_session();
+    s.active_tools = ToolRegistry::optional_names();
+    let error = tools::execute(
+        &mut s,
+        "code_outline",
+        json!({"path":dir.path().join("src").display().to_string()}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("path_glob (e.g. src/**)"), "{error}");
+    let error = tools::execute(
+        &mut s,
+        "code_outline",
+        json!({"path":dir.path().display().to_string()}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("path_glob (e.g. **)"), "{error}");
+    assert!(!error.contains("backend/**"), "{error}");
+}
+
 #[test]
 fn a_directory_given_to_document_inspect_says_to_omit_the_path() {
     // A live model sent document_inspect the project root and was told to

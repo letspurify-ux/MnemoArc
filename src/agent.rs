@@ -46,7 +46,8 @@ fn progress_score(s: &Session) -> usize {
         + s.progress_recovery.evidence_credit
 }
 
-/// Whether the output's open issues (document_audit's issue count) fell
+/// Whether the output's open issues (document_audit's issue count plus
+/// flagged citation mismatches) fell
 /// below the fewest seen in this run. The repairs the final answer requires
 /// (citation paths and ranges, format, citations narrowed to read lines)
 /// add no section, line or evidence: a live run fixed 25 citation paths over
@@ -572,7 +573,10 @@ fn coverage_check(s: &mut Session) -> Option<String> {
         String::new()
     };
     // Shown with the one coverage check, the last look before the final: a
-    // live correction kept a claim whose cited lines hold other code.
+    // live correction kept a claim whose cited lines hold other code. The
+    // check only compares names, so a claim that reading confirms stays: a
+    // live run told only to correct a right citation re-read it for 30
+    // requests.
     let mismatches = tools::citation_mismatches(s)
         .map(|check| {
             let items: Vec<String> = check["items"]
@@ -589,7 +593,7 @@ fn coverage_check(s: &mut Session) -> Option<String> {
                 })
                 .collect();
             format!(
-                " Also, {} claim(s) name code that the lines they cite never mention: {}. Read those lines, then correct the claim or its citation.",
+                " Also, {} claim(s) name code that the lines they cite never mention: {}. Read those lines once: correct a claim they do not support, or cite the lines that hold that code; if they do support it (for example they lie inside the named function), leave it as it is. This check only compares names, so a correct claim may stay flagged: do not read the same lines again for it.",
                 check["flagged"],
                 items.join("; ")
             )
@@ -3662,6 +3666,15 @@ mod readiness_tests {
         save(&mut s, "# A\n\nOne a.rs:1.\nTwo a.rs:1.\n");
         assert!(document_issues_fell(&mut s));
         assert_eq!(s.progress_recovery.fewest_document_issues, Some(0));
+        // Live run 2026-10-13: a claim naming code its cited lines never
+        // mention counts too, so its saved fix is progress (counted from a
+        // new task's baseline).
+        s.progress_recovery.fewest_document_issues = None;
+        s.progress_recovery.document_issues_hash = None;
+        save(&mut s, "# A\n\n`missing_fn` runs a.rs:1.\n");
+        assert!(!document_issues_fell(&mut s));
+        save(&mut s, "# A\n\n`a()` runs a.rs:1.\n");
+        assert!(document_issues_fell(&mut s));
     }
 
     #[test]
