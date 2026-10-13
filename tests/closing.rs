@@ -2997,6 +2997,51 @@ async fn a_citation_fix_that_fails_after_the_refusal_can_be_corrected() {
     );
 }
 
+// Live runs 2026-10-13: reads sent beside checkpoint_complete were withheld,
+// and the acknowledgement was refused as checkpoint_has_failed_operations,
+// costing a cleanup request; the same reads were sent again afterwards.
+#[tokio::test]
+async fn a_withheld_call_does_not_hold_the_checkpoint() {
+    let (_dir, s, id) = checkpoint_fixture();
+    let (result, _, _) = run_scripted_tools(
+        s,
+        vec![calls(vec![
+            (
+                "read",
+                "file_read",
+                json!({"path":"main.js","start_line":2,"max_lines":2}),
+            ),
+            (
+                "ack",
+                "checkpoint_complete",
+                json!({"id":id,"progress":"Saved the flow and history sections."}),
+            ),
+        ])],
+    )
+    .await;
+    let tool_results: Vec<&str> = result
+        .history
+        .bundles
+        .iter()
+        .flat_map(|b| b.messages.iter())
+        .filter(|m| m["role"] == "tool")
+        .filter_map(|m| m["content"].as_str())
+        .collect();
+    assert!(
+        tool_results
+            .iter()
+            .any(|r| r.contains("checkpoint_pending")),
+        "{tool_results:#?}"
+    );
+    assert!(
+        !tool_results
+            .iter()
+            .any(|r| r.contains("checkpoint_has_failed_operations")),
+        "{tool_results:#?}"
+    );
+    assert_eq!(result.checkpoints_completed, 1, "{:?}", result.last_error);
+}
+
 #[test]
 fn a_checkpoint_is_acknowledged_at_once_when_the_document_cites_a_source() {
     let (_dir, mut s, id) = checkpoint_fixture();

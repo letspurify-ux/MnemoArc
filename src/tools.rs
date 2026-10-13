@@ -7559,7 +7559,7 @@ pub fn run_call_cancellable(
     let mut result = guard_tool(s, |s| run_call_inner(s, call, cancel));
     recovery::attach(s, call, &mut result);
     if result["status"] != "ok"
-        && failure_holds_checkpoint(s, &call.name)
+        && failure_holds_checkpoint(s, &call.name, &result)
         && let Some(cp) = &mut s.checkpoint
     {
         cp.failed = true;
@@ -7572,10 +7572,16 @@ pub fn run_call_cancellable(
 /// document edit changes nothing in the document: it holds the checkpoint
 /// once, so the edit can be corrected while its evidence is still in
 /// context, and after that the checkpoint goes ahead without it.
-fn failure_holds_checkpoint(s: &mut Session, name: &str) -> bool {
+fn failure_holds_checkpoint(s: &mut Session, name: &str, result: &Value) -> bool {
     let Some(cp) = &s.checkpoint else {
         return false;
     };
+    // A call the checkpoint withholds ran nothing and has nothing to repair.
+    // Live runs sent reads beside checkpoint_complete; holding the batch for
+    // them cost a cleanup request each, and the reads were sent again after.
+    if result["recovery"]["code"] == "checkpoint_pending" {
+        return false;
+    }
     if !matches!(name, "document_edit" | "document_edit_batch") {
         return true;
     }
