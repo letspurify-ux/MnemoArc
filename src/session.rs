@@ -385,9 +385,11 @@ pub struct ProgressRecovery {
     /// document with the request.
     #[serde(skip)]
     pub coverage_checked: bool,
-    /// The checkpoint whose batch a failed document edit already held once.
+    /// The checkpoint whose batch a failed document edit already held once,
+    /// with its cleanup batch count at that failure: the next batch may
+    /// correct the edit.
     #[serde(skip)]
-    pub checkpoint_edit_held: Option<String>,
+    pub checkpoint_edit_held: Option<(String, usize)>,
     /// The checkpoint whose acknowledgement was refused once because the
     /// document cites nothing, with its cleanup batch count at that refusal:
     /// the next batch may save citations.

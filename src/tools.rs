@@ -502,15 +502,27 @@ impl ToolRegistry {
         let Some(cp) = s.checkpoint.as_ref().filter(|_| s.is_document_work()) else {
             return false;
         };
-        let (id, batches) = &s.progress_recovery.checkpoint_write_batches;
-        let batches = if *id == cp.id { *batches } else { 0 };
+        let batches = Self::checkpoint_batches(s, &cp.id);
+        let recovery = &s.progress_recovery;
+        // A live model's citation fix, sent on the batch a citation refusal
+        // reopened, failed; its edit hold then held the checkpoint with
+        // writes closed, and the corrected edit was refused.
         batches == 0
-            || (batches == 1
-                && s.progress_recovery.checkpoint_edit_held.as_deref() == Some(cp.id.as_str()))
-            || s.progress_recovery
-                .checkpoint_citations_held
+            || recovery
+                .checkpoint_edit_held
                 .as_ref()
                 .is_some_and(|(held, at)| *held == cp.id && batches == at + 1)
+            // Open on the refusing batch too, so its recovery names the
+            // edit tools; checkpoint_complete runs last in its batch.
+            || recovery
+                .checkpoint_citations_held
+                .as_ref()
+                .is_some_and(|(held, at)| *held == cp.id && (*at..=at + 1).contains(&batches))
+    }
+    /// Cleanup batches already processed for this checkpoint.
+    pub(crate) fn checkpoint_batches(s: &Session, id: &str) -> usize {
+        let (batch_id, batches) = &s.progress_recovery.checkpoint_write_batches;
+        if batch_id == id { *batches } else { 0 }
     }
     fn workflow_required_tools(s: &Session) -> &'static [&'static str] {
         if s.task.workflow == "source_document" {
@@ -6064,15 +6076,13 @@ fn execute_repaired(
             // Refused once per checkpoint, with one more batch open to save.
             if s.is_document_work() && s.document_written && citation_count(s) == 0 {
                 let id = cp.id.clone();
-                let recovery = &mut s.progress_recovery;
-                if recovery
+                if s.progress_recovery
                     .checkpoint_citations_held
                     .as_ref()
                     .is_none_or(|(held, _)| *held != id)
                 {
-                    let (batch_id, batches) = &recovery.checkpoint_write_batches;
-                    let at = if *batch_id == id { *batches } else { 0 };
-                    recovery.checkpoint_citations_held = Some((id, at));
+                    let at = ToolRegistry::checkpoint_batches(s, &id);
+                    s.progress_recovery.checkpoint_citations_held = Some((id, at));
                     bail!(
                         "checkpoint_citations_missing: the saved document cites no project source as path:start-end. The reads in this context still show their line numbers; after checkpoint_complete they leave context and would have to be read again. On the next request, save citations next to the claims these reads support with document_edit_batch, then call checkpoint_complete in the same batch. It is accepted then even if nothing could be cited"
                     );
@@ -7572,11 +7582,15 @@ fn failure_holds_checkpoint(s: &mut Session, name: &str) -> bool {
     // An edit refused because writes are closed changed nothing either and
     // must not keep the checkpoint open.
     if !ToolRegistry::checkpoint_writes_open(s)
-        || s.progress_recovery.checkpoint_edit_held.as_deref() == Some(cp.id.as_str())
+        || s.progress_recovery
+            .checkpoint_edit_held
+            .as_ref()
+            .is_some_and(|(held, _)| *held == cp.id)
     {
         return false;
     }
-    s.progress_recovery.checkpoint_edit_held = Some(cp.id.clone());
+    let at = ToolRegistry::checkpoint_batches(s, &cp.id);
+    s.progress_recovery.checkpoint_edit_held = Some((cp.id.clone(), at));
     true
 }
 

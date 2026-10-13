@@ -2911,6 +2911,21 @@ async fn a_checkpoint_is_refused_once_while_the_document_cites_nothing() {
             1,
             "{tool_results:#?}"
         );
+        // Its recovery names the edit tools the next batch offers.
+        let refusal: Value = serde_json::from_str(
+            tool_results
+                .iter()
+                .find(|r| r.contains("checkpoint_citations_missing"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            refusal["recovery"]["tools"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("document_edit_batch")),
+            "{refusal}"
+        );
         // The batch after the refusal may still save the citations.
         assert!(
             tools_offered[1].contains(&"document_edit_batch".to_owned()),
@@ -2922,6 +2937,64 @@ async fn a_checkpoint_is_refused_once_while_the_document_cites_nothing() {
             if cite { cited } else { uncited }
         );
     }
+}
+
+// Live run 2026-10-13 (space_query): the citation fix sent on the reopened
+// batch failed on its old_text; its edit hold held the checkpoint with
+// writes closed, so the corrected fix was refused as checkpoint_pending.
+#[tokio::test]
+async fn a_citation_fix_that_fails_after_the_refusal_can_be_corrected() {
+    let uncited =
+        "# Flow\nA for loop runs work five times.\n\n# History\nHistory is normalized first.\n";
+    let cited = "# Flow\nA for loop runs work five times. main.js:3-5\n\n# History\nHistory is normalized first.\n";
+    let (_dir, s, id) = checkpoint_fixture();
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    let ack = |n: &str| {
+        (
+            format!("ack-{n}"),
+            "checkpoint_complete",
+            json!({"id":id,"progress":"Saved the flow and history sections."}),
+        )
+    };
+    let cite = |n: &str, old: &str| {
+        (
+            format!("cite-{n}"),
+            "document_edit_batch",
+            json!({"expected_hash":tools::hash(uncited.as_bytes()),"edits":[{"action":"replace_text","old_text":old,"text":"five times. main.js:3-5"}]}),
+        )
+    };
+    let as_calls = |batch: Vec<(String, &'static str, Value)>| {
+        calls(
+            batch
+                .iter()
+                .map(|(call_id, name, args)| (call_id.as_str(), *name, args.clone()))
+                .collect(),
+        )
+    };
+    let steps = vec![
+        as_calls(vec![(
+            "drop-citations".to_owned(),
+            "document_edit_batch",
+            json!({"expected_hash":hash,"edits":[
+                {"action":"replace_text","old_text":"five times. main.js:3-5","text":"five times."},
+                {"action":"replace_text","old_text":"first. main.js:2-2","text":"first."}]}),
+        )]),
+        as_calls(vec![ack("1")]),
+        as_calls(vec![cite("1", "five times retyped.")]),
+        as_calls(vec![cite("2", "five times."), ack("2")]),
+    ];
+    let (result, _, tools_offered) = run_scripted_tools(s, steps).await;
+    for batch in 2..4 {
+        assert!(
+            tools_offered[batch].contains(&"document_edit_batch".to_owned()),
+            "{tools_offered:?}"
+        );
+    }
+    assert_eq!(result.checkpoints_completed, 1, "{:?}", result.last_error);
+    assert_eq!(
+        std::fs::read_to_string(&result.project.output).unwrap(),
+        cited
+    );
 }
 
 #[test]
