@@ -1448,6 +1448,87 @@ fn a_citation_past_the_end_of_its_file_names_the_file_length() {
     );
 }
 
+// Live run 2026-10-13: {old_text, new_text, path} without an action was
+// refused 20 times for the missing action, and the diagram fix it carried
+// was never saved.
+#[test]
+fn old_text_with_text_and_no_action_is_a_replace_text() {
+    let (dir, mut s) = source_setup();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n\nFirst text.\n\nLast text.\n"}),
+    );
+    let output = s.project.output.display().to_string();
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"path":output,"old_text":"First text.","new_text":"Second text."}),
+    );
+    assert_eq!(
+        saved["adjusted_arguments"],
+        json!(["action was missing; old_text with text is action=replace_text, which was used"]),
+        "{saved}"
+    );
+    let saved = run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":saved["hash"],"edits":[
+            {"action":"replace_text","old_text":"Second text.","text":"Third text."},
+            {"action":"","old_text":"Last text.","text":"End text."}
+        ]}),
+    );
+    assert_eq!(
+        saved["adjusted_arguments"],
+        json!([
+            "edits[1].action was missing; old_text with text is action=replace_text, which was used"
+        ]),
+        "{saved}"
+    );
+    let doc = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+    assert_eq!(doc, "# Guide\n\nThird text.\n\nEnd text.\n");
+    // old_text alone could be a deletion: the action is still asked for.
+    let error = tools::execute(&mut s, "document_edit", json!({"old_text":"End text."}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("action is required for document_edit"),
+        "{error}"
+    );
+}
+
+// Live run 2026-10-13: offset 106 (a line number) was refused four times for
+// a missing hash before the fifth call heard that offset counts headings.
+#[test]
+fn an_inspect_offset_past_the_outline_is_explained_before_a_hash_is_asked_for() {
+    let (_dir, mut s) = source_setup();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n\n## One\n\nText.\n\n## Two\n\nText.\n"}),
+    );
+    // No document_inspect has run, so no hash is remembered.
+    let error = tools::execute(&mut s, "document_inspect", json!({"offset":106,"limit":30}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.starts_with(
+            "invalid_offset: offset 106 is an outline heading index, but this document has 3 headings; it is not a document line number"
+        ),
+        "{error}"
+    );
+    let error = tools::execute(&mut s, "document_inspect", json!({"offset":1,"limit":30}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("document_hash_required"), "{error}");
+    assert!(
+        error.ends_with(
+            "offset counts outline headings (characters within section when section is given), not document lines: read a line range with file_read start_line"
+        ),
+        "{error}"
+    );
+}
+
 #[test]
 fn an_edit_given_the_output_path_edits_the_output() {
     // Live run 2026-10-13: document_edit with path set to the configured

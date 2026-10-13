@@ -5465,6 +5465,7 @@ fn execute_repaired(
     adjusted.extend(clamp_size_arguments(name, &mut args));
     unwrap_continuation_cursor(name, &mut args);
     normalize_argument_aliases(s, name, &mut args)?;
+    adjusted.extend(infer_replace_text_action(name, &mut args));
     normalize_lone_carriage_returns(name, &mut args);
     drop_empty_unaccepted_fields(name, &mut args);
     expand_fix_word(s, name, &mut args)?;
@@ -6455,6 +6456,47 @@ fn complete_unclosed_json_arguments(name: &str, args: &mut Value) -> Vec<String>
         }
     }
     completed
+}
+
+/// A document edit that sends old_text and text without an action can only
+/// be replace_text: every other action that takes old_text takes no text. A
+/// live model sent {old_text, new_text, path} 20 times and was refused each
+/// time for the missing action, so its diagram fix was never saved. A blank
+/// or null action counts as missing; any other action is left to validation.
+fn infer_replace_text_action(name: &str, args: &mut Value) -> Vec<String> {
+    let infer = |object: &mut serde_json::Map<String, Value>, at: &str| {
+        let missing = object
+            .get("action")
+            .is_none_or(|action| action.is_null() || action == "");
+        (missing
+            && object.get("old_text").is_some_and(Value::is_string)
+            && object.get("text").is_some_and(Value::is_string))
+        .then(|| {
+            object.insert("action".into(), json!("replace_text"));
+            format!(
+                "{at}action was missing; old_text with text is action=replace_text, which was used"
+            )
+        })
+    };
+    match name {
+        "document_edit" => args
+            .as_object_mut()
+            .and_then(|object| infer(object, ""))
+            .into_iter()
+            .collect(),
+        "document_edit_batch" => args
+            .get_mut("edits")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(index, edit)| {
+                edit.as_object_mut()
+                    .and_then(|object| infer(object, &format!("edits[{index}].")))
+            })
+            .collect(),
+        _ => vec![],
+    }
 }
 
 fn clamp_size_arguments(name: &str, args: &mut Value) -> Vec<String> {

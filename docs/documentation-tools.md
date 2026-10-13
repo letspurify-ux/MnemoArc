@@ -574,3 +574,8 @@ apodex(apodex/apodex-1.1-mini:free)로 같은 요청을 실행했을 때(192라�
 - 자기 편집이 성공한 뒤 그 전 hash로 세 번 충돌했다. 문서의 현재 내용이 이 작업의 마지막 저장이면 충돌 오류가 현재 hash와 편집 점검 결과를 함께 준다. 다른 곳에서 바뀐 문서는 지금처럼 다시 읽게 한다(`documentation::a_hash_from_before_this_tasks_own_last_save_is_answered_with_the_current_hash`).
 - file_read의 줄 번호 라벨(`354|`)을 붙인 old_text가 두 번 거절됐다. 첫 줄이 라벨로 시작하면 라벨은 문서 글이 아니라고 알리고, 라벨을 뺀 old_text가 문서에 몇 번 나오는지 말한다(`documentation::old_text_with_file_read_line_labels_is_named_as_such`).
 - 8줄 파일을 64-107로 인용한 citation_range가 3건 남았다. 이슈의 error가 파일 줄 수를 말하고, 0번 줄·거꾸로 된 범위·빈 파일도 이유를 적는다(`documentation::a_citation_past_the_end_of_its_file_names_the_file_length`).
+
+세 번째 재실행(170507)도 `complete_with_gaps`로 끝났다. 남은 문제는 진짜 mermaid 문법 오류 한 건이었다(`A(["…"]:::flow)`처럼 노드 괄호 안에 클래스를 붙였다). 이를 고치려던 편집은 저장되지 못했다.
+
+- 모델이 `{old_text, new_text, path}`만 보내고 action을 빠뜨려 20번 거절됐다. 다른 action 가운데 old_text와 text를 함께 받는 것은 없으므로, action이 없거나 비어 있고 old_text와 text가 문자열이면 replace_text로 보고 `adjusted_arguments`로 알린다. 일괄 편집의 각 항목도 같다. old_text만 있으면 지금처럼 action을 묻는다(`documentation::old_text_with_text_and_no_action_is_a_replace_text`).
+- document_inspect의 offset 106(줄 번호)이 hash가 없다는 이유로 네 번 거절되고, 다섯 번째에야 offset이 제목 순번이라는 안내를 받았다. section 없이 보낸 offset이 제목 수보다 크면 hash보다 그 안내를 먼저 하고, hash를 요구하는 오류에도 offset이 줄 번호가 아니며 줄 범위는 file_read start_line으로 읽으라고 덧붙였다(`documentation::an_inspect_offset_past_the_outline_is_explained_before_a_hash_is_asked_for`).

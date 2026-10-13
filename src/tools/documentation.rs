@@ -640,8 +640,18 @@ pub(super) fn execute(
                 .map(|(_, hash)| hash.as_str());
             let expected_hash = args["expected_hash"].as_str().or(remembered);
             if (document_offset > 0 || coverage_offset > 0) && expected_hash.is_none() {
+                // An offset past the outline is a line number taken for a
+                // heading index: a live model sent offset 106 five times,
+                // asked four times for a hash before hearing what offset
+                // means. Say that first.
+                if args["section"].as_str().is_none() {
+                    let count = headings(&doc).len();
+                    if document_offset > count {
+                        return Err(outline_offset_error(document_offset, count));
+                    }
+                }
                 bail!(
-                    "document_hash_required: offset or coverage_offset > 0 requires expected_hash from the first document_inspect result; copy its hash or the returned next_cursor arguments. If that result is unavailable, call document_inspect with offset 0 and coverage_offset 0 first"
+                    "document_hash_required: offset or coverage_offset > 0 requires expected_hash from the first document_inspect result; copy its hash or the returned next_cursor arguments. If that result is unavailable, call document_inspect with offset 0 and coverage_offset 0 first. offset counts outline headings (characters within section when section is given), not document lines: read a line range with file_read start_line"
                 );
             }
             // Offset 0 starts a fresh read that returns the current hash, so a
@@ -701,10 +711,7 @@ pub(super) fn execute(
                 let paths = heading_paths(&headings);
                 let offset = n(args, "offset", 0);
                 if offset > headings.len() {
-                    bail!(
-                        "invalid_offset: offset {offset} is an outline heading index, but this document has {} headings; it is not a document line number. Use file_read with start_line to read a line range, or copy next_offset from the previous document_inspect outline page",
-                        headings.len()
-                    );
+                    return Err(outline_offset_error(offset, headings.len()));
                 }
                 let limit = n(args, "limit", 50).clamp(1, 100);
                 let (coverage, read_lines) = super::coverage::report(
@@ -851,6 +858,14 @@ pub(super) fn execute(
         }
         _ => bail!("unsupported_tool"),
     }
+}
+
+/// An outline offset past the document's headings, which models send as a
+/// line number.
+fn outline_offset_error(offset: usize, headings: usize) -> anyhow::Error {
+    anyhow::anyhow!(
+        "invalid_offset: offset {offset} is an outline heading index, but this document has {headings} headings; it is not a document line number. Use file_read with start_line to read a line range, or copy next_offset from the previous document_inspect outline page"
+    )
 }
 
 /// document_audit's issues for the output text: citation issues, format
