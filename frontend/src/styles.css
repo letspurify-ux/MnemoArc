@@ -951,8 +951,12 @@ button:hover {
   color: var(--muted);
   overflow-wrap: anywhere;
 }
+.thinking-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .activity-steps .failed {
-  color: #a4785b;
+  color: #8a5a3a;
 }
 .pulse {
   width: 6px;

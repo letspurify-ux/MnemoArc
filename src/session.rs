@@ -694,6 +694,10 @@ impl Session {
     /// Adds a finished tool call to the recent steps the activity shows,
     /// keeping the last RECENT_STEPS. The UI shows them; the model does not.
     pub fn record_step(&mut self, text: String, status: &str) {
+        // A malformed call with no name has nothing to show.
+        if text.is_empty() {
+            return;
+        }
         // Indexing a non-object Value to assign panics.
         if !self.activity.is_object() {
             self.activity = json!({});

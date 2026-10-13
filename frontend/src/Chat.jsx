@@ -203,12 +203,16 @@ export default function Chat({
           )}
           {streamText && <StreamingMessage text={streamText} />}
           {session?.status === "running" && (
-            <div className="thinking" role="status">
+            <div className="thinking">
               <span className="pulse" />
-              {progress} · {elapsed}초
-              {session?.activity?.round
-                ? ` · ${session.activity.round}번째 모델 호출`
-                : ""}
+              {/* Only the progress is announced: the elapsed seconds change
+                  every second and would repeat the whole line. */}
+              <span className="thinking-text">
+                <span role="status">{progress}</span> · {elapsed}초
+                {session?.activity?.round
+                  ? ` · ${session.activity.round}번째 모델 호출`
+                  : ""}
+              </span>
             </div>
           )}
           {session?.status === "running" &&

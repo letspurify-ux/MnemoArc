@@ -3351,3 +3351,45 @@ async fn a_run_reports_what_each_tool_call_did() {
         "{recent:?}"
     );
 }
+
+// A run that a tool call ends is recorded as ending in the tool stage, not
+// in the "preparing" stage a finished batch reports otherwise.
+#[tokio::test]
+async fn a_run_ended_by_a_tool_failure_records_the_tool_stage() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128_000),
+            // The same failing call ends the run at the stall limit.
+            stall_round_limit: 2,
+            ..support::compact_config()
+        },
+    );
+    s.add_user("Read missing.js.".into());
+    s.select_workflow("answer").unwrap();
+    let missing = json!({"path":"missing.js"});
+    let (result, _) = run_scripted(
+        s,
+        vec![calls(vec![
+            ("a", "file_read", missing.clone()),
+            ("b", "file_read", missing),
+        ])],
+    )
+    .await;
+    let run = result.run_history.back().unwrap();
+    assert!(
+        result
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("tool_recovery_limit")),
+        "{:?}",
+        result.last_error
+    );
+    assert_eq!(run.last_stage, "tools");
+}

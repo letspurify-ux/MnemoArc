@@ -89,6 +89,49 @@ pub fn call_summary(root: &Path, name: &str, arguments: &str) -> String {
             |section| heading_text(section).to_owned(),
         ),
         "task_plan" => plan(&args),
+        "file_write" | "file_edit" => path("path"),
+        "file_patch" => {
+            let parts: Vec<String> = args["operations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|operation| {
+                    let verb = match operation["action"].as_str().unwrap_or("") {
+                        "add" => "추가",
+                        "update" => "수정",
+                        "replace" => "교체",
+                        "move" => "이동",
+                        "delete" => "삭제",
+                        other => other,
+                    };
+                    let from = relative(root, operation["path"].as_str().unwrap_or(""));
+                    match operation["to_path"].as_str() {
+                        Some(to) if !from.is_empty() => {
+                            join([verb.to_owned(), format!("{from} → {}", relative(root, to))])
+                        }
+                        Some(to) => join([verb.to_owned(), relative(root, to)]),
+                        None => join([verb.to_owned(), from]),
+                    }
+                })
+                .collect();
+            if parts.is_empty() {
+                String::new()
+            } else {
+                format!("{}건: {}", parts.len(), parts.join("; "))
+            }
+        }
+        "db_query" => match args["action"].as_str() {
+            Some("list") => "목록 보기".to_owned(),
+            _ => args["id"].as_str().unwrap_or("").to_owned(),
+        },
+        "db_execute" => join([
+            args["mode"].as_str().unwrap_or("").to_owned(),
+            args["name"]
+                .as_str()
+                .or(args["sql"].as_str())
+                .unwrap_or("")
+                .to_owned(),
+        ]),
         "memory_write" => args["title"]
             .as_str()
             .or(args["key"].as_str())
@@ -109,7 +152,14 @@ fn label(name: &str) -> &str {
     match name {
         "document_inspect" => "문서 구조 조회",
         "document_audit" => "문서 근거 점검",
-        "document_edit" | "document_edit_batch" => "문서 편집",
+        // Each tool keeps its own name: the settings list its toggles by it.
+        "document_edit" => "문서 편집",
+        "document_edit_batch" => "문서 일괄 편집",
+        "file_write" => "파일 쓰기",
+        "file_edit" => "파일 수정",
+        "file_patch" => "파일 패치",
+        "db_query" => "DB 조회",
+        "db_execute" => "DB 실행",
         "symbol_search" => "심볼 검색",
         "symbol_relations" => "호출·참조 추적",
         "code_outline" => "코드 구조 조회",
@@ -381,7 +431,7 @@ mod tests {
         ]);
         assert_eq!(
             summary("document_edit_batch", json!({"edits":edits.to_string()})),
-            "문서 편집 2건: 문구 수정: SQL 에디터; 깨진 낱말 수정"
+            "문서 일괄 편집 2건: 문구 수정: SQL 에디터; 깨진 낱말 수정"
         );
     }
 
@@ -404,7 +454,7 @@ mod tests {
         // Unreadable batches and cursor-only reads still show their tool.
         assert_eq!(
             summary("document_edit_batch", json!({"edits":"[{broken"})),
-            "문서 편집"
+            "문서 일괄 편집"
         );
         assert_eq!(
             summary("file_read", json!({"cursor":"abc:2"})),
@@ -502,6 +552,58 @@ mod tests {
             ),
             "파일 읽기 src/main.rs"
         );
+    }
+
+    #[test]
+    fn project_file_writes_and_database_calls_name_their_targets() {
+        assert_eq!(
+            summary(
+                "file_edit",
+                json!({"path":"/work/app/src/a.rs","old_text":"x","new_text":"y"})
+            ),
+            "파일 수정 src/a.rs"
+        );
+        assert_eq!(
+            summary(
+                "file_patch",
+                json!({"operations":[
+                    {"action":"update","path":"src/a.rs"},
+                    {"action":"move","path":"/work/app/src/b.rs","to_path":"/work/app/src/c.rs"}]})
+            ),
+            "파일 패치 2건: 수정 src/a.rs; 이동 src/b.rs → src/c.rs"
+        );
+        assert_eq!(
+            summary("db_query", json!({"action":"run","id":"orders_by_day"})),
+            "DB 조회 orders_by_day"
+        );
+        assert_eq!(
+            summary(
+                "db_execute",
+                json!({"mode":"query","sql":"SELECT 1 FROM dual"})
+            ),
+            "DB 실행 query SELECT 1 FROM dual"
+        );
+    }
+
+    // The two tables drifted once: a label added only to the frontend
+    // named two settings toggles alike.
+    #[test]
+    fn labels_match_the_frontend_tool_names() {
+        let api = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("frontend/src/api.js"),
+        )
+        .unwrap();
+        let table = &api[api.find("export const toolLabels").unwrap()..];
+        let table = &table[..table.find("};").unwrap()];
+        let entry = regex::Regex::new(r#"(?m)^\s+(\w+): "([^"]+)","#).unwrap();
+        let frontend: Vec<(&str, &str)> = entry
+            .captures_iter(table)
+            .map(|c| (c.get(1).unwrap().as_str(), c.get(2).unwrap().as_str()))
+            .collect();
+        assert!(frontend.len() > 20, "{frontend:?}");
+        for (name, frontend_label) in frontend {
+            assert_eq!(label(name), frontend_label, "{name}");
+        }
     }
 
     #[test]
