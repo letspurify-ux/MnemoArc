@@ -183,6 +183,47 @@ fn output_exists(s: &Session) -> bool {
     tools::output_path(&s.project).is_ok_and(|path| path.is_file())
 }
 
+/// The task phase a model declared, as it steers this request. A source
+/// document has no answer stage: a model that declared one (8 of 120 live
+/// document runs) got the chat instruction "Answer the user now ... do not
+/// save memory before answering a simple explanation" on every later
+/// request, so it is read as verification, the stage before the final
+/// answer.
+fn declared_phase(phase: &str, document_work: bool) -> &str {
+    if document_work && phase == "answer" {
+        "verify"
+    } else {
+        phase
+    }
+}
+
+/// run_guidance.instruction for a phase when no recovery or readiness
+/// instruction replaces it. budget_phase tells a draft the budget reached
+/// from one kept from earlier in the task: the task phase persists across
+/// runs, so a resumed run starts in draft without spending half its budget.
+fn phase_instruction(phase: &str, budget_phase: &str, answer_workflow: bool) -> &'static str {
+    match phase {
+        "answer" => {
+            "Answer the user now from gathered evidence; read further only for a concrete missing fact the question requires."
+        }
+        "verify" => {
+            "Verify: read the evidence still missing and repair known issues in their original sections; qualify a fact that stays unverified where its claim appears."
+        }
+        "draft" if budget_phase == "draft" => {
+            "Half of the run budget is spent: write the sections whose evidence is in context before reading more, and read only what the unwritten sections still need."
+        }
+        "draft" => {
+            "Draft phase: write the sections whose evidence is in context, then read what the next section needs."
+        }
+        _ if answer_workflow => {
+            "Investigate: locate and read what the question needs, then answer once the evidence is sufficient."
+        }
+        _ => {
+            "Investigate: read what the next planned section needs. You judge from the request and the evidence when the document is complete."
+        }
+    }
+}
+
 fn closing_instruction(s: &Session) -> String {
     let closing = s.progress_recovery.closing.as_ref();
     let remaining = CLOSING_ROUND_LIMIT.saturating_sub(closing.map_or(0, |c| c.rounds));
@@ -193,11 +234,11 @@ fn closing_instruction(s: &Session) -> String {
     }
     if !s.document_written {
         return format!(
-            "Closing mode: no document is saved yet and source reading is withheld. Create the requested document NOW with document_edit action=create (or document_edit_batch) from the evidence already gathered. Write every requested section; where a fact was not confirmed from delivered sources, say so in the text instead of guessing. Then give a concise final answer. At most {remaining} requests remain; without a saved document the run stops unfinished."
+            "Closing mode: no document is saved yet and source reading is withheld. Create the requested document NOW with document_edit action=create (or document_edit_batch) from the evidence already gathered. Write every requested section, then give a concise final answer. At most {remaining} requests remain; without a saved document the run stops unfinished."
         );
     }
     format!(
-        "Closing mode: finish the requested document now from the evidence already gathered; discovery tools are withheld. 1) Write any missing requested section from gathered evidence, stating in the text when a fact is unconfirmed. 2) For a cited range reported as unread (citation_check or document_readiness unread_citation), file_read that range or narrow the citation to the lines already read; qualify a claim that cannot be supported in its section instead of describing it as verified. For a citation whose path or range is invalid (citation_path or citation_range), send the fix of every such issue from document_audit together in one document_edit_batch; where an issue has no fix, correct that citation to an existing project path:start-end or remove it. If the document cites no project source at all, cite the sources of its claims as path:start-end from ranges already read. 3) Complete or remove remaining to-dos with actual results, then give a concise final answer. At most {remaining} requests remain; afterwards the runtime finishes the document and lists every unresolved item. Do not invent evidence."
+        "Closing mode: finish the requested document now from the evidence already gathered; discovery tools are withheld. 1) Write any missing requested section. 2) Resolve the document_readiness issues: an unread cited range is read or the citation narrowed, the fixes of all citation_path and citation_range issues go together in one document_edit_batch, and a citation with no fix is corrected to an existing project path:start-end or removed; if the document cites no project source at all, cite the sources of its claims from ranges already read. 3) Complete the to-dos whose work is done with actual results and remove only obsolete ones; leave unfinished ones open for the runtime to report, then give a concise final answer. At most {remaining} requests remain; afterwards the runtime finishes the document and lists every unresolved item."
     )
 }
 
@@ -228,7 +269,7 @@ fn plan_structure_check(task: &crate::session::TaskState) -> String {
         items.push(format!("and {} more", pending.len() - PLAN_STRUCTURE_ITEMS));
     }
     format!(
-        "Before reading further, compare task_plan with latest_request. The items should follow the structure the request asks for, in order: when it asks how something proceeds (a flow or procedure), one item per step of that flow in the order it happens; otherwise one per area it names; each naming its step or area first, then its source files. If the items instead follow modules or files, or plan separate reading such as understanding a module, restructure the plan now in one task_plan apply (update, split, remove, insert or move), then continue with the first item. Items: {}",
+        "Before reading further, compare task_plan with latest_request: as the Plan section says, the items follow the structure the request asks for (for a flow or procedure, its steps in the order they happen), not modules or files, and reading belongs to the section it serves. If they do not, restructure the plan now in one task_plan apply, then continue with the first item. Items: {}",
         items.join("; ")
     )
 }
@@ -270,7 +311,7 @@ fn plan_check(s: &mut Session) -> Option<String> {
         if rounds < PLAN_CHECK_START {
             return None;
         }
-        (format!("empty:{}", s.task.plan_revision), "task_plan is empty. Add one short item per section the request needs, in the order the document presents them (for a flow or procedure, one per step in the order it happens; otherwise one per requested area), each one text naming its step or area first and then its main source files, plus final verification, using task_plan action=apply with expected_revision 0; then work through them.".to_owned())
+        (format!("empty:{}", s.task.plan_revision), "task_plan is empty: create it now with task_plan action=apply and expected_revision 0, one item per section of the request (for a flow or procedure, one per step in the order it happens), then work through it.".to_owned())
     } else if !s
         .progress_recovery
         .plan_checks_shown
@@ -378,14 +419,14 @@ fn collect_gaps(s: &mut Session) -> Vec<String> {
 // A document that passes its audit can still lack requested sections; a live
 // run read an older wording as permission to remove the to-dos for unwritten
 // sections.
-const PLAN_CLOSEOUT_INSTRUCTION: &str = "The document is written and passes its audit, but the to-dos in plan_closeout are open and the final answer is refused while any is open. A to-do whose work is not done yet, such as a requested section still missing from the document, is NOT obsolete. Do that work first: read the evidence and write the section. When the listed work is done, close them in ONE task_plan apply using plan_closeout.expected_revision: one operation per item in the listed order, complete with the actual observed result, or remove with a reason only when the item is genuinely obsolete, never merely unstarted. complete must follow list order, because only the current item can complete. Give the final answer only when the requested document is complete.";
+const PLAN_CLOSEOUT_INSTRUCTION: &str = "The document is written and passes its audit, but the to-dos in plan_closeout are open. A to-do whose work is not done yet, such as a requested section still missing from the document, is NOT obsolete: do that work first. When the listed work is done, close them in ONE task_plan apply using plan_closeout.expected_revision, one operation per item in the listed order: complete with the actual observed result, or remove with a reason only when the item is genuinely obsolete, never merely unstarted. Give the final answer only when the requested document is complete.";
 
 /// The final answer of a source document that cites no project source.
 const DOCUMENT_CITATIONS_MISSING: &str = "document_citations_missing: the saved document cites no project source as path:start-end (for example backend/src/server.js:12-30), so it cannot be checked against the source and the final answer is refused. Cite the sources next to the claims they support, from ranges you have read (file_read a range first if needed), then give the final answer.";
 
 /// Closing mode only: the runtime is ending the run and nothing is left to
 /// repair. Outside closing the model judges when the document is complete.
-const READY_FOR_FINAL_INSTRUCTION: &str = "Ready to finish, provided every requested section is written: the document is saved, its audit passes and no to-do remains. If a requested section is still missing, write it first. Give the concise final answer now (output path, verification scope, remaining limitations). Do not inspect or audit again unless you change the document.";
+const READY_FOR_FINAL_INSTRUCTION: &str = "Ready to finish: the document is saved, its audit passes and no to-do remains. If a requested section is still missing, write it first; otherwise give the concise final answer now. Do not inspect or audit again unless you change the document.";
 
 /// Document work whose own bookkeeping is finished: the next useful step is
 /// the final answer.
@@ -517,7 +558,7 @@ fn coverage_check(s: &mut Session) -> Option<String> {
         })
         .unwrap_or_default();
     Some(format!(
-        "request_coverage_check: before finishing, compare the saved document with latest_request. Its headings are: {}{more}. Check that a section explains each part the request asks for; for a flow or procedure, every step from its start to its end. If a part has no section, add a task_plan item for it and write that section from source you have read (read more first if needed). If every part is covered, give the final answer again. Do not add a section that only lists coverage or checks.{mismatches}{uncited}",
+        "request_coverage_check: before finishing, compare the saved document with latest_request. Its headings are: {}{more}. Check that a section explains each part the request asks for; for a flow or procedure, every step from its start to its end. If a part has no section, add a task_plan item for it and write that section from source you have read (read more first if needed). If every part is covered, give the final answer again.{mismatches}{uncited}",
         headings.join(" | ")
     ))
 }
@@ -1557,8 +1598,9 @@ pub async fn run_session_controlled(
             _ => 0,
         };
         let mut phase = budget_phase.to_string();
-        if rank(&s.task.phase) > rank(&phase) {
-            phase = s.task.phase.clone();
+        let declared = declared_phase(&s.task.phase, s.is_document_work());
+        if rank(declared) > rank(&phase) {
+            phase = declared.to_owned();
         }
         // Chat explanations get a bounded investigation hint, not a forced finish:
         // missing evidence may still be read, while document workflows retain verification.
@@ -1727,9 +1769,8 @@ pub async fn run_session_controlled(
         } else {
             DOCUMENT_FOCUSED_INSTRUCTION
         };
-        const DOCUMENT_FOCUSED_INSTRUCTION: &str = "Focused recovery: choose the current to-do and perform one concrete action that changes the requested result or verifies specific missing evidence. Read recovery_reason and the last tool's recovery contract; correct the cause or choose a different action before retrying. A task_plan applied=false or unchanged=true result did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, repeat an unchanged plan, or save another summary. After a real edit, advance its to-do or read any cited range it left unread. If the original result already exists, take its remaining problems from run_guidance.document_readiness and complete only the actual remaining work. Document retry counts are recovery signals, not permission to stop or weaken requirements: continue to final verification within the remaining tokens and time.";
-        const ANSWER_INVESTIGATE_INSTRUCTION: &str = "For a SOURCE CODE question, the first batch should locate the requested symbols/routes with source_search or code_outline scoped to the named files. Batch independent searches or reads together instead of paying a model round per file. Do not begin with file_read of each file from line 1; that often misses the target and requires another read. After locating the branch, file_read only its relevant range with explicit start_line and max_lines, or use symbol_read. For an existing-document summary, read the relevant document sections directly. For a requested document edit, inspect the target section and make a targeted edit. Answer once evidence is sufficient.";
-        const ANSWER_FOCUSED_INSTRUCTION: &str = "Focused recovery: choose the current to-do, or the question itself, and perform one concrete action that changes the requested result. Read recovery_reason and the last tool's recovery contract; correct the cause or choose a different action before retrying. A task_plan applied=false or unchanged=true result did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, repeat an unchanged plan, or save another summary. If the requested result already exists, complete only the actual remaining work, then answer.";
+        const DOCUMENT_FOCUSED_INSTRUCTION: &str = "Focused recovery: recovery_reason says what stalled. Choose the current to-do and perform one concrete action, different from the one that failed, that changes the requested result or verifies specific missing evidence; a task_plan result with applied=false or unchanged=true did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, repeat an unchanged plan or save another summary. After a real edit, advance its to-do or read any cited range it left unread; if the result already exists, take its remaining problems from run_guidance.document_readiness.";
+        const ANSWER_FOCUSED_INSTRUCTION: &str = "Focused recovery: recovery_reason says what stalled. Choose the current to-do, or the question itself, and perform one concrete action, different from the one that failed, that changes the requested result; a task_plan result with applied=false or unchanged=true did no work. Do not submit another final answer with unfinished work, cycle between earlier file versions, repeat an unchanged plan or save another summary. If the requested result already exists, complete only the actual remaining work, then answer.";
         s.run_guidance = json!({"task_rounds":s.task_rounds,"run_rounds":s.run_rounds(),"finalization_attempts":finalization_attempts,"phase":phase,"remaining_tokens":remaining,"remaining_seconds":seconds_remaining,"unread_citation_count":unread_count,
             "recovery_reason":s.progress_recovery.recovery_reason,"action_required":s.progress_recovery.action_required,
             "progress_recovery":{"active":progress_recovery,"focused":focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus,"rounds_without_substantive_progress":s.progress_recovery.rounds_without_substantive_progress,"repeated_outcome_rounds":s.progress_recovery.repeated_outcome_rounds,"artifact_edits_without_milestone":s.progress_recovery.artifact_edits_without_milestone,"repeated_read":repeated_read_detected},
@@ -1737,7 +1778,7 @@ pub async fn run_session_controlled(
             "max_tool_calls":32.min(if s.checkpoint.is_some() { ContextManager::cleanup_result_budget(&s.config) } else { s.config.batch_budget() } / 200),
             "plan_pending_count":s.task.todos.iter().filter(|item| !item.done).count(),
             "finalization_error":s.last_error.as_deref().filter(|error| finalization_attempts > 0 || error.starts_with("task_plan_pending:") || error.starts_with("task_unresolved_open:") || error.starts_with("request_coverage_check:")),
-            "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: the last requests produced no new evidence, document change or resolved citation. Change approach instead of repeating them: read sources the document still needs and has not read, write or correct a section, or file_read a cited range reported as unread. Do not repeat an unchanged read, plan rewrite or memory save. If a claim cannot be supported, mark that gap in the relevant section and continue with supported work; do not invent evidence." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { match phase.as_str() {"answer"=>"Answer the user now from gathered evidence. Read further only for a concrete missing fact required by the question. Do not save memory before answering a simple explanation. State any missing coverage instead of claiming exhaustive review.","verify"=>"For source documentation, batch reads for missing evidence, then repair known issues in their original locations with targeted section or text edits when safe. Corrections are edits, not document content: do not append a review, checks, improvements, or TODO section unless the user explicitly requested it. If a fact remains unverified, qualify it where the relevant claim appears; include a limitation only when needed for the requested document. Inspect the final outline for review-note headings before completion. Use document_edit_batch for related edits from one document snapshot; its operations are applied in order. Keep correcting the original requirements within the remaining run tokens and time.","draft"=>"Half of the run budget is spent: plan the remaining reading and writing so the requested document is complete and verified within remaining_tokens and remaining_seconds. Save sections in separate edits; place each from the outline in the last save result, use insert_before/insert_after for siblings and insert_first_child/insert_last_child for nested sections when that preserves the document flow, and copy section_path when headings repeat.",_=>if answer_workflow { ANSWER_INVESTIGATE_INSTRUCTION } else { "For source documentation, judge from the request and the evidence how much to read and when the document is complete. When a section's evidence is in context, write that section with its path:start-end citations right away, then read for the next one; save sections in separate edits rather than one full-file write; place each from the outline in the last save result (document_inspect only when none is in context), copy section_path when headings repeat, and use sibling or child insertion to place it within the hierarchy. Batch independent searches or reads together instead of paying a model round per file." }} }});
+            "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: the last requests produced no new evidence, document change or resolved citation. Change approach instead of repeating them: read sources the document still needs and has not read, write or correct a section, or file_read a cited range reported as unread. Do not repeat an unchanged read, plan rewrite or memory save." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { phase_instruction(&phase, budget_phase, answer_workflow) } });
         if s.checkpoint.is_none() && !s.progress_recovery.checkpoint_document_edits.is_empty() {
             let hash = tools::output_path(&s.project)
                 .and_then(|path| tools::read_text(&path))
@@ -1775,7 +1816,7 @@ pub async fn run_session_controlled(
             && s.run_guidance["document_readiness"]["structural_ok"] == false
         {
             s.run_guidance["instruction"] = json!(
-                "The document is not ready for final acceptance. Resolve document_readiness.issues using their next actions: file_read each unread_citation range (or narrow that citation to the lines already read), send the fix of each citation_path issue together in one document_edit_batch, or repair the reported format/citation problem at its line. Do not submit another final answer before those issues are resolved. For additional issues, use document_audit with offset=next_offset and expected_revision=revision from this audit."
+                "The saved document does not pass its audit yet: before another final answer, file_read each unread_citation range or narrow that citation, send the fixes of all citation_path issues together in one document_edit_batch, and repair any other listed problem at its line; document_audit with offset=next_offset and expected_revision from this audit pages more issues."
             );
         }
         if let Some(closing) = &s.progress_recovery.closing {
@@ -2121,7 +2162,7 @@ pub async fn run_session_controlled(
             // Change the next request: an identical one tends to produce the
             // same empty reply again. recovery_reason reaches run_guidance.
             let reason = format!(
-                "The model returned {empty_completions} empty response(s) in a row (no text and no tool call). Call one concrete document repair or verification tool, or give the final answer if the document is finished."
+                "The model returned {empty_completions} empty response(s) in a row (no text and no tool call). Call one concrete tool that advances the document, such as reading missing evidence or editing a section, or give the final answer if the document is finished."
             );
             if recover_document(&mut s, &reason) {
                 empty_reply_reason = Some(reason);
@@ -2966,7 +3007,7 @@ pub async fn run_session_controlled(
                 >= artifact_exhaust_limit(&s.config)
             && !recover_document(
                 &mut s,
-                "Different rewrites have not completed a milestone. Verify the current section and resolve its concrete findings instead of another general rewrite.",
+                "Different rewrites have not completed a milestone. Fix the specific problems of the current section, its document_readiness issues or missing evidence, instead of another general rewrite.",
             )
         {
             s.status = "partial".into();
@@ -3153,6 +3194,79 @@ pub fn apply_config(s: &mut Session, config: Config) -> Result<()> {
 mod plan_check_tests {
     use super::*;
     use crate::config::Project;
+
+    #[test]
+    fn phase_guidance_matches_the_workflow_and_where_the_phase_came_from() {
+        // A declared answer stage steers document work as verification; the
+        // chat answer instruction stays with the answer workflow.
+        assert_eq!(declared_phase("answer", true), "verify");
+        assert_eq!(declared_phase("answer", false), "answer");
+        assert_eq!(declared_phase("draft", true), "draft");
+        // A draft phase kept from an earlier run is not attributed to a
+        // declaration or to the budget of this run.
+        let kept = phase_instruction("draft", "investigate", false);
+        assert!(kept.starts_with("Draft phase"), "{kept}");
+        assert!(
+            !kept.contains("declared") && !kept.contains("budget"),
+            "{kept}"
+        );
+        let budget = phase_instruction("draft", "draft", false);
+        assert!(
+            budget.starts_with("Half of the run budget is spent"),
+            "{budget}"
+        );
+        for phase in ["investigate", "draft", "verify"] {
+            let text = phase_instruction(phase, "investigate", false);
+            assert!(!text.contains("Answer the user now"), "{phase}: {text}");
+        }
+        assert!(
+            phase_instruction("investigate", "investigate", false)
+                .contains("when the document is complete")
+        );
+        // A phase instruction says what this phase changes; the standing
+        // rules are in the system prompt, sent with the same request.
+        for (phase, budget, answer) in [
+            ("investigate", "investigate", false),
+            ("investigate", "investigate", true),
+            ("draft", "draft", false),
+            ("draft", "investigate", false),
+            ("verify", "verify", false),
+            ("answer", "investigate", true),
+        ] {
+            let prompt = if answer {
+                crate::context::ANSWER_SYSTEM.as_str()
+            } else {
+                crate::context::SYSTEM.as_str()
+            };
+            for sentence in phase_instruction(phase, budget, answer)
+                .split(". ")
+                .map(|sentence| sentence.trim_end_matches('.'))
+                .filter(|sentence| sentence.len() >= 40)
+            {
+                assert!(!prompt.contains(sentence), "{phase}: {sentence}");
+            }
+        }
+        // The final answer's contents are listed once, in the prompt.
+        assert!(!READY_FOR_FINAL_INSTRUCTION.contains("verification scope"));
+    }
+
+    #[test]
+    fn closing_keeps_unfinished_to_dos_open_for_the_gap_report() {
+        // The closing result lists open to-dos as unfinished; a removed to-do
+        // leaves that list, so closing must not ask to remove undone work.
+        let mut s = Session::new(Project::default(), Config::compact_test());
+        s.select_workflow("source_document").unwrap();
+        s.document_written = true;
+        s.progress_recovery.closing = Some(crate::session::Closing {
+            reason: "stall".into(),
+            ..Default::default()
+        });
+        let text = closing_instruction(&s);
+        assert!(text.contains("leave unfinished ones open"), "{text}");
+        assert!(!text.contains("Complete or remove remaining"), "{text}");
+        // The audit's issues reach the model as document_readiness.
+        assert!(!text.contains("from document_audit"), "{text}");
+    }
 
     #[test]
     fn a_stale_to_do_is_pointed_out_after_a_saved_section_and_once_per_state() {

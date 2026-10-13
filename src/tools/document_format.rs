@@ -61,7 +61,7 @@ impl FormatCheck {
         result["issues"] = json!(self.issues.iter().take(PREVIEW_LIMIT).collect::<Vec<_>>());
         result["issues_truncated"] = json!(self.issues.len() > PREVIEW_LIMIT);
         result["guidance"] = json!(
-            "Fix Markdown/Mermaid errors in the next edit, and each garbled word with document_edit action=fix_word and its fix_id; document_audit paginates all errors. Warnings identify unchecked syntax or UI extensions. Browser layout and compatibility with newer Mermaid versions require UI inspection."
+            "Fix Markdown/Mermaid errors in the next edit, and each garbled word with document_edit action=fix_word and its fix_id; document_audit paginates all errors. Warnings identify unchecked syntax or UI extensions. Browser layout and newer Mermaid versions are not checked."
         );
         result
     }

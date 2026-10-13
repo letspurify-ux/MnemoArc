@@ -449,6 +449,53 @@ fn large_metadata_is_only_shortened_in_the_model_preview() {
 }
 
 #[test]
+fn a_bucket_share_never_lets_a_lower_ranked_memory_take_a_higher_ones_room() {
+    // Each bucket first fills only its share of the index budget. A newest
+    // memory too large for the recency share used to be skipped while an
+    // older, smaller one took the share; when the unused relevance share was
+    // lent back, the newest no longer fit next to it and the index carried
+    // the older memory instead. Sizes are measured, because memory IDs are
+    // random UUIDs of varying token length.
+    let mut s = session();
+    let older = save(&mut s, "a", "b", "c", "d");
+    let long = "recency outranks size in the memory index ".repeat(40);
+    let newest = save(&mut s, &long, &long, &long, "d");
+    s.config.related_count = 0;
+    s.config.recent_count = 2;
+    s.config.index_tokens = 20_000;
+    let state = ContextManager::state(&s).unwrap();
+    let entries = state["recent_memories"].as_array().unwrap();
+    assert_eq!(entries[0]["id"], newest);
+    let measure = |recent: Vec<&Value>| {
+        context::count(
+            &json!({"recent_memories":recent,"related_memories":[],"referenced_memories":[]}),
+            "gpt-4o",
+        )
+    };
+    let empty = measure(vec![]);
+    let large = measure(vec![&entries[0]]);
+    let small = measure(vec![&entries[1]]);
+    let both = measure(vec![&entries[0], &entries[1]]);
+    // A budget the newest memory fits alone but not beside the older one,
+    // whose recency share still admits the older one.
+    let budget = both - 1;
+    let recency_share = empty + (budget - empty) - (budget - empty) * 7 / 10;
+    assert!(
+        large <= budget && small <= recency_share && large > recency_share,
+        "empty={empty} large={large} small={small} both={both}"
+    );
+    s.config.index_tokens = budget;
+    let state = ContextManager::state(&s).unwrap();
+    assert_eq!(ids(&state), vec![newest.clone()], "older={older}");
+    // With the buckets swapped, the same memory wins.
+    s.config.related_count = 2;
+    s.config.recent_count = 0;
+    s.latest_request = "d".into();
+    let state = ContextManager::state(&s).unwrap();
+    assert_eq!(ids(&state), vec![newest]);
+}
+
+#[test]
 fn unused_bucket_space_is_borrowed_and_zero_counts_disable_buckets() {
     let mut s = session();
     for n in 0..8 {

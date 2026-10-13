@@ -193,7 +193,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_write",
-                description: "Save one self-contained finding useful beyond the current step: an observed fact, decision with rationale, reusable procedure, failure lesson with its conditions, or question with lasting relevance. Pending reads, retry instructions, temporary blockers and completion updates belong in task_state or checkpoint_complete progress, not a memory. title/summary/body/kind are required plain JSON fields. Same key requires expected_revision. Missing/stale revisions return current ID/key/status/revision and a retry patch; merge it into the full intended call. Invalid input reports received/missing/unknown fields and a JSON example. Updates replace evidence: resupply observed source_ids; sources are not inherited. Never omit source_ids after unknown_source. A project path (or path:start-end) stands in for the evidence already delivered from it. For failure lessons, separate the observed tool/input conditions and actual result from a suspected cause. One failed call does not establish a universal limitation. Set inferred=true for unconfirmed explanations or generalizations, even with source_ids. Unsourced facts, inferred memories and changed evidence are needs_review. Keep stable fact keys separate from progress; never replace an observed fact with a progress summary. Metadata has no per-entry token rejection; keep it concise for index_tokens. Oversized entries remain available through memory_find/memory_read. Put details in body. kind: fact/decision/failure/question/procedure",
+                description: "Save one self-contained finding useful beyond the current step: an observed fact, decision with rationale, reusable procedure, failure lesson with its conditions, or question with lasting relevance. title/summary/body/kind are required plain JSON fields. Same key requires expected_revision; a new key omits it (not even 0). Updates replace evidence: resupply observed source_ids; sources are not inherited. Never omit source_ids after unknown_source. A project path (or path:start-end) stands in for the evidence already delivered from it. For failure lessons, separate the observed tool/input conditions and actual result from a suspected cause. One failed call does not establish a universal limitation. Set inferred=true for unconfirmed explanations or generalizations, even with source_ids. Unsourced facts, inferred memories and changed evidence are needs_review. Keep stable fact keys separate from progress; never replace an observed fact with a progress summary. Keep metadata concise and put details in body. kind: fact/decision/failure/question/procedure",
                 optional: false,
                 read_only: false,
                 parameters: memory_input_schema(),
@@ -207,7 +207,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_find",
-                description: "Search memories by ID/key, title, tags, summary, source path or body. Unicode/case and identifier word boundaries are normalized; full ID/key matches rank first, followed by term coverage, field relevance and memory status. Tags are exact AND filters. An empty query lists every status by recency. Needs-review/superseded results remain discoverable and are not verified facts. Use next cursor until exhausted; it is bound to memory generation and the exact query/tag filters and expires if either changes",
+                description: "Search memories by ID/key, title, tags, summary, source path or body. Unicode/case and identifier word boundaries are normalized; full ID/key matches rank first, followed by term coverage, field relevance and memory status. Tags are exact AND filters. An empty query lists every status by recency. Needs-review/superseded results remain discoverable. Use next cursor until exhausted; it is bound to memory generation and the exact query/tag filters and expires if either changes",
                 optional: false,
                 read_only: true,
                 parameters: schema(
@@ -217,7 +217,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "memory_manage",
-                description: "List cleanup candidates, delete unreferenced memories, or atomically replace IDs and redirect references. delete requires ids; replace requires ids and replacement; duplicate IDs are ignored. replacement follows the same reusable-knowledge and inference rules as memory_write; keep transient progress in task_state/checkpoint_complete. It uses memory_write fields and must use a new key or a key among the replaced IDs; when it reuses a replaced key, expected_revision and observed-source rules are checked before removal",
+                description: "List cleanup candidates, delete unreferenced memories, or atomically replace IDs and redirect references. delete requires ids; replace requires ids and replacement; duplicate IDs are ignored. replacement follows the same reusable-knowledge and inference rules as memory_write. It uses memory_write fields and must use a new key or a key among the replaced IDs; when it reuses a replaced key, expected_revision and observed-source rules are checked before removal",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -227,7 +227,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "task_state",
-                description: "Read/update goals, constraints and completion criteria. Manage ordered work through task_plan; current/next/done and todos are not patch fields. State fields belong inside patch, e.g. {action:update,patch:{phase:verify}}. A new user task starts with a request-based completion condition; refine it into concrete checks before substantial work. The user selects task.workflow (answer or source_document) and it cannot be patched; for source_document START with completion criteria matching the user request. Do not send empty patches or completion:[]. Updates preserve omitted fields. Evidence requirements and explicit user constraints remain in force even when a plan item is removed.",
+                description: "Read or update your task bookkeeping: phase, unresolved items, details and working notes (goals, constraints, completion, deliverables) go inside patch, e.g. {action:update,patch:{phase:verify}}. Manage ordered work through task_plan; current/next/done and todos are not patch fields. Do not send empty patches or completion:[]. Updates preserve omitted fields.",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -248,7 +248,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "source_lookup",
-                description: "Recover exact IDs from already observed sources, including stored memory evidence. Optional path is a path substring, id is an exact source ID. Returns paginated excerpts; does NOT read files or establish unseen facts. Available during checkpoints. If no matching evidence exists, preserve the claim as unresolved and investigate after checkpoint completion. Never substitute an unrelated ID.",
+                description: "Recover exact IDs from already observed sources, including stored memory evidence. Optional path is a path substring, id is an exact source ID. Returns paginated excerpts; does NOT read files or establish unseen facts. Available during checkpoints. If no matching evidence exists, record the pending read in checkpoint_complete progress and investigate after the checkpoint. Never substitute an unrelated ID.",
                 optional: false,
                 read_only: true,
                 parameters: schema(
@@ -258,7 +258,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "checkpoint_complete",
-                description: "Finish a checkpoint and preserve the ordered task_plan in ONE call. Required progress is a concise checkpoint summary including current blockers, pending reads and retry instructions; it does not complete or replace plan items. Saving memories is optional: write one only for a reusable finding that is not saved yet and later work needs; otherwise call this directly with progress (no_save_reason is optional). Evaluated after other calls in this batch. Continue the first unfinished plan item after cleanup.",
+                description: "Acknowledge the pending checkpoint in ONE call: id is the ID from the CHECKPOINT CONTROL REQUEST, and progress (required) a concise summary of current blockers, pending reads and retry instructions. It preserves the ordered task_plan and does not complete or replace plan items; it is evaluated after the other calls of its batch. no_save_reason is optional.",
                 optional: false,
                 read_only: false,
                 parameters: schema(
@@ -268,7 +268,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "file_list",
-                description: "List project files. Default mode=text validates UTF-8 text; mode=paths lists regular file paths without reading contents (may include binary/large files). path_glob is a file glob such as backend/**/*.js (pattern is a legacy alias); path lists everything below one directory instead. Paginated; respects project boundaries and exclusions",
+                description: "List project files. Default mode=text validates UTF-8 text; mode=paths lists regular file paths without reading contents (may include binary/large files). path_glob is a file glob such as backend/**/*.js (pattern is a legacy alias), and a basename is found with mode=paths and path_glob=**/name; path lists everything below one directory instead. Paginated; respects project boundaries and exclusions",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -298,7 +298,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "symbol_search",
-                description: "Search Tree-sitter declarations across Rust, JS/JSX, TS/TSX, Python, Java and C# files. query matches symbol names (case-insensitive substring by default); use match=exact for an exact name. path scopes one file/directory; path_glob filters files (pattern is a legacy alias); do not combine them. kind, container and max_depth follow code_outline. Returns path, hash, exact symbol_id and location; copy path/symbol_id into symbol_read or symbol_relations. Declarations/excerpts are navigation, not implementation evidence. Unsupported files and parse errors are reported. Follow next_cursor with unchanged filters; file changes expire cursors/IDs.",
+                description: "Search Tree-sitter declarations across Rust, JS/JSX, TS/TSX, Python, Java and C# files. query matches symbol names (case-insensitive substring by default); use match=exact for an exact name. path scopes one file/directory; path_glob filters files (pattern is a legacy alias); do not combine them. kind, container and max_depth follow code_outline. Returns path, hash, exact symbol_id and location; copy path/symbol_id into symbol_read or symbol_relations. Unsupported files and parse errors are reported. Follow next_cursor with unchanged filters; file changes expire cursors/IDs.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -308,7 +308,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "symbol_relations",
-                description: "Trace syntax calls/references without external language servers. Copy path and symbol_id from symbol_search/code_outline. relation=calls lists outgoing call sites in the symbol (nested functions have their own calls); callers finds incoming calls; references includes call and non-call uses. Optional path_glob limits scanned files; the target file is always included. resolved means a unique local syntax binding, NOT guaranteed runtime execution. Explicit imports/module paths and member access return candidate/ambiguous targets; unknown receivers or shadowed bindings remain unresolved. Never infer links from matching names alone. Results include source locations, hashes, candidate IDs, reasons and scan limitations, but no source evidence IDs. Read sites with file_read and bodies with symbol_read before describing behavior. Inbound results omit unresolved targets: an empty page is not proof of no callers. Follow next_cursor with all original arguments; source changes expire cursors/IDs.",
+                description: "Trace syntax calls/references without external language servers. Copy path and symbol_id from symbol_search/code_outline. relation=calls lists outgoing call sites in the symbol (nested functions have their own calls); callers finds incoming calls; references includes call and non-call uses. Optional path_glob limits scanned files; the target file is always included. resolved means a unique local syntax binding, NOT guaranteed runtime execution. Explicit imports/module paths and member access return candidate/ambiguous targets; unknown receivers or shadowed bindings remain unresolved. Never infer links from matching names alone. Results include source locations, hashes, candidate IDs, reasons and scan limitations, but no source evidence IDs. Inbound results omit unresolved targets: an empty page is not proof of no callers. Follow next_cursor with all original arguments; source changes expire cursors/IDs.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -318,7 +318,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "code_outline",
-                description: "Explore one Rust, JS/JSX, TS/TSX, Python, Java or C# file. For a function list use {path,view:\"compact\",max_depth:0,kind:\"function\"}; use kind:\"method\" with container and without max_depth:0 for class methods. Omit kind only for a mixed overview. Find a name with {path,query:\"handleQuestion\",match:\"exact\",kind:\"function\"}. query defaults to case-insensitive substring matching. kind filters normalized symbol_kind; container is an exact enclosing path: copy the parent class qualified_name, e.g. Store or Outer::Inner, never convert :: to Java or C# member dots. qualified_name is navigation, not a unique ID for overloaded methods. max_depth uses symbol nesting (0=top level, 1=direct members), not AST depth. Defaults: all kinds/depths, view=detailed. Compact returns names, kinds, containers, positions, a ready-to-copy location and symbol IDs, without source evidence. For parameters, defaults and declared return types use view=detailed with query and match=exact; an untruncated signature often answers without a body read. Detailed includes signature_source and signature_truncated; if truncated, read only the missing signature lines. When signature_context_start_line is present, shared declaration modifiers were omitted; use file_read there for the common prefix. A signature does not establish runtime behavior. Copy symbol_id into symbol_read for the body. Follow next_cursor preserving ALL filters and view; limit may change. Edits expire cursors/IDs. Positions are 1-based Unicode. Syntax structure does not resolve semantic references.",
+                description: "Explore one Rust, JS/JSX, TS/TSX, Python, Java or C# file. For a function list use {path,view:\"compact\",max_depth:0,kind:\"function\"}; use kind:\"method\" with container and without max_depth:0 for class methods. Omit kind only for a mixed overview. Find a name with {path,query:\"handleQuestion\",match:\"exact\",kind:\"function\"}. query defaults to case-insensitive substring matching. kind filters normalized symbol_kind; container is an exact enclosing path: copy the parent class qualified_name, e.g. Store or Outer::Inner, never convert :: to Java or C# member dots. qualified_name is navigation, not a unique ID for overloaded methods. max_depth uses symbol nesting (0=top level, 1=direct members), not AST depth. Defaults: all kinds/depths, view=detailed. Compact returns names, kinds, containers, positions, a ready-to-copy location and symbol IDs, without source evidence. For parameters, defaults and declared return types use view=detailed with query and match=exact; an untruncated signature often answers without a body read. Detailed includes signature_source and signature_truncated; if truncated, read only the missing signature lines. When signature_context_start_line is present, shared declaration modifiers were omitted; use file_read there for the common prefix. Copy symbol_id into symbol_read for the body. Follow next_cursor preserving ALL filters and view; limit may change. Edits expire cursors/IDs. Positions are 1-based Unicode. Syntax structure does not resolve semantic references.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -328,7 +328,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "symbol_read",
-                description: "Read implementation only when the requested fact is missing from code_outline's detailed signature. Use {path,symbol_id,max_lines:30} for the start of a function; do not read a whole long function just to list arguments. start_line is an optional ABSOLUTE file line within the symbol (default symbol.start_line), max_lines is a count from 1 to 2000, capped at the symbol end. Omit both to read the whole symbol subject to file_read limits. Copy exact symbol_id from code_outline or symbol_search; stale IDs are rejected. If text is truncated, finish that requested range with file_read cursor before starting another range at next_line, at most symbol.end_line. Sources and coverage attest only delivered text. Shared declaration lines can include neighboring declarations.",
+                description: "Read implementation only when the requested fact is missing from code_outline's detailed signature. Use {path,symbol_id,max_lines:30} for the start of a function; do not read a whole long function just to list arguments. start_line is an optional ABSOLUTE file line within the symbol (default symbol.start_line), max_lines is a count from 1 to 2000, capped at the symbol end. Omit both to read the whole symbol subject to file_read limits. Copy exact symbol_id from code_outline or symbol_search; stale IDs are rejected. If text is truncated, finish that requested range with file_read cursor before starting another range at next_line, at most symbol.end_line. Shared declaration lines can include neighboring declarations.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -338,7 +338,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_audit",
-                description: "run_guidance.document_readiness already carries this audit of the saved document on every request; call this only to page its remaining issues with offset. Check output citations path:line[-line], cited ranges not yet read as complete lines of the current file version (unread_citation), Markdown tables/code fences and fenced Mermaid syntax in one call. format_check reports parser coverage and warnings for unchecked UI extensions. Structural checks do NOT prove semantic correctness or browser layout. Paginated errors; the first result returns revision, and offset > 0 requires expected_revision copied from that result. Restart from offset 0 when the revision changes.",
+                description: "run_guidance.document_readiness already carries this audit of the saved document on every request; call this only to page its remaining issues with offset. Check output citations path:line[-line], cited ranges not yet read as complete lines of the current file version (unread_citation), Markdown tables/code fences and fenced Mermaid syntax in one call. format_check reports parser coverage and warnings for unchecked UI extensions. Paginated errors; the first result returns revision, and offset > 0 requires expected_revision copied from that result. Restart from offset 0 when the revision changes.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -348,7 +348,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "file_read",
-                description: "Read a new range with path, 1-based start_line and max_lines (line count). For a targeted source question, first locate the identifier/route with source_search or code_outline, then supply an explicit range. limit is accepted as a compatibility alias for max_lines; prefer max_lines. Do not use offset as a line number. Example: {path:\"src/agent.rs\",start_line:160,max_lines:140}. Relative paths resolve against project.root, NEVER the output directory or workspace parent. For project.output outside the project, copy the absolute path returned by document_inspect; do not shorten it to a basename. Example: root=/workspace/app and output=/workspace/app_summary.md requires path=/workspace/app_summary.md, not app_summary.md. file_read always needs path, or cursor alone; to view the configured output, call document_inspect instead. If truncated, continue ONLY with {cursor: next_cursor.cursor}; never combine cursor with path/start_line/max_lines/offset. A cursor completes the original requested range and expires if the file changes. Once that range is complete, next_line indicates where a NEW range can start. Returned line_start/line_end describe delivered text; boundary flags mark partial lines, and partial boundary lines do not satisfy citation coverage. Use force_read=true only to re-read the same file range on purpose; a document edit already returns the output's new hash and checks.",
+                description: "Read a new range with path, 1-based start_line and max_lines (line count). limit is accepted as a compatibility alias for max_lines; prefer max_lines. Do not use offset as a line number. Example: {path:\"src/agent.rs\",start_line:160,max_lines:140}. Relative paths resolve against project.root, NEVER the output directory or workspace parent. For project.output outside the project, copy the absolute path returned by document_inspect; do not shorten it to a basename. Example: root=/workspace/app and output=/workspace/app_summary.md requires path=/workspace/app_summary.md, not app_summary.md. file_read always needs path, or cursor alone; to view sections of the configured output, call document_inspect instead. If truncated, continue ONLY with {cursor: next_cursor.cursor}; never combine cursor with path/start_line/max_lines/offset. A cursor completes the original requested range and expires if the file changes. Once that range is complete, next_line indicates where a NEW range can start. Returned line_start/line_end describe delivered text; boundary flags mark partial lines, and partial boundary lines do not satisfy citation coverage. Use force_read=true only to re-read the same file range on purpose; a document edit already returns the output's new hash and checks.",
                 optional: true,
                 read_only: true,
                 parameters: schema(
@@ -388,7 +388,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit",
-                description: "Edit ONLY configured Markdown output. Save one section at a time as its evidence is read. Every save returns the outline; copy section_path from it when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Do not replace the whole document merely to add or fix a small part. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition (a supplied hash is still checked). Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash; use document_edit_batch for related edits. section replaces an existing section INCLUDING all descendants and needs expected_section_hash (its section_hash) or the current expected_hash; its text must start with the original full heading; a numbered heading may be retitled at the same level and number. fix_word replaces one garbled word reported as a mixed_script_word issue: send its fix_id and the whole word rewritten as text, without copying the garbled characters. In the source_document workflow every save returns citation_check with unread cited ranges; do not patch workflow. Returns measured lines, new hash and the outline",
+                description: "Edit ONLY configured Markdown output. Every save returns the outline; copy section_path from it when headings repeat. insert_before/insert_after add a same-level sibling beside section; insert_first_child/insert_last_child add a child under section, including a parent with no children. For a smaller change, use replace_text, delete_text, insert_before_text or insert_after_text with an exact unique old_text anchor; optional section limits matching to that subtree. Insertions keep the anchor unless text contains the exact old_text once, in which case the operation replaces it to avoid duplication. Prefer replace_text for rewrites. Existing file requires expected_hash, except replace_text, delete_text, insert_before_text and insert_after_text, whose exact old_text match is the precondition (a supplied hash is still checked). Multiple document_edit calls in one model response are applied sequentially and carry forward a successful write's hash. section replaces an existing section INCLUDING all descendants and needs expected_section_hash (its section_hash) or the current expected_hash; its text must start with the original full heading; a numbered heading may be retitled at the same level and number. fix_word replaces one garbled word reported as a mixed_script_word issue: send its fix_id and the whole word rewritten as text, without copying the garbled characters. Returns measured lines, new hash and the outline",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -398,7 +398,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "document_edit_batch",
-                description: "Apply 1..32 related edits to the existing configured Markdown output in order using one base expected_hash. Each edit is write, append, insert_before, insert_after, insert_first_child, insert_last_child, patch, replace_text, delete_text, insert_before_text, insert_after_text, section or fix_word (fix_id of a mixed_script_word issue plus the whole word rewritten as text) and observes prior edits. Copy section_path from document_inspect for repeated headings. Sibling insertion uses a same-level section anchor; child insertion uses a parent section and a heading one level deeper. Text edits use an exact unique old_text anchor, optionally within section. If insertion text contains that exact old_text once, it is treated as a replacement to avoid duplication; prefer replace_text for rewrites. All edits are prepared in memory and persisted only if every operation succeeds. Use this for related corrections from one snapshot; save new sections as their evidence is read. section replaces descendants; the batch's expected_hash pins it, so its expected_section_hash is optional.",
+                description: "Apply 1..32 related edits to the existing configured Markdown output in order using one base expected_hash. Each edit is write, append, insert_before, insert_after, insert_first_child, insert_last_child, patch, replace_text, delete_text, insert_before_text, insert_after_text, section or fix_word (fix_id of a mixed_script_word issue plus the whole word rewritten as text) and observes prior edits. Copy section_path from the latest save result's outline for repeated headings. Sibling insertion uses a same-level section anchor; child insertion uses a parent section and a heading one level deeper. Text edits use an exact unique old_text anchor, optionally within section. If insertion text contains that exact old_text once, it is treated as a replacement to avoid duplication; prefer replace_text for rewrites. All edits are prepared in memory and persisted only if every operation succeeds. section replaces descendants; the batch's expected_hash pins it, so its expected_section_hash is optional.",
                 optional: true,
                 read_only: false,
                 parameters: schema(
@@ -569,35 +569,12 @@ impl ToolRegistry {
         normalized
     }
     /// Description text that refers to investigation or verification,
-    /// neither of which exists in the answer workflow.
-    const ANSWER_DESCRIPTION_EDITS: &[(&str, &str, &str)] = &[
-        (
-            "document_edit",
-            " Save one section at a time as its evidence is read.",
-            "",
-        ),
-        (
-            "document_edit",
-            " In the source_document workflow every save returns citation_check with unread cited ranges; do not patch workflow.",
-            "",
-        ),
-        (
-            "document_edit_batch",
-            "; save new sections as their evidence is read.",
-            ".",
-        ),
-        ("task_state", "patch:{phase:verify}", "patch:{phase:answer}"),
-        (
-            "task_state",
-            "; for source_document START with completion criteria matching the user request.",
-            ".",
-        ),
-        (
-            "task_state",
-            "Evidence requirements and explicit user constraints remain",
-            "Explicit user constraints remain",
-        ),
-    ];
+    /// neither of which exists in the answer workflow. Each phrase must occur
+    /// in that tool's description, which tests/core.rs checks: a reworded
+    /// description would otherwise keep the phrase in the answer workflow
+    /// silently.
+    pub const ANSWER_DESCRIPTION_EDITS: &[(&str, &str, &str)] =
+        &[("task_state", "patch:{phase:verify}", "patch:{phase:answer}")];
     pub fn answer_description(name: &str, base: &'static str) -> &'static str {
         static DESCRIPTIONS: std::sync::OnceLock<BTreeMap<&'static str, &'static str>> =
             std::sync::OnceLock::new();
@@ -946,7 +923,7 @@ fn validate_task_state_arguments(args: &Value) -> Result<()> {
         // A bare {"action":"update"} was repeated in a live run; show the
         // whole call shape to copy.
         bail!(
-            r#"missing_argument: patch for task_state action=update. Send the fields to change inside patch in the same call, for example {{"action":"update","patch":{{"completion":["the requested result"]}}}}"#
+            r#"missing_argument: patch for task_state action=update. Send the fields to change inside patch in the same call, for example {{"action":"update","patch":{{"phase":"draft"}}}}"#
         );
     };
     let object = patch.as_object().ok_or_else(|| {
@@ -1176,7 +1153,7 @@ fn validate_document_edit_arguments(args: &Value) -> Result<()> {
 /// action=section without a heading usually means the whole document: a
 /// live model sent its complete text that way, section "", and was told only
 /// that section must not be empty.
-const WHOLE_DOCUMENT_HINT: &str = "; action=section replaces the one section its section heading names (copy the heading from the document_inspect outline). To replace the whole document, use action=write with expected_hash and the complete text";
+const WHOLE_DOCUMENT_HINT: &str = "; action=section replaces the one section its section heading names (copy the heading from the outline of the latest save result or document_inspect). To replace the whole document, use action=write with expected_hash and the complete text";
 
 /// What a document edit needs (document_edit_needs), except that a section
 /// edit pinned by the document's expected_hash needs no section hash: that

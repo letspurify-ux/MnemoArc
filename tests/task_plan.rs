@@ -1797,6 +1797,14 @@ fn closing_mode_does_not_add_open_to_dos() {
         split["reason"].as_str().unwrap().contains("from 2 to 3"),
         "{split}"
     );
+    // The closing result reports open to-dos as unfinished; a removed one
+    // leaves that report, so unfinished work stays open rather than removed.
+    let correction = split["conflict"]["correction"].as_str().unwrap();
+    assert!(
+        correction.contains("leave unfinished items open"),
+        "{correction}"
+    );
+    assert!(!correction.contains("will not be done"), "{correction}");
     assert_eq!(s.task.todos.len(), 2);
     let done = apply(
         &mut s,

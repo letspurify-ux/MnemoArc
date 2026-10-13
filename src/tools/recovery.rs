@@ -638,7 +638,7 @@ pub fn annotate_identical_document_failure(result: &mut Value) {
     result["recovery"]["action"] = json!("change_approach");
     result["recovery"]["tools"] = json!(["document_inspect", "document_edit"]);
     result["recovery"]["guidance"] = json!(
-        "This exact request already failed with the same cause. Do not resubmit it. Inspect the current outline and failure cause, then make one targeted document_edit using the current document hash."
+        "This exact request already failed with the same cause. Do not resubmit it. Correct what the failure names against the current document (the latest save result's outline, or document_inspect when none is in context), then make one targeted document_edit with the current document hash."
     );
 }
 

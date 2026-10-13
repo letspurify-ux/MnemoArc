@@ -1052,7 +1052,7 @@ fn answer_workflow_sends_no_verification_guidance() {
     assert!(written["hash"].is_string());
     // Source documentation keeps the full verification prompt.
     s.select_workflow("source_document").unwrap();
-    assert_eq!(context::system_prompt(&s), context::SYSTEM);
+    assert_eq!(context::system_prompt(&s), context::SYSTEM.as_str());
 }
 
 #[test]
@@ -1074,7 +1074,20 @@ fn the_source_prompt_leaves_audit_and_task_state_to_the_runtime() {
     assert!(
         context::SYSTEM.contains("run_guidance.document_readiness is the saved document's audit")
     );
-    assert!(context::SYSTEM.contains("Every save returns the document's outline"));
+    // The prompt places additions from the save result's outline; that every
+    // save returns one is stated once, in the document_edit description.
+    assert!(
+        context::SYSTEM.contains("Place each addition from the outline in the latest save result")
+    );
+    let document_edit = tools::ToolRegistry::specs()
+        .into_iter()
+        .find(|spec| spec.name == "document_edit")
+        .unwrap();
+    assert!(
+        document_edit
+            .description
+            .contains("Every save returns the outline")
+    );
 }
 
 #[test]
@@ -1091,46 +1104,308 @@ fn both_workflow_prompts_follow_the_request_language() {
 }
 
 #[test]
-fn the_answer_prompt_derivation_still_finds_every_edit_in_the_source_prompt() {
-    // system_prompt derives the answer workflow's prompt from SYSTEM by
-    // replacing lines found by their opening words and shortening phrases
-    // found verbatim. Rewording a SYSTEM line turns its edit into a silent
-    // no-op that leaves a source-document rule in the answer prompt, so every
-    // edit must still find exactly its target.
+fn answer_description_edits_still_find_their_phrases() {
+    // The answer workflow derives a few tool descriptions by replacing
+    // phrases of the source descriptions; a reworded description would keep
+    // its verification phrase in the answer workflow silently.
+    for (name, old, new) in tools::ToolRegistry::ANSWER_DESCRIPTION_EDITS {
+        let spec = tools::ToolRegistry::specs()
+            .into_iter()
+            .find(|spec| spec.name == *name)
+            .unwrap_or_else(|| panic!("{name}"));
+        assert!(spec.description.contains(old), "{name}: {old}");
+        let edited = tools::ToolRegistry::answer_description(name, spec.description);
+        assert!(!edited.contains(old), "{name}: {old}");
+        assert!(new.is_empty() || edited.contains(new), "{name}: {new}");
+    }
+    // The task's bookkeeping tool adds no requirement in either workflow.
+    let task_state = tools::ToolRegistry::specs()
+        .into_iter()
+        .find(|spec| spec.name == "task_state")
+        .unwrap();
+    for removed in [
+        "START with completion criteria",
+        "refine it into concrete checks",
+    ] {
+        assert!(!task_state.description.contains(removed), "{removed}");
+    }
+}
+
+#[test]
+fn a_pending_checkpoint_replaces_the_phase_instruction() {
+    // The phase instruction is computed before a checkpoint starts; sent as
+    // is, a cleanup request told the model to read sources while the control
+    // request said to pause.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.select_workflow("source_document").unwrap();
+    s.add_user("Document the project".into());
+    s.run_guidance = json!({"phase":"investigate","instruction":"Investigate: read what the next planned section needs."});
+    let state = ContextManager::state(&s).unwrap();
+    assert_eq!(
+        state["run_guidance"]["instruction"],
+        "Investigate: read what the next planned section needs."
+    );
+    s.checkpoint = Some(mnemoarc::session::Checkpoint {
+        id: "cp-1".into(),
+        bundle_ids: vec![],
+        maintenance_bundle_ids: vec![],
+        acknowledged: false,
+        attempts: 0,
+        failed_attempts: 0,
+        last_failure: None,
+        source_lookup_calls: 0,
+        starting_state_revision: s.task.revision,
+        starting_memory_generation: s.memory.generation,
+        failed: false,
+    });
+    let state = ContextManager::state(&s).unwrap();
+    assert_eq!(
+        state["run_guidance"]["instruction"],
+        context::CHECKPOINT_INSTRUCTION
+    );
+    assert_eq!(state["run_guidance"]["phase"], "investigate");
+    assert_eq!(
+        s.run_guidance["instruction"],
+        "Investigate: read what the next planned section needs."
+    );
+}
+
+#[test]
+fn each_workflow_prompt_is_assembled_from_its_own_fragments() {
+    // Both prompts are assembled from shared and workflow-specific fragments.
+    // The answer prompt used to be derived by deleting phrases from the source
+    // prompt: a reworded phrase stayed in silently, and the source prompt kept
+    // advertising file_write, which that workflow withholds (a live run wrote
+    // a stray manual into the repository with it).
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
     s.select_workflow("answer").unwrap();
     s.add_user("Answer a question".into());
     let answer = context::system_prompt(&s);
-    assert_eq!(answer, context::answer_prompt());
-    let mut dropped = 0;
-    for (prefix, replacement) in context::ANSWER_LINE_EDITS {
-        let lines: Vec<_> = context::SYSTEM
-            .lines()
-            .filter(|line| line.starts_with(prefix))
-            .collect();
-        assert_eq!(lines.len(), 1, "{prefix}");
-        assert!(!answer.contains(lines[0]), "{prefix}");
-        match replacement {
-            Some(text) => assert!(answer.lines().any(|line| line == text), "{prefix}"),
-            None => dropped += 1,
-        }
+    assert_eq!(answer, context::ANSWER_SYSTEM.as_str());
+    let source = context::SYSTEM.as_str();
+    for term in [
+        "file_edit",
+        "file_write",
+        "file_patch",
+        "workflow=\"answer\"",
+        "JSON only",
+    ] {
+        assert!(!source.contains(term), "source prompt mentions {term}");
+        assert!(answer.contains(term), "answer prompt lacks {term}");
     }
-    for (old, _) in context::ANSWER_PHRASE_EDITS {
-        assert!(context::SYSTEM.contains(old), "{old}");
-        assert!(!answer.contains(old), "{old}");
-    }
-    assert_eq!(
-        answer.lines().count(),
-        context::SYSTEM.lines().count() - dropped
-    );
     for term in [
         "workflow=\"source_document\"",
-        "document_readiness",
         "unread_citation",
+        "citation_check",
+        "document_audit",
+        "document_readiness",
+        "closing mode",
     ] {
-        assert!(!answer.contains(term), "{term}");
+        assert!(source.contains(term), "source prompt lacks {term}");
+        assert!(!answer.contains(term), "answer prompt mentions {term}");
     }
+    for (workflow, prompt) in [("source_document", source), ("answer", answer)] {
+        let sections = context::prompt_sections(workflow);
+        for section in [
+            "Workflow",
+            "Requirements",
+            "Citations",
+            "Plan",
+            "Reading the project",
+            "Memory and progress",
+            "Checkpoints",
+            "Each request",
+            "Judgement",
+        ] {
+            assert!(sections.contains(&section), "{workflow} lacks {section}");
+        }
+        // Each heading once, and no rule stated twice.
+        for section in sections.iter().filter(|section| !section.is_empty()) {
+            assert_eq!(
+                prompt.matches(&format!("\n# {section}\n")).count(),
+                1,
+                "{workflow} {section}"
+            );
+        }
+        let mut seen = BTreeSet::new();
+        for sentence in prompt
+            .split(". ")
+            .map(str::trim)
+            .filter(|sentence| sentence.len() >= 40)
+        {
+            assert!(seen.insert(sentence), "{workflow} repeats: {sentence}");
+        }
+    }
+    // Facts the runtime decides are stated as the runtime has them, and
+    // values a workflow never reports are not described to it.
+    assert!(source.contains(&format!(
+        "at most {} calls per checkpoint",
+        context::CHECKPOINT_SOURCE_LOOKUP_LIMIT
+    )));
+    assert!(!answer.contains("plan_check"), "{answer}");
+    for prompt in [source, answer] {
+        assert!(!prompt.contains("(investigate, draft, verify or answer)"));
+        // Argument rules live in the tool descriptions only.
+        for argument_rule in [
+            "{cursor: next_cursor.cursor}",
+            "insert_first_child",
+            "set inferred=true",
+            "it runs after the other calls of its batch",
+        ] {
+            assert!(!prompt.contains(argument_rule), "{argument_rule}");
+        }
+    }
+}
+
+#[test]
+fn prompts_and_tool_descriptions_state_each_rule_once_and_agree() {
+    // The prompt says when and why, a tool description what its arguments
+    // and results mean; the same sentence in both drifted apart before.
+    let sentences = |text: &str| -> Vec<String> {
+        text.split(". ")
+            .map(|sentence| sentence.trim().trim_end_matches('.').to_owned())
+            .filter(|sentence| sentence.len() >= 50)
+            .collect()
+    };
+    for prompt in [context::SYSTEM.as_str(), context::ANSWER_SYSTEM.as_str()] {
+        for spec in tools::ToolRegistry::specs() {
+            for sentence in sentences(spec.description) {
+                assert!(
+                    !prompt.contains(&sentence),
+                    "{} repeats the prompt: {sentence}",
+                    spec.name
+                );
+            }
+        }
+    }
+    let description = |name: &str| {
+        tools::ToolRegistry::specs()
+            .into_iter()
+            .find(|spec| spec.name == name)
+            .unwrap()
+            .description
+    };
+    // Every item left in task.unresolved is reported to the user as
+    // unconfirmed, so neither the prompt nor source_lookup may send pending
+    // reads there.
+    for prompt in [context::SYSTEM.as_str(), context::ANSWER_SYSTEM.as_str()] {
+        assert!(prompt.contains("every item left there is reported to the user as unconfirmed"));
+        assert!(!prompt.contains("patch phase, unresolved or details"));
+        // The to-do gate refuses the final answer in both workflows.
+        assert!(prompt.contains("the final answer is refused while any to-do is open"));
+    }
+    assert!(!description("source_lookup").contains("as unresolved"));
+    // Closing mode reports phase verify and withholds source_search, so the
+    // prompt promises no search during verification.
+    assert!(!context::SYSTEM.contains("stay allowed during verification"));
+    // Answer runs stop after repeated failures; only document work goes on.
+    assert!(!context::ANSWER_SYSTEM.contains("not a stop"));
+    assert!(context::SYSTEM.contains("not a stop"));
+    // A new memory key's revision rule lives with memory_write.
+    assert!(description("memory_write").contains("a new key omits it"));
+    assert!(!context::SYSTEM.contains("omit expected_revision"));
+}
+
+#[test]
+fn the_state_carries_no_tool_list_or_idle_guidance() {
+    // The request's tool definitions are the offered tools. The state's
+    // active_tools listed file_write in source documentation, which that
+    // workflow withholds, and discovery tools closing mode withholds.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.select_workflow("source_document").unwrap();
+    s.add_user("Document the project".into());
+    let state = ContextManager::state(&s).unwrap();
+    assert!(state.get("active_tools").is_none(), "{state}");
+    // A plan window that shows every pending item needs no paging hint.
+    tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Write the overview from src/main.rs","Final verification"]}]}),
+    )
+    .unwrap();
+    let window = &ContextManager::state(&s).unwrap()["task"]["todo_window"];
+    assert_eq!(window["pending_count"], 2);
+    assert!(window.get("guidance").is_none(), "{window}");
+    let texts: Vec<String> = (0..10)
+        .map(|n| format!("Write section {n} from src/main.rs"))
+        .collect();
+    tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":1,"operations":[{"op":"insert","texts":texts}]}),
+    )
+    .unwrap();
+    let window = &ContextManager::state(&s).unwrap()["task"]["todo_window"];
+    assert!(
+        window["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("task_plan list"),
+        "{window}"
+    );
+    // Execution-order and exception citations hold for documents too.
+    assert!(context::SYSTEM.contains("For an execution-order claim cite both operations"));
+}
+
+#[test]
+fn request_headers_rank_no_direction_and_leave_rules_to_the_prompt() {
+    // The state header used to call everything but instruction "state to
+    // consult", while a refused final answer's direction is in
+    // finalization_error; the prompt's Each request section says how to read
+    // run_guidance, so the header only points to it. The checkpoint header
+    // repeated the prompt's checkpoint rules on every cleanup request.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.select_workflow("source_document").unwrap();
+    s.add_user("Document the project".into());
+    let last = |s: &Session| {
+        let request = ContextManager::request(s, vec![]).unwrap();
+        request["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let header = last(&s);
+    let first = header.lines().next().unwrap();
+    assert!(first.contains("run_guidance"), "{first}");
+    assert!(!first.contains("state to consult"), "{first}");
+    for direction in ["finalization_error", "plan_check"] {
+        assert!(context::SYSTEM.contains(direction), "{direction}");
+    }
+    s.checkpoint = Some(mnemoarc::session::Checkpoint {
+        id: "cp-2".into(),
+        bundle_ids: vec![],
+        maintenance_bundle_ids: vec![],
+        acknowledged: false,
+        attempts: 0,
+        failed_attempts: 0,
+        last_failure: None,
+        source_lookup_calls: 0,
+        starting_state_revision: s.task.revision,
+        starting_memory_generation: s.memory.generation,
+        failed: false,
+    });
+    let control = last(&s);
+    let control = control.lines().next().unwrap();
+    assert!(
+        control.starts_with("CHECKPOINT CONTROL REQUEST cp-2"),
+        "{control}"
+    );
+    assert!(control.contains("Checkpoints section"), "{control}");
+    for rule in ["source_lookup", "same batch", "plan items"] {
+        assert!(!control.contains(rule), "{rule}: {control}");
+    }
+    let request = ContextManager::request(&s, vec![]).unwrap();
+    let system = request["messages"][0]["content"].as_str().unwrap();
+    let suffix = system.lines().last().unwrap();
+    assert!(
+        suffix.starts_with("Checkpoint cp-2: cleanup request 1/"),
+        "{suffix}"
+    );
+    assert!(!suffix.contains("Document edits"), "{suffix}");
 }
 
 #[test]
@@ -1857,8 +2132,10 @@ fn a_bare_task_state_update_shows_the_call_to_send() {
         .unwrap_err()
         .to_string();
     assert!(error.starts_with("missing_argument: patch"), "{error}");
+    // The example patches a bookkeeping field: completion notes add no
+    // requirement, so the example does not invite writing them.
     assert!(
-        error.contains(r#"{"action":"update","patch":{"completion":"#),
+        error.contains(r#"{"action":"update","patch":{"phase":"#),
         "{error}"
     );
 }

@@ -413,3 +413,88 @@ apodex(apodex/apodex-1.1-mini:free)로 같은 요청을 실행했을 때(192라�
 - 테스트의 64K 프로필(`Config::compact_test`, `tests/support::compact_config`)은 4,000·8,000을 명시해 기존 시나리오를 보존한다.
 - 설정 화면의 두 칸은 비울 수 있고, 비우면 현재 컨텍스트 예산으로 계산한 자동 값을 자리표시로 보여 준다(`fields.js` `autoBudget`). 저장 설정 파일에서 두 키를 지우면 자동 값을 쓴다.
 - 답변 워크플로의 시스템 프롬프트는 `SYSTEM`의 줄을 첫 단어로 찾아 바꾸거나 빼고, 특정 구절을 글자 그대로 찾아 지워 만든다. 그 규칙을 `ANSWER_LINE_EDITS`·`ANSWER_PHRASE_EDITS` 표로 분리하고, 각 줄 접두어가 SYSTEM에서 정확히 한 줄과 맞고 각 구절이 SYSTEM에 있으며 답변 프롬프트에는 남지 않는지 검사하는 테스트를 두었다(`core::the_answer_prompt_derivation_still_finds_every_edit_in_the_source_prompt`). 전에는 SYSTEM 문구를 고치면 치환이 조용히 빠져 소스 문서 규칙이 답변 프롬프트에 남을 수 있었다. 이 테스트의 첫 실행이 바로 그런 경우 하나를 잡았다. 세 구절 치환 중 `"audit citations, "`는 34870a9가 SYSTEM 문구를 고친 뒤로 대상이 없어 아무 일도 하지 않았고, 이번에 뺐다(남은 두 구절은 모두 SYSTEM에 있다).
+
+## 시스템 프롬프트 재구성 (2026-10-13)
+
+프롬프트 본문(`src/context.rs`)을 다시 읽어 내용 자체의 문제를 고쳤다. 전에는 소스 문서용 프롬프트 한 덩어리(18문단, 한 문단 최대 4,300자)를 그대로 쓰고 답변용은 거기서 줄·구절을 빼서 만들었다.
+
+- **워크플로에 없는 내용이 섞여 있었다.** 소스 문서 프롬프트가 그 워크플로에서 숨기는 `file_edit`·`file_write`·`file_patch`를 안내했고(문서 도구 오류 뒤 `file_write`로 매뉴얼을 소스 저장소에 쓴 라이브 사고의 유인), 답변 워크플로 설명·JSON 전용 답변 규칙·소스 흐름 질문 규칙과, 도구 목록에서 이미 빠지는 `memory_read` 금지 문장이 들어 있었다.
+- **어긋나는 문장이 있었다.** "인용은 필수이고 읽지 않은 인용이 남으면 거절한다"와 "사용자가 요구하지 않으면 인용 감사는 전제 조건이 아니다"가 한 프롬프트에 있었고, "섹션마다 기억을 저장하라"와 "기억 저장은 선택"이 함께 있었다. 상태 메시지 머리말은 "지시가 아닌 데이터"라고 적으면서 그 안에 매 요청의 지시(`run_guidance.instruction`)를 실었다. draft 단계 안내는 모델이 `task_state`로 draft를 먼저 선언한 경우에도 "예산의 절반을 썼다"고 알렸다.
+- **사고 하나가 영구 규칙이 된 문장이 많았다.** 루프 안 읽기, JavaScript 인자 생략, total_lines 비교, `queries:[...]` 예시, code_outline 호출 형식 같은 문장은 도구 설명이나 런타임 검사(읽지 않은 인용, 인용 줄 불일치, 인용 없는 코드 블록)가 이미 담당한다.
+
+바꾼 것:
+
+- 프롬프트를 조각(`Fragment`: 절 이름, 본문, 적용 워크플로) 목록에서 워크플로별로 조립한다(`SYSTEM`, `ANSWER_SYSTEM`). 공통 조각은 한 번만 쓰고, 소스 문서 조각은 문서 도구·인용 검사·마감 단계를, 답변 조각은 파일 편집 도구·JSON 답변·소스 흐름 질문을 담는다. 절은 지켜야 할 계약(Workflow, Requirements, Citations, Write as you read, Plan)부터 일하는 방법(Reading the project, Memory and progress, Checkpoints, Each request, Judgement) 순서로 `#` 제목을 붙였다.
+- 줄 번호 표기 `N|source text` 설명을 인용 규칙 옆으로 옮기고, 인용 형식 규칙을 한 곳에만 두었다. 도구 호출 형식은 도구 설명에만 남기고 사고별 문장은 "전달된 줄이 보여 주는 것만 주장하라"는 일반 원칙 한 문단(Judgement)으로 합쳤다. 기억 저장은 "나중 작업에 필요한 발견만, 선택"으로 통일했다.
+- 탐색 도구 목록이 정체·마감 단계에서 줄어든다는 점, `source_lookup`은 체크포인트당 3회라는 점을 프롬프트에 한 번씩 적고, 요청마다 붙던 체크포인트 접미사와 제어 요청 머리말은 횟수 같은 동적 사실만 남겼다. 상태 머리말은 "런타임 상태와 안내"로 바꿨다. `document_audit`가 의미를 검사하지 않는다는 문장은 요청마다 덧붙이지 않고 프롬프트에 둔다.
+- draft 안내를 둘로 나눴다. 예산으로 들어온 draft는 "예산의 절반을 썼다", 모델이 선언한 draft는 "선언한 대로 근거가 있는 섹션부터 저장하라"로 시작한다. investigate·verify 안내도 프롬프트와 겹치는 부분을 뺐다.
+- 회귀 테스트 `core::each_workflow_prompt_is_assembled_from_its_own_fragments`: 소스 프롬프트에 파일 편집 도구·답변 워크플로 용어가 없고, 답변 프롬프트에 인용 검사·감사·마감 용어가 없으며, 두 프롬프트 모두 절 제목이 한 번씩만 나오고 40자 이상 문장이 두 번 나오지 않는지 검사한다. 이전의 파생 규칙 표(`ANSWER_LINE_EDITS`)와 그 테스트는 없앴다.
+
+같은 날 검토에서 남은 문제 다섯 가지를 더 고쳤다.
+
+- `task_state` 도구 설명이 "요청 기반 완료 조건으로 시작하고 구체 검사로 다듬어라"고 해 프롬프트("task_state는 요구사항을 더하지 않는다")와 반대였다(10-12 qwen 실행의 두 번째 호출이 completion·deliverables를 채운 task_state였다). 설명을 단계·미확인 사항·세부 기록용으로 바꾸고, 답변 워크플로용 설명 치환표(`ToolRegistry::ANSWER_DESCRIPTION_EDITS`)에서 사라진 구절 둘을 빼고 공개 상수로 두어, 각 구절이 설명에 실제로 있는지 검사한다(`core::answer_description_edits_still_find_their_phrases`).
+- 체크포인트 정리 요청에도 단계 안내("Investigate: read …")가 `run_guidance.instruction`으로 실려 제어 요청("소스 읽기를 멈추라")과 충돌했다. 상태를 만들 때 체크포인트가 걸려 있으면 instruction을 `CHECKPOINT_INSTRUCTION`("제어 요청을 따르고 완료 뒤에 재개하라")로 바꾼다. 세션에 저장된 안내는 그대로 둔다(`core::a_pending_checkpoint_replaces_the_phase_instruction`).
+- `finalization_error` 설명이 "최종 답변을 반복하지 말고 도구로 고치라"였는데, 요청 범위 대조와 미확인 항목 정리는 "덮였으면 답변을 다시 하라"고 요구한다. "거절 이유가 요구하는 대로, 도구로 고치거나 답변을 다시 하라"로 바꿨다.
+- 출력 문서가 작업 시작 때 이미 있으면 목차를 먼저 조회하고 요청이 가리키는 절만 고치라는 문장을 Workflow 절에 더했다.
+- `run_guidance.max_tool_calls`가 응답당 호출 한도이며 넘기면 묶음이 실행되지 않고 버려진다는 점을 Each request 절에 적었다.
+
+다시 검토해 모순 여섯 가지와 중복을 정리했다.
+
+- 런타임은 예산으로 들어간 draft 단계를 작업 단계에 저장하고 재개한 실행이 이어받는데, 안내는 이를 "task_state로 선언한 draft"라고 불렀다. 단계 안내를 `phase_instruction`으로 모으고, 예산 draft가 아니면 "Draft phase"로 시작하는 중립 문구를 쓴다.
+- 소스 문서 작업에서 모델이 `phase: answer`를 선언하면(라이브 실행 120회 중 8회) 채팅용 "Answer the user now … 간단한 설명 전에는 기억을 저장하지 말라" 안내가 최종 답변이 거절될 때까지 매 요청 나갔다. 문서 작업에서는 이 선언을 verify로 읽는다(`declared_phase`). 프롬프트와 `task_state` 설명의 단계 목록에서 answer를 뺐다.
+- 상태 머리말이 instruction 외에는 "참고할 상태"라고 해, 거절 사유가 담긴 `finalization_error`와 `plan_check`를 낮췄다. 세 가지를 모두 따르라고 적는다.
+- 기억 재사용이 꺼진 평가 기준선에서도 "기억을 먼저 검색하라"고 했다. "memory_find와 memory_read가 제공될 때"로 조건을 붙였다.
+- 첫 정리 요청 뒤 문서 편집이 닫힌다는 프롬프트에, 편집이 실패하면 한 번 더 열린다는 예외를 옮겨 적었다.
+- 답변 프롬프트에서 답변 작업에 나오지 않는 `plan_check` 설명을 뺐다.
+
+중복은 역할로 나눴다. 프롬프트는 언제·왜를, 도구 설명은 인자의 의미를, 요청별 안내는 지금 달라진 사실만 맡는다. 체크포인트 규칙은 프롬프트 Checkpoints 절에만 두고, 시스템 메시지 접미사는 요청·실패 횟수와 마지막 요청 표시만, 제어 요청 머리말은 ID·지금 할 행동(편집 열림·닫힘)·호출 한도만 적는다. 섹션 삽입 동작, 커서 이어 읽기, 계획 연산 의미, 기억 기록 방법은 도구 설명에만 남기고 `memory_write`·`checkpoint_complete` 설명에서 프롬프트와 겹치던 문장을 뺐다. 빈 계획 알림·계획 구조 비교·감사 불통과·집중 복구 안내는 프롬프트 규칙을 다시 풀어 쓰지 않고 지금 할 행동만 적는다. 회귀 테스트: `core::request_headers_name_every_direction_and_leave_rules_to_the_prompt`, `agent::plan_check_tests::phase_guidance_matches_the_workflow_and_where_the_phase_came_from`, 그리고 `each_workflow_prompt_is_assembled_from_its_own_fragments`에 인자 규칙이 프롬프트에 없는지 검사를 더했다.
+
+세 번째 검토에서 남은 모순과 중복을 더 정리했다.
+
+- `task.unresolved`의 항목은 최종 결과에 "확인하지 못한 항목"으로 보고되는데, 프롬프트는 대기 중인 읽기·재시도 지시를 `task_state`의 unresolved에 적으라고 했고 `source_lookup` 설명도 근거가 없으면 "unresolved로 남기라"고 했다. 진행 기록은 details나 checkpoint_complete progress에 두고, unresolved에는 결과에서 미확인으로 남을 수 있는 것만 둔다고 적었다.
+- "수정 가능한 오류나 정체는 중단이 아니라 접근을 바꿀 신호"라는 문장이 답변 프롬프트에도 있었지만, 답변 작업은 반복 실패에서 실제로 멈춘다. 이 문장을 소스 문서 프롬프트에만 둔다.
+- 열린 할 일이 있으면 최종 답변이 거절되는 규칙은 두 워크플로에 모두 적용되는데 소스 문서 프롬프트에만 있었다. Plan 절 공통 문단으로 옮겼다.
+- 최종 답변에 담을 내용이 프롬프트("결과 경로, 범위, 확인한 사실, 남은 미확인")와 마감 준비 안내("출력 경로, 검증 범위, 남은 한계")에서 달랐다. 마감 준비 안내에서 목록을 빼고 프롬프트 한 곳에만 둔다.
+- 빈 응답 복구 안내가 "검증 도구를 부르라"고 해, 바뀌지 않은 문서의 감사를 다시 부르지 말라는 프롬프트와 어긋났다. "읽기나 섹션 편집처럼 문서를 진전시키는 도구"로 바꿨다. 편집 반복 복구 안내의 "concrete findings"(없어진 개념)도 "document_readiness 문제나 빠진 근거"로 바꿨다.
+- 프롬프트가 "serialized history로 범위를 이어 읽지 말라"고 했는데, 결과 예산을 넘어 보관된 결과의 next_cursor는 history 읽기다. "next_cursor가 말하는 대로 이어 읽고 직접 계산한 offset을 쓰지 말라"로 바꿨다.
+
+중복으로는 Workflow 절의 섹션 단위 저장·tool_catalog·사실과 추측 구분·인용 대조 문장(각각 Write·Reading·Judgement·Citations 절에 있음), Reading 절의 거절 처리(복구 문단에 있음)와 `symbol_relations` 결과 의미, Plan 절의 계획 충돌 처리(`task_plan` 설명), Checkpoints 절의 새 기억 키 규칙(`memory_write` 설명으로 옮김)·재시도 규칙(복구 문단)·제어 요청과 같은 저장 지시, 단계 안내의 "한 번에 한 섹션"·"남은 예산 안에서 계속 고치라"를 뺐다. 답변 작업의 investigate 안내는 프롬프트 Workflow·Reading 절을 다시 풀어 쓰던 것을 한 문장으로 줄였다. 도구 설명에서는 `document_edit`의 섹션 단위 저장·인용 검사·전체 교체 금지, `document_edit_batch`의 섹션 저장(그리고 목차를 document_inspect에서 복사하라는, 저장 결과의 목차를 쓰라는 프롬프트와 어긋난 문장), `file_read`의 "먼저 위치를 찾으라", `task_state`의 사용자 제약 유지, `memory_manage`의 진행 기록 위치를 뺐다. 답변 워크플로용 설명 치환표에는 `task_state` 예시 한 줄만 남는다.
+
+회귀 테스트 `core::prompts_and_tool_descriptions_state_each_rule_once_and_agree`는 도구 설명의 50자 이상 문장이 프롬프트에 그대로 있지 않은지와 위 모순이 되살아나지 않는지 검사하고, `agent::plan_check_tests::phase_guidance_matches_the_workflow_and_where_the_phase_came_from`은 단계 안내의 40자 이상 문장이 프롬프트에 그대로 있지 않은지 검사한다. 소스 문서 프롬프트는 약 13.0K자, 답변 프롬프트는 약 10.0K자다.
+
+네 번째 검토에서는 모델이 쓸 일이 없는 설명을 뺐다.
+
+- 도구 목록이나 스키마가 이미 보여 주는 사실: 새 세션에서 활성인 도구 이름 목록, document_audit가 항상 활성이라는 문장, 워크플로를 바꿀 수 없다는 문장(`task_state` patch 스키마에 workflow 필드가 없다), 감사 도구가 제공되지 않는다는 문장, "각 도구 설명이 인자를 적는다"·"memory_write 설명이 기록 방법을 적는다" 같은 안내문.
+- 런타임 내부 동작이라 모델이 행동을 바꿀 수 없는 것: 기억 색인의 우선순위 방식, 관련 없는 성공이 실패 횟수를 초기화하지 않는다는 문장, 저장 결과 목차가 줄어드는 기준(줄었을 때 결과에 `outline_note`가 붙는다), 새 무관 작업은 새 세션이라는 문장(세션은 모델이 만들 수 없다), 답변 근거 검사가 감사 도구 호출을 요구하지 않는다는 문장.
+- 다른 곳에 이미 있는 것: 계획 첫 호출 형식(`task_plan` 설명과, 계획이 비었을 때의 알림이 적는다), 감사 문제가 남으면 완료를 주장하지 말라·예산이 끊기면 부분 결과를 보고하라(최종 답변은 감사가 막고, 예산이 끊기면 런타임이 미확인 항목을 보고한다), 파일 편집 도구의 동작 설명과 해시 규칙(각 도구 설명), 잘린 결과의 경계 플래그 설명(`file_read` 설명), 파일 이름만 알 때의 검색 방법(`file_list` 설명으로 옮김), 체크포인트 제어 요청의 호출 한도(`run_guidance.max_tool_calls`), "증거를 지어내지 말라"(Judgement 절).
+- 도구 설명에서는 `memory_write`의 오류 결과 형식과 메타데이터 크기 이력, `task_state`의 요구사항 설명(Requirements 절)을 뺐다.
+
+상태 머리말은 run_guidance 필드에 순위를 매기지 않고 "run_guidance가 런타임의 지시를 담는다"고만 적는다. 무엇을 따를지는 프롬프트 Each request 절이 정한다(`core::request_headers_rank_no_direction_and_leave_rules_to_the_prompt`).
+
+다섯 번째 검토에서 남은 것을 정리했다.
+
+- **상태와 프롬프트의 모순.** 매 요청 상태의 `active_tools`는 세션의 활성 도구 집합을 그대로 실어, 소스 문서 작업에서 숨기는 `file_edit`·`file_write`·`file_patch`와 마감 단계에서 숨기는 탐색 도구까지 활성으로 보여 줬다. 요청에 실리는 도구 정의가 실제로 제공되는 도구이므로 상태에서 이 필드를 뺐다. 계획 창의 페이지 안내(`todo_window.guidance`)는 보이지 않는 대기 항목이 있을 때만 싣는다(`core::the_state_carries_no_tool_list_or_idle_guidance`).
+- **잃었던 규칙.** 실행 순서를 주장하면 두 동작을 모두 인용하고 예외 동작은 오류를 고르는 분기를 인용하라는 규칙이 첫 재구성 때 답변 프롬프트에만 남아, 흐름을 설명하는 소스 문서에서 빠져 있었다. Citations 절 공통 문단으로 옮기고, 답변 프롬프트의 JSON 규칙에서 같은 내용을 뺐다.
+- **행동으로 이어지지 않는 문장.** 답변 프롬프트의 "예산이 끊기면 부분 결과를 보고하라"(예산이 끊기면 런타임이 실행을 멈춘다)와, 체크포인트 절의 "읽지 않은 근거는 진행 메모에 적으라"(Memory 절과 Judgement 절에 있음)를 뺐다.
+- **중복.** Requirements 절의 task_state 역할 설명(Memory 절), Citations 절의 "완전한 줄로 전달되지 않은 범위" 정의 반복, "저장 결과가 목차를 돌려준다"(`document_edit` 설명), 도구 선택이 다음 요청에 적용된다는 문장(`tool_select` 설명), 기억 한 개에 발견 하나라는 문장(`memory_write` 설명), 답변 프롬프트의 "소스 흐름 질문" 두 번, 마감 준비 안내 안의 "빠진 섹션이 있으면 먼저 쓰라" 두 번, 할 일 마감 안내의 "열린 할 일이 있으면 거절된다"(Plan 절)와 "현재 항목만 완료할 수 있다"(`task_plan` 설명)를 정리했다.
+- **도구 설명이 프롬프트 원칙을 되풀이하던 문장.** `symbol_search`·`symbol_relations`·`code_outline`·`symbol_read`의 "탐색 결과는 근거가 아니다", "본문을 읽고 설명하라", "시그니처는 동작을 증명하지 않는다", "전달된 텍스트만 근거다", `document_audit`의 "의미를 검증하지 않는다"(Citations 절), `memory_find`의 "검증된 사실이 아니다"(Memory 절), `task_plan`의 "실제로 일한 뒤 완료하라"(Plan 절), `document_edit`·`document_edit_batch`의 "관련 수정은 일괄로"(Write 절)를 뺐다. `file_read`의 "출력은 document_inspect로 보라"는 같은 설명 안의 "출력의 줄 번호는 절대 경로로 file_read하라"와 어긋나 "출력의 섹션은"으로 좁혔다.
+
+소스 문서 프롬프트는 약 11.6K자, 답변 프롬프트는 약 8.5K자다.
+
+여섯 번째 검토에서는 프롬프트 밖의 안내문까지 넓혀 봤다.
+
+- **모순.** 프롬프트는 "검증 중에도 대상을 좁힌 검색과 읽기는 허용된다"고 했지만, 마감 단계는 단계를 verify로 보고하면서 `source_search` 등 탐색 도구를 숨기고, 정체가 감지 횟수의 2배가 되어도 숨긴다. 이 문장을 빼고, 도구 목록이 줄어드는 경우는 Reading 절 한 곳에서만 말한다. 마감 안내는 인용 수정 목록을 "document_audit에서" 가져오라고 했는데, 감사 결과는 매 요청 `document_readiness`로 오고 document_audit는 남은 문제를 페이지로 볼 때만 쓴다. "document_readiness 문제를 해결하라"로 바꿨다.
+- **프롬프트 규칙을 되풀이하던 안내.** 마감 안내 두 곳의 "확인하지 못한 사실은 본문에 적으라", 진척 복구 안내의 "근거가 없으면 그 절에 빈틈을 표시하라"(Judgement 절), 범위 대조 안내의 "점검 목록만 적은 절을 더하지 말라"(Write 절), 답변 단계 안내의 "간단한 설명 전에는 기억을 저장하지 말라"·"범위를 다 봤다고 하지 말라"(Memory·Reading 절), draft 예산 안내의 "남은 토큰·시간 안에 끝나도록 계획하라"(Each request 절)를 뺐다.
+- **필요 없는 문장.** Workflow 절의 "관련 파일을 연결하라"는 Reading 절의 "호출 지점과 대상 본문을 읽으라"와 같은 뜻이라 뺐다.
+
+소스 문서 프롬프트는 약 11.5K자, 답변 프롬프트는 약 8.5K자다.
+
+일곱 번째 전체 재검토에서는 작업 프롬프트 밖의 모델용 문구를 함께 봤다. 후속 질문 프롬프트 두 개, 요청 변경 판별 프롬프트, 도구 실패 복구 안내, 도구 결과의 안내문이다.
+
+- **마감 단계의 할 일 처리(모순).** 마감 결과는 열린 할 일을 "미완료 할 일"로 보고하지만, 지운 할 일은 목록에서 사라져 보고되지 않는다. 그런데 마감 안내는 "남은 할 일을 완료하거나 지우라", 마감 중 계획 변경 거절 안내는 "하지 않을 항목은 이유를 달아 지우라, 런타임이 미완료를 보고한다"고 해, 따르면 끝내지 못한 일이 보고에서 빠졌다. 일이 끝난 할 일만 완료하고 쓸모없어진 것만 지우며, 끝내지 못한 것은 열어 두면 런타임이 보고한다고 바꿨다(`agent::plan_check_tests::closing_keeps_unfinished_to_dos_open_for_the_gap_report`, `task_plan::closing_mode_does_not_add_open_to_dos`).
+- **후속 질문 프롬프트.** 도구 없는 후속 답변은 사용자를 "Resume or New task"로 안내했는데 화면에는 New task가 없고 "새 세션"이 있다. 도구를 쓰는 후속 답변은 "file_read 커서는 원래 범위만 잇는다"·"사실 기억은 관측한 출처 ID를 쓰고 추론은 표시하라"(각 도구 설명에 있음)와 "편집 요청은 work route가 필요하다, 쓰기로 위장한 읽기 도구가 아니라"(뜻이 불분명한 내부 용어)를 담고 있었다. 이 프롬프트를 상수(`TOOL_FOLLOW_UP`)로 빼고, 일을 요청받으면 이 답변이 할 수 없다는 것과 명시적 지시나 Resume으로 이어진다는 것을 알리게 했다(`agent::question::prompt_tests`).
+- **안내문의 사소한 어긋남.** 같은 편집이 같은 원인으로 다시 실패했을 때의 복구 안내는 "현재 목차를 조회하라"고 해, 최근 저장 결과의 목차를 쓰고 없을 때만 조회하라는 프롬프트와 어긋났다. section 동작의 제목 안내도 "document_inspect 목차에서 복사하라"고만 했다. 둘 다 저장 결과의 목차를 먼저 가리키게 했다. 빈 `task_state update`의 예시는 요구사항으로 오해될 수 있는 completion 대신 phase를 쓴다. 형식 검사 안내의 "브라우저 배치와 새 Mermaid 버전은 UI 확인이 필요하다"는 모델이 할 수 없는 일이라 "검사하지 않는다"로 바꿨다.
+
+요청 변경 판별 프롬프트와 나머지 도구 오류 문구에서는 고칠 것을 찾지 못했다. `memory_retrieval::unused_bucket_space_is_borrowed_and_zero_counts_disable_buckets`는 이번 변경 전 커밋에서도 10번 중 1번 실패하는 기존의 불안정한 테스트다(같은 시각에 저장한 기억의 순서가 동률일 때 갈린다).
+
+프롬프트 길이는 약 21.7K자에서 줄었고 요청당 고정 접두가 그만큼 작아진다. 라이브 실행 비교는 아직 하지 않았으므로, 같은 요청의 실행 한 번으로 섹션 저장 시점과 인용 오류 수가 나빠지지 않았는지 확인해야 한다.
