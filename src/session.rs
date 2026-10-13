@@ -354,6 +354,13 @@ pub struct ProgressRecovery {
     /// Highest count of distinct project source lines delivered, credited
     /// as progress; re-read lines and the output document never add to it.
     pub evidence_credit: usize,
+    /// Fewest open document issues (document_audit's issue count) seen in
+    /// this run, and the output hash last counted. Falling below it is
+    /// progress; the first count of a run is the baseline.
+    #[serde(skip)]
+    pub fewest_document_issues: Option<usize>,
+    #[serde(skip)]
+    pub document_issues_hash: Option<String>,
     /// Set once document work must converge: exploration stops and the run
     /// finishes within a fixed number of requests, reporting unresolved items.
     pub closing: Option<Closing>,

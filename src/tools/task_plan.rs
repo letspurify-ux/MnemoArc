@@ -473,19 +473,8 @@ fn decode_json(text: &str) -> Result<(Value, Option<String>)> {
         Ok(value) => return Ok((value, None)),
         Err(error) => error,
     };
-    let outer = match text.trim_start().chars().next() {
-        Some('[') => "]",
-        Some('{') => "}",
-        _ => "",
-    };
-    if error.classify() == serde_json::error::Category::Eof && !outer.is_empty() {
-        let (closing, value_due) = open_json(text);
-        if !value_due
-            && closing == outer
-            && let Ok(value) = serde_json::from_str(&format!("{text}{closing}"))
-        {
-            return Ok((value, Some(closing)));
-        }
+    if let Some((value, closing)) = decode_unclosed_json(text) {
+        return Ok((value, Some(closing)));
     }
     Err({
         // At the end of the text serde_json reports the last character, so
@@ -505,6 +494,27 @@ fn decode_json(text: &str) -> Result<(Value, Option<String>)> {
             "Invalid JSON: {error}; near {near}. Send operations as a JSON array value, not as quoted text, so no brackets or quotes need hand escaping"
         )
     })
+}
+
+/// JSON text whose items are all finished and which lacks only the closing
+/// bracket of its outermost array or object, decoded with that bracket
+/// added, and the bracket; None for any other text, valid JSON included.
+pub(super) fn decode_unclosed_json(text: &str) -> Option<(Value, String)> {
+    let outer = match text.trim_start().chars().next() {
+        Some('[') => "]",
+        Some('{') => "}",
+        _ => return None,
+    };
+    let error = serde_json::from_str::<Value>(text).err()?;
+    if error.classify() != serde_json::error::Category::Eof {
+        return None;
+    }
+    let (closing, value_due) = open_json(text);
+    if value_due || closing != outer {
+        return None;
+    }
+    let value = serde_json::from_str(&format!("{text}{closing}")).ok()?;
+    Some((value, closing))
 }
 
 /// What an unfinished JSON text still needs at its end: a value after a

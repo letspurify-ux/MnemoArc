@@ -557,4 +557,20 @@ apodex(apodex/apodex-1.1-mini:free)로 같은 요청을 실행했을 때(192라�
 
 소스 문서 프롬프트는 약 10.9K자, 답변 프롬프트는 약 7.8K자다. 소스 문서 작업의 도구 정의는 약 25.2K자에서 22.7K자로 줄었다.
 
+같은 날 nemotron-3.5-lightning 라이브 실행에서는 `document_edit`에 설정된 출력 경로를 path로 함께 보낸 마지막 수정이 알 수 없는 인자로 거절됐다. 모델은 다시 시도하지 않고 답해 그 수정이 빠졌다. `document_audit`가 이미 하던 대로, `document_edit`와 `document_edit_batch`도 출력 파일을 가리키는 path는 버리고 다른 경로만 거절한다. 일괄 편집은 각 편집 항목의 path도 같이 처리한다(`documentation::an_edit_given_the_output_path_edits_the_output`).
+
 프롬프트 길이는 약 21.7K자에서 줄었고 요청당 고정 접두가 그만큼 작아진다. 라이브 실행 비교는 아직 하지 않았으므로, 같은 요청의 실행 한 번으로 섹션 저장 시점과 인용 오류 수가 나빠지지 않았는지 확인해야 한다.
+
+같은 요청의 두 번째 nemotron-3.5-lightning 실행(145826)은 27번째 요청부터 폴더 없이 쓴 인용(`App.jsx:565`)을 `frontend/src/App.jsx:565`로 고치는 데 24개 요청을 쓰고 정체로 마감 단계에 들어갔다. 고친 것은 25개, 남은 것은 29개였다. 저장 결과는 citation_path 이슈를 8개씩만 보여 줬고, 진척 점수는 섹션·본문 줄·새 근거만 세어서 인용 수리를 진척으로 보지 않았다. 다음을 고쳤다.
+
+- 저장할 때 끝 경로가 맞는 프로젝트 파일이 하나뿐인 인용은 그 줄에서 바로 프로젝트 경로로 고쳐 저장한다. replace_text 수정과 달리 같은 줄이 코드 블록 안에 또 있어도 고친다(재실행 153933에서 이 경우 수정이 만들어지지 않았다). 저장 결과의 `citation_paths_completed`가 줄·원래 인용·저장된 인용을 알리고, 이후 old_text는 저장된 글에서 복사하라고 안내한다. 답변 워크플로는 보낸 글을 그대로 저장한다(`documentation::a_citation_missing_its_folder_is_saved_with_its_project_path`).
+- 진척 사다리는 문서의 audit 이슈 수가 이번 실행에서 가장 적었던 값보다 줄어도 진척으로 센다. 최솟값만 내려가므로 같은 글을 망가뜨렸다 고쳐도 한 번만 인정된다(`agent::readiness_tests::fewer_document_issues_than_ever_before_count_as_progress`).
+- 배열·객체 인자를 JSON 텍스트로 보내면서 항목은 모두 끝났고 마지막 닫는 괄호만 빠진 경우, task_plan처럼 그 괄호를 붙여 읽고 `adjusted_arguments`로 알린다. 같은 실행에서 edits 텍스트가 `]` 하나 없이 세 번 거절됐다(`documentation::edits_text_missing_only_its_final_bracket_is_completed`).
+- old_text가 여러 번 나오면 오류가 처음 네 곳을 각각 같은 줄 안에서 유일해질 때까지 넓힌 구절로 보여 준다. 같은 인용이 두 줄에 있어 일괄 편집이 네 번 거절됐다(`documentation::ambiguous_old_text_lists_each_occurrence_with_the_text_that_makes_it_unique`).
+
+재실행(153933)은 `complete_with_gaps`(closing_round_limit, 73라운드)로 끝났다. 위의 2·3번은 쓰일 일이 없었고, 대신 다음이 드러나 고쳤다.
+
+- 5.2절의 예시 코드 블록이 닫히지 않아, 마지막 다이어그램을 열려던 펜스가 그 블록을 닫았다. 6~8절과 요약이 코드로 렌더링됐지만 펜스 짝이 맞아 형식 검사는 통과했다. 언어가 없거나 markdown·text인 코드 블록 안의 2단계 이상 제목이 블록 앞 마지막 번호 제목에 이어지는 번호(5.3, 6.)이고 실제 제목이 쓰지 않은 번호면 `headings_inside_code_block` 이슈로 블록 줄, 끝 줄, 첫 제목 줄을 알린다. 지난 라이브 문서 95개 중 이 문서만 걸렸다(`document_format::numbered_sections_inside_an_example_block_are_reported`).
+- 자기 편집이 성공한 뒤 그 전 hash로 세 번 충돌했다. 문서의 현재 내용이 이 작업의 마지막 저장이면 충돌 오류가 현재 hash와 편집 점검 결과를 함께 준다. 다른 곳에서 바뀐 문서는 지금처럼 다시 읽게 한다(`documentation::a_hash_from_before_this_tasks_own_last_save_is_answered_with_the_current_hash`).
+- file_read의 줄 번호 라벨(`354|`)을 붙인 old_text가 두 번 거절됐다. 첫 줄이 라벨로 시작하면 라벨은 문서 글이 아니라고 알리고, 라벨을 뺀 old_text가 문서에 몇 번 나오는지 말한다(`documentation::old_text_with_file_read_line_labels_is_named_as_such`).
+- 8줄 파일을 64-107로 인용한 citation_range가 3건 남았다. 이슈의 error가 파일 줄 수를 말하고, 0번 줄·거꾸로 된 범위·빈 파일도 이유를 적는다(`documentation::a_citation_past_the_end_of_its_file_names_the_file_length`).

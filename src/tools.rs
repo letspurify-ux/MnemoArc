@@ -1436,6 +1436,23 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
         }
         Ok(())
     }
+    // The document tools always act on the configured output. Live models
+    // named that output in path (document_audit, then document_edit, whose
+    // last correction of a run was lost to the refusal); any other path is
+    // still refused as an unknown argument.
+    let drop_output_path = |object: &mut serde_json::Map<String, Value>| {
+        let names_output = object
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| {
+                path.is_empty()
+                    || output_path(&s.project)
+                        .is_ok_and(|output| documentation::names_output(s, path, &output))
+            });
+        if names_output {
+            object.remove("path");
+        }
+    };
     match name {
         // The schema shares details paging with every action; providers that
         // fill every field send it with read/update too. Paging changes no
@@ -1472,6 +1489,7 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
         "document_edit" => {
             if let Some(object) = args.as_object_mut() {
                 rename(object, "new_text", "text", "")?;
+                drop_output_path(object);
                 drop_filled_delete_text(object);
                 // Appending to a document that does not exist yet is creating
                 // it; a live run spent rounds on hashes for a missing output.
@@ -1516,11 +1534,15 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
             }
         }
         "document_edit_batch" => {
+            if let Some(object) = args.as_object_mut() {
+                drop_output_path(object);
+            }
             // Malformed (non-object) arguments reach normal validation.
             if let Some(edits) = args.get_mut("edits").and_then(Value::as_array_mut) {
                 for (index, edit) in edits.iter_mut().enumerate() {
                     if let Some(object) = edit.as_object_mut() {
                         rename(object, "new_text", "text", &format!("edits[{index}]."))?;
+                        drop_output_path(object);
                         drop_filled_delete_text(object);
                     }
                 }
@@ -1529,20 +1551,7 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
         "document_audit" => {
             if let Some(object) = args.as_object_mut() {
                 rename(object, "max_issues", "limit", "")?;
-                // The audit always reads the configured output. A live model
-                // named that output in path and was refused as an unknown
-                // argument; any other path is still refused.
-                let names_output = object
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .is_some_and(|path| {
-                        path.is_empty()
-                            || output_path(&s.project)
-                                .is_ok_and(|output| documentation::names_output(s, path, &output))
-                    });
-                if names_output {
-                    object.remove("path");
-                }
+                drop_output_path(object);
             }
         }
         // Shared-schema placeholders: search does not use a history id or
@@ -1986,8 +1995,17 @@ fn is_document_hash(value: &str) -> bool {
 /// A stale hash means the document changed; a malformed one was never issued
 /// by a tool, so rereading alone would not tell the model what went wrong.
 /// Like a missing hash, a malformed one comes with what checking the edit
-/// against the current document found (`checked`).
-fn revision_conflict(args: &Value, current: &str, checked: Option<String>) -> anyhow::Error {
+/// against the current document found (`checked`). So does a stale hash
+/// when the change was this task's own last save (`own_write`), with the
+/// current hash: the model already has the text, and a live model resent
+/// the hash from before its own successful edit three times when told only
+/// to read the output again.
+fn revision_conflict(
+    args: &Value,
+    current: &str,
+    checked: Option<String>,
+    own_write: bool,
+) -> anyhow::Error {
     let expected = args["expected_hash"].as_str().unwrap_or("");
     let checked = checked.map_or_else(String::new, |checked| {
         format!("; {checked}; nothing was written")
@@ -2010,9 +2028,24 @@ fn revision_conflict(args: &Value, current: &str, checked: Option<String>) -> an
             expected.chars().count()
         );
     }
+    if own_write {
+        return anyhow::anyhow!(
+            "document_revision_conflict: the document changed since this expected_hash, by this task's own last save; that save's result gave the current hash, {current}: resend with it{checked}"
+        );
+    }
     anyhow::anyhow!(
         "document_revision_conflict: the document changed since this expected_hash; read output and retry with its current hash"
     )
+}
+
+/// Whether the configured output still holds this task's last save, whose
+/// hash is `digest`.
+fn own_last_write(s: &Session, digest: &str) -> bool {
+    s.last_document_write
+        .as_ref()
+        .is_some_and(|(written, hash)| {
+            hash == digest && output_path(&s.project).is_ok_and(|path| path == *written)
+        })
 }
 
 /// The contiguous span removed from `current` to produce `copy`, when the
@@ -2156,6 +2189,18 @@ fn unique_document_text_span(old: &str, target: &str) -> Result<(usize, usize)> 
         bail!("patch_target_must_match_once: old_text is empty");
     }
     let Some(first) = old.find(target) else {
+        if let Some(labels) = line_labels(target) {
+            let stripped = labels.text;
+            let found = match old.matches(stripped.as_str()).count() {
+                0 => "is still not in the document",
+                1 => "occurs once",
+                _ => "occurs more than once",
+            };
+            bail!(
+                "patch_target_must_match_once: old_text is not in the current document: its lines start with labels such as {:?} that file_read puts before each line it shows; they are not document text. Without them old_text {found}. Send old_text, and any text copied the same way, without the labels",
+                labels.first
+            );
+        }
         if let Some(entities) = html_escaped_target(old, target) {
             bail!(
                 "patch_target_must_match_once: old_text contains HTML entities ({entities}) but the document has the literal characters; send old_text and text unescaped (for example => instead of =&gt;)"
@@ -2189,12 +2234,89 @@ fn unique_document_text_span(old: &str, target: &str) -> Result<(usize, usize)> 
     // occurrences such as `aa` in `aaa` are treated as ambiguous.
     let next_start = first + old[first..].chars().next().unwrap().len_utf8();
     if old[next_start..].contains(target) {
+        let passages = unique_occurrence_passages(old, target);
+        let listed = if passages.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ". Each occurrence with the text around it that makes it unique: {}; copy the one to change as old_text, or send one edit per occurrence to change each",
+                passages
+                    .iter()
+                    .map(|passage| format!("{passage:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         bail!(
-            "patch_target_must_match_once: old_text occurs {} times; include more surrounding text so it matches once",
+            "patch_target_must_match_once: old_text occurs {} times; include more surrounding text so it matches once{listed}",
             old.matches(target).count().max(2)
         );
     }
     Ok((first, first + target.len()))
+}
+
+/// An old_text copied from file_read's numbered lines: its first line
+/// starts with a "354|" label. The text without the labels on its lines,
+/// and the first label.
+struct LineLabels {
+    text: String,
+    first: String,
+}
+
+/// A live model sent old_text "354|```\n355|\n356|---" twice and was told
+/// only to copy the text exactly.
+fn line_labels(target: &str) -> Option<LineLabels> {
+    let label = |line: &str| {
+        let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+        (digits > 0 && line[digits..].starts_with('|')).then_some(digits + 1)
+    };
+    let first = label(target)?;
+    let text = target
+        .split_inclusive('\n')
+        .map(|line| label(line).map_or(line, |end| &line[end..]))
+        .collect();
+    Some(LineLabels {
+        text,
+        first: target[..first].to_owned(),
+    })
+}
+
+/// Occurrences of an ambiguous old_text listed at most.
+const OCCURRENCE_PASSAGES: usize = 4;
+/// Characters added on each side of an occurrence at most.
+const OCCURRENCE_WIDEN_STEPS: usize = 40;
+
+/// For the first occurrences of `target`, the occurrence widened one
+/// character at a time on each side, within its own line, until it occurs
+/// once in `old`. A live model sent the same citation (RunHistory.jsx:5-22)
+/// on two lines as old_text in four batches; "include more surrounding
+/// text" did not say which text tells them apart. Occurrences whose line
+/// repeats elsewhere are left out.
+fn unique_occurrence_passages(old: &str, target: &str) -> Vec<String> {
+    let mut passages = Vec::new();
+    for (at, _) in old.match_indices(target).take(OCCURRENCE_PASSAGES) {
+        let line_start = old[..at].rfind('\n').map_or(0, |index| index + 1);
+        let line_end = old[at + target.len()..]
+            .find('\n')
+            .map_or(old.len(), |index| at + target.len() + index);
+        let (mut start, mut end) = (at, at + target.len());
+        for _ in 0..OCCURRENCE_WIDEN_STEPS {
+            if start == line_start && end == line_end {
+                break;
+            }
+            start -= old[line_start..start]
+                .chars()
+                .next_back()
+                .map_or(0, char::len_utf8);
+            end += old[end..line_end].chars().next().map_or(0, char::len_utf8);
+            let passage = &old[start..end];
+            if old.matches(passage).nth(1).is_none() {
+                passages.push(passage.to_owned());
+                break;
+            }
+        }
+    }
+    passages
 }
 
 /// Where an old_text that begins like the document stops matching it. The
@@ -3388,6 +3510,9 @@ fn recover_copied_text(
     None
 }
 
+/// Completed citation paths a save result lists; its count covers the rest.
+const CITATION_PATHS_LISTED: usize = 8;
+
 /// Outline entries a save result carries at most (about 1.5K tokens).
 const OUTLINE_SAVE_ENTRIES: usize = 60;
 const OUTLINE_OMITTED_NOTE: &str = "outline lists the headings of the edited part with their ancestors and neighbours, then the top heading levels while they fit; outline_omitted deeper headings are not listed. document_inspect (offset 0, limit 100) pages the complete outline when a placement needs an unlisted heading.";
@@ -3416,6 +3541,15 @@ fn persist_document_edit(
     result: String,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value> {
+    // A citation naming its file without the folder is saved with the
+    // project path its ready citation_path fix names.
+    let (result, completed) = match (s.task.workflow != "answer")
+        .then(|| documentation::complete_citation_paths(s, path, &result))
+        .flatten()
+    {
+        Some((fixed, completed)) => (fixed, completed),
+        None => (result, Vec::new()),
+    };
     // Every persisted document must remain readable by document_inspect and
     // subsequent edits, which both use read_text's size and text checks.
     if result.len() > MAX_FILE_BYTES {
@@ -3492,6 +3626,13 @@ fn persist_document_edit(
     // The answer workflow verifies nothing: report the write only.
     if s.task.workflow == "answer" {
         return Ok(saved);
+    }
+    if !completed.is_empty() {
+        saved["citation_paths_completed"] = json!({
+            "count":completed.len(),
+            "items":completed.iter().take(CITATION_PATHS_LISTED).collect::<Vec<_>>(),
+            "note":"These citations named a file without its folder; the save wrote the project path in saved_as, so the saved text differs from the text sent there. Copy later old_text from the saved text."
+        });
     }
     saved["citation_check"] = documentation::citation_check(s, path, &result)?;
     saved["format_check"] = document_format::check(&result).write_result();
@@ -5320,7 +5461,8 @@ fn execute_repaired(
 ) -> Result<Value> {
     unwrap_task_state_call(name, &mut args);
     normalize_integer_arguments(name, &mut args);
-    let adjusted = clamp_size_arguments(name, &mut args);
+    let mut adjusted = complete_unclosed_json_arguments(name, &mut args);
+    adjusted.extend(clamp_size_arguments(name, &mut args));
     unwrap_continuation_cursor(name, &mut args);
     normalize_argument_aliases(s, name, &mut args)?;
     normalize_lone_carriage_returns(name, &mut args);
@@ -6097,18 +6239,20 @@ fn execute_repaired(
                 && !(anchored && omitted)
                 && args["expected_hash"].as_str() != Some(digest.as_str())
             {
-                let checked = args["expected_hash"]
-                    .as_str()
-                    .is_some_and(|expected| !is_document_hash(expected))
-                    .then(|| {
-                        let failures: Vec<String> = apply_document_edit_operation(&old, &args)
-                            .err()
-                            .map(|error| error.to_string())
-                            .into_iter()
-                            .collect();
-                        checked_clause(false, &failures)
-                    });
-                return Err(revision_conflict(&args, &digest, checked));
+                let own_write = own_last_write(s, &digest);
+                let checked = (own_write
+                    || args["expected_hash"]
+                        .as_str()
+                        .is_some_and(|expected| !is_document_hash(expected)))
+                .then(|| {
+                    let failures: Vec<String> = apply_document_edit_operation(&old, &args)
+                        .err()
+                        .map(|error| error.to_string())
+                        .into_iter()
+                        .collect();
+                    checked_clause(false, &failures)
+                });
+                return Err(revision_conflict(&args, &digest, checked, own_write));
             }
             if !exists && action != "create" && action != "write" {
                 bail!(
@@ -6157,7 +6301,12 @@ fn execute_repaired(
                 && !hash_malformed
                 && args["expected_hash"].as_str() != Some(digest.as_str())
             {
-                return Err(revision_conflict(&args, &digest, None));
+                return Err(revision_conflict(
+                    &args,
+                    &digest,
+                    None,
+                    own_last_write(s, &digest),
+                ));
             }
             let edits = args["edits"].as_array().expect("validated edits array");
             let mut current = old.clone();
@@ -6218,6 +6367,7 @@ fn execute_repaired(
                     &args,
                     &digest,
                     Some(checked_clause(true, &failures)),
+                    false,
                 ));
             }
             if let Some((first, rest)) = failures.split_first() {
@@ -6274,6 +6424,39 @@ fn execute_repaired(
 /// schema maximum. They only bound how much a call returns, so the call runs
 /// at the maximum and the result says so. A live model sent source_search
 /// after:40, then 30 and 25, each rejected while the read was still needed.
+/// An array or object argument sent as JSON text whose items are all
+/// finished and which lacks only its final closing bracket is decoded with
+/// that bracket added, as task_plan decodes its operations. A live model
+/// sent document_edit_batch edits text missing its final "]" three times,
+/// once resending the same text after the type error named the cause.
+fn complete_unclosed_json_arguments(name: &str, args: &mut Value) -> Vec<String> {
+    if name == "task_plan" {
+        return vec![];
+    }
+    let Some(spec) = ToolRegistry::specs().into_iter().find(|t| t.name == name) else {
+        return vec![];
+    };
+    let Some(fields) = args.as_object_mut() else {
+        return vec![];
+    };
+    let mut completed = Vec::new();
+    for (key, value) in fields.iter_mut() {
+        let kind = &spec.parameters["properties"][key]["type"];
+        if (*kind == "array" || *kind == "object")
+            && let Some(text) = value.as_str()
+            && let Some((decoded, closing)) = task_plan::decode_unclosed_json(text.trim())
+            && (decoded.is_array() && *kind == "array" || decoded.is_object() && *kind == "object")
+        {
+            *value = decoded;
+            completed.push(format!(
+                "{key} text was missing its final {closing:?}, which was added; send {key} as a JSON {} value, not as quoted text",
+                kind.as_str().unwrap_or("array")
+            ));
+        }
+    }
+    completed
+}
+
 fn clamp_size_arguments(name: &str, args: &mut Value) -> Vec<String> {
     let Some(spec) = ToolRegistry::specs().into_iter().find(|t| t.name == name) else {
         return vec![];
@@ -6647,6 +6830,20 @@ pub fn audit_document(s: &mut Session) -> Result<Value> {
         &json!({}),
         &tokio_util::sync::CancellationToken::new(),
     )
+}
+
+/// The configured output's hash and the number of issues document_audit
+/// reports for it; None when the output is missing or still has the hash
+/// `known`, so an unchanged document is not checked again.
+pub fn document_issue_count(s: &Session, known: Option<&str>) -> Option<(String, usize)> {
+    let path = output_path(&s.project).ok()?;
+    let doc = read_text(&path).ok()?;
+    let digest = hash(doc.as_bytes());
+    if known == Some(digest.as_str()) {
+        return None;
+    }
+    let count = documentation::open_issue_count(s, &path, &doc).ok()?;
+    Some((digest, count))
 }
 
 pub fn run_call(s: &mut Session, call: &crate::llm::ToolCall) -> Value {

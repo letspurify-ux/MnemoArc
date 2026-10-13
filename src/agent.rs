@@ -46,6 +46,34 @@ fn progress_score(s: &Session) -> usize {
         + s.progress_recovery.evidence_credit
 }
 
+/// Whether the output's open issues (document_audit's issue count) fell
+/// below the fewest seen in this run. The repairs the final answer requires
+/// (citation paths and ranges, format, citations narrowed to read lines)
+/// add no section, line or evidence: a live run fixed 25 citation paths over
+/// 24 requests and was closed as stalled. The fewest count only falls, so
+/// breaking and repairing the same text is credited once.
+fn document_issues_fell(s: &mut Session) -> bool {
+    if !s.is_document_work() {
+        return false;
+    }
+    let known = s.progress_recovery.document_issues_hash.clone();
+    let Some((digest, count)) = tools::document_issue_count(s, known.as_deref()) else {
+        return false;
+    };
+    let recovery = &mut s.progress_recovery;
+    recovery.document_issues_hash = Some(digest);
+    let fell = recovery
+        .fewest_document_issues
+        .is_some_and(|fewest| count < fewest);
+    if recovery
+        .fewest_document_issues
+        .is_none_or(|fewest| count < fewest)
+    {
+        recovery.fewest_document_issues = Some(count);
+    }
+    fell
+}
+
 /// Cited ranges of the output document never delivered as complete lines of
 /// the current file version; zero before the document exists. An existing
 /// output this task has not written yet counts too: correction runs on an
@@ -1516,6 +1544,8 @@ pub async fn run_session_controlled(
     s.progress_recovery.evidence_credit = tools::delivered_source_lines(&s);
     s.progress_recovery.best_score = progress_score(&s);
     s.progress_recovery.rounds_since_best = 0;
+    s.progress_recovery.fewest_document_issues = None;
+    s.progress_recovery.document_issues_hash = None;
     // The ladder counts completed model requests, so the first loop pass of
     // a run only establishes the baseline score.
     let mut ladder_request_completed = false;
@@ -1720,8 +1750,11 @@ pub async fn run_session_controlled(
                 .evidence_credit
                 .max(tools::delivered_source_lines(&s));
             let score = progress_score(&s);
+            let repaired = document_issues_fell(&mut s);
             if score > s.progress_recovery.best_score {
                 s.progress_recovery.best_score = score;
+                s.progress_recovery.rounds_since_best = 0;
+            } else if repaired {
                 s.progress_recovery.rounds_since_best = 0;
             } else if request_completed {
                 s.progress_recovery.rounds_since_best =
@@ -3576,6 +3609,61 @@ mod readiness_tests {
     use super::*;
     use crate::config::Project;
 
+    // Live run 2026-10-13: 14 saves repaired citations over 24 requests and
+    // the run was closed as stalled, because repairs add no section, line
+    // or evidence.
+    #[test]
+    fn fewer_document_issues_than_ever_before_count_as_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            Config {
+                model: "gpt-4o".into(),
+                ..Config::compact_test()
+            },
+        );
+        s.add_user("Document a.rs.".into());
+        s.select_workflow("source_document").unwrap();
+        tools::execute(
+            &mut s,
+            "file_read",
+            json!({"path":"a.rs","start_line":1,"max_lines":1}),
+        )
+        .unwrap();
+        // No document yet, then the first count is the baseline.
+        assert!(!document_issues_fell(&mut s));
+        let save = |s: &mut Session, text: &str| {
+            let args = match std::fs::read(dir.path().join("out.md")) {
+                Ok(old) => {
+                    json!({"action":"write","expected_hash":tools::hash(&old),"text":text})
+                }
+                Err(_) => json!({"action":"create","text":text}),
+            };
+            tools::execute(s, "document_edit", args).unwrap();
+        };
+        // Two citations past the end of a.rs.
+        save(&mut s, "# A\n\nOne a.rs:5.\nTwo a.rs:6.\n");
+        assert!(!document_issues_fell(&mut s));
+        assert_eq!(s.progress_recovery.fewest_document_issues, Some(2));
+        // An unchanged document is not counted again.
+        assert!(!document_issues_fell(&mut s));
+        save(&mut s, "# A\n\nOne a.rs:1.\nTwo a.rs:6.\n");
+        assert!(document_issues_fell(&mut s));
+        // Breaking a citation and repairing it again is not new progress.
+        save(&mut s, "# A\n\nOne a.rs:7.\nTwo a.rs:6.\n");
+        assert!(!document_issues_fell(&mut s));
+        save(&mut s, "# A\n\nOne a.rs:1.\nTwo a.rs:6.\n");
+        assert!(!document_issues_fell(&mut s));
+        save(&mut s, "# A\n\nOne a.rs:1.\nTwo a.rs:1.\n");
+        assert!(document_issues_fell(&mut s));
+        assert_eq!(s.progress_recovery.fewest_document_issues, Some(0));
+    }
+
     #[test]
     fn unread_citations_block_readiness_until_read() {
         let dir = tempfile::tempdir().unwrap();
@@ -3666,9 +3754,15 @@ mod readiness_tests {
         tools::execute(
             &mut s,
             "document_edit",
-            json!({"action":"create","text":"# Manual\n\nStarts at agent.rs:1.\n"}),
+            json!({"action":"create","text":"# Manual\n\nStarts here.\n"}),
         )
         .unwrap();
+        // A save completes a citation missing its folder; stand in for a
+        // document whose citation still lacks it (one this task has not
+        // saved), which keeps its ready fix.
+        let unsaved = "# Manual\n\nStarts at agent.rs:1.\n";
+        std::fs::write(dir.path().join("out.md"), unsaved).unwrap();
+        s.last_document_write = Some((dir.path().join("out.md"), tools::hash(unsaved.as_bytes())));
         // A live closing kept its last to-do open and never received the
         // document's problems.
         s.progress_recovery.closing = Some(Default::default());

@@ -83,6 +83,14 @@ pub(super) fn check(doc: &str) -> FormatCheck {
     options.extension.front_matter_delimiter = Some("---".into());
     let root = parse_document(&arena, doc, &options);
     let mut engine = None;
+    // Numbered section labels of the real headings, by line.
+    let numbered: Vec<(usize, String)> = super::documentation::headings(doc)
+        .iter()
+        .filter_map(|heading| {
+            let title = heading.heading.trim_start_matches('#').trim();
+            super::section_number(title).map(|label| (heading.line, label.to_owned()))
+        })
+        .collect();
     // Literal code and HTML may contain table examples, including multi-line
     // inline code. Those examples must not be mistaken for broken table syntax.
     let mut literal_lines = vec![false; lines.len()];
@@ -119,6 +127,11 @@ pub(super) fn check(doc: &str) -> FormatCheck {
                 if !code.closed {
                     result.issues.push(json!({"kind":"unclosed_code_fence","line":start,
                         "guidance":"Close this code block with the same fence marker and at least the opening fence length."}));
+                }
+                if let Some(issue) =
+                    headings_in_code_block(&numbered, start, end, &code.info, &code.literal)
+                {
+                    result.issues.push(issue);
                 }
                 if code
                     .info
@@ -416,6 +429,61 @@ fn other_script(c: char) -> Option<&'static str> {
 fn extension_warning(result: &mut FormatCheck, line: usize, end_line: usize) {
     result.warnings.push(json!({"kind":"markdown_ui_extension_unchecked","line":line,"end_line":end_line,
         "guidance":"This table uses UI math or serialized chart/Mermaid syntax; its columns and embedded diagrams were not validated by the GFM check."}));
+}
+
+/// Headings in a code block that continue the document's section numbering
+/// (5.3 or 6. after a real 5.2 heading, a label no real heading uses). An
+/// example whose closing fence is missing turns the next fence into its
+/// close, and every section between renders as code with its citations
+/// unchecked. A live document kept sections 6-8 inside an example opened in
+/// 5.2; its fences paired, so nothing was reported, and the model spent 25
+/// requests on the fence at the end. Only level 2+ headings in Markdown or
+/// plain-text blocks count: other languages hold `#` comments.
+fn headings_in_code_block(
+    numbered: &[(usize, String)],
+    start: usize,
+    end: usize,
+    info: &str,
+    literal: &str,
+) -> Option<Value> {
+    let language = info.split_whitespace().next().unwrap_or("").to_lowercase();
+    if !matches!(
+        language.as_str(),
+        "" | "markdown" | "md" | "text" | "txt" | "plaintext"
+    ) {
+        return None;
+    }
+    let top = |label: &str| label.split('.').next()?.parse::<u64>().ok();
+    let (_, previous) = numbered.iter().rev().find(|(line, _)| *line < start)?;
+    // The numbering may go on inside the block (6, 7, 8).
+    let mut previous = top(previous)?;
+    let mut headings = Vec::new();
+    let mut first_line = None;
+    for (index, line) in literal.lines().enumerate() {
+        let trimmed = line.trim_start_matches(' ');
+        let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+        if !(2..=6).contains(&level) || !trimmed[level..].starts_with([' ', '\t']) {
+            continue;
+        }
+        let Some(label) = super::section_number(trimmed[level..].trim()) else {
+            continue;
+        };
+        if let Some(number) = top(label)
+            && (number == previous || number == previous + 1)
+            && !numbered.iter().any(|(_, used)| used == label)
+        {
+            previous = number;
+            first_line.get_or_insert(start + 1 + index);
+            headings.push(trimmed.trim_end().to_owned());
+        }
+    }
+    let first_line = first_line?;
+    Some(
+        json!({"kind":"headings_inside_code_block","line":start,"end_line":end,
+        "first_heading_line":first_line,"heading_count":headings.len(),
+        "headings":headings.iter().take(3).collect::<Vec<_>>(),
+        "guidance":"These headings continue the document's section numbering but stand inside this code block, so their sections render as code and their citations are not checked. An example above them was probably never closed: add a closing fence line where the example ends, before first_heading_line, then check that the fence at end_line still pairs as intended."}),
+    )
 }
 
 fn uses_mermaid_ui_extension(source: &str) -> bool {

@@ -1217,6 +1217,288 @@ fn an_audit_given_the_output_path_audits_the_output() {
     assert!(error.starts_with("unknown_argument"), "{error}");
 }
 
+// Live run 2026-10-13: document_edit_batch edits arrived as JSON text with
+// every item finished and only the final "]" missing, three times; the type
+// error naming serde's "EOF while parsing a list" did not get it resent
+// whole.
+#[test]
+fn edits_text_missing_only_its_final_bracket_is_completed() {
+    let (dir, mut s) = source_setup();
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n\nFirst text.\n"}),
+    );
+    let saved = run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":saved["hash"],"edits":" [{\"action\": \"replace_text\", \"old_text\": \"First text.\", \"text\": \"Second \\\"quoted\\\" text.\"}"}),
+    );
+    let doc = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+    assert!(doc.contains("Second \"quoted\" text."), "{doc}");
+    assert_eq!(
+        saved["adjusted_arguments"],
+        json!([
+            "edits text was missing its final \"]\", which was added; send edits as a JSON array value, not as quoted text"
+        ]),
+        "{saved}"
+    );
+    // Text cut inside an item, or missing more than the last bracket, is
+    // not guessed.
+    for edits in [
+        "[{\"action\": \"replace_text\", \"old_text\": \"Second",
+        "[{\"action\": \"replace_text\", \"old_text\": \"x\", \"text\": \"y\"},",
+        "[{\"action\": \"replace_text\", \"old_text\": \"x\", \"text\": \"y\"",
+    ] {
+        let error = tools::execute(
+            &mut s,
+            "document_edit_batch",
+            json!({"expected_hash":saved["hash"],"edits":edits}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("invalid_argument_type: edits must be array, got string"),
+            "{error}"
+        );
+    }
+}
+
+// Live run 2026-10-13: the same citation on two lines was sent as old_text
+// in four batches; "include more surrounding text" did not say which text
+// tells the lines apart.
+#[test]
+fn ambiguous_old_text_lists_each_occurrence_with_the_text_that_makes_it_unique() {
+    let (dir, mut s) = source_setup();
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Flow\n\n- 단계를 표시합니다([문서]: Chat.jsx:33-53).\n- 예: `\"답변 생성 중\"` 등([문서]: Chat.jsx:33-53).\n"}),
+    );
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":saved["hash"],"old_text":"Chat.jsx:33-53","text":"frontend/src/Chat.jsx:33-53"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("patch_target_must_match_once: old_text occurs 2 times"),
+        "{error}"
+    );
+    assert!(
+        error.contains(
+            "Each occurrence with the text around it that makes it unique: \"다([문서]: Chat.jsx:33-53).\", \"등([문서]: Chat.jsx:33-53).\"; copy the one to change as old_text"
+        ),
+        "{error}"
+    );
+    // A listed passage is a valid old_text.
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":saved["hash"],"old_text":"등([문서]: Chat.jsx:33-53).","text":"등([문서]: frontend/src/Chat.jsx:33-53)."}),
+    );
+    let doc = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+    assert!(
+        doc.contains("등([문서]: frontend/src/Chat.jsx:33-53)."),
+        "{doc}"
+    );
+    // Occurrences on identical lines cannot be told apart within a line.
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","text":"\nSame line.\n\nSame line.\n"}),
+    );
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":saved["hash"],"old_text":"Same","text":"Other"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.ends_with("include more surrounding text so it matches once"),
+        "{error}"
+    );
+}
+
+// Live run 2026-10-13: after its own replace_text succeeded, a model sent
+// the hash from before it three times and was told only to read the output.
+#[test]
+fn a_hash_from_before_this_tasks_own_last_save_is_answered_with_the_current_hash() {
+    let (dir, mut s) = source_setup();
+    let first = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n\nFirst text.\n\nLast text.\n"}),
+    );
+    let second = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":first["hash"],"old_text":"First text.","text":"Second text."}),
+    );
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":first["hash"],"old_text":"Last text.","text":"End text."}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with(&format!(
+            "document_revision_conflict: the document changed since this expected_hash, by this task's own last save; that save's result gave the current hash, {}: resend with it; the edit was checked against the current document and has no other problem; nothing was written",
+            second["hash"].as_str().unwrap()
+        )),
+        "{error}"
+    );
+    let error = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":first["hash"],"edits":[{"action":"replace_text","old_text":"Last text.","text":"End text."}]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("by this task's own last save"), "{error}");
+    assert!(error.contains(second["hash"].as_str().unwrap()), "{error}");
+    // A change made outside this task's saves still needs a read.
+    std::fs::write(
+        dir.path().join("summary.md"),
+        "# Guide\n\nOther text.\n\nLast text.\n",
+    )
+    .unwrap();
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":second["hash"],"old_text":"Last text.","text":"End text."}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert_eq!(
+        error,
+        "document_revision_conflict: the document changed since this expected_hash; read output and retry with its current hash"
+    );
+}
+
+// Live run 2026-10-13: old_text copied from file_read's numbered lines
+// ("354|```\n355|\n356|---") was refused twice with only "copy it exactly".
+#[test]
+fn old_text_with_file_read_line_labels_is_named_as_such() {
+    let (_dir, mut s) = source_setup();
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\n\nFirst text.\n\n---\n"}),
+    );
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":saved["hash"],"old_text":"3|First text.\n4|\n5|---","text":"3|First text.\n4|---"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with(
+            "patch_target_must_match_once: old_text is not in the current document: its lines start with labels such as \"3|\" that file_read puts before each line it shows; they are not document text. Without them old_text occurs once."
+        ),
+        "{error}"
+    );
+    // Only the first line labeled, as the live model also sent.
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","expected_hash":saved["hash"],"old_text":"3|First text.\nMissing","text":"x"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("Without them old_text is still not in the document"),
+        "{error}"
+    );
+}
+
+// Live run 2026-10-13: a closing re-read an 8-line file cited as 64-107 for
+// 12 requests; the issue did not say how long the file is.
+#[test]
+fn a_citation_past_the_end_of_its_file_names_the_file_length() {
+    let (dir, mut s) = source_setup();
+    std::fs::write(dir.path().join("main.jsx"), "line\n".repeat(8)).unwrap();
+    std::fs::write(dir.path().join("empty.js"), "").unwrap();
+    std::fs::write(
+        dir.path().join("summary.md"),
+        "# Guide\n\nStart main.jsx:64-107.\nZero main.jsx:0.\nBack main.jsx:5-2.\nNone empty.js:1.\n",
+    )
+    .unwrap();
+    let audit = run(&mut s, "document_audit", json!({}));
+    let errors: Vec<_> = audit["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| issue["kind"] == "citation_range")
+        .map(|issue| issue["error"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            "main.jsx has 8 lines; cite lines within 1-8 that hold the claim, or remove the citation",
+            "line numbers start at 1",
+            "the range ends before it starts",
+            "empty.js is empty; cite the file that holds the claim, or remove the citation",
+        ],
+        "{audit}"
+    );
+}
+
+#[test]
+fn an_edit_given_the_output_path_edits_the_output() {
+    // Live run 2026-10-13: document_edit with path set to the configured
+    // output was refused as an unknown argument, and the model answered
+    // instead of retrying, so its last correction was lost.
+    let (dir, mut s) = source_setup();
+    let outside = tempfile::tempdir().unwrap();
+    s.project.output = outside.path().join("generated.md");
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\nFirst text.\n"}),
+    );
+    let output = s.project.output.display().to_string();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","path":output,"old_text":"First text.","new_text":"Second text."}),
+    );
+    let hash = tools::hash(&std::fs::read(&s.project.output).unwrap());
+    run(
+        &mut s,
+        "document_edit_batch",
+        json!({"path":output,"expected_hash":hash,"edits":[
+            {"action":"replace_text","path":"generated.md","old_text":"Second text.","text":"Third text."}
+        ]}),
+    );
+    let doc = std::fs::read_to_string(&s.project.output).unwrap();
+    assert!(doc.contains("Third text."), "{doc}");
+    // Another path is still refused: these tools edit only the output.
+    std::fs::write(dir.path().join("other.md"), "# Other\nThird text.\n").unwrap();
+    for (name, args) in [
+        (
+            "document_edit",
+            json!({"action":"replace_text","path":"other.md","old_text":"Third text.","text":"x"}),
+        ),
+        (
+            "document_edit_batch",
+            json!({"path":"other.md","edits":[{"action":"replace_text","old_text":"Third text.","text":"x"}]}),
+        ),
+    ] {
+        let error = tools::execute(&mut s, name, args).unwrap_err().to_string();
+        assert!(error.starts_with("unknown_argument"), "{name}: {error}");
+    }
+    assert!(
+        std::fs::read_to_string(&s.project.output)
+            .unwrap()
+            .contains("Third text.")
+    );
+}
+
 #[test]
 fn inspecting_the_output_by_path_before_the_first_write_reports_it_missing() {
     // A live model named the configured output's path before writing it and
@@ -4392,8 +4674,11 @@ fn a_blank_section_reads_the_outline() {
     assert_eq!(page["outline"].as_array().map(Vec::len), Some(2), "{page}");
 }
 
-#[test]
-fn a_citation_missing_its_folder_comes_with_its_line_and_a_ready_fix() {
+/// A session whose src/agent.rs has 2600 lines, line 25 read, and a
+/// document citing it as agent.rs:25 twice. The live shape: agent.rs:25 also
+/// occurs inside src/agent.rs:2563, so a replace_text of the bare citation
+/// alone matched several places.
+fn folderless_citation_setup() -> (tempfile::TempDir, Session, &'static str) {
     let (dir, mut s) = source_setup();
     std::fs::create_dir(dir.path().join("src")).unwrap();
     let source: String = (1..=2600).map(|n| format!("fn f{n}() {{}}\n")).collect();
@@ -4403,40 +4688,116 @@ fn a_citation_missing_its_folder_comes_with_its_line_and_a_ready_fix() {
         "file_read",
         json!({"path":"src/agent.rs","start_line":25,"max_lines":1}),
     );
-    // The live shape: agent.rs:25 also occurs inside src/agent.rs:2563, so
-    // a replace_text of the bare citation alone matched several places.
     let doc = "# Flow\n\nThe loop starts here (agent.rs:25).\nIt ends at `src/agent.rs:2563`.\n\n| Step | Where |\n|---|---|\n| Start | agent.rs:25 |\n";
-    let saved = run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":doc}),
-    );
-    let issues: Vec<_> = saved["citation_check"]["issues"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|issue| issue["kind"] == "citation_path")
-        .cloned()
-        .collect();
-    assert_eq!(issues.len(), 2, "{saved}");
-    assert_eq!(issues[0]["line"], 3);
-    assert_eq!(issues[0]["suggested"], "src/agent.rs:25");
-    assert_eq!(issues[1]["line"], 8);
-    let fixes: Vec<_> = issues.iter().map(|issue| issue["fix"].clone()).collect();
-    assert!(fixes.iter().all(Value::is_object), "{saved}");
-    // Every listed fix applies together in one batch.
-    run(
-        &mut s,
-        "document_edit_batch",
-        json!({"expected_hash":saved["hash"],"edits":fixes}),
-    );
-    let doc = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+    (dir, s, doc)
+}
+
+fn assert_folderless_citations_completed(doc: &str) {
     assert!(doc.contains("(src/agent.rs:25)"), "{doc}");
     assert!(doc.contains("| src/agent.rs:25 |"), "{doc}");
     assert!(
         doc.contains("`src/agent.rs:2563`") && !doc.contains("src/src/"),
         "{doc}"
     );
+}
+
+// Live run 2026-10-13: a document citing App.jsx:565 and 50 more files
+// without their folder spent 24 requests rewriting the paths, eight issues
+// per save result, and was closed as stalled.
+#[test]
+fn a_citation_missing_its_folder_is_saved_with_its_project_path() {
+    let (dir, mut s, doc) = folderless_citation_setup();
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":doc}),
+    );
+    let written = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+    assert_folderless_citations_completed(&written);
+    assert_eq!(saved["hash"], tools::hash(written.as_bytes()), "{saved}");
+    let completed = &saved["citation_paths_completed"];
+    assert_eq!(completed["count"], 2, "{saved}");
+    assert_eq!(
+        completed["items"][0],
+        json!({"line":3,"cited":"agent.rs:25","saved_as":"src/agent.rs:25"})
+    );
+    assert_eq!(completed["items"][1]["line"], 8);
+    assert!(
+        completed["note"]
+            .as_str()
+            .unwrap()
+            .contains("Copy later old_text from the saved text")
+    );
+    assert_eq!(saved["citation_check"]["issue_count"], 0, "{saved}");
+    // A later edit written with the bare citation is completed the same way.
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":saved["hash"],"text":"## End\n\nIt returns at agent.rs:25.\n"}),
+    );
+    let written = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+    assert!(
+        written.contains("It returns at src/agent.rs:25."),
+        "{written}"
+    );
+    assert_eq!(saved["citation_paths_completed"]["count"], 1, "{saved}");
+    // Live run 2026-10-13: the same line also stood inside a code block,
+    // where it is an example, so no replace_text of it was unique; the
+    // citation line is completed in place and the example stays.
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","expected_hash":saved["hash"],"text":"## Again\n\nSee agent.rs:25 here.\n\n```text\nSee agent.rs:25 here.\n```\n"}),
+    );
+    let written = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+    assert!(
+        written.contains("See src/agent.rs:25 here.\n\n```text\nSee agent.rs:25 here.\n```"),
+        "{written}"
+    );
+    assert_eq!(saved["citation_paths_completed"]["count"], 1, "{saved}");
+    // The answer workflow saves what it is sent.
+    let (dir, mut s, doc) = folderless_citation_setup();
+    s.select_workflow("answer").unwrap();
+    s.active_tools.insert("document_edit".into());
+    let saved = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":doc}),
+    );
+    assert!(saved.get("citation_paths_completed").is_none(), "{saved}");
+    let written = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+    assert_eq!(written, doc);
+}
+
+#[test]
+fn a_citation_missing_its_folder_comes_with_its_line_and_a_ready_fix() {
+    // A document this task has not saved yet, such as the existing output
+    // of a correction run, lists the fixes.
+    let (dir, mut s, doc) = folderless_citation_setup();
+    std::fs::write(dir.path().join("summary.md"), doc).unwrap();
+    let audit = run(&mut s, "document_audit", json!({}));
+    let issues: Vec<_> = audit["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| issue["kind"] == "citation_path")
+        .cloned()
+        .collect();
+    assert_eq!(issues.len(), 2, "{audit}");
+    assert_eq!(issues[0]["line"], 3);
+    assert_eq!(issues[0]["suggested"], "src/agent.rs:25");
+    assert_eq!(issues[1]["line"], 8);
+    let fixes: Vec<_> = issues.iter().map(|issue| issue["fix"].clone()).collect();
+    assert!(fixes.iter().all(Value::is_object), "{audit}");
+    // Every listed fix applies together in one batch.
+    let saved = run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":audit["hash"],"edits":fixes}),
+    );
+    assert!(saved.get("citation_paths_completed").is_none(), "{saved}");
+    let doc = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+    assert_folderless_citations_completed(&doc);
     let audit = run(&mut s, "document_audit", json!({}));
     assert!(
         audit["issue_kinds"].get("citation_path").is_none(),
@@ -4486,7 +4847,8 @@ fn a_budget_cut_read_of_the_output_is_not_repeated_with_another_max_lines() {
             "Step {n} keeps the run going and is explained at some length here.\n"
         ));
     }
-    doc.push_str("The end is at agent.rs:1.\n");
+    // Line 9 is past the end of src/agent.rs.
+    doc.push_str("The end is at src/agent.rs:9.\n");
     run(
         &mut s,
         "document_edit",
@@ -4533,20 +4895,27 @@ fn two_unresolved_citations_on_one_line_share_one_fix() {
     std::fs::create_dir(dir.path().join("src")).unwrap();
     let source: String = (1..=40).map(|n| format!("fn f{n}() {{}}\n")).collect();
     std::fs::write(dir.path().join("src/agent.rs"), source).unwrap();
-    let saved = run(
-        &mut s,
-        "document_edit",
-        json!({"action":"create","text":"# A\n\nFrom agent.rs:3 to agent.rs:30-32.\n"}),
-    );
-    let issues = saved["citation_check"]["issues"].as_array().unwrap();
-    assert_eq!(issues.len(), 2, "{saved}");
-    assert!(issues[0]["fix"].is_object(), "{saved}");
-    assert!(issues[1].get("fix").is_none(), "{saved}");
+    // A document this task has not saved: a save completes such paths.
+    std::fs::write(
+        dir.path().join("summary.md"),
+        "# A\n\nFrom agent.rs:3 to agent.rs:30-32.\n",
+    )
+    .unwrap();
+    let audit = run(&mut s, "document_audit", json!({}));
+    let issues: Vec<_> = audit["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| issue["kind"] == "citation_path")
+        .collect();
+    assert_eq!(issues.len(), 2, "{audit}");
+    assert!(issues[0]["fix"].is_object(), "{audit}");
+    assert!(issues[1].get("fix").is_none(), "{audit}");
     assert_eq!(issues[1]["covered_by_line_fix"], true);
     run(
         &mut s,
         "document_edit_batch",
-        json!({"expected_hash":saved["hash"],"edits":[issues[0]["fix"].clone()]}),
+        json!({"expected_hash":audit["hash"],"edits":[issues[0]["fix"].clone()]}),
     );
     let doc = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
     assert!(
@@ -4916,16 +5285,22 @@ fn a_link_label_whose_target_is_the_citation_is_display_text() {
         "document_edit",
         json!({"action":"create","text":doc}),
     );
-    let issues: Vec<_> = saved["citation_check"]["issues"]
+    // The labels whose targets are not citations are citations, and the
+    // save completes their paths; the labels on line 3 are display text.
+    let completed: Vec<_> = saved["citation_paths_completed"]["items"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|issue| issue["kind"] == "citation_path")
-        .cloned()
+        .map(|item| item["line"].clone())
         .collect();
-    assert_eq!(issues.len(), 2, "{saved}");
-    assert_eq!(issues[0]["line"], 4, "{saved}");
-    assert_eq!(issues[1]["line"], 5, "{saved}");
+    assert_eq!(completed, [4, 5], "{saved}");
+    let written = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+    assert_eq!(written.lines().nth(2), doc.lines().nth(2), "{written}");
+    assert!(
+        written.contains("[src/agent.rs:25](https://example.com/agent.rs#L25)")
+            && written.contains("[src/agent.rs:25](docs/notes.md)"),
+        "{written}"
+    );
     assert!(
         saved["citation_check"]["unread_citations"]
             .as_array()
@@ -4936,7 +5311,10 @@ fn a_link_label_whose_target_is_the_citation_is_display_text() {
     // Two link targets on line 3, then the two labels whose targets are
     // not citations.
     assert_eq!(audit["citations_checked"], 4, "{audit}");
-    assert_eq!(audit["issue_kinds"]["citation_path"], 2, "{audit}");
+    assert!(
+        audit["issue_kinds"].get("citation_path").is_none(),
+        "{audit}"
+    );
 }
 
 // Live run 2026-10-12: sections 7 and 8 were written with the next

@@ -789,35 +789,7 @@ pub(super) fn execute(
                 );
             }
             let doc = read_text(&path)?;
-            let (checked, mut issues) = citation_issues(s, &path, &doc)?;
-            let format = super::document_format::check(&doc);
-            let format_check = format.summary();
-            // The citation scanner already catches many unclosed fences. Keep
-            // one diagnostic per fence while adding AST coverage for containers.
-            let mut fence_lines: BTreeSet<_> = issues
-                .iter()
-                .filter(|issue| issue["kind"] == "unclosed_code_fence")
-                .filter_map(|issue| issue["line"].as_u64())
-                .collect();
-            for issue in format.issues {
-                if issue["kind"] != "unclosed_code_fence"
-                    || issue["line"]
-                        .as_u64()
-                        .is_none_or(|line| fence_lines.insert(line))
-                {
-                    issues.push(issue);
-                }
-            }
-            if checked == 0 {
-                issues.push(json!({"kind":"no_machine_readable_citations","guidance":NO_CITATIONS_GUIDANCE}));
-            }
-            // The output's own absolute path in its text is a run report
-            // (where it was written), which belongs in the final answer.
-            if let Some(line) = output_path_line(&path, &doc) {
-                issues.push(json!({"kind":"output_path_in_document","line":line,
-                    "guidance":"The document states its own output path, a report of how it was produced. Remove that text; the final chat answer reports it."}));
-            }
-            issues.extend(unread_citations(s, &doc)?);
+            let (checked, issues, format_check) = audit_issues(s, &path, &doc)?;
             // The issue list includes delivered-evidence state as well as
             // document citations. Bind every continuation page to the
             // exact list that produced the first page.
@@ -879,6 +851,48 @@ pub(super) fn execute(
         }
         _ => bail!("unsupported_tool"),
     }
+}
+
+/// document_audit's issues for the output text: citation issues, format
+/// issues, a missing-citations issue, the output's own path, then unread
+/// citations; with the number of citations checked and the format summary.
+fn audit_issues(s: &Session, path: &Path, doc: &str) -> Result<(usize, Vec<Value>, Value)> {
+    let (checked, mut issues) = citation_issues(s, path, doc)?;
+    let format = super::document_format::check(doc);
+    let format_check = format.summary();
+    // The citation scanner already catches many unclosed fences. Keep
+    // one diagnostic per fence while adding AST coverage for containers.
+    let mut fence_lines: BTreeSet<_> = issues
+        .iter()
+        .filter(|issue| issue["kind"] == "unclosed_code_fence")
+        .filter_map(|issue| issue["line"].as_u64())
+        .collect();
+    for issue in format.issues {
+        if issue["kind"] != "unclosed_code_fence"
+            || issue["line"]
+                .as_u64()
+                .is_none_or(|line| fence_lines.insert(line))
+        {
+            issues.push(issue);
+        }
+    }
+    if checked == 0 {
+        issues
+            .push(json!({"kind":"no_machine_readable_citations","guidance":NO_CITATIONS_GUIDANCE}));
+    }
+    // The output's own absolute path in its text is a run report
+    // (where it was written), which belongs in the final answer.
+    if let Some(line) = output_path_line(path, doc) {
+        issues.push(json!({"kind":"output_path_in_document","line":line,
+            "guidance":"The document states its own output path, a report of how it was produced. Remove that text; the final chat answer reports it."}));
+    }
+    issues.extend(unread_citations(s, doc)?);
+    Ok((checked, issues, format_check))
+}
+
+/// How many issues document_audit reports for the output text.
+pub(super) fn open_issue_count(s: &Session, path: &Path, doc: &str) -> Result<usize> {
+    Ok(audit_issues(s, path, doc)?.1.len())
 }
 
 /// Issue counts by kind, so a page of issues still shows the whole set.
@@ -1826,6 +1840,19 @@ pub(super) fn rust_test_modules(text: &str) -> Vec<(usize, usize)> {
 }
 
 fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<Value>)> {
+    citation_issues_and_paths(s, output, doc).map(|(checked, issues, _)| (checked, issues))
+}
+
+/// (document line, cited path, project file it names): the citation_path
+/// issues that come with a suggested project path.
+type FixablePaths = Vec<(usize, String, String)>;
+
+/// citation_issues, with the fixable citation paths behind their fixes.
+fn citation_issues_and_paths(
+    s: &Session,
+    output: &Path,
+    doc: &str,
+) -> Result<(usize, Vec<Value>, FixablePaths)> {
     let (spans, mut issues) = scan_citations(doc)?;
     let mut versions = std::collections::BTreeMap::new();
     let mut suggestions = BTreeMap::<String, Option<String>>::new();
@@ -1858,8 +1885,23 @@ fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<
         });
         match check {
             Ok(lines) if *begin > 0 && end >= begin && end <= lines => {}
-            Ok(_) => {
-                issues.push(json!({"kind":"citation_range","citation":raw,"line":document_line}))
+            // Name what is wrong with the range: a live closing re-read an
+            // 8-line file cited as 64-107 for 12 requests without fixing it.
+            Ok(lines) => {
+                let error = if *lines == 0 {
+                    format!(
+                        "{cited} is empty; cite the file that holds the claim, or remove the citation"
+                    )
+                } else if *begin == 0 {
+                    "line numbers start at 1".to_owned()
+                } else if end < begin {
+                    "the range ends before it starts".to_owned()
+                } else {
+                    format!(
+                        "{cited} has {lines} lines; cite lines within 1-{lines} that hold the claim, or remove the citation"
+                    )
+                };
+                issues.push(json!({"kind":"citation_range","citation":raw,"line":document_line,"error":error}))
             }
             Err(error) => {
                 let guidance = unreadable_citation_guidance(error);
@@ -1914,7 +1956,7 @@ fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<
             issue["covered_by_line_fix"] = json!(true);
         }
     }
-    Ok((spans.len(), issues))
+    Ok((spans.len(), issues, fixable))
 }
 
 /// Widening steps tried before a fix falls back to its whole line.
@@ -1949,22 +1991,7 @@ fn citation_fixes(doc: &str, fixable: &[(usize, String, String)]) -> BTreeMap<us
         else {
             continue;
         };
-        let mut rewrites = Vec::new();
-        let mut span: Option<(usize, usize)> = None;
-        for c in pattern.captures_iter(line) {
-            let whole = c.get(0).unwrap();
-            let path = c.get(1).unwrap();
-            let Some(file) = paths.get(path.as_str()) else {
-                continue;
-            };
-            if url_prefix(&line[..whole.start()], whole.as_str()) {
-                continue;
-            }
-            rewrites.push((path.start(), path.end(), *file));
-            span = Some(span.map_or((whole.start(), whole.end()), |(start, end)| {
-                (start.min(whole.start()), end.max(whole.end()))
-            }));
-        }
+        let (rewrites, span) = path_rewrites(&pattern, line, &paths);
         let Some((mut start, mut end)) = span else {
             continue;
         };
@@ -1978,14 +2005,7 @@ fn citation_fixes(doc: &str, fixable: &[(usize, String, String)]) -> BTreeMap<us
             end += line[end..].chars().next().map_or(0, char::len_utf8);
             steps += 1;
         }
-        let mut text = String::new();
-        let mut at = start;
-        for (path_start, path_end, file) in rewrites {
-            text.push_str(&line[at..path_start]);
-            text.push_str(file);
-            at = path_end;
-        }
-        text.push_str(&line[at..end]);
+        let text = rewritten(line, start, end, &rewrites);
         let fix = json!({"action":"replace_text","old_text":&line[start..end],"text":text});
         if let Ok(next) = super::apply_document_edit_operation(&current, &fix) {
             current = next;
@@ -1993,6 +2013,107 @@ fn citation_fixes(doc: &str, fixable: &[(usize, String, String)]) -> BTreeMap<us
         }
     }
     fixes
+}
+
+/// The document with each citation path that names exactly one project
+/// file by its end (App.jsx:565 for frontend/src/App.jsx) rewritten to that
+/// file's project path, and the citations completed ({line, cited,
+/// saved_as}); None when there is none. A save writes these, so such a
+/// citation needs no repair request: a live run spent 24 requests rewriting
+/// 25 of them, eight listed per save, and was closed as stalled. Lines are
+/// rewritten in place, so an identical line elsewhere (another live
+/// document repeated one inside an unclosed code block) does not stop it,
+/// as it stops a replace_text fix.
+pub(super) fn complete_citation_paths(
+    s: &Session,
+    output: &Path,
+    doc: &str,
+) -> Option<(String, Vec<Value>)> {
+    let (_, issues, fixable) = citation_issues_and_paths(s, output, doc).ok()?;
+    let pattern = regex::Regex::new(CITATION_PATTERN).ok()?;
+    let mut by_line = BTreeMap::<usize, BTreeMap<&str, &str>>::new();
+    for (line, cited, file) in &fixable {
+        by_line
+            .entry(*line)
+            .or_default()
+            .insert(cited.as_str(), file.as_str());
+    }
+    let mut completed_lines = BTreeSet::new();
+    let mut current = String::with_capacity(doc.len());
+    for (index, piece) in doc.split_inclusive('\n').enumerate() {
+        let line = piece.trim_end_matches(['\n', '\r']);
+        let (rewrites, span) = by_line
+            .get(&(index + 1))
+            .map(|paths| path_rewrites(&pattern, line, paths))
+            .unwrap_or_default();
+        if span.is_some() {
+            current.push_str(&rewritten(line, 0, line.len(), &rewrites));
+            current.push_str(&piece[line.len()..]);
+            completed_lines.insert(index as u64 + 1);
+        } else {
+            current.push_str(piece);
+        }
+    }
+    if completed_lines.is_empty() {
+        return None;
+    }
+    let completed = issues
+        .iter()
+        .filter(|issue| {
+            issue.get("suggested").is_some()
+                && issue["line"]
+                    .as_u64()
+                    .is_some_and(|line| completed_lines.contains(&line))
+        })
+        .map(|issue| {
+            json!({"line":issue["line"],"cited":issue["citation"],"saved_as":issue["suggested"]})
+        })
+        .collect();
+    Some((current, completed))
+}
+
+/// A cited path's byte range in its line and the project file to write.
+type PathRewrite<'a> = (usize, usize, &'a str);
+
+/// The paths to rewrite in one document line, as (path start, path end,
+/// project file), for each citation whose path `paths` maps and that is not
+/// part of a URL; and the span from the first such citation to the end of
+/// the last.
+fn path_rewrites<'a>(
+    pattern: &regex::Regex,
+    line: &str,
+    paths: &BTreeMap<&str, &'a str>,
+) -> (Vec<PathRewrite<'a>>, Option<(usize, usize)>) {
+    let mut rewrites = Vec::new();
+    let mut span: Option<(usize, usize)> = None;
+    for c in pattern.captures_iter(line) {
+        let whole = c.get(0).unwrap();
+        let path = c.get(1).unwrap();
+        let Some(file) = paths.get(path.as_str()) else {
+            continue;
+        };
+        if url_prefix(&line[..whole.start()], whole.as_str()) {
+            continue;
+        }
+        rewrites.push((path.start(), path.end(), *file));
+        span = Some(span.map_or((whole.start(), whole.end()), |(start, end)| {
+            (start.min(whole.start()), end.max(whole.end()))
+        }));
+    }
+    (rewrites, span)
+}
+
+/// line[start..end] with each rewrite's path replaced by its project file.
+fn rewritten(line: &str, start: usize, end: usize, rewrites: &[PathRewrite]) -> String {
+    let mut text = String::new();
+    let mut at = start;
+    for (path_start, path_end, file) in rewrites {
+        text.push_str(&line[at..*path_start]);
+        text.push_str(file);
+        at = *path_end;
+    }
+    text.push_str(&line[at..end]);
+    text
 }
 
 /// A cited file the tools refuse to read fails every audit until the

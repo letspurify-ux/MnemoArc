@@ -170,6 +170,33 @@ fn checks_nested_mermaid_fences_and_deduplicates_unclosed_fences_in_audit() {
     );
 }
 
+// Live run 2026-10-13: an example block opened in 5.2 was never closed, so
+// the fence meant to open the closing diagram closed it, and sections 6-8
+// rendered as code. The fences paired up and the format check passed.
+#[test]
+fn numbered_sections_inside_an_example_block_are_reported() {
+    let (_dir, mut s) = setup();
+    let doc = "# Guide\n\n## 5. Drafting\n\n### 5.2 Structure\n\n```\n# Example\n## Entry Point\n\n## 6. Audit\n\n### 6.1 Check\n\n## 7. End\n\n```\nUser\n  ->\nDone\n";
+    let format = create(&mut s, doc)["format_check"].clone();
+    assert_eq!(format["issue_count"], 1, "{format}");
+    let issue = &format["issues"][0];
+    assert_eq!(issue["kind"], "headings_inside_code_block", "{format}");
+    assert_eq!(issue["line"], 7);
+    assert_eq!(issue["end_line"], 17);
+    assert_eq!(issue["first_heading_line"], 11);
+    assert_eq!(issue["heading_count"], 3);
+    assert_eq!(
+        issue["headings"],
+        json!(["## 6. Audit", "### 6.1 Check", "## 7. End"])
+    );
+    // Examples that do not continue the numbering stay examples: numbers
+    // real headings use, other languages' comments, and level-1 headings.
+    let (_dir, mut s) = setup();
+    let doc = "# Guide\n\n## 1. Intro\n\n## 2. Usage\n\n```markdown\n## 1. Intro\n## 2. Usage\n```\n\n```python\n## 3. load the data\n```\n\n```\n# 3. run it\n```\n";
+    let format = create(&mut s, doc)["format_check"].clone();
+    assert_eq!(format["issue_count"], 0, "{format}");
+}
+
 #[test]
 fn ui_extensions_and_check_limits_are_explicitly_unchecked() {
     let (_dir, mut s) = setup();

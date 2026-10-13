@@ -2286,17 +2286,20 @@ fn type_errors_name_the_expected_and_received_type() {
         "{error}"
     );
     // Live run 2026-10-08: edits text missing its closing ']' was resent
-    // twice; the error now says where the text stops being JSON.
+    // twice; the error says where the text stops being JSON. Text missing
+    // only that ']' is now completed (documentation::
+    // edits_text_missing_only_its_final_bracket_is_completed); text cut
+    // inside an item is still refused.
     let error = tools::execute(
         &mut s,
         "document_edit_batch",
-        json!({"edits":"[{\"action\":\"replace_text\",\"old_text\":\"a\",\"text\":\"b\"}"}),
+        json!({"edits":"[{\"action\":\"replace_text\",\"old_text\":\"a\""}),
     )
     .unwrap_err()
     .to_string();
     assert!(
         error.contains(
-            "edits must be array, got string; the text is not valid JSON (EOF while parsing a list"
+            "edits must be array, got string; the text is not valid JSON (EOF while parsing an object"
         ),
         "{error}"
     );
