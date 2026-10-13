@@ -68,7 +68,7 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     answer(
         "Workflow",
-        "The user selected workflow=\"answer\" for this session: answer in chat; collect and read files and documents on initial and follow-up messages; create and edit project UTF-8 files with file_edit, file_write and file_patch; create or edit the configured Markdown output only with document_edit and document_edit_batch. No audit or verification runs in this workflow; the project output path is a default location, not an instruction to create a document on every turn. For a simple question, answer directly after the necessary reads. For summarizing or explaining an existing document (including Mermaid diagrams), use the document as the requested evidence, read only the relevant sections and respond in chat; do not inspect source code or edit the document unless the user requests that work. For a requested document edit, inspect the target section, make a targeted text or section edit and check the saved result. For a source-flow question, inspect the entry or dispatch point and only the necessary helpers, then answer with a concise diagram. If the user requests JSON only, emit exactly the requested JSON object without fences or trailing explanation; identifier fields contain only the identifier, and every required citation goes in the requested citations array, because prose outside it does not satisfy it.",
+        "The user selected workflow=\"answer\" for this session: answer in chat; collect and read files and documents on initial and follow-up messages; create and edit project UTF-8 files with file_edit, file_write and file_patch; create or edit the configured Markdown output only with document_edit and document_edit_batch. The project output path is a default location, not an instruction to create a document on every turn. For a simple question, answer directly after the necessary reads. For summarizing or explaining an existing document (including Mermaid diagrams), use the document as the requested evidence, read only the relevant sections and respond in chat; do not inspect source code or edit the document unless the user requests that work. For a requested document edit, inspect the target section, make a targeted text or section edit and check the saved result. For a source-flow question, inspect the entry or dispatch point and only the necessary helpers, then answer with a concise diagram. If the user requests JSON only, emit exactly the requested JSON object without fences or trailing explanation; identifier fields contain only the identifier, and every required citation goes in the requested citations array, because prose outside it does not satisfy it.",
     ),
     both(
         "Requirements",
@@ -88,7 +88,7 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     source(
         "Citations",
-        "Every save returns citation_check.unread_citations, the cited ranges that break this rule, and the final audit refuses the document while any remains: file_read such a range or narrow the citation to the lines you read. document_audit checks citations and format, not semantic accuracy: compare each claim with its cited source yourself.",
+        "Every save returns citation_check.unread_citations, the cited ranges that break this rule, and the final audit refuses the document while any remains (closing mode reports them instead): file_read such a range or narrow the citation to the lines you read. document_audit checks citations and format, not semantic accuracy: compare each claim with its cited source yourself.",
     ),
     source(
         "Write as you read",
@@ -116,7 +116,7 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     source(
         "Plan",
-        "run_guidance.plan_check, when present, names a way the plan no longer matches the work; correct the plan accordingly.",
+        "run_guidance.plan_check, when present, names a way the plan no longer matches the work; correct the plan accordingly. In closing mode open to-dos are reported as unfinished instead of refusing the final answer.",
     ),
     both(
         "Reading the project",
@@ -124,7 +124,7 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     source(
         "Reading the project",
-        "The offered tool list can shrink during a run: broad discovery tools are withheld after a long stall and in closing mode, and a rejected call names what to use instead.",
+        "The offered tool list can shrink during a run: broad discovery tools are withdrawn after a long stall and in closing mode, so use the tools offered on each request.",
     ),
     both(
         "Reading the project",
@@ -144,15 +144,11 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     both(
         "Checkpoints",
-        "When the context fills, the runtime sends a CHECKPOINT CONTROL REQUEST while the current reads are still in context; once the checkpoint completes, those reads leave active context and only memories, the task plan, the progress note and saved files remain. On that request do not read sources.",
-    ),
-    source(
-        "Checkpoints",
-        "On the first cleanup request document edits stay offered so that what the current reads support can be saved before they leave context, as the control request says; afterwards they close until the checkpoint completes, except once more after a failed edit so it can be corrected.",
+        "When the context fills, the runtime sends a CHECKPOINT CONTROL REQUEST while the current reads are still in context; once the checkpoint completes, the older reads it retires leave active context, so their line labels are gone, while citations of ranges already read stay valid. Memories, the task plan, the progress note and saved files carry the work on. On that request do not read sources.",
     ),
     both(
         "Checkpoints",
-        "If later work needs a finding that is not saved yet, save it first, then call checkpoint_complete in the same batch with a concise progress summary; prose does not commit a checkpoint, and a separate task_state call is not required. source_lookup, at most 3 calls per checkpoint, only recovers the ID of a source already observed. If cleanup cannot succeed, explain the blocker. If pending_settings is present, clean up within the old settings first so the new limits can apply.",
+        "If later work needs a finding that is not saved yet, save it first, then call checkpoint_complete in the same batch with a concise progress summary; prose does not commit a checkpoint, and a separate task_state call is not required. source_lookup allows at most 3 calls per checkpoint. If cleanup cannot succeed, explain the blocker. If pending_settings is present, it names the limits the new settings would break: delete obsolete memories with memory_manage when memories exceed them.",
     ),
     both(
         "Each request",
@@ -290,7 +286,8 @@ pub const DOCUMENT_CHECKPOINT_MAX_REQUESTS: usize = CHECKPOINT_MAX_REQUESTS * 2;
 pub const DOCUMENT_CHECKPOINT_MAX_FAILURES: usize = CHECKPOINT_MAX_FAILURES * 2;
 pub const CHECKPOINT_SOURCE_LOOKUP_LIMIT: usize = 3;
 /// run_guidance.instruction while a checkpoint is pending.
-pub const CHECKPOINT_INSTRUCTION: &str = "A checkpoint is pending: follow the CHECKPOINT CONTROL REQUEST; the phase guidance resumes after checkpoint_complete succeeds.";
+pub const CHECKPOINT_INSTRUCTION: &str =
+    "A checkpoint is pending; the phase guidance resumes after checkpoint_complete succeeds.";
 pub struct ContextManager;
 
 fn model_message(mut message: Value) -> Value {
@@ -502,15 +499,17 @@ impl ContextManager {
         const PREVIEW_PENDING: usize = 6;
         let pending: Vec<_> = task.todos.iter().filter(|item| !item.done).collect();
         let mut snapshot = json!(task);
-        snapshot.as_object_mut().unwrap().remove("details");
+        // details are paged with task_state; todo_sequence is the internal
+        // counter behind to-do IDs.
+        for internal in ["details", "todo_sequence"] {
+            snapshot.as_object_mut().unwrap().remove(internal);
+        }
         let mut shown = pending.len().min(PREVIEW_PENDING);
         loop {
             snapshot["todos"] = json!(pending.iter().take(shown).collect::<Vec<_>>());
             snapshot["todo_window"] = json!({
                 "pending_count":pending.len(),
-                "total_items":task.todos.len(),
-                "shown_pending":shown,
-                "omitted_items":task.todos.len().saturating_sub(shown)
+                "shown_pending":shown
             });
             // Only a window that hides pending items needs the way to the rest.
             if pending.len() > shown {
@@ -594,7 +593,7 @@ impl ContextManager {
         let source_ids = user_sources
             .into_iter()
             .take(5)
-            .map(|x| json!({"id":x.id,"origin":x.origin,"excerpt":crate::session::user_excerpt(&x.excerpt, &sent)}))
+            .map(|x| json!({"id":x.id,"excerpt":crate::session::user_excerpt(&x.excerpt, &sent)}))
             .collect::<Vec<_>>();
         // The phase instruction is computed before a checkpoint starts and
         // would tell a cleanup request to read sources while the control
@@ -603,7 +602,39 @@ impl ContextManager {
         if s.checkpoint.is_some() && run_guidance.is_object() {
             run_guidance["instruction"] = json!(CHECKPOINT_INSTRUCTION);
         }
-        let mut state = json!({"run_guidance":run_guidance,"memory_reuse_enabled":s.config.memory_reuse,"pending_settings":s.pending_config,"task":task,"task_detail_count":s.task.details.len(),"recent_memories":recent,"related_memories":related,"referenced_memories":pinned,"project":s.project,"user_criteria":s.user_criteria,"checkpoint":s.checkpoint,"user_sources":source_ids,"history_pruned_through":s.history.pruned_through});
+        // Run counters for the progress panel and run history; no prompt or
+        // guidance text refers to them, and plan_pending_count repeats
+        // task.todo_window.pending_count.
+        if let Some(fields) = run_guidance.as_object_mut() {
+            for counter in [
+                "task_rounds",
+                "run_rounds",
+                "finalization_attempts",
+                "action_required",
+                "plan_pending_count",
+            ] {
+                fields.remove(counter);
+            }
+        }
+        // The project as the model uses it: where to read and where to write.
+        let mut project = json!(s.project);
+        if let Some(fields) = project.as_object_mut() {
+            fields.remove("id");
+        }
+        // A pending checkpoint by its ID, its request counts and the cause of
+        // a failed acknowledgement; its bundle bookkeeping is the runtime's.
+        let checkpoint = s.checkpoint.as_ref().map(|cp| {
+            json!({"id":cp.id,"attempts":cp.attempts,"failed_attempts":cp.failed_attempts,
+                "last_failure":cp.last_failure})
+        });
+        // New settings that wait for cleanup, by what they would break; they
+        // apply at the next request boundary once the session fits them.
+        let pending_settings = s
+            .pending_config
+            .as_ref()
+            .and_then(|config| s.check_limits(config).err())
+            .map(|error| json!({"blocked_by":error.to_string()}));
+        let mut state = json!({"run_guidance":run_guidance,"pending_settings":pending_settings,"task":task,"task_detail_count":s.task.details.len(),"recent_memories":recent,"related_memories":related,"referenced_memories":pinned,"project":project,"user_criteria":s.user_criteria,"checkpoint":checkpoint,"user_sources":source_ids});
         state.as_object_mut().unwrap().extend(request_fields);
         // After a checkpoint cleared the context, a live model read its own
         // saved progress ("stopped source reads as the checkpoint
@@ -667,14 +698,14 @@ impl ContextManager {
             // prompt's Checkpoints section, and the counts in the system
             // message.
             let documents = if crate::tools::ToolRegistry::checkpoint_writes_open(s) {
-                " Before checkpoint_complete, save with document_edit or document_edit_batch what the current reads support and the document lacks: a section not yet written, or a correction to an existing section; make no other document edits."
+                " Before checkpoint_complete, save with document_edit (action=create when no document exists yet) or document_edit_batch what the current reads support and the document lacks: a section not yet written, or a correction to an existing section; make no other document edits."
             } else if s.is_document_work() {
                 " Call checkpoint_complete now: document edits are closed for this checkpoint."
             } else {
                 ""
             };
             format!(
-                "CHECKPOINT CONTROL REQUEST {}: pause source reading and follow the Checkpoints section.{documents} The JSON below is the runtime state.",
+                "CHECKPOINT CONTROL REQUEST {}.{documents} The JSON below is the runtime state.",
                 cp.id
             )
         } else {

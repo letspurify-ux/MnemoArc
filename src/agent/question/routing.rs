@@ -57,9 +57,7 @@ fn request(
     let mut payload = json!({
         "session_message_routing":true,"current_goal":s.latest_request,
         "user_criteria":s.user_criteria,"current_message":question.text,
-        "task_status":question.prior_status,"workflow":s.workflow_mode,
-
-        "context_note":"The current message and effective requirements are complete. Optional saved context may be shortened or omitted."
+        "task_status":question.prior_status,"workflow":s.workflow_mode
     });
     if let Some(feedback) = feedback {
         payload["program_feedback"] = json!(feedback.chars().take(512).collect::<String>());

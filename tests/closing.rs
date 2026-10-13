@@ -431,6 +431,78 @@ async fn finished_bookkeeping_leaves_the_final_answer_to_the_model() {
 }
 
 #[tokio::test]
+async fn a_recovery_instruction_is_not_replaced_by_the_plan_closeout() {
+    // The saved document passes its audit as soon as one section cites read
+    // lines, so the closeout used to replace every later instruction while
+    // to-dos were open, including the recovery that names what stalled.
+    let (_dir, mut s) = saved_fixture();
+    tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Write the remaining sections from main.js"]}]}),
+    )
+    .unwrap();
+    s.progress_recovery.recovery_reason = Some("The same read returned the same lines.".into());
+    let (_, guidance) = run_scripted(
+        s,
+        vec![Completion {
+            text: "Saved out.md".into(),
+            ..Default::default()
+        }],
+    )
+    .await;
+    assert!(guidance[0]["plan_closeout"].is_object(), "{}", guidance[0]);
+    let instruction = guidance[0]["instruction"].as_str().unwrap();
+    assert!(instruction.starts_with("Focused recovery"), "{instruction}");
+}
+
+#[tokio::test]
+async fn closing_reports_open_to_dos_instead_of_refusing_the_final_answer() {
+    // Closing tells the model to leave unfinished to-dos open for the gap
+    // report; refusing its first final for them forced another round.
+    let (_dir, mut s) = saved_fixture();
+    tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Write the error-handling section from main.js"]}]}),
+    )
+    .unwrap();
+    // A run starts without closing; idle rounds stall it into closing mode,
+    // where the first final answer is the one under test.
+    s.config.stall_round_limit = 2;
+    let mut steps: Vec<Completion> = (0..6)
+        .map(|i| call(&format!("idle-{i}"), "task_state", json!({"action":"read"})))
+        .collect();
+    steps.push(Completion {
+        text: "Saved out.md".into(),
+        ..Default::default()
+    });
+    let (result, guidance) = run_scripted(s, steps).await;
+    assert_eq!(guidance.last().unwrap()["closing"]["active"], true);
+    assert_eq!(
+        result.status, "complete_with_gaps",
+        "{:?}",
+        result.last_error
+    );
+    assert!(
+        result
+            .completion_gaps
+            .iter()
+            .any(|gap| gap.contains("Write the error-handling section")),
+        "{:?}",
+        result.completion_gaps
+    );
+    assert!(
+        result
+            .replies_without_calls
+            .iter()
+            .all(|reply| reply.outcome != "task_plan_pending"),
+        "{:?}",
+        result.replies_without_calls
+    );
+}
+
+#[tokio::test]
 async fn open_todos_on_a_finished_document_are_closed_in_one_batch() {
     let (_dir, mut s) = saved_fixture();
     // The live shape: the document is done but three plan items remain,

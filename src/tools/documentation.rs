@@ -617,7 +617,7 @@ pub(super) fn execute(
             };
             if !path.exists() {
                 return Ok(json!({"exists":false,"path":path,"total_lines":0,
-                    "guidance":"Nothing has been written to the configured output yet. Create it with document_edit action=create (or document_edit_batch) before reading or auditing it."}));
+                    "guidance":"Nothing has been written to the configured output yet. Create it with document_edit action=create before reading or auditing it."}));
             }
             let doc = read_text(&path)?;
             let digest = hash(doc.as_bytes());
@@ -857,7 +857,7 @@ pub(super) fn execute(
             let structural_ok = issues
                 .iter()
                 .all(|issue| issue["kind"] == "no_machine_readable_citations");
-            let mut result = json!({"hash":document_hash,"revision":revision,"total_lines":doc.lines().count(),"citations_checked":checked,"structural_ok":structural_ok,"semantic_verified":false,"format_check":format_check,"issue_count":issues.len(),"issue_kinds":issue_kinds(&issues),"issues":issues[offset..end],"next_offset":(end<issues.len()).then_some(end)});
+            let mut result = json!({"hash":document_hash,"revision":revision,"total_lines":doc.lines().count(),"citations_checked":checked,"structural_ok":structural_ok,"format_check":format_check,"issue_count":issues.len(),"issue_kinds":issue_kinds(&issues),"issues":issues[offset..end],"next_offset":(end<issues.len()).then_some(end)});
             if s.is_document_work()
                 && let Some(check) = test_code_check(s, &path, &doc)
             {
@@ -2088,7 +2088,7 @@ fn project_file_for_link(s: &Session, target: &str) -> Option<String> {
 /// A source document without a machine-readable citation cannot be
 /// finished: say so on every save and audit, not only when the final answer
 /// is refused.
-const NO_CITATIONS_GUIDANCE: &str = "The document cites no project source as relative/path.ext:start-end. Cite the sources of its claims next to them (for example backend/src/server.js:12-30); the final answer is refused while the document cites no project source. memory_read returns the path and lines of each source saved with a memory. Other citation formats require manual review.";
+const NO_CITATIONS_GUIDANCE: &str = "The document cites no project source as relative/path.ext:start-end. Cite the sources of its claims next to them (for example backend/src/server.js:12-30); the final answer is refused while the document cites no project source. memory_read returns the path and lines of each source saved with a memory.";
 
 pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Value> {
     let (checked, issues) = citation_issues(s, output, doc)?;
@@ -2098,12 +2098,17 @@ pub(super) fn citation_check(s: &Session, output: &Path, doc: &str) -> Result<Va
         Ok(unread) => (unread, None),
         Err(error) => (vec![], Some(error.to_string())),
     };
-    let guidance = "Fix citation or code-fence issues in the next section edit; a citation_path issue's fix is a ready document_edit_batch edit that rewrites the citations on its line to the suggested project path (an issue marked covered_by_line_fix needs no edit of its own), so send the listed fixes together in one document_edit_batch. unread_citations are cited ranges never delivered to you as complete lines of the current file version: file_read each listed range, or narrow the citation to the lines you read, before the final answer; the final audit treats them as unresolved evidence.";
     let mut check = json!({"citations_checked":checked,"issue_count":issues.len(),"issues":issues.iter().take(8).collect::<Vec<_>>(),
         "unread_citation_count":unread.len(),"unread_citations":unread.iter().take(8).collect::<Vec<_>>(),
-        "unread_citation_error":unread_error,
-        "semantic_verified":false,
-        "guidance":guidance});
+        "unread_citation_error":unread_error});
+    // Every save result stays in context: a clean save carries no guidance,
+    // and the unread-citation rule is the prompt's. Only a ready path fix
+    // needs saying how to send it.
+    if issues.iter().any(|issue| issue.get("fix").is_some()) {
+        check["guidance"] = json!(
+            "Send the fixes of the listed citation_path issues together in one document_edit_batch; an issue marked covered_by_line_fix needs no edit of its own."
+        );
+    }
     if checked == 0 {
         check["citations_required"] = json!(NO_CITATIONS_GUIDANCE);
     }

@@ -1348,6 +1348,90 @@ fn the_state_carries_no_tool_list_or_idle_guidance() {
     );
     // Execution-order and exception citations hold for documents too.
     assert!(context::SYSTEM.contains("For an execution-order claim cite both operations"));
+    // Internal bookkeeping stays out of the model's state.
+    let state = ContextManager::state(&s).unwrap();
+    for internal in [
+        "memory_reuse_enabled",
+        "history_pruned_through",
+        "active_tools",
+    ] {
+        assert!(state.get(internal).is_none(), "{internal}");
+    }
+    assert!(state["project"].get("id").is_none(), "{}", state["project"]);
+    assert!(state["task"].get("todo_sequence").is_none());
+    assert!(state["run_guidance"].get("task_rounds").is_none());
+    s.checkpoint = Some(mnemoarc::session::Checkpoint {
+        id: "cp-3".into(),
+        bundle_ids: vec![1, 2],
+        maintenance_bundle_ids: vec![],
+        acknowledged: false,
+        attempts: 1,
+        failed_attempts: 0,
+        last_failure: None,
+        source_lookup_calls: 0,
+        starting_state_revision: 0,
+        starting_memory_generation: 0,
+        failed: false,
+    });
+    let checkpoint = &ContextManager::state(&s).unwrap()["checkpoint"];
+    assert_eq!(checkpoint["id"], "cp-3");
+    assert_eq!(checkpoint["attempts"], 1);
+    assert!(checkpoint.get("bundle_ids").is_none(), "{checkpoint}");
+}
+
+#[test]
+fn pending_settings_name_what_blocks_them() {
+    // The state used to carry the whole pending configuration (endpoint,
+    // database host, saved SQL, project paths) while the reason it could not
+    // apply went only to a user notice.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.add_user("Document the project".into());
+    for key in ["a", "b", "c"] {
+        tools::execute(
+            &mut s,
+            "memory_write",
+            json!({"key":key,"title":key,"summary":"s","body":"b","kind":"decision","inferred":true}),
+        )
+        .unwrap();
+    }
+    let mut smaller = s.config.clone();
+    smaller.memory_count = 2;
+    smaller.recent_count = 1;
+    s.pending_config = Some(smaller.clone());
+    let pending = &ContextManager::state(&s).unwrap()["pending_settings"];
+    let blocked = pending["blocked_by"].as_str().unwrap();
+    assert!(blocked.contains("3 memories > memory_count 2"), "{blocked}");
+    assert!(pending.get("base_url").is_none(), "{pending}");
+    // Settings the session already fits apply at the next request boundary.
+    smaller.memory_count = 10;
+    s.pending_config = Some(smaller);
+    assert!(ContextManager::state(&s).unwrap()["pending_settings"].is_null());
+}
+
+#[test]
+fn a_clean_save_carries_no_repeated_guidance() {
+    // Every save result stays in context; constant guidance on each one
+    // repeated the prompt once per save.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let mut s = session(dir.path());
+    s.select_workflow("source_document").unwrap();
+    s.add_user("Document main".into());
+    tools::execute(&mut s, "file_read", json!({"path":"main.rs"})).unwrap();
+    let saved = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Main\n\nThe entry point is main (main.rs:1-1).\n"}),
+    )
+    .unwrap();
+    assert_eq!(saved["citation_check"]["issue_count"], 0, "{saved}");
+    assert!(saved["citation_check"].get("guidance").is_none(), "{saved}");
+    assert!(saved["format_check"].get("guidance").is_none(), "{saved}");
+    assert!(
+        saved["format_check"].get("markdown_parser").is_none(),
+        "{saved}"
+    );
 }
 
 #[test]
@@ -1394,7 +1478,7 @@ fn request_headers_rank_no_direction_and_leave_rules_to_the_prompt() {
         control.starts_with("CHECKPOINT CONTROL REQUEST cp-2"),
         "{control}"
     );
-    assert!(control.contains("Checkpoints section"), "{control}");
+    assert!(!control.contains("pause source reading"), "{control}");
     for rule in ["source_lookup", "same batch", "plan items"] {
         assert!(!control.contains(rule), "{rule}: {control}");
     }

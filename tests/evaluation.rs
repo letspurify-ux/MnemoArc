@@ -77,7 +77,9 @@ prompt = "Document main.rs with source evidence."
         )
         .unwrap();
         assert_eq!(state["task"]["workflow"], "source_document");
-        assert_eq!(state["memory_reuse_enabled"], index < 3);
+        // The baseline withholds the memory tools below; the state carries
+        // no separate flag for it.
+        assert!(state.get("memory_reuse_enabled").is_none());
         let tools = request["tools"].as_array().unwrap();
         for name in ["document_audit", "document_edit"] {
             assert!(

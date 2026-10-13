@@ -1222,12 +1222,40 @@ impl Session {
     }
     pub fn check_limits(&self, c: &Config) -> Result<()> {
         c.validate()?;
-        if self.memory.entries.len() > c.memory_count
-            || self.memory.bytes() > c.memory_bytes
-            || self.history.bytes() > c.history_bytes
-            || self.ancillary_bytes() > c.memory_bytes
-        {
-            bail!("New limits require cleanup first; current settings retained");
+        let mut over = Vec::new();
+        if self.memory.entries.len() > c.memory_count {
+            over.push(format!(
+                "{} memories > memory_count {}",
+                self.memory.entries.len(),
+                c.memory_count
+            ));
+        }
+        if self.memory.bytes() > c.memory_bytes {
+            over.push(format!(
+                "memory bytes {} > memory_bytes {}",
+                self.memory.bytes(),
+                c.memory_bytes
+            ));
+        }
+        if self.history.bytes() > c.history_bytes {
+            over.push(format!(
+                "history bytes {} > history_bytes {}",
+                self.history.bytes(),
+                c.history_bytes
+            ));
+        }
+        if self.ancillary_bytes() > c.memory_bytes {
+            over.push(format!(
+                "session metadata bytes {} > memory_bytes {}",
+                self.ancillary_bytes(),
+                c.memory_bytes
+            ));
+        }
+        if !over.is_empty() {
+            bail!(
+                "New limits require cleanup first ({}); current settings retained",
+                over.join("; ")
+            );
         }
         if self
             .memory

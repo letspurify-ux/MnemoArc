@@ -38,10 +38,6 @@ impl FormatCheck {
     pub fn summary(&self) -> Value {
         json!({
             "ok":self.issues.is_empty(),
-            "markdown_parser":"comrak 0.55",
-            "mermaid_parser":"merman-core 0.6",
-            "mermaid_baseline":"11.12.3",
-            "mermaid_scope":"fenced_blocks",
             "markdown_tables_checked":self.tables_checked,
             "mermaid_blocks":self.mermaid_blocks,
             "mermaid_blocks_checked":self.mermaid_checked,
@@ -50,9 +46,7 @@ impl FormatCheck {
             "warning_count":self.warnings.len(),
             "warnings":self.warnings.iter().take(PREVIEW_LIMIT).collect::<Vec<_>>(),
             "warnings_truncated":self.warnings.len() > PREVIEW_LIMIT,
-            "checks_complete":self.warnings.is_empty(),
-            "semantic_verified":false,
-            "ui_render_verified":false
+            "checks_complete":self.warnings.is_empty()
         })
     }
 
@@ -60,9 +54,13 @@ impl FormatCheck {
         let mut result = self.summary();
         result["issues"] = json!(self.issues.iter().take(PREVIEW_LIMIT).collect::<Vec<_>>());
         result["issues_truncated"] = json!(self.issues.len() > PREVIEW_LIMIT);
-        result["guidance"] = json!(
-            "Fix Markdown/Mermaid errors in the next edit, and each garbled word with document_edit action=fix_word and its fix_id; document_audit paginates all errors. Warnings identify unchecked syntax or UI extensions. Browser layout and newer Mermaid versions are not checked."
-        );
+        // Every save result stays in context: only one with errors says how
+        // to fix them.
+        if !self.issues.is_empty() {
+            result["guidance"] = json!(
+                "Fix Markdown/Mermaid errors in the next edit, and each garbled word with document_edit action=fix_word and its fix_id."
+            );
+        }
         result
     }
 }
@@ -135,20 +133,22 @@ pub(super) fn check(doc: &str) -> FormatCheck {
                         || result.mermaid_blocks > MAX_MERMAID_BLOCKS
                     {
                         result.warnings.push(json!({"kind":"mermaid_check_limit","line":start,"end_line":end,
-                            "guidance":"Diagram not checked: the Rust syntax check accepts at most 64 KiB per block and 128 blocks per document. Inspect this diagram in the UI."}));
+                            "guidance":"Diagram not checked: the Rust syntax check accepts at most 64 KiB per block and 128 blocks per document; split the diagram if it must be checked."}));
                         continue;
                     }
                     if uses_mermaid_ui_extension(&code.literal) {
                         result.warnings.push(json!({"kind":"mermaid_ui_extension_unchecked","line":start,"end_line":end,
-                            "guidance":"This diagram uses serialized line breaks or UI math labels. Inspect it in the UI; its transformed source was not validated by the Rust parser."}));
+                            "guidance":"This diagram uses serialized line breaks or UI math labels; its transformed source was not validated by the Rust parser."}));
                         continue;
                     }
                     let parser = engine.get_or_insert_with(Engine::new);
                     match parser.parse_diagram_sync(&code.literal, ParseOptions::strict()) {
                         Ok(Some(_)) => result.mermaid_checked += 1,
                         Ok(None) | Err(Error::UnsupportedDiagram { .. }) => {
-                            result.warnings.push(json!({"kind":"mermaid_unsupported","line":start,"end_line":end,
-                                "guidance":"The Rust parser did not check this diagram. Inspect it with the UI Mermaid renderer."}));
+                            result.warnings.push(
+                                json!({"kind":"mermaid_unsupported","line":start,"end_line":end,
+                                "guidance":"The Rust parser did not check this diagram."}),
+                            );
                         }
                         Err(Error::InvalidDirectiveJson { message }) => {
                             // Mermaid.js tolerates/ignores malformed directives
@@ -157,7 +157,7 @@ pub(super) fn check(doc: &str) -> FormatCheck {
                             // document-completion failure.
                             result.warnings.push(json!({"kind":"mermaid_directive_unchecked","line":start,"end_line":end,
                                 "message":message.chars().take(1200).collect::<String>(),
-                                "guidance":"The Rust parser rejected a configuration directive that Mermaid.js may ignore. Fix the directive or inspect this diagram in the UI; its syntax was not fully checked."}));
+                                "guidance":"The Rust parser rejected a configuration directive that Mermaid.js may ignore; fix the directive, since the diagram's syntax was not fully checked."}));
                         }
                         Err(error) => {
                             result.mermaid_checked += 1;
@@ -166,7 +166,7 @@ pub(super) fn check(doc: &str) -> FormatCheck {
                                 "diagram_start_line":start + 1,
                                 "message":message.chars().take(1200).collect::<String>(),
                                 "message_truncated":message.chars().count() > 1200,
-                                "guidance":"Fix the diagram using the parser diagnostic (positions in the message refer to the diagram, not the document). The Rust parser targets Mermaid 11.12.3; check newer syntax in the UI."}));
+                                "guidance":"Fix the diagram using the parser diagnostic (positions in the message refer to the diagram, not the document). The Rust parser targets Mermaid 11.12.3, so newer syntax may be reported as an error."}));
                         }
                     }
                 }
@@ -417,7 +417,7 @@ fn other_script(c: char) -> Option<&'static str> {
 
 fn extension_warning(result: &mut FormatCheck, line: usize, end_line: usize) {
     result.warnings.push(json!({"kind":"markdown_ui_extension_unchecked","line":line,"end_line":end_line,
-        "guidance":"This table uses UI math or serialized chart/Mermaid syntax. Its columns and embedded diagrams require UI inspection; they were not validated by the GFM check."}));
+        "guidance":"This table uses UI math or serialized chart/Mermaid syntax; its columns and embedded diagrams were not validated by the GFM check."}));
 }
 
 fn uses_mermaid_ui_extension(source: &str) -> bool {

@@ -77,7 +77,10 @@ fn valid_tables_accept_empty_cells_escaped_pipes_containers_and_line_endings() {
         assert_eq!(format["ok"], true, "{format}");
         assert_eq!(format["markdown_tables_checked"], 3, "{format}");
         assert_eq!(format["checks_complete"], true);
-        assert_eq!(format["ui_render_verified"], false);
+        // Fixed values (parser names, never-verified flags) stay out of every
+        // save result, and a clean save carries no fix guidance.
+        assert!(format.get("ui_render_verified").is_none(), "{format}");
+        assert!(format.get("guidance").is_none(), "{format}");
     }
 }
 

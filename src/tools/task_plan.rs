@@ -109,7 +109,7 @@ pub fn spec() -> ToolSpec {
     ]);
     ToolSpec {
         name: "task_plan",
-        description: "Manage an ordered to-do list; the first unfinished item is current. list accepts offset/limit (default 10, maximum 20). apply requires expected_revision copied from the returned plan and an operations array of 1..16 objects, applied atomically. insert: texts, optional before; update: id/text; split: unfinished id and 2..100 specific texts preserving its goal, keeping its ID for the first part; move: unfinished id, optional before. Omit before to append. complete: CURRENT id/result. remove: unfinished id/reason; reopen: completed id/reason, placed before current. Keep at most 100 unfinished small outcomes and the latest 5 completed items plus completed_total. Recoverable conflicts return applied=false; the whole batch remains unapplied. conflict reports code, zero-based operation_index, target/current IDs, blocking_ids, expected/current revisions and correction. Continue current work.",
+        description: "Manage an ordered to-do list; the first unfinished item is current. apply applies its operations atomically. insert: texts, optional before; update: id/text; split: unfinished id and 2..100 specific texts preserving its goal, keeping its ID for the first part; move: unfinished id, optional before. Omit before to append. complete: CURRENT id/result. remove: unfinished id/reason; reopen: completed id/reason, placed before current. Keep at most 100 unfinished small outcomes. Recoverable conflicts return applied=false; the whole batch remains unapplied. conflict reports code, zero-based operation_index, target/current IDs, blocking_ids, expected/current revisions and correction. Continue current work.",
         optional: false,
         read_only: false,
         parameters,
@@ -1161,7 +1161,7 @@ fn completed_without_edit(s: &Session, next: &TaskState) -> Option<String> {
         // is this to-do's work.
         return (!s.document_written).then(|| {
             format!(
-                "No document is saved yet, and {id} is being completed: a section to-do is done when its section is in the document, not when its sources are read. Save that section now from the evidence in this context with document_edit (action=create for the first section), then complete the to-do.",
+                "No document is saved yet, and {id} is being completed: a section to-do is done when its section is in the document, not when its sources are read. Save that section now from the evidence in this context with document_edit (action=create for the first section); if it cannot be saved now, reopen {id} with that reason.",
                 id = watch.id
             )
         });
@@ -1169,7 +1169,7 @@ fn completed_without_edit(s: &Session, next: &TaskState) -> Option<String> {
     let current = super::read_text(&super::output_path(&s.project).ok()?).ok()?;
     (super::hash(current.as_bytes()) == before).then(|| {
         format!(
-            "No document edit was saved while {id} was current: the document is exactly as it was when {id} began. If {id} needed corrections, they are not in the document; save them with document_edit or document_edit_batch, then reopen or update {id} so its result states only what was actually changed.",
+            "No document edit was saved while {id} was current: the document is exactly as it was when {id} began. If {id} needed corrections, they are not in the document; save them with document_edit or document_edit_batch, then reopen {id} with a reason and complete it again with a result that states only what was actually changed.",
             id = watch.id
         )
     })
