@@ -1,4 +1,6 @@
-use super::{MAX_FILE_BYTES, excluded, hash, output_path, read_text};
+use super::{
+    DirectoryPath, MAX_FILE_BYTES, excluded, hash, output_name_at_root, output_path, read_text,
+};
 use crate::{config::Project, session::Session};
 use anyhow::{Result, bail};
 use caseless::Caseless;
@@ -23,10 +25,12 @@ fn folded_alias_key(value: &str) -> String {
 }
 
 pub(super) fn excluded_case_alias(project: &Project, relative: &Path) -> Result<bool> {
-    let default_excludes = [
-        ".git",
-        ".hg",
-        ".svn",
+    // Version-control metadata is excluded as a file too: a `.git` file
+    // points a worktree or submodule at its repository.
+    let version_control = [".git", ".hg", ".svn"];
+    // Dependency and build output directories. A regular file with such a
+    // name (a Bazel `BUILD`, a root `build` script) is not inside one.
+    let directories = [
         "target",
         "node_modules",
         "vendor",
@@ -35,12 +39,14 @@ pub(super) fn excluded_case_alias(project: &Project, relative: &Path) -> Result<
         ".venv",
         "__pycache__",
     ];
-    if relative.components().any(|part| {
-        default_excludes.iter().any(|name| {
-            part.as_os_str()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(name)
-        })
+    let named = |part: Component, names: &[&str]| {
+        let part = part.as_os_str().to_string_lossy();
+        names.iter().any(|name| part.eq_ignore_ascii_case(name))
+    };
+    let last = relative.components().count().saturating_sub(1);
+    if relative.components().enumerate().any(|(index, part)| {
+        named(part, &version_control)
+            || (named(part, &directories) && (index < last || project.root.join(relative).is_dir()))
     }) {
         return Ok(true);
     }
@@ -154,8 +160,11 @@ fn project_path(s: &Session, raw: &str) -> Result<PathBuf> {
         bail!("path_excluded: {raw}");
     }
     let normalized_output = normalize_existing_prefix(&output_path(&s.project)?)?;
+    // file_read resolves the output's bare name at the root to the output, so
+    // writing that name must not create a stray copy beside it.
     if path == normalized_output
         || normalized_alias_key(&path) == normalized_alias_key(&normalized_output)
+        || output_name_at_root(&s.project, &path).is_some()
     {
         bail!("configured_output_requires_document_edit");
     }
@@ -263,9 +272,26 @@ fn check_operation_hash(
     op: &Value,
     path: &Path,
     actual: &str,
+    originals: &BTreeMap<PathBuf, Option<String>>,
     checked: &BTreeSet<PathBuf>,
 ) -> Result<()> {
     match op.get("expected_hash") {
+        // An earlier operation in this patch checked the file. Models repeat
+        // the file_read hash on each operation (document_edit_batch accepts
+        // that too); re-reading returns that same hash, so refusing it loops.
+        Some(Value::String(expected)) if checked.contains(path) => {
+            let original = originals.get(path).and_then(Option::as_ref);
+            if *expected == hash(actual.as_bytes())
+                || original.is_some_and(|text| *expected == hash(text.as_bytes()))
+            {
+                return Ok(());
+            }
+            bail!(
+                "file_revision_conflict: expected_hash {:?} matches neither {} as file_read returns it nor its version after the earlier operations in this patch; omit expected_hash on later operations of the same file",
+                expected.chars().take(80).collect::<String>(),
+                path.display()
+            )
+        }
         Some(Value::String(expected)) => check_hash(expected, actual),
         Some(_) => bail!("invalid_argument_type: expected_hash"),
         None if checked.contains(path) => Ok(()),
@@ -344,7 +370,7 @@ fn operation(
         "update" => {
             let old = load(&path, state, originals, permissions)?
                 .ok_or_else(|| anyhow::anyhow!("file_not_found: {}", path.display()))?;
-            check_operation_hash(op, &path, &old, checked)?;
+            check_operation_hash(op, &path, &old, originals, checked)?;
             let all = match op.get("replace_all") {
                 None => false,
                 Some(Value::Bool(value)) => *value,
@@ -361,7 +387,7 @@ fn operation(
         "replace" => {
             let old = load(&path, state, originals, permissions)?
                 .ok_or_else(|| anyhow::anyhow!("file_not_found: {}", path.display()))?;
-            check_operation_hash(op, &path, &old, checked)?;
+            check_operation_hash(op, &path, &old, originals, checked)?;
             let next = required(op, "content")?;
             content(next)?;
             state.insert(path.clone(), Some(next.to_owned()));
@@ -369,7 +395,7 @@ fn operation(
         "move" => {
             let old = load(&path, state, originals, permissions)?
                 .ok_or_else(|| anyhow::anyhow!("file_not_found: {}", path.display()))?;
-            check_operation_hash(op, &path, &old, checked)?;
+            check_operation_hash(op, &path, &old, originals, checked)?;
             let destination = project_path(s, required(op, "to_path")?)?;
             if destination == path || load(&destination, state, originals, permissions)?.is_some() {
                 bail!(
@@ -395,7 +421,7 @@ fn operation(
         "delete" => {
             let old = load(&path, state, originals, permissions)?
                 .ok_or_else(|| anyhow::anyhow!("file_not_found: {}", path.display()))?;
-            check_operation_hash(op, &path, &old, checked)?;
+            check_operation_hash(op, &path, &old, originals, checked)?;
             permissions.insert(path.clone(), None);
             state.insert(path.clone(), None);
         }
@@ -606,6 +632,11 @@ pub(super) fn execute(
         ],
         "file_write" => {
             let path = project_path(s, required(args, "path")?)?;
+            // A directory has no hash to copy from file_read; name it before
+            // asking for one.
+            if path.is_dir() {
+                return Err(DirectoryPath(path).into());
+            }
             let exists = path.exists();
             let content = required(args, "content")?;
             if exists {

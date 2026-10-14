@@ -439,3 +439,167 @@ fn edit_hash_conflict_keeps_its_recovery_code() {
         "current"
     );
 }
+
+#[test]
+fn file_write_to_a_directory_names_the_directory() {
+    let (dir, mut session) = setup();
+    std::fs::create_dir(dir.path().join("docs_dir")).unwrap();
+    // file_read cannot read a directory, so asking for its hash loops.
+    let error = tools::execute(
+        &mut session,
+        "file_write",
+        json!({"path":"docs_dir","content":"x"}),
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.starts_with("path_is_directory"), "{message}");
+    assert!(!message.contains("expected_hash"), "{message}");
+    assert_eq!(
+        tools::envelope(Err(error))["recovery"]["code"],
+        "path_is_directory"
+    );
+    assert!(dir.path().join("docs_dir").is_dir());
+}
+
+#[test]
+fn patch_accepts_the_file_read_hash_repeated_on_later_operations() {
+    let (dir, mut session) = setup();
+    let path = dir.path().join("p.txt");
+    std::fs::write(&path, "one two").unwrap();
+    let digest = run(&mut session, "file_read", json!({"path":"p.txt"}))["hash"].clone();
+    // Re-reading returns this same hash, so refusing it on the second
+    // operation left the model no way to succeed.
+    run(
+        &mut session,
+        "file_patch",
+        json!({"operations":[
+            {"action":"update","path":"p.txt","expected_hash":digest,"old_text":"one","new_text":"three"},
+            {"action":"update","path":"p.txt","expected_hash":digest,"old_text":"two","new_text":"four"}
+        ]}),
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "three four");
+    let error = tools::execute(
+        &mut session,
+        "file_patch",
+        json!({"operations":[
+            {"action":"update","path":"p.txt","expected_hash":tools::hash(b"three four"),"old_text":"three","new_text":"five"},
+            {"action":"update","path":"p.txt","expected_hash":digest,"old_text":"four","new_text":"six"}
+        ]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("file_revision_conflict"), "{error}");
+    assert!(
+        error.contains("omit expected_hash on later operations"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "three four");
+}
+
+#[test]
+fn files_named_like_excluded_directories_stay_readable_and_editable() {
+    let (dir, mut session) = setup();
+    std::fs::create_dir_all(dir.path().join("pkg")).unwrap();
+    std::fs::create_dir_all(dir.path().join("scripts")).unwrap();
+    std::fs::create_dir_all(dir.path().join("build")).unwrap();
+    std::fs::write(dir.path().join("pkg/BUILD"), "cc_library(name = \"x\")\n").unwrap();
+    std::fs::write(dir.path().join("scripts/build"), "#!/bin/sh\nmake\n").unwrap();
+    std::fs::write(dir.path().join("build/out.txt"), "cc_library output\n").unwrap();
+    std::fs::write(dir.path().join(".git"), "gitdir: elsewhere\n").unwrap();
+
+    let read = run(&mut session, "file_read", json!({"path":"pkg/BUILD"}));
+    run(
+        &mut session,
+        "file_write",
+        json!({"path":"pkg/BUILD","content":"cc_library(name = \"y\")\n","expected_hash":read["hash"]}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("pkg/BUILD")).unwrap(),
+        "cc_library(name = \"y\")\n"
+    );
+    run(&mut session, "file_read", json!({"path":"scripts/build"}));
+    let listed = run(&mut session, "file_list", json!({"mode":"paths"}));
+    assert_eq!(listed["paths"], json!(["pkg/BUILD", "scripts/build"]));
+    let found = run(&mut session, "source_search", json!({"query":"cc_library"}));
+    assert_eq!(found["matching_files"], 1, "{found}");
+    assert!(
+        found["matches"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("pkg/BUILD"),
+        "{found}"
+    );
+
+    // The directories themselves, and VCS metadata as a file, stay excluded.
+    for args in [
+        json!({"path":"build/out.txt"}),
+        json!({"path":"BUILD/out.txt"}),
+        json!({"path":".git"}),
+    ] {
+        let error = tools::execute(&mut session, "file_read", args.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("path_excluded"), "{args}: {error}");
+    }
+    let error = tools::execute(&mut session, "file_list", json!({"path":"build"}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("path_excluded"), "{error}");
+    for path in ["build/new.txt", ".git"] {
+        let error = tools::execute(
+            &mut session,
+            "file_write",
+            json!({"path":path,"content":"bad"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.starts_with("path_excluded"), "{path}: {error}");
+    }
+    assert!(!dir.path().join("build/new.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".git")).unwrap(),
+        "gitdir: elsewhere\n"
+    );
+}
+
+#[test]
+fn output_file_name_at_the_root_is_not_written_as_a_project_file() {
+    let root = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let output = elsewhere.path().join("generated.md");
+    std::fs::write(&output, "# Doc\n").unwrap();
+    let mut session = Session::new(
+        Project {
+            root: root.path().into(),
+            output: output.clone(),
+            ..Default::default()
+        },
+        support::compact_config(),
+    );
+    // file_read resolves this name to the output outside the root.
+    let digest = run(&mut session, "file_read", json!({"path":"generated.md"}))["hash"].clone();
+    assert_eq!(digest, tools::hash(b"# Doc\n"));
+    for (name, args) in [
+        (
+            "file_write",
+            json!({"path":"generated.md","content":"# Doc v2\n","expected_hash":digest}),
+        ),
+        (
+            "file_write",
+            json!({"path":"generated.md","content":"# Doc v2\n"}),
+        ),
+        (
+            "file_patch",
+            json!({"operations":[{"action":"add","path":"generated.md","content":"# Doc v2\n"}]}),
+        ),
+    ] {
+        let error = tools::execute(&mut session, name, args.clone()).unwrap_err();
+        assert_eq!(
+            tools::envelope(Err(error))["recovery"]["code"],
+            "configured_output_requires_document_edit",
+            "{name} {args}"
+        );
+    }
+    assert!(!root.path().join("generated.md").exists());
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "# Doc\n");
+}
