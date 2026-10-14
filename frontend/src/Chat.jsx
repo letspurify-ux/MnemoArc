@@ -189,13 +189,18 @@ export default function Chat({
             ) : m.role === "assistant" && m.tool_calls?.length ? (
               <div className="tool-group" key={m.key}>
                 {m.content && <Message role="assistant" text={m.content} />}
-                <span className="tool-label">
-                  {m.tool_calls
-                    .map(
-                      (c) => toolLabels[c.function?.name] || c.function?.name,
-                    )
-                    .join(" · ")}
-                </span>
+                {/* Each result block below names what its call did; the
+                    tool names are only needed from a server without those
+                    descriptions. */}
+                {!m.tool_calls.some((c) => c.summary) && (
+                  <span className="tool-label">
+                    {m.tool_calls
+                      .map(
+                        (c) => toolLabels[c.function?.name] || c.function?.name,
+                      )
+                      .join(" · ")}
+                  </span>
+                )}
               </div>
             ) : m.content && ["user", "assistant"].includes(m.role) ? (
               <Message key={m.key} role={m.role} text={m.content} />
