@@ -66,6 +66,8 @@ mod tool_argument_robustness;
 mod tool_input_diagnostics;
 #[path = "tool_recovery.rs"]
 mod tool_recovery;
+#[path = "tool_review_followup.rs"]
+mod tool_review_followup;
 #[path = "web.rs"]
 mod web;
 #[path = "web_concurrency.rs"]

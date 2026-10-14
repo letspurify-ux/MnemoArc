@@ -258,10 +258,14 @@ fn special_field(
             "end_line" | "end" | "line_end" | "to_line" | "stop_line" | "last_line" | "until_line"
             | "end_row",
         ) => {
+            // Checked: an end line near u64::MAX overflowed the count and
+            // panicked the tool worker.
             let computed = match (siblings[original].as_u64(), siblings["start_line"].as_u64()) {
-                (Some(end), Some(start)) if end >= start => {
-                    format!(" (here max_lines: {})", end - start + 1)
-                }
+                (Some(end), Some(start)) => end
+                    .checked_sub(start)
+                    .and_then(|span| span.checked_add(1))
+                    .map(|lines| format!(" (here max_lines: {lines})"))
+                    .unwrap_or_default(),
                 _ => String::new(),
             };
             renamed(

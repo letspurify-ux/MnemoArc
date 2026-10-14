@@ -240,7 +240,7 @@ impl ToolRegistry {
             task_plan::spec(),
             ToolSpec {
                 name: "history",
-                description: "Search retained raw conversation/tool bundles, or read one by ID and character offset (read requires id).",
+                description: "Search retained raw conversation/tool bundles (continue a search with after: next_cursor), or read one by ID and character offset (read requires id).",
                 optional: false,
                 read_only: true,
                 parameters: schema(
@@ -1228,16 +1228,16 @@ fn also_missing(rest: &[&str]) -> String {
 /// holding the title. Split such a key back into its arguments; a key that
 /// does not parse completely is left for normal validation to reject.
 /// Returns whether any key was repaired.
-fn repair_leaked_argument_markup(args: &mut Value) -> Result<bool> {
-    fn split(key: &str) -> Option<Vec<(String, Option<Value>)>> {
+fn repair_leaked_argument_markup(tool: &str, args: &mut Value) -> Result<bool> {
+    /// The key's argument names with their value text; the last name has
+    /// none, as the key's own JSON value is its value.
+    fn split(key: &str) -> Option<Vec<(String, Option<&str>)>> {
         let mut pairs = Vec::new();
         let mut rest = key;
         while let Some((name, after)) = rest.split_once("</arg_key>") {
             let after = after.trim_start();
             let after = after.strip_prefix("<arg_value>").unwrap_or(after);
             let (value, next) = after.split_once("</arg_value>")?;
-            let value = value.trim();
-            let value = serde_json::from_str(value).unwrap_or_else(|_| json!(value));
             pairs.push((name.trim().to_owned(), Some(value)));
             rest = next.trim_start().strip_prefix("<arg_key>")?;
         }
@@ -1256,6 +1256,31 @@ fn repair_leaked_argument_markup(args: &mut Value) -> Result<bool> {
         .filter(|key| key.contains("</arg_key>"))
         .cloned()
         .collect();
+    if leaked.is_empty() {
+        return Ok(false);
+    }
+    // The markup writes a string value as it is and any other value as JSON.
+    // Decoding and trimming every value wrote file content "    indented();\n"
+    // as "indented();", dropped the quotes of a "hi" string literal, and
+    // turned a query "404" into a number the search refused.
+    let properties = ToolRegistry::specs()
+        .into_iter()
+        .find(|spec| spec.name == tool)
+        .map(|spec| spec.parameters["properties"].clone())
+        .unwrap_or_default();
+    let decode = |name: &str, text: &str| {
+        // document_edit takes new_text as its text (normalize_argument_aliases).
+        let field = if tool == "document_edit" && name == "new_text" {
+            "text"
+        } else {
+            name
+        };
+        if properties[field]["type"] == "string" {
+            return json!(text);
+        }
+        let text = text.trim();
+        serde_json::from_str(text).unwrap_or_else(|_| json!(text))
+    };
     for key in leaked {
         let Some(pairs) = split(&key) else {
             continue;
@@ -1263,7 +1288,7 @@ fn repair_leaked_argument_markup(args: &mut Value) -> Result<bool> {
         let last = object.remove(&key).expect("leaked key present");
         repaired = true;
         for (name, value) in pairs {
-            let value = value.unwrap_or_else(|| last.clone());
+            let value = value.map_or_else(|| last.clone(), |text| decode(&name, text));
             match object.get(&name) {
                 Some(existing) if *existing != value => bail!(
                     "conflicting_arguments: {name} was sent twice with different values (once inside leaked <arg_key> markup); pass each argument once as a JSON field"
@@ -1587,6 +1612,20 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
                     }) {
                         object.remove(*key);
                     }
+                }
+                // Search returns next_cursor, and a model sends it back as
+                // cursor; search continues after that bundle ID.
+                if object
+                    .get("action")
+                    .is_some_and(|action| action == "search")
+                    && object.contains_key("cursor")
+                {
+                    if object.get("after").is_some_and(|value| {
+                        value.is_null() || value == &json!(0) || value == &json!("")
+                    }) {
+                        object.remove("after");
+                    }
+                    rename(object, "cursor", "after", "")?;
                 }
             }
         }
@@ -2097,7 +2136,16 @@ fn anchor_outside_section(
     section: &documentation::Heading,
     target: &str,
 ) -> Option<anyhow::Error> {
-    let line_of = |at: usize| old[..at].matches('\n').count() + 1;
+    // Count line breaks in bytes: the section's last line is found from its
+    // last byte, which lies inside a character when a document ends in Korean
+    // text without a line break, and slicing there panicked the write worker.
+    let line_of = |at: usize| {
+        old.as_bytes()[..at]
+            .iter()
+            .filter(|&&byte| byte == b'\n')
+            .count()
+            + 1
+    };
     let lines: Vec<usize> = old
         .match_indices(target)
         .map(|(at, _)| line_of(at))
@@ -3101,16 +3149,24 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                         .unwrap_or(error)
                 })?;
             let (start, end) = (base + relative_start, base + relative_end);
+            let at = if action == "insert_after_text" {
+                end
+            } else {
+                start
+            };
+            // Inline text put at the start of a heading line joins that line,
+            // and the heading stops being one: "Closing sentence of A."
+            // inserted before "## B" was saved as "...of A.## B". It goes on
+            // its own line before the heading instead.
+            let before_heading = !new.is_empty()
+                && (at == 0 || old[..at].ends_with('\n'))
+                && !old[at..].starts_with(['\r', '\n'])
+                && starts_with_heading(&old[at..]);
             // A line or block inserted beside an anchor that stops mid-line
             // is glued into that line ("...다릅니다.- MariaDB는 ..."), which
             // leaves a broken list. Only inline text may go mid-line.
             let mut separated = None;
-            if insertion && !replace_instead && inserts_block(new) {
-                let at = if action == "insert_after_text" {
-                    end
-                } else {
-                    start
-                };
+            if insertion && !replace_instead && (inserts_block(new) || before_heading) {
                 let line_boundary = at == 0
                     || at == old.len()
                     || old[..at].ends_with('\n')
@@ -4060,6 +4116,9 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
                         "code_outline" | "symbol_search" | "symbol_relations" | "symbol_read" => {
                             matches!(key.as_str(), "path" | "path_glob" | "pattern" | "cursor")
                         }
+                        // A blank id matched no source, and the empty result
+                        // told the model not to invent an ID.
+                        "source_lookup" => matches!(key.as_str(), "path" | "id"),
                         _ => false,
                     };
                 !spec.parameters["properties"]
@@ -4869,6 +4928,23 @@ const SKIPPED_DIRECTORIES: [&str; 10] = [
     "__pycache__",
 ];
 
+/// A path glob as matched, relative to the project root. Written from the
+/// root (`./src/**`) or with the root's absolute path in front, it matched
+/// no file and the search reported an empty project.
+fn root_relative_glob<'a>(p: &Project, root: &Path, glob: &'a str) -> &'a str {
+    let mut glob = [root, p.root.as_path()]
+        .iter()
+        .filter_map(|prefix| prefix.to_str())
+        .map(|prefix| prefix.trim_end_matches('/'))
+        .filter(|prefix| !prefix.is_empty())
+        .find_map(|prefix| glob.strip_prefix(prefix)?.strip_prefix('/'))
+        .unwrap_or(glob);
+    while let Some(rest) = glob.strip_prefix("./") {
+        glob = rest;
+    }
+    glob
+}
+
 fn candidate_paths_bounded(
     p: &Project,
     pattern: Option<&str>,
@@ -4900,6 +4976,7 @@ fn candidate_paths_bounded(
     let mut non_utf8 = 0usize;
     let mut path_bytes = 0usize;
     let filter = pattern
+        .map(|glob| root_relative_glob(p, &root, glob))
         .map(globset::Glob::new)
         .transpose()?
         .map(|g| g.compile_matcher());
@@ -4916,7 +4993,12 @@ fn candidate_paths_bounded(
         .build()
     {
         check()?;
-        let entry = entry?;
+        // A directory the walk cannot read (permissions, or removed since)
+        // holds nothing to list; propagated, it failed every unscoped
+        // listing and search of the project.
+        let Ok(entry) = entry else {
+            continue;
+        };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -4970,7 +5052,16 @@ fn paths(
 fn search_text(path: &Path) -> Result<Option<String>> {
     match read_text(path) {
         Ok(text) => Ok(Some(text)),
-        Err(error) if error.to_string().starts_with("unsupported_") => Ok(None),
+        // A file the walk found but cannot read (permissions, or removed
+        // since) is skipped like a binary one: one such file failed every
+        // listing and search of the project.
+        Err(error)
+            if ["unsupported_", "file_permission_denied", "file_not_found"]
+                .iter()
+                .any(|code| error.to_string().starts_with(code)) =>
+        {
+            Ok(None)
+        }
         Err(error) => Err(error),
     }
 }
@@ -5476,7 +5567,8 @@ fn execute_arguments(
         bail!("cancelled");
     }
     reject_project_write_in_source_document(s, name)?;
-    if !repair_leaked_argument_markup(&mut args)
+    check_checkpoint_withholds(s, name)?;
+    if !repair_leaked_argument_markup(name, &mut args)
         .map_err(|error| memory_tools::argument_error(error, name, &args))?
     {
         return execute_repaired(s, name, args, cancel);
@@ -5508,21 +5600,68 @@ fn execute_arguments(
     })
 }
 
+/// A pending checkpoint withholds most tools. Checked before the arguments,
+/// so a withheld call with a bad argument is withheld too: refused for its
+/// argument it failed the checkpoint batch, and the fix the error asked for
+/// could not run until the checkpoint was acknowledged.
+fn check_checkpoint_withholds(s: &Session, name: &str) -> Result<()> {
+    let Some(cp) = s
+        .checkpoint
+        .as_ref()
+        .filter(|_| !ToolRegistry::checkpoint_allows(s, name))
+    else {
+        return Ok(());
+    };
+    bail!(
+        "checkpoint_pending: {name} is withheld while checkpoint {} is pending; nothing was executed. Call checkpoint_complete with this id and progress (memory_write first only for a reusable finding not saved yet); {name} is available again afterwards. Allowed now: {}",
+        cp.id,
+        // What this request offers: memory reuse and the lookup limit
+        // narrow the checkpoint tools further.
+        ToolRegistry::definitions(s)
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// The argument repairs every call gets before validation, returning the
+/// adjustments to report.
+fn normalize_call_arguments(s: &Session, name: &str, args: &mut Value) -> Result<Vec<String>> {
+    unwrap_task_state_call(name, args);
+    normalize_integer_arguments(name, args);
+    let mut adjusted = complete_unclosed_json_arguments(name, args);
+    adjusted.extend(clamp_size_arguments(name, args));
+    unwrap_continuation_cursor(name, args);
+    normalize_argument_aliases(s, name, args)?;
+    adjusted.extend(infer_replace_text_action(name, args));
+    normalize_lone_carriage_returns(name, args);
+    drop_empty_unaccepted_fields(name, args);
+    Ok(adjusted)
+}
+
+/// A call's arguments as it executed them. Continuations are built from
+/// these: rebuilt from the raw arguments, a next_cursor object sent back
+/// whole as the cursor lost its offset and filters, so code_outline and
+/// source_search returned the same page again and history read restarted.
+fn executed_arguments(s: &Session, call: &crate::llm::ToolCall) -> Value {
+    let raw = if call.arguments.trim().is_empty() {
+        "{}"
+    } else {
+        call.arguments.as_str()
+    };
+    let mut args = serde_json::from_str(raw).unwrap_or_default();
+    let _ = normalize_call_arguments(s, &call.name, &mut args);
+    args
+}
+
 fn execute_repaired(
     s: &mut Session,
     name: &str,
     mut args: Value,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value> {
-    unwrap_task_state_call(name, &mut args);
-    normalize_integer_arguments(name, &mut args);
-    let mut adjusted = complete_unclosed_json_arguments(name, &mut args);
-    adjusted.extend(clamp_size_arguments(name, &mut args));
-    unwrap_continuation_cursor(name, &mut args);
-    normalize_argument_aliases(s, name, &mut args)?;
-    adjusted.extend(infer_replace_text_action(name, &mut args));
-    normalize_lone_carriage_returns(name, &mut args);
-    drop_empty_unaccepted_fields(name, &mut args);
+    let adjusted = normalize_call_arguments(s, name, &mut args)?;
     expand_fix_word(s, name, &mut args)?;
     if name == "source_search"
         && args["query"]
@@ -5581,23 +5720,6 @@ fn execute_repaired(
         .map_err(|error| memory_tools::argument_error(error, name, &args))?;
     memory_tools::validate_input(name, &args)?;
     check_whole_write(s, name, &args)?;
-    if let Some(cp) = s
-        .checkpoint
-        .as_ref()
-        .filter(|_| !ToolRegistry::checkpoint_allows(s, name))
-    {
-        bail!(
-            "checkpoint_pending: {name} is withheld while checkpoint {} is pending; nothing was executed. Call checkpoint_complete with this id and progress (memory_write first only for a reusable finding not saved yet); {name} is available again afterwards. Allowed now: {}",
-            cp.id,
-            // What this request offers: memory reuse and the lookup limit
-            // narrow the checkpoint tools further.
-            ToolRegistry::definitions(s)
-                .iter()
-                .filter_map(|tool| tool["function"]["name"].as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
     if s.run_guidance["phase"] == "verify"
         && s.document_written
         && ((name == "file_list"
@@ -7122,21 +7244,19 @@ pub fn limit_result(
     mut result: Value,
     limit: usize,
 ) -> Value {
+    let args = executed_arguments(s, call);
     if call.name == "code_outline"
         && result["status"] == "ok"
         && let (Some(path), Some(cursor)) = (
             result["data"]["path"].as_str(),
             result["data"]["next_cursor"].as_str(),
         )
-        && let Ok(mut args) = serde_json::from_str::<Value>(&call.arguments)
     {
-        normalize_integer_arguments(call.name.as_str(), &mut args);
         result["next_cursor"] = structure::continuation(&args, path, cursor);
     }
     if matches!(call.name.as_str(), "symbol_search" | "symbol_relations")
         && result["status"] == "ok"
         && let Some(cursor) = result["data"]["next_cursor"].as_str()
-        && let Ok(args) = serde_json::from_str::<Value>(&call.arguments)
     {
         result["next_cursor"] = navigation::continuation(&call.name, &args, cursor);
     }
@@ -7150,8 +7270,6 @@ pub fn limit_result(
         result["next_cursor"] = json!({"tool":"file_read","cursor":id});
     }
     if call.name == "document_inspect" && result["data"]["content"]["truncated"] == true {
-        let mut args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
-        normalize_integer_arguments(call.name.as_str(), &mut args);
         let mut next = json!({"tool":"document_inspect","path":result["data"]["path"],"section":args["section"],"offset":result["data"]["content"]["next_offset"],"expected_hash":result["data"]["hash"]});
         if result["data"]["coverage"]["revision"].is_string() {
             next["expected_coverage_revision"] = result["data"]["coverage"]["revision"].clone();
@@ -7186,18 +7304,16 @@ pub fn limit_result(
         return output;
     }
     if call.name == "code_outline"
-        && let Some(page) = structure::limit_outline(call, &output, limit, &s.config.model)
+        && let Some(page) = structure::limit_outline(call, &args, &output, limit, &s.config.model)
     {
         return page;
     }
     if matches!(call.name.as_str(), "symbol_search" | "symbol_relations")
         && result["status"] == "ok"
-        && let Some(page) = navigation::limit_page(call, &output, limit, &s.config.model)
+        && let Some(page) = navigation::limit_page(call, &args, &output, limit, &s.config.model)
     {
         return page;
     }
-    let mut args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
-    normalize_integer_arguments(call.name.as_str(), &mut args);
     let old_archive = result["archive_id"]
         .as_u64()
         .or_else(|| {
@@ -7581,7 +7697,12 @@ fn failure_holds_checkpoint(s: &mut Session, name: &str, result: &Value) -> bool
     // A call the checkpoint withholds ran nothing and has nothing to repair.
     // Live runs sent reads beside checkpoint_complete; holding the batch for
     // them cost a cleanup request each, and the reads were sent again after.
-    if result["recovery"]["code"] == "checkpoint_pending" {
+    // An unknown tool and a lookup past its limit ran nothing either.
+    if matches!(
+        result["recovery"]["code"].as_str(),
+        Some("checkpoint_pending" | "checkpoint_lookup_limit")
+    ) || !ToolRegistry::checkpoint_allows(s, name)
+    {
         return false;
     }
     if !matches!(name, "document_edit" | "document_edit_batch") {

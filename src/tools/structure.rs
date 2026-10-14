@@ -155,6 +155,7 @@ pub(super) fn continuation(args: &Value, path: &str, cursor: &str) -> Value {
 /// symbol. Rebounding the same result keeps the original page's starting offset.
 pub(super) fn limit_outline(
     call: &crate::llm::ToolCall,
+    args: &Value,
     result: &Value,
     limit: usize,
     model: &str,
@@ -162,13 +163,11 @@ pub(super) fn limit_outline(
     if result["status"] != "ok" {
         return None;
     }
-    let mut args: Value = serde_json::from_str(&call.arguments).ok()?;
-    super::normalize_integer_arguments(call.name.as_str(), &mut args);
     let data = &result["data"];
     let symbols = data["symbols"].as_array()?;
     let path = data["path"].as_str()?;
-    let digest = fingerprint(Path::new(path), data["hash"].as_str()?, &options(&args));
-    let start = page_cursor(&args, &digest).ok()?;
+    let digest = fingerprint(Path::new(path), data["hash"].as_str()?, &options(args));
+    let start = page_cursor(args, &digest).ok()?;
     let total = data["total_symbols"].as_u64()? as usize;
     let candidate = |count: usize| {
         let mut page = result.clone();
@@ -178,7 +177,7 @@ pub(super) fn limit_outline(
         page["data"]["next_cursor"] = json!(cursor);
         page["truncated"] = json!(true);
         page["next_cursor"] =
-            cursor.map_or(Value::Null, |cursor| continuation(&args, path, &cursor));
+            cursor.map_or(Value::Null, |cursor| continuation(args, path, &cursor));
         page
     };
     let (mut low, mut high) = (0, symbols.len());

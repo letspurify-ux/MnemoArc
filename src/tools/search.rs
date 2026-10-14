@@ -157,24 +157,38 @@ pub(super) fn execute(
     if mode != "matches" && (before != 0 || after != 0) {
         bail!("invalid_argument_value: before/after require mode=matches");
     }
-    let mut expression = if let Some(terms) = terms {
+    let whole_word = args["whole_word"].as_bool().unwrap_or(false);
+    // `\b` beside punctuation needs a word character on its other side, so
+    // a whole-word `load()` never matched `load();`. A literal term gets a
+    // boundary only on a side that ends in a word character.
+    let literal = |term: &str| {
+        let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let boundary = |at_word: bool| if whole_word && at_word { r"\b" } else { "" };
+        format!(
+            "{}{}{}",
+            boundary(word(term.chars().next())),
+            regex::escape(term),
+            boundary(word(term.chars().next_back()))
+        )
+    };
+    let expression = if let Some(terms) = terms {
         format!(
             "(?:{})",
             terms
                 .iter()
-                .map(|t| regex::escape(t.as_str().unwrap()))
+                .map(|t| literal(t.as_str().unwrap()))
                 .collect::<Vec<_>>()
                 .join("|")
         )
     } else if args["regex"].as_bool().unwrap_or(false) {
-        query.to_owned()
+        if whole_word {
+            format!(r"\b(?:{query})\b")
+        } else {
+            query.to_owned()
+        }
     } else {
-        regex::escape(query)
+        literal(query)
     };
-    let whole_word = args["whole_word"].as_bool().unwrap_or(false);
-    if whole_word {
-        expression = format!(r"\b(?:{expression})\b");
-    }
     let case_sensitive = args["case_sensitive"].as_bool().unwrap_or(true);
     let regex = regex::RegexBuilder::new(&expression)
         .case_insensitive(!case_sensitive)
@@ -204,7 +218,12 @@ pub(super) fn execute(
     let mut matching_file_count = 0;
     let mut total_matching_lines = 0usize;
     let candidates = match exact_path {
-        Some(path) => vec![path],
+        // A named file that cannot be read is an error, not an empty
+        // result: only walked files are skipped when unreadable.
+        Some(path) => {
+            super::open_regular_file(&path)?;
+            vec![path]
+        }
         None => candidate_paths_scoped(&s.project, scope_glob, cancel, directory.as_deref(), None)?,
     };
     for path in candidates {

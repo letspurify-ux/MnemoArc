@@ -293,11 +293,11 @@ pub(super) fn continuation(name: &str, args: &Value, cursor: &str) -> Value {
 /// requested page. Never silently discard rows or manufacture read evidence.
 pub(super) fn limit_page(
     call: &crate::llm::ToolCall,
+    args: &Value,
     result: &Value,
     limit: usize,
     model: &str,
 ) -> Option<Value> {
-    let args: Value = serde_json::from_str(&call.arguments).ok()?;
     let data = &result["data"];
     let field = if call.name == "symbol_search" {
         "symbols"
@@ -314,7 +314,7 @@ pub(super) fn limit_page(
         let cursor = (start + count < total).then(|| format!("{fingerprint}:{}", start + count));
         result["data"]["next_cursor"] = json!(cursor);
         result["next_cursor"] = cursor.map_or(Value::Null, |cursor| {
-            continuation(&call.name, &args, &cursor)
+            continuation(&call.name, args, &cursor)
         });
         result["truncated"] = json!(true);
         result

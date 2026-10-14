@@ -82,50 +82,59 @@ fn visible_without_html_comments(line: &str, in_comment: &mut bool) -> String {
 }
 
 /// ATX headings outside fenced code and HTML comments. Byte offsets preserve Unicode and CRLF.
+/// Fences are the citation scanner's (CodeFence), so a fence opened after a
+/// list marker (`1. ```bash`) holds its `# comment` lines; read as prose,
+/// its indented closer opened a fence that hid every later heading, and a
+/// section replace deleted the next section.
 pub(super) fn headings(doc: &str) -> Vec<Heading> {
     let mut result: Vec<Heading> = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence: Option<CodeFence> = None;
     let mut in_comment = false;
     let mut offset = 0;
     for (i, line) in doc.split_inclusive('\n').enumerate() {
-        let was_fenced = fence.is_some();
-        let trimmed = line.trim_start_matches(' ');
-        let indent = line.len() - trimmed.len();
-        let first = trimmed.chars().next().unwrap_or(' ');
-        let run = trimmed.chars().take_while(|c| *c == first).count();
-        if indent <= 3 {
-            if let Some((ch, size)) = fence {
-                if first == ch && run >= size && trimmed[run..].trim().is_empty() {
+        let start = offset;
+        offset += line.len();
+        if let Some(open) = &fence {
+            match open.ended_by(line) {
+                Some(FenceEnd::Closer) => {
                     fence = None;
+                    continue;
                 }
-            } else if !in_comment && (first == '`' || first == '~') && run >= 3 {
-                fence = Some((first, run));
-            } else if !in_comment
-                && first == '#'
-                && (1..=6).contains(&run)
-                && trimmed
-                    .as_bytes()
-                    .get(run)
-                    .is_none_or(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
-            {
-                for prior in result.iter_mut().rev() {
-                    if prior.end == doc.len() && prior.level >= run {
-                        prior.end = offset;
-                    }
-                }
-                result.push(Heading {
-                    heading: line.trim().to_string(),
-                    start: offset,
-                    end: doc.len(),
-                    line: i + 1,
-                    level: run,
-                });
+                Some(FenceEnd::ListItemEnd) => fence = None,
+                None => continue,
             }
         }
-        if !was_fenced && fence.is_none() && (in_comment || indent < 4) {
+        if !in_comment && let Some((opened, _)) = CodeFence::opened_by(line) {
+            fence = Some(opened);
+            continue;
+        }
+        let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
+        let run = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+        if indent <= 3
+            && !in_comment
+            && (1..=6).contains(&run)
+            && trimmed
+                .as_bytes()
+                .get(run)
+                .is_none_or(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            for prior in result.iter_mut().rev() {
+                if prior.end == doc.len() && prior.level >= run {
+                    prior.end = start;
+                }
+            }
+            result.push(Heading {
+                heading: line.trim().to_string(),
+                start,
+                end: doc.len(),
+                line: i + 1,
+                level: run,
+            });
+        }
+        if in_comment || indent < 4 {
             in_comment = html_comment_state(line, in_comment);
         }
-        offset += line.len();
     }
     result
 }
@@ -1521,11 +1530,70 @@ pub(super) fn uncited_code_check(s: &Session, output: &Path, doc: &str) -> Optio
 }
 
 struct CitationFence {
-    marker: char,
-    width: usize,
+    fence: CodeFence,
     mermaid: bool,
     start_line: usize,
+}
+
+/// An open fenced code block: its marker and width, and the list item's
+/// content indent when the fence began right after a list marker.
+struct CodeFence {
+    marker: char,
+    width: usize,
     list_content_indent: Option<usize>,
+}
+
+/// How a line inside an open fence ends it.
+enum FenceEnd {
+    /// The line is the closing fence.
+    Closer,
+    /// The line is outdented below the list item the fence opened in, so
+    /// the item and its fence end without a closer; the line stands outside.
+    ListItemEnd,
+}
+
+impl CodeFence {
+    /// The fence a line opens and its info string: a fence at most three
+    /// spaces in, or one right after a list marker.
+    fn opened_by(line: &str) -> Option<(CodeFence, &str)> {
+        let trimmed = line.trim_start_matches(' ');
+        (line.len() - trimmed.len() <= 3)
+            .then(|| fence_opener(trimmed).map(|run| (run, None)))
+            .flatten()
+            .or_else(|| {
+                list_fence_content(line).and_then(|(content_indent, content)| {
+                    fence_opener(content).map(|run| (run, Some(content_indent)))
+                })
+            })
+            .map(|((marker, width, info), list_content_indent)| {
+                let fence = CodeFence {
+                    marker,
+                    width,
+                    list_content_indent,
+                };
+                (fence, info)
+            })
+    }
+
+    fn ended_by(&self, line: &str) -> Option<FenceEnd> {
+        let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
+        let base_indent = self.list_content_indent.unwrap_or(0);
+        // An outdented sibling item or heading ends a list item even if
+        // its code fence has no explicit closer.
+        if self.list_content_indent.is_some() && !line.trim().is_empty() && indent < base_indent {
+            Some(FenceEnd::ListItemEnd)
+        } else if indent >= base_indent
+            && indent <= base_indent + 3
+            && fence_run(trimmed).is_some_and(|(marker, width, tail)| {
+                marker == self.marker && width >= self.width && tail.trim().is_empty()
+            })
+        {
+            Some(FenceEnd::Closer)
+        } else {
+            None
+        }
+    }
 }
 
 fn fence_run(text: &str) -> Option<(char, usize, &str)> {
@@ -1583,8 +1651,12 @@ fn unclosed_fence_issue(fence: &CitationFence) -> Value {
 }
 
 /// A machine-readable citation: path, `:` or `#L`, then a line or range.
-const CITATION_PATTERN: &str =
-    r"([\p{L}\p{N}_./@-]+\.[A-Za-z][A-Za-z0-9]*)(:|#L)([0-9]+)(?:[-–]L?([0-9]+))?";
+/// Route-file names count as path text: a `+` after a slash (SvelteKit
+/// `routes/+page.svelte`), a bracketed segment (Next.js `[id]`,
+/// `[...slug]`) and a parenthesised directory (`(auth)/`). Without them the
+/// match began inside the path and reported a missing file the model could
+/// not cite any other way.
+const CITATION_PATTERN: &str = r"((?:[\p{L}\p{N}_./@-]|/\+|\[\[?[\p{L}\p{N}_.@-]+\]\]?|\([\p{L}\p{N}_.@-]+\)/)+\.[A-Za-z][A-Za-z0-9]*)(:|#L)([0-9]+)(?:[-–]L?([0-9]+))?";
 
 /// Whether a citation match is the label of a Markdown link whose target is
 /// itself a citation, `…](src/agent.rs:10-20)`: the target is the citation
@@ -1621,6 +1693,35 @@ fn url_prefix(before: &str, matched: &str) -> bool {
     head.contains("://") || (head.ends_with(':') && matched.starts_with("//"))
 }
 
+/// Per zero-based `str::lines` line, whether a CommonMark parse puts it in
+/// a code block, indented or fenced, inside any list or quote.
+fn code_block_lines(doc: &str) -> Vec<bool> {
+    // The parser also ends a line at a lone CR, which `str::lines` keeps.
+    let normalized;
+    let doc = if doc.contains('\r') {
+        normalized = doc.replace("\r\n", "\n").replace('\r', " ");
+        normalized.as_str()
+    } else {
+        doc
+    };
+    let mut code = vec![false; doc.lines().count()];
+    let arena = comrak::Arena::new();
+    let mut options = comrak::Options::default();
+    options.extension.table = true;
+    options.extension.footnotes = true;
+    let root = comrak::parse_document(&arena, doc, &options);
+    for node in root.descendants() {
+        let data = node.data.borrow();
+        if matches!(data.value, comrak::nodes::NodeValue::CodeBlock(_)) {
+            let lines = data.sourcepos.start.line.saturating_sub(1)..data.sourcepos.end.line;
+            for line in code.iter_mut().take(lines.end).skip(lines.start) {
+                *line = true;
+            }
+        }
+    }
+    code
+}
+
 fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
     let pattern = regex::Regex::new(CITATION_PATTERN)?;
     let continuation = regex::Regex::new(r"^\s*,\s*([0-9]+)(?:[-–]L?([0-9]+))?")?;
@@ -1628,50 +1729,44 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
     let mut issues = vec![];
     let mut fence: Option<CitationFence> = None;
     let mut in_comment = false;
+    let mut code_lines: Option<Vec<bool>> = None;
     for (document_line, line) in doc.lines().enumerate() {
-        let trimmed = line.trim_start_matches(' ');
-        let indent = line.len() - trimmed.len();
         if let Some(open) = &fence {
-            let base_indent = open.list_content_indent.unwrap_or(0);
-            // An outdented sibling item or heading ends a list item even if
-            // its code fence has no explicit closer.
-            if open.list_content_indent.is_some() && !line.trim().is_empty() && indent < base_indent
-            {
-                issues.push(unclosed_fence_issue(open));
-                fence = None;
-            } else if indent >= base_indent
-                && indent <= base_indent + 3
-                && fence_run(trimmed).is_some_and(|(marker, width, tail)| {
-                    marker == open.marker && width >= open.width && tail.trim().is_empty()
-                })
-            {
-                fence = None;
-                continue;
+            match open.fence.ended_by(line) {
+                Some(FenceEnd::Closer) => {
+                    fence = None;
+                    continue;
+                }
+                Some(FenceEnd::ListItemEnd) => {
+                    issues.push(unclosed_fence_issue(open));
+                    fence = None;
+                }
+                None => {}
             }
         }
         if fence.as_ref().is_some_and(|open| !open.mermaid) {
             continue;
         }
         if fence.is_none() {
-            let opening = (indent <= 3)
-                .then(|| fence_opener(trimmed).map(|run| (run, None)))
-                .flatten()
-                .or_else(|| {
-                    list_fence_content(line).and_then(|(content_indent, content)| {
-                        fence_opener(content).map(|run| (run, Some(content_indent)))
-                    })
-                });
-            if !in_comment && let Some(((marker, width, info), list_content_indent)) = opening {
+            if !in_comment && let Some((opened, info)) = CodeFence::opened_by(line) {
                 fence = Some(CitationFence {
-                    marker,
-                    width,
+                    fence: opened,
                     mermaid: info.trim().eq_ignore_ascii_case("mermaid"),
                     start_line: document_line + 1,
-                    list_content_indent,
                 });
                 continue;
             }
-            if indent >= 4 {
+            // Four spaces in is often list content, a nested `    - item` or
+            // a `10.` item's continuation paragraph. Skipped as code, their
+            // unread and missing citations passed every check, so only a code
+            // block of the parsed document is skipped.
+            let indent = line.len() - line.trim_start_matches(' ').len();
+            if indent >= 4
+                && code_lines
+                    .get_or_insert_with(|| code_block_lines(doc))
+                    .get(document_line)
+                    .is_some_and(|code| *code)
+            {
                 if in_comment {
                     let _ = visible_without_html_comments(line, &mut in_comment);
                 }
@@ -2131,12 +2226,28 @@ fn path_rewrites<'a>(
         if url_prefix(&line[..whole.start()], whole.as_str()) {
             continue;
         }
+        // A match inside a longer path, agent.rs in src\agent.rs:1-2, does
+        // not name the file it ends with: completing it saved
+        // src\src/agent.rs.
+        if line[..whole.start()]
+            .chars()
+            .next_back()
+            .is_some_and(continues_path)
+        {
+            continue;
+        }
         rewrites.push((path.start(), path.end(), *file));
         span = Some(span.map_or((whole.start(), whole.end()), |(start, end)| {
             (start.min(whole.start()), end.max(whole.end()))
         }));
     }
     (rewrites, span)
+}
+
+/// Whether a character before a citation match makes the match the end of
+/// a longer path.
+fn continues_path(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '\\' | '_' | '.' | '/' | '@' | '-' | '+')
 }
 
 /// line[start..end] with each rewrite's path replaced by its project file.
