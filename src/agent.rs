@@ -2094,7 +2094,7 @@ pub async fn run_session_controlled(
             break;
         }
         s.task_rounds += 1;
-        s.set_activity(json!({"stage":"model","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds()}));
+        s.activity = json!({"stage":"model","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds()});
         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
         let deadline = run_deadline(started, &s.config);
         if tokio::time::Instant::now() >= deadline {
@@ -2414,7 +2414,7 @@ pub async fn run_session_controlled(
             if s.is_document_work() && document_tokens >= s.config.output_tokens / 4 {
                 s.progress_recovery.whole_write_withheld = true;
             }
-            s.set_activity(json!({"stage":"continuing","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds()}));
+            s.activity = json!({"stage":"continuing","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds()});
             snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
             if length_recoveries >= LENGTH_RECOVERY_LIMIT {
                 // The advice follows what the next edit can be: with no
@@ -2777,7 +2777,7 @@ pub async fn run_session_controlled(
                 .iter()
                 .map(|c| tools::call_summary(&s.project.root, &c.name, &c.arguments))
                 .collect();
-            s.set_activity(json!({"stage":"tools","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds(),"tools":execution_calls[i..i+group].iter().map(|c| c.name.clone()).collect::<Vec<_>>(),"steps":&steps}));
+            s.activity = json!({"stage":"tools","started_at_ms":chrono::Utc::now().timestamp_millis(),"round":s.run_rounds(),"tools":execution_calls[i..i+group].iter().map(|c| c.name.clone()).collect::<Vec<_>>(),"steps":&steps});
             snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
             // A single completion can contain many groups. Stop before the
             // next group when earlier archives or receipts exhausted capacity.
@@ -3025,7 +3025,6 @@ pub async fn run_session_controlled(
                 remaining =
                     remaining.saturating_sub(tools::result_tokens(call, &result, &s.config.model));
                 let status = result["status"].as_str().unwrap_or("error").to_owned();
-                s.record_step(summary.clone(), &status);
                 emit(
                     &events,
                     AgentEvent::Tool {
@@ -3197,13 +3196,12 @@ pub async fn run_session_controlled(
             break;
         }
         // The batch is over: its progress line must not still read as
-        // running while its calls are listed as finished. A failure set in
-        // the batch ends the run here, and the run history records the stage
-        // it ended in, so that stage stays.
+        // running while its results already show in the history. A failure
+        // set in the batch ends the run here, and the run history records
+        // the stage it ended in, so that stage stays.
         if failure.is_none() {
-            s.set_activity(
-                json!({"stage":"preparing","started_at_ms":chrono::Utc::now().timestamp_millis()}),
-            );
+            s.activity =
+                json!({"stage":"preparing","started_at_ms":chrono::Utc::now().timestamp_millis()});
         }
         snapshot(&s, &events, &cancel, run_deadline(started, &s.config)).await;
     }

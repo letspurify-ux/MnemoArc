@@ -9,7 +9,7 @@ import {
 import { Message, StreamingMessage } from "./chat/Message.jsx";
 import { continuationMessages } from "./chat/continuation.js";
 import { toolLabels } from "./api.js";
-import { recentSteps, toolProgress } from "./activity.js";
+import { toolProgress } from "./activity.js";
 import { displayPathText, displayToolResult } from "./paths.js";
 
 export default function Chat({
@@ -220,16 +220,6 @@ export default function Chat({
               </span>
             </div>
           )}
-          {session?.status === "running" &&
-            recentSteps(session.activity).length > 0 && (
-              <ol className="activity-steps" aria-label="최근 실행 단계">
-                {recentSteps(session.activity).map((step, index) => (
-                  <li key={index} className={step.ok ? undefined : "failed"}>
-                    {step.ok ? "✓" : "✗"} {step.text}
-                  </li>
-                ))}
-              </ol>
-            )}
           {session?.status !== "running" &&
             ["follow_up", "message_routing"].includes(lastRun?.workflow) && (
               <div

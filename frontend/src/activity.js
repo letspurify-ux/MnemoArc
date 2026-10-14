@@ -19,10 +19,3 @@ export function toolProgress(activity, labels) {
     shown.length > SHOWN_STEPS ? ` 외 ${shown.length - SHOWN_STEPS}건` : "";
   return `${shown.slice(0, SHOWN_STEPS).join(" · ")}${more} 실행 중`;
 }
-
-/** Finished calls shown below the progress line, oldest first. */
-export function recentSteps(activity) {
-  return (activity?.recent || [])
-    .filter((step) => typeof step?.text === "string" && step.text)
-    .map((step) => ({ text: step.text, ok: step.status === "ok" }));
-}

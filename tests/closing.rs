@@ -3288,28 +3288,8 @@ async fn closing_drops_plan_refusals_it_no_longer_applies() {
     }
 }
 
-// The running task's progress keeps what its last calls did, so a slow model
-// request still shows the reads and edits before it.
-#[test]
-fn activity_keeps_the_last_finished_steps_across_stages() {
-    let (_dir, mut s) = unsaved_fixture(false);
-    for n in 0..mnemoarc::session::RECENT_STEPS + 2 {
-        s.record_step(format!("파일 읽기 main.js:{n}"), "ok");
-    }
-    s.record_step("문서 편집 절 추가: 흐름".into(), "error");
-    s.set_activity(json!({"stage":"model","round":3}));
-    assert_eq!(s.activity["stage"], "model");
-    let recent = s.activity["recent"].as_array().unwrap();
-    assert_eq!(recent.len(), mnemoarc::session::RECENT_STEPS);
-    assert_eq!(recent[0]["text"], "파일 읽기 main.js:3");
-    assert_eq!(
-        recent.last().unwrap(),
-        &json!({"text":"문서 편집 절 추가: 흐름","status":"error"})
-    );
-}
-
-// A run reports what each call did: the tool event names it, the batch's
-// progress lists it, and the next model wait still shows it.
+// A run reports what each call did: the tool event names it and the
+// batch's progress lists it.
 #[tokio::test]
 async fn a_run_reports_what_each_tool_call_did() {
     let (_dir, s) = saved_fixture();
@@ -3324,32 +3304,24 @@ async fn a_run_reports_what_each_tool_call_did() {
     });
     let (tx, mut rx) = mpsc::channel(256);
     let drain = tokio::spawn(async move {
-        let (mut summaries, mut steps, mut recent) = (vec![], vec![], vec![]);
+        let (mut summaries, mut steps) = (vec![], vec![]);
         while let Some(event) = rx.recv().await {
             match event {
                 AgentEvent::Tool { summary, .. } => summaries.push(summary),
                 AgentEvent::Snapshot(s) if s.activity["stage"] == "tools" => {
                     steps.push(s.activity["steps"].clone());
                 }
-                AgentEvent::Snapshot(s) if s.activity["stage"] == "model" => {
-                    recent.push(s.activity["recent"].clone());
-                }
                 _ => {}
             }
         }
-        (summaries, steps, recent)
+        (summaries, steps)
     });
     run_session(s, client, CancellationToken::new(), tx).await;
-    let (summaries, steps, recent) = drain.await.unwrap();
+    let (summaries, steps) = drain.await.unwrap();
     assert_eq!(summaries, ["파일 읽기 main.js:3-4"]);
     // Only while the batch runs: the snapshot after it no longer reads as
     // running.
     assert_eq!(steps, [json!(["파일 읽기 main.js:3-4"])]);
-    assert_eq!(
-        recent.last().unwrap(),
-        &json!([{"text":"파일 읽기 main.js:3-4","status":"ok"}]),
-        "{recent:?}"
-    );
 }
 
 // A run that a tool call ends is recorded as ending in the tool stage, not

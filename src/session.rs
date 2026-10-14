@@ -13,9 +13,6 @@ use std::sync::{Arc, atomic::AtomicBool};
 mod run_history;
 pub use run_history::{RUN_HISTORY_LIMIT, RunRecord};
 
-/// Finished tool calls a running task shows below its progress line.
-pub const RECENT_STEPS: usize = 5;
-
 #[derive(Clone, Debug)]
 pub struct FollowUpQuestion {
     pub text: String,
@@ -679,37 +676,6 @@ impl Session {
                 }
             }
         }
-    }
-
-    /// Replaces the run's activity, keeping the recent steps it shows.
-    pub fn set_activity(&mut self, mut activity: Value) {
-        if let Some(recent) = self.activity.get("recent").cloned()
-            && activity.is_object()
-        {
-            activity["recent"] = recent;
-        }
-        self.activity = activity;
-    }
-
-    /// Adds a finished tool call to the recent steps the activity shows,
-    /// keeping the last RECENT_STEPS. The UI shows them; the model does not.
-    pub fn record_step(&mut self, text: String, status: &str) {
-        // A malformed call with no name has nothing to show.
-        if text.is_empty() {
-            return;
-        }
-        // Indexing a non-object Value to assign panics.
-        if !self.activity.is_object() {
-            self.activity = json!({});
-        }
-        let mut recent = self.activity["recent"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        recent.push(json!({"text":text,"status":status}));
-        let excess = recent.len().saturating_sub(RECENT_STEPS);
-        recent.drain(..excess);
-        self.activity["recent"] = json!(recent);
     }
 
     /// Whether document verification (progress recovery, closing, the
