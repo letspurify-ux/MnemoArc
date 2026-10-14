@@ -561,3 +561,145 @@ fn uninitialized_csharp_enum_members_and_exported_js_variables_are_references() 
     let target = symbol(&mut s, "a.js", "target", None);
     assert_eq!(relations(&mut s, &target, "references")["total_results"], 1);
 }
+
+#[test]
+fn rust_plain_use_imports_its_last_path_segment() {
+    // A scoped path's `path` field is only its prefix: `use crate::store::save`
+    // imports `save`, and `use crate::store::Store` does not bind `store`.
+    let (_dir, mut s) = setup(&[
+        (
+            "src/lib.rs",
+            "mod store;\nmod app;\nuse crate::store::save;\nuse crate::store::Store;\nfn main() { save(); store::helper(); }\n",
+        ),
+        (
+            "src/store.rs",
+            "pub struct Store;\npub fn save() {}\npub fn helper() {}\n",
+        ),
+        (
+            "src/app.rs",
+            "use super::store;\nfn run() { store::save(); }\n",
+        ),
+    ]);
+    let save = symbol(&mut s, "src/store.rs", "save", None);
+    let callers = relations(&mut s, &save, "callers");
+    let paths: Vec<_> = callers["relations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["src/app.rs", "src/lib.rs"], "{callers}");
+    let helper = symbol(&mut s, "src/store.rs", "helper", None);
+    assert_eq!(relations(&mut s, &helper, "callers")["total_results"], 1);
+}
+
+#[test]
+fn rust_plain_use_does_not_conflict_with_a_function_named_like_the_module() {
+    let (_dir, mut s) = setup(&[
+        (
+            "src/lib.rs",
+            "mod settings;\nuse crate::settings::Settings;\nfn settings() -> Settings { Settings }\nfn main() { settings(); }\n",
+        ),
+        ("src/settings.rs", "pub struct Settings;\n"),
+    ]);
+    let settings = symbol(&mut s, "src/lib.rs", "settings", Some("function"));
+    let callers = relations(&mut s, &settings, "callers");
+    assert_eq!(callers["total_results"], 1, "{callers}");
+    assert_eq!(
+        callers["relations"][0]["resolution"], "resolved",
+        "{callers}"
+    );
+}
+
+#[test]
+fn rust_block_scoped_plain_use_shadows_an_outer_function() {
+    let (_dir, mut s) = setup(&[(
+        "src/lib.rs",
+        "mod other { pub fn save() {} }\nfn save() {}\nfn main() { use other::save; save(); }\n",
+    )]);
+    let main = symbol(&mut s, "src/lib.rs", "main", None);
+    assert_eq!(
+        candidate_names(&relations(&mut s, &main, "calls")),
+        vec!["other::save"]
+    );
+}
+
+#[test]
+fn java_and_csharp_members_of_other_receivers_are_not_bare_names() {
+    for (path, code, name) in [
+        (
+            "A.java",
+            "class A {\n  void run() {\n    java.io.OutputStream out = null;\n    System.out.println(1);\n  }\n}\n",
+            "out",
+        ),
+        (
+            "A.java",
+            "class A {\n  int read(B other) {\n    int size = 0;\n    return other.size;\n  }\n}\n",
+            "size",
+        ),
+        (
+            "A.java",
+            "class A {\n  int count;\n  int read(B other) { return other.count; }\n}\n",
+            "count",
+        ),
+        (
+            "A.java",
+            "class A {\n  void save(Object o) {}\n  void run(java.util.List<Object> xs) { xs.forEach(Other::save); }\n}\n",
+            "save",
+        ),
+        (
+            "A.cs",
+            "class A {\n  void Save() {}\n  void Run(B other) { other?.Save(); var n = other?.Save; }\n}\n",
+            "Save",
+        ),
+    ] {
+        let (_dir, mut s) = setup(&[(path, code)]);
+        let target = symbol(&mut s, path, name, None);
+        let refs = relations(&mut s, &target, "references");
+        assert_eq!(refs["total_results"], 0, "{code}: {refs}");
+    }
+}
+
+#[test]
+fn java_and_csharp_this_and_type_receivers_keep_their_member_candidates() {
+    for (path, code, name, expected) in [
+        (
+            "A.java",
+            "class A {\n  int count;\n  int read() { this.count = 1; return this.count; }\n}\n",
+            "count",
+            2,
+        ),
+        (
+            "A.java",
+            "class A {\n  void save(Object o) {}\n  void run(java.util.List<Object> xs) { xs.forEach(this::save); }\n}\n",
+            "save",
+            1,
+        ),
+        (
+            "A.cs",
+            "class A {\n  void Save() {}\n  void Run() { this?.Save(); }\n}\n",
+            "Save",
+            1,
+        ),
+    ] {
+        let (_dir, mut s) = setup(&[(path, code)]);
+        let target = symbol(&mut s, path, name, None);
+        let refs = relations(&mut s, &target, "references");
+        assert_eq!(refs["total_results"], expected, "{code}: {refs}");
+        for row in refs["relations"].as_array().unwrap() {
+            assert_eq!(row["qualifier"], "this", "{code}: {refs}");
+        }
+    }
+    let (_dir, mut s) = setup(&[
+        (
+            "A.java",
+            "class A {\n  void run(java.util.List<Object> xs) { xs.forEach(Other::save); }\n}\n",
+        ),
+        (
+            "Other.java",
+            "class Other {\n  static void save(Object o) {}\n}\n",
+        ),
+    ]);
+    let save = symbol(&mut s, "Other.java", "save", None);
+    assert_eq!(relations(&mut s, &save, "references")["total_results"], 1);
+}

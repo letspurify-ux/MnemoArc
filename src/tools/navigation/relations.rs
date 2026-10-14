@@ -345,6 +345,7 @@ fn identifiers(node: Node<'_>) -> Vec<Node<'_>> {
                 | "type_identifier"
                 | "member_expression"
                 | "field_expression"
+                | "field_access"
                 | "attribute"
                 | "member_access_expression"
                 | "scoped_identifier"
@@ -453,7 +454,13 @@ fn rust_import(
             }
             "use_wildcard" => *wildcard = true,
             _ => {
-                let path = node.child_by_field_name("path").unwrap_or(node);
+                // Only `path as alias` names the imported path in a field. A
+                // plain scoped path is imported whole; its `path` is a prefix.
+                let path = if node.kind() == "use_as_clause" {
+                    node.child_by_field_name("path").unwrap_or(node)
+                } else {
+                    node
+                };
                 let full = if text_of(path, source) == "self" && !prefix.is_empty() {
                     prefix
                 } else {
@@ -712,8 +719,30 @@ fn expression<'a>(node: Node<'a>, source: &str) -> Option<(Node<'a>, Option<Stri
             });
             Some((name, qualifier))
         }
+        // Java `Type::method` has no fields; its receiver precedes the name.
+        // A constructor reference (`Type::new`) names no method.
+        "method_reference" => match named(node).as_slice() {
+            [receiver, .., name] if name.kind() == "identifier" => {
+                Some((*name, Some(path_text(*receiver, source))))
+            }
+            _ => None,
+        },
+        // C# `receiver?.Member`: the binding holds only the member name, and
+        // its enclosing conditional access holds the receiver.
+        "conditional_access_expression" => expression(
+            named(node)
+                .into_iter()
+                .find(|n| n.kind() == "member_binding_expression")?,
+            source,
+        ),
+        "member_binding_expression" => {
+            let (name, _) = expression(node.child_by_field_name("name")?, source)?;
+            let receiver = node.parent()?.child_by_field_name("condition")?;
+            Some((name, Some(path_text(receiver, source))))
+        }
         "member_expression"
         | "field_expression"
+        | "field_access"
         | "attribute"
         | "member_access_expression"
         | "nested_type_identifier"
@@ -1367,7 +1396,9 @@ fn collect(
                             {
                                 Some(NameLookup::Type)
                             }
-                            ("java", "method_invocation") => Some(NameLookup::Method),
+                            ("java", "method_invocation" | "method_reference") => {
+                                Some(NameLookup::Method)
+                            }
                             ("typescript" | "typescriptreact", "nested_type_identifier") => {
                                 Some(NameLookup::Type)
                             }
@@ -2383,6 +2414,9 @@ fn resolve_exact(
                 && visible(facts, &d.scope, at)
                 && lookup.is_none_or(|lookup| lookup.accepts(&d.kind))
                 && !(language == "rust" && matches!(d.kind.as_str(), "macro" | "impl"))
+                // A Rust module is named only as a path segment, so `mod x;`
+                // and `fn x()` coexist and a call or value selects the function.
+                && !(language == "rust" && d.kind == "module" && !site.scoped_path)
         })
         .filter(|d| {
             !matches!(
