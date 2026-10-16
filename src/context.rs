@@ -1,7 +1,7 @@
 use crate::{
     config::Config,
-    memory::{MemoryMeta, MemoryStatus, id, serialized_bytes},
-    session::{Checkpoint, Session, TaskState},
+    memory::{MemoryMeta, MemoryStatus, id},
+    session::{Checkpoint, Session, SessionHistory, TaskState},
 };
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -511,6 +511,42 @@ fn todo_view(item: &Value) -> Value {
     view
 }
 
+/// What history at its limit is brought down to, so the next groups do not
+/// cross the limit again at once.
+fn history_floor(limit: usize) -> usize {
+    limit.saturating_mul(4) / 5
+}
+
+/// Prune history that reached `limit` down to history_floor, the size a
+/// checkpoint under history pressure retires groups for, or to the limit
+/// itself when the groups that may leave cannot reach the floor. Pruning
+/// only to the limit left the next small group to cross it again, so every
+/// later request opened another checkpoint.
+fn prune_toward(history: &mut SessionHistory, limit: usize, retired: &BTreeSet<u64>) -> Result<()> {
+    if history.bytes() >= limit
+        && history
+            .prune_retiring(history_floor(limit), retired)
+            .is_ok()
+    {
+        return Ok(());
+    }
+    history.prune_retiring(limit, retired)
+}
+
+/// Bytes of the bundles from `front` on that a commit could prune: complete
+/// bundles already retired or in `chosen`. Moves `front` past them.
+fn prunable_run(history: &SessionHistory, front: &mut usize, chosen: &BTreeSet<u64>) -> usize {
+    let mut bytes = 0usize;
+    while let Some(b) = history.bundles.get(*front)
+        && b.complete
+        && ((!b.active && b.reviewed) || chosen.contains(&b.id))
+    {
+        bytes = bytes.saturating_add(b.bytes());
+        *front += 1;
+    }
+    bytes
+}
+
 impl ContextManager {
     /// Keep the full plan in the session, but bound the model-facing preview so
     /// a long plan cannot consume the entire task-state token budget.
@@ -876,16 +912,6 @@ impl ContextManager {
         } else {
             (budget as f64 * s.config.high_water) as usize
         };
-        if request_tokens < threshold
-            && s.history.bytes()
-                < s.pending_config
-                    .as_ref()
-                    .map_or(s.config.history_bytes, |c| {
-                        c.history_bytes.min(s.config.history_bytes)
-                    })
-        {
-            return Ok(false);
-        }
         let history_limit = s
             .pending_config
             .as_ref()
@@ -893,18 +919,26 @@ impl ContextManager {
                 c.history_bytes.min(s.config.history_bytes)
             });
         let history_pressure = s.history.bytes() >= history_limit;
+        if request_tokens < threshold && !history_pressure {
+            return Ok(false);
+        }
         let history_target = if history_pressure {
-            history_limit.saturating_mul(4) / 5
+            history_floor(history_limit)
         } else {
             history_limit
         };
-        let mut retained_bytes = s.history.bytes();
-        for b in &s.history.bundles {
-            if b.active || !b.reviewed || !b.complete {
-                break;
-            }
-            retained_bytes = retained_bytes.saturating_sub(serialized_bytes(b));
-        }
+        // A commit prunes from the front, and only through groups retired
+        // before or with this checkpoint, so a retired group behind one that
+        // stays (an answered follow-up between runs) leaves once the groups
+        // in front of it are chosen. Counted from the leading retired run
+        // alone, it never left the estimate, and groups the history target
+        // did not need were retired with it.
+        let mut chosen = BTreeSet::new();
+        let mut front = 0;
+        let mut retained_bytes = s
+            .history
+            .bytes()
+            .saturating_sub(prunable_run(&s.history, &mut front, &chosen));
         let target = (budget as f64 * s.config.low_water) as usize;
         let mut remaining = request_tokens;
         let mut ids = vec![];
@@ -918,18 +952,35 @@ impl ContextManager {
             .find(|b| b.active && b.complete)
             .map(|b| b.id)
             .unwrap_or(0);
+        // The partial replies the pending continuation extends: the active
+        // bundles after its last complete reply. An older partial reply was
+        // continued long ago; kept active as well, it blocked the prune of
+        // every group behind it, and under history pressure the commit
+        // failed on each resume.
+        let continued: BTreeSet<u64> = if s.continuation.is_some() {
+            s.history
+                .bundles
+                .iter()
+                .rev()
+                .filter(|b| b.active)
+                .take_while(|b| b.messages.iter().any(|m| m["partial"] == true))
+                .map(|b| b.id)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
         let candidates: Vec<_> = s
             .history
             .bundles
             .iter()
             .filter(|b| b.complete && b.id <= last && (b.active || !b.reviewed))
-            .filter(|b| {
-                !(s.continuation.is_some() && b.messages.iter().any(|m| m["partial"] == true))
-            })
+            .filter(|b| !continued.contains(&b.id))
             .collect();
         for b in candidates {
             ids.push(b.id);
-            retained_bytes = retained_bytes.saturating_sub(serialized_bytes(b));
+            chosen.insert(b.id);
+            retained_bytes =
+                retained_bytes.saturating_sub(prunable_run(&s.history, &mut front, &chosen));
             if b.active {
                 let delivered: Vec<_> = b.messages.iter().cloned().map(model_message).collect();
                 remaining = remaining.saturating_sub(count(&json!(delivered), &s.config.model));
@@ -942,9 +993,17 @@ impl ContextManager {
             // A previous cleanup may already have retired every complete
             // group. Crossing the high-water mark alone is not a capacity
             // failure when the current request still fits and retained
-            // history is below its hard target; there is nothing left to
-            // evict, so continue with the existing context.
-            if request_tokens <= budget && retained_bytes <= history_target {
+            // history is below its limit; there is nothing left to evict,
+            // so continue with the existing context. Retired history over
+            // the limit (an answered follow-up, say) needs no checkpoint to
+            // leave: without this prune nothing released it, and history
+            // grew until the hard limit stopped the run.
+            if request_tokens <= budget && retained_bytes <= history_limit {
+                // A lower pending limit prunes when it applies, so a
+                // rejected setting leaves no irreversible prune behind.
+                if history_pressure {
+                    prune_toward(&mut s.history, s.config.history_bytes, &BTreeSet::new())?;
+                }
                 return Ok(false);
             }
             bail!(
@@ -966,6 +1025,33 @@ impl ContextManager {
         });
         Ok(true)
     }
+    /// Take the oldest response of the pending checkpoint's cleanup out of
+    /// active context, keeping the latest, whose results the next request
+    /// answers. It stays retained, unreviewed, until the commit retires it.
+    /// False when no response can leave.
+    pub fn hide_cleanup_round(s: &mut Session) -> bool {
+        let Some(cp) = &s.checkpoint else {
+            return false;
+        };
+        let active: Vec<u64> = cp
+            .maintenance_bundle_ids
+            .iter()
+            .copied()
+            .filter(|id| s.history.read(*id).is_ok_and(|b| b.active))
+            .collect();
+        let [oldest, _, ..] = active[..] else {
+            return false;
+        };
+        let bundle = s
+            .history
+            .bundles
+            .iter_mut()
+            .find(|b| b.id == oldest)
+            .unwrap();
+        bundle.active = false;
+        bundle.reviewed = false;
+        true
+    }
     pub fn commit(s: &mut Session) -> Result<()> {
         let cp = s
             .checkpoint
@@ -986,7 +1072,7 @@ impl ContextManager {
             .chain(&cp.maintenance_bundle_ids)
             .copied()
             .collect();
-        s.history.prune_retiring(s.config.history_bytes, &ids)?;
+        prune_toward(&mut s.history, s.config.history_bytes, &ids)?;
         s.checkpoint = None;
         s.checkpoints_completed += 1;
         Ok(())

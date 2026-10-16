@@ -401,6 +401,97 @@ async fn unknown_model_accepts_large_memory_metadata_over_three_checkpoints() {
     assert!(session.memory.search("실패", &[]).len() >= 3);
 }
 
+struct OverfullCleanup {
+    requests: Mutex<Vec<Value>>,
+}
+#[async_trait]
+impl LlmClient for OverfullCleanup {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let state: Value = serde_json::from_str(
+            request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )?;
+        self.requests.lock().unwrap().push(request);
+        Ok(if state["checkpoint"].is_object() {
+            call(
+                "ack",
+                "checkpoint_complete",
+                json!({"id":state["checkpoint"]["id"],"progress":"Findings are saved; continue the answer.","no_save_reason":"Already saved"}),
+            )
+        } else {
+            Completion {
+                text: "The answer continues from the saved findings.".into(),
+                ..Default::default()
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn cleanup_rounds_past_the_reserve_leave_context_instead_of_failing_the_run() {
+    // input_budget reserves three cleanup rounds. Rounds beyond them stayed
+    // in context, so a long checkpoint ended at context_limit and every
+    // resume failed at once on the same oversized cleanup request.
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = s(dir.path());
+    session.add_user("Explain the project".into());
+    session.add_user("Next observation".into());
+    mnemoarc::context::ContextManager::prepare(&mut session, 60000).unwrap();
+    for round in 0..10 {
+        let id = session.history.push(
+            vec![json!({"role":"assistant","content":format!("round-{round}-marker {}", format!("cleanup note {round} ").repeat(1600))})],
+            true,
+        );
+        session
+            .checkpoint
+            .as_mut()
+            .unwrap()
+            .maintenance_bundle_ids
+            .push(id);
+    }
+    let config = session.config.clone();
+    let oversized = mnemoarc::context::ContextManager::request(
+        &session,
+        mnemoarc::tools::ToolRegistry::definitions(&session),
+    )
+    .unwrap();
+    assert!(
+        mnemoarc::context::count(&oversized, &config.model)
+            + mnemoarc::context::ContextManager::cleanup_output_tokens(&config)
+            + 512
+            > config.context_tokens
+    );
+    let client = Arc::new(OverfullCleanup {
+        requests: Mutex::new(vec![]),
+    });
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(session, client.clone(), CancellationToken::new(), tx).await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert_eq!(result.checkpoints_completed, 1);
+    let requests = client.requests.lock().unwrap();
+    let cleanup = requests[0].to_string();
+    assert!(!cleanup.contains("round-0-marker"));
+    assert!(cleanup.contains("round-9-marker"));
+    assert!(
+        mnemoarc::context::count(&requests[0], &config.model)
+            + mnemoarc::context::ContextManager::cleanup_output_tokens(&config)
+            + 512
+            <= config.context_tokens
+    );
+}
+
 struct InvalidCleanup;
 #[async_trait]
 impl LlmClient for InvalidCleanup {

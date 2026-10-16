@@ -140,7 +140,7 @@ pub struct Bundle {
     pub complete: bool,
 }
 impl Bundle {
-    fn bytes(&self) -> usize {
+    pub(crate) fn bytes(&self) -> usize {
         // Only flags and the ID change during retirement. Count their small
         // envelope and reuse the immutable messages' serialized byte count.
         #[derive(Serialize)]
@@ -936,6 +936,20 @@ impl Session {
         // The old goal's completion checks do not carry over to a new goal.
         if amendment.goal.is_some() && amendment.completion.is_none() {
             next.task.completion.clear();
+        }
+        // Every request carries the task within state_tokens. Accepted, a
+        // revision over it failed each later request with task_state_limit,
+        // which neither the model nor a resume could repair.
+        let snapshot = crate::context::ContextManager::task_snapshot(
+            &next.task,
+            &next.config.model,
+            next.config.state_tokens,
+        );
+        if crate::context::count(&snapshot, &next.config.model) > next.config.state_tokens {
+            bail!(
+                "invalid_task_requirements: the revised requirements exceed the task state budget (state_tokens {}); state them more concisely without dropping any",
+                next.config.state_tokens
+            );
         }
         next.task_amendments.push(amendment);
         if let Some(bundle) = next

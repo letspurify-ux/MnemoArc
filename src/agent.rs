@@ -2048,6 +2048,28 @@ pub async fn run_session_controlled(
                     break;
                 }
             };
+            // input_budget reserves three cleanup rounds; later ones run
+            // while they fit. Every round stayed in context, so a checkpoint
+            // that needed more ended at context_limit, and each resume failed
+            // at once on the same request. The oldest rounds leave context
+            // instead; what they saved shows in the state.
+            while ContextManager::calibrated(&s, context::count(&request, &s.config.model))
+                .saturating_add(ContextManager::cleanup_output_tokens(&s.config))
+                .saturating_add(512)
+                > s.config.context_tokens
+                && ContextManager::hide_cleanup_round(&mut s)
+            {
+                match ContextManager::request(&s, ToolRegistry::definitions(&s)) {
+                    Ok(r) => request = r,
+                    Err(e) => {
+                        failure = Some(e.to_string());
+                        break;
+                    }
+                }
+            }
+            if failure.is_some() {
+                break;
+            }
         }
         // After an empty reply, let the model choose: some providers answer a
         // required tool choice with reasoning only and no content or calls.

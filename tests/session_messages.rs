@@ -402,3 +402,96 @@ async fn routing_cannot_promote_work_from_a_previous_instruction() {
             .starts_with("message_routing_invalid")
     );
 }
+
+/// Routes the message as a discussion, then reads another page of big.txt
+/// on every request that still offers calls, and answers once none may be
+/// made.
+struct Reader(Mutex<Vec<Value>>);
+#[async_trait]
+impl LlmClient for Reader {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> anyhow::Result<Completion> {
+        let mut requests = self.0.lock().unwrap();
+        requests.push(request.clone());
+        if request["response_format"].is_object() {
+            return Ok(route("discuss", ""));
+        }
+        let n = requests.len();
+        if request["tool_choice"] == "none" || n > 60 {
+            return Ok(Completion {
+                text: "Answer from the pages read so far".into(),
+                ..Default::default()
+            });
+        }
+        Ok(Completion {
+            calls: vec![ToolCall {
+                id: format!("read-{n}"),
+                name: "file_read".into(),
+                arguments: json!({"path":"big.txt","start_line":n * 200 + 1,"max_lines":200})
+                    .to_string(),
+            }],
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_follow_up_that_keeps_reading_answers_before_its_context_is_full() {
+    // A follow-up has no checkpoint: every result stays in its request. A
+    // question that kept reading ended at context_limit with no answer.
+    let dir = tempfile::tempdir().unwrap();
+    let big: String = (1..=20_000)
+        .map(|i| format!("line {i}: the retry loop keeps its counter in state {i}\n"))
+        .collect();
+    std::fs::write(dir.path().join("big.txt"), big).unwrap();
+    let mut s = fixture(dir.path());
+    s.receive_message("Read big.txt and explain the retry loop".into())
+        .unwrap();
+    let client = Arc::new(Reader(Mutex::new(vec![])));
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let s = run_session(s, client.clone(), CancellationToken::new(), tx).await;
+    drain.await.unwrap();
+    let run = s.run_history.back().unwrap();
+    assert_eq!(run.status, "complete", "{:?}", run.error);
+    let requests = client.0.lock().unwrap();
+    let last = requests.last().unwrap();
+    assert_eq!(last["tool_choice"], "none");
+    assert!(requests.len() > 3, "{}", requests.len());
+    assert!(
+        s.history
+            .bundles
+            .iter()
+            .flat_map(|bundle| bundle.messages.iter())
+            .any(|message| message["content"] == "Answer from the pages read so far")
+    );
+}
+
+#[tokio::test]
+async fn requirements_too_large_for_the_task_state_budget_are_refused_before_they_block_the_task() {
+    // An accepted amendment over state_tokens failed every later request
+    // with task_state_limit, which neither the model nor a resume could fix.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = fixture(dir.path());
+    let before = serde_json::to_value(&s.task).unwrap();
+    s.receive_message("Add these constraints to the report".into())
+        .unwrap();
+    let constraints: Vec<String> = (0..100)
+        .map(|i| format!("Constraint {i}: keep every heading of the original document in its order, cite each claim with its source lines and keep the existing diagrams"))
+        .collect();
+    let route = text(
+        json!({"intent":"work","authorization_quote":"Add these constraints","changes":{"goal":"Create the current report","constraints":constraints}}),
+    );
+    let (s, _) = run(s, vec![route.clone(), route.clone(), route]).await;
+    assert_eq!(serde_json::to_value(&s.task).unwrap(), before);
+    assert!(s.task_amendments.is_empty());
+    let error = s.run_history.back().unwrap().error.clone().unwrap();
+    assert!(error.starts_with("message_routing_invalid"), "{error}");
+    assert!(error.contains("state_tokens"), "{error}");
+    mnemoarc::context::ContextManager::state(&s).unwrap();
+}

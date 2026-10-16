@@ -87,7 +87,8 @@ fn request(
         .run_tokens
         .saturating_sub(used)
         .saturating_sub(s.config.output_tokens);
-    let core_tokens = context::count(&request, &s.config.model);
+    // Calibrated, as complete() checks the request it sends.
+    let core_tokens = ContextManager::calibrated(s, context::count(&request, &s.config.model));
     if core_tokens > context_budget {
         bail!(
             "message_routing_context_limit: current request and effective requirements exceed the context budget; shorten the message or increase context_tokens; no requirements changed"
@@ -121,7 +122,7 @@ fn request(
     for limit in [1600, 800, 400, 160] {
         payload["optional_context"] = bounded(optional.clone(), limit >> shift);
         request["messages"][1]["content"] = json!(payload.to_string());
-        if context::count(&request, &s.config.model) <= ceiling {
+        if ContextManager::calibrated(s, context::count(&request, &s.config.model)) <= ceiling {
             return Ok(request);
         }
     }

@@ -466,6 +466,99 @@ fn history_pressure_selects_enough_groups_even_when_context_is_small() {
 }
 
 #[test]
+fn history_pressure_checkpoint_leaves_room_before_the_next_one() {
+    // A checkpoint chosen to bring history down to 4/5 of its limit was
+    // pruned only to the limit, so the next small bundle crossed it again
+    // and every later request opened another checkpoint.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    for i in 0..40 {
+        s.add_user(format!("{i} retained original text"));
+    }
+    s.config.history_bytes = s.history.bytes() / 2;
+    assert!(ContextManager::prepare(&mut s, 100).unwrap());
+    s.checkpoint.as_mut().unwrap().acknowledged = true;
+    ContextManager::commit(&mut s).unwrap();
+    assert!(s.history.bytes() <= s.config.history_bytes * 4 / 5);
+    s.add_user("40 retained original text".into());
+    assert!(!ContextManager::prepare(&mut s, 100).unwrap());
+    assert!(s.checkpoint.is_none());
+}
+
+#[test]
+fn history_pressure_without_a_group_to_retire_prunes_retired_history() {
+    // Only already-retired history (a follow-up record) is over the limit:
+    // nothing needs a checkpoint, but the record must still be released or
+    // history grows until the hard limit stops the run.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.add_user("old answered follow-up".repeat(200));
+    s.add_user("current".into());
+    s.history.bundles[0].active = false;
+    s.history.bundles[0].reviewed = true;
+    s.history.bundles[1].active = false;
+    s.history.bundles[1].reviewed = true;
+    s.config.history_bytes = s.history.bytes() / 2;
+    assert!(!ContextManager::prepare(&mut s, 100).unwrap());
+    assert!(s.checkpoint.is_none());
+    assert!(s.history.bytes() <= s.config.history_bytes);
+}
+
+#[test]
+fn history_pressure_counts_retired_records_behind_the_chosen_groups() {
+    // A retired follow-up record between task groups leaves once the group
+    // in front of it is chosen. The estimate missed it, so every group,
+    // the latest included, was retired to meet the history target.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.add_user("first group".into());
+    s.add_user("answered follow-up ".repeat(300));
+    s.history.bundles[1].active = false;
+    s.history.bundles[1].reviewed = true;
+    for i in 0..5 {
+        s.add_user(format!("{i} later group"));
+    }
+    s.config.history_bytes = s.history.bytes() / 2;
+    assert!(ContextManager::prepare(&mut s, 100).unwrap());
+    let first = s.history.bundles[0].id;
+    assert_eq!(s.checkpoint.as_ref().unwrap().bundle_ids, vec![first]);
+    s.checkpoint.as_mut().unwrap().acknowledged = true;
+    ContextManager::commit(&mut s).unwrap();
+    assert!(s.history.bytes() <= s.config.history_bytes * 4 / 5);
+    assert_eq!(s.history.bundles.iter().filter(|b| b.active).count(), 5);
+}
+
+#[test]
+fn an_old_partial_reply_retires_while_a_continuation_is_pending() {
+    // Every partial reply was held back while a continuation was pending,
+    // also one continued long ago. Still active, it stopped the prune in
+    // front of the retired groups and the commit failed under history
+    // pressure, on every resume.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.add_user("request".into());
+    s.history.push(
+        vec![json!({"role":"assistant","content":"old partial","partial":true})],
+        true,
+    );
+    for i in 0..4 {
+        s.add_user(format!("{i} group ").repeat(100));
+    }
+    let pending = s.history.push(
+        vec![json!({"role":"assistant","content":"new partial","partial":true})],
+        true,
+    );
+    s.continuation = Some(false);
+    s.config.history_bytes = s.history.bytes() / 2;
+    assert!(ContextManager::prepare(&mut s, 100).unwrap());
+    assert!(!s.checkpoint.as_ref().unwrap().bundle_ids.contains(&pending));
+    s.checkpoint.as_mut().unwrap().acknowledged = true;
+    ContextManager::commit(&mut s).unwrap();
+    assert!(s.history.bytes() <= s.config.history_bytes);
+    assert!(s.history.read(pending).unwrap().active);
+}
+
+#[test]
 fn unknown_model_can_store_korean_metadata_and_budget_twenty_memories() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session(dir.path());
