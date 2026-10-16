@@ -91,6 +91,8 @@ fn recent_tool_errors(s: &Session) -> Vec<Value> {
 /// Longest string kept in the follow-up snapshot; an unanswered request is
 /// asked once more with half.
 const SNAPSHOT_STRING_CHARS: usize = 1600;
+/// Shortest string limit the snapshot is fitted down to.
+const SNAPSHOT_MIN_CHARS: usize = 100;
 /// A request asked again after it got no answer: a timeout, or the output ran
 /// out before any text. A second one gives up.
 const SHRUNK_NOTICE: &str = "응답을 받지 못해(출력 한도 소진 또는 응답 시간 초과), 요청 범위를 절반으로 줄여 다시 보냅니다.";
@@ -347,7 +349,8 @@ async fn answer(
     automatic: bool,
     events: &mpsc::Sender<AgentEvent>,
 ) -> Result<()> {
-    let mut request = request(s, SNAPSHOT_STRING_CHARS);
+    let mut limit = SNAPSHOT_STRING_CHARS;
+    let mut request = request(s, limit);
     let mut unanswered_requests = 0usize;
     if automatic {
         request["messages"][0]["content"] = json!(TOOL_FOLLOW_UP);
@@ -359,6 +362,25 @@ async fn answer(
     work.progress_recovery = Default::default();
     work.run_guidance = json!({});
     work.ledger.clear();
+    // The snapshot is shortened until the request and its answer fit the
+    // context, as routing fits its optional context: at full length a long
+    // plan or task detail list refused every follow-up with context_limit.
+    let tools = automatic.then(|| json!(ToolRegistry::definitions(&work)));
+    while limit > SNAPSHOT_MIN_CHARS {
+        let mut sized = request.clone();
+        if let Some(tools) = &tools {
+            sized["tools"] = tools.clone();
+        }
+        if ContextManager::calibrated(s, context::count(&sized, &s.config.model))
+            .saturating_add(s.config.output_tokens)
+            .saturating_add(512)
+            <= s.config.context_tokens
+        {
+            break;
+        }
+        limit /= 2;
+        request["messages"][1] = self::request(s, limit)["messages"][1].clone();
+    }
     loop {
         let deadline = control.boundary(s, cancel)?;
         request["model"] = json!(s.config.model);
@@ -396,8 +418,7 @@ async fn answer(
                     "question_unanswered: the follow-up request got no answer twice (output limit or timeout); task preserved"
                 );
             }
-            request["messages"][1] =
-                self::request(s, SNAPSHOT_STRING_CHARS / 2)["messages"][1].clone();
+            request["messages"][1] = self::request(s, limit / 2)["messages"][1].clone();
             emit(
                 events,
                 AgentEvent::Notice {

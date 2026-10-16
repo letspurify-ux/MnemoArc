@@ -2003,6 +2003,15 @@ pub async fn run_session_controlled(
             failure = Some(e.to_string());
             break;
         }
+        // A checkpoint that cannot bring the request within budget stops
+        // the run before its cleanup requests, with the context unchanged.
+        if !checkpoint_was_open
+            && let Err(e) = ContextManager::check_checkpoint_fits(&s, definitions.clone())
+        {
+            s.checkpoint = None;
+            failure = Some(e.to_string());
+            break;
+        }
         // Checkpoint requests do not count as closing rounds, so the one that
         // just started must not spend the round counted above either:
         // otherwise the last closing request becomes cleanup and the run is
@@ -3391,19 +3400,26 @@ fn apply_pending_config(s: &mut Session, prune_history: bool) -> Result<bool> {
 pub fn apply_config(s: &mut Session, config: Config) -> Result<()> {
     s.check_limits(&config)?;
     let mut copy = s.clone();
+    if copy.config.model != config.model {
+        // Calibration samples describe the previous model's tokenizer.
+        copy.token_ratios.clear();
+    }
     copy.config = config;
     ContextManager::state(&copy)?;
     let request = ContextManager::request(&copy, ToolRegistry::definitions(&copy))?;
-    if context::count(&request, &copy.config.model).saturating_add(copy.config.output_tokens)
+    // Sized as the run loop checks the next request: calibrated, with its
+    // margin. A raw count let a smaller context through whose next request,
+    // a pending checkpoint's cleanup included, the run then refused with
+    // context_limit on every resume.
+    if ContextManager::calibrated(&copy, context::count(&request, &copy.config.model))
+        .saturating_add(copy.config.output_tokens)
+        .saturating_add(512)
         > copy.config.context_tokens
     {
         bail!("New context budget requires checkpoint first; current settings retained");
     }
-    if s.config.model != copy.config.model {
-        // Calibration samples describe the previous model's tokenizer.
-        s.token_ratios.clear();
-    }
     s.config = copy.config;
+    s.token_ratios = copy.token_ratios;
     Ok(())
 }
 

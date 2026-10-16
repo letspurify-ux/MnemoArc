@@ -345,6 +345,58 @@ async fn an_unanswered_question_is_asked_once_more_with_half_the_snapshot() {
     }
 }
 
+struct Recorded(std::sync::Mutex<Vec<Value>>);
+#[async_trait]
+impl LlmClient for Recorded {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> anyhow::Result<Completion> {
+        self.0.lock().unwrap().push(request);
+        Ok(Completion {
+            text: "The budget was exhausted.".into(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_large_snapshot_is_shortened_to_fit_the_context() {
+    // Only routing fitted its context. A long task snapshot refused every
+    // follow-up with context_limit, however short the question.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = fixture(dir.path());
+    let long = |i: usize| {
+        format!("{i}번 항목은 확인되지 않은 조건과 남은 작업을 길게 설명합니다. ").repeat(40)
+    };
+    s.completion_gaps.extend((0..19).map(long));
+    s.task.constraints = (0..20).map(long).collect();
+    s.task.completion = (20..40).map(long).collect();
+    s.task.deliverables = (40..60).map(long).collect();
+    let before = preserved(&s);
+    s.queue_question("Why did it stop?".into()).unwrap();
+    let client = Arc::new(Recorded(Default::default()));
+    let result = run(s, client.clone()).await;
+    assert_eq!(result.run_history.back().unwrap().reason, "complete");
+    assert_eq!(preserved(&result), before);
+    let requests = client.0.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let config = &result.config;
+    assert!(
+        ContextManager::calibrated(
+            &result,
+            mnemoarc::context::count(&requests[0], &config.model)
+        ) + config.output_tokens
+            + 512
+            <= config.context_tokens
+    );
+    let snapshot = requests[0]["messages"][1]["content"].as_str().unwrap();
+    assert!(snapshot.contains("Diagram still needs repair"));
+}
+
 struct Resume;
 #[async_trait]
 impl LlmClient for Resume {

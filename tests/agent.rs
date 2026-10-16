@@ -608,6 +608,64 @@ async fn input_overflow_does_not_spend_cleanup_attempts_or_remove_history() {
     assert_eq!(result.history.active(), before);
 }
 
+/// A valid context whose input budget is below what the system prompt, the
+/// tools and the state take on their own.
+fn small_context(c: &Config) -> Config {
+    let small = Config {
+        context_tokens: 28_500,
+        output_tokens: 4000,
+        batch_tokens: Some(1000),
+        result_tokens: Some(500),
+        checkpoint_tokens: 1000,
+        ..c.clone()
+    };
+    small.validate().unwrap();
+    small
+}
+
+#[tokio::test]
+async fn a_checkpoint_that_cannot_fit_the_request_stops_before_its_cleanup() {
+    // The first request crossed high water on the fixed part alone. The
+    // checkpoint retired the request, its cleanup was paid for, and the
+    // next request stopped with context_capacity, on every run.
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = s(dir.path());
+    session.config = small_context(&session.config);
+    session.add_user("Explain the project".into());
+    let before = session.history.active();
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(session, Arc::new(NeverCalled), CancellationToken::new(), tx).await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "blocked");
+    let error = result.last_error.unwrap();
+    assert!(error.starts_with("context_capacity:"), "{error}");
+    assert!(error.contains("increase context_tokens"), "{error}");
+    assert!(result.checkpoint.is_none());
+    assert_eq!(result.checkpoints_completed, 0);
+    assert_eq!(result.history.active(), before);
+}
+
+#[tokio::test]
+async fn pending_settings_that_cannot_fit_the_request_are_named() {
+    // Waiting settings lower the budget prepare aims for. When they cannot
+    // hold the fixed part, the run stops naming them, before the cleanup.
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = s(dir.path());
+    for i in 0..3 {
+        session.add_user(format!("{i} observation ").repeat(2500));
+    }
+    session.pending_config = Some(small_context(&session.config));
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(session, Arc::new(NeverCalled), CancellationToken::new(), tx).await;
+    drain.await.unwrap();
+    let error = result.last_error.unwrap();
+    assert!(error.contains("the pending settings"), "{error}");
+    assert!(result.checkpoint.is_none());
+    assert!(result.history.bundles.iter().all(|b| b.active));
+}
+
 struct RepeatedRead {
     step: Mutex<usize>,
 }

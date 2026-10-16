@@ -340,6 +340,34 @@ fn settings_validation_and_lowering_keeps_original() {
 }
 
 #[test]
+fn a_smaller_context_is_checked_with_calibrated_counts() {
+    // The run loop sizes each request with the provider's measured ratio.
+    // Checked on the raw count, a smaller context was accepted whose next
+    // request the run then refused with context_limit on every resume.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.config.model = "z-ai/glm-5.3-flash".into();
+    s.add_user("Document every request handler of the project. ".repeat(800));
+    ContextManager::record_usage(&mut s, 10_000, 15_000);
+    let request = ContextManager::request(&s, tools::ToolRegistry::definitions(&s)).unwrap();
+    let raw = context::count(&request, &s.config.model);
+    let mut smaller = s.config.clone();
+    smaller.output_tokens = 2000;
+    smaller.batch_tokens = Some(2000);
+    smaller.result_tokens = Some(1000);
+    smaller.checkpoint_tokens = 1000;
+    smaller.context_tokens = raw + smaller.output_tokens + 512 + raw / 4;
+    smaller.validate().unwrap();
+    let original = s.config.context_tokens;
+    assert!(mnemoarc::agent::apply_config(&mut s, smaller.clone()).is_err());
+    assert_eq!(s.config.context_tokens, original);
+    // Without a measured ratio the same settings fit.
+    s.token_ratios.clear();
+    mnemoarc::agent::apply_config(&mut s, smaller).unwrap();
+    assert_eq!(s.config.context_tokens, raw + 2000 + 512 + raw / 4);
+}
+
+#[test]
 fn llm_transport_settings_are_validated_and_endpoint_is_composed_safely() {
     let mut c = Config {
         base_url: "ftp://example.com/v1".into(),
@@ -556,6 +584,137 @@ fn an_old_partial_reply_retires_while_a_continuation_is_pending() {
     ContextManager::commit(&mut s).unwrap();
     assert!(s.history.bytes() <= s.config.history_bytes);
     assert!(s.history.read(pending).unwrap().active);
+}
+
+#[test]
+fn a_cleanup_instruction_after_a_partial_reply_keeps_it_continued() {
+    // 기억 정리 adds its instruction after the partial reply a pending
+    // continuation extends. Counted as the end of the chain, it let the
+    // partial retire while LENGTH RECOVERY still said to continue it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    for i in 0..4 {
+        s.add_user(format!("{i} group ").repeat(100));
+    }
+    let pending = s.history.push(
+        vec![json!({"role":"assistant","content":"partial answer","partial":true})],
+        true,
+    );
+    s.continuation = Some(false);
+    s.add_maintenance("Clean up memory and progress to fit the pending settings.".into());
+    assert!(ContextManager::prepare(&mut s, 60000).unwrap());
+    assert!(!s.checkpoint.as_ref().unwrap().bundle_ids.contains(&pending));
+    s.checkpoint.as_mut().unwrap().acknowledged = true;
+    ContextManager::commit(&mut s).unwrap();
+    assert!(s.history.read(pending).unwrap().active);
+}
+
+#[test]
+fn a_follow_up_near_the_history_limit_releases_retired_history() {
+    // queue_question refused every message while history stayed just under
+    // its limit; nothing released the retired history in front of it, and
+    // a finished task has no run that would.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.add_user("Document the project".into());
+    s.history.push(
+        vec![json!({"role":"assistant","content":"old reads ".repeat(4000)})],
+        true,
+    );
+    for bundle in s.history.bundles.iter_mut() {
+        bundle.active = false;
+        bundle.reviewed = true;
+    }
+    s.add_user("latest request".into());
+    let reserved = s.config.output_tokens * 32 + 4096;
+    s.config.history_bytes = s.history.bytes() + reserved - 100;
+    s.queue_question("What is left?".into()).unwrap();
+    assert!(s.history.bytes() <= s.config.history_bytes);
+    assert!(s.history.bundles.iter().any(|b| b.active));
+    // Active history alone over the reservation is still refused.
+    let mut full = session(dir.path());
+    full.add_user("x ".repeat(4000));
+    full.config.history_bytes = full.history.bytes() + reserved - 100;
+    assert!(full.queue_question("What is left?".into()).is_err());
+}
+
+#[test]
+fn history_pressure_alone_retires_only_what_history_needs() {
+    // A checkpoint opened for history alone also retired active groups
+    // down to low water, so reads the request still used left context.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    for i in 0..6 {
+        s.add_user(format!("{i} group ").repeat(100));
+    }
+    let latest = s.history.bundles.back().unwrap().id;
+    s.config.history_bytes = s.history.bytes();
+    let budget = ContextManager::input_budget(&s.config);
+    assert!(ContextManager::prepare(&mut s, budget * 7 / 10).unwrap());
+    let chosen = s.checkpoint.as_ref().unwrap().bundle_ids.clone();
+    assert!(chosen.len() < 6 && !chosen.contains(&latest), "{chosen:?}");
+    s.checkpoint.as_mut().unwrap().acknowledged = true;
+    ContextManager::commit(&mut s).unwrap();
+    assert!(s.history.bytes() <= s.config.history_bytes * 4 / 5);
+    // A request over high water is still taken to low water.
+    let mut s = session(dir.path());
+    for i in 0..6 {
+        s.add_user(format!("{i} group ").repeat(100));
+    }
+    s.config.history_bytes = s.history.bytes();
+    assert!(ContextManager::prepare(&mut s, budget).unwrap());
+    assert_eq!(s.checkpoint.as_ref().unwrap().bundle_ids.len(), 6);
+}
+
+#[test]
+fn a_waiting_lower_history_limit_opens_one_checkpoint_not_one_per_request() {
+    // A lower history limit waiting for another limit (too many memories,
+    // say) prunes only once it applies, so the commit left the retired
+    // groups in place. Counted as pressure, they opened a checkpoint on
+    // every later request, each retiring the reads just made.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    for i in 0..5 {
+        s.add_user(format!("{i} group ").repeat(100));
+    }
+    let mut lower = s.config.clone();
+    lower.history_bytes = s.history.bytes() / 2;
+    s.pending_config = Some(lower);
+    assert!(ContextManager::prepare(&mut s, 100).unwrap());
+    s.checkpoint.as_mut().unwrap().acknowledged = true;
+    ContextManager::commit(&mut s).unwrap();
+    for i in 0..3 {
+        s.add_user(format!("{i} next group"));
+        assert!(
+            !ContextManager::prepare(&mut s, 100).unwrap(),
+            "request {i}"
+        );
+        assert!(s.checkpoint.is_none());
+    }
+    // Retained history that reaches the waiting limit still checkpoints.
+    for i in 5..10 {
+        s.add_user(format!("{i} group ").repeat(100));
+    }
+    assert!(ContextManager::prepare(&mut s, 100).unwrap());
+}
+
+#[test]
+fn retired_history_a_prune_releases_needs_no_checkpoint() {
+    // History at its limit whose retired front alone brings it to the
+    // floor is pruned; a checkpoint would only retire the active reads.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.add_user("answered follow-up ".repeat(400));
+    s.history.bundles[0].active = false;
+    s.history.bundles[0].reviewed = true;
+    for i in 0..3 {
+        s.add_user(format!("{i} group"));
+    }
+    s.config.history_bytes = s.history.bytes() - 10;
+    assert!(!ContextManager::prepare(&mut s, 100).unwrap());
+    assert!(s.checkpoint.is_none());
+    assert!(s.history.bytes() <= s.config.history_bytes * 4 / 5);
+    assert_eq!(s.history.bundles.iter().filter(|b| b.active).count(), 3);
 }
 
 #[test]

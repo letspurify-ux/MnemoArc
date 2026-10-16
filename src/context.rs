@@ -72,7 +72,7 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     both(
         "Requirements",
-        "The requirements are the user request and user_criteria, amended only by task_amendments: a later amendment supersedes an earlier conflicting requirement and omitted requirements stay in force. task_state notes add no requirement, and you never weaken one without a new user instruction. One session holds one task: current_request is the latest instruction and latest_request the current effective goal. A request text given as {\"same_as\": field} repeats that field, and {\"start_of\": field} is its beginning. When an amendment changes the goal, preserve prior evidence, files and unaffected completed plan items, reopen the affected to-dos with task_plan and a concrete reason, and finish the revised result.",
+        "The requirements are the user request and user_criteria, amended only by task_amendments: a later amendment supersedes an earlier conflicting requirement and omitted requirements stay in force. task_state notes add no requirement, and you never weaken one without a new user instruction. One session holds one task: current_request is the latest instruction and latest_request the current effective goal. A request text or list given as {\"same_as\": field} repeats that field, {\"start_of\": field} is its beginning, and an amendment field given as {\"superseded_by\": field} was replaced by that later one. When an amendment changes the goal, preserve prior evidence, files and unaffected completed plan items, reopen the affected to-dos with task_plan and a concrete reason, and finish the revised result.",
     ),
     source(
         "Citations",
@@ -890,19 +890,61 @@ impl ContextManager {
     pub fn calibrated(s: &Session, estimate: usize) -> usize {
         (estimate as f64 * Self::token_ratio(s)).ceil() as usize
     }
+    /// An input budget in local-estimate units, so eviction arithmetic stays
+    /// consistent with the estimated group sizes.
+    fn estimate_budget(s: &Session, c: &Config) -> usize {
+        (Self::input_budget(c) as f64 / Self::token_ratio(s)) as usize
+    }
+    /// The budget prepare sizes requests against: the lower of the current
+    /// and any pending settings' budgets.
+    fn prepare_budget(s: &Session) -> usize {
+        s.pending_config
+            .as_ref()
+            .map_or(Self::estimate_budget(s, &s.config), |c| {
+                Self::estimate_budget(s, c).min(Self::estimate_budget(s, &s.config))
+            })
+    }
+    /// Refuse the checkpoint prepare just opened when the request without
+    /// every group it retires (the system prompt, tools and state) still
+    /// exceeds the budget: the request after its commit stopped with
+    /// context_capacity, the cleanup requests paid for nothing. A context
+    /// that validate accepts (32K with 4K output, say) left less input
+    /// budget than that fixed part, so every run of such a session did so.
+    pub fn check_checkpoint_fits(s: &Session, tools: Vec<Value>) -> Result<()> {
+        let Some(cp) = &s.checkpoint else {
+            return Ok(());
+        };
+        let mut after = s.clone();
+        after.checkpoint = None;
+        for bundle in after.history.bundles.iter_mut() {
+            if cp.bundle_ids.contains(&bundle.id) {
+                bundle.active = false;
+            }
+        }
+        let tokens = count(&Self::request(&after, tools)?, &s.config.model);
+        if tokens <= Self::prepare_budget(s) {
+            return Ok(());
+        }
+        let needed = Self::calibrated(s, tokens);
+        if tokens <= Self::estimate_budget(s, &s.config)
+            && let Some(pending) = &s.pending_config
+        {
+            bail!(
+                "context_capacity: the pending settings leave an input budget of {} tokens, but the system prompt, tools and state the checkpoint cannot retire take about {needed}; change them (a larger context_tokens or smaller output, batch or checkpoint limits); context retained",
+                Self::input_budget(pending)
+            );
+        }
+        bail!(
+            "context_capacity: the system prompt, tools and state the checkpoint cannot retire take about {needed} input tokens, more than the input budget of {} that context_tokens {} leaves after output, tool results and three cleanup rounds; increase context_tokens or lower output_tokens, batch_tokens or checkpoint_tokens; context retained",
+            Self::input_budget(&s.config),
+            s.config.context_tokens
+        );
+    }
     pub fn prepare(s: &mut Session, request_tokens: usize) -> Result<bool> {
         if s.checkpoint.is_some() {
             return Ok(true);
         }
-        // Thresholds are converted into local-estimate units, so eviction
-        // arithmetic below stays consistent with the estimated group sizes.
-        let budget = (s
-            .pending_config
-            .as_ref()
-            .map_or(Self::input_budget(&s.config), |c| {
-                Self::input_budget(c).min(Self::input_budget(&s.config))
-            }) as f64
-            / Self::token_ratio(s)) as usize;
+        let budget = Self::prepare_budget(s);
         // Closing mode has a few bounded requests left, and input_budget
         // already reserves room for cleanup. A checkpoint there costs several
         // requests that the run may never use, so only a request that no
@@ -918,15 +960,6 @@ impl ContextManager {
             .map_or(s.config.history_bytes, |c| {
                 c.history_bytes.min(s.config.history_bytes)
             });
-        let history_pressure = s.history.bytes() >= history_limit;
-        if request_tokens < threshold && !history_pressure {
-            return Ok(false);
-        }
-        let history_target = if history_pressure {
-            history_floor(history_limit)
-        } else {
-            history_limit
-        };
         // A commit prunes from the front, and only through groups retired
         // before or with this checkpoint, so a retired group behind one that
         // stays (an answered follow-up between runs) leaves once the groups
@@ -939,7 +972,37 @@ impl ContextManager {
             .history
             .bytes()
             .saturating_sub(prunable_run(&s.history, &mut front, &chosen));
-        let target = (budget as f64 * s.config.low_water) as usize;
+        // A checkpoint is needed only for history a prune of the retired
+        // groups in front cannot release. The current limit prunes them at
+        // once (to the floor when it can); a lower pending limit prunes them
+        // only when it applies, so they stay until then, and only retained
+        // history reaching it calls for a checkpoint. Counted from the whole
+        // history, a pending limit that waited for another one (too many
+        // memories, say) opened a checkpoint on every request.
+        let history_pressure = retained_bytes >= history_limit
+            || (s.history.bytes() >= s.config.history_bytes
+                && retained_bytes > history_floor(s.config.history_bytes));
+        if request_tokens < threshold && !history_pressure {
+            // A lower pending limit prunes when it applies, so a rejected
+            // setting leaves no irreversible prune behind.
+            if s.history.bytes() >= s.config.history_bytes {
+                prune_toward(&mut s.history, s.config.history_bytes, &BTreeSet::new())?;
+            }
+            return Ok(false);
+        }
+        let history_target = if history_pressure {
+            history_floor(history_limit)
+        } else {
+            history_limit
+        };
+        // History pressure alone retires only what history needs. Taken to
+        // low water as well, a request below high water lost reads it still
+        // used, and the model read them again.
+        let target = if request_tokens < threshold {
+            request_tokens
+        } else {
+            (budget as f64 * s.config.low_water) as usize
+        };
         let mut remaining = request_tokens;
         let mut ids = vec![];
         // Never split a tool-call/result group. The latest complete group may
@@ -956,13 +1019,15 @@ impl ContextManager {
         // bundles after its last complete reply. An older partial reply was
         // continued long ago; kept active as well, it blocked the prune of
         // every group behind it, and under history pressure the commit
-        // failed on each resume.
+        // failed on each resume. A cleanup instruction sent after them
+        // (기억 정리) does not end the chain: counted as its end, the
+        // partial retired while LENGTH RECOVERY still said to continue it.
         let continued: BTreeSet<u64> = if s.continuation.is_some() {
             s.history
                 .bundles
                 .iter()
                 .rev()
-                .filter(|b| b.active)
+                .filter(|b| b.active && !b.messages.iter().any(|m| m["maintenance"] == true))
                 .take_while(|b| b.messages.iter().any(|m| m["partial"] == true))
                 .map(|b| b.id)
                 .collect()
@@ -999,9 +1064,7 @@ impl ContextManager {
             // leave: without this prune nothing released it, and history
             // grew until the hard limit stopped the run.
             if request_tokens <= budget && retained_bytes <= history_limit {
-                // A lower pending limit prunes when it applies, so a
-                // rejected setting leaves no irreversible prune behind.
-                if history_pressure {
+                if s.history.bytes() >= s.config.history_bytes {
                     prune_toward(&mut s.history, s.config.history_bytes, &BTreeSet::new())?;
                 }
                 return Ok(false);

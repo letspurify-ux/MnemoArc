@@ -363,9 +363,19 @@ async fn a_large_old_conversation_cannot_overflow_the_classification_request() {
     }
     s.receive_message(CHANGE.into()).unwrap();
     let config = s.config.clone();
-    let (s, requests) = execute(s, vec![work(GOAL), Reply::WorkReached]).await;
+    let (s, requests) = execute(s, vec![work(GOAL)]).await;
     assert_eq!(s.latest_request, GOAL);
     assert_eq!(s.task_amendments.len(), 1);
+    // This input budget cannot hold the work request's fixed part, so the
+    // work stops before a checkpoint whose cleanup could not help.
+    assert_eq!(requests.len(), 1);
+    assert!(
+        s.last_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("context_capacity:")),
+        "{:?}",
+        s.last_error
+    );
     assert!(
         context::count(&requests[0], &config.model) + config.output_tokens + 1024
             <= config.context_tokens

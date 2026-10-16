@@ -35,6 +35,25 @@ pub struct TaskAmendment {
     pub deliverables: Option<Vec<String>>,
 }
 
+/// The requirement lists an amendment can replace, as named in the state.
+const AMENDMENT_LISTS: [&str; 3] = ["completion", "constraints", "deliverables"];
+
+impl TaskAmendment {
+    fn changes_requirements(&self) -> bool {
+        self.goal.is_some()
+            || AMENDMENT_LISTS
+                .iter()
+                .any(|field| self.list(field).is_some())
+    }
+    fn list(&self, field: &str) -> Option<&Vec<String>> {
+        match field {
+            "completion" => self.completion.as_ref(),
+            "constraints" => self.constraints.as_ref(),
+            _ => self.deliverables.as_ref(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TodoItem {
@@ -90,6 +109,15 @@ pub struct UserCriteria {
     pub completion: Vec<String>,
     pub constraints: Vec<String>,
     pub deliverables: Vec<String>,
+}
+impl UserCriteria {
+    fn list(&self, field: &str) -> &Vec<String> {
+        match field {
+            "completion" => &self.completion,
+            "constraints" => &self.constraints,
+            _ => &self.deliverables,
+        }
+    }
 }
 impl TaskState {
     pub fn current_todo(&self) -> Option<&TodoItem> {
@@ -836,13 +864,22 @@ impl Session {
         if self.question.is_some() || self.status == "running" {
             bail!("session_busy: wait for the current run to finish");
         }
-        // Reserve room for both messages without pruning the suspended task's history.
+        // Reserve room for both messages without retiring the suspended
+        // task's history. Already retired history in front leaves first, as
+        // a run releases it at the limit: kept, it refused every message
+        // while history stayed just under the limit, and a finished task has
+        // no run to release it.
         let message = json!({"role":"user","content":text,"follow_up":true});
         let reserved = serde_json::to_vec(&message)?
             .len()
             .saturating_add(self.config.output_tokens.saturating_mul(32))
             .saturating_add(4096);
-        if self.history.bytes().saturating_add(reserved) > self.config.history_bytes {
+        if self.history.bytes().saturating_add(reserved) > self.config.history_bytes
+            && self
+                .history
+                .prune(self.config.history_bytes.saturating_sub(reserved))
+                .is_err()
+        {
             bail!(
                 "history_capacity: not enough space for a follow-up answer; clean up history first"
             );
@@ -951,7 +988,14 @@ impl Session {
                 next.config.state_tokens
             );
         }
-        next.task_amendments.push(amendment);
+        // A change-less resume (계속, or the request sent again) amends
+        // nothing: recorded, each one stayed in every later request's state.
+        if amendment.changes_requirements()
+            || !(Self::is_continuation(&amendment.request)
+                || amendment.request.trim() == self.latest_request.trim())
+        {
+            next.task_amendments.push(amendment);
+        }
         if let Some(bundle) = next
             .history
             .bundles
@@ -1175,12 +1219,35 @@ impl Session {
             fields.insert(name.into(), same_text_as(text, &sent));
             sent.push((name.into(), text));
         }
+        // A goal or list a later amendment replaced is named, not resent:
+        // each amendment repeats the full revised goal and its lists, so
+        // every one stayed in every request. The ones in force are
+        // latest_request and user_criteria.
         let mut amendments = Vec::new();
         for (index, amendment) in self.task_amendments.iter().enumerate() {
+            let superseded = |field: &str| {
+                self.task_amendments[index + 1..]
+                    .iter()
+                    .position(|later| match field {
+                        "goal" => later.goal.is_some(),
+                        list => later.list(list).is_some(),
+                    })
+                    .map(|at| json!({"superseded_by": format!("task_amendments[{}].{field}", index + 1 + at)}))
+            };
             let mut value = json!(amendment);
             value["request"] = same_text_as(&amendment.request, &sent);
             if let Some(goal) = &amendment.goal {
-                value["goal"] = same_text_as(goal, &sent);
+                value["goal"] = superseded("goal").unwrap_or_else(|| same_text_as(goal, &sent));
+            }
+            for field in AMENDMENT_LISTS {
+                let Some(list) = amendment.list(field) else {
+                    continue;
+                };
+                if let Some(marker) = superseded(field) {
+                    value[field] = marker;
+                } else if list == self.user_criteria.list(field) {
+                    value[field] = json!({"same_as": format!("user_criteria.{field}")});
+                }
             }
             amendments.push(value);
             sent.push((
@@ -1398,6 +1465,69 @@ mod history_tests {
         let rest = rest.to_string();
         assert_eq!(rest.matches("Write both chapters.").count(), 1);
         assert_eq!(rest.matches(change).count(), 1);
+    }
+
+    #[test]
+    fn amendments_send_only_the_requirements_in_force_once() {
+        // Each amendment repeats the full revised goal and its lists, and
+        // every 계속 added a change-less one; all of them stayed in every
+        // request's state.
+        let mut s = Session::new(Project::default(), Config::compact_test());
+        s.receive_message("Write the report".into()).unwrap();
+        for text in ["계속", "Write the report"] {
+            s.receive_message(text.into()).unwrap();
+            s.accept_amendment(TaskAmendment::default()).unwrap();
+            assert!(s.task_amendments.is_empty(), "{text}");
+            assert_eq!(s.current_request, text);
+        }
+        let first: Vec<String> = (0..20)
+            .map(|i| format!("first criterion {i} with a long explanation"))
+            .collect();
+        let second = vec!["Only the first chapter".to_string()];
+        s.receive_message("Cover every chapter".into()).unwrap();
+        s.accept_amendment(TaskAmendment {
+            goal: Some("Write the report on every chapter".into()),
+            completion: Some(first.clone()),
+            constraints: Some(vec!["Keep the headings".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+        s.receive_message("Only the first chapter after all".into())
+            .unwrap();
+        s.accept_amendment(TaskAmendment {
+            goal: Some("Write the report on the first chapter".into()),
+            completion: Some(second),
+            ..Default::default()
+        })
+        .unwrap();
+        // An instruction without changed requirements is still recorded.
+        s.receive_message("Also cite the tests".into()).unwrap();
+        s.accept_amendment(TaskAmendment::default()).unwrap();
+        assert_eq!(s.task_amendments.len(), 3);
+        let state = crate::context::ContextManager::state(&s).unwrap();
+        let amendments = &state["task_amendments"];
+        assert_eq!(
+            amendments[0]["goal"],
+            json!({"superseded_by":"task_amendments[1].goal"})
+        );
+        assert_eq!(
+            amendments[0]["completion"],
+            json!({"superseded_by":"task_amendments[1].completion"})
+        );
+        assert_eq!(
+            amendments[0]["constraints"],
+            json!({"same_as":"user_criteria.constraints"})
+        );
+        assert_eq!(amendments[1]["goal"], json!({"same_as":"latest_request"}));
+        assert_eq!(
+            amendments[1]["completion"],
+            json!({"same_as":"user_criteria.completion"})
+        );
+        assert_eq!(
+            amendments[2]["request"],
+            json!({"same_as":"current_request"})
+        );
+        assert!(!state.to_string().contains(&first[3]));
     }
 
     #[test]
