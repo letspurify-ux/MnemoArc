@@ -666,6 +666,84 @@ async fn pending_settings_that_cannot_fit_the_request_are_named() {
     assert!(result.history.bundles.iter().all(|b| b.active));
 }
 
+/// A long chat answer: three replies cut at the output limit, then its end;
+/// a pending checkpoint is acknowledged.
+struct LongAnswer {
+    replies: Mutex<usize>,
+}
+#[async_trait]
+impl LlmClient for LongAnswer {
+    async fn complete(
+        &self,
+        request: Value,
+        _: &Config,
+        _: CancellationToken,
+        _: mpsc::Sender<String>,
+    ) -> Result<Completion> {
+        let state: Value = serde_json::from_str(
+            request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )?;
+        if let Some(id) = state["checkpoint"]["id"].as_str() {
+            return Ok(call(
+                &format!("ack-{id}"),
+                "checkpoint_complete",
+                json!({"id":id,"progress":"Continue the answer","no_save_reason":"Nothing to save"}),
+            ));
+        }
+        let mut replies = self.replies.lock().unwrap();
+        *replies += 1;
+        if *replies > 3 {
+            return Ok(Completion {
+                text: "End of the answer.".into(),
+                ..Default::default()
+            });
+        }
+        Ok(Completion {
+            text: format!("part {replies} ") + &"the item functions multiply values ".repeat(1250),
+            length_limited: true,
+            ..Default::default()
+        })
+    }
+}
+#[tokio::test]
+async fn a_long_answer_cut_at_the_output_limit_is_finished() {
+    // Every partial reply of the chain stayed in context until the answer
+    // ended. Two of them filled the input budget of this 64K context with
+    // nothing left to retire; the run and each resume stopped with
+    // context_capacity while the request still fit.
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = s(dir.path());
+    session.add_user("Explain the project in detail".into());
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(
+        session,
+        Arc::new(LongAnswer {
+            replies: Mutex::new(0),
+        }),
+        CancellationToken::new(),
+        tx,
+    )
+    .await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert!(result.continuation.is_none());
+    // The user still sees every part of the answer.
+    let parts = result
+        .history
+        .bundles
+        .iter()
+        .flat_map(|b| b.messages.iter())
+        .filter(|m| m["partial"] == true)
+        .count();
+    assert_eq!(parts, 3);
+}
+
 struct RepeatedRead {
     step: Mutex<usize>,
 }

@@ -1015,31 +1015,33 @@ impl ContextManager {
             .find(|b| b.active && b.complete)
             .map(|b| b.id)
             .unwrap_or(0);
-        // The partial replies the pending continuation extends: the active
-        // bundles after its last complete reply. An older partial reply was
-        // continued long ago; kept active as well, it blocked the prune of
-        // every group behind it, and under history pressure the commit
-        // failed on each resume. A cleanup instruction sent after them
-        // (기억 정리) does not end the chain: counted as its end, the
-        // partial retired while LENGTH RECOVERY still said to continue it.
-        let continued: BTreeSet<u64> = if s.continuation.is_some() {
-            s.history
-                .bundles
-                .iter()
-                .rev()
-                .filter(|b| b.active && !b.messages.iter().any(|m| m["maintenance"] == true))
-                .take_while(|b| b.messages.iter().any(|m| m["partial"] == true))
-                .map(|b| b.id)
-                .collect()
-        } else {
-            BTreeSet::new()
-        };
+        // The partial reply the pending continuation extends: the latest
+        // active bundle, a cleanup instruction sent after it (기억 정리)
+        // aside; counted as the latest, it let the partial retire while
+        // LENGTH RECOVERY still said to continue it. Only that reply stays.
+        // An older partial reply was continued long ago and blocked the
+        // prune of every group behind it; the earlier replies of a long
+        // answer cut at the output limit several times leave like any other
+        // group, oldest first, when the target needs them. Kept, the chain
+        // outgrew the input budget with nothing left to retire, and the run
+        // and every resume stopped with context_capacity.
+        let continued = s
+            .continuation
+            .and_then(|_| {
+                s.history
+                    .bundles
+                    .iter()
+                    .rev()
+                    .find(|b| b.active && !b.messages.iter().any(|m| m["maintenance"] == true))
+            })
+            .filter(|b| b.messages.iter().any(|m| m["partial"] == true))
+            .map(|b| b.id);
         let candidates: Vec<_> = s
             .history
             .bundles
             .iter()
             .filter(|b| b.complete && b.id <= last && (b.active || !b.reviewed))
-            .filter(|b| !continued.contains(&b.id))
+            .filter(|b| Some(b.id) != continued)
             .collect();
         for b in candidates {
             ids.push(b.id);

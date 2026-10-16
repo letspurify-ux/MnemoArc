@@ -587,6 +587,34 @@ fn an_old_partial_reply_retires_while_a_continuation_is_pending() {
 }
 
 #[test]
+fn a_long_answer_retires_its_earlier_partial_replies() {
+    // Every partial reply of the chain a continuation extends was kept, so
+    // a long answer cut at the output limit a few times outgrew the input
+    // budget with nothing left to retire: the run and each resume stopped
+    // with context_capacity. Only the reply being continued stays.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.add_user("Explain every file in detail".into());
+    let partials: Vec<u64> = (0..3)
+        .map(|i| {
+            s.history.push(
+                vec![json!({"role":"assistant","content":format!("part {i} ") + &"the item functions multiply values ".repeat(1000),"partial":true})],
+                true,
+            )
+        })
+        .collect();
+    s.continuation = Some(false);
+    let budget = ContextManager::input_budget(&s.config);
+    assert!(ContextManager::prepare(&mut s, budget).unwrap());
+    let chosen = s.checkpoint.as_ref().unwrap().bundle_ids.clone();
+    assert!(chosen.contains(&partials[0]), "{chosen:?}");
+    assert!(!chosen.contains(&partials[2]), "{chosen:?}");
+    s.checkpoint.as_mut().unwrap().acknowledged = true;
+    ContextManager::commit(&mut s).unwrap();
+    assert!(s.history.read(partials[2]).unwrap().active);
+}
+
+#[test]
 fn a_cleanup_instruction_after_a_partial_reply_keeps_it_continued() {
     // 기억 정리 adds its instruction after the partial reply a pending
     // continuation extends. Counted as the end of the chain, it let the
