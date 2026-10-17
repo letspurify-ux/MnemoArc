@@ -253,7 +253,10 @@ export default function App() {
             }
             let id = selection.current;
             if (!next.sessions.some((s) => s.id === id)) {
-              id = next.sessions[0]?.id || "";
+              // An automatic session appears and closes on its own; picked
+              // here, it would switch the page (and drop unsaved settings)
+              // without the user doing anything.
+              id = next.sessions.find((s) => !s.automatic)?.id || "";
               selection.current = id;
               setSelected(id);
               displaySession(cache.get(id));
@@ -893,7 +896,6 @@ export default function App() {
           <div className="loading-state">작업 공간을 불러오는 중…</div>
         ) : page === "settings" ? (
           <Settings
-            key={`settings-${selected}`}
             config={state.config}
             credential={state.credential}
             sessionCredential={session?.credential_configured}
@@ -982,12 +984,11 @@ export default function App() {
             <div className="welcome-mark">
               <RobotIcon variant="standing" />
             </div>
+            {/* Nothing is selected while only automatic sessions exist. */}
             <h2>
-              {state.sessions.length
-                ? "세션을 불러오는 중…"
-                : "첫 작업을 시작해 보세요"}
+              {selected ? "세션을 불러오는 중…" : "첫 작업을 시작해 보세요"}
             </h2>
-            {!state.sessions.length && state.config.projects.length > 0 && (
+            {!selected && state.config.projects.length > 0 && (
               <button
                 className="primary"
                 onClick={() => requestSession(state.config.projects[0])}

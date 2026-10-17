@@ -60,3 +60,90 @@ test("automatic improvement settings and a project's own prompt save through the
   await expect(page.getByRole("status").filter({ hasText: "설정을 저장했습니다" })).toBeVisible();
   expect(errors).toEqual([]);
 });
+
+test("an automatic session is never selected on the user's behalf", async ({
+  page,
+  request,
+}) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  const state = await (await request.get("/api/state")).json();
+  const auto = {
+    id: "automatic-session",
+    project: state.config.projects[0],
+    status: "running",
+    title: "자동 개선 프롬프트",
+    workflow_mode: "source_document",
+    automatic: true,
+    memory_count: 0,
+    revision: state.revision,
+  };
+  state.sessions = [auto];
+  state.running = [{ id: auto.id, closing: false, automatic: true }];
+  let opened = 0;
+  await page.route("**/api/state", (route) => route.fulfill({ json: state }));
+  await page.route(`**/api/sessions/${auto.id}*`, (route) => {
+    opened++;
+    return route.fulfill({ status: 404, json: { error: "세션을 찾을 수 없습니다." } });
+  });
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "첫 작업을 시작해 보세요" })).toBeVisible();
+  await expect(page.getByRole("button", { name: /자동 개선 프롬프트/ })).toContainText("자동 개선 ·");
+  expect(page.url()).not.toContain(auto.id);
+  expect(opened).toBe(0);
+  expect(errors).toEqual([]);
+});
+
+// An automatic session closes by itself when its run ends; closing one from
+// outside the page changes the selection the same way.
+async function selectThenCloseOutside(page, request, edit) {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  const headers = { "x-mnemoarc-client": "web" };
+  const { config } = await (await request.get("/api/state")).json();
+  const created = await request.post("/api/sessions", {
+    headers,
+    data: { project: config.projects[0], workflow: "answer" },
+  });
+  expect(created.ok()).toBe(true);
+  const { id } = await created.json();
+  await page.goto(`/#${id}`);
+  await page.getByRole("button", { name: "모든 설정" }).click();
+  await edit();
+  expect((await request.delete(`/api/sessions/${id}`, { headers })).ok()).toBe(true);
+  await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(`#${id}`);
+  return { config, errors };
+}
+
+test("unsaved app-wide settings survive the selected session closing on its own", async ({
+  page,
+  request,
+}) => {
+  const count = page.getByLabel("최대 기억 개수", { exact: true });
+  const { errors } = await selectThenCloseOutside(page, request, async () => {
+    await page.getByRole("button", { name: "기억과 보관" }).click();
+    await count.fill("777");
+  });
+  await expect(count).toHaveValue("777");
+  await expect(page.getByText("저장하지 않은 변경 사항", { exact: true })).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test("edits for a session that closed on its own fall back to app-wide settings", async ({
+  page,
+  request,
+}) => {
+  const scope = page.getByLabel("설정 적용 범위");
+  const count = page.getByLabel("최대 기억 개수", { exact: true });
+  const { config, errors } = await selectThenCloseOutside(page, request, async () => {
+    await scope.selectOption("session");
+    await page.getByRole("button", { name: "기억과 보관" }).click();
+    await count.fill("555");
+  });
+  await expect(scope).toHaveValue("global");
+  await expect(
+    page.getByRole("status").filter({ hasText: "전체 기본 설정으로 전환했습니다" }),
+  ).toBeVisible();
+  await expect(count).toHaveValue(String(config.memory_count));
+  expect(errors).toEqual([]);
+});

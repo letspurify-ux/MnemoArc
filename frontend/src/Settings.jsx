@@ -204,6 +204,8 @@ function AutomationEditor({ automation, onChange, projects, runs = [], disabled 
   const set = (key, value) => onChange({ ...automation, [key]: value });
   const result = (run) => run.status === "not_started" ? "시작하지 못함" : statusLabel[run.status] || run.status;
   const optedIn = projects.filter((p) => p.auto_improve);
+  // A project runs only with its own prompt or the default one.
+  const prompted = (p) => Boolean(p.auto_prompt?.trim() || automation.prompt.trim());
   return <div className="project-fields">
     {disabled && <small>자동 문서 개선은 전체 기본 설정에서만 변경할 수 있습니다.</small>}
     <label className="check-label"><input type="checkbox" checked={automation.enabled} disabled={disabled} onChange={e => set("enabled", e.target.checked)} />자동 문서 개선 사용</label>
@@ -214,7 +216,7 @@ function AutomationEditor({ automation, onChange, projects, runs = [], disabled 
         <label className="setting-field" key={key}><span>{label}</span><input aria-label={label} type="number" min="1" disabled={disabled} value={automation[key]} onChange={e => set(key, parseValue(e.target.value, "number"))} /><small>{help}</small></label>
       )}
     </div>
-    <small>대상 프로젝트: {optedIn.length ? optedIn.map((p) => p.name).join(", ") : "없음 · 프로젝트 관리에서 자동 개선을 켜세요"}</small>
+    <small>대상 프로젝트: {optedIn.length ? optedIn.map((p) => prompted(p) ? p.name : `${p.name} (프롬프트가 없어 실행하지 않음)`).join(", ") : "없음 · 프로젝트 관리에서 자동 개선을 켜세요"}</small>
     <h3>최근 자동 실행</h3>
     {runs.length ? runs.map((run, index) => <details className="run-record" key={`${run.started_at}-${index}`}>
       <summary>
@@ -290,9 +292,20 @@ export default function Settings({
   onClose,
   onDirtyChange,
 }) {
-  const [scope, setScope] = useState("global"),
+  const [scopeName, setScope] = useState("global"),
     [tab, setTab] = useState("connection");
-  const [draft, setDraft, markSaved] = useServerDraft(scope === "global" ? config : sessionConfig, scope);
+  // The selected session can change under this page without the user
+  // leaving it: an automatic session closes when its run ends. Session-only
+  // edits go with that session (from this render on, as its settings are
+  // gone); app-wide edits stay.
+  const [scopeSession, setScopeSession] = useState(sessionId);
+  const scope =
+    scopeName === "session" && scopeSession !== sessionId ? "global" : scopeName;
+  // A session's draft never carries over to another session's settings.
+  const [draft, setDraft, markSaved] = useServerDraft(
+    scope === "global" ? config : sessionConfig,
+    scope === "global" ? scope : `session:${sessionId}`,
+  );
   const [key, setKey] = useState(""),
     [remember, setRemember] = useState(false),
     [clear, setClear] = useState(false),
@@ -409,9 +422,7 @@ export default function Settings({
       setBusy(false);
     }
   }
-  function switchScope(value) {
-    if (operation.current || value === scope) return;
-    if (dirty && !confirm("저장하지 않은 설정을 버리고 전환할까요?")) return;
+  function enterScope(value) {
     setScope(value);
     setDirty(false);
     setKey("");
@@ -420,6 +431,18 @@ export default function Settings({
     setMessage("");
     setError("");
   }
+  function switchScope(value) {
+    if (operation.current || value === scope) return;
+    if (dirty && !confirm("저장하지 않은 설정을 버리고 전환할까요?")) return;
+    enterScope(value);
+  }
+  useEffect(() => {
+    if (scopeSession === sessionId) return;
+    setScopeSession(sessionId);
+    if (scopeName !== "session") return;
+    enterScope("global");
+    setMessage("선택한 세션이 바뀌어 전체 기본 설정으로 전환했습니다. 세션 설정 변경 사항은 적용하지 않았습니다.");
+  }, [sessionId, scopeSession, scopeName]);
   return (
     <section className="settings-page">
       <header className="page-heading">

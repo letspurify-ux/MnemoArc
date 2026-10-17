@@ -10,5 +10,6 @@ config.toml
 /frontend/dist
 *.credentials.json
 *.automation.json
+*.automation.lock
 /frontend/test-artifacts
 /.mnemoarc

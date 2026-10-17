@@ -111,6 +111,8 @@ impl From<anyhow::Error> for ApiError {
 }
 type Api<T = Value> = std::result::Result<Json<T>, ApiError>;
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long shutdown waits for schedule records still being written.
+const SCHEDULE_WRITE_WAIT: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug, Default, Serialize)]
 struct Change {
     server_instance: String,
@@ -329,9 +331,16 @@ impl WebState {
         for cancel in cancellations {
             cancel.cancel();
         }
+        // A settled run starts its schedule record before releasing its
+        // slot; the process waits for that write, but a stuck folder must
+        // not keep it from stopping.
+        let mut writing = Duration::ZERO;
         loop {
             if self.core.lock().await.running.is_empty() {
-                break;
+                if self.automation.written() || writing >= SCHEDULE_WRITE_WAIT {
+                    break;
+                }
+                writing += Duration::from_millis(30);
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
@@ -1013,18 +1022,28 @@ async fn start_run(
             return Err(busy());
         }
         // An automatic session takes only its scheduled run and closes after
-        // it; one switched off since it was chosen does not start.
+        // it; one switched off (or its project opted out) since it was
+        // chosen does not start.
         if c.sessions.get(&id).is_some_and(|v| v.automatic) != automatic {
             return Err(ApiError(
                 StatusCode::CONFLICT,
                 "자동 개선 세션에는 요청을 보낼 수 없습니다. 새 세션에서 작업하세요.".into(),
             ));
         }
-        if automatic && !c.config.automation.enabled {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "자동 문서 개선이 꺼져 있습니다.".into(),
-            ));
+        if automatic {
+            let project = &c.sessions[&id].project.id;
+            let automation = &c.config.automation;
+            let opted_in = c
+                .config
+                .projects
+                .iter()
+                .any(|p| &p.id == project && p.automation_prompt(automation).is_some());
+            if !automation.enabled || !opted_in {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "자동 문서 개선이 꺼졌거나 이 프로젝트가 대상에서 빠졌습니다.".into(),
+                ));
+            }
         }
         // An automatic run starts only when nothing runs and never holds a
         // user's run back.
@@ -1118,6 +1137,9 @@ async fn start_run(
                 automatic,
             },
         );
+        if automatic || c.config.automation.enabled {
+            s.automation.mark_activity(chrono::Utc::now());
+        }
         session_changed(s, &mut c, &id, true);
         (copy, cancel, rx)
     };
@@ -1247,26 +1269,34 @@ async fn start_run(
                 }
             }
             let ended = chrono::Utc::now();
-            if let Some(project) = project {
-                let auto_run = automatic
-                    .then(|| c.sessions.get(&id))
-                    .flatten()
-                    .map(|v| automation::AutoRun::finished(v, ended));
-                state
-                    .automation
-                    .note_run_end(&c.config.projects, &project, ended, auto_run);
-            }
+            // Work times serve only the scheduler: while it is off, a run
+            // writes nothing beside the settings.
+            let saved = match project {
+                Some(project) if automatic || c.config.automation.enabled => {
+                    let auto_run = automatic
+                        .then(|| c.sessions.get(&id))
+                        .flatten()
+                        .map(|v| automation::AutoRun::finished(v, ended));
+                    state
+                        .automation
+                        .note_run_end(&c.config.projects, &project, ended, auto_run);
+                    state.automation.mark_activity(ended);
+                    // Started before the slot is released, so shutdown, which
+                    // waits for every slot, cannot exit ahead of the record.
+                    Some(state.automation.persist())
+                }
+                _ => None,
+            };
             if automatic {
                 c.remove_session(&id);
             }
             c.idle_since = ended;
-            // Started before the slot is released, so shutdown, which waits
-            // for every slot, cannot exit ahead of the record.
-            let saved = state.automation.persist();
             c.running.remove(&id);
             session_changed(&state, &mut c, &id, true);
             drop(c);
-            let _ = saved.await;
+            if let Some(saved) = saved {
+                let _ = saved.await;
+            }
         })
         .catch_unwind()
         .await;
@@ -1578,12 +1608,19 @@ mod worker_wait_tests {
             .await
             .unwrap_err();
         assert_eq!(error.0, StatusCode::CONFLICT);
-        // Automation was switched off after the session was chosen.
+        // Automation was switched off after the session was chosen, or
+        // stayed on while the project opted out.
+        let error = start_run(&state, automatic.clone(), input("scheduled"), true)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("꺼졌거나"), "{}", error.1);
+        state.core.lock().await.config.automation.enabled = true;
         let error = start_run(&state, automatic, input("scheduled"), true)
             .await
             .unwrap_err();
         assert_eq!(error.0, StatusCode::CONFLICT);
-        assert!(error.1.contains("꺼져"), "{}", error.1);
+        assert!(error.1.contains("대상에서 빠졌습니다"), "{}", error.1);
         let user = open_session(&state, project, "answer", false)
             .await
             .unwrap();
