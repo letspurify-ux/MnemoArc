@@ -499,6 +499,7 @@ fn prepare_settings(
     if config.projects.is_empty() {
         bail!("At least one project is required");
     }
+    crate::context::ContextManager::check_capacity(&config, &config.projects[0])?;
     config.api_key = if config.api_key_env == old.api_key_env {
         old.api_key.clone()
     } else {
@@ -2470,6 +2471,92 @@ mod worker_wait_tests {
             };
             assert_eq!(queued.api_key.as_ref().map(|key| key.0.as_str()), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn settings_that_cannot_hold_the_request_prefix_are_refused_on_save() {
+        // 32K with 4K output passed validation, but its input budget is
+        // below what the system prompt and tools take alone: every task
+        // stopped with context_capacity at its first request.
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            model: "gpt-4o".into(),
+            model_context: Some(128000),
+            projects: vec![Project {
+                root: dir.path().into(),
+                ..Default::default()
+            }],
+            ..Config::compact_test()
+        };
+        let state = test_state(
+            config.clone(),
+            dir.path().join("config.toml"),
+            Arc::new(OpenAiClient),
+        )
+        .unwrap();
+        let id = state.core.lock().await.order[0].clone();
+        let small = Config {
+            context_tokens: 32_000,
+            output_tokens: 4_000,
+            batch_tokens: None,
+            result_tokens: None,
+            ..config.clone()
+        };
+        small.validate().unwrap();
+        let result = session_settings(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(Settings {
+                config: small.clone(),
+                api_key: None,
+                credential_mode: "keep".into(),
+            }),
+        )
+        .await;
+        let Err(ApiError(_, error)) = result else {
+            panic!("32K/4K settings were saved")
+        };
+        assert!(error.starts_with("context_capacity:"), "{error}");
+        assert!(error.contains("increase context_tokens"), "{error}");
+        {
+            let core = state.core.lock().await;
+            let session = &core.sessions[&id];
+            assert_eq!(session.config.context_tokens, config.context_tokens);
+            assert!(session.pending_config.is_none());
+        }
+        let result = settings(
+            State(state.clone()),
+            Json(Settings {
+                config: small,
+                api_key: None,
+                credential_mode: "keep".into(),
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            state.core.lock().await.config.context_tokens,
+            config.context_tokens
+        );
+        // The same context with a smaller output limit holds the request.
+        let fitting = Config {
+            context_tokens: 32_000,
+            output_tokens: 2_000,
+            batch_tokens: None,
+            result_tokens: None,
+            ..config.clone()
+        };
+        let result = session_settings(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(Settings {
+                config: fitting,
+                api_key: None,
+                credential_mode: "keep".into(),
+            }),
+        )
+        .await;
+        assert!(result.is_ok(), "{:?}", result.err().map(|e| e.1));
     }
 
     #[tokio::test]

@@ -344,6 +344,42 @@ async fn resume_and_repeated_effective_prompt_do_not_depend_on_classification() 
 }
 
 #[tokio::test]
+async fn an_instruction_near_the_history_limit_needs_no_room_for_an_answer() {
+    // Every message reserved room for a follow-up answer before routing.
+    // With the task's own history within that room of its limit, 계속 and
+    // every changed instruction were refused, and no run could reach the
+    // limit to release history.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = cancelled(dir.path()).await;
+    let answer = s.config.output_tokens * 32 + 4096;
+    s.config.history_bytes = s.history.bytes() + answer - 2000;
+    assert!(s.clone().queue_question("What is left?".into()).is_err());
+    for message in ["계속 진행", CHANGE] {
+        let mut s = s.clone();
+        s.receive_message(message.into()).unwrap();
+        let replies = if message == CHANGE {
+            vec![work(GOAL), Reply::WorkReached]
+        } else {
+            vec![Reply::WorkReached]
+        };
+        let (s, _) = execute(s, replies).await;
+        assert!(s.question.is_none());
+        assert_eq!(s.run_history.back().unwrap().workflow, "source_document");
+    }
+    // A question still needs the room, once routing has made it one.
+    s.receive_message("남은 작업이 뭐야?".into()).unwrap();
+    let before = preserved(&s);
+    let discuss =
+        text(json!({"intent":"discuss","authorization_quote":"","changes":null}).to_string());
+    let (s, requests) = execute(s, vec![discuss]).await;
+    assert_eq!(requests.len(), 1);
+    let error = s.run_history.back().unwrap().error.clone().unwrap();
+    assert!(error.starts_with("history_capacity:"), "{error}");
+    assert!(error.contains("task preserved"), "{error}");
+    assert_eq!(preserved(&s), before);
+}
+
+#[tokio::test]
 async fn a_large_old_conversation_cannot_overflow_the_classification_request() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = cancelled(dir.path()).await;

@@ -526,7 +526,10 @@ pub(super) async fn run(
         if automatic {
             match routing::run(&mut s, &client, &cancel, &events, &mut control, initial_tokens).await? {
                 routing::Decision::Work => { promote = true; return Ok(()); }
-                routing::Decision::Discuss => s.promote_run_to_question(),
+                routing::Decision::Discuss => {
+                    s.promote_run_to_question();
+                    s.reserve_answer()?;
+                }
                 routing::Decision::NewTask => {
                     s.promote_run_to_question();
                     append(&mut s, vec![json!({"role":"assistant","content":"새 작업은 ‘새 세션’에서 시작하세요. 이 세션의 목표를 변경하거나 현재 작업을 수정하는 요청은 여기에서 이어갈 수 있습니다.","follow_up":true})])?;

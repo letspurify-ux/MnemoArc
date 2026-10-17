@@ -855,6 +855,13 @@ impl Session {
             .collect()
     }
     pub fn queue_question(&mut self, text: String) -> Result<()> {
+        self.queue_message(text, true)
+    }
+
+    /// Queue a message as the pending question. `answer` reserves history
+    /// room for a follow-up answer as well; a routed message reserves it
+    /// only once routing makes it a question (see reserve_answer).
+    fn queue_message(&mut self, text: String, answer: bool) -> Result<()> {
         if text.trim().is_empty() {
             bail!("empty_question: enter a question");
         }
@@ -864,26 +871,12 @@ impl Session {
         if self.question.is_some() || self.status == "running" {
             bail!("session_busy: wait for the current run to finish");
         }
-        // Reserve room for both messages without retiring the suspended
-        // task's history. Already retired history in front leaves first, as
-        // a run releases it at the limit: kept, it refused every message
-        // while history stayed just under the limit, and a finished task has
-        // no run to release it.
         let message = json!({"role":"user","content":text,"follow_up":true});
-        let reserved = serde_json::to_vec(&message)?
-            .len()
-            .saturating_add(self.config.output_tokens.saturating_mul(32))
-            .saturating_add(4096);
-        if self.history.bytes().saturating_add(reserved) > self.config.history_bytes
-            && self
-                .history
-                .prune(self.config.history_bytes.saturating_sub(reserved))
-                .is_err()
-        {
-            bail!(
-                "history_capacity: not enough space for a follow-up answer; clean up history first"
-            );
+        let mut reserved = serde_json::to_vec(&message)?.len();
+        if answer {
+            reserved = reserved.saturating_add(self.answer_bytes());
         }
+        self.make_history_room(reserved)?;
         let bundle_id = self.history.push(vec![message], true);
         let bundle = self.history.bundles.back_mut().unwrap();
         bundle.active = false;
@@ -898,6 +891,39 @@ impl Session {
             automatic: false,
         });
         Ok(())
+    }
+
+    /// History bytes a follow-up answer is given, its tool results included.
+    fn answer_bytes(&self) -> usize {
+        self.config
+            .output_tokens
+            .saturating_mul(32)
+            .saturating_add(4096)
+    }
+
+    /// Make room for `bytes` more history without retiring the suspended
+    /// task's history. Already retired history in front leaves first, as a
+    /// run releases it at the limit: kept, it refused every message while
+    /// history stayed just under the limit, and a finished task has no run
+    /// to release it.
+    fn make_history_room(&mut self, bytes: usize) -> Result<()> {
+        if self.history.bytes().saturating_add(bytes) > self.config.history_bytes
+            && self
+                .history
+                .prune(self.config.history_bytes.saturating_sub(bytes))
+                .is_err()
+        {
+            bail!(
+                "history_capacity: not enough history space for a follow-up answer; raise history_bytes in the session settings or continue in another session; task preserved"
+            );
+        }
+        Ok(())
+    }
+
+    /// Reserve the follow-up answer's history room once routing has made
+    /// the pending message a question.
+    pub(crate) fn reserve_answer(&mut self) -> Result<()> {
+        self.make_history_room(self.answer_bytes())
     }
 
     /// The public message entry point: one task is initialized per session.
@@ -919,7 +945,12 @@ impl Session {
             )?;
             self.start_new_task(text);
         } else {
-            self.queue_question(text)?;
+            // Routing decides whether the message is a question. A work
+            // instruction (계속, a changed goal) needs no room for an answer:
+            // reserved here, history within that room of its limit refused
+            // every instruction, and no run could reach the limit to release
+            // it.
+            self.queue_message(text, false)?;
             self.question.as_mut().unwrap().automatic = true;
         }
         self.check_runtime_capacity()
@@ -951,10 +982,19 @@ impl Session {
                 bail!("invalid_task_requirements: use at most 100 non-empty entries");
             }
         }
+        // A change-less resume (계속, or the request sent again) amends
+        // nothing: recorded, each one stayed in every later request's state,
+        // and as a user source each pushed an earlier request out of the
+        // five user_sources the state lists.
+        let recorded = amendment.changes_requirements()
+            || !(Self::is_continuation(&amendment.request)
+                || amendment.request.trim() == self.latest_request.trim());
         let mut next = self.clone();
         let question = next.question.take().unwrap();
         next.current_request = question.text.clone();
-        next.observe_user(&question.text);
+        if recorded {
+            next.observe_user(&question.text);
+        }
         if let Some(goal) = &amendment.goal {
             next.latest_request = goal.clone();
         }
@@ -988,12 +1028,7 @@ impl Session {
                 next.config.state_tokens
             );
         }
-        // A change-less resume (계속, or the request sent again) amends
-        // nothing: recorded, each one stayed in every later request's state.
-        if amendment.changes_requirements()
-            || !(Self::is_continuation(&amendment.request)
-                || amendment.request.trim() == self.latest_request.trim())
-        {
+        if recorded {
             next.task_amendments.push(amendment);
         }
         if let Some(bundle) = next
@@ -1474,12 +1509,18 @@ mod history_tests {
         // request's state.
         let mut s = Session::new(Project::default(), Config::compact_test());
         s.receive_message("Write the report".into()).unwrap();
-        for text in ["계속", "Write the report"] {
+        for text in ["계속", "Write the report", "계속", "계속", "계속", "계속"] {
             s.receive_message(text.into()).unwrap();
             s.accept_amendment(TaskAmendment::default()).unwrap();
             assert!(s.task_amendments.is_empty(), "{text}");
             assert_eq!(s.current_request, text);
         }
+        // Nor do they push the request out of the listed user sources.
+        let state = crate::context::ContextManager::state(&s).unwrap();
+        assert_eq!(
+            state["user_sources"],
+            json!([{"id":state["user_sources"][0]["id"],"excerpt":{"same_as":"latest_request"}}])
+        );
         let first: Vec<String> = (0..20)
             .map(|i| format!("first criterion {i} with a long explanation"))
             .collect();

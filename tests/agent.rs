@@ -670,6 +670,8 @@ async fn pending_settings_that_cannot_fit_the_request_are_named() {
 /// a pending checkpoint is acknowledged.
 struct LongAnswer {
     replies: Mutex<usize>,
+    /// Repetitions of the reply's phrase, about five tokens each.
+    phrases: usize,
 }
 #[async_trait]
 impl LlmClient for LongAnswer {
@@ -704,7 +706,8 @@ impl LlmClient for LongAnswer {
             });
         }
         Ok(Completion {
-            text: format!("part {replies} ") + &"the item functions multiply values ".repeat(1250),
+            text: format!("part {replies} ")
+                + &"the item functions multiply values ".repeat(self.phrases),
             length_limited: true,
             ..Default::default()
         })
@@ -725,6 +728,7 @@ async fn a_long_answer_cut_at_the_output_limit_is_finished() {
         session,
         Arc::new(LongAnswer {
             replies: Mutex::new(0),
+            phrases: 1250,
         }),
         CancellationToken::new(),
         tx,
@@ -742,6 +746,35 @@ async fn a_long_answer_cut_at_the_output_limit_is_finished() {
         .filter(|m| m["partial"] == true)
         .count();
     assert_eq!(parts, 3);
+}
+
+#[tokio::test]
+async fn an_answer_cut_at_a_large_output_limit_is_finished() {
+    // The reply being continued was charged to the input budget, about 17K
+    // at 96K with a 16K output limit: one cut reply beside the system
+    // prompt, tools and state exceeded it with nothing else to retire, and
+    // the run and every resume stopped with context_capacity.
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = s(dir.path());
+    session.config.context_tokens = 96_000;
+    session.config.output_tokens = 16_000;
+    session.config.validate().unwrap();
+    session.add_user("Explain the project in detail".into());
+    let (tx, mut rx) = mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = run_session(
+        session,
+        Arc::new(LongAnswer {
+            replies: Mutex::new(0),
+            phrases: 2500,
+        }),
+        CancellationToken::new(),
+        tx,
+    )
+    .await;
+    drain.await.unwrap();
+    assert_eq!(result.status, "complete", "{:?}", result.last_error);
+    assert!(result.continuation.is_none());
 }
 
 struct RepeatedRead {

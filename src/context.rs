@@ -1,7 +1,7 @@
 use crate::{
     config::Config,
     memory::{MemoryMeta, MemoryStatus, id},
-    session::{Checkpoint, Session, SessionHistory, TaskState},
+    session::{Bundle, Checkpoint, Session, SessionHistory, TaskState},
 };
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -533,6 +533,38 @@ fn prune_toward(history: &mut SessionHistory, limit: usize, retired: &BTreeSet<u
     history.prune_retiring(limit, retired)
 }
 
+/// Tokens a bundle adds to the model request.
+fn delivered_tokens(bundle: &Bundle, model: &str) -> usize {
+    let delivered: Vec<_> = bundle.messages.iter().cloned().map(model_message).collect();
+    count(&json!(delivered), model)
+}
+
+/// The partial reply the pending continuation extends: the latest active
+/// bundle, a cleanup instruction sent after it (기억 정리) aside; counted as
+/// the latest, it let the partial retire while LENGTH RECOVERY still said to
+/// continue it. Only that reply is continued: an older partial reply was
+/// continued long ago and leaves like any other group.
+fn continued(s: &Session) -> Option<&Bundle> {
+    s.continuation?;
+    s.history
+        .bundles
+        .iter()
+        .rev()
+        .find(|b| b.active && !b.messages.iter().any(|m| m["maintenance"] == true))
+        .filter(|b| b.messages.iter().any(|m| m["partial"] == true))
+}
+
+/// Request tokens the input budget is charged with: all but the reply being
+/// continued. That reply filled the output allowance the request it came
+/// from reserved, and the continuation answers in place of a tool batch, so
+/// the request still fits the context (the run checks it). Charged to the
+/// input budget as well, one reply cut at a large output limit (16K at 96K,
+/// say) left no room beside the system prompt, tools and state: nothing else
+/// could retire, and the run and every resume stopped with context_capacity.
+fn charged_tokens(s: &Session, request_tokens: usize) -> usize {
+    request_tokens.saturating_sub(continued(s).map_or(0, |b| delivered_tokens(b, &s.config.model)))
+}
+
 /// Bytes of the bundles from `front` on that a commit could prune: complete
 /// bundles already retired or in `chosen`. Moves `front` past them.
 fn prunable_run(history: &SessionHistory, front: &mut usize, chosen: &BTreeSet<u64>) -> usize {
@@ -862,6 +894,32 @@ impl ContextManager {
                 .saturating_add(1024),
         )
     }
+    /// Refuse settings whose input budget cannot hold the part of a request
+    /// no checkpoint retires: the system prompt, the tools of either
+    /// workflow, and a task state and memory index at their configured
+    /// limits. validate's 4096-token floor let such settings through (32K
+    /// with 4K output leaves 6.8K, under the ~7.3K a new task's request
+    /// takes alone): every task then stopped with context_capacity at its
+    /// first request, and a 64K session once its memories filled the index.
+    pub fn check_capacity(c: &Config, project: &crate::config::Project) -> Result<()> {
+        let mut prefix = 0;
+        for workflow in crate::session::WORKFLOW_MODES {
+            let mut s = Session::new(project.clone(), c.clone());
+            s.select_workflow(workflow)?;
+            let tools = crate::tools::ToolRegistry::definitions(&s);
+            prefix = prefix.max(count(&Self::request(&s, tools)?, &c.model));
+        }
+        let index = if c.memory_reuse { c.index_tokens } else { 0 };
+        let needed = prefix.saturating_add(c.state_tokens).saturating_add(index);
+        let budget = Self::input_budget(c);
+        if needed > budget {
+            bail!(
+                "context_capacity: these settings leave an input budget of {budget} tokens after output, tool results and three cleanup rounds, but the system prompt and tools (about {prefix}) with a full task state (state_tokens {}) and memory index (index_tokens {index}) need about {needed}; increase context_tokens, or lower output_tokens, batch_tokens, checkpoint_tokens, state_tokens or index_tokens",
+                c.state_tokens
+            );
+        }
+        Ok(())
+    }
     /// Record a provider-reported input size against the local estimate of
     /// the same request. Only estimated tokenizers are calibrated.
     pub fn record_usage(s: &mut Session, estimated: usize, actual: usize) {
@@ -921,7 +979,10 @@ impl ContextManager {
                 bundle.active = false;
             }
         }
-        let tokens = count(&Self::request(&after, tools)?, &s.config.model);
+        let tokens = charged_tokens(
+            &after,
+            count(&Self::request(&after, tools)?, &s.config.model),
+        );
         if tokens <= Self::prepare_budget(s) {
             return Ok(());
         }
@@ -982,7 +1043,10 @@ impl ContextManager {
         let history_pressure = retained_bytes >= history_limit
             || (s.history.bytes() >= s.config.history_bytes
                 && retained_bytes > history_floor(s.config.history_bytes));
-        if request_tokens < threshold && !history_pressure {
+        // The reply being continued stays, and is not charged to the budget.
+        let continued = continued(s).map(|b| b.id);
+        let charged = charged_tokens(s, request_tokens);
+        if charged < threshold && !history_pressure {
             // A lower pending limit prunes when it applies, so a rejected
             // setting leaves no irreversible prune behind.
             if s.history.bytes() >= s.config.history_bytes {
@@ -998,12 +1062,12 @@ impl ContextManager {
         // History pressure alone retires only what history needs. Taken to
         // low water as well, a request below high water lost reads it still
         // used, and the model read them again.
-        let target = if request_tokens < threshold {
-            request_tokens
+        let target = if charged < threshold {
+            charged
         } else {
             (budget as f64 * s.config.low_water) as usize
         };
-        let mut remaining = request_tokens;
+        let mut remaining = charged;
         let mut ids = vec![];
         // Never split a tool-call/result group. The latest complete group may
         // also be preserved and retired if older groups cannot reach the target.
@@ -1015,27 +1079,11 @@ impl ContextManager {
             .find(|b| b.active && b.complete)
             .map(|b| b.id)
             .unwrap_or(0);
-        // The partial reply the pending continuation extends: the latest
-        // active bundle, a cleanup instruction sent after it (기억 정리)
-        // aside; counted as the latest, it let the partial retire while
-        // LENGTH RECOVERY still said to continue it. Only that reply stays.
-        // An older partial reply was continued long ago and blocked the
-        // prune of every group behind it; the earlier replies of a long
-        // answer cut at the output limit several times leave like any other
-        // group, oldest first, when the target needs them. Kept, the chain
-        // outgrew the input budget with nothing left to retire, and the run
-        // and every resume stopped with context_capacity.
-        let continued = s
-            .continuation
-            .and_then(|_| {
-                s.history
-                    .bundles
-                    .iter()
-                    .rev()
-                    .find(|b| b.active && !b.messages.iter().any(|m| m["maintenance"] == true))
-            })
-            .filter(|b| b.messages.iter().any(|m| m["partial"] == true))
-            .map(|b| b.id);
+        // The earlier replies of a long answer cut at the output limit
+        // several times leave like any other group, oldest first, when the
+        // target needs them. Kept, the chain outgrew the input budget with
+        // nothing left to retire, and the run and every resume stopped with
+        // context_capacity.
         let candidates: Vec<_> = s
             .history
             .bundles
@@ -1049,8 +1097,7 @@ impl ContextManager {
             retained_bytes =
                 retained_bytes.saturating_sub(prunable_run(&s.history, &mut front, &chosen));
             if b.active {
-                let delivered: Vec<_> = b.messages.iter().cloned().map(model_message).collect();
-                remaining = remaining.saturating_sub(count(&json!(delivered), &s.config.model));
+                remaining = remaining.saturating_sub(delivered_tokens(b, &s.config.model));
             }
             if remaining <= target && retained_bytes <= history_target {
                 break;
@@ -1065,7 +1112,7 @@ impl ContextManager {
             // the limit (an answered follow-up, say) needs no checkpoint to
             // leave: without this prune nothing released it, and history
             // grew until the hard limit stopped the run.
-            if request_tokens <= budget && retained_bytes <= history_limit {
+            if charged <= budget && retained_bytes <= history_limit {
                 if s.history.bytes() >= s.config.history_bytes {
                     prune_toward(&mut s.history, s.config.history_bytes, &BTreeSet::new())?;
                 }

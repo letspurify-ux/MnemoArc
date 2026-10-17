@@ -604,14 +604,58 @@ fn a_long_answer_retires_its_earlier_partial_replies() {
         })
         .collect();
     s.continuation = Some(false);
-    let budget = ContextManager::input_budget(&s.config);
-    assert!(ContextManager::prepare(&mut s, budget).unwrap());
+    let request = ContextManager::request(&s, tools::ToolRegistry::definitions(&s)).unwrap();
+    let tokens = context::count(&request, &s.config.model);
+    assert!(ContextManager::prepare(&mut s, tokens).unwrap());
     let chosen = s.checkpoint.as_ref().unwrap().bundle_ids.clone();
     assert!(chosen.contains(&partials[0]), "{chosen:?}");
     assert!(!chosen.contains(&partials[2]), "{chosen:?}");
     s.checkpoint.as_mut().unwrap().acknowledged = true;
     ContextManager::commit(&mut s).unwrap();
     assert!(s.history.read(partials[2]).unwrap().active);
+}
+
+#[test]
+fn a_reply_cut_at_a_large_output_limit_is_continued() {
+    // The reply being continued was charged to the input budget too. At 96K
+    // with a 16K output limit the budget is about 17K, so one cut reply and
+    // the system prompt, tools and state exceeded it with nothing else to
+    // retire: the run and every resume stopped with context_capacity, while
+    // the continuation request fit the context with room to spare.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session(dir.path());
+    s.config.context_tokens = 96_000;
+    s.config.output_tokens = 16_000;
+    s.config.validate().unwrap();
+    let budget = ContextManager::input_budget(&s.config);
+    s.add_user("Explain every file in detail".into());
+    let partial = s.history.push(
+        vec![json!({"role":"assistant","content":"the item functions multiply values ".repeat(2500),"partial":true})],
+        true,
+    );
+    s.continuation = Some(false);
+    let size = |s: &Session| {
+        let request = ContextManager::request(s, tools::ToolRegistry::definitions(s)).unwrap();
+        context::count(&request, &s.config.model)
+    };
+    let tokens = size(&s);
+    assert!(tokens > budget, "{tokens} <= {budget}");
+    assert!(tokens + s.config.output_tokens + 512 <= s.config.context_tokens);
+    assert!(!ContextManager::prepare(&mut s, tokens).unwrap());
+    assert!(s.checkpoint.is_none());
+    // The continuation was cut too: the earlier reply retires, and the
+    // checkpoint that keeps the latest one is not refused as futile.
+    let latest = s.history.push(
+        vec![json!({"role":"assistant","content":"the item functions divide values ".repeat(2500),"partial":true})],
+        true,
+    );
+    let tools = tools::ToolRegistry::definitions(&s);
+    let tokens = size(&s);
+    assert!(ContextManager::prepare(&mut s, tokens).unwrap());
+    let chosen = s.checkpoint.as_ref().unwrap().bundle_ids.clone();
+    assert!(chosen.contains(&partial), "{chosen:?}");
+    assert!(!chosen.contains(&latest), "{chosen:?}");
+    ContextManager::check_checkpoint_fits(&s, tools).unwrap();
 }
 
 #[test]
