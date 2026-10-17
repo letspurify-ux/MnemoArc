@@ -176,7 +176,7 @@ async fn cancelling_then_sending_a_changed_prompt_repairs_routing_and_finishes_t
     let client = reqwest::Client::new();
     assert_eq!(
         get(&client, &format!("{url}/api/state")).await["api_version"],
-        2
+        3
     );
     let created: Value = client
         .post(format!("{url}/api/sessions"))

@@ -3,6 +3,8 @@ import { autoBudget, groups, inputValue, parseValue } from "./fields.js";
 import { api, send } from "./api.js";
 import { useServerDraft } from "./use-server-draft.js";
 import { displayPath, displayPathText } from "./paths.js";
+import { statusLabel } from "./api.js";
+import { reasons } from "./RunHistory.jsx";
 
 export function DirectoryPicker({ path, onSelect, onClose }) {
   const [data, setData] = useState(null),
@@ -91,7 +93,9 @@ export function DirectoryPicker({ path, onSelect, onClose }) {
       </dialog>
   );
 }
-export function ProjectForm({ project, onChange, disabled = false }) {
+// automationPrompt is the default automatic-run prompt; when it is given the
+// form also edits the project's automatic improvement settings.
+export function ProjectForm({ project, onChange, disabled = false, automationPrompt }) {
   const [browse, setBrowse] = useState(false);
   useEffect(() => {
     if (disabled) setBrowse(false);
@@ -148,6 +152,34 @@ export function ProjectForm({ project, onChange, disabled = false }) {
           <small>한 줄에 한 패턴. 예: src/**, **/*.rs</small>
         </label>
       ))}
+      {automationPrompt !== undefined && (
+        <>
+          <label className="check-label">
+            <input
+              type="checkbox"
+              checked={Boolean(project.auto_improve)}
+              disabled={disabled}
+              onChange={(e) => set("auto_improve", e.target.checked)}
+            />
+            유휴 시간 자동 문서 개선
+          </label>
+          <label>
+            자동 개선 프롬프트
+            <textarea
+              aria-label="자동 개선 프롬프트"
+              rows={4}
+              disabled={disabled}
+              placeholder={automationPrompt}
+              value={project.auto_prompt || ""}
+              onChange={(e) => set("auto_prompt", e.target.value)}
+            />
+            <small>
+              비우면 모든 설정 → 자동 문서 개선의 기본 프롬프트를 사용합니다.
+              결과 문서가 이미 있는 프로젝트만 실행합니다.
+            </small>
+          </label>
+        </>
+      )}
       {browse && (
         <DirectoryPicker
           path={project.root}
@@ -167,6 +199,39 @@ export function cleanProject(project) {
     include: project.include.filter((s) => s.trim()),
     exclude: project.exclude.filter((s) => s.trim()),
   };
+}
+function AutomationEditor({ automation, onChange, projects, runs = [], disabled }) {
+  const set = (key, value) => onChange({ ...automation, [key]: value });
+  const result = (run) => run.status === "not_started" ? "시작하지 못함" : statusLabel[run.status] || run.status;
+  const optedIn = projects.filter((p) => p.auto_improve);
+  return <div className="project-fields">
+    {disabled && <small>자동 문서 개선은 전체 기본 설정에서만 변경할 수 있습니다.</small>}
+    <label className="check-label"><input type="checkbox" checked={automation.enabled} disabled={disabled} onChange={e => set("enabled", e.target.checked)} />자동 문서 개선 사용</label>
+    <small>실행 중인 작업이 없는 상태가 대기 시간만큼 이어지면, 자동 개선을 켠 프로젝트 중 결과 문서와 세션 작업이 가장 오래된 프로젝트 하나를 소스 기반 문서 작성으로 실행합니다. 실행이 끝나면 세션을 닫습니다. 자동 실행 중에도 직접 작업을 시작할 수 있으며 동시 실행 세션 수에 포함하지 않습니다.</small>
+    <label>기본 프롬프트<textarea aria-label="자동 개선 기본 프롬프트" rows={4} disabled={disabled} value={automation.prompt} onChange={e => set("prompt", e.target.value)} /><small>프로젝트 관리에서 프로젝트별 프롬프트를 지정하면 그 프롬프트를 사용합니다.</small></label>
+    <div className="field-grid">
+      {[["idle_minutes", "대기 시간 (분)", "마지막 작업이 끝나거나 앱을 시작한 뒤 기다리는 시간 (1~10080)"], ["stale_days", "작업 없는 기간 (일)", "결과 문서 변경·세션 실행·자동 시도 이후 이 기간이 지난 프로젝트만 실행합니다 (1~3650)"], ["max_runs_per_day", "24시간 최대 실행", "최근 24시간 동안 시작할 수 있는 자동 실행 수 (1~100)"]].map(([key, label, help]) =>
+        <label className="setting-field" key={key}><span>{label}</span><input aria-label={label} type="number" min="1" disabled={disabled} value={automation[key]} onChange={e => set(key, parseValue(e.target.value, "number"))} /><small>{help}</small></label>
+      )}
+    </div>
+    <small>대상 프로젝트: {optedIn.length ? optedIn.map((p) => p.name).join(", ") : "없음 · 프로젝트 관리에서 자동 개선을 켜세요"}</small>
+    <h3>최근 자동 실행</h3>
+    {runs.length ? runs.map((run, index) => <details className="run-record" key={`${run.started_at}-${index}`}>
+      <summary>
+        <strong>{run.project_name} · {reasons[run.reason] || result(run)}</strong>
+        <time dateTime={run.ended_at}>{new Date(run.ended_at).toLocaleString("ko-KR")}</time>
+      </summary>
+      <dl>
+        <dt>결과</dt><dd>{result(run)}</dd>
+        <dt>시작 시각</dt><dd>{new Date(run.started_at).toLocaleString("ko-KR")}</dd>
+        <dt>문서</dt><dd>{run.document_written ? "수정함" : "수정 없음"}</dd>
+        <dt>모델 호출</dt><dd>{run.rounds}회</dd>
+        <dt>입력 토큰</dt><dd>{run.input_tokens.toLocaleString()}</dd>
+        <dt>출력 토큰</dt><dd>{run.output_tokens.toLocaleString()}</dd>
+      </dl>
+      {run.error && <pre className="run-error">{displayPathText(run.error)}</pre>}
+    </details>) : <small>아직 자동 실행 기록이 없습니다. 최근 20회를 보관합니다.</small>}
+  </div>;
 }
 function DatabaseEditor({ database, onChange }) {
   const set = (key, value) => onChange({ ...database, [key]: value });
@@ -220,6 +285,7 @@ export default function Settings({
   sessionConfig,
   sessionId,
   sessionReady,
+  automationLog,
   onSaved,
   onClose,
   onDirtyChange,
@@ -413,6 +479,9 @@ export default function Settings({
           <h2>{group.label}</h2>
           <p className="subtle">{group.description}</p>
           {tab === "database" && <DatabaseEditor database={draft.database} onChange={value => change("database", value)} />}
+          {tab === "automation" && (scope === "session"
+            ? <AutomationEditor automation={config.automation} onChange={() => {}} projects={config.projects} runs={automationLog?.runs} disabled />
+            : <AutomationEditor automation={draft.automation} onChange={value => change("automation", value)} projects={draft.projects} runs={automationLog?.runs} />)}
           {tab === "connection" && (
             <div className="credential-card">
               <div className="credential-title">

@@ -620,7 +620,7 @@ async fn state_details_and_reconnected_events_identify_the_same_server_instance(
             .json()
             .await
             .unwrap();
-        assert_eq!(current["api_version"], 2);
+        assert_eq!(current["api_version"], 3);
         let instance = current["server_instance"].as_str().unwrap();
         assert!(uuid::Uuid::parse_str(instance).is_ok());
         assert_ne!(instance, previous);

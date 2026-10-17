@@ -7,6 +7,12 @@ export const groups = [
     fields: [],
   },
   {
+    id: "automation",
+    label: "자동 문서 개선",
+    description: "실행 중인 작업이 없을 때, 오래 작업하지 않은 프로젝트의 결과 문서를 설정한 프롬프트로 자동 개선합니다.",
+    fields: [],
+  },
+  {
     id: "connection",
     label: "모델 연결",
     description: "응답을 생성할 서버와 모델을 연결합니다.",
@@ -201,7 +207,7 @@ export const groups = [
     ],
   },
 ];
-export const fieldKeys = ["database", ...groups.flatMap((g) => g.fields.map((f) => f[0]))];
+export const fieldKeys = ["database", "automation", ...groups.flatMap((g) => g.fields.map((f) => f[0]))];
 // Budgets the server derives from context_tokens when they are left empty
 // (Config::result_budget and Config::batch_budget in src/config.rs).
 export const AUTO_BUDGET_SHARES = { result_tokens: 32, batch_tokens: 16 };

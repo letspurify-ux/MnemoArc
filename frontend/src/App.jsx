@@ -612,7 +612,11 @@ export default function App() {
   const current = state?.sessions.find((s) => s.id === selected);
   const running = state?.running || [];
   const runningById = new Map(running.map((run) => [run.id, run]));
-  const activeCount = new Set([...runningById.keys(), ...runPending]).size;
+  // Automatic runs do not count against the session limit.
+  const activeCount = new Set([
+    ...running.filter((run) => !run.automatic).map((run) => run.id),
+    ...runPending,
+  ]).size;
   const capacityFull =
     activeCount >= (state?.config.max_concurrent_sessions ?? 4);
   const selectedBusy =
@@ -774,6 +778,9 @@ export default function App() {
                       ([value]) => value === session.workflow_mode,
                     )?.[1] || session.workflow_mode}
                   </span>
+                  {current?.automatic && (
+                    <span className="workflow-badge">자동 개선</span>
+                  )}
                   <p title={displayPath(session.project.root)}>
                     {displayPath(session.project.root)}
                   </p>
@@ -837,6 +844,7 @@ export default function App() {
                     const item = state.sessions.find((s) => s.id === run.id);
                     return (
                       <button key={run.id} onClick={() => choose(run.id)}>
+                        {run.automatic ? "자동 개선 · " : ""}
                         {item?.title || item?.project.name || "새 대화"}
                         {run.closing ? " · 종료 중" : " · 작업 중"}
                       </button>
@@ -892,6 +900,7 @@ export default function App() {
             sessionConfig={session?.pending_config || session?.config}
             sessionId={session?.id}
             sessionReady={sessionReady}
+            automationLog={state.automation}
             onSaved={() => refresh(true)}
             onClose={() => showPage("chat")}
             onDirtyChange={onSettingsDirtyChange}
@@ -1010,6 +1019,7 @@ function SessionButton({ session, active, onClick, onClose, closing }) {
         <span>
           {title}
           <small>
+            {session.automatic ? "자동 개선 · " : ""}
             {session.memory_count}개 기억 ·{" "}
             {statusLabel[session.status] || session.status}
           </small>
@@ -1037,6 +1047,8 @@ function Projects({ config, onSaved, onCreate, onDirtyChange, creating }) {
     output: "docs/source-summary.md",
     include: [],
     exclude: [".env*"],
+    auto_improve: false,
+    auto_prompt: "",
   };
   const [list, setList, markSaved] = useServerDraft(config.projects);
   const [index, setIndex] = useState(0),
@@ -1129,6 +1141,7 @@ function Projects({ config, onSaved, onCreate, onDirtyChange, creating }) {
                 key={index}
                 project={project}
                 disabled={creating}
+                automationPrompt={config.automation?.prompt ?? ""}
                 onChange={(p) => {
                   setList(list.map((old, i) => (i === index ? p : old)));
                   setDirty(true);

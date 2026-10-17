@@ -17,7 +17,7 @@ export async function api(path, options = {}) {
     throw new Error(`서버 응답을 읽지 못했습니다 (${response.status}).`);
   if (
     path === "/state" &&
-    (data.api_version !== 2 ||
+    (data.api_version !== 3 ||
       typeof data.server_instance !== "string" ||
       !data.server_instance)
   ) {

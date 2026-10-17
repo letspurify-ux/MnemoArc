@@ -27,14 +27,14 @@ test("API errors preserve server messages, including null error responses", asyn
 });
 
 test("a stale server is detected before its state can enable task requests", async (t) => {
-  for (const state of [{ running: null }, { running: [] }, { api_version: 1, running: [] }, { api_version: 2, running: [] }]) {
+  for (const state of [{ running: null }, { running: [] }, { api_version: 1, running: [] }, { api_version: 2, running: [] }, { api_version: 3, running: [] }]) {
     t.mock.method(globalThis, "fetch", async () => Response.json(state));
     await assert.rejects(api("/state"), (error) =>
       error.code === "server_version_mismatch" && /앱을 종료한 뒤 다시 시작/.test(error.message),
     );
     t.mock.restoreAll();
   }
-  const state = { api_version: 2, server_instance: "test-server", running: [], sessions: [] };
+  const state = { api_version: 3, server_instance: "test-server", running: [], sessions: [] };
   t.mock.method(globalThis, "fetch", async () => Response.json(state));
   assert.deepEqual(await api("/state"), state);
 });

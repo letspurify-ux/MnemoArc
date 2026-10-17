@@ -35,7 +35,7 @@ test("a server version change disables a cached session and keeps its unsent dra
     page.getByText(/실행 중인 서버와 화면 버전이 맞지 않습니다/),
   ).toBeVisible();
   await expect(input).toHaveCount(0);
-  state.api_version = 2;
+  state.api_version = 3;
   await expect(input).toBeVisible();
   await expect(input).toHaveValue("중지 후 수정할 요청 초안");
 });

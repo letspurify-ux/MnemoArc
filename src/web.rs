@@ -36,6 +36,7 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 
+mod automation;
 mod connections;
 mod file_checks;
 mod file_io;
@@ -48,6 +49,9 @@ struct Running {
     cancel: CancellationToken,
     commands: mpsc::Sender<RunCommand>,
     closing: bool,
+    /// Started by the idle-time scheduler: not counted against the session
+    /// limit, and its session closes when the run ends.
+    automatic: bool,
 }
 struct Core {
     config: Config,
@@ -59,6 +63,9 @@ struct Core {
     revision: u64,
     session_revisions: BTreeMap<String, u64>,
     credentials: BTreeMap<String, Secret>,
+    /// When the last run ended, or the app started; automatic runs wait
+    /// automation.idle_minutes from here.
+    idle_since: chrono::DateTime<chrono::Utc>,
 }
 impl Core {
     fn session_mut(&mut self, id: &str) -> Option<&mut Session> {
@@ -88,6 +95,7 @@ pub struct WebState {
     file_io: FileIo,
     file_checks: FileChecks,
     write_outcome_uncertain: Arc<AtomicBool>,
+    automation: Arc<automation::Automation>,
 }
 #[derive(Debug)]
 struct ApiError(StatusCode, String);
@@ -149,7 +157,7 @@ fn session_summary(session: &Session) -> Value {
     } else {
         &session.original_request
     };
-    json!({"id":session.id,"project":session.project,"status":session.status,"title":title.chars().take(60).collect::<String>(),"workflow_mode":session.workflow_mode,"memory_count":session.memory.entries.len()})
+    json!({"id":session.id,"project":session.project,"status":session.status,"title":title.chars().take(60).collect::<String>(),"workflow_mode":session.workflow_mode,"automatic":session.automatic,"memory_count":session.memory.entries.len()})
 }
 fn same_config(a: &Config, b: &Config) -> bool {
     // Config serialization intentionally omits the secret, so compare it
@@ -274,6 +282,7 @@ impl WebState {
             }
         }
         let write_outcome_uncertain = Arc::new(AtomicBool::new(false));
+        let automation = Arc::new(automation::Automation::load(&path));
         let sessions = BTreeMap::new();
         let order = Vec::new();
         let (events, _) = broadcast::channel(128);
@@ -290,6 +299,7 @@ impl WebState {
                 revision: 0,
                 session_revisions: BTreeMap::new(),
                 credentials,
+                idle_since: chrono::Utc::now(),
             })),
             settings_gate: Arc::new(Mutex::new(())),
             events,
@@ -298,7 +308,13 @@ impl WebState {
             file_checks: FileChecks::default(),
             stopping,
             write_outcome_uncertain,
+            automation,
         })
+    }
+    /// One idle-time scheduling decision at `now`, as the server's scheduler
+    /// makes every minute. Returns the automatic session it started.
+    pub async fn automation_tick(&self, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+        automation::tick(self, now).await
     }
     pub async fn shutdown(&self) {
         self.stopping.cancel();
@@ -458,7 +474,7 @@ async fn events(
 async fn state_get(State(s): State<WebState>) -> Json<Value> {
     let c = s.core.lock().await;
     Json(
-        json!({"api_version":2,"server_instance":s.server_instance,"revision":c.revision,"config":c.config,"defaults":Config::default(),"credential":{"configured":OpenAiClient::has_key(&c.config),"saved":c.credentials.contains_key(&c.config.api_key_env)},"running":c.order.iter().filter_map(|id| c.running.get(id).map(|r| json!({"id":id,"closing":r.closing}))).collect::<Vec<_>>(),"sessions":c.order.iter().filter_map(|id|c.sessions.get(id)).map(|v| { let mut summary = session_summary(v); summary["revision"] = json!(c.session_revisions.get(&v.id).copied().unwrap_or(0)); summary }).collect::<Vec<_>>(),"tools":ToolRegistry::specs().iter().filter(|t|t.name != "db_query" && t.name != "db_execute").map(|t|json!({"name":t.name,"description":t.description,"optional":t.optional})).collect::<Vec<_>>()}),
+        json!({"api_version":3,"server_instance":s.server_instance,"revision":c.revision,"config":c.config,"defaults":Config::default(),"credential":{"configured":OpenAiClient::has_key(&c.config),"saved":c.credentials.contains_key(&c.config.api_key_env)},"running":c.order.iter().filter_map(|id| c.running.get(id).map(|r| json!({"id":id,"closing":r.closing,"automatic":r.automatic}))).collect::<Vec<_>>(),"automation":s.automation.view(),"sessions":c.order.iter().filter_map(|id|c.sessions.get(id)).map(|v| { let mut summary = session_summary(v); summary["revision"] = json!(c.session_revisions.get(&v.id).copied().unwrap_or(0)); summary }).collect::<Vec<_>>(),"tools":ToolRegistry::specs().iter().filter(|t|t.name != "db_query" && t.name != "db_execute").map(|t|json!({"name":t.name,"description":t.description,"optional":t.optional})).collect::<Vec<_>>()}),
     )
 }
 #[derive(Default, Deserialize)]
@@ -726,7 +742,16 @@ fn default_workflow() -> String {
     "answer".into()
 }
 async fn create_session(State(s): State<WebState>, Json(input): Json<NewSession>) -> Api {
-    if !crate::session::WORKFLOW_MODES.contains(&input.workflow.as_str()) {
+    let id = open_session(&s, input.project, &input.workflow, false).await?;
+    Ok(Json(json!({"id":id})))
+}
+async fn open_session(
+    s: &WebState,
+    project: Project,
+    workflow: &str,
+    automatic: bool,
+) -> Result<String, ApiError> {
+    if !crate::session::WORKFLOW_MODES.contains(&workflow) {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             "선택할 수 없는 작업 방식입니다.".into(),
@@ -735,20 +760,21 @@ async fn create_session(State(s): State<WebState>, Json(input): Json<NewSession>
     let timeout = Duration::from_secs(s.core.lock().await.config.tool_timeout_secs);
     let mut project = s
         .file_io
-        .run_queued(timeout, move |_| normalize_project(input.project))
+        .run_queued(timeout, move |_| normalize_project(project))
         .await?;
     let mut c = s.core.lock().await;
     inherit_project_id(&mut project, &c.config.projects);
     let mut session = Session::new(project, c.config.clone());
-    session.select_workflow(&input.workflow)?;
+    session.select_workflow(workflow)?;
     session.workflow_locked = true;
+    session.automatic = automatic;
     session.write_outcome_uncertain = s.write_outcome_uncertain.clone();
     let id = session.id.clone();
     c.order.push(id.clone());
     c.sessions
         .insert(id.clone(), Arc::new(session_view::Snapshot::new(session)));
-    session_changed(&s, &mut c, &id, true);
-    Ok(Json(json!({"id":id})))
+    session_changed(s, &mut c, &id, true);
+    Ok(id)
 }
 async fn session_project(
     State(s): State<WebState>,
@@ -956,6 +982,15 @@ async fn run(
     Path(id): Path<String>,
     Json(input): Json<RunInput>,
 ) -> Api {
+    start_run(&s, id, input, false).await?;
+    Ok(Json(json!({"started":true})))
+}
+async fn start_run(
+    s: &WebState,
+    id: String,
+    input: RunInput,
+    automatic: bool,
+) -> Result<(), ApiError> {
     if s.stopping.is_cancelled() {
         return Err(ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -977,7 +1012,23 @@ async fn run(
         if c.running.contains_key(&id) {
             return Err(busy());
         }
-        if c.running.len() >= c.config.max_concurrent_sessions {
+        // An automatic session takes only its scheduled run and closes after
+        // it; one switched off since it was chosen does not start.
+        if c.sessions.get(&id).is_some_and(|v| v.automatic) != automatic {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "자동 개선 세션에는 요청을 보낼 수 없습니다. 새 세션에서 작업하세요.".into(),
+            ));
+        }
+        if automatic && !c.config.automation.enabled {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "자동 문서 개선이 꺼져 있습니다.".into(),
+            ));
+        }
+        // An automatic run starts only when nothing runs and never holds a
+        // user's run back.
+        if c.running.values().filter(|r| !r.automatic).count() >= c.config.max_concurrent_sessions {
             return Err(ApiError(
                 StatusCode::CONFLICT,
                 format!(
@@ -1064,9 +1115,10 @@ async fn run(
                 cancel: cancel.clone(),
                 commands: tx,
                 closing: false,
+                automatic,
             },
         );
-        session_changed(&s, &mut c, &id, true);
+        session_changed(s, &mut c, &id, true);
         (copy, cancel, rx)
     };
     let state = s.clone();
@@ -1132,7 +1184,13 @@ async fn run(
             };
             let mut c = state.core.lock().await;
             c.streams.remove(&id);
-            if c.running.get(&id).is_some_and(|r| r.closing) {
+            let project = c.sessions.get(&id).map(|v| v.project.id.clone());
+            // An automatic session keeps its final state until its run is
+            // logged below, even when the user closed it.
+            if c.running
+                .get(&id)
+                .is_some_and(|r| r.closing && !r.automatic)
+            {
                 c.remove_session(&id);
             } else {
                 match outcome {
@@ -1188,8 +1246,27 @@ async fn run(
                     Err(_) => block_after_panic(&mut c, &id),
                 }
             }
+            let ended = chrono::Utc::now();
+            if let Some(project) = project {
+                let auto_run = automatic
+                    .then(|| c.sessions.get(&id))
+                    .flatten()
+                    .map(|v| automation::AutoRun::finished(v, ended));
+                state
+                    .automation
+                    .note_run_end(&c.config.projects, &project, ended, auto_run);
+            }
+            if automatic {
+                c.remove_session(&id);
+            }
+            c.idle_since = ended;
+            // Started before the slot is released, so shutdown, which waits
+            // for every slot, cannot exit ahead of the record.
+            let saved = state.automation.persist();
             c.running.remove(&id);
             session_changed(&state, &mut c, &id, true);
+            drop(c);
+            let _ = saved.await;
         })
         .catch_unwind()
         .await;
@@ -1200,17 +1277,18 @@ async fn run(
             let mut c = state.core.lock().await;
             if c.running.contains_key(&id) {
                 c.streams.remove(&id);
-                if c.running.get(&id).is_some_and(|r| r.closing) {
+                if c.running.get(&id).is_some_and(|r| r.closing || r.automatic) {
                     c.remove_session(&id);
                 } else {
                     block_after_panic(&mut c, &id);
                 }
+                c.idle_since = chrono::Utc::now();
                 c.running.remove(&id);
                 session_changed(&state, &mut c, &id, true);
             }
         }
     });
-    Ok(Json(json!({"started":true})))
+    Ok(())
 }
 fn block_after_panic(c: &mut Core, id: &str) {
     if let Some(session) = c.session_mut(id) {
@@ -1406,6 +1484,7 @@ pub async fn serve_app(
             }
             Err(error) => return Err(error.into()),
         };
+    let scheduler = automation::spawn(state.clone());
     let url = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
     crate::console::notice(crate::console::Target::Stdout, format!("MnemoArc: {url}\n"));
     // The listener is bound before launching the browser; failures leave a usable printed URL.
@@ -1436,6 +1515,7 @@ pub async fn serve_app(
     if let Some(browser) = browser {
         let _ = browser.await;
     }
+    let _ = scheduler.await;
     Ok(())
 }
 
@@ -1467,6 +1547,52 @@ fn test_state(config: Config, path: PathBuf, client: Arc<dyn LlmClient>) -> Resu
 #[cfg(test)]
 mod worker_wait_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_automatic_session_takes_only_its_scheduled_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = Project {
+            root: dir.path().into(),
+            ..Default::default()
+        };
+        let state = WebState::new(
+            Config {
+                model: "gpt-4o".into(),
+                model_context: Some(128000),
+                projects: vec![project.clone()],
+                ..Config::compact_test()
+            },
+            dir.path().join("config.toml"),
+            Arc::new(OpenAiClient),
+        )
+        .unwrap();
+        let input = |text: &str| RunInput {
+            text: text.into(),
+            action: auto_action(),
+        };
+        let automatic = open_session(&state, project.clone(), "source_document", true)
+            .await
+            .unwrap();
+        // A user's message in the moment before the scheduled run starts.
+        let error = start_run(&state, automatic.clone(), input("user"), false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        // Automation was switched off after the session was chosen.
+        let error = start_run(&state, automatic, input("scheduled"), true)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("꺼져"), "{}", error.1);
+        let user = open_session(&state, project, "answer", false)
+            .await
+            .unwrap();
+        let error = start_run(&state, user, input("scheduled"), true)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(state.core.lock().await.running.is_empty());
+    }
 
     #[tokio::test]
     async fn startup_is_empty_and_creation_selects_a_permanent_workflow() {
@@ -1617,6 +1743,7 @@ mod worker_wait_tests {
                 cancel: CancellationToken::new(),
                 commands,
                 closing: false,
+                automatic: false,
             },
         );
         let mut session = core.sessions[&id].session.clone();
@@ -2429,6 +2556,7 @@ mod worker_wait_tests {
                     cancel: CancellationToken::new(),
                     commands,
                     closing: false,
+                    automatic: false,
                 },
             );
             let first = session_settings(

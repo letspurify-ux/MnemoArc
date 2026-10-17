@@ -9,5 +9,6 @@ config.toml
 /frontend/node_modules
 /frontend/dist
 *.credentials.json
+*.automation.json
 /frontend/test-artifacts
 /.mnemoarc

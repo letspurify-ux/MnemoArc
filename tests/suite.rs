@@ -70,6 +70,8 @@ mod tool_recovery;
 mod tool_review_followup;
 #[path = "web.rs"]
 mod web;
+#[path = "web_automation.rs"]
+mod web_automation;
 #[path = "web_concurrency.rs"]
 mod web_concurrency;
 #[path = "web_follow_up.rs"]

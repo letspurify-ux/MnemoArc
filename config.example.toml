@@ -49,6 +49,15 @@ repeated_read_limit = 2
 stall_round_limit = 8
 projects = []
 
+# Idle-time document improvement stays off until enabled. Each project opts in
+# with auto_improve = true and may set its own auto_prompt (empty uses prompt).
+[automation]
+enabled = false
+prompt = "결과 문서를 현재 소스와 대조해 틀리거나 오래된 내용을 고치고, 빠진 중요한 내용을 근거와 함께 보완하세요. 바뀐 내용이 없으면 문서를 수정하지 마세요."
+idle_minutes = 30
+stale_days = 7
+max_runs_per_day = 3
+
 # DB access remains off until you explicitly enable both switches.
 # Put the password in the named environment variable or .env, not here.
 [database]

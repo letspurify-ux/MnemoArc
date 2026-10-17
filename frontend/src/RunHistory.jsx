@@ -1,7 +1,7 @@
 import { statusLabel, workflowOptions } from "./api.js";
 import { displayPathText } from "./paths.js";
 
-const reasons = {
+export const reasons = {
   complete: "정상 완료",
   complete_with_gaps: "미확인 항목을 남기고 완료",
   cancelled: "실행 중지",

@@ -194,7 +194,10 @@ async fn parallel_streams_cancel_and_completion_keep_other_sessions_running() {
     app.llm.finish["second"].notify_one();
     app.wait(1, "status", json!("complete")).await;
     let state = app.get("/api/state").await;
-    assert_eq!(state["running"], json!([{"id":app.ids[2],"closing":false}]));
+    assert_eq!(
+        state["running"],
+        json!([{"id":app.ids[2],"closing":false,"automatic":false}])
+    );
     assert_eq!(
         app.get(&format!("/api/sessions/{}", app.ids[2])).await["stream"],
         "stream third"

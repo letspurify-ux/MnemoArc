@@ -580,6 +580,8 @@ pub struct Session {
     /// Workflow selected when the session is created (one of WORKFLOW_MODES).
     pub workflow_mode: String,
     pub workflow_locked: bool,
+    /// Started by the idle-time scheduler; the web app closes it after its run.
+    pub automatic: bool,
     pub original_request: String,
     pub current_request: String,
     pub task_amendments: Vec<TaskAmendment>,
@@ -777,6 +779,7 @@ impl Session {
             pending_tools: None,
             workflow_mode: "answer".into(),
             workflow_locked: false,
+            automatic: false,
             original_request: String::new(),
             current_request: String::new(),
             task_amendments: vec![],

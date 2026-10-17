@@ -132,7 +132,48 @@ pub struct Config {
     pub repeated_read_limit: usize,
     pub stall_round_limit: usize,
     pub database: crate::database::DatabaseConfig,
+    pub automation: AutomationConfig,
     pub projects: Vec<Project>,
+}
+/// Idle-time document improvement. While no run is active, the web app starts
+/// one run on the opted-in project whose output document has gone longest
+/// without work, then closes that session when the run ends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutomationConfig {
+    pub enabled: bool,
+    /// Used by projects whose own `auto_prompt` is empty.
+    pub prompt: String,
+    /// Minutes without any run (or since app start) before one may start.
+    pub idle_minutes: u64,
+    /// Days since a project's document or session last saw work.
+    pub stale_days: u64,
+    /// Automatic runs allowed in any 24 hours.
+    pub max_runs_per_day: usize,
+}
+impl Default for AutomationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prompt: "결과 문서를 현재 소스와 대조해 틀리거나 오래된 내용을 고치고, 빠진 중요한 내용을 근거와 함께 보완하세요. 바뀐 내용이 없으면 문서를 수정하지 마세요.".into(),
+            idle_minutes: 30,
+            stale_days: 7,
+            max_runs_per_day: 3,
+        }
+    }
+}
+impl AutomationConfig {
+    fn validate(&self) -> Result<()> {
+        if !(1..=10_080).contains(&self.idle_minutes)
+            || !(1..=3650).contains(&self.stale_days)
+            || !(1..=100).contains(&self.max_runs_per_day)
+        {
+            bail!(
+                "automation requires idle_minutes 1-10080, stale_days 1-3650 and max_runs_per_day 1-100"
+            );
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -145,6 +186,10 @@ pub struct Project {
     pub output: PathBuf,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
+    /// Opt-in to idle-time document improvement (see AutomationConfig).
+    pub auto_improve: bool,
+    /// Prompt for this project's automatic runs; empty uses automation.prompt.
+    pub auto_prompt: String,
     /// Retired project purpose and reader settings: the request states them.
     /// Older settings still load; the next save drops them.
     #[serde(rename = "purpose", default, skip_serializing)]
@@ -161,6 +206,8 @@ impl Default for Project {
             output: "docs/source-summary.md".into(),
             include: vec![],
             exclude: vec![],
+            auto_improve: false,
+            auto_prompt: String::new(),
             retired_purpose: Retired,
             retired_audience: Retired,
         }
@@ -188,6 +235,20 @@ impl Project {
         if self.id.trim().is_empty() {
             self.id = uuid::Uuid::new_v4().to_string();
         }
+    }
+
+    /// The prompt an automatic run of this project sends, if it takes part.
+    pub fn automation_prompt<'a>(&'a self, automation: &'a AutomationConfig) -> Option<&'a str> {
+        if !self.auto_improve {
+            return None;
+        }
+        let own = self.auto_prompt.trim();
+        let prompt = if own.is_empty() {
+            automation.prompt.trim()
+        } else {
+            own
+        };
+        (!prompt.is_empty()).then_some(prompt)
     }
 }
 impl Default for Config {
@@ -234,6 +295,7 @@ impl Default for Config {
             repeated_read_limit: 2,
             stall_round_limit: 8,
             database: crate::database::DatabaseConfig::default(),
+            automation: AutomationConfig::default(),
             retired_source_document_review: Retired,
             retired_review_limit: Retired,
             retired_document_repair_limit: Retired,
@@ -421,6 +483,7 @@ impl Config {
             reqwest::Proxy::all(proxy)?;
         }
         self.database.validate()?;
+        self.automation.validate()?;
         Ok(())
     }
     pub fn runnable(&self) -> Result<()> {

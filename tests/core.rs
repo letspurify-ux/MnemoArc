@@ -404,6 +404,49 @@ fn config_saved_then_session_override() {
 }
 
 #[test]
+fn automation_settings_and_project_prompts_survive_save_and_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("config.toml");
+    let mut c = config();
+    c.automation = mnemoarc::config::AutomationConfig {
+        enabled: true,
+        prompt: "기본 \"프롬프트\"\n두 번째 줄".into(),
+        idle_minutes: 45,
+        stale_days: 3,
+        max_runs_per_day: 2,
+    };
+    c.projects = vec![
+        Project {
+            name: "first".into(),
+            root: dir.path().into(),
+            auto_improve: true,
+            auto_prompt: "전용 프롬프트".into(),
+            ..Default::default()
+        },
+        Project {
+            name: "second".into(),
+            root: dir.path().into(),
+            ..Default::default()
+        },
+    ];
+    c.save(&p).unwrap();
+    let loaded = Config::load(&p, &Default::default()).unwrap();
+    assert_eq!(loaded.automation, c.automation);
+    assert_eq!(loaded.projects, c.projects);
+    assert_eq!(
+        loaded.projects[0].automation_prompt(&loaded.automation),
+        Some("전용 프롬프트")
+    );
+    assert_eq!(
+        loaded.projects[1].automation_prompt(&loaded.automation),
+        None,
+        "a project takes part only after opting in"
+    );
+    c.automation.idle_minutes = 0;
+    assert!(c.validate().is_err());
+}
+
+#[test]
 fn config_load_uses_saved_credential_for_cli_commands() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");

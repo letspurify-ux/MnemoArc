@@ -754,6 +754,9 @@ impl ContextManager {
         if let Some(fields) = project.as_object_mut() {
             fields.remove("id");
             fields.remove("name");
+            // Scheduling settings; an automatic run sends its prompt as the request.
+            fields.remove("auto_improve");
+            fields.remove("auto_prompt");
         }
         // task.revision counts every task change, which no call takes (models
         // copied it into patches); the completed total is the progress
