@@ -7,7 +7,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Mutex as StdMutex, PoisonError,
-        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering as AtomicOrdering},
     },
 };
 
@@ -153,6 +153,53 @@ pub(super) struct Automation {
     checking: Arc<AtomicBool>,
     /// An activity mark still being written, for the same reason.
     marking: Arc<AtomicBool>,
+    /// The latest mark asked for (milliseconds); a thread already writing
+    /// one applies it after, so no mark is lost.
+    wanted: AtomicI64,
+    /// The settings file as last read.
+    disk: StdMutex<Option<DiskSettings>>,
+    /// Whether automatic improvement is on as the scheduler last found it
+    /// (the settings file decides): 0 not yet known, 1 off, 2 on.
+    active: AtomicU8,
+}
+
+/// The settings file as last read, keyed by its text so an unchanged file is
+/// not parsed again every minute (a file time can repeat within a second).
+struct DiskSettings {
+    text: String,
+    loaded: Option<(crate::config::Config, BTreeSet<String>)>,
+}
+
+/// What the scheduler knows of this process when it decides.
+#[derive(Clone, Copy)]
+struct Moment {
+    now: DateTime<Utc>,
+    idle_since: DateTime<Utc>,
+    /// Any run in progress, and an automatic one among them.
+    running: bool,
+    automatic: bool,
+    /// Runnable settings and no write of unknown outcome.
+    ready: bool,
+}
+
+/// Run blocking file work on a thread of its own, as `crate::worker` does: a
+/// stuck folder must not keep Tokio's shutdown (and the app's exit)
+/// waiting. The receiver resolves when the work is done.
+fn detached(work: impl FnOnce() + Send + 'static) -> tokio::sync::oneshot::Receiver<()> {
+    let (done, finished) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("mnemoarc-automation".into())
+        .spawn(move || {
+            work();
+            let _ = done.send(());
+        });
+    if let Err(error) = spawned {
+        crate::console::notice(
+            crate::console::Target::Stderr,
+            format!("자동 개선 기록 작업을 시작하지 못했습니다: {error}\n"),
+        );
+    }
+    finished
 }
 
 /// Holds one of the flags above until the operation's thread finishes.
@@ -197,6 +244,9 @@ impl Automation {
             pending: Arc::default(),
             checking: Arc::default(),
             marking: Arc::default(),
+            wanted: AtomicI64::new(i64::MIN),
+            disk: StdMutex::new(None),
+            active: AtomicU8::new(0),
         }
     }
 
@@ -323,19 +373,35 @@ impl Automation {
     /// running process sharing these settings. It never moves back, and
     /// without a lease file no process schedules to read it.
     pub(super) fn mark_activity(self: &Arc<Self>, at: DateTime<Utc>) {
+        self.wanted
+            .fetch_max(at.timestamp_millis(), AtomicOrdering::AcqRel);
+        // A thread already writing a mark applies this one after it.
         let Some(busy) = Busy::begin(&self.marking) else {
             return;
         };
         let automation = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let _busy = busy;
-            if automation.activity().is_some_and(|last| last >= at) {
-                return;
+        drop(detached(move || {
+            let mut busy = Some(busy);
+            loop {
+                let target = automation.wanted.load(AtomicOrdering::Acquire);
+                if let Some(at) = DateTime::from_timestamp_millis(target)
+                    && automation.activity().is_none_or(|last| last < at)
+                    && let Ok(file) = automation.open_lease_file(false)
+                {
+                    let _ = file.set_modified(at.into());
+                }
+                drop(busy.take());
+                // A mark asked for while this one was written follows it,
+                // unless another thread has taken over.
+                if automation.wanted.load(AtomicOrdering::Acquire) <= target {
+                    break;
+                }
+                busy = Busy::begin(&automation.marking);
+                if busy.is_none() {
+                    break;
+                }
             }
-            if let Ok(file) = automation.open_lease_file(false) {
-                let _ = file.set_modified(at.into());
-            }
-        });
+        }));
     }
 
     /// The latest work any process sharing these settings marked. Blocking.
@@ -344,29 +410,135 @@ impl Automation {
         modified.ok().map(DateTime::from)
     }
 
-    /// What the settings file says about running `project` now: Some of its
-    /// prompt, or Some(None) when automation or the project is off there or
-    /// the project was removed. Another process sharing the file may have
-    /// changed it, which this process's memory does not show. None when the
-    /// file cannot tell (missing, unreadable, or keeping no project
-    /// identities that `known` has): the settings in memory decide. Blocking.
-    fn prompt_on_disk(&self, project: &str, known: &[String]) -> Option<Option<String>> {
+    /// The settings as last saved by any window, with the project
+    /// identities the file itself stores (loading gives the others new ones
+    /// every time). Another process sharing the file may have changed it,
+    /// which this process's memory does not show. None without a readable
+    /// file. Parsed again only when its text changed. Blocking.
+    fn settings_on_disk(&self) -> Option<(crate::config::Config, BTreeSet<String>)> {
         if !self.settings.try_exists().unwrap_or(false) {
             return None;
         }
-        let settings = crate::config::Config::load(&self.settings, &BTreeMap::new()).ok()?;
-        if !settings.automation.enabled {
-            return Some(None);
+        let text = tools::read_text(&self.settings).ok()?;
+        let mut cached = self.disk.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(disk) = &*cached
+            && disk.text == text
+        {
+            return disk.loaded.clone();
         }
-        match settings.projects.iter().find(|p| p.id == project) {
-            Some(saved) => Some(
-                saved
-                    .automation_prompt(&settings.automation)
-                    .map(str::to_owned),
-            ),
-            None if settings.projects.iter().any(|p| known.contains(&p.id)) => Some(None),
-            None => None,
+        let loaded = (|| {
+            let raw: toml::Value = toml::from_str(&text).ok()?;
+            let ids = raw
+                .get("projects")
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p.get("id")?.as_str())
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned)
+                .collect();
+            let settings = crate::config::Config::load(&self.settings, &BTreeMap::new()).ok()?;
+            Some((settings, ids))
+        })();
+        *cached = Some(DiskSettings {
+            text,
+            loaded: loaded.clone(),
+        });
+        loaded
+    }
+
+    /// Whether automatic improvement is on as the scheduler last found it;
+    /// a run end is recorded only then.
+    pub(super) fn active(&self) -> bool {
+        self.active.load(AtomicOrdering::Acquire) == 2
+    }
+
+    /// A settings save in this process wrote the file the scheduler follows.
+    pub(super) fn saw_settings(&self, enabled: bool) {
+        self.active
+            .store(if enabled { 2 } else { 1 }, AtomicOrdering::Release);
+    }
+
+    /// One scheduling decision's file work: the project to improve now, its
+    /// prompt and the idle time that applied. The settings file decides
+    /// (switching on and off, the limits, which projects take part and
+    /// their prompts, from whichever window saved them); `memory` decides
+    /// only without a readable file, or for the projects of a file that
+    /// stores no project identities. Blocking.
+    fn decide(
+        self: &Arc<Self>,
+        memory: &crate::config::Config,
+        moment: Moment,
+    ) -> Option<(Project, String, chrono::Duration)> {
+        let disk = self.settings_on_disk();
+        let settings = disk.as_ref().map_or(memory, |(settings, _)| settings);
+        let automation = &settings.automation;
+        self.saw_settings(automation.enabled);
+        if !automation.enabled {
+            // Another process sharing these settings may schedule instead,
+            // once this one has no automatic run left to finish.
+            if !moment.automatic {
+                self.release_lease();
+            }
+            return None;
         }
+        let now = moment.now;
+        if moment.running {
+            // A heartbeat, so a scheduler in another process sees a long run.
+            self.mark_activity(now);
+        }
+        if !moment.ready {
+            // Without a model here, or after a write of unknown outcome, this
+            // process cannot start a run: it leaves the lease to one that can.
+            if !moment.automatic {
+                self.release_lease();
+            }
+            return None;
+        }
+        let idle = chrono::Duration::minutes(automation.idle_minutes as i64);
+        if !self.take_lease()
+            || moment.running
+            || now.signed_duration_since(moment.idle_since) < idle
+        {
+            return None;
+        }
+        let (times, attempts) = self.snapshot(now);
+        if attempts >= automation.max_runs_per_day {
+            return None;
+        }
+        // Work in another process sharing these settings counts too. Its
+        // heartbeat comes once a minute, so a mark within two minutes
+        // still means a run, whatever the idle time.
+        let busy = idle.max(chrono::Duration::minutes(2));
+        if self
+            .activity()
+            .is_some_and(|at| now.signed_duration_since(at) < busy)
+        {
+            return None;
+        }
+        let projects: Vec<_> = match &disk {
+            Some((settings, ids)) if !ids.is_empty() => {
+                // Times of projects no longer configured anywhere go.
+                self.saved().projects.retain(|id, _| ids.contains(id));
+                settings
+                    .projects
+                    .iter()
+                    .filter(|p| ids.contains(&p.id))
+                    .cloned()
+                    .collect()
+            }
+            _ => memory.projects.clone(),
+        };
+        let candidates = projects
+            .into_iter()
+            .filter_map(|p| {
+                let prompt = p.automation_prompt(automation)?.to_owned();
+                Some((p, prompt))
+            })
+            .collect();
+        let stale = chrono::Duration::days(automation.stale_days as i64);
+        let (project, prompt) = stalest(candidates, &times, now, stale)?;
+        Some((project, prompt, idle))
     }
 
     /// Whether every started write has finished.
@@ -374,15 +546,23 @@ impl Automation {
         self.pending.load(AtomicOrdering::Acquire) == 0
     }
 
-    /// Recent automatic runs (newest first) and per-project times.
+    /// Recent automatic runs (newest first), per-project times, and whether
+    /// automatic improvement is on as the scheduler last found it (null
+    /// before its first decision).
     pub(super) fn view(&self) -> Value {
+        let active = match self.active.load(AtomicOrdering::Acquire) {
+            0 => None,
+            state => Some(state == 2),
+        };
         let saved = self.saved();
-        json!({"runs":saved.runs.iter().rev().collect::<Vec<_>>(),"projects":saved.projects})
+        json!({"runs":saved.runs.iter().rev().collect::<Vec<_>>(),"projects":saved.projects,"active":active})
     }
 
     /// Record a finished run of any session; `auto_run` for automatic ones.
-    /// Only the configured `projects` keep times, so sessions of unsaved or
-    /// removed projects do not grow the file. `persist` then stores it.
+    /// Only the configured `projects` keep times, so sessions of unsaved
+    /// projects do not grow the file; removed ones are forgotten when the
+    /// scheduler reads the settings file (a project another window added
+    /// keeps its attempt). `persist` then stores it.
     pub(super) fn note_run_end(
         &self,
         projects: &[Project],
@@ -391,9 +571,6 @@ impl Automation {
         auto_run: Option<AutoRun>,
     ) {
         let mut saved = self.saved();
-        saved
-            .projects
-            .retain(|id, _| projects.iter().any(|p| &p.id == id));
         if projects.iter().any(|p| p.id == project_id) {
             saved
                 .projects
@@ -433,7 +610,7 @@ impl Automation {
     /// dropped, and shutdown waits for it. Failures are reported and
     /// otherwise ignored: the in-memory state still prevents repeats until
     /// the app restarts.
-    pub(super) fn persist(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+    pub(super) fn persist(self: &Arc<Self>) -> tokio::sync::oneshot::Receiver<()> {
         struct Finished(Arc<AtomicUsize>);
         impl Drop for Finished {
             fn drop(&mut self) {
@@ -443,7 +620,7 @@ impl Automation {
         self.pending.fetch_add(1, AtomicOrdering::AcqRel);
         let finished = Finished(self.pending.clone());
         let automation = self.clone();
-        tokio::task::spawn_blocking(move || {
+        detached(move || {
             let _finished = finished;
             if let Err(error) = automation.write() {
                 crate::console::notice(
@@ -514,117 +691,64 @@ fn stalest(
 
 /// One scheduling decision at `now`; returns the session it started.
 pub(super) async fn tick(s: &WebState, now: DateTime<Utc>) -> Option<String> {
-    let timeout = {
-        let c = s.core.lock().await;
-        if !c.config.automation.enabled {
-            // Another process sharing these settings may schedule instead,
-            // once this one has no automatic run left to finish.
-            if !c.running.values().any(|r| r.automatic) {
-                s.automation.release_lease();
-            }
-            return None;
-        }
-        // A heartbeat, so a scheduler in another process sees a long run.
-        if !c.running.is_empty() {
-            s.automation.mark_activity(now);
-        }
-        Duration::from_secs(c.config.tool_timeout_secs)
-    };
     if s.stopping.is_cancelled() {
         return None;
     }
-    if !s.automation.locked() {
-        let busy = Busy::begin(&s.automation.checking)?;
-        let automation = s.automation.clone();
-        let taken = s
-            .file_io
-            .run_queued(timeout, move |_| {
-                let _busy = busy;
-                Ok(automation.take_lease())
-            })
-            .await;
-        if !taken.unwrap_or(false) {
-            return None;
-        }
-    }
-    let config = {
+    let (memory, moment) = {
         let c = s.core.lock().await;
-        let automation = &c.config.automation;
-        let idle = chrono::Duration::minutes(automation.idle_minutes as i64);
-        if !automation.enabled
-            || s.stopping.is_cancelled()
-            || !c.running.is_empty()
-            || s.write_outcome_uncertain.load(Ordering::Acquire)
-            || now.signed_duration_since(c.idle_since) < idle
-            || c.config.runnable().is_err()
-        {
-            return None;
-        }
-        c.config.clone()
+        let ready =
+            c.config.runnable().is_ok() && !s.write_outcome_uncertain.load(Ordering::Acquire);
+        let moment = Moment {
+            now,
+            idle_since: c.idle_since,
+            running: !c.running.is_empty(),
+            automatic: c.running.values().any(|r| r.automatic),
+            ready,
+        };
+        (c.config.clone(), moment)
     };
-    let automation = &config.automation;
-    let (times, attempts) = s.automation.snapshot(now);
-    if attempts >= automation.max_runs_per_day {
-        return None;
-    }
-    let candidates: Vec<_> = config
-        .projects
-        .iter()
-        .filter_map(|p| Some((p.clone(), p.automation_prompt(automation)?.to_owned())))
-        .collect();
-    if candidates.is_empty() {
-        return None;
-    }
-    let stale = chrono::Duration::days(automation.stale_days as i64);
-    let idle = chrono::Duration::minutes(automation.idle_minutes as i64);
-    let known: Vec<_> = config.projects.iter().map(|p| p.id.clone()).collect();
-    let marks = s.automation.clone();
     let busy = Busy::begin(&s.automation.checking)?;
-    let (chosen, prompt) = s
+    let automation = s.automation.clone();
+    let decided = memory.clone();
+    let (project, mut prompt, idle) = s
         .file_io
-        .run_queued(Duration::from_secs(config.tool_timeout_secs), move |_| {
+        .run_queued(Duration::from_secs(memory.tool_timeout_secs), move |_| {
             let _busy = busy;
-            // Work in another process sharing these settings counts too.
-            if marks
-                .activity()
-                .is_some_and(|at| now.signed_duration_since(at) < idle)
-            {
-                return Ok(None);
-            }
-            let Some((project, prompt)) = stalest(candidates, &times, now, stale) else {
-                return Ok(None);
-            };
-            // Switched off, opted out or reworded in another window: the
-            // settings file says so.
-            let prompt = match marks.prompt_on_disk(&project.id, &known) {
-                Some(Some(saved)) => saved,
-                Some(None) => return Ok(None),
-                None => prompt,
-            };
-            Ok(Some((project, prompt)))
+            Ok(automation.decide(&decided, moment))
         })
         .await
         .ok()
         .flatten()?;
-    let (project, projects) = {
-        // The document checks can take a while: a run, a switched-off
-        // setting or a changed project in the meantime wins over the choice.
+    let projects = {
+        // The files can take a while: a run in the meantime, or switching
+        // off or changing the project in this window, wins over the choice.
         let c = s.core.lock().await;
-        let automation = &c.config.automation;
-        let project = c.config.projects.iter().find(|p| p.id == chosen.id)?;
-        project.automation_prompt(automation)?;
-        let idle = chrono::Duration::minutes(automation.idle_minutes as i64);
-        if !automation.enabled
-            || !c.running.is_empty()
+        if !c.running.is_empty()
             || s.stopping.is_cancelled()
             || now.signed_duration_since(c.idle_since) < idle
         {
             return None;
         }
+        let automation = &c.config.automation;
+        if *automation != memory.automation && !automation.enabled {
+            return None;
+        }
+        let before = memory.projects.iter().find(|p| p.id == project.id);
+        let current = c.config.projects.iter().find(|p| p.id == project.id);
+        match (before, current) {
+            (Some(_), None) => return None,
+            (Some(before), Some(current))
+                if (before.auto_improve, &before.auto_prompt)
+                    != (current.auto_improve, &current.auto_prompt) =>
+            {
+                prompt = current.automation_prompt(automation)?.to_owned();
+            }
+            _ => {}
+        }
         // Recorded first, so a failed or interrupted run waits another
         // stale_days instead of starting again on the next tick.
         s.automation.note_attempt(&project.id, now);
-        (project.clone(), c.config.projects.clone())
+        c.config.projects.clone()
     };
     // A stuck folder must not keep the app from stopping.
     tokio::select! {
@@ -706,6 +830,31 @@ mod tests {
             rounds: 0,
             document_written: false,
         }
+    }
+
+    #[test]
+    fn marks_asked_for_while_one_is_written_are_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let automation = Arc::new(Automation::load(&dir.path().join("config.toml")));
+        automation.open_lease_file(true).unwrap();
+        // Whole seconds: marks are kept to the millisecond.
+        let base = DateTime::from_timestamp(Utc::now().timestamp(), 0).unwrap();
+        for minutes in 1..=50 {
+            automation.mark_activity(base + chrono::Duration::minutes(minutes));
+        }
+        let last = base + chrono::Duration::minutes(50);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while automation.activity().is_none_or(|at| at < last) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the last mark was lost"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // An older mark never moves it back.
+        automation.mark_activity(base);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(automation.activity(), Some(last));
     }
 
     #[test]

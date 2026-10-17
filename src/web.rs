@@ -630,6 +630,7 @@ fn save_settings(s: &WebState, input: Settings, cancel: &CancellationToken) -> R
     // Once persistence starts, publish the completed transaction even if the
     // requester disconnects, keeping live settings consistent with the files.
     let mut c = s.core.blocking_lock();
+    s.automation.saw_settings(config.automation.enabled);
     c.config = config;
     c.credentials = credentials;
     changed(s, &mut c);
@@ -1022,28 +1023,12 @@ async fn start_run(
             return Err(busy());
         }
         // An automatic session takes only its scheduled run and closes after
-        // it; one switched off (or its project opted out) since it was
-        // chosen does not start.
+        // it.
         if c.sessions.get(&id).is_some_and(|v| v.automatic) != automatic {
             return Err(ApiError(
                 StatusCode::CONFLICT,
                 "자동 개선 세션에는 요청을 보낼 수 없습니다. 새 세션에서 작업하세요.".into(),
             ));
-        }
-        if automatic {
-            let project = &c.sessions[&id].project.id;
-            let automation = &c.config.automation;
-            let opted_in = c
-                .config
-                .projects
-                .iter()
-                .any(|p| &p.id == project && p.automation_prompt(automation).is_some());
-            if !automation.enabled || !opted_in {
-                return Err(ApiError(
-                    StatusCode::CONFLICT,
-                    "자동 문서 개선이 꺼졌거나 이 프로젝트가 대상에서 빠졌습니다.".into(),
-                ));
-            }
         }
         // An automatic run starts only when nothing runs and never holds a
         // user's run back.
@@ -1137,7 +1122,7 @@ async fn start_run(
                 automatic,
             },
         );
-        if automatic || c.config.automation.enabled {
+        if automatic || s.automation.active() {
             s.automation.mark_activity(chrono::Utc::now());
         }
         session_changed(s, &mut c, &id, true);
@@ -1272,7 +1257,7 @@ async fn start_run(
             // Work times serve only the scheduler: while it is off, a run
             // writes nothing beside the settings.
             let saved = match project {
-                Some(project) if automatic || c.config.automation.enabled => {
+                Some(project) if automatic || state.automation.active() => {
                     let auto_run = automatic
                         .then(|| c.sessions.get(&id))
                         .flatten()
@@ -1608,19 +1593,6 @@ mod worker_wait_tests {
             .await
             .unwrap_err();
         assert_eq!(error.0, StatusCode::CONFLICT);
-        // Automation was switched off after the session was chosen, or
-        // stayed on while the project opted out.
-        let error = start_run(&state, automatic.clone(), input("scheduled"), true)
-            .await
-            .unwrap_err();
-        assert_eq!(error.0, StatusCode::CONFLICT);
-        assert!(error.1.contains("꺼졌거나"), "{}", error.1);
-        state.core.lock().await.config.automation.enabled = true;
-        let error = start_run(&state, automatic, input("scheduled"), true)
-            .await
-            .unwrap_err();
-        assert_eq!(error.0, StatusCode::CONFLICT);
-        assert!(error.1.contains("대상에서 빠졌습니다"), "{}", error.1);
         let user = open_session(&state, project, "answer", false)
             .await
             .unwrap();

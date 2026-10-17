@@ -147,3 +147,24 @@ test("edits for a session that closed on its own fall back to app-wide settings"
   await expect(count).toHaveValue(String(config.memory_count));
   expect(errors).toEqual([]);
 });
+
+test("the settings page says when another window's saved setting decides", async ({
+  page,
+  request,
+}) => {
+  const state = await (await request.get("/api/state")).json();
+  expect(state.config.automation.enabled).toBe(false);
+  state.automation.active = true;
+  await page.route("**/api/state", (route) => route.fulfill({ json: state }));
+  await page.goto("/");
+  await page.getByRole("button", { name: "모든 설정" }).click();
+  await page.getByRole("button", { name: "자동 문서 개선" }).click();
+  await expect(
+    page.getByText("다른 창에서 저장한 설정에 따라 자동 문서 개선이 켜져 있습니다."),
+  ).toBeVisible();
+  state.automation.active = false;
+  await page.reload();
+  await page.getByRole("button", { name: "모든 설정" }).click();
+  await page.getByRole("button", { name: "자동 문서 개선" }).click();
+  await expect(page.getByText("다른 창에서 저장한 설정에 따라")).toHaveCount(0);
+});

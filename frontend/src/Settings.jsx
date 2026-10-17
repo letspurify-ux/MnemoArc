@@ -200,7 +200,10 @@ export function cleanProject(project) {
     exclude: project.exclude.filter((s) => s.trim()),
   };
 }
-function AutomationEditor({ automation, onChange, projects, runs = [], disabled }) {
+// active: whether automatic improvement is on as the scheduler last found it
+// in the settings file, which another window may have saved since this one
+// loaded (null before its first check); saved: this window's saved setting.
+function AutomationEditor({ automation, onChange, projects, runs = [], disabled, active, saved }) {
   const set = (key, value) => onChange({ ...automation, [key]: value });
   const result = (run) => run.status === "not_started" ? "시작하지 못함" : statusLabel[run.status] || run.status;
   const optedIn = projects.filter((p) => p.auto_improve);
@@ -208,6 +211,7 @@ function AutomationEditor({ automation, onChange, projects, runs = [], disabled 
   const prompted = (p) => Boolean(p.auto_prompt?.trim() || automation.prompt.trim());
   return <div className="project-fields">
     {disabled && <small>자동 문서 개선은 전체 기본 설정에서만 변경할 수 있습니다.</small>}
+    {active != null && active !== saved && <p className="pending-note">다른 창에서 저장한 설정에 따라 자동 문서 개선이 {active ? "켜져" : "꺼져"} 있습니다. 이 창에 표시된 설정은 앱을 다시 시작하면 갱신되며, 이 창에서 설정을 저장하면 표시된 값으로 바뀝니다.</p>}
     <label className="check-label"><input type="checkbox" checked={automation.enabled} disabled={disabled} onChange={e => set("enabled", e.target.checked)} />자동 문서 개선 사용</label>
     <small>실행 중인 작업이 없는 상태가 대기 시간만큼 이어지면, 자동 개선을 켠 프로젝트 중 결과 문서와 세션 작업이 가장 오래된 프로젝트 하나를 소스 기반 문서 작성으로 실행합니다. 실행이 끝나면 세션을 닫습니다. 자동 실행 중에도 직접 작업을 시작할 수 있으며 동시 실행 세션 수에 포함하지 않습니다.</small>
     <label>기본 프롬프트<textarea aria-label="자동 개선 기본 프롬프트" rows={4} disabled={disabled} value={automation.prompt} onChange={e => set("prompt", e.target.value)} /><small>프로젝트 관리에서 프로젝트별 프롬프트를 지정하면 그 프롬프트를 사용합니다.</small></label>
@@ -503,8 +507,8 @@ export default function Settings({
           <p className="subtle">{group.description}</p>
           {tab === "database" && <DatabaseEditor database={draft.database} onChange={value => change("database", value)} />}
           {tab === "automation" && (scope === "session"
-            ? <AutomationEditor automation={config.automation} onChange={() => {}} projects={config.projects} runs={automationLog?.runs} disabled />
-            : <AutomationEditor automation={draft.automation} onChange={value => change("automation", value)} projects={draft.projects} runs={automationLog?.runs} />)}
+            ? <AutomationEditor automation={config.automation} onChange={() => {}} projects={config.projects} runs={automationLog?.runs} active={automationLog?.active} saved={config.automation.enabled} disabled />
+            : <AutomationEditor automation={draft.automation} onChange={value => change("automation", value)} projects={draft.projects} runs={automationLog?.runs} active={automationLog?.active} saved={config.automation.enabled} />)}
           {tab === "connection" && (
             <div className="credential-card">
               <div className="credential-title">
