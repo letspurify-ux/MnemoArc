@@ -1256,32 +1256,29 @@ async fn start_run(
             let ended = chrono::Utc::now();
             // Work times serve only the scheduler: while it is off, a run
             // writes nothing beside the settings.
-            let saved = match project {
-                Some(project) if automatic || state.automation.active() => {
-                    let auto_run = automatic
-                        .then(|| c.sessions.get(&id))
-                        .flatten()
-                        .map(|v| automation::AutoRun::finished(v, ended));
-                    state
-                        .automation
-                        .note_run_end(&c.config.projects, &project, ended, auto_run);
-                    state.automation.mark_activity(ended);
-                    // Started before the slot is released, so shutdown, which
-                    // waits for every slot, cannot exit ahead of the record.
-                    Some(state.automation.persist())
-                }
-                _ => None,
-            };
+            if let Some(project) = project
+                && (automatic || state.automation.active())
+            {
+                let auto_run = automatic
+                    .then(|| c.sessions.get(&id))
+                    .flatten()
+                    .map(|v| automation::AutoRun::finished(v, ended));
+                state
+                    .automation
+                    .note_run_end(&c.config.projects, &project, ended, auto_run);
+                state.automation.mark_activity(ended);
+                // Started before the slot is released, so shutdown, which
+                // waits for every slot and then for written(), cannot exit
+                // ahead of the record. Not awaited: with a stuck folder each
+                // run end would otherwise park another task here.
+                drop(state.automation.persist());
+            }
             if automatic {
                 c.remove_session(&id);
             }
             c.idle_since = ended;
             c.running.remove(&id);
             session_changed(&state, &mut c, &id, true);
-            drop(c);
-            if let Some(saved) = saved {
-                let _ = saved.await;
-            }
         })
         .catch_unwind()
         .await;
