@@ -476,6 +476,24 @@ fn unicode_truncation_is_safe() {
     assert!(context::tokens(&part, "unknown-model") <= 100);
     assert!(s.starts_with(&part));
 }
+#[test]
+fn counts_from_short_lived_threads_match_the_tokenizer() {
+    // Counting runs on shared encoder threads; a tool call's own thread
+    // must get the same count the tokenizer gives directly.
+    let text = "fn main() { println!(\"한국어🦀\"); }\n".repeat(50);
+    let direct = tiktoken_rs::o200k_base_singleton()
+        .encode_with_special_tokens(&text)
+        .len();
+    let counts: Vec<_> = (0..16)
+        .map(|_| {
+            let text = text.clone();
+            std::thread::spawn(move || context::tokens(&text, "gpt-4o"))
+        })
+        .collect();
+    for count in counts {
+        assert_eq!(count.join().unwrap(), direct);
+    }
+}
 
 #[test]
 fn history_pruning_and_checkpoint_capacity_failure_are_atomic() {

@@ -245,8 +245,76 @@ fn tokenizer(model: &str) -> &'static tiktoken_rs::CoreBPE {
     }
 }
 
+struct Encoding {
+    tokenizer: &'static tiktoken_rs::CoreBPE,
+    text: String,
+    reply: std::sync::mpsc::SyncSender<std::thread::Result<usize>>,
+}
+
+/// Token counts run on a few threads that live as long as the process.
+/// tiktoken-rs picks one of 128 copies of its regexes by thread ID, and each
+/// copy keeps its match caches for good. Counted on the short-lived thread of
+/// each tool call or file operation, every copy filled in turn: a probe
+/// retained 135MB of caches after 27 small runs with no session left open.
+fn encoders() -> Option<&'static std::sync::mpsc::Sender<Encoding>> {
+    static ENCODERS: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Encoding>>> =
+        std::sync::OnceLock::new();
+    ENCODERS
+        .get_or_init(|| {
+            let (sender, receiver) = std::sync::mpsc::channel::<Encoding>();
+            let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+            let mut started = 0;
+            for _ in 0..threads {
+                let receiver = receiver.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("mnemoarc-tokens".into())
+                    .spawn(move || {
+                        loop {
+                            let job = receiver
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .recv();
+                            let Ok(job) = job else { break };
+                            let Encoding {
+                                tokenizer,
+                                text,
+                                reply,
+                            } = job;
+                            // A panic goes back to the caller, as if it had
+                            // counted on its own thread; this thread stays.
+                            let count =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    tokenizer.encode_with_special_tokens(&text).len()
+                                }));
+                            let _ = reply.send(count);
+                        }
+                    });
+                started += usize::from(spawned.is_ok());
+            }
+            (started > 0).then_some(sender)
+        })
+        .as_ref()
+}
+
 pub fn tokens(text: &str, model: &str) -> usize {
-    let n = tokenizer(model).encode_with_special_tokens(text).len();
+    let tokenizer = tokenizer(model);
+    let (reply, result) = std::sync::mpsc::sync_channel(1);
+    let sent = encoders().is_some_and(|encoders| {
+        encoders
+            .send(Encoding {
+                tokenizer,
+                text: text.to_owned(),
+                reply,
+            })
+            .is_ok()
+    });
+    let n = match sent.then(|| result.recv().ok()).flatten() {
+        Some(Ok(count)) => count,
+        Some(Err(panic)) => std::panic::resume_unwind(panic),
+        // Without an encoder thread, count here as before.
+        None => tokenizer.encode_with_special_tokens(text).len(),
+    };
     if is_estimated(model) {
         // Provider tokenizers vary. Keep the multilingual fallback and its
         // 25% headroom, explicitly labelled as an estimate in the UI.
