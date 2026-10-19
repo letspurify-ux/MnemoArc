@@ -7,7 +7,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Mutex as StdMutex, PoisonError,
-        atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering as AtomicOrdering},
     },
 };
 
@@ -145,8 +145,12 @@ pub(super) struct Automation {
     writer: StdMutex<()>,
     /// Only the lease holder schedules and writes the file.
     lease: StdMutex<Lease>,
-    /// Writes started and not yet finished; shutdown waits for them.
-    pending: Arc<AtomicUsize>,
+    /// Callers of `persist` whose write has not finished; shutdown waits
+    /// for them. The writing thread takes them all before each write.
+    waiting: StdMutex<Vec<tokio::sync::oneshot::Sender<()>>>,
+    /// The one thread storing the state, so a stuck folder holds a single
+    /// thread however many runs end meanwhile.
+    persisting: Arc<AtomicBool>,
     /// A scheduler file operation (lease or document checks) still running.
     /// A stuck folder keeps its worker past the timeout; the next tick must
     /// not take another from the app's shared file workers.
@@ -184,22 +188,18 @@ struct Moment {
 
 /// Run blocking file work on a thread of its own, as `crate::worker` does: a
 /// stuck folder must not keep Tokio's shutdown (and the app's exit)
-/// waiting. The receiver resolves when the work is done.
-fn detached(work: impl FnOnce() + Send + 'static) -> tokio::sync::oneshot::Receiver<()> {
-    let (done, finished) = tokio::sync::oneshot::channel();
+/// waiting. False when no thread could start (`work` is then dropped).
+fn detached(work: impl FnOnce() + Send + 'static) -> bool {
     let spawned = std::thread::Builder::new()
         .name("mnemoarc-automation".into())
-        .spawn(move || {
-            work();
-            let _ = done.send(());
-        });
-    if let Err(error) = spawned {
+        .spawn(work);
+    if let Err(error) = &spawned {
         crate::console::notice(
             crate::console::Target::Stderr,
             format!("자동 개선 기록 작업을 시작하지 못했습니다: {error}\n"),
         );
     }
-    finished
+    spawned.is_ok()
 }
 
 /// Holds one of the flags above until the operation's thread finishes.
@@ -241,7 +241,8 @@ impl Automation {
             saved: StdMutex::new(saved),
             writer: StdMutex::new(()),
             lease: StdMutex::new(Lease::Free),
-            pending: Arc::default(),
+            waiting: StdMutex::new(Vec::new()),
+            persisting: Arc::default(),
             checking: Arc::default(),
             marking: Arc::default(),
             wanted: AtomicI64::new(i64::MIN),
@@ -380,7 +381,7 @@ impl Automation {
             return;
         };
         let automation = self.clone();
-        drop(detached(move || {
+        detached(move || {
             let mut busy = Some(busy);
             loop {
                 let target = automation.wanted.load(AtomicOrdering::Acquire);
@@ -401,7 +402,7 @@ impl Automation {
                     break;
                 }
             }
-        }));
+        });
     }
 
     /// The latest work any process sharing these settings marked. Blocking.
@@ -543,7 +544,11 @@ impl Automation {
 
     /// Whether every started write has finished.
     pub(super) fn written(&self) -> bool {
-        self.pending.load(AtomicOrdering::Acquire) == 0
+        self.waiting().is_empty() && !self.persisting.load(AtomicOrdering::Acquire)
+    }
+
+    fn waiting(&self) -> std::sync::MutexGuard<'_, Vec<tokio::sync::oneshot::Sender<()>>> {
+        self.waiting.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Recent automatic runs (newest first), per-project times, and whether
@@ -609,26 +614,48 @@ impl Automation {
     /// Start writing the current state; the write runs even if the handle is
     /// dropped, and shutdown waits for it. Failures are reported and
     /// otherwise ignored: the in-memory state still prevents repeats until
-    /// the app restarts.
+    /// the app restarts. A write already running takes this one with its
+    /// next write, so a stuck folder holds one thread, not one per run end.
     pub(super) fn persist(self: &Arc<Self>) -> tokio::sync::oneshot::Receiver<()> {
-        struct Finished(Arc<AtomicUsize>);
-        impl Drop for Finished {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, AtomicOrdering::AcqRel);
-            }
-        }
-        self.pending.fetch_add(1, AtomicOrdering::AcqRel);
-        let finished = Finished(self.pending.clone());
+        let (done, finished) = tokio::sync::oneshot::channel();
+        self.waiting().push(done);
+        let Some(busy) = Busy::begin(&self.persisting) else {
+            return finished;
+        };
         let automation = self.clone();
-        detached(move || {
-            let _finished = finished;
-            if let Err(error) = automation.write() {
-                crate::console::notice(
-                    crate::console::Target::Stderr,
-                    format!("자동 개선 기록을 저장하지 못했습니다: {error}\n"),
-                );
+        let started = detached(move || {
+            let mut busy = Some(busy);
+            loop {
+                let batch = std::mem::take(&mut *automation.waiting());
+                if !batch.is_empty()
+                    && let Err(error) = automation.write()
+                {
+                    crate::console::notice(
+                        crate::console::Target::Stderr,
+                        format!("자동 개선 기록을 저장하지 못했습니다: {error}\n"),
+                    );
+                }
+                for done in batch {
+                    let _ = done.send(());
+                }
+                drop(busy.take());
+                // A request made after the batch was taken follows it,
+                // unless another thread has taken over.
+                if automation.waiting().is_empty() {
+                    break;
+                }
+                busy = Busy::begin(&automation.persisting);
+                if busy.is_none() {
+                    break;
+                }
             }
-        })
+        });
+        if !started {
+            // Nothing will write them: release the callers instead of
+            // leaving them, and shutdown, waiting.
+            self.waiting().clear();
+        }
+        finished
     }
 
     /// Store the current state if this process holds the lease; another
@@ -855,6 +882,42 @@ mod tests {
         automation.mark_activity(base);
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(automation.activity(), Some(last));
+    }
+
+    #[tokio::test]
+    async fn writes_asked_for_while_one_is_stuck_share_its_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let automation = Arc::new(Automation::load(&dir.path().join("config.toml")));
+        *automation.lease() = Lease::Unlocked;
+        // A write stuck in a slow folder: the first thread waits here.
+        let stuck = automation.writer.lock().unwrap();
+        let first = automation.persist();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !automation.waiting().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no thread took the write"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let later: Vec<_> = (0..20).map(|_| automation.persist()).collect();
+        // No other thread started: all twenty wait for the stuck one.
+        assert_eq!(automation.waiting().len(), 20);
+        assert!(!automation.written());
+        automation.note_attempt("p", Utc::now());
+        drop(stuck);
+        first.await.unwrap();
+        for done in later {
+            done.await.unwrap();
+        }
+        assert!(automation.written());
+        let stored: Saved =
+            serde_json::from_str(&std::fs::read_to_string(&automation.path).unwrap()).unwrap();
+        assert_eq!(
+            stored.attempts.len(),
+            1,
+            "the last write missed the latest state"
+        );
     }
 
     #[test]
