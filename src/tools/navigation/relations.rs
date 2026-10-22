@@ -674,6 +674,19 @@ fn imports(
     })
 }
 
+/// The initializer of a C# declarator (`int count = Compute();`), which its
+/// grammar attaches without a field name: a call in it had no enclosing
+/// field.
+fn csharp_declarator_value(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "variable_declarator" {
+        return None;
+    }
+    let name = node.child_by_field_name("name");
+    named(node).into_iter().rev().find(|child| {
+        Some(*child) != name && !matches!(child.kind(), "bracketed_argument_list" | "tuple_pattern")
+    })
+}
+
 /// Return the selected name and the receiver/path whose type is not inferred.
 fn expression<'a>(node: Node<'a>, source: &str) -> Option<(Node<'a>, Option<String>)> {
     let mut node = node;
@@ -1186,7 +1199,9 @@ fn collect(
             .filter(|d| matches!(d.kind.as_str(), "field" | "constant" | "property" | "event"))
             .filter_map(|d| {
                 let node = declaration_node(root, &file.symbols[d.key.1])?;
-                let value = node.child_by_field_name("value")?;
+                let value = node
+                    .child_by_field_name("value")
+                    .or_else(|| csharp_declarator_value(node))?;
                 Some((
                     (node.start_byte(), node.end_byte()),
                     (value.byte_range(), d.key),

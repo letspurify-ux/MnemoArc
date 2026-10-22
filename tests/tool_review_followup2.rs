@@ -532,3 +532,47 @@ fn code_beside_a_host_and_port_is_still_uncited() {
     let advice = tools::uncited_code(&s).expect("the code section is flagged");
     assert!(advice.to_string().contains("## Setup"), "{advice}");
 }
+
+/// A call in a C# field initializer had no enclosing symbol: the grammar
+/// attaches the initializer without a field name.
+#[test]
+fn a_call_in_a_csharp_field_initializer_is_inside_the_field() {
+    let (dir, mut s) = setup();
+    write(
+        &dir,
+        "F.cs",
+        "class F {\n  int count = Compute();\n  static int Compute() { return 1; }\n}\n",
+    );
+    let id = symbol_id(&mut s, "F.cs", "Compute");
+    let result = tools::execute(
+        &mut s,
+        "symbol_relations",
+        json!({"path":"F.cs","symbol_id":id,"relation":"callers"}),
+    )
+    .unwrap();
+    assert_eq!(
+        result["relations"][0]["enclosing_symbol"]["qualified_name"], "F::count",
+        "{result}"
+    );
+}
+
+/// An outline too broad to list told the model to "use a smaller file".
+#[test]
+fn a_too_broad_outline_names_the_filters_that_narrow_it() {
+    let (dir, mut s) = setup();
+    let source: String = (0..20_001).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    write(&dir, "big.rs", &source);
+    let error = tools::execute(&mut s, "code_outline", json!({"path":"big.rs"}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("outline_too_broad:"), "{error}");
+    assert!(!error.contains("smaller file"), "{error}");
+    assert!(error.contains("max_depth"), "{error}");
+    let narrowed = tools::execute(
+        &mut s,
+        "code_outline",
+        json!({"path":"big.rs","query":"f7","match":"exact"}),
+    )
+    .unwrap();
+    assert_eq!(narrowed["symbols"].as_array().unwrap().len(), 1);
+}

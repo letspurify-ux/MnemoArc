@@ -689,7 +689,9 @@ impl SyntaxFile {
                         break;
                     }
                     if symbols.len() > 20_000 {
-                        bail!("outline_too_broad: narrow query or use a smaller file");
+                        bail!(
+                            "outline_too_broad: more than 20000 symbols match; narrow them with query (match=exact for one name), kind, container or max_depth:0 (symbol_search also takes path or path_glob)"
+                        );
                     }
                 }
                 container = next_container;
