@@ -285,7 +285,7 @@ fn encoders() -> Option<&'static std::sync::mpsc::Sender<Encoding>> {
                             // counted on its own thread; this thread stays.
                             let count =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    tokenizer.encode_with_special_tokens(&text).len()
+                                    count_tokens(tokenizer, &text)
                                 }));
                             let _ = reply.send(count);
                         }
@@ -295,6 +295,46 @@ fn encoders() -> Option<&'static std::sync::mpsc::Sender<Encoding>> {
             (started > 0).then_some(sender)
         })
         .as_ref()
+}
+
+/// Longest stretch of one kind of character (letters, digits, other marks,
+/// or space) counted at once. The tokenizer splits text into such stretches
+/// and merges each one's bytes in time quadratic in its length: bounding one
+/// file_read of a 200K-character line without spaces (a data blob, minified
+/// text) took 17 seconds. A longer stretch is counted in parts, which differ
+/// from the whole by about a token per part; ordinary text has none.
+const COUNT_RUN_BYTES: usize = 512;
+
+fn count_tokens(tokenizer: &tiktoken_rs::CoreBPE, text: &str) -> usize {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind {
+        Space,
+        Letter,
+        Digit,
+        Other,
+    }
+    let kind = |ch: char| {
+        if ch.is_whitespace() {
+            Kind::Space
+        } else if ch.is_alphabetic() {
+            Kind::Letter
+        } else if ch.is_numeric() {
+            Kind::Digit
+        } else {
+            Kind::Other
+        }
+    };
+    let (mut total, mut part, mut run, mut previous) = (0, 0, 0, None);
+    for (at, ch) in text.char_indices() {
+        let current = Some(kind(ch));
+        if current != previous {
+            (run, previous) = (at, current);
+        } else if at - run >= COUNT_RUN_BYTES {
+            total += tokenizer.encode_with_special_tokens(&text[part..at]).len();
+            (part, run) = (at, at);
+        }
+    }
+    total + tokenizer.encode_with_special_tokens(&text[part..]).len()
 }
 
 pub fn tokens(text: &str, model: &str) -> usize {
@@ -313,7 +353,7 @@ pub fn tokens(text: &str, model: &str) -> usize {
         Some(Ok(count)) => count,
         Some(Err(panic)) => std::panic::resume_unwind(panic),
         // Without an encoder thread, count here as before.
-        None => tokenizer.encode_with_special_tokens(text).len(),
+        None => count_tokens(tokenizer, text),
     };
     if is_estimated(model) {
         // Provider tokenizers vary. Keep the multilingual fallback and its
@@ -344,6 +384,18 @@ pub fn truncate(text: &str, limit: usize, model: &str) -> (String, bool) {
         &text[..end]
     };
     let (mut low, mut high) = (0, text.chars().count());
+    // Each count costs the length counted. Widen from a prefix of about the
+    // limit's size, so a long text is not counted whole a dozen times when
+    // only its start fits.
+    let mut probe = limit.saturating_mul(4).max(1);
+    while probe < high {
+        if tokens(prefix(probe), model) <= limit {
+            low = probe;
+            probe = probe.saturating_mul(2);
+        } else {
+            high = probe - 1;
+        }
+    }
     while low < high {
         let mid = (low + high).div_ceil(2);
         if tokens(prefix(mid), model) <= limit {

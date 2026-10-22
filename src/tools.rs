@@ -5382,9 +5382,7 @@ impl Revalidation {
     }
 
     pub(crate) fn apply(&self, s: &mut Session) {
-        for (path, hash) in &self.hashes {
-            s.memory.stale_path(path, hash.as_deref());
-        }
+        s.memory.stale_paths(&self.hashes);
     }
 }
 
@@ -7443,7 +7441,7 @@ fn existing_file_cursor<'a>(
 ) -> Option<&'a str> {
     s.file_cursors
         .iter()
-        .find(|(_, existing)| *existing == cursor)
+        .find(|(_, existing)| ***existing == *cursor)
         .map(|(id, _)| id.as_str())
 }
 
@@ -7454,7 +7452,7 @@ fn register_file_cursor(s: &mut Session, id: String, result: &Value) -> String {
     if let Some(existing) = existing_file_cursor(s, &cursor) {
         return existing.into();
     }
-    s.file_cursors.insert(id.clone(), cursor);
+    s.file_cursors.insert(id.clone(), cursor.into());
     id
 }
 
@@ -8134,6 +8132,50 @@ mod panic_tests {
 #[cfg(test)]
 mod file_tests {
     use super::*;
+
+    // Every tool call keeps a copy of the session as its backup. A read then
+    // copied each file's coverage ranges and every cursor already held, so a
+    // read grew slower with every file the session had read.
+    #[test]
+    fn a_read_beside_a_copy_shares_the_coverage_and_cursors_held() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs"] {
+            // One line longer than a page: its read is continued by a cursor.
+            let line = format!("const A: &str = \"{}\";\n", "x".repeat(200_000));
+            std::fs::write(dir.path().join(name), line).unwrap();
+        }
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            crate::config::Config::compact_test(),
+        );
+        s.add_user("Read the code".into());
+        let read = |s: &mut Session, id: &str, path: &str| {
+            let call = crate::llm::ToolCall {
+                id: id.into(),
+                name: "file_read".into(),
+                arguments: json!({"path":path}).to_string(),
+            };
+            let result = run_call_cancellable(s, &call, &Default::default());
+            assert_eq!(result["status"], "ok");
+            record_delivered_read(s, &call, &result);
+        };
+        read(&mut s, "c1", "a.rs");
+        let copy = s.clone();
+        read(&mut s, "c2", "b.rs");
+        assert_eq!(s.read_coverage.len(), copy.read_coverage.len() + 1);
+        assert_eq!(s.file_cursors.len(), copy.file_cursors.len() + 1);
+        assert!(!copy.file_cursors.is_empty());
+        for (key, coverage) in copy.read_coverage.iter() {
+            assert!(std::sync::Arc::ptr_eq(coverage, &s.read_coverage[key]));
+        }
+        for (id, cursor) in copy.file_cursors.iter() {
+            assert!(std::sync::Arc::ptr_eq(cursor, &s.file_cursors[id]));
+        }
+    }
 
     // A rewrite that keeps the size and resets the modification time
     // (touch -r, rsync -t) reused the old digest of a settled file.

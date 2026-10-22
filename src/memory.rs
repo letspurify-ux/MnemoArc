@@ -457,21 +457,43 @@ impl MemoryStore {
         }))
     }
     pub fn stale_path(&mut self, path: &str, hash: Option<&str>) {
-        let mut changed = false;
-        for m in self.entries.values_mut() {
-            if m.sources
-                .iter()
-                .any(|s| s.path.as_deref() == Some(path) && s.hash.as_deref() != hash)
-                && m.status == MemoryStatus::Active
-            {
+        self.stale_sources(|source| (source == path).then_some(hash));
+    }
+    /// stale_path for every path checked at once, `hashes` holding each
+    /// path's current hash: one pass over the memories, where a pass per path
+    /// grew with paths times memories as a project's memories accumulated.
+    pub fn stale_paths(&mut self, hashes: &BTreeMap<String, Option<String>>) {
+        self.stale_sources(|source| hashes.get(source).map(Option::as_deref));
+    }
+    /// Active memories citing a path whose current hash (`current`, None for
+    /// a path not checked) differs from the one recorded need review. Only
+    /// they are written: the store is shared with session copies, and editing
+    /// it in place copied every memory's entry on each new source read.
+    fn stale_sources<'a>(&mut self, current: impl Fn(&str) -> Option<Option<&'a str>>) {
+        let stale: Vec<String> = self
+            .entries
+            .values()
+            .filter(|m| {
+                m.status == MemoryStatus::Active
+                    && m.sources.iter().any(|s| {
+                        s.path
+                            .as_deref()
+                            .and_then(&current)
+                            .is_some_and(|hash| s.hash.as_deref() != hash)
+                    })
+            })
+            .map(|m| m.id.clone())
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        for id in stale {
+            if let Some(m) = self.entries.get_mut(&id) {
                 m.status = MemoryStatus::NeedsReview;
                 m.revision += 1;
-                changed = true;
             }
         }
-        if changed {
-            self.generation += 1;
-        }
+        self.generation += 1;
     }
     pub fn candidates(&self, protected: &BTreeSet<String>) -> Vec<serde_json::Value> {
         self.entries.values().filter(|m|!protected.contains(&m.id)).map(|m|serde_json::json!({"id":m.id,"reason":if m.status==MemoryStatus::Superseded{"superseded"}else{"not_referenced"}})).take(20).collect()
@@ -514,6 +536,56 @@ mod tests {
             metadata: serde_json::Value::Null,
             expected_revision,
         }
+    }
+
+    // Revalidation checked each path with its own pass over every memory and
+    // copied the shared store even when nothing had changed.
+    #[test]
+    fn stale_paths_marks_changed_sources_once_and_leaves_a_shared_store_alone() {
+        let mut store = MemoryStore::default();
+        let config = Config::compact_test();
+        let source = |id: &str, path: &str, hash: &str| -> Source {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "observed_at": "2026-01-01T00:00:00Z", "origin": "file",
+                "path": path, "start_line": 1, "end_line": 2, "hash": hash, "excerpt": "x"
+            }))
+            .unwrap()
+        };
+        let both = store
+            .save(
+                input("both".into(), "a and b", None),
+                vec![source("s1", "a.rs", "a1"), source("s2", "b.rs", "b1")],
+                &config,
+            )
+            .unwrap();
+        let other = store
+            .save(
+                input("other".into(), "c", None),
+                vec![source("s3", "c.rs", "c1")],
+                &config,
+            )
+            .unwrap();
+        let current = |a: &str, b: &str| {
+            BTreeMap::from([
+                ("a.rs".to_owned(), Some(a.to_owned())),
+                ("b.rs".to_owned(), Some(b.to_owned())),
+            ])
+        };
+
+        let copy = store.clone();
+        let generation = store.generation;
+        store.stale_paths(&current("a1", "b1"));
+        assert!(std::ptr::eq(&*store.entries, &*copy.entries));
+        assert_eq!(store.generation, generation);
+
+        store.stale_paths(&current("a2", "b2"));
+        let marked = store.get(&both.id).unwrap();
+        assert_eq!(marked.status, MemoryStatus::NeedsReview);
+        assert_eq!(marked.revision, both.revision + 1);
+        assert_eq!(store.generation, generation + 1);
+        // A path not checked (c.rs) leaves its memory as it was.
+        assert_eq!(store.get(&other.id).unwrap().status, MemoryStatus::Active);
+        assert_eq!(copy.get(&both.id).unwrap().status, MemoryStatus::Active);
     }
 
     #[test]

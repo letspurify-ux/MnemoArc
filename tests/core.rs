@@ -476,6 +476,51 @@ fn unicode_truncation_is_safe() {
     assert!(context::tokens(&part, "unknown-model") <= 100);
     assert!(s.starts_with(&part));
 }
+// Byte-pair merging is quadratic in the length of a stretch without spaces:
+// one file_read of a 200K-character line spent 17 seconds counting while it
+// bounded the page. Such stretches are counted in parts; ordinary text, with
+// every stretch shorter than a part, is counted exactly as before.
+#[test]
+fn long_stretches_without_spaces_are_counted_quickly_and_closely() {
+    let bpe = tiktoken_rs::o200k_base_singleton();
+    let ordinary = format!(
+        "{}{}{}",
+        "fn main() { println!(\"한국어🦀\"); }\n".repeat(200),
+        "長い日本語の文章です。".repeat(10),
+        "    indented\n\n\n".repeat(50)
+    );
+    assert_eq!(
+        context::tokens(&ordinary, "gpt-4o"),
+        bpe.encode_with_special_tokens(&ordinary).len()
+    );
+    for stretch in [
+        "x".repeat(8_000),
+        "ab".repeat(4_000),
+        "+".repeat(8_000),
+        " ".repeat(8_000),
+        "가".repeat(2_700),
+    ] {
+        let whole = bpe.encode_with_special_tokens(&stretch).len();
+        let counted = context::tokens(&stretch, "gpt-4o");
+        let parts = stretch.len().div_ceil(512);
+        assert!(
+            counted.abs_diff(whole) <= parts,
+            "{:?}: {counted} vs {whole}",
+            &stretch[..3]
+        );
+    }
+    let line = format!("const A: &str = \"{}\";\n", "x".repeat(200_000));
+    let started = std::time::Instant::now();
+    let (part, cut) = context::truncate(&line, 3_500, "gpt-4o");
+    assert!(cut);
+    assert!(context::tokens(&part, "gpt-4o") <= 3_500);
+    assert!(context::tokens(&line[..part.len() + 64], "gpt-4o") > 3_500);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+}
 #[test]
 fn counts_from_short_lived_threads_match_the_tokenizer() {
     // Counting runs on shared encoder threads; a tool call's own thread

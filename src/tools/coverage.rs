@@ -76,7 +76,7 @@ pub fn record_delivered_read(s: &mut Session, call: &crate::llm::ToolCall, resul
         .unwrap_or_else(|_| PathBuf::from(path))
         .to_string_lossy()
         .into_owned();
-    let entry = s.read_coverage.entry(key).or_default();
+    let entry = std::sync::Arc::make_mut(s.read_coverage.entry(key).or_default());
     if entry.hash != digest {
         entry.hash = digest;
         entry.ranges.clear();

@@ -6,10 +6,11 @@ use anyhow::{Result, bail};
 use caseless::Caseless;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::Permissions,
     io::Write,
     path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
 };
 use tokio_util::sync::CancellationToken;
 use unicode_normalization::UnicodeNormalization;
@@ -22,6 +23,44 @@ fn normalized_alias_key(path: &Path) -> String {
 
 fn folded_alias_key(value: &str) -> String {
     value.nfd().default_case_fold().nfd().collect()
+}
+
+/// A project include/exclude pattern, compiled: case-insensitive, or (with
+/// `folded`) as written over case-folded text, where an invalid one is None.
+/// Compiling a glob costs far more than matching it, and every path a tool
+/// resolves is checked against every pattern: one memory revalidation over
+/// 2000 source files compiled 24000 globs and took 0.9 s. The patterns come
+/// from the project settings, so few are seen; a full cache starts over.
+fn project_glob(pattern: String, folded: bool) -> Result<Option<Arc<globset::GlobMatcher>>> {
+    type Compiled = std::result::Result<Option<Arc<globset::GlobMatcher>>, String>;
+    static CACHE: OnceLock<Mutex<HashMap<(String, bool), Compiled>>> = OnceLock::new();
+    const ENTRIES: usize = 256;
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (pattern, folded);
+    if let Some(compiled) = cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+    {
+        return compiled.clone().map_err(anyhow::Error::msg);
+    }
+    let compiled: Compiled = if folded {
+        Ok(globset::Glob::new(&key.0)
+            .ok()
+            .map(|glob| Arc::new(glob.compile_matcher())))
+    } else {
+        globset::GlobBuilder::new(&key.0)
+            .case_insensitive(true)
+            .build()
+            .map(|glob| Some(Arc::new(glob.compile_matcher())))
+            .map_err(|error| error.to_string())
+    };
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    if cache.len() >= ENTRIES {
+        cache.clear();
+    }
+    cache.insert(key, compiled.clone());
+    compiled.map_err(anyhow::Error::msg)
 }
 
 pub(super) fn excluded_case_alias(project: &Project, relative: &Path) -> Result<bool> {
@@ -50,26 +89,18 @@ pub(super) fn excluded_case_alias(project: &Project, relative: &Path) -> Result<
     }) {
         return Ok(true);
     }
+    let normalized_path: String = relative.to_string_lossy().nfd().collect();
+    let folded_path = folded_alias_key(&relative.to_string_lossy());
+    let matches = |pattern: &String| -> Result<bool> {
+        Ok(project_glob(pattern.nfd().collect(), false)?
+            .is_some_and(|glob| glob.is_match(&normalized_path))
+            || project_glob(folded_alias_key(pattern), true)?
+                .is_some_and(|glob| glob.is_match(&folded_path)))
+    };
     if !project.include.is_empty() {
-        let normalized_path: String = relative.to_string_lossy().nfd().collect();
-        let folded_path = folded_alias_key(&relative.to_string_lossy());
         let mut included = false;
         for pattern in &project.include {
-            let normalized_pattern: String = pattern.nfd().collect();
-            if globset::GlobBuilder::new(&normalized_pattern)
-                .case_insensitive(true)
-                .build()?
-                .compile_matcher()
-                .is_match(&normalized_path)
-            {
-                included = true;
-                break;
-            }
-            let folded_pattern = folded_alias_key(pattern);
-            if globset::Glob::new(&folded_pattern)
-                .ok()
-                .is_some_and(|glob| glob.compile_matcher().is_match(&folded_path))
-            {
+            if matches(pattern)? {
                 included = true;
                 break;
             }
@@ -79,21 +110,7 @@ pub(super) fn excluded_case_alias(project: &Project, relative: &Path) -> Result<
         }
     }
     for pattern in &project.exclude {
-        let normalized_pattern: String = pattern.nfd().collect();
-        let normalized_path: String = relative.to_string_lossy().nfd().collect();
-        if globset::GlobBuilder::new(&normalized_pattern)
-            .case_insensitive(true)
-            .build()?
-            .compile_matcher()
-            .is_match(&normalized_path)
-        {
-            return Ok(true);
-        }
-        let folded_pattern = folded_alias_key(pattern);
-        let folded_path = folded_alias_key(&relative.to_string_lossy());
-        if let Ok(folded_glob) = globset::Glob::new(&folded_pattern)
-            && folded_glob.compile_matcher().is_match(&folded_path)
-        {
+        if matches(pattern)? {
             return Ok(true);
         }
     }
@@ -707,4 +724,31 @@ pub(super) fn execute(
     let mut result = commit(s, state, originals, permissions, replaced_paths, cancel)?;
     result["operation_count"] = json!(operations.len());
     Ok(result)
+}
+
+#[cfg(test)]
+mod glob_tests {
+    use super::*;
+
+    // Every resolved and every listed path is checked against every project
+    // pattern; each check compiled each pattern again (a 2000-file listing
+    // took a second). A pattern is compiled once and its matcher shared.
+    #[test]
+    fn project_patterns_are_compiled_once_and_match_as_before() {
+        let first = project_glob("**/*.RS".into(), false).unwrap().unwrap();
+        let again = project_glob("**/*.RS".into(), false).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        assert!(first.is_match("src/main.rs"));
+        assert!(project_glob("[".into(), false).is_err());
+        assert!(project_glob("[".into(), false).is_err());
+        assert!(project_glob("[".into(), true).unwrap().is_none());
+        let project = Project {
+            include: vec!["src/**".into()],
+            exclude: vec!["**/*.lock".into(), "[".into()],
+            ..Default::default()
+        };
+        assert!(excluded_case_alias(&project, Path::new("docs/a.md")).unwrap());
+        assert!(excluded_case_alias(&project, Path::new("SRC/Cargo.lock")).unwrap());
+        assert!(excluded_case_alias(&project, Path::new("src/a.rs")).is_err());
+    }
 }

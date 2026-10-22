@@ -611,8 +611,8 @@ pub struct Session {
     pub memory: MemoryStore,
     pub history: SessionHistory,
     pub sources: Shared<BTreeMap<String, Arc<Source>>>,
-    pub file_cursors: Shared<BTreeMap<String, FileCursor>>,
-    pub read_coverage: Shared<BTreeMap<String, ReadCoverage>>,
+    pub file_cursors: Shared<BTreeMap<String, Arc<FileCursor>>>,
+    pub read_coverage: Shared<BTreeMap<String, Arc<ReadCoverage>>>,
     /// Coverage page revisions let legacy offset callers detect intervening
     /// reads even when they do not echo expected_coverage_revision.
     pub coverage_cursors: Shared<BTreeMap<String, String>>,
@@ -1515,7 +1515,8 @@ mod history_tests {
                 start_line: 1,
                 max_lines: 40,
                 offset: 12,
-            },
+            }
+            .into(),
         );
         s.receive_message("Read more of the code".into()).unwrap();
         assert_eq!(s.retained_bytes(), whole(&s));
