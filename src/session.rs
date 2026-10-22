@@ -1300,54 +1300,68 @@ impl Session {
     /// the memory and history stores. Runtime turns use the same bound to
     /// avoid silently discarding observations or receipts.
     pub fn ancillary_bytes(&self) -> usize {
-        serialized_bytes(&(
-            &self.sources,
-            &self.ledger,
-            &self.task,
-            &self.file_cursors,
-            &self.read_coverage,
-            &self.coverage_cursors,
-            &self.user_criteria,
-            &self.checkpoint,
-            &self.config,
-            &self.pending_config,
-            &self.project,
-            &self.active_tools,
-            &self.pending_tools,
-            &self.workflow_mode,
-            &self.workflow_locked,
-        ))
-        .saturating_add(serialized_bytes(&(
-            &self.latest_request,
-            &self.original_request,
-            &self.current_request,
-            &self.task_amendments,
-            &self.status,
-            &self.last_error,
-            self.question.as_ref().map(|q| {
-                (
-                    &q.text,
-                    &q.prior_status,
-                    &q.prior_error,
-                    &q.prior_activity,
-                    q.automatic,
-                )
-            }),
-            &self.run_guidance,
-            &self.progress_recovery,
-            &self.completion_gaps,
-            &self.token_ratios,
-            &self.list_cursor_scopes,
-            &self.activity,
-            &self.run_history,
-        )))
-        .saturating_add(self.config.api_key.as_ref().map_or(0, |key| key.0.len()))
-        .saturating_add(
-            self.pending_config
-                .as_ref()
-                .and_then(|c| c.api_key.as_ref())
-                .map_or(0, |key| key.0.len()),
-        )
+        self.retained_bytes()
+            .saturating_add(serialized_bytes(&(
+                &self.latest_request,
+                &self.original_request,
+                &self.current_request,
+                &self.task_amendments,
+                &self.status,
+                &self.last_error,
+                self.question.as_ref().map(|q| {
+                    (
+                        &q.text,
+                        &q.prior_status,
+                        &q.prior_error,
+                        &q.prior_activity,
+                        q.automatic,
+                    )
+                }),
+                &self.run_guidance,
+                &self.progress_recovery,
+                &self.completion_gaps,
+                &self.token_ratios,
+                &self.list_cursor_scopes,
+                &self.activity,
+                &self.run_history,
+            )))
+            .saturating_add(self.config.api_key.as_ref().map_or(0, |key| key.0.len()))
+            .saturating_add(
+                self.pending_config
+                    .as_ref()
+                    .and_then(|c| c.api_key.as_ref())
+                    .map_or(0, |key| key.0.len()),
+            )
+    }
+    /// The serialized size of the evidence maps, task and settings, as one
+    /// JSON array of them. The shared maps keep their serialized size until
+    /// they change: a long session's sources were serialized whole by each
+    /// of the three or more capacity checks of every request.
+    fn retained_bytes(&self) -> usize {
+        let shared = [
+            self.sources.bytes(),
+            self.ledger.bytes(),
+            self.file_cursors.bytes(),
+            self.read_coverage.bytes(),
+            self.coverage_cursors.bytes(),
+        ];
+        // Brackets and a comma between the array's fifteen fields: one comma
+        // for each shared map, and the rest come with the other ten fields.
+        shared
+            .iter()
+            .fold(shared.len(), |total, bytes| total.saturating_add(*bytes))
+            .saturating_add(serialized_bytes(&(
+                &self.task,
+                &self.user_criteria,
+                &self.checkpoint,
+                &self.config,
+                &self.pending_config,
+                &self.project,
+                &self.active_tools,
+                &self.pending_tools,
+                &self.workflow_mode,
+                &self.workflow_locked,
+            )))
     }
     pub(crate) fn check_runtime_capacity(&self) -> Result<()> {
         if self.ancillary_bytes() > self.config.memory_bytes {
@@ -1410,6 +1424,56 @@ impl Session {
 #[cfg(test)]
 mod history_tests {
     use super::*;
+
+    // The capacity checks sum the shared maps' cached sizes; the total must
+    // stay what serializing every field in one array gives, also after the
+    // maps change.
+    #[test]
+    fn retained_bytes_match_serializing_every_field_after_changes() {
+        let mut s = Session::new(Project::default(), Config::compact_test());
+        s.receive_message("Read the code".into()).unwrap();
+        let whole = |s: &Session| {
+            serialized_bytes(&(
+                &s.sources,
+                &s.ledger,
+                &s.task,
+                &s.file_cursors,
+                &s.read_coverage,
+                &s.coverage_cursors,
+                &s.user_criteria,
+                &s.checkpoint,
+                &s.config,
+                &s.pending_config,
+                &s.project,
+                &s.active_tools,
+                &s.pending_tools,
+                &s.workflow_mode,
+                &s.workflow_locked,
+            ))
+        };
+        assert_eq!(s.retained_bytes(), whole(&s));
+        let snapshot = s.clone();
+        s.remember_call(
+            "c1".into(),
+            "file_read:{}".into(),
+            json!({"status":"ok","data":{"text":"a \"quoted\" line\n"}}),
+        );
+        s.file_cursors.insert(
+            "R1".into(),
+            FileCursor {
+                path: "src/a.rs".into(),
+                hash: "h".into(),
+                start_line: 1,
+                max_lines: 40,
+                offset: 12,
+            },
+        );
+        s.receive_message("Read more of the code".into()).unwrap();
+        assert_eq!(s.retained_bytes(), whole(&s));
+        // The copy shared the maps before they changed and keeps its size.
+        assert_eq!(snapshot.retained_bytes(), whole(&snapshot));
+        assert!(s.retained_bytes() > snapshot.retained_bytes());
+    }
 
     #[test]
     fn explicit_changes_preserve_artifacts_and_unaffected_work() {

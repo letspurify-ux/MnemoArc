@@ -989,6 +989,9 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
     // Delivered complete-line ranges of each file's current version.
     let mut versions = BTreeMap::<PathBuf, Option<String>>::new();
     let mut delivered = BTreeMap::<PathBuf, Vec<(usize, usize)>>::new();
+    // Every source of a long session is checked on each request; resolve
+    // each file once rather than once per source.
+    let mut paths = PathResolver::new(&s.project);
     for source in s.sources.values() {
         if source.origin != "file" || source.evidence_truncated {
             continue;
@@ -998,7 +1001,7 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
         else {
             continue;
         };
-        let Ok(resolved) = read_path(&s.project, path) else {
+        let Some(resolved) = paths.lookup(path) else {
             continue;
         };
         let current = versions
@@ -1052,7 +1055,7 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
         } else {
             citation.path
         };
-        let Ok(cited) = read_path(&s.project, &path) else {
+        let Some(cited) = paths.lookup(&path) else {
             continue;
         };
         if own.as_ref() == Some(&cited) {
@@ -1269,6 +1272,7 @@ pub(super) fn citation_mismatch_check(s: &Session, output: &Path, doc: &str) -> 
     let lines: Vec<&str> = doc.lines().collect();
     let own = output.canonicalize().ok();
     let mut files = BTreeMap::<PathBuf, Option<Vec<String>>>::new();
+    let mut paths = PathResolver::new(&s.project);
     let mut items = Vec::new();
     let mut total = 0usize;
     let mut index = 0;
@@ -1346,7 +1350,7 @@ pub(super) fn citation_mismatch_check(s: &Session, output: &Path, doc: &str) -> 
                 } else {
                     citation.path.clone()
                 };
-                let Ok(resolved) = read_path(&s.project, &path) else {
+                let Some(resolved) = paths.lookup(&path) else {
                     continue;
                 };
                 if own.as_ref() == Some(&resolved) {
@@ -1853,6 +1857,7 @@ pub(super) fn test_code_check(s: &Session, output: &Path, doc: &str) -> Option<V
     let root = s.project.root.canonicalize().ok()?;
     let citations = citation_spans(doc).ok()?;
     let mut modules = BTreeMap::<PathBuf, Vec<(usize, usize)>>::new();
+    let mut paths = PathResolver::new(&s.project);
     let mut items = Vec::new();
     let mut total = 0usize;
     for citation in citations {
@@ -1866,7 +1871,7 @@ pub(super) fn test_code_check(s: &Session, output: &Path, doc: &str) -> Option<V
         } else {
             citation.path.clone()
         };
-        let Ok(resolved) = read_path(&s.project, &path) else {
+        let Some(resolved) = paths.lookup(&path) else {
             continue;
         };
         let Ok(relative) = resolved.strip_prefix(&root) else {
@@ -1986,6 +1991,7 @@ fn citation_issues_and_paths(
 ) -> Result<(usize, Vec<Value>, FixablePaths)> {
     let (spans, mut issues) = scan_citations(doc)?;
     let mut versions = std::collections::BTreeMap::new();
+    let mut paths = PathResolver::new(&s.project);
     let mut suggestions = BTreeMap::<String, Option<String>>::new();
     // (document line, cited path, suggested project path)
     let mut fixable = Vec::new();
@@ -2010,7 +2016,8 @@ fn citation_issues_and_paths(
             cited.clone()
         };
         let check = versions.entry(path.clone()).or_insert_with(|| {
-            read_path(&s.project, &path)
+            paths
+                .resolve(&path)
                 .and_then(|p| super::text_line_count(&p))
                 .map_err(|e| e.to_string())
         });

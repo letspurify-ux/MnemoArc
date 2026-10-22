@@ -4312,85 +4312,177 @@ pub fn output_path(p: &Project) -> Result<PathBuf> {
 /// the root, and one sent that name joined to the root path 12 times, each
 /// told that no project file had the name.
 fn output_name_at_root(p: &Project, candidate: &Path) -> Option<PathBuf> {
-    if candidate.exists() {
-        return None;
-    }
-    let output = output_path(p).ok()?;
-    let root = p.root.canonicalize().ok()?;
-    (candidate.file_name().is_some()
-        && candidate.file_name() == output.file_name()
-        && candidate.parent()?.canonicalize().ok()? == root)
-        .then_some(output)
+    PathResolver::new(p).output_name_at_root(candidate)
 }
 
 pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
-    let root = p.root.canonicalize()?;
-    let mut candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        root.join(path)
-    };
-    if let Some(output) = output_name_at_root(p, &candidate) {
-        candidate = output;
+    PathResolver::new(p).resolve(path)
+}
+
+/// read_path for many paths of one project. Each read_path canonicalized the
+/// project root up to three times and resolved the configured output again;
+/// the per-request citation checks did that for every source a session had
+/// read, so each request of a long session took longer than the one before
+/// (a probe went from 40 to 158 ms per request over eight tasks). A resolver
+/// resolves the root and the output once, and `lookup` each distinct path
+/// once. Hold one for a single check only: files change between checks.
+pub(crate) struct PathResolver<'a> {
+    project: &'a Project,
+    root: Option<Result<PathBuf, String>>,
+    output: Option<Result<PathBuf, String>>,
+    /// The output's canonical path, None when it does not exist.
+    output_canonical: Option<Result<Option<PathBuf>, String>>,
+    resolved: BTreeMap<String, Option<PathBuf>>,
+}
+
+impl<'a> PathResolver<'a> {
+    pub(crate) fn new(project: &'a Project) -> Self {
+        Self {
+            project,
+            root: None,
+            output: None,
+            output_canonical: None,
+            resolved: BTreeMap::new(),
+        }
     }
-    let canonical = candidate.canonicalize().map_err(|e| {
-        let code = match e.kind() {
-            std::io::ErrorKind::NotFound => "file_not_found",
-            std::io::ErrorKind::PermissionDenied => "file_permission_denied",
-            _ => "file_access_error",
-        };
-        // Reading the output before its first write: say so, rather than
-        // suggesting a different project file (a live run asked three times).
-        let is_output = output_path(p).is_ok_and(|output| output == candidate);
-        let hint = if e.kind() == std::io::ErrorKind::NotFound && is_output {
-            " The configured output does not exist yet: nothing has been written to it.".to_owned()
-        } else if e.kind() == std::io::ErrorKind::NotFound {
-            if let Some(shape) = path_shape_hint(&root, path) {
-                shape
+
+    fn root(&mut self) -> Result<PathBuf> {
+        let project = self.project;
+        self.root
+            .get_or_insert_with(|| project.root.canonicalize().map_err(|e| e.to_string()))
+            .clone()
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn output(&mut self) -> Result<PathBuf> {
+        let project = self.project;
+        self.output
+            .get_or_insert_with(|| output_path(project).map_err(|e| e.to_string()))
+            .clone()
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn output_canonical(&mut self) -> Result<Option<PathBuf>> {
+        if self.output_canonical.is_none() {
+            let output = self.output()?;
+            self.output_canonical = Some(if output.exists() {
+                output.canonicalize().map(Some).map_err(|e| e.to_string())
             } else {
-                match similar_paths(p, &candidate).as_slice() {
-                    [] => " No project file or directory has this name; list files with file_list mode=paths and path_glob before reading.".to_owned(),
-                    similar => format!(" Existing project paths with a similar name: {}. Copy one exactly.", similar.join(", ")),
-                }
-            }
+                Ok(None)
+            });
+        }
+        self.output_canonical
+            .clone()
+            .unwrap()
+            .map_err(anyhow::Error::msg)
+    }
+
+    /// See the free function output_name_at_root.
+    fn output_name_at_root(&mut self, candidate: &Path) -> Option<PathBuf> {
+        if candidate.exists() {
+            return None;
+        }
+        let output = self.output().ok()?;
+        let root = self.root().ok()?;
+        (candidate.file_name().is_some()
+            && candidate.file_name() == output.file_name()
+            && candidate.parent()?.canonicalize().ok()? == root)
+            .then_some(output)
+    }
+
+    /// read_path's result, None where it fails, resolving each distinct
+    /// path once.
+    pub(crate) fn lookup(&mut self, path: &str) -> Option<PathBuf> {
+        if let Some(resolved) = self.resolved.get(path) {
+            return resolved.clone();
+        }
+        let resolved = self.resolve(path).ok();
+        self.resolved.insert(path.to_owned(), resolved.clone());
+        resolved
+    }
+
+    pub(crate) fn resolve(&mut self, path: &str) -> Result<PathBuf> {
+        let p = self.project;
+        let root = self.root()?;
+        let mut candidate = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
         } else {
-            String::new()
+            root.join(path)
         };
-        anyhow::anyhow!("{code}: resolved path {}; project root {}; configured output {}. Relative paths use project.root; use document_inspect with no path for configured output.{hint} {e}", candidate.display(), root.display(), p.output.display())
-    })?;
-    utf8_path(&canonical)?;
-    let output = output_path(p)?;
-    if output.exists() && canonical == output.canonicalize()? {
-        return Ok(canonical);
-    }
-    if !canonical.starts_with(&root) {
-        bail!(
-            "path_outside_project: {} resolves to {} (symlinks are followed), outside project root {}; read files inside the project, or the configured output via document_inspect",
-            candidate.display(),
-            canonical.display(),
-            root.display()
-        );
-    }
-    // Include patterns select files. A directory scope need not itself match
-    // `**/*.rs`; its children are still filtered when enumerated. Exclusion
-    // rules continue to apply to the directory itself.
-    let directory_rules;
-    let rules = if canonical.is_dir() {
-        directory_rules = Project {
-            include: vec![],
-            ..p.clone()
+        if let Some(output) = self.output_name_at_root(&candidate) {
+            candidate = output;
+        }
+        let canonical = match candidate.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(e) => {
+                let code = match e.kind() {
+                    std::io::ErrorKind::NotFound => "file_not_found",
+                    std::io::ErrorKind::PermissionDenied => "file_permission_denied",
+                    _ => "file_access_error",
+                };
+                // Reading the output before its first write: say so, rather than
+                // suggesting a different project file (a live run asked three times).
+                let is_output = self.output().is_ok_and(|output| output == candidate);
+                let hint = if e.kind() == std::io::ErrorKind::NotFound && is_output {
+                    " The configured output does not exist yet: nothing has been written to it."
+                        .to_owned()
+                } else if e.kind() == std::io::ErrorKind::NotFound {
+                    if let Some(shape) = path_shape_hint(&root, path) {
+                        shape
+                    } else {
+                        match similar_paths(p, &candidate).as_slice() {
+                            [] => " No project file or directory has this name; list files with file_list mode=paths and path_glob before reading.".to_owned(),
+                            similar => format!(" Existing project paths with a similar name: {}. Copy one exactly.", similar.join(", ")),
+                        }
+                    }
+                } else {
+                    String::new()
+                };
+                bail!(
+                    "{code}: resolved path {}; project root {}; configured output {}. Relative paths use project.root; use document_inspect with no path for configured output.{hint} {e}",
+                    candidate.display(),
+                    root.display(),
+                    p.output.display()
+                )
+            }
         };
-        &directory_rules
-    } else {
-        p
-    };
-    if excluded(rules, canonical.strip_prefix(&root)?)? {
-        bail!(
-            "path_excluded: {} is excluded by the project's include/exclude settings and cannot be read; choose a listed file from file_list",
-            canonical.strip_prefix(&root)?.display()
-        );
+        utf8_path(&canonical)?;
+        self.output()?;
+        if self
+            .output_canonical()?
+            .is_some_and(|output| canonical == output)
+        {
+            return Ok(canonical);
+        }
+        if !canonical.starts_with(&root) {
+            bail!(
+                "path_outside_project: {} resolves to {} (symlinks are followed), outside project root {}; read files inside the project, or the configured output via document_inspect",
+                candidate.display(),
+                canonical.display(),
+                root.display()
+            );
+        }
+        // Include patterns select files. A directory scope need not itself match
+        // `**/*.rs`; its children are still filtered when enumerated. Exclusion
+        // rules continue to apply to the directory itself.
+        let directory_rules;
+        let rules = if canonical.is_dir() {
+            directory_rules = Project {
+                include: vec![],
+                ..p.clone()
+            };
+            &directory_rules
+        } else {
+            p
+        };
+        if excluded(rules, canonical.strip_prefix(&root)?)? {
+            bail!(
+                "path_excluded: {} is excluded by the project's include/exclude settings and cannot be read; choose a listed file from file_list",
+                canonical.strip_prefix(&root)?.display()
+            );
+        }
+        Ok(canonical)
     }
-    Ok(canonical)
 }
 /// A missing path that is a citation or a glob rather than a file name.
 /// Documents cite `path:line-line`, and models copy that (or `#L12-L20`)
@@ -5208,11 +5300,12 @@ pub(crate) fn inspect_freshness_with(
         .filter_map(|source| source.path.as_deref())
         .collect();
     let mut hashes = BTreeMap::new();
+    let mut resolver = PathResolver::new(&s.project);
     for path in paths {
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
-        let current = read_path(&s.project, path).and_then(|p| file_hash(&p)).ok();
+        let current = resolver.resolve(path).and_then(|p| file_hash(&p)).ok();
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
@@ -5252,6 +5345,7 @@ fn delivered_sources_for(
     supplied: &[crate::memory::Source],
 ) -> Result<Vec<crate::memory::Source>> {
     let mut wanted = Vec::new();
+    let mut paths = PathResolver::new(&s.project);
     for range in missing {
         let (Some(path), Some(start), Some(end)) = (
             range["path"].as_str(),
@@ -5260,7 +5354,7 @@ fn delivered_sources_for(
         ) else {
             continue;
         };
-        let resolved = read_path(&s.project, path)?;
+        let resolved = paths.resolve(path)?;
         let current = hash_file(&resolved)?;
         wanted.push((resolved, current, start as usize, end as usize));
     }
@@ -5280,7 +5374,7 @@ fn delivered_sources_for(
         else {
             continue;
         };
-        let Ok(resolved) = read_path(&s.project, path) else {
+        let Some(resolved) = paths.lookup(path) else {
             continue;
         };
         if wanted
@@ -5388,6 +5482,7 @@ fn delivered_file_ending_with(s: &Session, suffix: &str) -> Result<Option<String
     }
     let root = s.project.root.canonicalize()?;
     let mut files = BTreeSet::new();
+    let mut paths = PathResolver::new(&s.project);
     for source in s.sources.values() {
         if source.origin != "file" || source.evidence_truncated {
             continue;
@@ -5395,7 +5490,7 @@ fn delivered_file_ending_with(s: &Session, suffix: &str) -> Result<Option<String
         let Some(path) = source.path.as_deref() else {
             continue;
         };
-        let Ok(resolved) = read_path(&s.project, path) else {
+        let Some(resolved) = paths.lookup(path) else {
             continue;
         };
         if let Ok(relative) = resolved.strip_prefix(&root)
@@ -8062,5 +8157,49 @@ mod file_tests {
         let error = file_access_error(&path, std::io::Error::from(std::io::ErrorKind::NotFound));
         assert!(error.to_string().starts_with("file_not_found:"));
         assert!(error.to_string().contains(&path.display().to_string()));
+    }
+
+    // Citation checks resolve every source of a long session on each
+    // request. A resolver gives read_path's result and resolves each
+    // distinct path once per check.
+    #[test]
+    fn a_path_resolver_matches_read_path_and_resolves_each_path_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join(".env"), "KEY=1\n").unwrap();
+        let project = Project {
+            root: dir.path().into(),
+            output: dir.path().join("docs/out.md"),
+            exclude: vec![".env*".into()],
+            ..Default::default()
+        };
+        let mut paths = PathResolver::new(&project);
+        for path in [
+            "src/a.rs",
+            "./src/a.rs",
+            "src",
+            "missing.rs",
+            ".env",
+            "out.md",
+            "../outside.rs",
+        ] {
+            assert_eq!(paths.lookup(path), read_path(&project, path).ok(), "{path}");
+            assert_eq!(paths.lookup(path), read_path(&project, path).ok(), "{path}");
+        }
+        assert!(paths.lookup("src/a.rs").is_some());
+        assert!(paths.lookup(".env").is_none());
+        std::fs::remove_file(dir.path().join("src/a.rs")).unwrap();
+        assert!(paths.lookup("src/a.rs").is_some());
+        assert!(PathResolver::new(&project).lookup("src/a.rs").is_none());
+        // The output, once written, resolves through the same resolver kind.
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs/out.md"), "# Out\n").unwrap();
+        let mut paths = PathResolver::new(&project);
+        assert_eq!(
+            paths.lookup("out.md"),
+            Some(dir.path().join("docs/out.md").canonicalize().unwrap())
+        );
+        assert_eq!(paths.lookup("out.md"), read_path(&project, "out.md").ok());
     }
 }
