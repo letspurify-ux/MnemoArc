@@ -93,8 +93,18 @@ pub(super) fn headings(doc: &str) -> Vec<Heading> {
     let mut in_comment = false;
     let mut offset = 0;
     for (i, line) in doc.split_inclusive('\n').enumerate() {
-        let start = offset;
+        let mut start = offset;
         offset += line.len();
+        // A byte order mark is no text, and no part of the first section:
+        // before, the first heading of a document saved by a Windows editor
+        // was not seen at all.
+        let line = match line.strip_prefix('\u{feff}') {
+            Some(rest) if i == 0 => {
+                start += '\u{feff}'.len_utf8();
+                rest
+            }
+            _ => line,
+        };
         if let Some(open) = &fence {
             match open.ended_by(line) {
                 Some(FenceEnd::Closer) => {
@@ -1663,7 +1673,7 @@ fn unclosed_fence_issue(fence: &CitationFence) -> Value {
 /// `[...slug]`) and a parenthesised directory (`(auth)/`). Without them the
 /// match began inside the path and reported a missing file the model could
 /// not cite any other way.
-const CITATION_PATTERN: &str = r"((?:[\p{L}\p{N}_./@-]|/\+|\[\[?[\p{L}\p{N}_.@-]+\]\]?|\([\p{L}\p{N}_.@-]+\)/)+\.[A-Za-z][A-Za-z0-9]*)(:|#L)([0-9]+)(?:[-–]L?([0-9]+))?";
+const CITATION_PATTERN: &str = r"((?:[\p{L}\p{N}_./@%-]|/\+|\[\[?[\p{L}\p{N}_.@-]+\]\]?|\([\p{L}\p{N}_.@-]+\)/)+\.[A-Za-z][A-Za-z0-9]*)(:|#L)([0-9]+)(?:[-–]L?([0-9]+))?";
 
 /// Whether a citation match is the label of a Markdown link whose target is
 /// itself a citation, `…](src/agent.rs:10-20)`: the target is the citation
@@ -1692,6 +1702,102 @@ fn link_label_of_citation(line: &str, from: usize, pattern: &regex::Regex) -> bo
 /// Whether the text before a citation match makes it part of a URL. The
 /// match itself may start with the `//` of the scheme, since `/` is a path
 /// character: `https://example.com/agent.rs#L25` matches from `//`.
+/// Name endings of network hosts, never of a project file: the host of
+/// `api.example.com:443` or `redis.internal:6379` matched the citation
+/// pattern, and its port was reported as a line of a missing file, which
+/// held back the final answer.
+const HOST_SUFFIXES: &[&str] = &[
+    "com",
+    "net",
+    "org",
+    "io",
+    "dev",
+    "local",
+    "internal",
+    "intranet",
+    "corp",
+    "lan",
+    "svc",
+    "cluster",
+    "cloud",
+    "example",
+    "invalid",
+    "localdomain",
+    "edu",
+    "gov",
+    "co",
+    "ai",
+    "kr",
+    "jp",
+    "cn",
+    "uk",
+    "de",
+    "fr",
+    "eu",
+    "us",
+];
+
+/// Whether a `name.suffix:number` match is a host and port: no folder, and
+/// a name ending that only hosts use.
+fn network_address(path: &str, separator: &str) -> bool {
+    separator == ":"
+        && !path.contains(['/', '\\', '%'])
+        && path.rsplit_once('.').is_some_and(|(name, suffix)| {
+            !name.is_empty() && HOST_SUFFIXES.contains(&suffix.to_ascii_lowercase().as_str())
+        })
+}
+
+/// A cited path as written, with %XX escapes decoded: a path holding a
+/// space is cited as `docs/my%20notes.md:3`, since a space ends a citation.
+fn decode_citation_path(path: &str) -> String {
+    if !path.contains('%') {
+        return path.to_owned();
+    }
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escape = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
+        if let Some(byte) = escape {
+            decoded.push(byte);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| path.to_owned())
+}
+
+/// The project file a cited path ends when the words written before it
+/// join it with spaces (`src/my file.rs:3` cites `file.rs`), as written.
+fn spaced_path(s: &Session, before: &str, cited: &str) -> Option<String> {
+    if !before.ends_with(' ') {
+        return None;
+    }
+    let words: Vec<&str> = before.split(' ').collect();
+    // words ends with the empty word after the final space.
+    (2..=words.len().min(5)).find_map(|count| {
+        let joined = words[words.len() - count..].join(" ");
+        let joined = joined.trim_start_matches(|ch: char| "([`\"'*_".contains(ch));
+        if joined.trim().is_empty() || joined.starts_with(' ') {
+            return None;
+        }
+        let candidate = format!("{joined}{cited}");
+        super::read_path(&s.project, &candidate)
+            .is_ok_and(|path| path.is_file())
+            .then_some(candidate)
+    })
+}
+
+/// A project path as a citation writes it: spaces (and a literal %) escaped.
+fn encode_citation_path(path: &str) -> String {
+    path.replace('%', "%25").replace(' ', "%20")
+}
+
 fn url_prefix(before: &str, matched: &str) -> bool {
     let head = before
         .rsplit(|ch: char| ch.is_whitespace() || ['`', '(', '"'].contains(&ch))
@@ -1789,7 +1895,9 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
         let mut line_text: Option<Arc<str>> = None;
         for c in pattern.captures_iter(&visible) {
             let whole = c.get(0).unwrap();
-            if url_prefix(&visible[..whole.start()], whole.as_str()) {
+            if url_prefix(&visible[..whole.start()], whole.as_str())
+                || network_address(&c[1], &c[2])
+            {
                 continue;
             }
             // A Markdown link whose label and target are both citations,
@@ -1807,7 +1915,7 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
                 .unwrap_or(begin);
             spans.push(Citation {
                 raw: c[0].into(),
-                path: c[1].into(),
+                path: decode_citation_path(&c[1]),
                 begin,
                 end,
                 relative_link: &c[2] == "#L",
@@ -1830,7 +1938,7 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
                 let matched = extra.get(0).unwrap();
                 spans.push(Citation {
                     raw: format!("{}{}{}-{}", &c[1], &c[2], begin, end),
-                    path: c[1].into(),
+                    path: decode_citation_path(&c[1]),
                     begin,
                     end,
                     relative_link: &c[2] == "#L",
@@ -2013,6 +2121,8 @@ fn citation_issues_and_paths(
         end,
         relative_link,
         document_line,
+        columns,
+        line_text,
         ..
     } in &spans
     {
@@ -2073,13 +2183,24 @@ fn citation_issues_and_paths(
                 };
                 let missing_file = !*relative_link && error.starts_with("file_not_found");
                 let mut issue = json!({"kind":"citation_path","citation":raw,"line":document_line,"error":error});
+                // The citation's line range as written, after its path.
+                let range = &raw[raw.find([':', '#']).unwrap_or(raw.len())..];
                 if let Some(guidance) = guidance {
                     issue["guidance"] = json!(guidance);
+                } else if missing_file
+                    && suggested.is_none()
+                    && let Some(spaced) = spaced_path(s, &line_text[..columns.0], cited)
+                {
+                    issue["guidance"] = json!(format!(
+                        "{cited} is the end of the project file {spaced:?}: a citation ends at a space, so write each space of its path as %20: {}{range}",
+                        encode_citation_path(&spaced)
+                    ));
                 } else if missing_file && suggested.is_none() {
                     issue["guidance"] = json!(FORMAT_EXAMPLE_GUIDANCE);
                 }
                 if let Some(file) = suggested {
-                    issue["suggested"] = json!(format!("{file}{}", &raw[cited.len()..]));
+                    let file = encode_citation_path(&file);
+                    issue["suggested"] = json!(format!("{file}{range}"));
                     fixable.push((*document_line, cited.clone(), file));
                 }
                 issues.push(issue);
@@ -2238,7 +2359,7 @@ fn path_rewrites<'a>(
     for c in pattern.captures_iter(line) {
         let whole = c.get(0).unwrap();
         let path = c.get(1).unwrap();
-        let Some(file) = paths.get(path.as_str()) else {
+        let Some(file) = paths.get(decode_citation_path(path.as_str()).as_str()) else {
             continue;
         };
         if url_prefix(&line[..whole.start()], whole.as_str()) {

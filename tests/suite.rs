@@ -68,6 +68,8 @@ mod tool_input_diagnostics;
 mod tool_recovery;
 #[path = "tool_review_followup.rs"]
 mod tool_review_followup;
+#[path = "tool_review_followup2.rs"]
+mod tool_review_followup2;
 #[path = "web.rs"]
 mod web;
 #[path = "web_automation.rs"]

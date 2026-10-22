@@ -316,10 +316,31 @@ impl SessionHistory {
                     .unwrap()
                     .to_lowercase()
                     .contains(&q)
+                    || b.messages.iter().any(|m| text_contains(m, &q, 2))
             })
             .collect();
         let items:Vec<_>=rows.iter().take(limit.clamp(1,50)).map(|b|json!({"id":b.id,"active":b.active,"excerpt":serde_json::to_string(&b.messages).unwrap().chars().take(240).collect::<String>()})).collect();
         json!({"next_cursor":if rows.len()>items.len(){items.last().and_then(|x|x["id"].as_u64())}else{None},"items":items,"pruned_through":self.pruned_through})
+    }
+}
+
+/// Whether a string in `value` holds `query` (already lowercased) as text:
+/// tool results and call arguments are JSON text inside the message, so
+/// quotes and line breaks in a file appear escaped once or twice in the
+/// serialized bundle, and a search for the text as read missed them. Strings
+/// that are JSON documents are searched inside, `depth` levels deep.
+fn text_contains(value: &Value, query: &str, depth: u8) -> bool {
+    match value {
+        Value::String(text) => {
+            text.to_lowercase().contains(query)
+                || (depth > 0
+                    && text.trim_start().starts_with(['{', '['])
+                    && serde_json::from_str::<Value>(text)
+                        .is_ok_and(|inner| text_contains(&inner, query, depth - 1)))
+        }
+        Value::Array(values) => values.iter().any(|v| text_contains(v, query, depth)),
+        Value::Object(fields) => fields.values().any(|v| text_contains(v, query, depth)),
+        _ => false,
     }
 }
 

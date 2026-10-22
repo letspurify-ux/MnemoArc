@@ -238,6 +238,7 @@ pub fn describe(message: &str) -> Value {
             | "checkpoint_pending"
             | "tool_not_active"
             | "closing_mode"
+            | "progress_recovery"
             | "gap_requires_closing"
             | "workflow_write_scope"
     ) || code.starts_with("unsupported")
@@ -521,12 +522,19 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             "checkpoint_complete",
         ],
         // Closing withholds the catalog too; the document tools finish it.
-        "use_available_tools" if result["recovery"]["code"] == "closing_mode" => &[
-            "document_edit",
-            "document_edit_batch",
-            "document_inspect",
-            "file_read",
-        ],
+        "use_available_tools"
+            if matches!(
+                result["recovery"]["code"].as_str(),
+                Some("closing_mode" | "progress_recovery")
+            ) =>
+        {
+            &[
+                "document_edit",
+                "document_edit_batch",
+                "document_inspect",
+                "file_read",
+            ]
+        }
         "use_available_tools" => &["tool_catalog", "tool_select", "checkpoint_complete"],
         "stop" => &[],
         _ => &["history"],
@@ -622,6 +630,7 @@ pub fn correctable_document_error(result: &Value) -> bool {
                     | "unsupported_language"
                     | "checkpoint_pending"
                     | "closing_mode"
+                    | "progress_recovery"
                     | "gap_requires_closing"
             )
         ),
@@ -647,13 +656,26 @@ pub fn correctable_document_error(result: &Value) -> bool {
 
 /// Replace the ordinary retry hint after an identical document-edit failure
 /// with an explicit instruction to inspect state and change the edit strategy.
-pub fn annotate_identical_document_failure(result: &mut Value) {
+pub fn annotate_identical_document_failure(s: &Session, result: &mut Value) {
+    // Only offered tools: a pending checkpoint withholds document_inspect.
+    let definitions = ToolRegistry::definitions(s);
+    let offered = |name: &str| {
+        definitions
+            .iter()
+            .any(|definition| definition["function"]["name"] == name)
+    };
+    let tools: Vec<&str> = ["document_inspect", "document_edit"]
+        .into_iter()
+        .filter(|name| offered(name))
+        .collect();
     result["recovery"]["repeat_detected"] = json!(true);
     result["recovery"]["action"] = json!("change_approach");
-    result["recovery"]["tools"] = json!(["document_inspect", "document_edit"]);
-    result["recovery"]["guidance"] = json!(
+    result["recovery"]["tools"] = json!(tools);
+    result["recovery"]["guidance"] = json!(if offered("document_inspect") {
         "This exact request already failed with the same cause. Do not resubmit it. Correct what the failure names against the current document (the latest save result's outline, or document_inspect when none is in context), then make one targeted document_edit with the current document hash."
-    );
+    } else {
+        "This exact request already failed with the same cause. Do not resubmit it. Correct what the failure names against the current document (the latest save result's outline), then make one targeted document_edit with the current document hash."
+    });
 }
 
 impl FailureTracker {

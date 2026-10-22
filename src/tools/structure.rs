@@ -59,6 +59,32 @@ pub(super) fn language(path: &Path) -> Result<&'static str> {
     }
 }
 
+/// A symbol ID names the file it was listed for (hash:path:start:end). One
+/// sent with another file's path was reported as that file having changed.
+pub(super) fn check_symbol_file(file: &SyntaxFile, id: &str) -> Result<()> {
+    check_symbol_path(&file.path, &file.digest, id)
+}
+
+/// An ID whose file digest is this file's names this file, whatever its
+/// path part says (an invented one is diagnosed by its byte range).
+fn check_symbol_path(path: &Path, digest: &str, id: &str) -> Result<()> {
+    let mut parts = id.split(':');
+    let (Some(id_digest), Some(path_identity)) = (parts.next(), parts.next()) else {
+        return Ok(());
+    };
+    if id_digest != digest
+        && path_identity.len() == 64
+        && path_identity.bytes().all(|b| b.is_ascii_hexdigit())
+        && path_identity != hash(path.to_string_lossy().as_bytes())
+    {
+        bail!(
+            "invalid_symbol_id: this symbol_id was listed for another file, not {}; send it with the path (location) it was listed with, or list this file's symbols with code_outline",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn symbol_name<'a>(node: Node<'a>) -> Option<Node<'a>> {
     match node.kind() {
         "function_item"
@@ -107,7 +133,17 @@ pub(super) fn symbol_name<'a>(node: Node<'a>) -> Option<Node<'a>> {
         | "public_field_definition"
         | "property_signature"
         | "function_definition"
-        | "class_definition" => node.child_by_field_name("name"),
+        | "class_definition"
+        | "union_item"
+        | "enum_assignment" => node.child_by_field_name("name"),
+        // A TypeScript enum member without a value is its bare name.
+        "property_identifier" | "string"
+            if node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "enum_body") =>
+        {
+            Some(node)
+        }
         "impl_item" => node.child_by_field_name("type"),
         "operator_declaration" => node.child_by_field_name("operator"),
         "conversion_operator_declaration" => node.child_by_field_name("type"),
@@ -203,6 +239,12 @@ fn function_value(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
+/// A class expression assigned to a name: `const Store = class { ... }`.
+fn class_value(node: Node<'_>) -> bool {
+    node.child_by_field_name("value")
+        .is_some_and(|value| value.kind() == "class")
+}
+
 fn category(node: Node<'_>, parent_kind: &str, source: &str) -> &'static str {
     match node.kind() {
         "function_item" | "function_signature_item" | "function_definition" => {
@@ -215,8 +257,16 @@ fn category(node: Node<'_>, parent_kind: &str, source: &str) -> &'static str {
         "function_declaration" | "generator_function_declaration" | "function_signature" => {
             "function"
         }
+        // A class expression or anonymous default-export class has no name
+        // of its own, so its members' parent is not a class symbol.
         "method_definition"
-            if parent_kind == "class"
+            if (parent_kind == "class"
+                || node
+                    .parent()
+                    .and_then(|body| body.parent())
+                    .is_some_and(|class| {
+                        matches!(class.kind(), "class" | "class_declaration")
+                    }))
                 && node
                     .child_by_field_name("name")
                     .is_some_and(|name| &source[name.byte_range()] == "constructor") =>
@@ -231,12 +281,17 @@ fn category(node: Node<'_>, parent_kind: &str, source: &str) -> &'static str {
         "class_declaration" | "class" | "abstract_class_declaration" | "class_definition" => {
             "class"
         }
-        "struct_item" | "struct_declaration" => "struct",
+        "struct_item" | "struct_declaration" | "union_item" => "struct",
         "interface_declaration" => "interface",
         "trait_item" => "trait",
         "impl_item" => "impl",
         "enum_item" | "enum_declaration" => "enum",
-        "enum_variant" | "enum_constant" | "enum_member_declaration" => "enum_member",
+        "enum_variant"
+        | "enum_constant"
+        | "enum_member_declaration"
+        | "enum_assignment"
+        | "property_identifier"
+        | "string" => "enum_member",
         "record_declaration" => "record",
         "annotation_type_declaration" => "annotation",
         "annotation_type_element_declaration" => "method",
@@ -245,6 +300,7 @@ fn category(node: Node<'_>, parent_kind: &str, source: &str) -> &'static str {
         | "public_field_definition"
         | "property_signature" => "field",
         "variable_declarator" if function_value(node).is_some() => "function",
+        "variable_declarator" if class_value(node) => "class",
         "variable_declarator" => match declaration_owner(node).map(|p| p.kind()) {
             Some("event_field_declaration") => "event",
             Some("field_declaration")
@@ -748,6 +804,7 @@ pub(super) fn execute(
     let filters = options(args);
     if tool == "symbol_read" {
         let id = text(args, "symbol_id")?;
+        check_symbol_path(&path, &digest, id)?;
         if !id.starts_with(&format!("{digest}:")) {
             bail!("symbol_revision_conflict: source changed; call code_outline again");
         }

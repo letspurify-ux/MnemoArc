@@ -352,8 +352,10 @@ fn identical_invalid_document_call_is_reported_on_second_failure() {
         .unwrap();
     assert!(repeated.starts_with("identical_tool_failure:"));
 
+    let mut s = Session::new(Project::default(), support::compact_config());
+    s.active_tools = ToolRegistry::optional_names();
     let mut corrected = error.clone();
-    tools::recovery::annotate_identical_document_failure(&mut corrected);
+    tools::recovery::annotate_identical_document_failure(&s, &mut corrected);
     assert_eq!(corrected["recovery"]["repeat_detected"], true);
     assert_eq!(corrected["recovery"]["action"], "change_approach");
     assert_eq!(
@@ -365,6 +367,35 @@ fn identical_invalid_document_call_is_reported_on_second_failure() {
             .as_str()
             .unwrap()
             .contains("Do not resubmit it")
+    );
+    // A pending checkpoint withholds document_inspect: the hint names
+    // only what the next request offers.
+    s.task.workflow = "source_document".into();
+    s.checkpoint = Some(mnemoarc::session::Checkpoint {
+        id: "cp".into(),
+        bundle_ids: vec![],
+        maintenance_bundle_ids: vec![],
+        acknowledged: false,
+        attempts: 0,
+        failed_attempts: 0,
+        last_failure: None,
+        source_lookup_calls: 0,
+        starting_state_revision: 0,
+        starting_memory_generation: 0,
+        failed: false,
+    });
+    let mut withheld = error.clone();
+    tools::recovery::annotate_identical_document_failure(&s, &mut withheld);
+    let tools = withheld["recovery"]["tools"].as_array().unwrap();
+    assert!(
+        !tools.iter().any(|tool| tool == "document_inspect"),
+        "{withheld}"
+    );
+    assert!(
+        !withheld["recovery"]["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("document_inspect")
     );
 }
 #[test]

@@ -127,19 +127,40 @@ impl Field {
     }
 
     fn matches(&self, term: &str) -> usize {
+        let hangul = term.chars().all(|ch| ('가'..='힣').contains(&ch));
         if self.terms.contains(term) {
             4
-        } else if (term.chars().count() >= 3
-            || (term.chars().count() >= 2 && term.chars().all(|ch| ('가'..='힣').contains(&ch))))
+        } else if (term.chars().count() >= 3 || (term.chars().count() >= 2 && hangul))
             && self.text.contains(term)
         {
             // Keep literal partial search (including Korean suffixes), but
             // avoid one-character noise and short ASCII substring matches.
             1
+        } else if hangul && self.text.contains(korean_stem(term)) {
+            // A Korean query word carries its particle or ending ("설정을",
+            // "저장하는"), which the stored text rarely repeats.
+            1
         } else {
             0
         }
     }
+}
+
+/// A Hangul word without its last one or two syllables, kept to at least
+/// two: the stem a particle or verb ending was attached to. A word too short
+/// to shorten is returned whole.
+fn korean_stem(term: &str) -> &str {
+    let count = term.chars().count();
+    let keep = if count >= 4 {
+        count - 2
+    } else if count == 3 {
+        2
+    } else {
+        count
+    };
+    term.char_indices()
+        .nth(keep)
+        .map_or(term, |(end, _)| &term[..end])
 }
 
 pub(super) fn rank(

@@ -347,6 +347,28 @@ fn finish_mutation(
     Ok(result)
 }
 
+/// The statement's first word: leading space, comments and opening
+/// parentheses are not part of it. `(SELECT ...)`, a commented query and
+/// `SELECT*FROM t` were refused as no SELECT.
+fn first_keyword(sql: &str) -> &str {
+    let mut rest = sql;
+    loop {
+        let trimmed = rest.trim_start_matches(|ch: char| ch.is_whitespace() || ch == '(');
+        if let Some(comment) = trimmed.strip_prefix("--") {
+            rest = comment.split_once('\n').map_or("", |(_, after)| after);
+        } else if let Some(comment) = trimmed.strip_prefix("/*") {
+            rest = comment.split_once("*/").map_or("", |(_, after)| after);
+        } else {
+            rest = trimmed;
+            break;
+        }
+    }
+    let end = rest
+        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
 pub fn execute_free(
     config: &DatabaseConfig,
     args: &Value,
@@ -379,11 +401,8 @@ pub fn execute_free(
             let sql = sql_text(args)?;
             if mode == "query"
                 && !matches!(
-                    sql.split_whitespace()
-                        .next()
-                        .map(str::to_ascii_uppercase)
-                        .as_deref(),
-                    Some("SELECT" | "WITH")
+                    first_keyword(sql).to_ascii_uppercase().as_str(),
+                    "SELECT" | "WITH"
                 )
             {
                 return Err(bad(
@@ -514,6 +533,42 @@ pub fn execute_free(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // mode=query refused a parenthesised or commented SELECT and SELECT*.
+    #[test]
+    fn the_first_keyword_skips_comments_and_parentheses() {
+        for sql in [
+            "SELECT 1 FROM dual",
+            "  (SELECT 1 FROM dual)",
+            "-- totals\nSELECT 1 FROM dual",
+            "/* totals */ select 1 from dual",
+            "SELECT*FROM dual",
+            "/* a */ -- b\n ( WITH x AS (SELECT 1 FROM dual) SELECT * FROM x)",
+        ] {
+            assert!(
+                matches!(
+                    first_keyword(sql).to_ascii_uppercase().as_str(),
+                    "SELECT" | "WITH"
+                ),
+                "{sql:?}: {:?}",
+                first_keyword(sql)
+            );
+        }
+        for sql in [
+            "DELETE FROM t",
+            "-- SELECT\nDELETE FROM t",
+            "/* SELECT */ UPDATE t SET a = 1",
+            "-- only a comment",
+        ] {
+            assert!(
+                !matches!(
+                    first_keyword(sql).to_ascii_uppercase().as_str(),
+                    "SELECT" | "WITH"
+                ),
+                "{sql:?}"
+            );
+        }
+    }
 
     #[test]
     fn decimal_string_binds_preserve_all_digits() {

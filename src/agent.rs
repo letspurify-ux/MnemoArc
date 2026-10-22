@@ -2926,7 +2926,7 @@ pub async fn run_session_controlled(
                 ) && failure.is_none()
                 {
                     if reason.starts_with("identical_tool_failure:") {
-                        tools::recovery::annotate_identical_document_failure(&mut result);
+                        tools::recovery::annotate_identical_document_failure(&s, &mut result);
                     }
                     let correctable = tools::recovery::correctable_document_error(&result);
                     if !correctable || !recover_document(&mut s, &reason) {

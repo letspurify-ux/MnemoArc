@@ -1310,6 +1310,10 @@ fn collect(
                         (matches!(p.kind(), "pair" | "pair_pattern")
                             && p.child_by_field_name("key") == Some(name))
                             || (p.kind() == "keyword_pattern" && p.named_child(0) == Some(name))
+                            // A JSX attribute name is a prop, not a use of
+                            // a binding: `<Button onClick={...}>` named no
+                            // function onClick.
+                            || (p.kind() == "jsx_attribute" && p.named_child(0) == Some(name))
                             || (p.kind() == "field_initializer"
                                 && p.child_by_field_name("field") == Some(name))
                             || (p.kind() == "field_pattern"
@@ -2518,6 +2522,7 @@ pub(super) fn execute(s: &Session, args: &Value, cancel: &CancellationToken) -> 
         .iter()
         .position(|f| f.syntax.path == path)
         .ok_or_else(|| anyhow::anyhow!("unsupported_language: use source_search/file_read"))?;
+    structure::check_symbol_file(&workspace.files[file].syntax, id)?;
     // Reuse the outline's ID validation and revision contract, including paths.
     let (selected, _) =
         workspace.files[file]

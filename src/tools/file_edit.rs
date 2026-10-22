@@ -454,7 +454,7 @@ fn write_path(
             Err(error) => return Err(error.into()),
         }
     }
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    let mut temp = super::new_temp_file(parent)?;
     temp.write_all(text.as_bytes())?;
     if let Some(permissions) = permissions {
         temp.as_file().set_permissions(permissions.clone())?;

@@ -620,12 +620,32 @@ impl ToolRegistry {
             .copied()
             .unwrap_or(base)
     }
+    /// Discovery withheld by document progress recovery; a call to it is
+    /// refused as well, not only left out of the offered tools.
+    pub fn recovery_withholds(s: &Session, name: &str) -> bool {
+        if s.checkpoint.is_some() || !s.is_document_work() || !s.document_written {
+            return false;
+        }
+        let broad = matches!(
+            name,
+            "file_list" | "source_search" | "symbol_search" | "symbol_relations" | "code_outline"
+        );
+        // Second stage of the document progress ladder: after twice the
+        // stall limit without a better result, stop broad discovery even in
+        // the verify phase. Targeted file_read/symbol_read remain.
+        let stalled =
+            s.progress_recovery.rounds_since_best >= s.config.stall_round_limit.saturating_mul(2);
+        // Recovery focus steers an existing draft toward writing. Before
+        // any document is saved, discovery is still required to find the
+        // sources; verification must still be able to locate a missing
+        // helper/path and finish source coverage.
+        let focus = s.run_guidance["progress_recovery"]["active"] == true;
+        (stalled && broad)
+            || (focus
+                && (matches!(name, "memory_write" | "memory_find" | "history")
+                    || (s.run_guidance["phase"] != "verify" && broad)))
+    }
     pub fn definitions(s: &Session) -> Vec<Value> {
-        // Recovery focus steers an existing draft toward writing. Before any
-        // document is saved, discovery is still required to find the sources.
-        let recovery_focus = s.run_guidance["progress_recovery"]["active"] == true
-            && s.is_document_work()
-            && s.document_written;
         Self::specs().into_iter()
             .filter(|t| !s.read_only_turn || Self::question_allows(t.name))
             .filter(|t| t.name != "db_query" || s.config.database.active_queries().next().is_some())
@@ -648,23 +668,7 @@ impl ToolRegistry {
                     })
             })
             .filter(|t| !Self::closing_withholds(s, t.name))
-            // Second stage of the document progress ladder: after twice the
-            // stall limit without a better result, stop broad discovery even
-            // in the verify phase. Targeted file_read/symbol_read remain.
-            .filter(|t| {
-                s.checkpoint.is_some()
-                    || !s.is_document_work()
-                    || !s.document_written
-                    || s.progress_recovery.rounds_since_best
-                        < s.config.stall_round_limit.saturating_mul(2)
-                    || !matches!(t.name, "file_list" | "source_search" | "symbol_search" | "symbol_relations" | "code_outline")
-            })
-            // Draft recovery discourages rediscovery. Verification must still
-            // be able to locate a missing helper/path and finish source coverage.
-            .filter(|t| !recovery_focus || s.checkpoint.is_some() || !matches!(t.name,
-                "memory_write" | "memory_find" | "history")
-                && (s.run_guidance["phase"] == "verify" || !matches!(t.name,
-                    "file_list" | "source_search" | "symbol_search" | "symbol_relations" | "code_outline")))
+            .filter(|t| !Self::recovery_withholds(s, t.name))
             .map(|mut t| {
                 // OpenAI-compatible providers reject a top-level anyOf in a
                 // function parameter schema. Runtime verification-reserve
@@ -822,6 +826,11 @@ impl ToolRegistry {
         }
         if !s.config.memory_reuse && ["memory_find", "memory_read"].contains(&name) {
             bail!("unsupported: memory reuse disabled for evaluation");
+        }
+        if Self::recovery_withholds(s, name) {
+            bail!(
+                "progress_recovery: {name} is withheld while the document recovers from a stall; nothing was executed. Write the missing parts with document_edit from the evidence gathered, or file_read one specific range you still need"
+            );
         }
         let object = args.as_object().ok_or_else(|| {
             arguments::failure(
@@ -3355,6 +3364,44 @@ fn expand_fix_word(s: &Session, name: &str, args: &mut Value) -> Result<()> {
             );
         };
         let corrected = format!("{}{replacement}{}", &line[..at], &line[at + length..]);
+        // The line is the edit's anchor, which must occur once. A line that
+        // also begins another line ("A" and "A and B") occurred twice, and
+        // the fix was refused; take its line breaks and then its neighbours
+        // along until it is unique in the document as fixed so far.
+        let current_line = |index: usize| {
+            fixed_lines
+                .get(&(index + 1))
+                .map_or(lines[index], |(text, _)| text.as_str())
+        };
+        let separator = if doc.contains("\r\n") { "\r\n" } else { "\n" };
+        let current: String = (0..lines.len())
+            .map(current_line)
+            .collect::<Vec<_>>()
+            .join(separator);
+        let index = number - 1;
+        let window = |lines_around: usize, own: &str| {
+            let first = index.saturating_sub(lines_around);
+            let last = (index + lines_around).min(lines.len() - 1);
+            let mut text = String::new();
+            if lines_around > 0 && first > 0 {
+                text.push_str(separator);
+            }
+            for i in first..=last {
+                if i > first {
+                    text.push_str(separator);
+                }
+                text.push_str(if i == index { own } else { current_line(i) });
+            }
+            if lines_around > 0 && last + 1 < lines.len() {
+                text.push_str(separator);
+            }
+            text
+        };
+        let mut around = 0;
+        while current.matches(&window(around, &line)).count() > 1 && around < lines.len() {
+            around += 1;
+        }
+        let (old_text, new_text) = (window(around, &line), window(around, &corrected));
         let mut shifts = fixed_lines
             .remove(&number)
             .map(|(_, shifts)| shifts)
@@ -3364,8 +3411,8 @@ fn expand_fix_word(s: &Session, name: &str, args: &mut Value) -> Result<()> {
         let object = edit.as_object_mut().unwrap();
         object.remove("fix_id");
         object.insert("action".into(), json!("replace_text"));
-        object.insert("old_text".into(), json!(line));
-        object.insert("text".into(), json!(corrected));
+        object.insert("old_text".into(), json!(old_text));
+        object.insert("text".into(), json!(new_text));
     }
     Ok(())
 }
@@ -3630,6 +3677,20 @@ fn changed_lines(old: &str, new: &str) -> (usize, usize) {
     (prefix + 1, new.len().saturating_sub(suffix).max(prefix + 1))
 }
 
+/// A temporary file to be renamed over a new project file. NamedTempFile is
+/// private to its owner (0600), which a new document or source file then
+/// kept; it is created with the mode an editor's new file gets instead
+/// (0666 less the umask). Replacements copy the old file's mode onto it.
+pub(super) fn new_temp_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    builder.tempfile_in(parent)
+}
+
 fn persist_document_edit(
     s: &mut Session,
     path: &Path,
@@ -3665,7 +3726,7 @@ fn persist_document_edit(
     if checked != path {
         bail!("output_changed");
     }
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    let mut temp = new_temp_file(parent)?;
     temp.write_all(result.as_bytes())?;
     if exists {
         // Atomic replacement must retain the existing document's access mode;
@@ -4028,10 +4089,20 @@ fn path_glob_conflict_hint(s: &Session, args: &Value) -> String {
     } else {
         format!("**/{glob}")
     };
+    let folder = globset::escape(&relative);
+    // A glob already written from the project root through this directory
+    // (path "src" with path_glob "src/*.rs") is the one to send: prefixed
+    // again it named src/src/*.rs, which matched nothing.
+    let rooted = root_relative_glob(&s.project, &root, glob);
     let combined = if relative.is_empty() {
         below
+    } else if [&folder, &relative]
+        .iter()
+        .any(|prefix| rooted.starts_with(&format!("{prefix}/")))
+    {
+        rooted.to_owned()
     } else {
-        format!("{}/{below}", globset::escape(&relative))
+        format!("{folder}/{below}")
     };
     format!(
         "; to match {glob:?} below {path}, send only path_glob:{combined:?}{instead} (relative to project.root; ** includes subdirectories){legacy}"
@@ -4094,6 +4165,22 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
     if let Some(spec) = ToolRegistry::specs().into_iter().find(|t| t.name == name)
         && let Some(fields) = args.as_object_mut()
     {
+        // An array or object argument sent as its JSON text is decoded
+        // first, so the placeholder clean-up below sees its fields too: edits
+        // sent as text kept their blank fix_id and the batch was refused.
+        // task_plan decodes its operations itself and reports doing so.
+        for (key, value) in &mut *fields {
+            let kind = &spec.parameters["properties"][key]["type"];
+            if name != "task_plan"
+                && (*kind == "array" || *kind == "object")
+                && let Some(raw) = value.as_str()
+                && let Ok(decoded) = serde_json::from_str::<Value>(raw.trim())
+                && (decoded.is_array() && *kind == "array"
+                    || decoded.is_object() && *kind == "object")
+            {
+                *value = decoded;
+            }
+        }
         // For a read-only tool, explicit null means "not given". Some
         // providers also fill every optional path/filter/cursor string with
         // "". Keep required arguments and write-tool values unchanged.
@@ -4175,6 +4262,14 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
         }
         for (key, value) in &mut *fields {
             let kind = &spec.parameters["properties"][key]["type"];
+            // A whole number written as 2.0 is the same integer.
+            if *kind == "integer"
+                && let Some(number) = value.as_f64().filter(|_| value.is_f64())
+                && number.fract() == 0.0
+                && (0.0..=9_007_199_254_740_992.0).contains(&number)
+            {
+                *value = json!(number as u64);
+            }
             if *kind == "integer"
                 && let Some(raw) = value.as_str()
                 && !raw.is_empty()
@@ -4836,12 +4931,14 @@ pub(crate) fn text_line_count(path: &Path) -> Result<usize> {
 /// write in the same timestamp tick could keep its size and time (git's
 /// racy-entry rule), and a changed version replaces the entry.
 struct FileDigest {
-    len: u64,
-    modified: std::time::SystemTime,
+    version: FileVersion,
     hash: Option<String>,
     lines: Option<usize>,
 }
-type FileVersion = (u64, std::time::SystemTime);
+/// Size, modification time and, on Unix, the inode and status-change time:
+/// a write that kept the size and reset the modification time (touch -r,
+/// rsync -t) left the old digest in use; the change time cannot be reset.
+type FileVersion = (u64, std::time::SystemTime, (u64, i64, i64));
 type DigestCache = std::collections::HashMap<std::path::PathBuf, FileDigest>;
 const DIGEST_CACHE_ENTRIES: usize = 8192;
 const DIGEST_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -4852,7 +4949,14 @@ fn digest_cache() -> &'static std::sync::Mutex<DigestCache> {
 }
 
 fn file_version(meta: &std::fs::Metadata) -> Result<FileVersion> {
-    Ok((meta.len(), meta.modified()?))
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        (meta.ino(), meta.ctime(), meta.ctime_nsec())
+    };
+    #[cfg(not(unix))]
+    let identity = (0, 0, 0);
+    Ok((meta.len(), meta.modified()?, identity))
 }
 
 fn cached_digest<T>(
@@ -4863,7 +4967,7 @@ fn cached_digest<T>(
     let cache = digest_cache().lock().unwrap_or_else(|p| p.into_inner());
     cache
         .get(path)
-        .filter(|entry| (entry.len, entry.modified) == version)
+        .filter(|entry| entry.version == version)
         .and_then(field)
 }
 
@@ -4875,7 +4979,7 @@ fn remember_digest(path: &Path, version: FileVersion, update: impl FnOnce(&mut F
     if !settled
         || cache
             .get(path)
-            .is_some_and(|entry| (entry.len, entry.modified) != version)
+            .is_some_and(|entry| entry.version != version)
     {
         cache.remove(path);
     }
@@ -4886,8 +4990,7 @@ fn remember_digest(path: &Path, version: FileVersion, update: impl FnOnce(&mut F
         cache.clear();
     }
     let entry = cache.entry(path.to_path_buf()).or_insert(FileDigest {
-        len: version.0,
-        modified: version.1,
+        version,
         hash: None,
         lines: None,
     });
@@ -5687,7 +5790,7 @@ fn execute_arguments(
             return error;
         }
         let message = format!(
-            "{error}. Note: this call's arguments arrived with native tool-call markup (<arg_key>/<arg_value>) inside a JSON key; they were recovered, but only these fields were received: {received}. Resend every argument, including any reported missing, as a plain JSON field without <arg_key> tags"
+            "{error}; note: this call's arguments arrived with native tool-call markup (<arg_key>/<arg_value>) inside a JSON key; they were recovered, but only these fields were received: {received}. Resend every argument, including any reported missing, as a plain JSON field without <arg_key> tags"
         );
         if let Some(diagnostic) = error.downcast_ref::<recovery::DiagnosticError>() {
             let mut data = diagnostic.data.clone();
@@ -5724,6 +5827,23 @@ fn check_checkpoint_withholds(s: &Session, name: &str) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+/// expected_revision 0 on a key no memory has yet stands for "new": no
+/// revision is 0, so it is read as omitted, the same for memory_write and for
+/// a memory_manage replacement under a new key.
+fn drop_new_key_zero_revision(s: &Session, input: &mut Value) {
+    if input["expected_revision"] == 0
+        && let Some(key) = input["key"].as_str()
+        && !s
+            .memory
+            .entries
+            .values()
+            .any(|entry| entry.key.as_deref() == Some(key))
+        && let Some(fields) = input.as_object_mut()
+    {
+        fields.remove("expected_revision");
+    }
 }
 
 /// The argument repairs every call gets before validation, returning the
@@ -5778,17 +5898,10 @@ fn execute_repaired(
     {
         normalize_integer_arguments("memory_write", replacement);
         normalize_argument_aliases(s, "memory_write", replacement)?;
+        drop_new_key_zero_revision(s, replacement);
     }
-    if name == "memory_write"
-        && args["expected_revision"] == 0
-        && let Some(key) = args["key"].as_str()
-        && !s
-            .memory
-            .entries
-            .values()
-            .any(|entry| entry.key.as_deref() == Some(key))
-    {
-        args.as_object_mut().unwrap().remove("expected_revision");
+    if name == "memory_write" {
+        drop_new_key_zero_revision(s, &mut args);
     }
     if name == "document_edit_batch" {
         hoist_batch_expected_hash(&mut args)?;
@@ -5866,7 +5979,7 @@ fn execute_repaired(
                 .filter(|t| !t.is_empty())
                 .collect();
             Ok(
-                json!({"groups":["source-docs"],"tools":ToolRegistry::specs().into_iter().filter(|t|t.name != "db_query" || s.config.database.active_queries().next().is_some()).filter(|t|t.name != "db_execute" || s.config.database.free_execution_enabled()).filter(|t|terms.is_empty() || terms.iter().any(|term| t.name.contains(term) || t.description.to_lowercase().contains(term))).map(|t|json!({"name":t.name,"description":t.description,"basic":!t.optional,"active":!t.optional||s.active_tools.contains(t.name),"selectable":!s.workflow_forbidden_tools().contains(&t.name)})).collect::<Vec<_>>()}),
+                json!({"groups":["source-docs"],"tools":ToolRegistry::specs().into_iter().filter(|t|t.name != "db_query" || s.config.database.active_queries().next().is_some()).filter(|t|t.name != "db_execute" || s.config.database.free_execution_enabled()).filter(|t|terms.is_empty() || terms.iter().any(|term| t.name.contains(term) || t.description.to_lowercase().contains(term))).map(|t|json!({"name":t.name,"description":t.description,"basic":!t.optional,"active":!t.optional||s.active_tools.contains(t.name),"selectable":t.optional && !s.workflow_forbidden_tools().contains(&t.name)})).collect::<Vec<_>>()}),
             )
         }
         "tool_select" => {
@@ -7370,6 +7483,24 @@ pub fn limit_result(
         result["truncated"] = json!(true);
         result["next_cursor"] = json!({"tool":"file_read","cursor":id});
     }
+    // A bounded history or memory body says so in the envelope as every
+    // other paged result does; it was marked only inside data.
+    if call.name == "history"
+        && args["action"] == "read"
+        && result["data"]["truncated"] == true
+        && let Some(offset) = result["data"]["next_offset"].as_u64()
+    {
+        result["truncated"] = json!(true);
+        result["next_cursor"] =
+            json!({"tool":"history","action":"read","id":args["id"],"offset":offset});
+    }
+    if call.name == "memory_read"
+        && result["data"]["body"]["truncated"] == true
+        && let Some(offset) = result["data"]["body"]["next_offset"].as_u64()
+    {
+        result["truncated"] = json!(true);
+        result["next_cursor"] = json!({"tool":"memory_read","id":args["id"],"offset":offset});
+    }
     if call.name == "document_inspect" && result["data"]["content"]["truncated"] == true {
         let mut next = json!({"tool":"document_inspect","path":result["data"]["path"],"section":args["section"],"offset":result["data"]["content"]["next_offset"],"expected_hash":result["data"]["hash"]});
         if result["data"]["coverage"]["revision"].is_string() {
@@ -7382,25 +7513,30 @@ pub fn limit_result(
         return result;
     }
     let mut output = result.clone();
-    fn strip_duplicate_excerpts(value: &mut Value) {
+    fn strip_duplicate_excerpts(value: &mut Value) -> bool {
         match value {
             Value::Object(fields) => {
-                if fields.contains_key("observed_at") && fields.contains_key("origin") {
-                    fields.remove("excerpt");
-                }
+                let mut stripped = fields.contains_key("observed_at")
+                    && fields.contains_key("origin")
+                    && fields.remove("excerpt").is_some();
                 for v in fields.values_mut() {
-                    strip_duplicate_excerpts(v);
+                    stripped |= strip_duplicate_excerpts(v);
                 }
+                stripped
             }
-            Value::Array(values) => {
-                for v in values {
-                    strip_duplicate_excerpts(v);
-                }
-            }
-            _ => {}
+            Value::Array(values) => values
+                .iter_mut()
+                .fold(false, |stripped, v| strip_duplicate_excerpts(v) | stripped),
+            _ => false,
         }
     }
-    strip_duplicate_excerpts(&mut output);
+    // A read's source excerpt repeats the text shown with it, but a stored
+    // memory's evidence excerpts are shown nowhere else: name where they are.
+    if strip_duplicate_excerpts(&mut output) && call.name == "memory_read" {
+        output["data"]["source_excerpts_omitted"] = json!(
+            "The sources' excerpts were left out to fit this result; source_lookup with a source id returns its excerpt."
+        );
+    }
     if result_tokens(call, &output, &s.config.model) <= limit {
         return output;
     }
@@ -7990,6 +8126,30 @@ mod panic_tests {
 #[cfg(test)]
 mod file_tests {
     use super::*;
+
+    // A rewrite that keeps the size and resets the modification time
+    // (touch -r, rsync -t) reused the old digest of a settled file.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewrite_keeping_size_and_time_is_hashed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        let write = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        };
+        write("aaaa\n");
+        assert_eq!(hash_file(&path).unwrap(), hash(b"aaaa\n"));
+        assert!(digest_cache().lock().unwrap().contains_key(&path));
+        write("bbbb\n");
+        assert_eq!(hash_file(&path).unwrap(), hash(b"bbbb\n"));
+    }
 
     #[test]
     fn file_digests_are_cached_only_for_settled_files() {
