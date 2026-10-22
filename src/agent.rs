@@ -2020,6 +2020,10 @@ pub async fn run_session_controlled(
             }
         };
         let estimate = context::count(&request, &s.config.model);
+        // The request's count, kept while the request is the one counted:
+        // counting a full context costs tens of milliseconds, and an
+        // unchanged request was counted twice every round.
+        let mut counted = Some(estimate);
         let checkpoint_was_open = s.checkpoint.is_some();
         if let Err(e) = ContextManager::prepare(&mut s, estimate) {
             failure = Some(e.to_string());
@@ -2072,6 +2076,7 @@ pub async fn run_session_controlled(
             }
             cp.failed = false;
             cp.acknowledged = false;
+            counted = None;
             request = match ContextManager::request(&s, ToolRegistry::definitions(&s)) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2112,8 +2117,10 @@ pub async fn run_session_controlled(
             // A rejected final must return to a concrete tool action; a
             // subsequent final is still gated.
             request["tool_choice"] = json!("required");
+            counted = None;
         }
-        let raw_request_tokens = context::count(&request, &s.config.model);
+        let raw_request_tokens =
+            counted.unwrap_or_else(|| context::count(&request, &s.config.model));
         let request_tokens = ContextManager::calibrated(&s, raw_request_tokens);
         // Reasoning models spend output tokens on reasoning too. Cleanup
         // requests use the bounded cleanup allowance that input_budget reserves.

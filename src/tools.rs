@@ -5482,6 +5482,14 @@ fn delivered_sources_for(
         else {
             continue;
         };
+        // Sources are kept under their resolved paths: only one with a
+        // wanted file's name is resolved, not every file the session read.
+        if !wanted
+            .iter()
+            .any(|(want_path, ..)| want_path.file_name() == Path::new(path).file_name())
+        {
+            continue;
+        }
         let Some(resolved) = paths.lookup(path) else {
             continue;
         };
@@ -5598,6 +5606,10 @@ fn delivered_file_ending_with(s: &Session, suffix: &str) -> Result<Option<String
         let Some(path) = source.path.as_deref() else {
             continue;
         };
+        // Only a file of that name can end with it (see delivered_sources_for).
+        if Path::new(path).file_name() != wanted.file_name() {
+            continue;
+        }
         let Some(resolved) = paths.lookup(path) else {
             continue;
         };

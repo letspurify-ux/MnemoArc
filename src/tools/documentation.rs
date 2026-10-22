@@ -1005,6 +1005,29 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
     // Every source of a long session is checked on each request; resolve
     // each file once rather than once per source.
     let mut paths = PathResolver::new(&s.project);
+    let citations = citation_spans(doc)?;
+    let cited_path = |citation: &Citation| {
+        if citation.relative_link {
+            output
+                .parent()
+                .unwrap()
+                .join(&citation.path)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            citation.path.clone()
+        }
+    };
+    // Only a cited file's sources can attest a citation. Resolving and
+    // hashing every file the session had read, several times a round, made
+    // each round slower with every file read (200 ms per check at 6000).
+    // Sources are kept under their resolved paths, so the cited files' names
+    // tell which to resolve.
+    let cited_names: BTreeSet<std::ffi::OsString> = citations
+        .iter()
+        .filter_map(|citation| paths.lookup(&cited_path(citation)))
+        .filter_map(|path| path.file_name().map(ToOwned::to_owned))
+        .collect();
     for source in s.sources.values() {
         if source.origin != "file" || source.evidence_truncated {
             continue;
@@ -1014,6 +1037,12 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
         else {
             continue;
         };
+        if !Path::new(path)
+            .file_name()
+            .is_some_and(|name| cited_names.contains(name))
+        {
+            continue;
+        }
         let Some(resolved) = paths.lookup(path) else {
             continue;
         };
@@ -1054,21 +1083,11 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
     // the other four. Exempting only unchanged lines let a section's wrong
     // claim pass because the model rewrote that line as it was.
     let unchanged = unchanged_sections(s, &output, doc);
-    for citation in citation_spans(doc)? {
+    for citation in &citations {
         if unchanged(citation.document_line) {
             continue;
         }
-        let path = if citation.relative_link {
-            output
-                .parent()
-                .unwrap()
-                .join(&citation.path)
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            citation.path
-        };
-        let Some(cited) = paths.lookup(&path) else {
+        let Some(cited) = paths.lookup(&cited_path(citation)) else {
             continue;
         };
         if own.as_ref() == Some(&cited) {

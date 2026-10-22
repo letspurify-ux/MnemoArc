@@ -4698,6 +4698,31 @@ fn unread_citations_follow_delivered_lines_and_file_versions_and_merge_ranges() 
     assert_eq!(unread[0]["path"], "b.rs");
 }
 
+// Only the cited files' sources are resolved for the unread check; it read
+// and hashed every file the session had read, several times a round. A file
+// cited by a link's name is matched by the name it resolves to.
+#[cfg(unix)]
+#[test]
+fn unread_citations_look_only_at_cited_files_including_linked_names() {
+    let (dir, mut s) = source_setup();
+    std::fs::write(dir.path().join("real.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+    std::os::unix::fs::symlink(dir.path().join("real.rs"), dir.path().join("link.rs")).unwrap();
+    for i in 0..30 {
+        std::fs::write(dir.path().join(format!("other{i}.rs")), "fn other() {}\n").unwrap();
+        run(&mut s, "file_read", json!({"path":format!("other{i}.rs")}));
+    }
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":"# Guide\nA runs first. link.rs:1-2\n"}),
+    );
+    let unread = tools::unread_citations(&s).unwrap();
+    assert_eq!(unread.len(), 1, "{unread:?}");
+    assert_eq!(unread[0]["path"], "real.rs");
+    run(&mut s, "file_read", json!({"path":"real.rs"}));
+    assert!(tools::unread_citations(&s).unwrap().is_empty());
+}
+
 #[test]
 fn a_long_unread_citation_suggests_citing_entry_lines() {
     let (dir, mut s) = source_setup();
