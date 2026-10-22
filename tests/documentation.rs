@@ -5147,6 +5147,38 @@ A `path/to/file.rs` mention and `true` alone (src.rs:2).\n";
     assert!(tools::citation_mismatches(&s).is_none());
 }
 
+// Citation columns index the line without its HTML comments. Code spans
+// were taken from the raw line: a name inside a comment counted for the
+// claim, and a comment before the claim shifted its span past the citation,
+// so both mismatched claims below passed unchecked.
+#[test]
+fn a_claim_beside_an_html_comment_is_checked_by_its_own_code_names() {
+    let (dir, mut s) = source_setup();
+    std::fs::write(
+        dir.path().join("src.rs"),
+        "fn start() {}\nfn helper() {}\nfn finish() {}\n",
+    )
+    .unwrap();
+    let doc = "# Guide\n\
+<!-- `start` --> `finish` begins the run (src.rs:1).\n\
+<!-- a note the reader does not see --> `finish` ends it (src.rs:2).\n\
+<!-- `helper` --> `start` begins it (src.rs:1).\n";
+    let written = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":doc}),
+    );
+    let check = &written["citation_mismatch_check"];
+    assert_eq!(
+        check["items"],
+        json!([
+            {"line":2,"citations":["src.rs:1"],"names":["finish"]},
+            {"line":3,"citations":["src.rs:2"],"names":["finish"]}
+        ]),
+        "{written}"
+    );
+}
+
 // Live run 2026-10-11: four batches whose every replacement equalled its
 // old_text were each reported as a successful save.
 #[test]

@@ -876,7 +876,16 @@ impl Session {
             bail!("session_busy: wait for the current run to finish");
         }
         let message = json!({"role":"user","content":text,"follow_up":true});
-        let mut reserved = serde_json::to_vec(&message)?.len();
+        // The message's bundle as history counts it, envelope included:
+        // counted as the bare message, the reserved answer room came up short.
+        let mut reserved = Bundle {
+            id: self.history.next_id.saturating_add(1),
+            messages: vec![message.clone()].into(),
+            active: false,
+            reviewed: true,
+            complete: true,
+        }
+        .bytes();
         if answer {
             reserved = reserved.saturating_add(self.answer_bytes());
         }
@@ -1655,6 +1664,35 @@ mod history_tests {
             json!({"same_as":"current_request"})
         );
         assert!(!state.to_string().contains(&first[3]));
+    }
+
+    // The question's bundle, envelope included, and the answer room must
+    // both fit; counted as the bare message JSON, a question at the limit
+    // was admitted with less answer room than the reservation promised.
+    #[test]
+    fn a_queued_question_leaves_the_whole_answer_room() {
+        let mut s = Session::new(Project::default(), Config::compact_test());
+        s.receive_message("Task".into()).unwrap();
+        let text = "What is left?";
+        let message = json!({"role":"user","content":text,"follow_up":true});
+        let bare = serde_json::to_vec(&message).unwrap().len();
+        for slack in 0..=Bundle::bytes(&Bundle {
+            id: s.history.next_id + 1,
+            messages: vec![message.clone()].into(),
+            active: false,
+            reviewed: true,
+            complete: true,
+        }) - bare
+        {
+            let mut s = s.clone();
+            s.config.history_bytes = s.history.bytes() + bare + slack + s.answer_bytes();
+            if s.queue_question(text.into()).is_ok() {
+                assert!(
+                    s.history.bytes() + s.answer_bytes() <= s.config.history_bytes,
+                    "slack {slack}"
+                );
+            }
+        }
     }
 
     #[test]

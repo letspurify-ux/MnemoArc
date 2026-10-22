@@ -78,8 +78,20 @@ pub async fn run(config: Config, suite_path: &Path, output: &Path) -> Result<()>
             exclude: case.exclude.clone(),
             ..Default::default()
         };
+        // Generated documents and metrics are not source. Their folder is a
+        // literal path (a `[draft]` folder is no glob class); as the project
+        // root itself it holds the sources too, so only this case's outputs
+        // are excluded there.
         if let Ok(relative) = output.strip_prefix(&root) {
-            project.exclude.push(format!("{}/**", relative.display()));
+            let folder = globset::escape(&relative.to_string_lossy().replace('\\', "/"));
+            project.exclude.push(if folder.is_empty() {
+                format!(
+                    "{}-{{full,no-memory-reuse}}-*.{{md,json}}",
+                    globset::escape(&case.name)
+                )
+            } else {
+                format!("{folder}/**")
+            });
         }
         let fingerprint = tools::project_fingerprint(&project)?;
         for variant in ["full", "no-memory-reuse"] {

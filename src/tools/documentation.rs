@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub(super) struct Heading {
@@ -969,9 +970,11 @@ pub(super) struct Citation {
     pub end: usize,
     pub relative_link: bool,
     pub document_line: usize,
-    /// Byte range of the citation in its document line (with HTML comments
-    /// removed), and whether it stands in prose rather than in a diagram.
+    /// Byte range of the citation in `line_text`, its document line with HTML
+    /// comments removed, and whether it stands in prose rather than in a
+    /// diagram.
     pub columns: (usize, usize),
+    pub line_text: Arc<str>,
     pub prose: bool,
 }
 
@@ -1269,7 +1272,6 @@ const CITATION_MISMATCH_GUIDANCE: &str = "None of the code names written before 
 pub(super) fn citation_mismatch_check(s: &Session, output: &Path, doc: &str) -> Option<Value> {
     let citations = citation_spans(doc).ok()?;
     let unchanged = unchanged_sections(s, output, doc);
-    let lines: Vec<&str> = doc.lines().collect();
     let own = output.canonicalize().ok();
     let mut files = BTreeMap::<PathBuf, Option<Vec<String>>>::new();
     let mut paths = PathResolver::new(&s.project);
@@ -1287,9 +1289,10 @@ pub(super) fn citation_mismatch_check(s: &Session, output: &Path, doc: &str) -> 
         if unchanged(line) || !on_line.iter().all(|citation| citation.prose) {
             continue;
         }
-        let Some(text) = lines.get(line - 1) else {
-            continue;
-        };
+        // The line as the citation columns index it: with HTML comments
+        // removed, so a code span inside a comment names nothing and the
+        // spans after one are not shifted against the columns.
+        let text = &*on_line[0].line_text;
         // Inline code spans of the whole line, so a span is never paired
         // across a citation's own backticks.
         let mut spans = Vec::new();
@@ -1782,6 +1785,8 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
         } else {
             visible_without_html_comments(line, &mut in_comment)
         };
+        // The text the columns of this line's citations index, shared by them.
+        let mut line_text: Option<Arc<str>> = None;
         for c in pattern.captures_iter(&visible) {
             let whole = c.get(0).unwrap();
             if url_prefix(&visible[..whole.start()], whole.as_str()) {
@@ -1808,6 +1813,9 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
                 relative_link: &c[2] == "#L",
                 document_line: document_line + 1,
                 columns: (whole.start(), whole.end()),
+                line_text: line_text
+                    .get_or_insert_with(|| Arc::from(visible.as_str()))
+                    .clone(),
                 prose: fence.is_none(),
             });
             // Repeat the path internally for grouped citations such as a.js:3, 8-10.
@@ -1828,6 +1836,9 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
                     relative_link: &c[2] == "#L",
                     document_line: document_line + 1,
                     columns: (tail_start + matched.start(), tail_start + matched.end()),
+                    line_text: line_text
+                        .get_or_insert_with(|| Arc::from(visible.as_str()))
+                        .clone(),
                     prose: fence.is_none(),
                 });
                 tail_start += matched.end();
