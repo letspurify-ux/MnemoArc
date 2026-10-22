@@ -1115,8 +1115,7 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
             .entry(path.clone())
             .or_insert_with(|| hash_file(path).ok());
         if gaps.is_empty()
-            || s
-                .read_coverage
+            || s.read_coverage
                 .get(path.to_string_lossy().as_ref())
                 .is_none_or(|coverage| current.as_deref() != Some(coverage.hash.as_str()))
         {
@@ -1504,6 +1503,7 @@ const NON_SOURCE_FENCES: &[&str] = &[
 /// flagged.
 pub(super) fn uncited_code_check(s: &Session, output: &Path, doc: &str) -> Option<Value> {
     let pattern = regex::Regex::new(CITATION_PATTERN).ok()?;
+    let file_exists = |path: &str| super::read_path(&s.project, path).is_ok_and(|p| p.is_file());
     let note = regex::Regex::new(r"^ {0,3}\[\^([^\]]+)\]:").ok()?;
     let lines: Vec<&str> = doc.lines().collect();
     let cited_notes: Vec<String> = lines
@@ -1511,11 +1511,11 @@ pub(super) fn uncited_code_check(s: &Session, output: &Path, doc: &str) -> Optio
         .filter_map(|line| {
             let label = note.captures(line)?;
             let rest = &line[label.get(0)?.end()..];
-            line_cites(&pattern, rest).then(|| format!("[^{}]", &label[1]))
+            line_cites(&pattern, rest, &file_exists).then(|| format!("[^{}]", &label[1]))
         })
         .collect();
     let cites = |line: &&str| {
-        line_cites(&pattern, line)
+        line_cites(&pattern, line, &file_exists)
             || cited_notes
                 .iter()
                 .any(|label| line.contains(label.as_str()))
@@ -1747,10 +1747,11 @@ fn link_label_of_citation(line: &str, from: usize, pattern: &regex::Regex) -> bo
 /// Whether the text before a citation match makes it part of a URL. The
 /// match itself may start with the `//` of the scheme, since `/` is a path
 /// character: `https://example.com/agent.rs#L25` matches from `//`.
-/// Name endings of network hosts, never of a project file: the host of
-/// `api.example.com:443` or `redis.internal:6379` matched the citation
-/// pattern, and its port was reported as a line of a missing file, which
-/// held back the final answer.
+/// Name endings of network hosts: the host of `api.example.com:443` or
+/// `redis.internal:6379` matched the citation pattern, and its port was
+/// reported as a line of a missing file, which held back the final answer.
+/// Some also end file names (Dockerfile.dev, .env.example), so a match is a
+/// host only when the project has no such file.
 const HOST_SUFFIXES: &[&str] = &[
     "com",
     "net",
@@ -1782,8 +1783,9 @@ const HOST_SUFFIXES: &[&str] = &[
     "us",
 ];
 
-/// Whether a `name.suffix:number` match is a host and port: no folder, and
-/// a name ending that only hosts use.
+/// Whether a `name.suffix:number` match has the shape of a host and port:
+/// no folder, and a name ending hosts use. Callers check the project has no
+/// file of that name.
 fn network_address(path: &str, separator: &str) -> bool {
     separator == ":"
         && !path.contains(['/', '\\', '%'])
@@ -1793,11 +1795,12 @@ fn network_address(path: &str, separator: &str) -> bool {
 }
 
 /// Whether a line holds a citation, as the citation checks read one: not
-/// a URL and not a host with its port.
-fn line_cites(pattern: &regex::Regex, line: &str) -> bool {
+/// a URL and not a host with its port (`file_exists` tells a file apart).
+fn line_cites(pattern: &regex::Regex, line: &str, file_exists: &dyn Fn(&str) -> bool) -> bool {
     pattern.captures_iter(line).any(|c| {
         let whole = c.get(0).unwrap();
-        !url_prefix(&line[..whole.start()], whole.as_str()) && !network_address(&c[1], &c[2])
+        !url_prefix(&line[..whole.start()], whole.as_str())
+            && (!network_address(&c[1], &c[2]) || file_exists(&c[1]))
     })
 }
 
@@ -1949,9 +1952,7 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
         let mut line_text: Option<Arc<str>> = None;
         for c in pattern.captures_iter(&visible) {
             let whole = c.get(0).unwrap();
-            if url_prefix(&visible[..whole.start()], whole.as_str())
-                || network_address(&c[1], &c[2])
-            {
+            if url_prefix(&visible[..whole.start()], whole.as_str()) {
                 continue;
             }
             // A Markdown link whose label and target are both citations,
@@ -2216,6 +2217,11 @@ fn citation_issues_and_paths(
                 };
                 issues.push(json!({"kind":"citation_range","citation":raw,"line":document_line,"error":error}))
             }
+            // A host and port, not a file the project lacks.
+            Err(error)
+                if !*relative_link
+                    && error.starts_with("file_not_found")
+                    && network_address(cited, ":") => {}
             Err(error) => {
                 let guidance = unreadable_citation_guidance(error);
                 // A path missing only its folder (agent.rs for

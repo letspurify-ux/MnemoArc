@@ -4094,13 +4094,14 @@ fn path_glob_conflict_hint(s: &Session, args: &Value) -> String {
     // (path "src" with path_glob "src/*.rs") is the one to send: prefixed
     // again it named src/src/*.rs, which matched nothing.
     let rooted = root_relative_glob(&s.project, &root, glob);
+    let through_folder = [&folder, &relative]
+        .iter()
+        .find_map(|prefix| rooted.strip_prefix(&format!("{prefix}/")));
     let combined = if relative.is_empty() {
         below
-    } else if [&folder, &relative]
-        .iter()
-        .any(|prefix| rooted.starts_with(&format!("{prefix}/")))
-    {
-        rooted.to_owned()
+    } else if let Some(rest) = through_folder {
+        // The folder written literally ([draft]/*.rs) would be a glob class.
+        format!("{folder}/{rest}")
     } else {
         format!("{folder}/{below}")
     };

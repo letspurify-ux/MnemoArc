@@ -198,13 +198,32 @@ fn a_host_and_port_is_no_citation() {
     );
     write(&dir, "src/lib.rs", "fn main() {}\n");
     let audit = tools::execute(&mut s, "document_audit", json!({})).unwrap();
-    assert_eq!(audit["citations_checked"], 1, "{audit}");
     assert!(
         !audit["issues"]
             .as_array()
             .unwrap()
             .iter()
             .any(|issue| issue["kind"] == "citation_path"),
+        "{audit}"
+    );
+    // A file whose name ends like a host is still cited and checked.
+    let (dir, mut s) =
+        document("# T\n\nThe image builds in Dockerfile.dev:9 and reads .env.example:1.\n");
+    write(&dir, "Dockerfile.dev", "FROM rust\nRUN cargo build\n");
+    write(&dir, ".env.example", "KEY=value\n");
+    let audit = tools::execute(&mut s, "document_audit", json!({})).unwrap();
+    let issues = audit["issues"].as_array().unwrap();
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue["kind"] == "citation_range"
+                && issue["citation"] == "Dockerfile.dev:9"),
+        "{audit}"
+    );
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue["kind"] == "unread_citation" && issue["path"] == ".env.example"),
         "{audit}"
     );
 }
@@ -343,6 +362,9 @@ fn memory_find_matches_korean_words_without_their_endings() {
             "{query}: {found}"
         );
     }
+    // A single syllable is no stem: it would match nearly every memory.
+    let found = tools::execute(&mut s, "memory_find", json!({"query":"설"})).unwrap();
+    assert_eq!(found["items"].as_array().unwrap().len(), 0, "{found}");
 }
 
 /// Discovery hidden by document progress recovery still ran when called.
@@ -386,6 +408,23 @@ fn the_path_and_glob_hint_does_not_repeat_the_directory() {
     );
     let error = result["error"].as_str().unwrap();
     assert!(error.contains("path_glob:\"src/**/*.rs\""), "{error}");
+    // A folder name holding glob syntax is escaped in the glob to send.
+    write(&dir, "[draft]/a.rs", "fn hit() {}\n");
+    let result = call(
+        &mut s,
+        "c3",
+        "file_list",
+        json!({"path":"[draft]","path_glob":"[draft]/*.rs"}),
+    );
+    let error = result["error"].as_str().unwrap();
+    assert!(error.contains("path_glob:\"[[]draft[]]/*.rs\""), "{error}");
+    let listed = call(
+        &mut s,
+        "c4",
+        "file_list",
+        json!({"path_glob":"[[]draft[]]/*.rs"}),
+    );
+    assert_eq!(listed["data"]["paths"], json!(["[draft]/a.rs"]), "{listed}");
 }
 
 fn outline(s: &mut Session, path: &str) -> Vec<String> {

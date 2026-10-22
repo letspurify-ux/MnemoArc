@@ -136,7 +136,7 @@ impl Field {
             // Keep literal partial search (including Korean suffixes), but
             // avoid one-character noise and short ASCII substring matches.
             1
-        } else if hangul && self.text.contains(korean_stem(term)) {
+        } else if hangul && term.chars().count() >= 3 && self.text.contains(korean_stem(term)) {
             // A Korean query word carries its particle or ending ("설정을",
             // "저장하는"), which the stored text rarely repeats.
             1
