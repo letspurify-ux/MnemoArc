@@ -1140,6 +1140,70 @@ async fn rejected_json_schema_degrades_to_json_mode_and_is_remembered() {
     server.abort();
 }
 
+// A 400 says nothing about the schema when every fallback is refused too
+// (here an oversized prompt): the endpoint keeps strict output for the next
+// request instead of losing it for the rest of the process.
+#[tokio::test]
+async fn an_unrelated_bad_request_does_not_disable_strict_schemas() {
+    use std::sync::{Arc, Mutex};
+    let formats = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = formats.clone();
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let seen = seen.clone();
+            async move {
+                let format = body["response_format"]["type"]
+                    .as_str()
+                    .unwrap_or("none")
+                    .to_owned();
+                seen.lock().unwrap().push(format);
+                if body["messages"][0]["content"] == "too long" {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "maximum context length exceeded",
+                    )
+                        .into_response();
+                }
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    format!(
+                        "{}data: [DONE]\n\n",
+                        event(json!({"choices":[{"delta":{"content":"{\"issues\":[]}"},"finish_reason":"stop"}]}))
+                    ),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let c = Config {
+        base_url: format!("http://{}", listener.local_addr().unwrap()),
+        model: "unrelated-bad-request-test-model".into(),
+        retries: 0,
+        ..support::compact_config()
+    };
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let request = |content: &str| json!({"messages":[{"role":"user","content":content}],"response_format":strict_format()});
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let failed = OpenAiClient
+        .complete(request("too long"), &c, CancellationToken::new(), tx)
+        .await
+        .unwrap_err();
+    assert!(failed.to_string().starts_with("http_400"), "{failed}");
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let next = OpenAiClient
+        .complete(request("short"), &c, CancellationToken::new(), tx)
+        .await
+        .unwrap();
+    assert_eq!(next.attempts, 1);
+    assert_eq!(
+        *formats.lock().unwrap(),
+        ["json_schema", "json_object", "none", "json_schema"]
+    );
+    server.abort();
+}
+
 #[tokio::test]
 async fn rejected_json_mode_records_fallback_without_response_format() {
     let app = Router::new().route(

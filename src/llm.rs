@@ -913,6 +913,12 @@ impl LlmClient for OpenAiClient {
         let mut transient_retries = 0usize;
         let mut response_format_fallback = format_rejected;
         let mut schema_stream_fallback = false;
+        // A strict schema refused with a 400/422 is recorded for the endpoint
+        // only once the same request succeeds in plain JSON mode: the status
+        // alone cannot tell a schema refusal from an unrelated bad request
+        // (an oversized prompt, say), which then disabled strict output for
+        // every later request of the process.
+        let mut schema_rejection_fallback = false;
         let request_id = uuid::Uuid::new_v4().to_string();
         let mut attempt_diagnostics = Vec::new();
         loop {
@@ -934,6 +940,11 @@ impl LlmClient for OpenAiClient {
                 Ok(mut r) => {
                     if let Some(key) = &schema_key {
                         note_schema_stream_result(key, &request, schema_stream_fallback);
+                    }
+                    if schema_rejection_fallback
+                        && let Ok(mut rejected) = JSON_SCHEMA_REJECTED.lock()
+                    {
+                        rejected.insert(schema_endpoint(c));
                     }
                     // This request recovered by dropping a rejected format.
                     if response_format_fallback
@@ -958,9 +969,7 @@ impl LlmClient for OpenAiClient {
                         && response_format_rejected(&text)
                         && downgrade_json_schema(&mut request)
                     {
-                        if let Ok(mut rejected) = JSON_SCHEMA_REJECTED.lock() {
-                            rejected.insert(schema_endpoint(c));
-                        }
+                        schema_rejection_fallback = true;
                         record_attempt_failure(
                             &mut attempt_diagnostics,
                             &request_id,

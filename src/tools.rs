@@ -3282,7 +3282,12 @@ fn expand_fix_word(s: &Session, name: &str, args: &mut Value) -> Result<()> {
     }
     let doc = read_text(&path)?;
     let garbled = document_format::check(&doc).garbled;
-    let lines: Vec<&str> = doc.lines().collect();
+    // The check numbers lines as CommonMark reads them, where a lone CR ends
+    // a line too; str::lines kept such a line whole, so a word below a lone
+    // CR was refused as no garbled word. A line between CRs is still text of
+    // the saved document, so it serves as the edit's old_text.
+    let normalized = doc.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = normalized.lines().collect();
     // Batch edits apply in order, so a second fix on a line already fixed in
     // this batch starts from that line's new text, its column moved by the
     // length change of the fixes before it on the line.

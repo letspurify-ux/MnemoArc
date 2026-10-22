@@ -496,6 +496,33 @@ fn garbled_words_are_fixed_by_fix_id_without_retyping_them() {
     assert_eq!(audit["structural_ok"], true, "{audit}");
 }
 
+// The format check reads a lone CR as a line break, as CommonMark does; the
+// fix_id it gives a word below one must still find that word.
+#[test]
+fn a_garbled_word_below_a_lone_carriage_return_is_fixed_by_its_fix_id() {
+    let (dir, mut s) = setup();
+    let output = dir.path().join("guide.md");
+    std::fs::write(&output, "# 가이드\r\r도구 워커 인프รา 설명.\n").unwrap();
+    let audit = run(&mut s, "document_audit", json!({}));
+    let issue = audit["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|issue| issue["kind"] == "mixed_script_word")
+        .unwrap_or_else(|| panic!("{audit}"))
+        .clone();
+    let fixed = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"fix_word","fix_id":issue["fix_id"],"text":"인프라","expected_hash":audit["hash"]}),
+    );
+    assert_eq!(fixed["format_check"]["ok"], true, "{fixed}");
+    assert_eq!(
+        std::fs::read_to_string(&output).unwrap(),
+        "# 가이드\r\r도구 워커 인프라 설명.\n"
+    );
+}
+
 // Live run 2026-10-11: a correction turned Option\<Checkpoint\> into raw
 // Option<Checkpoint>, which Markdown reads as an HTML tag the page drops.
 #[test]
