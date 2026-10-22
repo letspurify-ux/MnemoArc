@@ -1109,7 +1109,17 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
     // pieces delivered shows the whole line was read. Without it, a citation
     // of such a line stayed unread however often it was read.
     for (path, gaps) in &mut missing {
-        if gaps.is_empty() {
+        // Only a file with delivered text coverage of its current version
+        // is read for it.
+        let current = versions
+            .entry(path.clone())
+            .or_insert_with(|| hash_file(path).ok());
+        if gaps.is_empty()
+            || s
+                .read_coverage
+                .get(path.to_string_lossy().as_ref())
+                .is_none_or(|coverage| current.as_deref() != Some(coverage.hash.as_str()))
+        {
             continue;
         }
         let Ok(text) = read_text(path) else {
