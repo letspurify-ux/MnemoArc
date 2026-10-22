@@ -408,10 +408,17 @@ fn plan_check(s: &mut Session) -> Option<String> {
     } else {
         (format!("done:{}", s.task.plan_revision), "Every item in task_plan is done. If a requested section or area is still unwritten, add items for it; otherwise give the final answer once the document is complete.".to_owned())
     };
-    s.progress_recovery
-        .plan_checks_shown
-        .insert(key)
-        .then_some(text)
+    // Every key of a kind grows (a count, a revision or a round), so an
+    // earlier key of the same kind is never checked again. Kept, they added
+    // one entry for each checkpoint and plan revision of a long task.
+    let shown = &mut s.progress_recovery.plan_checks_shown;
+    if shown.contains(&key) {
+        return None;
+    }
+    let kind = key.split(':').next().unwrap_or_default();
+    shown.retain(|old| old.split(':').next() != Some(kind));
+    shown.insert(key);
+    Some(text)
 }
 
 /// Everything a complete_with_gaps result must disclose, derived from state.
@@ -638,8 +645,12 @@ const UNRESOLVED_CLOSEOUT_ITEMS: usize = 10;
 /// item as unconfirmed; a live run listed its pending to-dos there,
 /// finished them and still ended complete_with_gaps reporting all three.
 fn unresolved_closeout(s: &mut Session) -> Option<String> {
-    let shown = &s.progress_recovery.unresolved_shown;
-    if s.task.unresolved.iter().all(|item| shown.contains(item)) {
+    // Only the task's current items are kept: every item a long task ever
+    // listed stayed here before.
+    let unresolved = &s.task.unresolved;
+    let shown = &mut s.progress_recovery.unresolved_shown;
+    shown.retain(|item| unresolved.contains(item));
+    if unresolved.iter().all(|item| shown.contains(item)) {
         return None;
     }
     s.progress_recovery
@@ -3669,6 +3680,56 @@ mod plan_check_tests {
             after_save.contains("against the saved document"),
             "{after_save}"
         );
+    }
+
+    // Each checkpoint of a long task used to leave its key behind.
+    #[test]
+    fn the_plan_checks_shown_keep_one_key_of_each_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::new(
+            Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            Config::compact_test(),
+        );
+        s.select_workflow("source_document").unwrap();
+        s.add_user("Write a source document".into());
+        tools::execute(
+            &mut s,
+            "task_plan",
+            json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":["Read the request flow","Write the document"]}]}),
+        )
+        .unwrap();
+        s.task_rounds = 1;
+        assert!(plan_check(&mut s).is_some());
+        for checkpoint in 1..=200 {
+            s.checkpoints_completed = checkpoint;
+            assert!(plan_check(&mut s).is_some(), "{checkpoint}");
+            // The same state is still pointed out once.
+            assert_eq!(plan_check(&mut s), None);
+        }
+        assert_eq!(
+            s.progress_recovery.plan_checks_shown,
+            ["checkpoint:200".to_owned(), PLAN_STRUCTURE_KEY.to_owned()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn unresolved_items_shown_are_only_the_current_ones() {
+        let mut s = Session::new(Project::default(), Config::compact_test());
+        s.task.unresolved = vec!["A".into()];
+        assert!(unresolved_closeout(&mut s).is_some());
+        assert_eq!(unresolved_closeout(&mut s), None);
+        for item in 0..100 {
+            s.task.unresolved = vec!["A".into(), format!("item {item}")];
+            assert!(unresolved_closeout(&mut s).is_some());
+        }
+        assert_eq!(unresolved_closeout(&mut s), None);
+        assert_eq!(s.progress_recovery.unresolved_shown.len(), 2);
     }
 }
 

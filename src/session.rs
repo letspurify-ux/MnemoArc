@@ -406,7 +406,7 @@ pub struct ProgressRecovery {
     #[serde(skip)]
     pub plan_checkpoints_seen: usize,
     /// task.unresolved items already shown before a final answer: each is
-    /// shown once, then reported as it stands.
+    /// shown once while it stays listed, then reported as it stands.
     #[serde(skip)]
     pub unresolved_shown: BTreeSet<String>,
     /// Whether a final answer was already sent back once to compare the
