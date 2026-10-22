@@ -5310,7 +5310,7 @@ fn observe_hashed_quality(
     s.memory
         .stale_path(source.path.as_deref().unwrap(), source.hash.as_deref());
     s.sources
-        .insert(source.id.clone(), std::sync::Arc::new(source.clone()));
+        .insert_counted(source.id.clone(), std::sync::Arc::new(source.clone()));
     source
 }
 /// Observations of the same content view, regardless of when they were made.
@@ -7464,7 +7464,7 @@ fn register_file_cursor(s: &mut Session, id: String, result: &Value) -> String {
     if let Some(existing) = existing_file_cursor(s, &cursor) {
         return existing.into();
     }
-    s.file_cursors.insert(id.clone(), cursor.into());
+    s.file_cursors.insert_counted(id.clone(), cursor.into());
     id
 }
 

@@ -1440,7 +1440,7 @@ async fn read_parallel(
                     {
                         cursor_ids.insert(id, canonical.clone());
                     } else {
-                        s.file_cursors.insert(id, cursor);
+                        s.file_cursors.insert_counted(id, cursor);
                     }
                 }
                 for (fingerprint, scope) in temp.list_cursor_scopes {
@@ -1466,7 +1466,7 @@ async fn read_parallel(
                             s.memory.stale_path(path, source.hash.as_deref());
                         }
                         let id = source_id.clone();
-                        s.sources.insert(id.clone(), source);
+                        s.sources.insert_counted(id.clone(), source);
                         id
                     };
                     source_ids.insert(source_id, id);

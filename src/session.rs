@@ -1143,7 +1143,8 @@ impl Session {
             hash: None,
             excerpt: text.chars().take(USER_EXCERPT_CHARS).collect(),
         };
-        self.sources.insert(source.id.clone(), Arc::new(source));
+        self.sources
+            .insert_counted(source.id.clone(), Arc::new(source));
     }
 
     fn add_request(&mut self, text: String, continuation: bool) {
@@ -1255,14 +1256,14 @@ impl Session {
     pub(crate) fn remember_call(&mut self, id: String, signature: String, result: Value) {
         if self
             .ledger
-            .insert(id.clone(), Arc::new((signature, result)))
+            .insert_counted(id.clone(), Arc::new((signature, result)))
             .is_none()
         {
             self.ledger_order.push_back(id);
         }
         while self.ledger_order.len() > LEDGER_CALLS {
             if let Some(oldest) = self.ledger_order.pop_front() {
-                self.ledger.remove(&oldest);
+                self.ledger.remove_counted(&oldest);
             }
         }
     }
@@ -1523,6 +1524,22 @@ mod history_tests {
         // The copy shared the maps before they changed and keeps its size.
         assert_eq!(snapshot.retained_bytes(), whole(&snapshot));
         assert!(s.retained_bytes() > snapshot.retained_bytes());
+        // Receipts past the ledger's limit replace the oldest; the size kept
+        // through those insertions and removals stays exact.
+        for i in 0..LEDGER_CALLS + 5 {
+            s.remember_call(
+                format!("call-{i}"),
+                "file_read:{}".into(),
+                json!({"status":"ok","data":{"text":"x".repeat(i % 7)}}),
+            );
+            assert!(s.ledger.len() <= LEDGER_CALLS);
+        }
+        s.remember_call(
+            "call-3".into(),
+            "file_read:{}".into(),
+            json!({"status":"ok"}),
+        );
+        assert_eq!(s.retained_bytes(), whole(&s));
     }
 
     #[test]
