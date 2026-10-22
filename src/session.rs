@@ -589,7 +589,7 @@ pub struct Session {
     pub read_only_turn: bool,
     pub memory: MemoryStore,
     pub history: SessionHistory,
-    pub sources: Shared<BTreeMap<String, Source>>,
+    pub sources: Shared<BTreeMap<String, Arc<Source>>>,
     pub file_cursors: Shared<BTreeMap<String, FileCursor>>,
     pub read_coverage: Shared<BTreeMap<String, ReadCoverage>>,
     /// Coverage page revisions let legacy offset callers detect intervening
@@ -598,7 +598,7 @@ pub struct Session {
     pub active_tools: BTreeSet<String>,
     pub pending_tools: Option<BTreeSet<String>>,
     pub checkpoint: Option<Checkpoint>,
-    pub ledger: Shared<BTreeMap<String, (String, Value)>>,
+    pub ledger: Shared<BTreeMap<String, Arc<(String, Value)>>>,
     /// Ledger keys in insertion order, for evicting the oldest.
     pub(crate) ledger_order: VecDeque<String>,
     pub latest_request: String,
@@ -839,7 +839,7 @@ impl Session {
             .map(|id| {
                 self.sources
                     .get(id)
-                    .cloned()
+                    .map(|source| Source::clone(source))
                     .or_else(|| {
                         self.memory
                             .entries
@@ -849,7 +849,8 @@ impl Session {
                             .cloned()
                     })
                     .ok_or_else(|| {
-                        let mut candidates: Vec<_> = self.sources.values().collect();
+                        let mut candidates: Vec<&Source> =
+                            self.sources.values().map(|source| &**source).collect();
                         candidates.sort_by_key(|s| std::cmp::Reverse(s.observed_at));
                         let choices: Vec<_> = candidates.into_iter().take(8).map(|s| json!({"id":s.id,"path":s.path,"start_line":s.start_line,"end_line":s.end_line})).collect();
                         anyhow::anyhow!("unknown_source: {id}; Use source_lookup with the matching path to recover an observed ID, or history to inspect the original result. A compact code_outline is navigation only and supplies no evidence ID. If no matching evidence exists, {}; do not save an unsupported fact. Do not substitute unrelated IDs or remove source_ids to bypass this error. Recent sources (not automatic replacements): {}", if self.checkpoint.is_some() { "record the pending read in checkpoint_complete progress and read the source after the checkpoint" } else { "file_read the range first and use the source ID it returns" }, json!(choices))
@@ -1112,7 +1113,7 @@ impl Session {
             hash: None,
             excerpt: text.chars().take(USER_EXCERPT_CHARS).collect(),
         };
-        self.sources.insert(source.id.clone(), source);
+        self.sources.insert(source.id.clone(), Arc::new(source));
     }
 
     fn add_request(&mut self, text: String, continuation: bool) {
@@ -1224,7 +1225,7 @@ impl Session {
     pub(crate) fn remember_call(&mut self, id: String, signature: String, result: Value) {
         if self
             .ledger
-            .insert(id.clone(), (signature, result))
+            .insert(id.clone(), Arc::new((signature, result)))
             .is_none()
         {
             self.ledger_order.push_back(id);
@@ -1424,6 +1425,24 @@ impl Session {
 #[cfg(test)]
 mod history_tests {
     use super::*;
+
+    // Each tool call runs beside a backup copy of the session, and the web
+    // view keeps another. A new source or call receipt copied every one
+    // already held, excerpts and results included, once per call.
+    #[test]
+    fn adding_a_source_or_receipt_beside_a_copy_shares_the_ones_held() {
+        let mut s = Session::new(Project::default(), Config::compact_test());
+        s.receive_message("Read the code".into()).unwrap();
+        s.remember_call("c1".into(), "file_read:{}".into(), json!({"status":"ok"}));
+        let copy = s.clone();
+        s.observe_user("Read more of the code");
+        s.remember_call("c2".into(), "file_read:{}".into(), json!({"status":"ok"}));
+        assert_eq!(s.sources.len(), copy.sources.len() + 1);
+        for (id, source) in copy.sources.iter() {
+            assert!(Arc::ptr_eq(source, &s.sources[id]));
+        }
+        assert!(Arc::ptr_eq(&copy.ledger["c1"], &s.ledger["c1"]));
+    }
 
     // The capacity checks sum the shared maps' cached sizes; the total must
     // stay what serializing every field in one array gives, also after the

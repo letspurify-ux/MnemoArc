@@ -77,10 +77,10 @@ async fn resuming_over_capacity_cannot_keep_appending_final_answers() {
     s.add_user("Keep the existing write receipt".into());
     s.ledger.insert(
         "retained-write".into(),
-        (
+        Arc::new((
             "file_write:receipt".into(),
             json!({"status":"ok","receipt":"x".repeat(s.config.memory_bytes)}),
-        ),
+        )),
     );
     let receipt = s.ledger.clone();
     let history = s.history.bytes();
@@ -226,7 +226,7 @@ async fn cleanup_preserves_request_and_receipts_and_expires_its_instruction_on_s
         s.add_user(ORIGINAL.into());
         s.ledger.insert(
             "saved-call".into(),
-            ("file_write:receipt".into(), json!({"status":"ok"})),
+            Arc::new(("file_write:receipt".into(), json!({"status":"ok"}))),
         );
         let ledger = s.ledger.clone();
         let criteria = s.task.completion.clone();

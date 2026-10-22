@@ -42,7 +42,7 @@ async fn configured_model_completes_checkpoint_with_inline_progress() {
         key:Some("comparison".into()), title:"설계 차이".into(), summary:"Alpha RAM, Beta file".into(),
         body:"Alpha는 RAM 기억을 사용한다. Beta는 기억을 파일에 저장한다. 원본 파일은 변경하지 않는다.".into(),
         tags:vec![], kind:MemoryKind::Fact, inferred:false, source_ids:vec![], metadata:json!(null), expected_revision:None,
-    }, s.sources.values().cloned().collect(), &s.config).unwrap();
+    }, s.sources.values().map(|source| mnemoarc::memory::Source::clone(source)).collect(), &s.config).unwrap();
     s.add_user("기억 정리 프로토콜 테스트다. 기존 기억에 필요한 사실이 이미 저장되어 있으므로 중복 저장하지 마. 대기 중인 체크포인트를 완료하고 진행 요약과 다음 작업을 보존해. 완료 후 두 설계 차이를 한 문장으로 답하고 종료해. 파일·도구 선택은 필요 없다.".into());
     ContextManager::prepare(&mut s, 60000).unwrap();
     let (tx, mut rx) = mpsc::channel(128);
@@ -167,7 +167,7 @@ async fn configured_model_resumes_readonly_investigation() {
         cp.failed = false;
         cp.acknowledged = false;
     }
-    fn source(value: &Value, sources: &mut BTreeMap<String, Source>) {
+    fn source(value: &Value, sources: &mut BTreeMap<String, Arc<Source>>) {
         if !value.is_object() {
             return;
         }
@@ -181,7 +181,7 @@ async fn configured_model_resumes_readonly_investigation() {
                 .get(&candidate.id)
                 .is_none_or(|old| old.excerpt.len() < candidate.excerpt.len())
         {
-            sources.insert(candidate.id.clone(), candidate);
+            sources.insert(candidate.id.clone(), Arc::new(candidate));
         }
     }
     let mut calls = BTreeMap::new();
@@ -217,7 +217,7 @@ async fn configured_model_resumes_readonly_investigation() {
             {
                 session
                     .ledger
-                    .insert(id.into(), (calls[id].clone(), result));
+                    .insert(id.into(), Arc::new((calls[id].clone(), result)));
             }
         }
     }

@@ -5183,7 +5183,7 @@ fn observe_hashed_quality(
             && source.evidence_truncated == quality.evidence_truncated
             && source.excerpt == excerpt.chars().take(2000).collect::<String>()
     }) {
-        return source.clone();
+        return Source::clone(source);
     }
     let source = Source {
         id: crate::memory::source_id(),
@@ -5200,7 +5200,8 @@ fn observe_hashed_quality(
     };
     s.memory
         .stale_path(source.path.as_deref().unwrap(), source.hash.as_deref());
-    s.sources.insert(source.id.clone(), source.clone());
+    s.sources
+        .insert(source.id.clone(), std::sync::Arc::new(source.clone()));
     source
 }
 /// Observations of the same content view, regardless of when they were made.
@@ -5386,7 +5387,7 @@ fn delivered_sources_for(
                     && end >= *want_start
             })
         {
-            found.push(source.clone());
+            found.push(Source::clone(source));
         }
     }
     found.sort_by_key(|source| (source.path.clone(), source.start_line));
@@ -6183,7 +6184,7 @@ fn execute_repaired(
                 .values()
                 .filter(|_| s.config.memory_reuse)
                 .flat_map(|m| &m.sources)
-                .chain(s.sources.values())
+                .chain(s.sources.values().map(|source| &**source))
             {
                 sources.insert(source.id.clone(), source);
             }
@@ -7453,7 +7454,7 @@ pub fn limit_result(
                 template["data"]["source"]["id"]
                     .as_str()
                     .and_then(|id| s.sources.get(id))
-                    .cloned()
+                    .map(|source| Source::clone(source))
                     .map(|mut source| {
                         source.id = crate::memory::source_id();
                         template["data"]["source"]["id"] = json!(source.id);
@@ -7566,7 +7567,8 @@ pub fn limit_result(
                     {
                         output["data"]["source"]["id"] = json!(existing.id);
                     } else {
-                        s.sources.insert(source.id.clone(), source);
+                        s.sources
+                            .insert(source.id.clone(), std::sync::Arc::new(source));
                     }
                 }
                 return output;
@@ -7859,7 +7861,8 @@ fn run_call_inner(
         return envelope(Err(anyhow::anyhow!("response_size_limit")));
     }
     let signature = format!("{}:{}", call.name, call.arguments);
-    if let Some((stored, result)) = s.ledger.get(&call.id) {
+    if let Some(entry) = s.ledger.get(&call.id) {
+        let (stored, result) = &**entry;
         return if stored == &signature {
             result.clone()
         } else {
