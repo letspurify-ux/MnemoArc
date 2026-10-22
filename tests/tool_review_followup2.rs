@@ -498,3 +498,37 @@ fn a_symbol_id_of_another_file_says_so() {
         assert!(error.contains("another file"), "{tool}: {error}");
     }
 }
+
+/// A continuation names its tool; a model that sent next_cursor whole as
+/// the call's arguments was refused for an unknown argument `tool`.
+#[test]
+fn a_continuation_sent_whole_as_arguments_continues() {
+    let (_dir, mut s) = setup();
+    let id = s.history.push(
+        vec![json!({"role":"user","content":"word ".repeat(40_000)})],
+        true,
+    );
+    let first = call(&mut s, "c1", "history", json!({"action":"read","id":id}));
+    let next = first["next_cursor"].clone();
+    assert_eq!(next["tool"], "history");
+    let second = call(&mut s, "c2", "history", next.clone());
+    assert_eq!(second["status"], "ok", "{second}");
+    let by_cursor = call(&mut s, "c3", "history", json!({"cursor":next}));
+    assert_eq!(second["data"], by_cursor["data"]);
+}
+
+/// A host and port or a URL beside code is no citation of it.
+#[test]
+fn code_beside_a_host_and_port_is_still_uncited() {
+    let doc = "# T\n\n## Setup\n\nConnect to api.example.com:443 or https://example.com/a.rs:3.\n\n```rust\nfn main() {}\n```\n";
+    let (_dir, mut s) = document("");
+    std::fs::remove_file(s.project.output.clone()).unwrap();
+    tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"create","text":doc}),
+    )
+    .unwrap();
+    let advice = tools::uncited_code(&s).expect("the code section is flagged");
+    assert!(advice.to_string().contains("## Setup"), "{advice}");
+}

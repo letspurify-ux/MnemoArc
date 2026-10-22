@@ -1466,11 +1466,11 @@ pub(super) fn uncited_code_check(s: &Session, output: &Path, doc: &str) -> Optio
         .filter_map(|line| {
             let label = note.captures(line)?;
             let rest = &line[label.get(0)?.end()..];
-            pattern.is_match(rest).then(|| format!("[^{}]", &label[1]))
+            line_cites(&pattern, rest).then(|| format!("[^{}]", &label[1]))
         })
         .collect();
     let cites = |line: &&str| {
-        pattern.is_match(line)
+        line_cites(&pattern, line)
             || cited_notes
                 .iter()
                 .any(|label| line.contains(label.as_str()))
@@ -1745,6 +1745,15 @@ fn network_address(path: &str, separator: &str) -> bool {
         && path.rsplit_once('.').is_some_and(|(name, suffix)| {
             !name.is_empty() && HOST_SUFFIXES.contains(&suffix.to_ascii_lowercase().as_str())
         })
+}
+
+/// Whether a line holds a citation, as the citation checks read one: not
+/// a URL and not a host with its port.
+fn line_cites(pattern: &regex::Regex, line: &str) -> bool {
+    pattern.captures_iter(line).any(|c| {
+        let whole = c.get(0).unwrap();
+        !url_prefix(&line[..whole.start()], whole.as_str()) && !network_address(&c[1], &c[2])
+    })
 }
 
 /// A cited path as written, with %XX escapes decoded: a path holding a

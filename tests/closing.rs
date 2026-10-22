@@ -3365,3 +3365,64 @@ async fn a_run_ended_by_a_tool_failure_records_the_tool_stage() {
     );
     assert_eq!(run.last_stage, "tools");
 }
+
+/// Reads run on parallel workers whose temporary sessions hold no closing
+/// state, so a file_list or source_search closing withholds ran anyway when
+/// the model called it.
+#[tokio::test]
+async fn a_read_closing_withholds_is_refused_on_the_run_path_too() {
+    // Nothing saved yet: outside verification, reads run on the parallel
+    // workers.
+    let (_dir, mut s) = unsaved_fixture(false);
+    s.active_tools = ToolRegistry::optional_names();
+    // Requests without progress lead into closing; the model goes on
+    // searching after it began.
+    let mut steps: Vec<Completion> = (0..12)
+        .map(|i| call(&format!("inspect-{i}"), "document_inspect", json!({})))
+        .collect();
+    steps.extend((0..24).map(|i| {
+        call(
+            &format!("search-{i}"),
+            "source_search",
+            json!({"query":"normalize"}),
+        )
+    }));
+    steps.push(Completion {
+        text: "Saved out.md".into(),
+        ..Default::default()
+    });
+    let (result, _) = run_scripted(s, steps).await;
+    let searches: Vec<Value> = result
+        .history
+        .bundles
+        .iter()
+        .flat_map(|bundle| &bundle.messages)
+        .filter(|message| {
+            message["role"] == "tool"
+                && message["tool_call_id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("search-"))
+        })
+        .map(|message| serde_json::from_str(message["content"].as_str().unwrap()).unwrap())
+        .collect();
+    // The second stall stage withholds discovery first, then closing.
+    let refused = searches.iter().position(|output| {
+        matches!(
+            output["recovery"]["code"].as_str(),
+            Some("progress_recovery" | "closing_mode")
+        )
+    });
+    assert!(refused.is_some(), "{searches:?}");
+    assert!(
+        searches
+            .iter()
+            .any(|output| output["recovery"]["code"] == "closing_mode"),
+        "{searches:?}"
+    );
+    assert!(
+        searches[refused.unwrap()..]
+            .iter()
+            .all(|output| output["status"] != "ok"),
+        "{searches:?}"
+    );
+}

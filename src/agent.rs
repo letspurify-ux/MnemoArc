@@ -1339,6 +1339,17 @@ fn rebase_document_call(call: &ToolCall, hash: Option<&str>) -> (ToolCall, bool)
     rebased.arguments = arguments;
     (rebased, true)
 }
+/// A read that may run on a parallel worker. The worker's temporary session
+/// holds no closing or progress-recovery state, so a read those withhold
+/// goes through execute_one, which refuses it: run in parallel, a withheld
+/// file_list or source_search ran in closing mode.
+fn parallel_read(s: &Session, name: &str) -> bool {
+    ["file_list", "file_read", "source_search"].contains(&name)
+        && s.active_tools.contains(name)
+        && !ToolRegistry::closing_withholds(s, name)
+        && !ToolRegistry::recovery_withholds(s, name)
+}
+
 async fn read_parallel(
     s: &mut Session,
     calls: &[ToolCall],
@@ -2785,9 +2796,7 @@ pub async fn run_session_controlled(
             };
             let malformed_call = call.id.trim().is_empty() || call.name.trim().is_empty();
             let duplicate_call_id = seen_call_ids.contains(&call.id);
-            let parallel = ["file_list", "file_read", "source_search"]
-                .contains(&call.name.as_str())
-                && s.active_tools.contains(&call.name)
+            let parallel = parallel_read(&s, &call.name)
                 && s.checkpoint.is_none()
                 && s.run_guidance["phase"] != "verify"
                 // Parallel workers use isolated temporary sessions. A call
@@ -2802,9 +2811,7 @@ pub async fn run_session_controlled(
                 let mut group_call_ids = std::collections::BTreeSet::new();
                 group_call_ids.insert(call.id.clone());
                 while i + group < execution_calls.len()
-                    && ["file_list", "file_read", "source_search"]
-                        .contains(&execution_calls[i + group].name.as_str())
-                    && s.active_tools.contains(&execution_calls[i + group].name)
+                    && parallel_read(&s, &execution_calls[i + group].name)
                     && !s.ledger.contains_key(&execution_calls[i + group].id)
                     && !execution_calls[i + group].id.trim().is_empty()
                     && !execution_calls[i + group].name.trim().is_empty()
@@ -3343,6 +3350,36 @@ fn console_report(result: &Session) -> String {
     }
     report.push('\n');
     report
+}
+
+#[cfg(test)]
+mod parallel_read_tests {
+    use super::*;
+
+    // Parallel workers run on a temporary session without closing or
+    // progress-recovery state; a read either withholds must not go there.
+    #[test]
+    fn withheld_reads_do_not_run_on_parallel_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::new(
+            crate::config::Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            crate::config::Config::compact_test(),
+        );
+        s.active_tools = ToolRegistry::optional_names();
+        s.task.workflow = "source_document".into();
+        assert!(parallel_read(&s, "source_search"));
+        s.document_written = true;
+        s.progress_recovery.rounds_since_best = s.config.stall_round_limit * 2;
+        assert!(!parallel_read(&s, "source_search"));
+        assert!(parallel_read(&s, "file_read"));
+        s.progress_recovery.rounds_since_best = 0;
+        s.progress_recovery.closing = Some(Default::default());
+        assert!(!parallel_read(&s, "file_list"));
+    }
 }
 
 #[cfg(test)]

@@ -5850,6 +5850,13 @@ fn drop_new_key_zero_revision(s: &Session, input: &mut Value) {
 /// adjustments to report.
 fn normalize_call_arguments(s: &Session, name: &str, args: &mut Value) -> Result<Vec<String>> {
     unwrap_task_state_call(name, args);
+    // A continuation (next_cursor) names its tool; sent whole as the call's
+    // arguments, that name was refused as an unknown argument.
+    if let Some(fields) = args.as_object_mut()
+        && fields.get("tool").and_then(Value::as_str) == Some(name)
+    {
+        fields.remove("tool");
+    }
     normalize_integer_arguments(name, args);
     let mut adjusted = complete_unclosed_json_arguments(name, args);
     adjusted.extend(clamp_size_arguments(name, args));
