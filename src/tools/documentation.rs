@@ -1104,6 +1104,41 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
             gaps.push((next, citation.end));
         }
     }
+    // A line longer than one page reaches the model in pieces, each one a
+    // partial line that attests nothing alone; the text coverage of the
+    // pieces delivered shows the whole line was read. Without it, a citation
+    // of such a line stayed unread however often it was read.
+    for (path, gaps) in &mut missing {
+        if gaps.is_empty() {
+            continue;
+        }
+        let Ok(text) = read_text(path) else {
+            continue;
+        };
+        let (_, covered) = super::coverage::report(s, path, &text, 0, 1);
+        if !covered.contains(&true) {
+            continue;
+        }
+        let mut unread = Vec::new();
+        for &(start, end) in gaps.iter() {
+            let mut from = None;
+            for line in start..=end {
+                let read = covered.get(line - 1).copied().unwrap_or(false);
+                match (read, from) {
+                    (false, None) => from = Some(line),
+                    (true, Some(first)) => {
+                        unread.push((first, line - 1));
+                        from = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(first) = from {
+                unread.push((first, end));
+            }
+        }
+        *gaps = unread;
+    }
     let root = s.project.root.canonicalize()?;
     let mut issues = vec![];
     for (path, mut gaps) in missing {

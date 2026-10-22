@@ -576,3 +576,46 @@ fn a_too_broad_outline_names_the_filters_that_narrow_it() {
     .unwrap();
     assert_eq!(narrowed["symbols"].as_array().unwrap().len(), 1);
 }
+
+/// A line longer than one page is delivered in partial pieces, none of
+/// which attests the line alone; its citation stayed unread even after a
+/// cursor had delivered every piece.
+#[test]
+fn a_line_read_whole_across_cursor_pages_is_read() {
+    let long: String = (0..9000).map(|i| format!("w{i} ")).collect();
+    let (dir, mut s) = document("# T\n\nThe string is long. a.rs:2\n");
+    write(
+        &dir,
+        "a.rs",
+        &format!("fn a() {{}}\nlet s = \"{long}\";\nfn b() {{}}\n"),
+    );
+    let deliver = |s: &mut Session, id: &str, args: Value| {
+        let call = ToolCall {
+            id: id.into(),
+            name: "file_read".into(),
+            arguments: args.to_string(),
+        };
+        let result = tools::run_call(s, &call);
+        let limit = s.config.result_budget();
+        let result = tools::limit_result(s, &call, result, limit);
+        tools::record_delivered_read(s, &call, &result);
+        result
+    };
+    let unread = |s: &Session| {
+        tools::unread_citations(s)
+            .unwrap()
+            .iter()
+            .any(|issue| issue["path"] == "a.rs" && issue["start_line"] == 2)
+    };
+    let mut page = deliver(&mut s, "p0", json!({"path":"a.rs"}));
+    assert_eq!(page["truncated"], true, "the line spans pages");
+    assert!(unread(&s), "one piece is not the line");
+    let mut pages = 1;
+    while let Some(cursor) = page["next_cursor"]["cursor"].as_str().map(str::to_owned) {
+        page = deliver(&mut s, &format!("p{pages}"), json!({"cursor":cursor}));
+        pages += 1;
+        assert!(pages < 50);
+    }
+    assert!(pages > 2, "{pages}");
+    assert!(!unread(&s), "every piece was delivered");
+}
