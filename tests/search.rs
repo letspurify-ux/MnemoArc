@@ -786,3 +786,150 @@ fn file_list_text_mode_notices_a_file_that_stopped_being_text() {
     let listed = tools::execute(&mut s, "file_list", json!({})).unwrap();
     assert_eq!(listed["total_files"], 0, "{listed}");
 }
+
+/// Tool review 2026-10-23 (sixth pass): a files or count page over the
+/// result budget was not shortened like a matches page; the whole page went
+/// to the history archive and the model saw only "follow next_cursor".
+#[test]
+fn files_and_count_pages_over_the_budget_are_shortened_and_continue() {
+    let (dir, mut s) = setup();
+    s.config.result_tokens = Some(1000);
+    let names: Vec<String> = (0..60)
+        .map(|i| format!("{}{i:03}.rs", "n".repeat(40)))
+        .collect();
+    for name in &names {
+        std::fs::write(dir.path().join(name), "hit\n").unwrap();
+    }
+    for (mode, field) in [("files", "files"), ("count", "counts")] {
+        let mut listed = Vec::new();
+        let mut args = json!({"query":"hit","mode":mode,"limit":100});
+        for call in 0.. {
+            let result = tools::run_call(
+                &mut s,
+                &mnemoarc::llm::ToolCall {
+                    id: format!("{mode}{call}"),
+                    name: "source_search".into(),
+                    arguments: args.to_string(),
+                },
+            );
+            assert_eq!(result["status"], "ok", "{result}");
+            let rows = result["data"][field].as_array().unwrap();
+            assert!(!rows.is_empty(), "{result}");
+            listed.extend(rows.iter().map(|row| {
+                let path = if mode == "files" { row } else { &row["path"] };
+                path.as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            }));
+            let Some(cursor) = result["data"]["next_cursor"].as_str() else {
+                break;
+            };
+            args = json!({"query":"hit","mode":mode,"limit":100,"cursor":cursor});
+            assert!(call < 30);
+        }
+        assert_eq!(listed, names, "{mode}");
+    }
+}
+
+/// Tool review 2026-10-23 (sixth pass): each search page read and matched
+/// every file in scope again; a file whose version an earlier page scanned
+/// is now read only for the matches its page shows. Pages, counts and
+/// changed files come out as a fresh scan gives them.
+#[test]
+fn later_search_pages_reuse_file_scans_and_notice_changed_files() {
+    let (dir, mut s) = setup();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+    let settle = |path: &std::path::Path| {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    };
+    for i in 0..30 {
+        let path = dir.path().join(format!("f{i:02}.rs"));
+        let body: String = (0..i % 4)
+            .map(|j| format!("scanhit {i} {j}\nother\n"))
+            .collect();
+        std::fs::write(&path, body).unwrap();
+        settle(&path);
+    }
+    let page_lines = |s: &mut Session, args: Value| -> (Vec<(String, u64)>, Value) {
+        let mut seen = Vec::new();
+        let mut args = args;
+        let mut last;
+        loop {
+            last = search(s, args.clone());
+            for row in last["matches"].as_array().unwrap() {
+                let name = row["path"].as_str().unwrap().rsplit('/').next().unwrap();
+                seen.push((name.to_owned(), row["line"].as_u64().unwrap()));
+            }
+            match last["next_cursor"].as_str() {
+                Some(cursor) => args["cursor"] = json!(cursor),
+                None => break,
+            }
+        }
+        (seen, last)
+    };
+    let expected = |dir: &std::path::Path| -> Vec<(String, u64)> {
+        let mut rows = Vec::new();
+        for i in 0..30 {
+            let name = format!("f{i:02}.rs");
+            let text = std::fs::read_to_string(dir.join(&name)).unwrap();
+            for (line, content) in text.lines().enumerate() {
+                if content.contains("scanhit") {
+                    rows.push((name.clone(), line as u64 + 1));
+                }
+            }
+        }
+        rows
+    };
+    for _ in 0..2 {
+        let (seen, last) = page_lines(&mut s, json!({"query":"scanhit","limit":7}));
+        assert_eq!(seen, expected(dir.path()));
+        assert_eq!(last["total_matching_lines"], 43);
+        assert_eq!(last["matched_files"], 30);
+    }
+    let counts = search(
+        &mut s,
+        json!({"query":"scanhit","mode":"count","limit":100}),
+    );
+    assert_eq!(counts["matching_files"], 22);
+    assert_eq!(
+        counts["counts"][0]["path"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next(),
+        Some("f01.rs")
+    );
+    assert_eq!(counts["counts"][0]["matching_lines"], 1);
+    // A changed file is scanned again, even with its old modification time.
+    let changed = dir.path().join("f01.rs");
+    std::fs::write(&changed, "scanhit a\nscanhit b\nscanhit c\n").unwrap();
+    settle(&changed);
+    let (seen, last) = page_lines(&mut s, json!({"query":"scanhit","limit":7}));
+    assert_eq!(seen, expected(dir.path()));
+    assert_eq!(last["total_matching_lines"], 45);
+    let counts = search(
+        &mut s,
+        json!({"query":"scanhit","mode":"count","limit":100}),
+    );
+    assert_eq!(counts["counts"][0]["matching_lines"], 3);
+    // A cursor issued before the change no longer continues.
+    let first = search(&mut s, json!({"query":"scanhit","limit":7}));
+    std::fs::write(&changed, "scanhit a\n").unwrap();
+    settle(&changed);
+    let error = tools::execute(
+        &mut s,
+        "source_search",
+        json!({"query":"scanhit","limit":7,"cursor":first["next_cursor"]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("cursor_expired"), "{error}");
+}

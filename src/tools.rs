@@ -4995,11 +4995,16 @@ fn cached_digest<T>(
         .and_then(field)
 }
 
+/// Whether a file version is old enough to cache (see FileDigest).
+fn settled(version: &FileVersion) -> bool {
+    std::time::SystemTime::now()
+        .duration_since(version.1)
+        .is_ok_and(|age| age >= DIGEST_SETTLE)
+}
+
 fn remember_digest(path: &Path, version: FileVersion, update: impl FnOnce(&mut FileDigest)) {
     let mut cache = digest_cache().lock().unwrap_or_else(|p| p.into_inner());
-    let settled = std::time::SystemTime::now()
-        .duration_since(version.1)
-        .is_ok_and(|age| age >= DIGEST_SETTLE);
+    let settled = settled(&version);
     if !settled
         || cache
             .get(path)
@@ -5468,6 +5473,7 @@ fn walked_text(path: &Path) -> Result<Option<(String, Option<FileVersion>)>> {
     Ok(text)
 }
 /// walked_text with the file's digest (read_text_hashed).
+#[cfg(test)]
 fn search_text_hashed(path: &Path) -> Result<Option<(String, String)>> {
     Ok(walked_text(path)?.map(|text| with_digest(path, text)))
 }
@@ -8017,7 +8023,13 @@ pub fn limit_result(
 
     // Collections stay structured; a shortened native page resumes at the
     // first omitted item, while non-paginated collections use the archive.
-    for field in ["paths", "matches", "items", "outline"] {
+    // source_search's files and count pages are collections too: left out,
+    // an over-budget page went whole to the archive. (file_patch's files
+    // report writes and are never shortened.)
+    for field in ["paths", "matches", "files", "counts", "items", "outline"] {
+        if matches!(field, "files" | "counts") && call.name != "source_search" {
+            continue;
+        }
         let Some(items) = output["data"][field].as_array().cloned() else {
             continue;
         };

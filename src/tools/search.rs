@@ -13,6 +13,93 @@ fn displayed_line(line: usize, text: &str) -> Value {
     json!({"line":line,"text":text.chars().take(500).collect::<String>(),"truncated":text.chars().nth(500).is_some()})
 }
 
+/// A searched text file at one version and how many of its lines the
+/// expression matches. Its digest is the digest cache's.
+struct ScannedFile {
+    version: FileVersion,
+    matching_lines: usize,
+}
+
+/// A walked file's digest and matching-line count from an earlier scan.
+struct Scanned {
+    digest: String,
+    matching_lines: usize,
+}
+
+/// Recent search expressions, each with the files a search of it scanned.
+/// Every page of a search read and matched every file in scope again (a
+/// 20,000-file scope took 360ms a page, 38ms of it the walk); a file at a
+/// version scanned before is read only when its matches fall on the page.
+/// Versions follow the digest cache's rules (settled, unchanged across the
+/// read).
+#[derive(Default)]
+struct ScanCache {
+    scans: std::collections::VecDeque<(String, std::collections::HashMap<PathBuf, ScannedFile>)>,
+    entries: usize,
+}
+
+const SCAN_CACHE_EXPRESSIONS: usize = 8;
+/// Files kept across all expressions, as many as one scan can list.
+const SCAN_CACHE_ENTRIES: usize = 100_000;
+
+fn scan_cache() -> &'static std::sync::Mutex<ScanCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ScanCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// The scan of `path` an earlier search of `key` made at its current version.
+fn scanned(key: &str, path: &Path) -> Option<Scanned> {
+    let version = super::file_version(&path.metadata().ok()?).ok()?;
+    let matching_lines = scan_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .scans
+        .iter()
+        .find(|(known, _)| known == key)?
+        .1
+        .get(path)
+        .filter(|file| file.version == version)?
+        .matching_lines;
+    Some(Scanned {
+        digest: super::cached_digest(path, version, |entry| entry.hash.clone())?,
+        matching_lines,
+    })
+}
+
+fn remember_scan(key: &str, path: &Path, file: ScannedFile) {
+    if !super::settled(&file.version) {
+        return;
+    }
+    let mut cache = scan_cache().lock().unwrap_or_else(|p| p.into_inner());
+    let ScanCache { scans, entries } = &mut *cache;
+    if !scans.iter().any(|(known, _)| known == key) {
+        if scans.len() >= SCAN_CACHE_EXPRESSIONS
+            && let Some((_, dropped)) = scans.pop_front()
+        {
+            *entries -= dropped.len();
+        }
+        scans.push_back((key.to_owned(), Default::default()));
+    }
+    let position = |scans: &std::collections::VecDeque<(String, _)>| {
+        scans.iter().position(|(known, _)| known == key).unwrap()
+    };
+    // Room for a new file is made by dropping the oldest other expression,
+    // or this one's files when it is the only one.
+    while *entries >= SCAN_CACHE_ENTRIES && !scans[position(scans)].1.contains_key(path) {
+        let oldest = if position(scans) == 0 { 1 } else { 0 };
+        let dropped = if oldest < scans.len() {
+            scans.remove(oldest).unwrap().1.len()
+        } else {
+            std::mem::take(&mut scans[0].1).len()
+        };
+        *entries -= dropped;
+    }
+    let index = position(scans);
+    if scans[index].1.insert(path.to_path_buf(), file).is_none() {
+        *entries += 1;
+    }
+}
+
 /// A matcher of the search expression over a whole file that matches
 /// wherever one of its lines matches, `^` and `$` matching at line ends: a
 /// file it does not match has no matching line, and a file it matches is
@@ -367,14 +454,51 @@ pub(super) fn execute(
         }
         None => candidate_paths_scoped(&s.project, scope_glob, cancel, directory.as_deref(), None)?,
     };
+    // What a file's scan depends on: the expression and its case.
+    let scan_key = hash(&serde_json::to_vec(
+        &json!({"expression":expression,"case_sensitive":case_sensitive}),
+    )?);
     for path in candidates {
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
-        let text = if named {
-            super::named_text_hashed(&path)?
+        // A walked file scanned before at this version is read again only
+        // for the lines this page shows.
+        if !named && let Some(scanned) = scanned(&scan_key, &path) {
+            let first = total_matching_lines;
+            let count = scanned.matching_lines;
+            let on_page = mode == "matches"
+                && count > 0
+                && first < requested_end
+                && first + count > requested_offset;
+            if !on_page {
+                matched_files += 1;
+                fingerprint.update(serde_json::to_vec(&(
+                    path.to_string_lossy(),
+                    &scanned.digest,
+                ))?);
+                total_matching_lines += count;
+                if count > 0 {
+                    let index = matching_file_count;
+                    if mode != "matches" && index >= requested_offset && index < requested_end {
+                        files.push(
+                            json!({"path":path,"hash":scanned.digest,"matching_lines":count}),
+                        );
+                    }
+                    matching_file_count += 1;
+                }
+                continue;
+            }
+        }
+        let (text, version) = if named {
+            (super::named_text_hashed(&path)?, None)
         } else {
-            search_text_hashed(&path)?
+            match super::walked_text(&path)? {
+                Some((text, version)) => {
+                    (Some(super::with_digest(&path, (text, version))), version)
+                }
+                None => (None, None),
+            }
         };
         let Some((contents, digest)) = text else {
             continue;
@@ -439,6 +563,16 @@ pub(super) fn execute(
                 text,
                 context,
             });
+        }
+        if let Some(version) = version {
+            remember_scan(
+                &scan_key,
+                &path,
+                ScannedFile {
+                    version,
+                    matching_lines,
+                },
+            );
         }
         if matching_lines > 0 {
             if mode != "matches" {
