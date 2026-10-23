@@ -8443,9 +8443,9 @@ pub fn limit_result(
         call: &crate::llm::ToolCall,
         args: &Value,
         field: &str,
-        original_len: usize,
-        retained_len: usize,
+        (original_len, retained_len): (usize, usize),
         archive: u64,
+        memory_page: Option<&str>,
     ) -> bool {
         if retained_len >= original_len {
             return false;
@@ -8494,7 +8494,14 @@ pub fn limit_result(
             data["next_cursor"] = json!(id);
             return true;
         }
-        if data["next_offset"].is_u64() {
+        // An offset-paged result's last page has a null next_offset: a
+        // shortened one continues at the first item left out too (a
+        // source_lookup or task_state details page lost its last items to
+        // the archive).
+        if data
+            .get("next_offset")
+            .is_some_and(|next| next.is_u64() || next.is_null())
+        {
             data["next_offset"] = json!(start + retained_len);
             return true;
         }
@@ -8503,6 +8510,11 @@ pub fn limit_result(
         if matches!(call.name.as_str(), "file_list" | "source_search")
             && let Some(fingerprint) = data["hash"].as_str()
         {
+            data["next_cursor"] = json!(format!("{fingerprint}:{}", start + retained_len));
+            return true;
+        }
+        // memory_find's cursor is the store's page fingerprint and an index.
+        if let Some(fingerprint) = memory_page {
             data["next_cursor"] = json!(format!("{fingerprint}:{}", start + retained_len));
             return true;
         }
@@ -8518,8 +8530,20 @@ pub fn limit_result(
     // source_search's files and count pages are collections too: left out,
     // an over-budget page went whole to the archive. (file_patch's files
     // report writes and are never shortened.)
-    for field in ["paths", "matches", "files", "counts", "items", "outline"] {
-        if matches!(field, "files" | "counts") && call.name != "source_search" {
+    let memory_page = (call.name == "memory_find" && result["status"] == "ok").then(|| {
+        s.memory
+            .page_fingerprint(args["query"].as_str().unwrap_or(""), &list(&args, "tags"))
+    });
+    // document_audit's issues page by offset; a database result's rows show
+    // their first rows with the archive for the rest. Left out, an audit of
+    // 60 issues went whole to the archive at a 3000-token budget.
+    for field in [
+        "paths", "matches", "files", "counts", "items", "outline", "issues", "rows",
+    ] {
+        if matches!(field, "files" | "counts") && call.name != "source_search"
+            || field == "issues" && call.name != "document_audit"
+            || field == "rows" && !matches!(call.name.as_str(), "db_query" | "db_execute")
+        {
             continue;
         }
         let Some(items) = output["data"][field].as_array().cloned() else {
@@ -8546,9 +8570,9 @@ pub fn limit_result(
                 call,
                 &args,
                 field,
-                items.len(),
-                keep,
+                (items.len(), keep),
                 archive,
+                memory_page.as_deref(),
             );
             if !native && keep == items.len() {
                 // Nothing left out of the collection: what was cut is

@@ -215,7 +215,7 @@ impl MemoryStore {
         Ok(owner.map(|memory| &**memory))
     }
 
-    fn page_fingerprint(&self, query: &str, tags: &[String]) -> String {
+    pub(crate) fn page_fingerprint(&self, query: &str, tags: &[String]) -> String {
         let input = serde_json::to_vec(&(self.generation, query, tags))
             .expect("memory page cursor input is always serializable");
         format!("{:x}", Sha256::digest(input))

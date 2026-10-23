@@ -997,3 +997,107 @@ fn search_matches_left_out_of_a_page_attest_nothing() {
     search(&mut s, "s3", 800);
     assert!(tools::unread_citations(&s).unwrap().is_empty());
 }
+
+/// Tool review 2026-10-23: a last page shortened to fit had no cursor when
+/// its tool pages by offset (source_lookup) or by the memory store's
+/// fingerprint (memory_find), and an audit page was never shortened: the
+/// items left out, or a whole audit of 60 issues, were reachable only
+/// through the history archive. Each now continues where it was cut.
+#[test]
+fn shortened_last_pages_and_audits_continue_where_they_were_cut() {
+    let (dir, mut s) = document("# T\n");
+    let body: String = (0..120)
+        .map(|i| format!("fn f{i}() {{ value_{i} }} {}\n", "가".repeat(80)))
+        .collect();
+    write(&dir, "src/a.rs", &body);
+    let mut n = 0;
+    let mut call = |s: &mut Session, name: &str, args: serde_json::Value, budget: usize| {
+        n += 1;
+        let call = mnemoarc::llm::ToolCall {
+            id: format!("c{n}"),
+            name: name.into(),
+            arguments: args.to_string(),
+        };
+        let result = tools::run_call(s, &call);
+        let result = tools::limit_result(s, &call, result, budget);
+        tools::record_delivered_read(s, &call, &result);
+        result
+    };
+    let mut sources = Vec::new();
+    for k in 0..20 {
+        let read = call(
+            &mut s,
+            "file_read",
+            json!({"path":"src/a.rs","start_line":1 + k * 6,"max_lines":5}),
+            20_000,
+        );
+        sources.push(read["data"]["source"]["id"].as_str().unwrap().to_owned());
+    }
+    // source_lookup by offset: every source once.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut offset = 0;
+    for _ in 0..100 {
+        let page = call(
+            &mut s,
+            "source_lookup",
+            json!({"path":"a.rs","offset":offset,"limit":10}),
+            900,
+        );
+        assert!(page["archive_id"].is_null(), "{page}");
+        for item in page["data"]["items"].as_array().unwrap() {
+            seen.insert(item["id"].as_str().unwrap().to_owned());
+        }
+        match page["data"]["next_offset"].as_u64() {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    assert_eq!(seen, sources.iter().cloned().collect());
+    // memory_find by cursor: every memory once.
+    let mut memories = std::collections::BTreeSet::new();
+    for (m, source) in sources.iter().take(12).enumerate() {
+        let saved = call(
+            &mut s,
+            "memory_write",
+            json!({"title":format!("Memo {m} value"),"summary":format!("{} {m}", "요약".repeat(60)),"body":"b","kind":"fact","source_ids":[source]}),
+            20_000,
+        );
+        memories.insert(saved["data"]["id"].as_str().unwrap().to_owned());
+    }
+    let mut found = std::collections::BTreeSet::new();
+    let mut args = json!({"query":"value","limit":12});
+    for _ in 0..100 {
+        let page = call(&mut s, "memory_find", args.clone(), 900);
+        assert!(page["archive_id"].is_null(), "{page}");
+        for item in page["data"]["items"].as_array().unwrap() {
+            found.insert(item["id"].as_str().unwrap().to_owned());
+        }
+        match page["data"]["next_cursor"].as_str() {
+            Some(cursor) => args["cursor"] = json!(cursor),
+            None => break,
+        }
+    }
+    assert_eq!(found, memories);
+    // document_audit: a shortened page of issues, continued by offset.
+    let mut doc = String::from("# T\n\n");
+    for i in 0..60 {
+        doc.push_str(&format!("## S{i}\n\nClaim {i} (missing/f{i}.rs:1-3).\n\n"));
+    }
+    std::fs::write(dir.path().join("summary.md"), &doc).unwrap();
+    let mut listed = 0;
+    let mut total = None;
+    let mut args = json!({});
+    for _ in 0..100 {
+        let page = call(&mut s, "document_audit", args.clone(), 1500);
+        let issues = page["data"]["issues"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{page}"));
+        total.get_or_insert(page["data"]["issue_count"].as_u64().unwrap());
+        listed += issues.len() as u64;
+        match page["data"]["next_offset"].as_u64() {
+            Some(next) => args = json!({"offset":next}),
+            None => break,
+        }
+    }
+    assert_eq!(Some(listed), total);
+}
