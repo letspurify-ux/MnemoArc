@@ -304,6 +304,12 @@ fn encoders() -> Option<&'static std::sync::mpsc::Sender<Encoding>> {
 /// text) took 17 seconds. A longer stretch is counted in parts, which differ
 /// from the whole by about a token per part; ordinary text has none.
 const COUNT_RUN_BYTES: usize = 512;
+/// Longest text without whitespace counted at once. The tokenizer's pieces
+/// do not follow the kinds above exactly: o200k joins letters and combining
+/// marks, and its symbol pieces take marks and circled letters, so text
+/// alternating two kinds (Japanese in decomposed form, か + U+3099) was one
+/// piece: a 120KB line took 2.2s.
+const COUNT_WORD_BYTES: usize = 2048;
 
 fn count_tokens(tokenizer: &tiktoken_rs::CoreBPE, text: &str) -> usize {
     #[derive(Clone, Copy, PartialEq)]
@@ -324,14 +330,18 @@ fn count_tokens(tokenizer: &tiktoken_rs::CoreBPE, text: &str) -> usize {
             Kind::Other
         }
     };
-    let (mut total, mut part, mut run, mut previous) = (0, 0, 0, None);
+    let (mut total, mut part, mut run, mut word, mut previous) = (0, 0, 0, 0, None);
     for (at, ch) in text.char_indices() {
         let current = Some(kind(ch));
+        if current == Some(Kind::Space) {
+            word = at;
+        }
         if current != previous {
             (run, previous) = (at, current);
-        } else if at - run >= COUNT_RUN_BYTES {
+        }
+        if at - run >= COUNT_RUN_BYTES || at - word >= COUNT_WORD_BYTES {
             total += tokenizer.encode_with_special_tokens(&text[part..at]).len();
-            (part, run) = (at, at);
+            (part, run, word) = (at, at, at);
         }
     }
     total + tokenizer.encode_with_special_tokens(&text[part..]).len()

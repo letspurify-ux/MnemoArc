@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -1090,8 +1090,11 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
             delivered.entry(resolved).or_default().push((start, end));
         }
     }
+    // Overlapping and adjacent reads merged, so each citation finds its
+    // first delivered range by binary search: walking every range of the
+    // file for every citation grew with both.
     for ranges in delivered.values_mut() {
-        ranges.sort_unstable();
+        *ranges = merged_ranges(std::mem::take(ranges));
     }
     let mut missing = BTreeMap::<PathBuf, Vec<(usize, usize)>>::new();
     let mut line_counts = BTreeMap::<PathBuf, usize>::new();
@@ -1126,10 +1129,9 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
         }
         let mut next = citation.begin;
         let gaps = missing.entry(cited.clone()).or_default();
-        for &(start, end) in delivered.get(&cited).map(Vec::as_slice).unwrap_or(&[]) {
-            if end < next {
-                continue;
-            }
+        let ranges = delivered.get(&cited).map(Vec::as_slice).unwrap_or(&[]);
+        let first = ranges.partition_point(|&(_, end)| end < next);
+        for &(start, end) in &ranges[first..] {
             if start > citation.end {
                 break;
             }
@@ -1150,6 +1152,8 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
     // pieces delivered shows the whole line was read. Without it, a citation
     // of such a line stayed unread however often it was read.
     for (path, gaps) in &mut missing {
+        // Citations of the same lines walk them once.
+        *gaps = merged_ranges(std::mem::take(gaps));
         // Only a file with delivered text coverage of its current version
         // is read for it.
         let current = versions
@@ -1191,18 +1195,8 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
     }
     let root = s.project.root.canonicalize()?;
     let mut issues = vec![];
-    for (path, mut gaps) in missing {
-        gaps.sort_unstable();
-        let mut merged: Vec<(usize, usize)> = vec![];
-        for (start, end) in gaps {
-            if let Some(last) = merged.last_mut()
-                && start <= last.1.saturating_add(1)
-            {
-                last.1 = last.1.max(end);
-            } else {
-                merged.push((start, end));
-            }
-        }
+    for (path, gaps) in missing {
+        let merged = merged_ranges(gaps);
         let path = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
         for (start, end) in merged {
             let mut issue =
@@ -1218,6 +1212,22 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
         }
     }
     Ok(issues)
+}
+
+/// Inclusive line ranges sorted, with overlapping and adjacent ones joined.
+fn merged_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1.saturating_add(1)
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
 }
 
 /// Whether a document line lies in a section an existing output already had,
@@ -1278,6 +1288,7 @@ const COMMON_CODE_WORDS: &[&str] = &[
 /// lines (a call site of `routing::run`) counts as a match too.
 fn code_names(span: &str) -> (Vec<String>, Vec<String>) {
     let (mut names, mut qualifiers) = (Vec::new(), Vec::new());
+    let mut seen = (HashSet::new(), HashSet::new());
     if span.contains('/') {
         return (names, qualifiers);
     }
@@ -1305,12 +1316,12 @@ fn code_names(span: &str) -> (Vec<String>, Vec<String>) {
             && !word.starts_with(|first: char| first.is_ascii_digit())
             && !COMMON_CODE_WORDS.contains(&word.as_str())
         {
-            let list = if qualifier {
-                &mut qualifiers
+            let (list, seen) = if qualifier {
+                (&mut qualifiers, &mut seen.1)
             } else {
-                &mut names
+                (&mut names, &mut seen.0)
             };
-            if !list.contains(&word) {
+            if seen.insert(word.clone()) {
                 list.push(word.clone());
             }
         }
@@ -1523,15 +1534,18 @@ pub(super) fn citation_mismatch_check(s: &Session, output: &Path, doc: &str) -> 
         for citation in on_line {
             let (start, end) = citation.columns;
             let (mut names, mut qualifiers) = (Vec::new(), Vec::new());
-            for (from, to) in spans
-                .iter()
-                .filter(|(from, to)| *from >= previous_end && *to <= start)
-            {
+            let mut seen = (HashSet::new(), HashSet::new());
+            // Spans are in line order and do not overlap: those between the
+            // previous citation and this one are one run.
+            let first = spans.partition_point(|(from, _)| *from < previous_end);
+            for (from, to) in spans[first..].iter().take_while(|(_, to)| *to <= start) {
                 let (span_names, span_qualifiers) = code_names(&text[*from..*to]);
-                for (list, found) in [(&mut names, span_names), (&mut qualifiers, span_qualifiers)]
-                {
+                for (list, seen, found) in [
+                    (&mut names, &mut seen.0, span_names),
+                    (&mut qualifiers, &mut seen.1, span_qualifiers),
+                ] {
                     for name in found {
-                        if !list.contains(&name) {
+                        if seen.insert(name.clone()) {
                             list.push(name);
                         }
                     }
@@ -1658,19 +1672,17 @@ pub(super) fn uncited_code_check(s: &Session, output: &Path, doc: &str) -> Optio
     let file_exists = |path: &str| super::read_path(&s.project, path).is_ok_and(|p| p.is_file());
     let note = regex::Regex::new(r"^ {0,3}\[\^([^\]]+)\]:").ok()?;
     let lines: Vec<&str> = doc.lines().collect();
-    let cited_notes: Vec<String> = lines
+    let cited_notes: HashSet<&str> = lines
         .iter()
         .filter_map(|line| {
             let label = note.captures(line)?;
             let rest = &line[label.get(0)?.end()..];
-            line_cites(&pattern, rest, &file_exists).then(|| format!("[^{}]", &label[1]))
+            line_cites(&pattern, rest, &file_exists).then(|| label.get(1).map(|l| l.as_str()))?
         })
         .collect();
     let cites = |line: &&str| {
         line_cites(&pattern, line, &file_exists)
-            || cited_notes
-                .iter()
-                .any(|label| line.contains(label.as_str()))
+            || (!cited_notes.is_empty() && cites_note(line, &cited_notes))
     };
     let unchanged = unchanged_sections(s, output, doc);
     let headings = headings(doc);
@@ -1683,18 +1695,32 @@ pub(super) fn uncited_code_check(s: &Session, output: &Path, doc: &str) -> Optio
                 .get(index + 1)
                 .map_or(lines.len() + 1, |next| next.line)
     };
-    let cited = |index: usize| {
-        let lines_of = own(index);
-        lines[lines_of.start - 1..lines_of.end - 1]
-            .iter()
-            .any(cites)
+    // A parent's own text is checked once for all its subsections.
+    let mut checked: Vec<Option<bool>> = vec![None; headings.len()];
+    let mut cited = |index: usize| {
+        *checked[index].get_or_insert_with(|| {
+            let lines_of = own(index);
+            lines[lines_of.start - 1..lines_of.end - 1]
+                .iter()
+                .any(cites)
+        })
     };
+    // Headings above the current one with rising levels: the last one
+    // with a lower level is its parent.
+    let mut ancestors: Vec<usize> = Vec::new();
     for (index, heading) in headings.iter().enumerate() {
-        let parent = headings[..index]
-            .iter()
-            .rposition(|prior| prior.level < heading.level)
+        while ancestors
+            .last()
+            .is_some_and(|&prior| headings[prior].level >= heading.level)
+        {
+            ancestors.pop();
+        }
+        let parent = ancestors
+            .last()
+            .copied()
             .filter(|&parent| headings[parent].level >= 2);
-        if unchanged(heading.line) || cited(index) || parent.is_some_and(cited) {
+        ancestors.push(index);
+        if unchanged(heading.line) || cited(index) || parent.is_some_and(&mut cited) {
             continue;
         }
         let own = own(index);
@@ -1741,6 +1767,20 @@ pub(super) fn uncited_code_check(s: &Session, output: &Path, doc: &str) -> Optio
         }
     }
     (total > 0).then(|| json!({"flagged":total,"items":items}))
+}
+
+/// Whether the line holds `[^label]` for one of `labels`. A label holds no
+/// `]`, so each `[^` names the label up to the first `]` after it. Testing
+/// every label against every line took 12 s for 16000 cited notes.
+fn cites_note(line: &str, labels: &HashSet<&str>) -> bool {
+    let mut close = None;
+    line.match_indices("[^").any(|(at, _)| {
+        let from = at + 2;
+        if close.is_none_or(|close| close < from) {
+            close = line[from..].find(']').map(|end| from + end);
+        }
+        close.is_some_and(|close| labels.contains(&line[from..close]))
+    })
 }
 
 struct CitationFence {
@@ -2380,7 +2420,9 @@ fn citation_issues_and_paths(
     let mut versions = std::collections::BTreeMap::new();
     let mut paths = PathResolver::new(&s.project);
     let mut suggestions = BTreeMap::<String, Option<String>>::new();
-    let mut project_files = None;
+    let mut project_files = super::FilesByName::default();
+    // The project file each broken #L link target means, looked up once.
+    let mut link_files = BTreeMap::<String, Option<String>>::new();
     // (document line, cited path, suggested project path)
     let mut fixable = Vec::new();
     for Citation {
@@ -2453,7 +2495,10 @@ fn citation_issues_and_paths(
                     })
                     .flatten();
                 let error = if *relative_link {
-                    link_target_error(s, output, cited, *begin, *end, error)
+                    let file = link_files
+                        .entry(cited.clone())
+                        .or_insert_with(|| project_file_for_link(s, cited));
+                    link_target_error(output, cited, file.as_deref(), *begin, *end, error)
                 } else {
                     error.clone()
                 };
@@ -2722,9 +2767,9 @@ fn unreadable_citation_guidance(error: &str) -> Option<&'static str> {
 /// requests, and recorded the check itself as broken. Name the folder, where
 /// the target landed, and the project-relative citation to write instead.
 fn link_target_error(
-    s: &Session,
     output: &Path,
     target: &str,
+    file: Option<&str>,
     begin: usize,
     end: usize,
     error: &str,
@@ -2746,7 +2791,7 @@ fn link_target_error(
     } else {
         begin.to_string()
     };
-    let instead = match project_file_for_link(s, target) {
+    let instead = match file {
         Some(relative) => format!("cite it as {relative}:{range}"),
         None => "cite the project file as path:start-end relative to project.root".to_owned(),
     };
@@ -2947,7 +2992,9 @@ mod outline_tests {
 
 #[cfg(test)]
 mod definition_tests {
-    use super::{DEFINITION_OCCURRENCES, defines, definition_pattern};
+    use super::{
+        DEFINITION_OCCURRENCES, HashSet, cites_note, code_names, defines, definition_pattern,
+    };
 
     /// The pattern defines checks form by form: one regex per name.
     fn reference(name: &str) -> regex::Regex {
@@ -3069,5 +3116,34 @@ mod definition_tests {
             defines(&few, "load", &mut None),
             reference("load").is_match(&few)
         );
+    }
+
+    /// The note lookup agrees with testing each `[^label]` as a substring.
+    #[test]
+    fn cited_note_lookup_matches_the_substring_test() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        let pieces = ["[^", "]", "a", "b", "[", "^", " ", "한"];
+        let pool = ["a", "b", "ab", "[^a", "a b", "^", "한a"];
+        for _ in 0..20_000 {
+            let line: String = (0..next(14)).map(|_| pieces[next(pieces.len())]).collect();
+            let labels: HashSet<&str> = (0..next(4)).map(|_| pool[next(pool.len())]).collect();
+            let expected = labels
+                .iter()
+                .any(|label| line.contains(&format!("[^{label}]")));
+            assert_eq!(cites_note(&line, &labels), expected, "{line:?} {labels:?}");
+        }
+    }
+
+    #[test]
+    fn code_names_keep_first_occurrences_in_order() {
+        let (names, qualifiers) = code_names("beta alpha beta gamma::delta alpha gamma::x");
+        assert_eq!(names, ["beta", "alpha", "delta"]);
+        assert_eq!(qualifiers, ["gamma"]);
     }
 }

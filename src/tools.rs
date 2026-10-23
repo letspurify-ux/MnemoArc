@@ -5977,20 +5977,30 @@ fn delivered_file_ending_with(s: &Session, suffix: &str) -> Result<Option<String
     if wanted.is_absolute() || suffix.is_empty() {
         return Ok(None);
     }
+    // Only a file of that name can end with it (see delivered_sources_for).
+    let named = s.sources.values().filter_map(|source| {
+        source.path.as_deref().filter(|path| {
+            delivered_file(source) && Path::new(path).file_name() == wanted.file_name()
+        })
+    });
+    delivered_ending_with(s, suffix, named)
+}
+
+fn delivered_file(source: &crate::memory::Source) -> bool {
+    source.origin == "file" && !source.evidence_truncated
+}
+
+/// delivered_file_ending_with over the given delivered source paths.
+fn delivered_ending_with<'a>(
+    s: &Session,
+    suffix: &str,
+    named: impl Iterator<Item = &'a str>,
+) -> Result<Option<String>> {
+    let wanted = Path::new(suffix);
     let root = s.project.root.canonicalize()?;
     let mut files = BTreeSet::new();
     let mut paths = PathResolver::new(&s.project);
-    for source in s.sources.values() {
-        if source.origin != "file" || source.evidence_truncated {
-            continue;
-        }
-        let Some(path) = source.path.as_deref() else {
-            continue;
-        };
-        // Only a file of that name can end with it (see delivered_sources_for).
-        if Path::new(path).file_name() != wanted.file_name() {
-            continue;
-        }
+    for path in named {
         let Some(resolved) = paths.lookup(path) else {
             continue;
         };
@@ -6010,27 +6020,56 @@ fn delivered_file_ending_with(s: &Session, suffix: &str) -> Result<Option<String
     }
 }
 
+/// The delivered and project files of one check by file name, built on
+/// first use. Each missing citation went through every source and every
+/// project file: 1000 of them in a 20000-file project took a save 5 s.
+#[derive(Default)]
+pub(super) struct FilesByName {
+    /// Delivered source paths.
+    delivered: Option<HashMap<std::ffi::OsString, BTreeSet<String>>>,
+    /// Project files, project-relative; None when the root is unreadable.
+    project: Option<Option<HashMap<std::ffi::OsString, Vec<PathBuf>>>>,
+}
+
 /// The one file a cited path that is not a project path names: the one
 /// delivered file ending with it, else the one project file ending with it.
 /// None when no file or several do, since a guess could point elsewhere.
-/// `project_files` holds the project's files for the calls of one check:
-/// each missing citation walked the whole project again.
-fn file_ending_with(
-    s: &Session,
-    suffix: &str,
-    project_files: &mut Option<Vec<PathBuf>>,
-) -> Option<String> {
-    match delivered_file_ending_with(s, suffix) {
+/// `files` holds the files for the calls of one check: each missing
+/// citation walked the whole project again.
+fn file_ending_with(s: &Session, suffix: &str, files: &mut FilesByName) -> Option<String> {
+    let wanted = Path::new(suffix);
+    if wanted.is_absolute() || suffix.is_empty() {
+        return None;
+    }
+    let delivered = files.delivered.get_or_insert_with(|| {
+        let mut by_name = HashMap::<_, BTreeSet<String>>::new();
+        for source in s.sources.values().filter(|source| delivered_file(source)) {
+            if let Some(path) = source.path.as_deref()
+                && let Some(name) = Path::new(path).file_name()
+            {
+                by_name
+                    .entry(name.to_owned())
+                    .or_default()
+                    .insert(path.to_owned());
+            }
+        }
+        by_name
+    });
+    let named = wanted
+        .file_name()
+        .and_then(|name| delivered.get(name))
+        .into_iter()
+        .flatten()
+        .map(String::as_str);
+    match delivered_ending_with(s, suffix, named) {
         Ok(Some(file)) => return Some(file),
         Ok(None) => {}
         Err(_) => return None,
     }
-    if Path::new(suffix).is_absolute() || suffix.is_empty() {
-        return None;
-    }
-    let root = s.project.root.canonicalize().ok()?;
-    let paths = project_files.get_or_insert_with(|| {
-        candidate_paths_scoped(
+    let project = files.project.get_or_insert_with(|| {
+        let root = s.project.root.canonicalize().ok()?;
+        let mut by_name = HashMap::<_, Vec<PathBuf>>::new();
+        for path in candidate_paths_scoped(
             &s.project,
             None,
             &tokio_util::sync::CancellationToken::new(),
@@ -6038,12 +6077,21 @@ fn file_ending_with(
             std::time::Instant::now().checked_add(SIMILAR_PATHS_WALK),
         )
         .unwrap_or_default()
+        {
+            if let Ok(relative) = path.strip_prefix(&root)
+                && let Some(name) = relative.file_name()
+            {
+                by_name
+                    .entry(name.to_owned())
+                    .or_default()
+                    .push(relative.to_owned());
+            }
+        }
+        Some(by_name)
     });
     let mut found = None;
-    for path in paths.iter() {
-        let Ok(relative) = path.strip_prefix(&root) else {
-            continue;
-        };
+    let candidates = project.as_ref()?.get(wanted.file_name()?)?;
+    for relative in candidates {
         if relative.ends_with(suffix) {
             if found.is_some() {
                 return None;

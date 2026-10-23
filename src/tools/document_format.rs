@@ -91,6 +91,8 @@ pub(super) fn check(doc: &str) -> FormatCheck {
             super::section_number(title).map(|label| (heading.line, label.to_owned()))
         })
         .collect();
+    let used_labels: std::collections::HashSet<&str> =
+        numbered.iter().map(|(_, label)| label.as_str()).collect();
     // Literal code and HTML may contain table examples, including multi-line
     // inline code. Those examples must not be mistaken for broken table syntax.
     let mut literal_lines = vec![false; lines.len()];
@@ -128,9 +130,14 @@ pub(super) fn check(doc: &str) -> FormatCheck {
                     result.issues.push(json!({"kind":"unclosed_code_fence","line":start,
                         "guidance":"Close this code block with the same fence marker and at least the opening fence length."}));
                 }
-                if let Some(issue) =
-                    headings_in_code_block(&numbered, start, end, &code.info, &code.literal)
-                {
+                if let Some(issue) = headings_in_code_block(
+                    &numbered,
+                    &used_labels,
+                    start,
+                    end,
+                    &code.info,
+                    &code.literal,
+                ) {
                     result.issues.push(issue);
                 }
                 if code
@@ -441,6 +448,7 @@ fn extension_warning(result: &mut FormatCheck, line: usize, end_line: usize) {
 /// plain-text blocks count: other languages hold `#` comments.
 fn headings_in_code_block(
     numbered: &[(usize, String)],
+    used_labels: &std::collections::HashSet<&str>,
     start: usize,
     end: usize,
     info: &str,
@@ -454,7 +462,9 @@ fn headings_in_code_block(
         return None;
     }
     let top = |label: &str| label.split('.').next()?.parse::<u64>().ok();
-    let (_, previous) = numbered.iter().rev().find(|(line, _)| *line < start)?;
+    // Headings come in line order.
+    let before = numbered.partition_point(|(line, _)| *line < start);
+    let (_, previous) = numbered[..before].last()?;
     // The numbering may go on inside the block (6, 7, 8).
     let mut previous = top(previous)?;
     let mut headings = Vec::new();
@@ -470,7 +480,7 @@ fn headings_in_code_block(
         };
         if let Some(number) = top(label)
             && (number == previous || number == previous + 1)
-            && !numbered.iter().any(|(_, used)| used == label)
+            && !used_labels.contains(label)
         {
             previous = number;
             first_line.get_or_insert(start + 1 + index);

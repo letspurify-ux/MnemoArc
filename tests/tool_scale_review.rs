@@ -570,3 +570,107 @@ fn citations_on_one_long_line_are_scanned_in_linear_time() {
         assert_eq!(audit["citations_checked"], 20_001, "{audit}");
     }
 }
+
+/// Each heading in a Markdown code block was looked up among all real
+/// headings, and each block searched them for the one above it: 40,000
+/// numbered headings and a block repeating the numbering took 2.75 s per
+/// audit (release build).
+#[test]
+fn headings_in_a_code_block_are_checked_against_an_index() {
+    let n = 40_000;
+    let mut doc = String::from("# Title\n\n");
+    for i in 0..n {
+        doc.push_str(&format!("## 1.{i} H\n\nx\n\n"));
+    }
+    doc.push_str("```markdown\n");
+    for i in 0..n {
+        doc.push_str(&format!("## 1.{} H\n", n + i));
+    }
+    doc.push_str("```\n");
+    let (_dir, mut s) = document(&doc);
+    let started = Instant::now();
+    let audit = tools::execute(&mut s, "document_audit", json!({"limit":5})).unwrap();
+    assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+    assert_eq!(
+        audit["issue_kinds"]["headings_inside_code_block"], 1,
+        "{audit}"
+    );
+}
+
+/// Every line of every section was tested against every cited footnote
+/// label: 16,000 footnotes took 12 s (release build) to find sections
+/// showing uncited code.
+#[test]
+fn sections_citing_by_footnote_are_found_by_label() {
+    let n = 16_000;
+    let mut doc = String::from("# Title\n\n");
+    for i in 0..n {
+        // The first section's reference has no cited note (the last one's
+        // text runs on through the notes, which cite).
+        let note = if i == 0 { "other" } else { "n" };
+        doc.push_str(&format!(
+            "## {i}. Sec\n\nText [^{note}{i}].\n\n```rust\nfn x() {{}}\n```\n\n"
+        ));
+    }
+    for i in 0..n {
+        doc.push_str(&format!("[^n{i}]: src/a.rs:{}\n", 1 + i % 5));
+    }
+    let (dir, s) = document(&doc);
+    write(
+        &dir,
+        "src/a.rs",
+        "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\nfn e() {}\n",
+    );
+    let started = Instant::now();
+    let check = tools::uncited_code(&s).unwrap();
+    assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+    assert_eq!(check["flagged"], 1, "{check}");
+    assert_eq!(check["items"][0]["heading"], "## 0. Sec");
+}
+
+/// Each missing citation path went through every project file and every
+/// delivered source: 1000 of them in a 20,000-file project took a save 5 s
+/// (release build).
+#[test]
+fn missing_citation_paths_look_up_project_files_by_name() {
+    let distinct = 1000;
+    let mut doc = String::from("# Title\n\nThe helper is in f7.rs:1 and deep/f8.rs:1.\n\n");
+    for i in 0..distinct {
+        doc.push_str(&format!("Claim {i} (lib/nofile_{i}.rs:1).\n\n"));
+    }
+    let (dir, mut s) = document(&doc);
+    for i in 0..5000 {
+        write(
+            &dir,
+            &format!("src/d{}/deep/f{i}.rs", i % 10),
+            "fn f() {}\n",
+        );
+    }
+    let started = Instant::now();
+    let audit = tools::execute(&mut s, "document_audit", json!({"limit":5})).unwrap();
+    assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+    assert_eq!(
+        audit["issue_kinds"]["citation_path"],
+        distinct + 2,
+        "{audit}"
+    );
+    let suggested: Vec<&str> = audit["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|issue| issue["suggested"].as_str())
+        .collect();
+    assert_eq!(suggested, ["src/d7/deep/f7.rs:1", "src/d8/deep/f8.rs:1"]);
+}
+
+/// The tokenizer joins letters and combining marks (o200k) into one piece:
+/// Japanese in decomposed form never formed a long run of one kind, so a
+/// 120 KB line went to the tokenizer whole and took 2.2 s (release build).
+#[test]
+fn text_alternating_letters_and_marks_is_counted_in_parts() {
+    let text = "\u{304b}\u{3099}".repeat(100_000);
+    let started = Instant::now();
+    let count = mnemoarc::context::tokens(&text, "gpt-4o");
+    assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+    assert_eq!(count, 300_000);
+}
