@@ -347,21 +347,47 @@ fn check_hash(expected: &str, actual: &str) -> Result<()> {
     Ok(())
 }
 
+/// What the operations of a patch checked so far.
+#[derive(Default)]
+struct HashChecks {
+    /// Files an earlier operation of the patch checked.
+    checked: BTreeSet<PathBuf>,
+    /// Hashes of files as the patch found them, each computed once: models
+    /// repeat the file_read hash on every operation, and hashing the
+    /// original and the edited text again per operation made 32 operations
+    /// on a 15 MB file take 2 s.
+    original_hashes: BTreeMap<PathBuf, String>,
+}
+
+impl HashChecks {
+    fn original_hash(
+        &mut self,
+        path: &Path,
+        originals: &BTreeMap<PathBuf, Option<String>>,
+    ) -> Option<&str> {
+        let text = originals.get(path)?.as_ref()?;
+        Some(
+            self.original_hashes
+                .entry(path.to_path_buf())
+                .or_insert_with(|| hash(text.as_bytes())),
+        )
+    }
+}
+
 fn check_operation_hash(
     op: &Value,
     path: &Path,
     actual: &str,
     originals: &BTreeMap<PathBuf, Option<String>>,
-    checked: &BTreeSet<PathBuf>,
+    checks: &mut HashChecks,
 ) -> Result<()> {
     match op.get("expected_hash") {
         // An earlier operation in this patch checked the file. Models repeat
         // the file_read hash on each operation (document_edit_batch accepts
         // that too); re-reading returns that same hash, so refusing it loops.
-        Some(Value::String(expected)) if checked.contains(path) => {
-            let original = originals.get(path).and_then(Option::as_ref);
-            if *expected == hash(actual.as_bytes())
-                || original.is_some_and(|text| *expected == hash(text.as_bytes()))
+        Some(Value::String(expected)) if checks.checked.contains(path) => {
+            if checks.original_hash(path, originals) == Some(expected.as_str())
+                || *expected == hash(actual.as_bytes())
             {
                 return Ok(());
             }
@@ -371,9 +397,18 @@ fn check_operation_hash(
                 path.display()
             )
         }
+        // The first operation on a file sees it as the patch found it.
+        Some(Value::String(expected))
+            if originals.get(path).and_then(Option::as_deref) == Some(actual) =>
+        {
+            if checks.original_hash(path, originals) == Some(expected.as_str()) {
+                return Ok(());
+            }
+            check_hash(expected, actual)
+        }
         Some(Value::String(expected)) => check_hash(expected, actual),
         Some(_) => bail!("invalid_argument_type: expected_hash"),
-        None if checked.contains(path) => Ok(()),
+        None if checks.checked.contains(path) => Ok(()),
         None => bail!(
             "file_hash_required: first operation on an existing file requires expected_hash from file_read"
         ),
@@ -386,7 +421,7 @@ fn operation(
     state: &mut BTreeMap<PathBuf, Option<String>>,
     originals: &mut BTreeMap<PathBuf, Option<String>>,
     permissions: &mut BTreeMap<PathBuf, Option<Permissions>>,
-    checked: &mut BTreeSet<PathBuf>,
+    checks: &mut HashChecks,
     replaced_paths: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
     let obj = op
@@ -449,7 +484,7 @@ fn operation(
         "update" => {
             let old = load(&path, state, originals, permissions)?
                 .ok_or_else(|| anyhow::anyhow!("file_not_found: {}", path.display()))?;
-            check_operation_hash(op, &path, &old, originals, checked)?;
+            check_operation_hash(op, &path, &old, originals, checks)?;
             let all = match op.get("replace_all") {
                 None => false,
                 Some(Value::Bool(value)) => *value,
@@ -466,7 +501,7 @@ fn operation(
         "replace" => {
             let old = load(&path, state, originals, permissions)?
                 .ok_or_else(|| anyhow::anyhow!("file_not_found: {}", path.display()))?;
-            check_operation_hash(op, &path, &old, originals, checked)?;
+            check_operation_hash(op, &path, &old, originals, checks)?;
             let next = required(op, "content")?;
             content(next)?;
             state.insert(path.clone(), Some(next.to_owned()));
@@ -474,7 +509,7 @@ fn operation(
         "move" => {
             let old = load(&path, state, originals, permissions)?
                 .ok_or_else(|| anyhow::anyhow!("file_not_found: {}", path.display()))?;
-            check_operation_hash(op, &path, &old, originals, checked)?;
+            check_operation_hash(op, &path, &old, originals, checks)?;
             let destination = project_path(s, required(op, "to_path")?)?;
             if destination == path || load(&destination, state, originals, permissions)?.is_some() {
                 bail!(
@@ -495,18 +530,18 @@ fn operation(
             permissions.insert(destination.clone(), moved_permissions);
             state.insert(path.clone(), None);
             state.insert(destination.clone(), Some(old));
-            checked.insert(destination);
+            checks.checked.insert(destination);
         }
         "delete" => {
             let old = load(&path, state, originals, permissions)?
                 .ok_or_else(|| anyhow::anyhow!("file_not_found: {}", path.display()))?;
-            check_operation_hash(op, &path, &old, originals, checked)?;
+            check_operation_hash(op, &path, &old, originals, checks)?;
             permissions.insert(path.clone(), None);
             state.insert(path.clone(), None);
         }
         _ => unreachable!(),
     }
-    checked.insert(path);
+    checks.checked.insert(path);
     Ok(())
 }
 
@@ -758,7 +793,7 @@ pub(super) fn execute(
     let mut state = BTreeMap::new();
     let mut originals = BTreeMap::new();
     let mut permissions = BTreeMap::new();
-    let mut checked = BTreeSet::new();
+    let mut checks = HashChecks::default();
     let mut replaced_paths = BTreeSet::new();
     for (index, op) in operations.iter().enumerate() {
         if cancel.is_cancelled() {
@@ -770,7 +805,7 @@ pub(super) fn execute(
             &mut state,
             &mut originals,
             &mut permissions,
-            &mut checked,
+            &mut checks,
             &mut replaced_paths,
         )
         .map_err(|error| {

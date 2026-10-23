@@ -3368,8 +3368,9 @@ fn expand_fix_word(s: &Session, name: &str, args: &mut Value) -> Result<()> {
             "document_missing: the configured output has not been written yet, so it has no garbled word for fix_word"
         );
     }
-    let doc = read_text(&path)?;
-    let garbled = document_format::check(&doc).garbled;
+    let (doc, digest) = read_text_hashed(&path)?;
+    let check = document_format::checked(&doc, &digest);
+    let garbled = &check.garbled;
     // The check numbers lines as CommonMark reads them, where a lone CR ends
     // a line too; str::lines kept such a line whole, so a word below a lone
     // CR was refused as no garbled word. A line between CRs is still text of
@@ -3949,7 +3950,7 @@ fn persist_document_edit(
         });
     }
     saved["citation_check"] = documentation::citation_check(s, path, &result)?;
-    saved["format_check"] = document_format::check(&result).write_result();
+    saved["format_check"] = document_format::checked(&result, &hash).write_result();
     if s.is_document_work()
         && let Some(check) = documentation::test_code_check(s, path, &result)
     {
@@ -7763,7 +7764,7 @@ fn read_file(
         && output_path(&s.project)
             .and_then(|output| Ok(output.canonicalize()?))
             .is_ok_and(|output| output == path))
-    .then(|| documentation::open_issue_lines(s, &path, &contents, OPEN_ISSUE_LINES))
+    .then(|| documentation::open_issue_lines(s, &path, &contents, &digest, OPEN_ISSUE_LINES))
     .filter(|lines| !lines.is_empty());
     if prior >= s.config.repeated_read_limit && !args["force_read"].as_bool().unwrap_or(false) {
         let mut result = json!({"path":path,"hash":digest,"total_lines":total_lines,"repeated_read":true,"suppressed":true,"guidance":"Unchanged range already present repeatedly in active context. Reuse it, continue it with its next_cursor, read another range, use document_inspect for output metadata, or force_read=true for deliberate verification."});
@@ -7905,7 +7906,7 @@ pub fn document_issue_count(s: &Session, known: Option<&str>) -> Option<(String,
     if known == Some(digest.as_str()) {
         return None;
     }
-    let count = documentation::open_issue_count(s, &path, &doc).ok()?;
+    let count = documentation::open_issue_count(s, &path, &doc, &digest).ok()?;
     // Claims whose cited lines never mention their code count too: the
     // coverage check asks for them, and a live run's saved fix of one was
     // not credited while its stall count kept rising.

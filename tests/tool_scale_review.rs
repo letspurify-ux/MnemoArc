@@ -776,3 +776,45 @@ fn batch_failures_are_explained_by_replaying_the_applied_edits() {
     assert!(saved_doc.contains("changed 31"));
     assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
 }
+
+/// Models repeat the file_read hash on every file_patch operation; the
+/// original and the edited text were hashed again for each one: 32
+/// operations on a 15 MB file took 2 s in release builds (0.27 s without
+/// the hash). The original's hash is computed once, and a later hash that
+/// names neither version is still refused.
+#[test]
+fn file_patch_hashes_the_original_once_for_repeated_hashes() {
+    let (dir, mut s) = document("# Doc\n");
+    // Project files are written outside the source_document workflow.
+    s.task.workflow = String::new();
+    s.workflow_mode = String::new();
+    let body: String = (0..400_000).map(|j| format!("line {j} value\n")).collect();
+    write(&dir, "big.txt", &body);
+    let digest = tools::hash(body.as_bytes());
+    let ops: Vec<_> = (0..32)
+        .map(|j| json!({"action":"update","path":"big.txt","old_text":format!("line {} value\n", j * 1000 + 7),"new_text":format!("edited {j}\n"),"expected_hash":digest}))
+        .collect();
+    let started = Instant::now();
+    let patched = tools::execute(&mut s, "file_patch", json!({"operations":ops})).unwrap();
+    assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+    let text = std::fs::read_to_string(dir.path().join("big.txt")).unwrap();
+    assert!(text.contains("edited 0\n") && text.contains("edited 31\n"));
+    assert!(!text.contains("line 31007 value"));
+    assert_eq!(patched["hash"], tools::hash(text.as_bytes()));
+    let current = tools::hash(text.as_bytes());
+    let refused = tools::execute(
+        &mut s,
+        "file_patch",
+        json!({"operations":[
+            {"action":"update","path":"big.txt","expected_hash":current,"old_text":"edited 0\n","new_text":"again\n"},
+            {"action":"update","path":"big.txt","expected_hash":digest,"old_text":"edited 1\n","new_text":"again 1\n"}
+        ]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(refused.starts_with("file_revision_conflict"), "{refused}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("big.txt")).unwrap(),
+        text
+    );
+}

@@ -63,6 +63,39 @@ impl FormatCheck {
     }
 }
 
+/// Checks of recently checked document versions kept at most.
+const CHECK_MEMO_ENTRIES: usize = 8;
+/// A check reporting more issues and warnings than this is not kept.
+const CHECK_MEMO_MAX_ITEMS: usize = 4096;
+
+/// check of `doc`, whose hash is `digest`. The check depends on the text
+/// alone, and one saved version was checked by its save, the run's issue
+/// count, every read of the output (suppressed repeats too) and each audit:
+/// 200 ms each for a 5.6 MB document.
+pub(super) fn checked(doc: &str, digest: &str) -> std::sync::Arc<FormatCheck> {
+    type Memo = std::collections::VecDeque<(String, std::sync::Arc<FormatCheck>)>;
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<Memo>> = std::sync::OnceLock::new();
+    let memo = || {
+        MEMO.get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if let Some((_, found)) = memo().iter().find(|(known, _)| known == digest) {
+        return found.clone();
+    }
+    let result = std::sync::Arc::new(check(doc));
+    if result.issues.len() + result.warnings.len() <= CHECK_MEMO_MAX_ITEMS {
+        let mut memo = memo();
+        if !memo.iter().any(|(known, _)| known == digest) {
+            if memo.len() >= CHECK_MEMO_ENTRIES {
+                memo.pop_front();
+            }
+            memo.push_back((digest.to_owned(), result.clone()));
+        }
+    }
+    result
+}
+
 pub(super) fn check(doc: &str) -> FormatCheck {
     let mut result = FormatCheck::default();
     // CommonMark recognizes lone CR as a line ending too; keep the line map in
@@ -554,17 +587,19 @@ fn is_delimiter(cell: &str) -> bool {
 fn uses_table_extension(line: &str) -> bool {
     // Conservative coverage boundary, not an implementation of the UI's
     // extended Markdown grammar. Avoid false errors on rich table payloads.
+    // Checked for every table row: the prefixes are not formatted per line.
+    const PREFIXES: [&str; 8] = [
+        "mermaid\\n",
+        "mermaid\\r\\n",
+        "mermaid<br",
+        "mermaid\\<br",
+        "chart\\n",
+        "chart\\r\\n",
+        "chart<br",
+        "chart\\<br",
+    ];
     let lower = line.to_ascii_lowercase();
-    let visualization = ["mermaid", "chart"].iter().any(|lang| {
-        [
-            format!("{lang}\\n"),
-            format!("{lang}\\r\\n"),
-            format!("{lang}<br"),
-            format!("{lang}\\<br"),
-        ]
-        .iter()
-        .any(|prefix| lower.contains(prefix))
-    });
+    let visualization = PREFIXES.iter().any(|prefix| lower.contains(prefix));
     let math_pipe = [("$$", "$$"), ("$", "$"), ("\\(", "\\)"), ("\\[", "\\]")]
         .iter()
         .any(|(open, close)| {
@@ -582,4 +617,35 @@ fn uses_table_extension(line: &str) -> bool {
         })
         || (line.contains("\\begin{") && line.contains("\\end{"));
     visualization || math_pipe
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tool review 2026-10-23: one saved version was format-checked by its
+    /// save, the run's issue count, every read of the output and each
+    /// audit. The check is kept per version and is the one check gives.
+    #[test]
+    fn a_checked_version_is_checked_once() {
+        let doc = "# T\n\n| a | b |\n|---|---|\n| 1 | 2 | 3 |\n\n배치末尾로 처리한다.\n";
+        let digest = crate::tools::hash(doc.as_bytes());
+        let first = checked(doc, &digest);
+        let fresh = check(doc);
+        assert_eq!(first.issues, fresh.issues);
+        assert_eq!(first.write_result(), fresh.write_result());
+        assert_eq!(first.garbled.len(), fresh.garbled.len());
+        assert!(first.issues.len() >= 2, "{:?}", first.issues);
+        // Other tests share the memo; one pair of calls in a row sees the
+        // same check unless eight other versions came between them.
+        assert!(
+            (0..10).any(|_| std::sync::Arc::ptr_eq(&checked(doc, &digest), &checked(doc, &digest)))
+        );
+        let other = "# T\n\nFine.\n";
+        assert!(
+            checked(other, &crate::tools::hash(other.as_bytes()))
+                .issues
+                .is_empty()
+        );
+    }
 }

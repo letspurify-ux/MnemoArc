@@ -839,11 +839,11 @@ pub(super) fn execute(
                 );
             }
             let doc = read_text(&path)?;
-            let (checked, issues, format_check) = audit_issues(s, &path, &doc)?;
+            let document_hash = hash(doc.as_bytes());
+            let (checked, issues, format_check) = audit_issues(s, &path, &doc, &document_hash)?;
             // The issue list includes delivered-evidence state as well as
             // document citations. Bind every continuation page to the
             // exact list that produced the first page.
-            let document_hash = hash(doc.as_bytes());
             let revision = hash(&serde_json::to_vec(&(
                 document_hash.as_str(),
                 checked,
@@ -914,9 +914,14 @@ fn outline_offset_error(offset: usize, headings: usize) -> anyhow::Error {
 /// document_audit's issues for the output text: citation issues, format
 /// issues, a missing-citations issue, the output's own path, then unread
 /// citations; with the number of citations checked and the format summary.
-fn audit_issues(s: &Session, path: &Path, doc: &str) -> Result<(usize, Vec<Value>, Value)> {
+fn audit_issues(
+    s: &Session,
+    path: &Path,
+    doc: &str,
+    digest: &str,
+) -> Result<(usize, Vec<Value>, Value)> {
     let (checked, mut issues) = citation_issues(s, path, doc)?;
-    let format = super::document_format::check(doc);
+    let format = super::document_format::checked(doc, digest);
     let format_check = format.summary();
     // The citation scanner already catches many unclosed fences. Keep
     // one diagnostic per fence while adding AST coverage for containers.
@@ -925,13 +930,13 @@ fn audit_issues(s: &Session, path: &Path, doc: &str) -> Result<(usize, Vec<Value
         .filter(|issue| issue["kind"] == "unclosed_code_fence")
         .filter_map(|issue| issue["line"].as_u64())
         .collect();
-    for issue in format.issues {
+    for issue in &format.issues {
         if issue["kind"] != "unclosed_code_fence"
             || issue["line"]
                 .as_u64()
                 .is_none_or(|line| fence_lines.insert(line))
         {
-            issues.push(issue);
+            issues.push(issue.clone());
         }
     }
     if checked == 0 {
@@ -949,8 +954,8 @@ fn audit_issues(s: &Session, path: &Path, doc: &str) -> Result<(usize, Vec<Value
 }
 
 /// How many issues document_audit reports for the output text.
-pub(super) fn open_issue_count(s: &Session, path: &Path, doc: &str) -> Result<usize> {
-    Ok(audit_issues(s, path, doc)?.1.len())
+pub(super) fn open_issue_count(s: &Session, path: &Path, doc: &str, digest: &str) -> Result<usize> {
+    Ok(audit_issues(s, path, doc, digest)?.1.len())
 }
 
 /// Issue counts by kind, so a page of issues still shows the whole set.
@@ -966,13 +971,19 @@ fn issue_kinds(issues: &[Value]) -> Value {
 
 /// The document lines of the output's open citation and format issues,
 /// in order and at most `limit`, for a read of the output to start near.
-pub(super) fn open_issue_lines(s: &Session, output: &Path, doc: &str, limit: usize) -> Vec<u64> {
+pub(super) fn open_issue_lines(
+    s: &Session,
+    output: &Path,
+    doc: &str,
+    digest: &str,
+    limit: usize,
+) -> Vec<u64> {
     let mut lines = BTreeSet::new();
     if let Ok((_, issues, _)) = citation_issues_and_paths(s, output, doc, false) {
         lines.extend(issues.iter().filter_map(|issue| issue["line"].as_u64()));
     }
     lines.extend(
-        super::document_format::check(doc)
+        super::document_format::checked(doc, digest)
             .issues
             .iter()
             .filter_map(|issue| issue["line"].as_u64()),
@@ -1109,7 +1120,7 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
     // the other four. Exempting only unchanged lines let a section's wrong
     // claim pass because the model rewrote that line as it was.
     let unchanged = unchanged_sections(s, &output, doc);
-    for citation in &citations {
+    for citation in citations.iter() {
         if unchanged(citation.document_line) {
             continue;
         }
@@ -2140,7 +2151,42 @@ fn code_block_lines(doc: &str) -> Vec<bool> {
     code
 }
 
-fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
+/// A document's citations and the issues found scanning them.
+pub(super) type CitationScan = (Vec<Citation>, Vec<Value>);
+
+/// Scans kept at most: the latest version's. A scan holds every citation
+/// with its line (about 14 MB for a 5.6 MB document citing on most lines),
+/// and the checks of a save or an issue count all scan one version.
+const SCAN_MEMO_ENTRIES: usize = 1;
+
+/// scan_document_citations of `doc`, kept for the latest versions by hash.
+/// One saved version was scanned by every check of its save (citations,
+/// test code, mismatches, unread ranges) and again by the run's issue count:
+/// seven scans of a 5.6 MB document took 0.6 s per save.
+fn scan_citations(doc: &str) -> Result<Arc<CitationScan>> {
+    type Memo = std::collections::VecDeque<([u8; 32], Arc<CitationScan>)>;
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<Memo>> = std::sync::OnceLock::new();
+    let memo = || {
+        MEMO.get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    let key: [u8; 32] = Sha256::digest(doc.as_bytes()).into();
+    if let Some((_, found)) = memo().iter().find(|(known, _)| *known == key) {
+        return Ok(found.clone());
+    }
+    let scan = Arc::new(scan_document_citations(doc)?);
+    let mut memo = memo();
+    if !memo.iter().any(|(known, _)| *known == key) {
+        if memo.len() >= SCAN_MEMO_ENTRIES {
+            memo.pop_front();
+        }
+        memo.push_back((key, scan.clone()));
+    }
+    Ok(scan)
+}
+
+fn scan_document_citations(doc: &str) -> Result<CitationScan> {
     let pattern = regex::Regex::new(CITATION_PATTERN)?;
     let continuation = regex::Regex::new(r"^\s*,\s*([0-9]+)(?:[-–]L?([0-9]+))?")?;
     let mut spans = vec![];
@@ -2265,8 +2311,18 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
     Ok((spans, issues))
 }
 
-pub(super) fn citation_spans(doc: &str) -> Result<Vec<Citation>> {
-    Ok(scan_citations(doc)?.0)
+/// The citations of `doc`, shared with the scan that found them.
+pub(super) struct CitationSpans(Arc<CitationScan>);
+
+impl std::ops::Deref for CitationSpans {
+    type Target = [Citation];
+    fn deref(&self) -> &[Citation] {
+        &self.0.0
+    }
+}
+
+pub(super) fn citation_spans(doc: &str) -> Result<CitationSpans> {
+    Ok(CitationSpans(scan_citations(doc)?))
 }
 
 const TEST_CODE_FLAG_LIMIT: usize = 12;
@@ -2284,7 +2340,7 @@ pub(super) fn test_code_check(s: &Session, output: &Path, doc: &str) -> Option<V
     let mut paths = PathResolver::new(&s.project);
     let mut items = Vec::new();
     let mut total = 0usize;
-    for citation in citations {
+    for citation in citations.iter() {
         let path = if citation.relative_link {
             output
                 .parent()
@@ -2417,7 +2473,8 @@ fn citation_issues_and_paths(
     doc: &str,
     with_fixes: bool,
 ) -> Result<(usize, Vec<Value>, FixablePaths)> {
-    let (spans, mut issues) = scan_citations(doc)?;
+    let scan = scan_citations(doc)?;
+    let (spans, mut issues) = (&scan.0, scan.1.clone());
     let mut versions = std::collections::BTreeMap::new();
     let mut paths = PathResolver::new(&s.project);
     let mut suggestions = BTreeMap::<String, Option<String>>::new();
@@ -2436,7 +2493,7 @@ fn citation_issues_and_paths(
         columns,
         line_text,
         ..
-    } in &spans
+    } in spans
     {
         let path = if *relative_link {
             output
@@ -3146,5 +3203,48 @@ mod definition_tests {
         let (names, qualifiers) = code_names("beta alpha beta gamma::delta alpha gamma::x");
         assert_eq!(names, ["beta", "alpha", "delta"]);
         assert_eq!(qualifiers, ["gamma"]);
+    }
+}
+
+#[cfg(test)]
+mod scan_memo_tests {
+    use super::*;
+
+    /// Tool review 2026-10-23: one saved version was scanned for citations
+    /// by every check of its save and again by the run's issue count. The
+    /// scan is kept per version: the same text gives the scan made for it,
+    /// with what scanning it again finds, and changed text a new scan.
+    #[test]
+    fn a_scanned_version_is_scanned_once() {
+        let doc = "# T\n\nSee src/memo_a.rs:1-2, 4 and memo_b.rs#L3.\n\n```\nsrc/x.rs:9\n";
+        let first = scan_citations(doc).unwrap();
+        let fresh = scan_document_citations(doc).unwrap();
+        let raw = |citations: &[Citation]| {
+            citations
+                .iter()
+                .map(|c| {
+                    (
+                        c.raw.clone(),
+                        c.path.clone(),
+                        c.begin,
+                        c.end,
+                        c.document_line,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(raw(&first.0), raw(&fresh.0));
+        assert_eq!(first.1, fresh.1);
+        assert_eq!(first.0.len(), 3, "{:?}", raw(&first.0));
+        assert!(!first.1.is_empty());
+        // Other tests share the memo; one pair of calls in a row sees the
+        // same scan unless another version came between them.
+        assert!(
+            (0..10)
+                .any(|_| Arc::ptr_eq(&scan_citations(doc).unwrap(), &scan_citations(doc).unwrap()))
+        );
+        let changed = doc.replace("1-2", "5-6");
+        let scan = citation_spans(&changed).unwrap();
+        assert_eq!((scan[0].begin, scan[0].end), (5, 6));
     }
 }
