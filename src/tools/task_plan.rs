@@ -17,6 +17,8 @@ const MAX_TEXT_CHARS: usize = 500;
 const MAX_RESULT_CHARS: usize = 500;
 const MAX_OPERATIONS: usize = 16;
 const MAX_ENCODED_BYTES: usize = 128 * 1024;
+/// Longest string kept whole in a refused batch's conflict details.
+const CONFLICT_STRING_CHARS: usize = 1024;
 
 #[derive(Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -419,6 +421,10 @@ fn unchanged(
         _ =>
             "Correct the reported operation using the returned IDs and current_revision, then resend the whole batch. No earlier operation was committed.",
     });
+    // The reason and conflict quote the operation that failed, IDs and op
+    // names included, which a call can make megabytes long.
+    omit_long_strings(&mut conflict, CONFLICT_STRING_CHARS);
+    let reason = omit_middle(reason, ERROR_MESSAGE_CHARS);
     json!({"applied":false,"reason":reason,"conflict":conflict,"plan":view(task, 0, DEFAULT_PAGE)})
 }
 

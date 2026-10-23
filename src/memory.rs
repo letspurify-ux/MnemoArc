@@ -103,6 +103,10 @@ pub struct Memory {
     pub revision: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// The searched fields, derived from the text above on the first search.
+    /// A stored memory's text never changes; only its status and revision do.
+    #[serde(skip)]
+    pub(crate) search: std::sync::OnceLock<std::sync::Arc<search::Fields>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -323,6 +327,7 @@ impl MemoryStore {
             revision: old.as_ref().map_or(1, |m| m.revision + 1),
             created_at: old.as_ref().map_or(now, |m| m.created_at),
             updated_at: now,
+            search: Default::default(),
         };
         let next_bytes = self.bytes().saturating_sub(
             old.as_ref()
@@ -631,5 +636,51 @@ mod tests {
         assert!(error.to_string().contains("memory_key_conflict"));
         assert_eq!(store.generation, generation);
         assert_eq!(store.get("original").unwrap().body, "original body");
+    }
+
+    // Every search normalized every memory's text again, and automatic
+    // recall searches on each model request: 1000 memories with 30 KB bodies
+    // took 2.4 s per search. A stored memory keeps its searched fields; a
+    // session copy shares them, and a status change keeps them.
+    #[test]
+    fn a_stored_memory_builds_its_search_fields_once() {
+        let mut store = MemoryStore::default();
+        let config = Config::compact_test();
+        let saved = store
+            .save(
+                input("auth".into(), "Token refresh in AuthService", None),
+                vec![],
+                &config,
+            )
+            .unwrap();
+        store
+            .save(
+                input("other".into(), "Unrelated cache notes", None),
+                vec![],
+                &config,
+            )
+            .unwrap();
+        // A listing of everything needs no fields.
+        store.search("", &[]);
+        assert!(store.get(&saved.id).unwrap().search.get().is_none());
+        let first: Vec<_> = store
+            .search("auth service", &[])
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        let built = store.get(&saved.id).unwrap().search.get().cloned().unwrap();
+        let copy = store.clone();
+        let again: Vec<_> = copy
+            .search("auth service", &[])
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(first, again);
+        assert_eq!(first.first(), Some(&saved.id));
+        let shared = copy.get(&saved.id).unwrap().search.get().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&built, shared));
+        store.entries.get_mut(&saved.id).unwrap().status = MemoryStatus::NeedsReview;
+        let kept = store.get(&saved.id).unwrap().search.get().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&built, kept));
     }
 }

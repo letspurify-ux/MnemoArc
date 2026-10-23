@@ -115,7 +115,20 @@ fn argument_failure(name: &str, args: &Value, message: String, diagnostic: Value
     // source IDs and kinds must be copied from the intended, observed claim.
     let example = json!({"title":"<intended title>","summary":"<intended summary>","body":"<intended body>","kind":"fact","source_ids":["<copy an observed source ID>"]});
     let example = if name == "memory_manage" {
-        json!({"action":"replace","ids":args["ids"],"replacement":example})
+        // The call's own IDs, bounded: they were repeated whole, and a call
+        // carrying megabytes of them took half a second to bound.
+        let ids: Vec<Value> = match &args["ids"] {
+            Value::Array(ids) => ids
+                .iter()
+                .take(32)
+                .map(|id| match id.as_str() {
+                    Some(id) => json!(super::arguments::shown_name(id)),
+                    None => json!("<memory ID>"),
+                })
+                .collect(),
+            _ => vec![json!("<memory ID>")],
+        };
+        json!({"action":"replace","ids":ids,"replacement":example})
     } else {
         example
     };

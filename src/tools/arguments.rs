@@ -374,7 +374,7 @@ pub(super) fn annotate(error: anyhow::Error, name: &str, args: &Value) -> anyhow
     let message = error.to_string();
     let (field, expected) = named_field(&message, &spec.parameters, args);
     let mut data = json!({"execution":"not_started","input_error":{
-        "tool":name,"field":field,"received":value_type(args),
+        "tool":name,"field":shown_name(&field),"received":value_type(args),
         "received_fields":received,"required_fields":spec.parameters["required"],"allowed_fields":allowed,
         "guidance":"Follow the error's action-specific requirements; preserve other intended arguments. No tool operation was executed."
     }});
@@ -451,7 +451,7 @@ pub(super) fn annotate_runtime(error: anyhow::Error, name: &str, shape: &Value) 
         return error;
     }
     let mut data = json!({"input_error":{
-        "tool":name,"field":field,"received":lookup(shape, &field).map_or("missing", value_type)
+        "tool":name,"field":shown_name(&field),"received":lookup(shape, &field).map_or("missing", value_type)
     }});
     if let Some(expected) = expected {
         data["input_error"]["expected"] = expected;

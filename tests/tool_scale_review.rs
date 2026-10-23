@@ -259,3 +259,104 @@ fn errors_repeat_only_the_start_of_a_long_argument_name() {
     .to_string();
     assert!(batch.len() < 2000, "{}", batch.len());
 }
+
+fn call(s: &mut Session, id: &str, name: &str, args: serde_json::Value) -> serde_json::Value {
+    let call = mnemoarc::llm::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: args.to_string(),
+    };
+    tools::run_call(s, &call)
+}
+
+/// Errors quote the value they refuse: a memory ID, a section, a path or a
+/// tool name. A 1 MiB value was repeated whole and bounding each result
+/// took 0.15 s per MiB; a refused plan batch and an unknown task_state patch
+/// field repeated it in their details as well. The start and the end of the
+/// message are kept.
+#[test]
+fn refusals_repeat_only_the_ends_of_a_long_value() {
+    let doc = "# Doc\n\n## A\n\nText.\n";
+    let (_dir, mut s) = document(doc);
+    s.document_written = true;
+    let digest = tools::hash(doc.as_bytes());
+    let big = "a".repeat(1 << 20);
+    let cases = [
+        ("memory_read", json!({"id":big})),
+        ("memory_manage", json!({"action":"delete","ids":[big]})),
+        ("tool_select", json!({"action":"add","names":[big]})),
+        ("file_read", json!({"path":big})),
+        (
+            "document_edit",
+            json!({"action":"section","section":big,"text":"x","expected_hash":digest,"expected_section_hash":digest}),
+        ),
+        (
+            "task_state",
+            json!({"action":"update","patch":{big.clone():1}}),
+        ),
+        (
+            "task_plan",
+            json!({"action":"apply","expected_revision":0,"operations":[{"op":"update","id":big,"text":"x"}]}),
+        ),
+    ];
+    for (index, (name, args)) in cases.into_iter().enumerate() {
+        let started = Instant::now();
+        let result = call(&mut s, &format!("c{index}"), name, args);
+        assert!(started.elapsed() < LIMIT, "{name}: {:?}", started.elapsed());
+        let shown = result.to_string();
+        assert!(shown.len() < 24_000, "{name}: {}", shown.len());
+        if let Some(error) = result["error"].as_str() {
+            assert!(error.contains("characters omitted"), "{name}: {error:.200}");
+        }
+    }
+    let error = call(&mut s, "m", "memory_read", json!({"id":big}))["error"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(error.starts_with("memory_not_found: "), "{error:.200}");
+    assert!(error.ends_with("never guess one"), "{error:.200}");
+}
+
+/// tool_catalog lowercased every description again for each query term:
+/// a query of 32,000 terms took 0.2 s. Matching is unchanged.
+#[test]
+fn tool_catalog_matches_each_term_against_each_description_once() {
+    let (_dir, mut s) = document("# Doc\n");
+    let started = Instant::now();
+    let query = format!("{} section", "zq ".repeat(32_000));
+    let result = tools::execute(&mut s, "tool_catalog", json!({"query":query})).unwrap();
+    assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+    let names: Vec<_> = result["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"document_edit"), "{names:?}");
+    let none = tools::execute(&mut s, "tool_catalog", json!({"query":"zq zq"})).unwrap();
+    assert!(none["tools"].as_array().unwrap().is_empty(), "{none}");
+}
+
+/// A history search prepared its search for the whole query against every
+/// string of every retained message, which a long query made slow even
+/// over a small history.
+#[test]
+fn a_long_history_query_is_not_prepared_per_message() {
+    let (_dir, mut s) = document("# Doc\n");
+    for i in 0..300 {
+        let content = json!({"status":"ok","data":{"items":(0..20).map(|j| format!("item {i} {j}")).collect::<Vec<_>>()}});
+        s.history.push(
+            vec![
+                json!({"role":"tool","tool_call_id":format!("c{i}"),"content":content.to_string()}),
+            ],
+            true,
+        );
+    }
+    let query = "zq ".repeat(100_000);
+    let started = Instant::now();
+    let result = s.history.search(&query, 0, 10);
+    assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+    assert!(result["items"].as_array().unwrap().is_empty(), "{result}");
+    let found = s.history.search("ITEM 7 3", 0, 10);
+    assert_eq!(found["items"].as_array().unwrap().len(), 1, "{found}");
+}

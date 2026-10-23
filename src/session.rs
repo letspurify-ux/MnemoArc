@@ -315,10 +315,7 @@ impl SessionHistory {
             .iter()
             .filter(|b| b.id > after)
             .filter(|b| {
-                serde_json::to_string(&b.messages)
-                    .unwrap()
-                    .to_lowercase()
-                    .contains(&q)
+                lower_contains(&serde_json::to_string(&b.messages).unwrap(), &q)
                     || b.messages.iter().any(|m| text_contains(m, &q, 2))
             })
             .take(limit + 1)
@@ -326,6 +323,15 @@ impl SessionHistory {
         let items:Vec<_>=rows.iter().take(limit).map(|b|json!({"id":b.id,"active":b.active,"excerpt":serde_json::to_string(&b.messages).unwrap().chars().take(240).collect::<String>()})).collect();
         json!({"next_cursor":if rows.len()>items.len(){items.last().and_then(|x|x["id"].as_u64())}else{None},"items":items,"pruned_through":self.pruned_through})
     }
+}
+
+/// Whether `text`, lowercased, contains `query`. A query longer than the
+/// text cannot occur in it; `str::contains` prepares its searcher over the
+/// whole query first, which for a 100 KB query over every string of every
+/// retained message cost 0.15 s on a small history.
+fn lower_contains(text: &str, query: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.len() >= query.len() && lower.contains(query)
 }
 
 /// Whether a string in `value` holds `query` (already lowercased) as text:
@@ -336,7 +342,7 @@ impl SessionHistory {
 fn text_contains(value: &Value, query: &str, depth: u8) -> bool {
     match value {
         Value::String(text) => {
-            text.to_lowercase().contains(query)
+            lower_contains(text, query)
                 || (depth > 0
                     && text.trim_start().starts_with(['{', '['])
                     && serde_json::from_str::<Value>(text)

@@ -4302,7 +4302,7 @@ pub fn envelope(result: Result<Value>) -> Value {
             }
         }
         Err(error) => {
-            let message = format!("{error:#}");
+            let message = bounded_error_message(format!("{error:#}"));
             let status = if message == "cancelled" || message.starts_with("cancelled:") {
                 "cancelled"
             } else if message.starts_with("unsupported") {
@@ -4316,6 +4316,58 @@ pub fn envelope(result: Result<Value>) -> Value {
             }
             result
         }
+    }
+}
+
+/// Longest error message kept whole, in characters.
+const ERROR_MESSAGE_CHARS: usize = 8192;
+
+/// An error message with an over-long middle omitted. Errors quote the value
+/// they refuse (a section, path, memory ID or tool name), and a call can carry
+/// megabytes in one field: bounding a 1 MiB message cost 0.15 s per call. The
+/// code at the start and the guidance after the quote are kept.
+fn bounded_error_message(message: String) -> String {
+    omit_middle(message, ERROR_MESSAGE_CHARS)
+}
+
+/// `text` whole when it has at most `limit` characters, else its first three
+/// quarters and last quarter of `limit` around a note of what was omitted.
+pub(crate) fn omit_middle(text: String, limit: usize) -> String {
+    if text.len() <= limit {
+        return text;
+    }
+    let chars = text.chars().count();
+    if chars <= limit {
+        return text;
+    }
+    let head = limit * 3 / 4;
+    let tail = (limit / 4).max(1);
+    let head_end = text.char_indices().nth(head).map_or(0, |(at, _)| at);
+    let tail_start = text
+        .char_indices()
+        .nth_back(tail - 1)
+        .map_or(text.len(), |(at, _)| at);
+    format!(
+        "{}… [{} characters omitted] …{}",
+        &text[..head_end],
+        chars - head - tail,
+        &text[tail_start..]
+    )
+}
+
+/// Every string in `value` shortened by omit_middle to `limit` characters.
+pub(crate) fn omit_long_strings(value: &mut Value, limit: usize) {
+    match value {
+        Value::String(text) if text.len() > limit => {
+            *text = omit_middle(std::mem::take(text), limit);
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| omit_long_strings(item, limit)),
+        Value::Object(fields) => fields
+            .values_mut()
+            .for_each(|field| omit_long_strings(field, limit)),
+        _ => {}
     }
 }
 
@@ -6255,12 +6307,15 @@ fn execute_repaired(
         "document_inspect" | "document_audit" => documentation::execute(s, name, &args, cancel),
         "tool_catalog" => {
             let q = args["query"].as_str().unwrap_or("").to_lowercase();
-            let terms: Vec<_> = q
+            // Distinct terms, each description lowercased once: lowercasing
+            // every description again for each term of a long query took
+            // 0.2 s for 32,000 terms.
+            let terms: BTreeSet<_> = q
                 .split(|c: char| c.is_whitespace() || c == '_' || c == '-')
                 .filter(|t| !t.is_empty())
                 .collect();
             Ok(
-                json!({"groups":["source-docs"],"tools":ToolRegistry::specs().into_iter().filter(|t|t.name != "db_query" || s.config.database.active_queries().next().is_some()).filter(|t|t.name != "db_execute" || s.config.database.free_execution_enabled()).filter(|t|terms.is_empty() || terms.iter().any(|term| t.name.contains(term) || t.description.to_lowercase().contains(term))).map(|t|json!({"name":t.name,"description":t.description,"basic":!t.optional,"active":!t.optional||s.active_tools.contains(t.name),"selectable":t.optional && !s.workflow_forbidden_tools().contains(&t.name)})).collect::<Vec<_>>()}),
+                json!({"groups":["source-docs"],"tools":ToolRegistry::all_specs().iter().filter(|t|t.name != "db_query" || s.config.database.active_queries().next().is_some()).filter(|t|t.name != "db_execute" || s.config.database.free_execution_enabled()).filter(|t|terms.is_empty() || { let description = t.description.to_lowercase(); terms.iter().any(|term| t.name.contains(term) || description.contains(term)) }).map(|t|json!({"name":t.name,"description":t.description,"basic":!t.optional,"active":!t.optional||s.active_tools.contains(t.name),"selectable":t.optional && !s.workflow_forbidden_tools().contains(&t.name)})).collect::<Vec<_>>()}),
             )
         }
         "tool_select" => {

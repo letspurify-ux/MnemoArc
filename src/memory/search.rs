@@ -6,6 +6,10 @@ use std::collections::BTreeSet;
 use unicode_normalization::UnicodeNormalization;
 
 fn normalize(text: &str) -> String {
+    // ASCII is NFKC already and folds to its lowercase.
+    if text.is_ascii() {
+        return text.to_ascii_lowercase();
+    }
     text.nfkc().default_case_fold().nfkc().collect()
 }
 
@@ -13,7 +17,11 @@ fn normalize(text: &str) -> String {
 /// Normalize before splitting to handle full-width identifiers consistently,
 /// but fold case afterwards so identifier boundaries are still available.
 fn terms(text: &str) -> BTreeSet<String> {
-    let chars: Vec<_> = text.nfkc().collect();
+    let chars: Vec<_> = if text.is_ascii() {
+        text.chars().collect()
+    } else {
+        text.nfkc().collect()
+    };
     let mut word = String::new();
     let mut words = BTreeSet::new();
     for (i, &ch) in chars.iter().enumerate() {
@@ -106,6 +114,41 @@ struct Field {
     weight: usize,
 }
 
+/// A memory's searched fields: key, title, tags, summary, source paths and
+/// body, normalized and split into terms. Built once per stored memory:
+/// building them on every search normalized all memory text each time, and
+/// automatic recall searches on every model request; 1000 memories with
+/// 30 KB bodies took 2.4 s per search.
+pub(crate) struct Fields([Field; 6]);
+
+impl std::fmt::Debug for Fields {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Fields")
+    }
+}
+
+fn fields(memory: &Memory) -> &[Field] {
+    &memory
+        .search
+        .get_or_init(|| {
+            let paths = memory
+                .sources
+                .iter()
+                .filter_map(|source| source.path.as_deref())
+                .collect::<Vec<_>>()
+                .join(" ");
+            std::sync::Arc::new(Fields([
+                Field::new(memory.key.as_deref().unwrap_or(""), 12),
+                Field::new(&memory.title, 10),
+                Field::new(&memory.tags.join(" "), 10),
+                Field::new(&memory.summary, 6),
+                Field::new(&paths, 3),
+                Field::new(&memory.body, 2),
+            ]))
+        })
+        .0
+}
+
 impl Field {
     fn new(text: &str, weight: usize) -> Self {
         let normalized = normalize(text);
@@ -192,21 +235,12 @@ pub(super) fn rank(
         let score = if list_all {
             1
         } else {
-            let paths = memory
-                .sources
-                .iter()
-                .filter_map(|source| source.path.as_deref())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let fields = [
-                Field::new(memory.key.as_deref().unwrap_or(""), 12),
-                Field::new(&memory.title, 10),
-                Field::new(&memory.tags.join(" "), 10),
-                Field::new(&memory.summary, 6),
-                Field::new(&paths, 3),
-                Field::new(&memory.body, 2),
-            ];
-            let relevance = request.score(&fields) * 3 + work.score(&fields);
+            let relevance = if request.terms.is_empty() && work.terms.is_empty() {
+                0
+            } else {
+                let fields = fields(memory);
+                request.score(fields) * 3 + work.score(fields)
+            };
             let reliability = match memory.status {
                 MemoryStatus::Active => 100,
                 MemoryStatus::NeedsReview => 70,
@@ -225,4 +259,39 @@ pub(super) fn rank(
             .then(a.id.cmp(&b.id))
     });
     matches.into_iter().map(|(_, _, m)| m.meta()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ASCII text skips Unicode normalization: it must fold exactly as the
+    // general path does.
+    #[test]
+    fn ascii_text_normalizes_as_the_general_path_does() {
+        let ascii: String = (0u8..128).map(char::from).collect();
+        let general: String = ascii.nfkc().default_case_fold().nfkc().collect();
+        assert_eq!(normalize(&ascii), general);
+        for text in [
+            "HTTPServer memoryRead",
+            "snake_case-and.path/File.rs",
+            "Mixed 한글 Text",
+        ] {
+            let chars: Vec<char> = text.nfkc().collect();
+            assert_eq!(text.chars().collect::<Vec<_>>(), chars, "{text}");
+            assert_eq!(
+                normalize(text),
+                text.nfkc().default_case_fold().nfkc().collect::<String>()
+            );
+        }
+        assert_eq!(
+            terms("HTTPServer memoryRead"),
+            BTreeSet::from([
+                "http".into(),
+                "server".into(),
+                "memory".into(),
+                "read".into()
+            ])
+        );
+    }
 }
