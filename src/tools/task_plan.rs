@@ -950,7 +950,16 @@ fn trial(
                 })),
             })
         })?;
-    let mut next = task.clone();
+    // Operations change only the plan, and a waiting operation is tried on
+    // a copy after every applied one: copying the whole state each time, its
+    // task_state details included (up to memory_bytes), made a reversed batch
+    // of 16 completes take 2.4 s with 22 MB of details.
+    let mut next = TaskState {
+        todos: task.todos.clone(),
+        todo_sequence: task.todo_sequence,
+        todos_completed_total: task.todos_completed_total,
+        ..TaskState::default()
+    };
     let count = operations.len();
     // Operations apply in order, so the plan the failing one saw can differ
     // from the one the caller read. Name the operation and the item that was
@@ -1031,7 +1040,11 @@ fn trial(
         let at = next.todos.iter().position(|item| item.done).unwrap();
         next.todos.remove(at);
     }
-    Ok((next, normalized, notices))
+    let mut full = task.clone();
+    full.todos = next.todos;
+    full.todo_sequence = next.todo_sequence;
+    full.todos_completed_total = next.todos_completed_total;
+    Ok((full, normalized, notices))
 }
 
 pub fn execute(s: &mut Session, args: &Value) -> Result<Value> {

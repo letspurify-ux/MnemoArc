@@ -1034,8 +1034,10 @@ const BROAD_CITATION_LINES: usize = 120;
 pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
     let output = output_path(&s.project)?;
     // Delivered complete-line ranges of each file's current version.
-    let mut versions = BTreeMap::<PathBuf, Option<String>>::new();
-    let mut delivered = BTreeMap::<PathBuf, Vec<(usize, usize)>>::new();
+    // Looked up once or twice per citation: hashed, as comparing paths by
+    // component took a third of the check for 80,000 citations.
+    let mut versions = HashMap::<PathBuf, Option<String>>::new();
+    let mut delivered = HashMap::<PathBuf, Vec<(usize, usize)>>::new();
     // Every source of a long session is checked on each request; resolve
     // each file once rather than once per source.
     let mut paths = PathResolver::new(&s.project);
@@ -1108,8 +1110,8 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
     for ranges in delivered.values_mut() {
         *ranges = merged_ranges(std::mem::take(ranges));
     }
-    let mut missing = BTreeMap::<PathBuf, Vec<(usize, usize)>>::new();
-    let mut line_counts = BTreeMap::<PathBuf, usize>::new();
+    let mut missing = HashMap::<PathBuf, Vec<(usize, usize)>>::new();
+    let mut line_counts = HashMap::<PathBuf, usize>::new();
     // The document is not evidence for itself: a self-citation would go
     // unread again after every edit, so it is never owed a read.
     let own = output.canonicalize().ok();
@@ -1159,6 +1161,8 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
             gaps.push((next, citation.end));
         }
     }
+    // Issues are listed by path.
+    let mut missing: BTreeMap<PathBuf, Vec<(usize, usize)>> = missing.into_iter().collect();
     // A line longer than one page reaches the model in pieces, each one a
     // partial line that attests nothing alone; the text coverage of the
     // pieces delivered shows the whole line was read. Without it, a citation
@@ -1506,7 +1510,7 @@ pub(super) fn citation_mismatch_check(s: &Session, output: &Path, doc: &str) -> 
     let citations = citation_spans(doc).ok()?;
     let unchanged = unchanged_sections(s, output, doc);
     let own = output.canonicalize().ok();
-    let mut files = BTreeMap::<PathBuf, Option<CitedFile>>::new();
+    let mut files = HashMap::<PathBuf, Option<CitedFile>>::new();
     let mut paths = PathResolver::new(&s.project);
     let mut items = Vec::new();
     let mut total = 0usize;
@@ -2336,7 +2340,7 @@ const TEST_CODE_GUIDANCE: &str = "These citations point into test code. A test s
 pub(super) fn test_code_check(s: &Session, output: &Path, doc: &str) -> Option<Value> {
     let root = s.project.root.canonicalize().ok()?;
     let citations = citation_spans(doc).ok()?;
-    let mut modules = BTreeMap::<PathBuf, Vec<(usize, usize)>>::new();
+    let mut modules = HashMap::<PathBuf, Vec<(usize, usize)>>::new();
     let mut paths = PathResolver::new(&s.project);
     let mut items = Vec::new();
     let mut total = 0usize;
@@ -2475,7 +2479,7 @@ fn citation_issues_and_paths(
 ) -> Result<(usize, Vec<Value>, FixablePaths)> {
     let scan = scan_citations(doc)?;
     let (spans, mut issues) = (&scan.0, scan.1.clone());
-    let mut versions = std::collections::BTreeMap::new();
+    let mut versions = HashMap::new();
     let mut paths = PathResolver::new(&s.project);
     let mut suggestions = BTreeMap::<String, Option<String>>::new();
     let mut project_files = super::FilesByName::default();

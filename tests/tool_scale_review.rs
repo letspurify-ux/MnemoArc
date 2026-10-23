@@ -818,3 +818,44 @@ fn file_patch_hashes_the_original_once_for_repeated_hashes() {
         text
     );
 }
+
+/// A complete whose earlier items the same batch finishes waits and is
+/// tried again after every applied operation, each try on a copy of the
+/// task state with its details (up to memory_bytes): 16 completes sent in
+/// reverse order took 2.4 s with 22 MB of details in release builds. The
+/// tries copy only the plan; the details stay as they were.
+#[test]
+fn waiting_plan_operations_are_tried_on_the_plan_alone() {
+    let (_dir, mut s) = document("# Doc\n");
+    // The default memory_bytes, which bounds the serialized task state.
+    s.config.memory_bytes = 32 * 1024 * 1024;
+    s.task.details = (0..100_000)
+        .map(|i| json!({"note":format!("detail {i} {}", "x".repeat(200))}))
+        .collect();
+    let texts: Vec<String> = (1..=16)
+        .map(|i| format!("Step number {i} of the work"))
+        .collect();
+    let planned = tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":0,"operations":[{"op":"insert","texts":texts}]}),
+    )
+    .unwrap();
+    let operations: Vec<_> = (1..=16)
+        .rev()
+        .map(|i| json!({"op":"complete","id":format!("T{i}"),"result":"done"}))
+        .collect();
+    let started = Instant::now();
+    let applied = tools::execute(
+        &mut s,
+        "task_plan",
+        json!({"action":"apply","expected_revision":planned["plan"]["revision"],"operations":operations}),
+    )
+    .unwrap();
+    assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+    assert_eq!(applied["applied"], true, "{applied}");
+    assert_eq!(applied["plan"]["pending_count"], 0);
+    assert_eq!(s.task.todos_completed_total, 16);
+    assert_eq!(s.task.details.len(), 100_000);
+    assert_eq!(s.task.details[7]["note"].as_str().unwrap().len(), 209);
+}
