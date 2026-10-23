@@ -674,3 +674,105 @@ fn text_alternating_letters_and_marks_is_counted_in_parts() {
     assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
     assert_eq!(count, 300_000);
 }
+
+/// A section replacement compared each new numbered heading with every
+/// heading of the document: 2000 numbered sections replaced into a
+/// 40,000-heading document took 2 s (optimized). A number its siblings
+/// already have is still refused.
+#[test]
+fn section_replacement_checks_numbered_siblings_against_an_index() {
+    let sections = 40_000;
+    let mut doc = String::from("# Title\n\n");
+    for i in 0..sections {
+        doc.push_str(&format!("## {i}. Section {i}\n\ntext\n\n"));
+    }
+    let (_dir, mut s) = document(&doc);
+    let mut text = String::from("## 0. Section 0\n\nnew\n\n");
+    for j in 0..2000 {
+        text.push_str(&format!("## {}. New {j}\n\nx\n\n", sections + j));
+    }
+    let clash = format!("{text}## 7. Another seven\n\nx\n");
+    let started = Instant::now();
+    let refused = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":"## 0. Section 0","text":clash,"expected_hash":tools::hash(doc.as_bytes())}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        refused.contains("already has section 7 as \"## 7. Section 7\""),
+        "{refused}"
+    );
+    let saved = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"section","section":"## 0. Section 0","text":text,"expected_hash":tools::hash(doc.as_bytes())}),
+    )
+    .unwrap();
+    assert_eq!(saved["inserted_sections"].as_array().unwrap().len(), 2000);
+    assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+}
+
+/// A batch kept a copy of the document per operation and hashed it three
+/// times per operation (32 edits of a 14 MB document held 1 GB, optimized),
+/// and a section hash that did not match hashed the whole document again
+/// per edit. Failures are now explained by replaying the applied edits:
+/// the hint still names the earlier edit that changed an old_text, and the
+/// per-operation hashes are those of the documents in between.
+#[test]
+fn batch_failures_are_explained_by_replaying_the_applied_edits() {
+    let filler = "A paragraph of background text for the section. ".repeat(40);
+    let mut doc = String::from("# Title\n\n");
+    for i in 0..1500 {
+        doc.push_str(&format!(
+            "## {i}. Section {i}\n\nmarker {i} here\n\n{filler}\n\n"
+        ));
+    }
+    let (dir, mut s) = document(&doc);
+    s.document_written = true;
+    let mut edits =
+        vec![json!({"action":"replace_text","old_text":"marker 0 here","text":"changed"})];
+    edits.push(json!({"action":"replace_text","old_text":"marker 0 here","text":"again"}));
+    for i in 1..31 {
+        edits.push(json!({"action":"section","section":format!("## {i}. Section {i}"),"text":format!("## {i}. Section {i}\n\nnew\n"),"expected_section_hash":tools::hash(b"stale")}));
+    }
+    let started = Instant::now();
+    let refused = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"edits":edits,"expected_hash":tools::hash(doc.as_bytes())}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        refused.contains("index=1; action=replace_text")
+            && refused.contains("edits[0] in this same batch already changed it"),
+        "{}",
+        &refused[..refused.len().min(2000)]
+    );
+    assert!(refused.contains("index=30; action=section; cause=section_revision_conflict"));
+    let edits: Vec<_> = (0..32)
+        .map(|i| json!({"action":"replace_text","old_text":format!("marker {i} here"),"text":format!("changed {i}")}))
+        .collect();
+    let saved = tools::execute(
+        &mut s,
+        "document_edit_batch",
+        json!({"edits":edits,"expected_hash":tools::hash(doc.as_bytes())}),
+    )
+    .unwrap();
+    let saved_doc = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+    assert_eq!(saved["hash"], tools::hash(saved_doc.as_bytes()));
+    assert_eq!(saved["operations"][31]["hash"], saved["hash"]);
+    assert_eq!(saved["operations"][5]["changed"], true);
+    let mut after_six = doc.clone();
+    for i in 0..6 {
+        after_six = after_six.replacen(&format!("marker {i} here"), &format!("changed {i}"), 1);
+    }
+    assert_eq!(
+        saved["operations"][5]["hash"],
+        tools::hash(after_six.as_bytes())
+    );
+    assert!(saved_doc.contains("changed 31"));
+    assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+}

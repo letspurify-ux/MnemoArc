@@ -404,9 +404,10 @@ impl HeadingIndex {
 
     /// The section path of the heading starting at byte `start`.
     pub(super) fn path_at(&self, start: usize) -> Result<&str> {
+        // Headings are in document order.
         self.headings
-            .iter()
-            .position(|heading| heading.start == start)
+            .binary_search_by_key(&start, |heading| heading.start)
+            .ok()
             .map(|index| self.paths[index].as_str())
             .ok_or_else(|| anyhow::anyhow!("section_not_found: heading position changed"))
     }

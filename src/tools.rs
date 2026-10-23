@@ -1896,57 +1896,130 @@ fn rebase_document_hash(
     })
 }
 
-/// Explain a batch operation whose old_text did not match exactly once.
-/// `states[k]` is the document before operation k (states[0] = original).
-fn batch_target_hint(states: &[String], applied: &[usize], edit: &Value, error: &str) -> String {
-    if error.starts_with("section_revision_conflict") {
-        // The section may have matched the snapshot the caller read and been
-        // changed by an earlier operation of this same batch.
-        let (Some(section), Some(expected)) = (
-            edit["section"].as_str(),
-            edit["expected_section_hash"].as_str(),
-        ) else {
-            return String::new();
-        };
-        // The hash of the original document names its version of the
-        // section as well (see check_section_hash).
-        let original = (expected == hash(states[0].as_bytes()))
-            .then(|| documentation::resolve_heading(&states[0], section).ok())
-            .flatten()
-            .map(|h| &states[0][h.start..h.end]);
-        let matched = |doc: &String| {
-            documentation::resolve_heading(doc, section).is_ok_and(|h| {
-                let text = &doc[h.start..h.end];
-                hash(text.as_bytes()) == expected || original == Some(text)
-            })
-        };
-        if let Some(changed_by) =
-            (1..states.len()).find(|&k| matched(&states[k - 1]) && !matched(&states[k]))
-        {
-            return format!(
-                ". The section matched when this batch started but edits[{}] in this same batch already changed it; merge the two edits into one section replacement or send them as separate requests",
-                applied[changed_by - 1]
-            );
+/// What a failed batch operation is checked for: its section matching
+/// its expected hash, or its old_text being in the document.
+enum BatchProbe<'a> {
+    Section {
+        section: &'a str,
+        expected: &'a str,
+        /// The original document's version of the section, when the
+        /// expected hash is that document's (see check_section_hash).
+        original: Option<String>,
+    },
+    Text(&'a str),
+    Skip,
+}
+
+impl BatchProbe<'_> {
+    fn holds(&self, doc: &str, index: Option<&documentation::HeadingIndex>) -> bool {
+        match self {
+            Self::Section {
+                section,
+                expected,
+                original,
+            } => index
+                .and_then(|index| index.resolve(section).ok())
+                .is_some_and(|h| {
+                    let text = &doc[h.start..h.end];
+                    hash(text.as_bytes()) == *expected || original.as_deref() == Some(text)
+                }),
+            Self::Text(target) => doc.contains(target),
+            Self::Skip => false,
         }
-        return String::new();
     }
-    if !error.starts_with("patch_target_must_match_once") {
-        return String::new();
-    }
-    let Some(target) = edit["old_text"].as_str().filter(|t| !t.is_empty()) else {
-        return String::new();
+}
+
+/// For each failed batch operation, why its section hash or old_text did
+/// not match when an earlier operation of the same batch changed that
+/// text; empty otherwise (the operation's own error explains every other
+/// cause). `steps` are the applied operations in order, as applied; the
+/// documents between them are rebuilt one at a time.
+fn batch_target_hints(
+    old: &str,
+    digest: &str,
+    steps: &[(usize, std::borrow::Cow<Value>, String)],
+    failed: &[(usize, &str, std::borrow::Cow<Value>, String)],
+) -> Vec<String> {
+    let mut hints = vec![String::new(); failed.len()];
+    let probes: Vec<BatchProbe> = failed
+        .iter()
+        .map(|(_, _, edit, error)| {
+            if error.starts_with("section_revision_conflict") {
+                let (Some(section), Some(expected)) = (
+                    edit["section"].as_str(),
+                    edit["expected_section_hash"].as_str(),
+                ) else {
+                    return BatchProbe::Skip;
+                };
+                let original = (expected == digest)
+                    .then(|| documentation::resolve_heading(old, section).ok())
+                    .flatten()
+                    .map(|h| old[h.start..h.end].to_owned());
+                BatchProbe::Section {
+                    section,
+                    expected,
+                    original,
+                }
+            } else if error.starts_with("patch_target_must_match_once") {
+                match edit["old_text"].as_str().filter(|t| !t.is_empty()) {
+                    Some(target) => BatchProbe::Text(target),
+                    None => BatchProbe::Skip,
+                }
+            } else {
+                BatchProbe::Skip
+            }
+        })
+        .collect();
+    // Probes still open: those failing after the next step to replay.
+    let open = |step: usize, done: &[bool]| -> Vec<usize> {
+        (0..failed.len())
+            .filter(|&j| !done[j] && failed[j].0 > step && !matches!(probes[j], BatchProbe::Skip))
+            .collect()
     };
-    // Present in the original but removed by an earlier operation here. The
-    // operation's own error explains every other cause.
-    if let Some(changed_by) =
-        (1..states.len()).find(|&k| states[k - 1].contains(target) && !states[k].contains(target))
-    {
-        return format!(
-            ". old_text existed in the original document but edits[{}] in this same batch already changed it; operations apply in order, so copy old_text from the text after that edit, merge the two corrections, or send them as separate requests",
-            applied[changed_by - 1]
-        );
+    let mut done = vec![false; failed.len()];
+    let index_for = |doc: &str, from: usize, done: &[bool]| {
+        open(from, done)
+            .into_iter()
+            .any(|j| matches!(probes[j], BatchProbe::Section { .. }))
+            .then(|| documentation::HeadingIndex::new(doc))
+    };
+    let Some(&(first_step, _, _)) = steps.first() else {
+        return hints;
+    };
+    let index = index_for(old, first_step, &done);
+    let mut held = vec![false; failed.len()];
+    for j in open(first_step, &done) {
+        held[j] = probes[j].holds(old, index.as_ref());
     }
-    String::new()
+    let mut current = std::borrow::Cow::Borrowed(old);
+    let mut current_hash = digest;
+    for (step, edit, next_hash) in steps {
+        if open(*step, &done).is_empty() {
+            break;
+        }
+        let Ok(next) = apply_document_edit_at(&current, Some(current_hash), edit) else {
+            break;
+        };
+        current_hash = next_hash;
+        let index = index_for(&next, *step, &done);
+        for j in open(*step, &done) {
+            let holds = probes[j].holds(&next, index.as_ref());
+            if held[j] && !holds {
+                done[j] = true;
+                hints[j] = match probes[j] {
+                    BatchProbe::Section { .. } => format!(
+                        ". The section matched when this batch started but edits[{step}] in this same batch already changed it; merge the two edits into one section replacement or send them as separate requests"
+                    ),
+                    _ => format!(
+                        ". old_text existed in the original document but edits[{step}] in this same batch already changed it; operations apply in order, so copy old_text from the text after that edit, merge the two corrections, or send them as separate requests"
+                    ),
+                };
+            }
+            held[j] = holds;
+        }
+        current = std::borrow::Cow::Owned(next);
+    }
+    hints
 }
 
 /// What checking an edit against the current document in memory found, for
@@ -2430,37 +2503,33 @@ fn anchored_passage(old: &str, target: &str) -> Option<String> {
 /// are often retyped with an en dash or a moved backtick; showing the exact
 /// text lets the caller copy it instead of guessing again.
 fn near_match(old: &str, target: &str) -> Option<String> {
-    /// The normalized text, and for each of its characters its byte offset
-    /// there and the span of `text` it stands for.
-    fn normalize(text: &str) -> (String, Vec<usize>, Vec<(usize, usize)>) {
+    /// A character as compared: backticks dropped, dash and quote variants
+    /// unified, whitespace a space.
+    fn normalized(c: char) -> Option<char> {
+        match c {
+            '`' => None,
+            '–' | '—' | '‒' | '−' => Some('-'),
+            '‘' | '’' => Some('\''),
+            '“' | '”' => Some('"'),
+            c if c.is_whitespace() => Some(' '),
+            c => Some(c),
+        }
+    }
+    /// The normalized text: whitespace runs are one space.
+    fn normalize(text: &str) -> String {
         let mut normal = String::new();
-        let mut offsets = Vec::new();
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        for (at, c) in text.char_indices() {
-            let end = at + c.len_utf8();
-            let c = match c {
-                '`' => continue,
-                '–' | '—' | '‒' | '−' => '-',
-                '‘' | '’' => '\'',
-                '“' | '”' => '"',
-                c if c.is_whitespace() => ' ',
-                c => c,
-            };
+        for c in text.chars().filter_map(normalized) {
             if c == ' ' && normal.ends_with(' ') {
-                if let Some(span) = spans.last_mut() {
-                    span.1 = end;
-                }
                 continue;
             }
-            offsets.push(normal.len());
             normal.push(c);
-            spans.push((at, end));
         }
-        (normal, offsets, spans)
+        normal
     }
-    let (doc, offsets, spans) = normalize(old);
-    let (wanted, wanted_offsets, _) = normalize(target.trim());
-    if wanted_offsets.len() < 8 {
+    let doc = normalize(old);
+    let wanted = normalize(target.trim());
+    let count = wanted.chars().count();
+    if count < 8 {
         return None;
     }
     // A substring search, not a comparison at every position: that took
@@ -2471,10 +2540,37 @@ fn near_match(old: &str, target: &str) -> Option<String> {
     if doc[next..].contains(&wanted) {
         return None;
     }
-    let first = offsets.binary_search(&start).ok()?;
-    let (from, _) = spans[first];
-    let (_, to) = spans[first + wanted_offsets.len() - 1];
-    Some(old[from..to].to_owned())
+    // The passage of `old` the match stands for, found by normalizing it
+    // again: a byte offset and span per character took 24 bytes a
+    // character (350 MB for a 14 MB document).
+    let (mut normal_len, mut previous) = (0, None);
+    let (mut from, mut to, mut taken) = (None, 0, 0);
+    for (at, c) in old.char_indices() {
+        let end = at + c.len_utf8();
+        let Some(c) = normalized(c) else {
+            continue;
+        };
+        if c == ' ' && previous == Some(' ') {
+            // A collapsed space belongs to the space before it.
+            if taken == count {
+                to = end;
+            }
+            continue;
+        }
+        if taken == count {
+            break;
+        }
+        if normal_len == start {
+            from = Some(at);
+        }
+        if from.is_some() {
+            taken += 1;
+            to = end;
+        }
+        normal_len += c.len_utf8();
+        previous = Some(c);
+    }
+    Some(old[from?..to].to_owned())
 }
 
 /// Entities in a target that only matches once they are decoded.
@@ -2639,11 +2735,22 @@ fn is_anchored_text_edit(action: &str) -> bool {
 /// current document names that version too: a live model copied the
 /// document hash from an audit into expected_section_hash, was refused as
 /// stale, and spent two requests re-reading a section that had not changed.
-fn check_section_hash(document: &str, section: &str, heading: &str, sent: &str) -> Result<()> {
-    if sent == hash(section.as_bytes()) || sent == hash(document.as_bytes()) {
+/// `digest` is the document's hash when the caller has it: hashing a 14 MB
+/// document per section edit of a batch took seconds.
+fn check_section_hash(
+    document: &str,
+    digest: Option<&str>,
+    section: &str,
+    heading: &str,
+    sent: &str,
+) -> Result<()> {
+    let hex = sent.len() == 64 && sent.bytes().all(|b| b.is_ascii_hexdigit());
+    if sent == hash(section.as_bytes())
+        || (hex && digest.map_or_else(|| hash(document.as_bytes()), str::to_owned) == sent)
+    {
         return Ok(());
     }
-    if sent.len() != 64 || !sent.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !hex {
         bail!(
             "section_revision_conflict: expected_section_hash {sent:?} is not a section hash (64 hex characters); copy section_hash from document_inspect of {heading:?}, not an item ID or document hash"
         );
@@ -2654,6 +2761,12 @@ fn check_section_hash(document: &str, section: &str, heading: &str, sent: &str) 
 }
 
 fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
+    apply_document_edit_at(old, None, args)
+}
+
+/// apply_document_edit_operation on a document whose hash `digest` the
+/// caller already has.
+fn apply_document_edit_at(old: &str, digest: Option<&str>, args: &Value) -> Result<String> {
     let action = text(args, "action")?;
     let new = if action == "delete_text" {
         ""
@@ -2835,7 +2948,7 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             // Without a section hash the caller pinned the whole document
             // with expected_hash (section_edit_needs).
             if let Some(expected) = args["expected_section_hash"].as_str() {
-                check_section_hash(old, target, &resolved.heading, expected)?;
+                check_section_hash(old, digest, target, &resolved.heading, expected)?;
             }
             let new_headings = documentation::headings(new);
             let current_line = target.lines().next().unwrap_or("").trim();
@@ -2913,19 +3026,36 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                 .iter()
                 .position(|heading| heading.start == resolved.start)
                 .map(|index| parent_of(&paths[index]));
+            // Siblings by level and number, each with the first one and the
+            // first one titled differently from it: scanning every heading
+            // per new heading made 2000 numbered sections replaced into a
+            // 40k-heading document take seconds.
+            let mut siblings: HashMap<(usize, &str), (usize, Option<usize>)> = HashMap::new();
+            for (index, (heading, path)) in existing.iter().zip(&paths).enumerate() {
+                if Some(parent_of(path)) != target_parent {
+                    continue;
+                }
+                let Some(number) =
+                    section_number(documentation::bare_heading_title(&heading.heading))
+                else {
+                    continue;
+                };
+                let entry = siblings
+                    .entry((heading.level, number))
+                    .or_insert((index, None));
+                if entry.1.is_none() && existing[entry.0].heading.trim() != heading.heading.trim() {
+                    entry.1 = Some(index);
+                }
+            }
             if let Some((extra, present, number)) = peers.iter().find_map(|peer| {
                 let number = section_number(documentation::bare_heading_title(&peer.heading))?;
-                existing
-                    .iter()
-                    .zip(&paths)
-                    .find(|(heading, path)| {
-                        heading.level == peer.level
-                            && heading.heading.trim() != peer.heading.trim()
-                            && section_number(documentation::bare_heading_title(&heading.heading))
-                                == Some(number)
-                            && Some(parent_of(path)) == target_parent
-                    })
-                    .map(|(present, _)| (peer, present, number))
+                let &(first, other) = siblings.get(&(peer.level, number))?;
+                let present = if existing[first].heading.trim() != peer.heading.trim() {
+                    first
+                } else {
+                    other?
+                };
+                Some((peer, &existing[present], number))
             }) {
                 bail!(
                     "invalid_argument_value: section replacement cannot add {:?} (line {} of text): the document already has section {number} as {:?} at document line {}, so two sections would share that number. If the text continues that section, rewrite it with its own action=section edit using its exact heading; if it is a new section, renumber it, or place it with action=insert_after",
@@ -2935,11 +3065,14 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
                     present.line
                 );
             }
+            let mut by_title: HashMap<&str, &documentation::Heading> = HashMap::new();
+            for heading in &existing {
+                by_title.entry(heading.heading.trim()).or_insert(heading);
+            }
             if let Some((extra, present)) = peers.iter().find_map(|peer| {
-                existing
-                    .iter()
-                    .find(|heading| heading.heading.trim() == peer.heading.trim())
-                    .map(|present| (peer, present))
+                by_title
+                    .get(peer.heading.trim())
+                    .map(|present| (peer, *present))
             }) {
                 bail!(
                     "invalid_argument_value: section replacement cannot add a heading the document already has: line {} of text contains {:?}, which is at document line {}; inserting it would duplicate that section. Keep this replacement to {:?} and its new sections, and rewrite {:?} with its own action=section edit",
@@ -3038,6 +3171,7 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             {
                 check_section_hash(
                     old,
+                    digest,
                     &old[heading.start..heading.end],
                     &heading.heading,
                     expected,
@@ -3567,10 +3701,16 @@ fn empty_peer_headings(text: &str, level: usize) -> Vec<documentation::Heading> 
 
 /// The replacement text without its empty peer headings.
 fn without_empty_peer_headings(text: &str, level: usize) -> String {
-    let mut kept = text.to_string();
-    for heading in empty_peer_headings(text, level).iter().rev() {
-        kept.replace_range(heading.start..heading.end, "");
+    // The text between them copied once: removing each from a copy moved
+    // the rest of the text per heading (20,000 before a 1.5 MB section
+    // took 0.5 s).
+    let mut kept = String::with_capacity(text.len());
+    let mut from = 0;
+    for heading in empty_peer_headings(text, level) {
+        kept.push_str(&text[from..heading.start]);
+        from = heading.end;
     }
+    kept.push_str(&text[from..]);
     kept
 }
 
@@ -3582,6 +3722,11 @@ fn dropped_peer_headings(old: &str, edit: &Value) -> Vec<String> {
     let (Some(section), Some(text)) = (edit["section"].as_str(), edit["text"].as_str()) else {
         return Vec::new();
     };
+    // Resolving the section parses the whole document; most texts have no
+    // empty heading at any level.
+    if empty_peer_headings(text, 6).is_empty() {
+        return Vec::new();
+    }
     documentation::resolve_heading(old, section)
         .map(|resolved| {
             empty_peer_headings(text, resolved.level)
@@ -3751,9 +3896,7 @@ fn persist_document_edit(
     if cancel.is_cancelled() {
         bail!("cancelled");
     }
-    if path.exists() != exists
-        || (exists && hash(read_text(path)?.as_bytes()) != hash(old.as_bytes()))
-    {
+    if path.exists() != exists || (exists && read_text(path)? != old) {
         bail!("document_revision_conflict: changed during write");
     }
     if exists {
@@ -3764,9 +3907,9 @@ fn persist_document_edit(
     s.document_written = true;
     // A smaller edit succeeded; whole-document writes are allowed again.
     s.progress_recovery.whole_write_withheld = false;
-    s.last_document_write = Some((path.to_path_buf(), hash(result.as_bytes())));
-    revalidate(s)?;
     let hash = hash(result.as_bytes());
+    s.last_document_write = Some((path.to_path_buf(), hash.clone()));
+    revalidate(s)?;
     let bytes = result.len();
     let total_lines = result.lines().count();
     // The outline places the next section without a document_inspect round;
@@ -7119,7 +7262,7 @@ fn execute_repaired(
                     "document_missing: the output document does not exist yet; create it with document_edit action=create and no expected_hash"
                 );
             }
-            let result = apply_document_edit_operation(&old, &args)?;
+            let result = apply_document_edit_at(&old, Some(&digest), &args)?;
             if exists && result == old && s.document_written {
                 return Err(document_unchanged(&digest, &[args.clone()]));
             }
@@ -7170,51 +7313,65 @@ fn execute_repaired(
             }
             let edits = args["edits"].as_array().expect("validated edits array");
             let mut current = old.clone();
-            // states[k] is the text after edits[applied[k - 1]].
-            let mut states = vec![old.clone()];
-            let mut applied = Vec::with_capacity(edits.len());
+            let mut current_hash = digest.clone();
+            // The operations applied so far, as applied. A failure is
+            // explained by replaying them (batch_target_hints): a copy of
+            // the document per operation held 1 GB for 32 edits of a 14 MB
+            // document, and three hashes per operation took seconds.
+            let mut steps: Vec<(usize, std::borrow::Cow<Value>, String)> =
+                Vec::with_capacity(edits.len());
             let mut operations = Vec::with_capacity(edits.len());
             // Keep checking after a failure so one response names every
             // operation to fix instead of one per retry.
-            let mut failures = Vec::new();
-            let mut failed_edits = Vec::new();
+            let mut failed = Vec::new();
             for (index, edit) in edits.iter().enumerate() {
                 if cancel.is_cancelled() {
                     bail!("cancelled");
                 }
                 let action = edit["action"].as_str().unwrap_or("unknown");
-                let before_hash = hash(current.as_bytes());
-                let rebased = rebase_document_hash(edit, &old, &digest, &current);
-                let edit = rebased.as_ref().unwrap_or(edit);
-                let dropped = dropped_peer_headings(&current, edit);
-                let next = match apply_document_edit_operation(&current, edit) {
+                let edit = match rebase_document_hash(edit, &old, &digest, &current) {
+                    Some(rebased) => std::borrow::Cow::Owned(rebased),
+                    None => std::borrow::Cow::Borrowed(edit),
+                };
+                let dropped = dropped_peer_headings(&current, &edit);
+                let next = match apply_document_edit_at(&current, Some(&current_hash), &edit) {
                     Ok(next) => next,
                     Err(error) => {
-                        let hint = batch_target_hint(&states, &applied, edit, &error.to_string());
-                        failed_edits.push(json!({
-                            "index":index,"action":action,
-                            "code":recovery::error_code(&error.to_string())
-                        }));
-                        failures.push(format!(
-                            "index={index}; action={action}; cause={error}{hint}"
-                        ));
+                        failed.push((index, action, edit, error.to_string()));
                         continue;
                     }
                 };
+                let changed = next != current;
                 current = next;
-                states.push(current.clone());
-                applied.push(index);
+                if changed {
+                    current_hash = hash(current.as_bytes());
+                }
+                steps.push((index, edit, current_hash.clone()));
                 let mut operation = json!({
                     "index":index,
                     "action":action,
-                    "changed":before_hash != hash(current.as_bytes()),
-                    "hash":hash(current.as_bytes())
+                    "changed":changed,
+                    "hash":current_hash
                 });
                 if !dropped.is_empty() {
                     operation["dropped_headings"] = json!(dropped);
                 }
                 operations.push(operation);
             }
+            let hints = batch_target_hints(&old, &digest, &steps, &failed);
+            let failed_edits: Vec<Value> = failed
+                .iter()
+                .map(|(index, action, _, error)| {
+                    json!({"index":index,"action":action,"code":recovery::error_code(error)})
+                })
+                .collect();
+            let failures: Vec<String> = failed
+                .iter()
+                .zip(&hints)
+                .map(|((index, action, _, error), hint)| {
+                    format!("index={index}; action={action}; cause={error}{hint}")
+                })
+                .collect();
             if hash_missing {
                 return Err(missing_document_hash(
                     "document_edit_batch",
@@ -9073,6 +9230,84 @@ mod edit_diagnostic_tests {
         let started = std::time::Instant::now();
         assert_eq!(near_match(&old, &target), None);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// Tool review 2026-10-23: near_match kept a byte offset and span per
+    /// character (350 MB for a 14 MB document); the passage it finds is
+    /// the one the per-character spans gave.
+    #[test]
+    fn near_match_finds_the_passage_the_character_spans_gave() {
+        fn by_spans(old: &str, target: &str) -> Option<String> {
+            fn normalize(text: &str) -> (String, Vec<usize>, Vec<(usize, usize)>) {
+                let (mut normal, mut offsets, mut spans) =
+                    (String::new(), Vec::new(), Vec::<(usize, usize)>::new());
+                for (at, c) in text.char_indices() {
+                    let end = at + c.len_utf8();
+                    let c = match c {
+                        '`' => continue,
+                        '–' | '—' | '‒' | '−' => '-',
+                        '‘' | '’' => '\'',
+                        '“' | '”' => '"',
+                        c if c.is_whitespace() => ' ',
+                        c => c,
+                    };
+                    if c == ' ' && normal.ends_with(' ') {
+                        if let Some(span) = spans.last_mut() {
+                            span.1 = end;
+                        }
+                        continue;
+                    }
+                    offsets.push(normal.len());
+                    normal.push(c);
+                    spans.push((at, end));
+                }
+                (normal, offsets, spans)
+            }
+            let (doc, offsets, spans) = normalize(old);
+            let (wanted, wanted_offsets, _) = normalize(target.trim());
+            if wanted_offsets.len() < 8 {
+                return None;
+            }
+            let start = doc.find(&wanted)?;
+            let next = start + doc[start..].chars().next().map_or(1, char::len_utf8);
+            if doc[next..].contains(&wanted) {
+                return None;
+            }
+            let first = offsets.binary_search(&start).ok()?;
+            Some(old[spans[first].0..spans[first + wanted_offsets.len() - 1].1].to_owned())
+        }
+        let alphabet = ['a', 'b', ' ', '\n', '`', '–', '-', '’', '\'', '가', '\t'];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let mut found = 0;
+        for _ in 0..40_000 {
+            let len = 4 + next(40);
+            let old: String = (0..len).map(|_| alphabet[next(alphabet.len())]).collect();
+            let chars: Vec<char> = old.chars().collect();
+            let from = next(chars.len());
+            let to = (from + 1 + next(chars.len() - from)).min(chars.len());
+            let mut target: String = chars[from..to]
+                .iter()
+                .map(|&c| match (c, next(4)) {
+                    ('`', 0) => ' ',
+                    ('–', 0) => '-',
+                    (' ', 0) => '\t',
+                    (c, _) => c,
+                })
+                .collect();
+            if next(3) == 0 {
+                target.push('`');
+            }
+            let expected = by_spans(&old, &target);
+            found += usize::from(expected.is_some());
+            assert_eq!(near_match(&old, &target), expected, "{old:?} {target:?}");
+        }
+        assert!(found > 1000, "{found}");
     }
 
     /// headings closes every open section at a heading of its level or
