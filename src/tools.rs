@@ -3910,7 +3910,10 @@ fn persist_document_edit(
     s.progress_recovery.whole_write_withheld = false;
     let hash = hash(result.as_bytes());
     s.last_document_write = Some((path.to_path_buf(), hash.clone()));
-    revalidate(s)?;
+    // The document is saved from here on: a check that fails now is reported
+    // beside the save, not as its failure, which would read as nothing
+    // written and invite the same edit again.
+    let revalidation_error = revalidate(s).err();
     let bytes = result.len();
     let total_lines = result.lines().count();
     // The outline places the next section without a document_inspect round;
@@ -3938,6 +3941,9 @@ fn persist_document_edit(
         saved["outline_omitted"] = json!(outline.omitted());
         saved["outline_note"] = json!(OUTLINE_OMITTED_NOTE);
     }
+    if let Some(error) = revalidation_error {
+        saved["memory_revalidation_error"] = json!(error.to_string());
+    }
     // The answer workflow verifies nothing: report the write only.
     if s.task.workflow == "answer" {
         return Ok(saved);
@@ -3949,7 +3955,8 @@ fn persist_document_edit(
             "note":"These citations named a file without its folder; the save wrote the project path in saved_as, so the saved text differs from the text sent there. Copy later old_text from the saved text."
         });
     }
-    saved["citation_check"] = documentation::citation_check(s, path, &result)?;
+    saved["citation_check"] = documentation::citation_check(s, path, &result)
+        .unwrap_or_else(|error| json!({"error":format!("citation_check_failed: {error}")}));
     saved["format_check"] = document_format::checked(&result, &hash).write_result();
     if s.is_document_work()
         && let Some(check) = documentation::test_code_check(s, path, &result)
