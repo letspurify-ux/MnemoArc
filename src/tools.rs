@@ -143,6 +143,19 @@ impl ToolRegistry {
     }
 
     pub fn specs() -> Vec<ToolSpec> {
+        Self::all_specs().to_vec()
+    }
+    /// The registry's tool specs, built once. Building them took about 150
+    /// microseconds, and each tool call looked its spec up six times or more.
+    pub(crate) fn all_specs() -> &'static [ToolSpec] {
+        static SPECS: std::sync::OnceLock<Vec<ToolSpec>> = std::sync::OnceLock::new();
+        SPECS.get_or_init(Self::build_specs)
+    }
+    /// The spec of the named tool.
+    pub(crate) fn spec(name: &str) -> Option<&'static ToolSpec> {
+        Self::all_specs().iter().find(|spec| spec.name == name)
+    }
+    fn build_specs() -> Vec<ToolSpec> {
         let specs = vec![
             ToolSpec {
                 name: "db_query",
@@ -530,7 +543,7 @@ impl ToolRegistry {
         DESCRIPTIONS
             .get_or_init(|| {
                 let mut edited = BTreeMap::new();
-                for spec in Self::specs() {
+                for spec in Self::all_specs() {
                     let mut text = spec.description.to_owned();
                     for (name, old, new) in Self::ANSWER_DESCRIPTION_EDITS {
                         if *name == spec.name {
@@ -714,8 +727,8 @@ impl ToolRegistry {
             .collect()
     }
     pub fn optional_names() -> BTreeSet<String> {
-        Self::specs()
-            .into_iter()
+        Self::all_specs()
+            .iter()
             .filter(|t| t.optional)
             .map(|t| t.name.into())
             .collect()
@@ -728,9 +741,8 @@ impl ToolRegistry {
         if s.read_only_turn && !Self::question_allows(name) {
             bail!("question_tools_not_allowed: {name} changes task state or files; task preserved");
         }
-        let spec = Self::specs()
-            .into_iter()
-            .find(|t| t.name == name)
+        let spec = Self::spec(name)
+            .cloned()
             .ok_or_else(|| unsupported_tool(s, name))?;
         reject_project_write_in_source_document(s, name)?;
         if spec.optional && !s.active_tools.contains(name) {
@@ -1196,9 +1208,7 @@ fn repair_leaked_argument_markup(tool: &str, args: &mut Value) -> Result<bool> {
     // Decoding and trimming every value wrote file content "    indented();\n"
     // as "indented();", dropped the quotes of a "hi" string literal, and
     // turned a query "404" into a number the search refused.
-    let properties = ToolRegistry::specs()
-        .into_iter()
-        .find(|spec| spec.name == tool)
+    let properties = ToolRegistry::spec(tool)
         .map(|spec| spec.parameters["properties"].clone())
         .unwrap_or_default();
     let decode = |name: &str, text: &str| {
@@ -1275,7 +1285,7 @@ fn unwrap_continuation_cursor(name: &str, args: &mut Value) {
         Some(tool) => tool == name,
         None => continuation.contains_key("cursor"),
     };
-    let Some(spec) = ToolRegistry::specs().into_iter().find(|t| t.name == name) else {
+    let Some(spec) = ToolRegistry::spec(name) else {
         return;
     };
     if !names_this_tool {
@@ -4103,7 +4113,7 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
             _ => false,
         }
     }
-    if let Some(spec) = ToolRegistry::specs().into_iter().find(|t| t.name == name)
+    if let Some(spec) = ToolRegistry::spec(name)
         && let Some(fields) = args.as_object_mut()
     {
         // An array or object argument sent as its JSON text is decoded
@@ -5464,16 +5474,36 @@ fn search_text_hashed(path: &Path) -> Result<Option<(String, String)>> {
 fn search_text_with<T>(path: &Path, read: impl FnOnce(&Path) -> Result<T>) -> Result<Option<T>> {
     match read(path) {
         Ok(text) => Ok(Some(text)),
-        // A file the walk found but cannot read (permissions, or removed
-        // since) is skipped like a binary one: one such file failed every
-        // listing and search of the project.
-        Err(error)
-            if ["unsupported_", "file_permission_denied", "file_not_found"]
-                .iter()
-                .any(|code| error.to_string().starts_with(code)) =>
-        {
-            Ok(None)
-        }
+        // A file the walk found but cannot read (permissions, removed or
+        // replaced by a directory since, or an I/O error while reading it)
+        // is skipped like a binary one: one such file failed every listing
+        // and search of the project.
+        Err(error) if unreadable_file(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether a read failed for the file itself: it is not a text file, cannot
+/// be opened, or an I/O error stopped its read.
+fn unreadable_file(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some()
+        || error.downcast_ref::<DirectoryPath>().is_some()
+        || [
+            "unsupported_",
+            "file_permission_denied",
+            "file_not_found",
+            "file_access_error",
+        ]
+        .iter()
+        .any(|code| error.to_string().starts_with(code))
+}
+
+/// search_text_hashed for a file the call names: only a file that is not
+/// text is skipped, and any other failure to read it is the call's error.
+fn named_text_hashed(path: &Path) -> Result<Option<(String, String)>> {
+    match read_text_hashed(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.to_string().starts_with("unsupported_") => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -6231,7 +6261,7 @@ fn execute_repaired(
                 } else if available.contains(&name) {
                     chosen.insert(name);
                 } else {
-                    let basic = ToolRegistry::specs()
+                    let basic = ToolRegistry::all_specs()
                         .iter()
                         .any(|spec| spec.name == name && !spec.optional);
                     bail!(
@@ -7077,7 +7107,7 @@ fn complete_unclosed_json_arguments(name: &str, args: &mut Value) -> Vec<String>
     if name == "task_plan" {
         return vec![];
     }
-    let Some(spec) = ToolRegistry::specs().into_iter().find(|t| t.name == name) else {
+    let Some(spec) = ToolRegistry::spec(name) else {
         return vec![];
     };
     let Some(fields) = args.as_object_mut() else {
@@ -7143,7 +7173,7 @@ fn infer_replace_text_action(name: &str, args: &mut Value) -> Vec<String> {
 }
 
 fn clamp_size_arguments(name: &str, args: &mut Value) -> Vec<String> {
-    let Some(spec) = ToolRegistry::specs().into_iter().find(|t| t.name == name) else {
+    let Some(spec) = ToolRegistry::spec(name) else {
         return vec![];
     };
     let Some(fields) = args.as_object_mut() else {
@@ -8604,6 +8634,28 @@ mod file_tests {
         assert_eq!(fixed, latin);
         assert!(search_text_hashed(&latin).unwrap().is_some());
         assert_eq!(text_flag(&latin), Some(true));
+    }
+
+    #[test]
+    fn walked_files_that_fail_to_read_are_skipped_but_named_ones_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        // An I/O error while reading, or a file replaced by a directory after
+        // the walk, failed every search and text listing of the project.
+        let io = || -> Result<()> { Err(std::io::Error::from_raw_os_error(libc::EIO).into()) };
+        assert!(search_text_with(&path, |_| io()).unwrap().is_none());
+        let moved = |_: &Path| -> Result<()> { Err(DirectoryPath(path.clone()).into()) };
+        assert!(search_text_with(&path, moved).unwrap().is_none());
+        let error = search_text_with(&path, |_| -> Result<()> { bail!("cancelled") });
+        assert_eq!(error.unwrap_err().to_string(), "cancelled");
+        // A file the call names is skipped only for not being text.
+        std::fs::create_dir(&path).unwrap();
+        assert!(named_text_hashed(&path).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"a\0").unwrap();
+        assert!(named_text_hashed(&path).unwrap().is_none());
+        std::fs::write(&path, b"fn a() {}\n").unwrap();
+        assert!(named_text_hashed(&path).unwrap().is_some());
     }
 
     #[test]

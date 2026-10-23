@@ -335,10 +335,7 @@ pub(super) fn annotate(error: anyhow::Error, name: &str, args: &Value) -> anyhow
     {
         return error;
     }
-    let Some(spec) = ToolRegistry::specs()
-        .into_iter()
-        .find(|spec| spec.name == name)
-    else {
+    let Some(spec) = ToolRegistry::spec(name) else {
         return error;
     };
     let allowed: Vec<_> = spec.parameters["properties"]
@@ -425,10 +422,7 @@ pub(super) fn annotate_runtime(error: anyhow::Error, name: &str, shape: &Value) 
     {
         return error;
     }
-    let Some(spec) = ToolRegistry::specs()
-        .into_iter()
-        .find(|spec| spec.name == name)
-    else {
+    let Some(spec) = ToolRegistry::spec(name) else {
         return error;
     };
     let (field, expected) = named_field(&message, &spec.parameters, shape);

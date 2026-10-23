@@ -666,8 +666,8 @@ impl FailureTracker {
         static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
         NAMES
             .get_or_init(|| {
-                ToolRegistry::specs()
-                    .into_iter()
+                ToolRegistry::all_specs()
+                    .iter()
                     .map(|spec| spec.name)
                     .collect()
             })

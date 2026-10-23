@@ -357,6 +357,7 @@ pub(super) fn execute(
     let mut matched_files = 0;
     let mut matching_file_count = 0;
     let mut total_matching_lines = 0usize;
+    let named = exact_path.is_some();
     let candidates = match exact_path {
         // A named file that cannot be read is an error, not an empty
         // result: only walked files are skipped when unreadable.
@@ -370,7 +371,12 @@ pub(super) fn execute(
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
-        let Some((contents, digest)) = search_text_hashed(&path)? else {
+        let text = if named {
+            super::named_text_hashed(&path)?
+        } else {
+            search_text_hashed(&path)?
+        };
+        let Some((contents, digest)) = text else {
             continue;
         };
         matched_files += 1;
