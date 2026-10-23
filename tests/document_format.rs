@@ -567,3 +567,85 @@ Escaped Option\\<Checkpoint\\> and <!-- note --> and <https://example.com> and <
     );
     assert_eq!(fixed["format_check"]["ok"], true, "{fixed}");
 }
+
+// A garbled line that also begins another line is anchored with its
+// neighbours, joined by the line breaks the document has between them: lone
+// CRs, or LF and CRLF mixed. Joined by one break for the whole document,
+// the anchor was not in the document and the fix was refused.
+#[test]
+fn a_widened_fix_word_anchor_keeps_the_documents_own_line_breaks() {
+    for doc in [
+        "# 가이드\r\r인프รา 설명\r\r인프รา 설명 추가\r",
+        "# 가이드\r\n\r\n인프รา 설명\n\n인프รา 설명 추가\r\n",
+    ] {
+        let (dir, mut s) = setup();
+        let output = dir.path().join("guide.md");
+        std::fs::write(&output, doc).unwrap();
+        let audit = run(&mut s, "document_audit", json!({}));
+        let issue = audit["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|issue| issue["kind"] == "mixed_script_word")
+            .unwrap_or_else(|| panic!("{audit}"))
+            .clone();
+        assert_eq!(issue["line"], 3, "{issue}");
+        run(
+            &mut s,
+            "document_edit",
+            json!({"action":"fix_word","fix_id":issue["fix_id"],"text":"인프라","expected_hash":audit["hash"]}),
+        );
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            doc.replacen("인프รา 설명", "인프라 설명", 1),
+            "{doc:?}"
+        );
+    }
+}
+
+// A document saved by a Windows editor breaks its lines with CRLF; models
+// send old_text with LF breaks. A passage of several lines was never found
+// there. Spelled with CRLF it matches, and the new text keeps CRLF breaks.
+#[test]
+fn old_text_with_lf_breaks_matches_a_crlf_document() {
+    let (dir, mut s) = setup();
+    let output = dir.path().join("guide.md");
+    let doc = "# T\r\n\r\n## A\r\n\r\na text\r\nmore a\r\n\r\n## B\r\n\r\na text\r\nmore b\r\n";
+    std::fs::write(&output, doc).unwrap();
+    let hash = tools::hash(doc.as_bytes());
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","old_text":"a text\nmore a","text":"new a\nsecond line","expected_hash":hash}),
+    );
+    let saved = std::fs::read_to_string(&output).unwrap();
+    assert_eq!(
+        saved,
+        doc.replace("a text\r\nmore a", "new a\r\nsecond line")
+    );
+    // In a batch too; a passage that occurs twice is still refused.
+    let saved_hash = tools::hash(saved.as_bytes());
+    run(
+        &mut s,
+        "document_edit_batch",
+        json!({"expected_hash":saved_hash,"edits":[
+            {"action":"delete_text","old_text":"a text\nmore b\n"},
+            {"action":"insert_after_text","old_text":"## B\n","text":"\nadded\n"}
+        ]}),
+    );
+    let batch = std::fs::read_to_string(&output).unwrap();
+    assert_eq!(
+        batch,
+        "# T\r\n\r\n## A\r\n\r\nnew a\r\nsecond line\r\n\r\n## B\r\n\r\nadded\r\n\r\n"
+    );
+    std::fs::write(&output, doc).unwrap();
+    let error = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","old_text":"\na text\n","text":"x","expected_hash":hash}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("occurs 2 times"), "{error}");
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), doc);
+}

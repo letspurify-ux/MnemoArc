@@ -603,3 +603,20 @@ fn output_file_name_at_the_root_is_not_written_as_a_project_file() {
     assert!(!root.path().join("generated.md").exists());
     assert_eq!(std::fs::read_to_string(&output).unwrap(), "# Doc\n");
 }
+
+#[test]
+fn update_with_lf_breaks_matches_a_crlf_file() {
+    let (dir, mut session) = setup();
+    let path = dir.path().join("win.txt");
+    std::fs::write(&path, "first\r\nsecond\r\nthird\r\n").unwrap();
+    let digest = run(&mut session, "file_read", json!({"path":"win.txt"}))["hash"].clone();
+    run(
+        &mut session,
+        "file_edit",
+        json!({"path":"win.txt","old_text":"first\nsecond","new_text":"one\ntwo","expected_hash":digest}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "one\r\ntwo\r\nthird\r\n"
+    );
+}

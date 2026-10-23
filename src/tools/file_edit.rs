@@ -276,6 +276,23 @@ fn exact_replace(old: &str, needle: &str, replacement: &str, all: bool) -> Resul
             "empty_old_text: old_text must not be empty; copy the exact text to replace from file_read"
         );
     }
+    // A file with CRLF line breaks holds a passage that models send with LF
+    // breaks; spelled with CRLF it is found, and the new text's breaks follow
+    // the file's.
+    let crlf: (String, String);
+    let (needle, replacement) = match (!old.contains(needle)
+        && needle.contains('\n')
+        && !needle.contains('\r')
+        && old.contains("\r\n"))
+    .then(|| needle.replace('\n', "\r\n"))
+    .filter(|spelled| old.contains(spelled.as_str()))
+    {
+        Some(spelled) => {
+            crlf = (spelled, super::crlf_line_breaks(replacement));
+            (crlf.0.as_str(), crlf.1.as_str())
+        }
+        None => (needle, replacement),
+    };
     let Some(first) = old.find(needle) else {
         bail!(
             "text_not_found: old_text does not occur in the current file; copy it exactly (including indentation and line breaks) from a fresh file_read"

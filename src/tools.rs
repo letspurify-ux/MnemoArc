@@ -3180,6 +3180,26 @@ fn apply_document_edit_at(old: &str, digest: Option<&str>, args: &Value) -> Resu
             let (base, scope) = scoped.as_ref().map_or((0, old), |heading| {
                 (heading.start, &old[heading.start..heading.end])
             });
+            // A document saved by a Windows editor breaks its lines with
+            // CRLF, and models send old_text with LF breaks: a passage of
+            // several lines was never found there, and the near-match hint
+            // cost a request per edit. Spelled with CRLF, old_text matches
+            // the passage, and the text's LF breaks become CRLF like the
+            // document's.
+            let crlf: (String, String);
+            let (target, new) = match (!scope.contains(target)
+                && target.contains('\n')
+                && !target.contains('\r')
+                && scope.contains("\r\n"))
+            .then(|| target.replace('\n', "\r\n"))
+            .filter(|spelled| scope.contains(spelled.as_str()))
+            {
+                Some(spelled) => {
+                    crlf = (spelled, crlf_line_breaks(new));
+                    (crlf.0.as_str(), crlf.1.as_str())
+                }
+                None => (target, new),
+            };
             // Surrounding whitespace in old_text is copying noise (for example
             // a line's indentation kept when the passage starts mid-line).
             // When only it differs, match the trimmed passage and drop the
@@ -3375,8 +3395,10 @@ fn expand_fix_word(s: &Session, name: &str, args: &mut Value) -> Result<()> {
     // a line too; str::lines kept such a line whole, so a word below a lone
     // CR was refused as no garbled word. A line between CRs is still text of
     // the saved document, so it serves as the edit's old_text.
-    let normalized = doc.replace("\r\n", "\n").replace('\r', "\n");
-    let lines: Vec<&str> = normalized.lines().collect();
+    // Each line with the break after it ("" for a last line without one),
+    // as the document has it: the anchor of a fix is copied from the
+    // document, lone CRs and mixed LF and CRLF breaks included.
+    let (lines, breaks) = document_lines(&doc);
     // Batch edits apply in order, so a second fix on a line already fixed in
     // this batch starts from that line's new text, its column moved by the
     // length change of the fixes before it on the line.
@@ -3453,33 +3475,28 @@ fn expand_fix_word(s: &Session, name: &str, args: &mut Value) -> Result<()> {
                 .get(&(index + 1))
                 .map_or(lines[index], |(text, _)| text.as_str())
         };
-        let separator = if doc.contains("\r\n") { "\r\n" } else { "\n" };
         // With the document's final line break: without it, a window of
         // repeated lines ending one line before the last occurred once here
         // but twice in the document, and replace_text refused it.
-        let mut current: String = (0..lines.len())
-            .map(current_line)
-            .collect::<Vec<_>>()
-            .join(separator);
-        if normalized.ends_with('\n') {
-            current.push_str(separator);
-        }
+        let current: String = (0..lines.len())
+            .flat_map(|i| [current_line(i), breaks[i]])
+            .collect();
         let index = number - 1;
         let window = |lines_around: usize, own: &str| {
             let first = index.saturating_sub(lines_around);
             let last = (index + lines_around).min(lines.len() - 1);
             let mut text = String::new();
             if lines_around > 0 && first > 0 {
-                text.push_str(separator);
+                text.push_str(breaks[first - 1]);
             }
             for i in first..=last {
                 if i > first {
-                    text.push_str(separator);
+                    text.push_str(breaks[i - 1]);
                 }
                 text.push_str(if i == index { own } else { current_line(i) });
             }
             if lines_around > 0 && last + 1 < lines.len() {
-                text.push_str(separator);
+                text.push_str(breaks[last]);
             }
             text
         };
@@ -3529,6 +3546,47 @@ fn expand_fix_word(s: &Session, name: &str, args: &mut Value) -> Result<()> {
         object.insert("text".into(), json!(new_text));
     }
     Ok(())
+}
+
+/// `text` with each LF that is not part of a CRLF pair written as CRLF.
+fn crlf_line_breaks(text: &str) -> String {
+    let mut written = String::with_capacity(text.len() + text.len() / 16);
+    let mut previous = None;
+    for c in text.chars() {
+        if c == '\n' && previous != Some('\r') {
+            written.push('\r');
+        }
+        written.push(c);
+        previous = Some(c);
+    }
+    written
+}
+
+/// The lines of `text` as CommonMark reads them (a lone CR ends a line
+/// too) and the break after each, "" for a last line without one.
+fn document_lines(text: &str) -> (Vec<&str>, Vec<&str>) {
+    let (mut lines, mut breaks) = (Vec::new(), Vec::new());
+    let bytes = text.as_bytes();
+    let (mut start, mut at) = (0, 0);
+    while at < bytes.len() {
+        let end = match bytes[at] {
+            b'\n' => at + 1,
+            b'\r' if bytes.get(at + 1) == Some(&b'\n') => at + 2,
+            b'\r' => at + 1,
+            _ => {
+                at += 1;
+                continue;
+            }
+        };
+        lines.push(&text[start..at]);
+        breaks.push(&text[at..end]);
+        (start, at) = (end, end);
+    }
+    if start < text.len() {
+        lines.push(&text[start..]);
+        breaks.push("");
+    }
+    (lines, breaks)
 }
 
 /// After an output-limit truncation, a whole-document write is withheld.
