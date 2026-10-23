@@ -98,6 +98,11 @@ fn within_lines(hir: regex_syntax::hir::Hir) -> regex_syntax::hir::Hir {
             Hir::alternation(parts.into_iter().map(within_lines).collect())
         }
         HirKind::Empty => Hir::empty(),
+        // A '\n' in a literal never matches a line either. Kept, `(?:.*\n)+x`
+        // matched from each line to the end of the file and every next line
+        // was searched again from there: a 200KB file took 1.4s to find no
+        // matching line.
+        HirKind::Literal(literal) if literal.0.contains(&b'\n') => Hir::fail(),
         HirKind::Literal(literal) => Hir::literal(literal.0),
         HirKind::Look(look) => Hir::look(look),
     }
@@ -550,6 +555,9 @@ mod tests {
             "^$",
             r"\s",
             "y\nx",
+            "(?:.*\n)+alpha",
+            r"\x0Aalpha|beta",
+            "(?:x\n)*y",
             "[^a]",
             "(?s).",
             r"\Aalpha",
@@ -682,6 +690,17 @@ mod tests {
                     "{expression}"
                 );
             }
+        }
+        // A literal line break matches no line, so a match spanning lines is
+        // no candidate: each one was searched again to the end of the text.
+        let long = "alpha\n".repeat(10_000);
+        for expression in ["(?:.*\n)+zzz", "(?:alpha\n)+", r"alpha\x0A"] {
+            let whole = whole_text_matcher(expression, true).unwrap();
+            assert_eq!(
+                candidate_lines(&long, Some(&whole)).count(),
+                0,
+                "{expression}"
+            );
         }
         // Expressions tied to the text's own ends are searched line by line.
         for expression in [r"\Aalpha", r"alpha\z", "(?-m)^alpha", "(?R)alpha$"] {

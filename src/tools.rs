@@ -5203,6 +5203,7 @@ fn candidate_paths_bounded(
     for entry in ignore::WalkBuilder::new(&root)
         .hidden(false)
         .follow_links(false)
+        .git_global(global_git_ignores_safe())
         .filter_entry(move |entry| {
             !entry.file_type().is_some_and(|t| t.is_dir())
                 || (!SKIPPED_DIRECTORIES.contains(&entry.file_name().to_string_lossy().as_ref())
@@ -5263,10 +5264,7 @@ const MAX_IGNORE_FILE_BYTES: u64 = 1024 * 1024;
 /// server until the system killed it. A directory holding one is not
 /// entered.
 fn unsafe_ignore_file(dir: &Path) -> Option<PathBuf> {
-    let safe = |path: &Path| match path.metadata() {
-        Ok(metadata) => metadata.is_file() && metadata.len() <= MAX_IGNORE_FILE_BYTES,
-        Err(_) => true,
-    };
+    let safe = safe_ignore_file;
     // The first line of a file `safe` accepted, as the walker reads it.
     let first_line = |path: &Path| {
         std::fs::read_to_string(path)
@@ -5308,6 +5306,52 @@ fn unsafe_ignore_file(dir: &Path) -> Option<PathBuf> {
         _ => {}
     }
     files.into_iter().find(|file| !safe(file))
+}
+
+/// Whether the walker may open `path` as an ignore or git config file: a
+/// regular file of at most MAX_IGNORE_FILE_BYTES (links followed), or none.
+fn safe_ignore_file(path: &Path) -> bool {
+    match path.metadata() {
+        Ok(metadata) => metadata.is_file() && metadata.len() <= MAX_IGNORE_FILE_BYTES,
+        Err(_) => true,
+    }
+}
+
+/// Whether a walk may read git's global excludes. The walker reads the
+/// global and system git config files, then the core.excludesFile they name,
+/// on every walk; a git config that was a pipe blocked every listing and
+/// search for good. Without them a walk leaves out only the user's global
+/// ignore patterns.
+fn global_git_ignores_safe() -> bool {
+    #[allow(deprecated)]
+    let home = std::env::home_dir();
+    let variable = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+    let configs = [
+        variable("GIT_CONFIG_GLOBAL").map(PathBuf::from),
+        home.as_ref().map(|home| home.join(".gitconfig")),
+        variable("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|home| home.join(".config")))
+            .map(|config| config.join("git/config")),
+        Some(
+            variable("GIT_CONFIG_SYSTEM")
+                .map_or_else(|| PathBuf::from("/etc/gitconfig"), PathBuf::from),
+        ),
+    ];
+    global_git_files_safe(
+        configs.iter().flatten(),
+        ignore::gitignore::gitconfig_excludes_path,
+    )
+}
+
+/// global_git_ignores_safe over these config files, asking for the excludes
+/// file they name only once every one of them is safe to read.
+fn global_git_files_safe<'a>(
+    configs: impl IntoIterator<Item = &'a PathBuf>,
+    excludes: impl FnOnce() -> Option<PathBuf>,
+) -> bool {
+    configs.into_iter().all(|config| safe_ignore_file(config))
+        && excludes().is_none_or(|path| safe_ignore_file(&path))
 }
 
 // Keep the existing text-only listing contract. Searches use candidates directly
@@ -5388,15 +5432,20 @@ fn observe_hashed_quality(
     excerpt: &str,
     quality: EvidenceQuality,
 ) -> Source {
+    // Checked against every source the session holds, once per search match:
+    // the path's UTF-8 check and the excerpt's copy are made once, not per
+    // source compared.
+    let shown_path = path.to_str();
+    let excerpt: String = excerpt.chars().take(2000).collect();
     if let Some(source) = s.sources.values().find(|source| {
-        source.path.as_deref() == path.to_str()
-            && source.hash.as_deref() == Some(&content_hash)
-            && source.start_line == Some(start)
+        source.start_line == Some(start)
             && source.end_line == Some(end)
+            && source.path.as_deref() == shown_path
+            && source.hash.as_deref() == Some(&content_hash)
             && source.line_start_complete == quality.line_start_complete
             && source.line_end_complete == quality.line_end_complete
             && source.evidence_truncated == quality.evidence_truncated
-            && source.excerpt == excerpt.chars().take(2000).collect::<String>()
+            && source.excerpt == excerpt
     }) {
         return Source::clone(source);
     }
@@ -5411,7 +5460,7 @@ fn observe_hashed_quality(
         line_end_complete: quality.line_end_complete,
         evidence_truncated: quality.evidence_truncated,
         hash: Some(content_hash),
-        excerpt: excerpt.chars().take(2000).collect(),
+        excerpt,
     };
     s.memory
         .stale_path(source.path.as_deref().unwrap(), source.hash.as_deref());
@@ -8339,6 +8388,31 @@ mod file_tests {
         fifo(&other.join(".gitignore"));
         let error = walk(other).unwrap_err().to_string();
         assert!(error.starts_with("unsafe_ignore_file"), "{error}");
+
+        // Git's global config and the excludes file it names are read by
+        // every walk: one that is a pipe, endless or large turns the global
+        // excludes off instead of blocking the walk.
+        let config = dir.path().join("gitconfig");
+        std::fs::write(&config, "[core]\n\texcludesFile = ~/ignore\n").unwrap();
+        let missing = dir.path().join("missing");
+        let pipe = dir.path().join("outside_pipe");
+        assert!(global_git_files_safe([&config, &missing], || Some(
+            config.clone()
+        )));
+        assert!(global_git_files_safe([&config], || None));
+        assert!(!global_git_files_safe(
+            [&config, &pipe],
+            || -> Option<PathBuf> {
+                panic!("the excludes file was looked up past an unsafe config file")
+            }
+        ));
+        assert!(!global_git_files_safe([&config], || Some(pipe.clone())));
+        assert!(!global_git_files_safe([&config], || Some(
+            "/dev/zero".into()
+        )));
+        assert!(!global_git_files_safe([&config], || Some(
+            root.join("huge/.gitignore")
+        )));
     }
 
     // Every tool call keeps a copy of the session as its backup. A read then
