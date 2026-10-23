@@ -22,7 +22,7 @@ pub use coverage::record_delivered_read;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     io::Write,
     path::{Path, PathBuf},
 };
@@ -3319,10 +3319,16 @@ fn expand_fix_word(s: &Session, name: &str, args: &mut Value) -> Result<()> {
                 .map_or(lines[index], |(text, _)| text.as_str())
         };
         let separator = if doc.contains("\r\n") { "\r\n" } else { "\n" };
-        let current: String = (0..lines.len())
+        // With the document's final line break: without it, a window of
+        // repeated lines ending one line before the last occurred once here
+        // but twice in the document, and replace_text refused it.
+        let mut current: String = (0..lines.len())
             .map(current_line)
             .collect::<Vec<_>>()
             .join(separator);
+        if normalized.ends_with('\n') {
+            current.push_str(separator);
+        }
         let index = number - 1;
         let window = |lines_around: usize, own: &str| {
             let first = index.saturating_sub(lines_around);
@@ -3342,9 +3348,37 @@ fn expand_fix_word(s: &Session, name: &str, args: &mut Value) -> Result<()> {
             }
             text
         };
+        // Unique as replace_text requires it: no other occurrence, not even
+        // one overlapping the first. Counting non-overlapping matches took a
+        // window of repeated lines for unique, and replace_text then refused
+        // it. A wider window contains the narrower one at a fixed offset, so
+        // repeats only shrink as it widens: the narrowest unique width is
+        // found by doubling and then halving, not one line at a time (each
+        // scanning the document: 2.9 s on 20,000 repeated lines).
+        let repeated = |around: usize| {
+            let anchor = window(around, &line);
+            current.find(&anchor).is_some_and(|first| {
+                let next = first + current[first..].chars().next().map_or(1, char::len_utf8);
+                current[next..].contains(&anchor)
+            })
+        };
         let mut around = 0;
-        while current.matches(&window(around, &line)).count() > 1 && around < lines.len() {
-            around += 1;
+        if repeated(0) {
+            let (mut unique, mut low) = (1, 0);
+            while unique < lines.len() && repeated(unique) {
+                low = unique;
+                unique = (unique * 2).min(lines.len());
+            }
+            // repeated(low) holds; unique is unique or lines.len().
+            while unique - low > 1 {
+                let middle = low + (unique - low) / 2;
+                if repeated(middle) {
+                    low = middle;
+                } else {
+                    unique = middle;
+                }
+            }
+            around = unique;
         }
         let (old_text, new_text) = (window(around, &line), window(around, &corrected));
         let mut shifts = fixed_lines
@@ -3399,22 +3433,56 @@ fn parent_of(path: &str) -> &str {
 fn check_appended_headings(candidate: &str, from: usize) -> Result<()> {
     let headings = documentation::headings(candidate);
     let paths = documentation::heading_paths(&headings);
+    let numbers: Vec<Option<&str>> = headings
+        .iter()
+        .map(|heading| section_number(documentation::bare_heading_title(&heading.heading)))
+        .collect();
+    // Headings by path, by numbered place and by sibling group, each in
+    // document order. Every appended heading was compared with every
+    // heading: 2000 appended to a 40,000-heading document took 6 s.
+    let mut by_path = HashMap::<&str, Vec<usize>>::new();
+    let mut by_number = HashMap::<(usize, &str, &str), Vec<usize>>::new();
+    let mut siblings = HashMap::<(usize, &str), Vec<usize>>::new();
     for (index, heading) in headings.iter().enumerate() {
-        if heading.start < from {
-            continue;
+        let parent = parent_of(&paths[index]);
+        by_path.entry(&paths[index]).or_default().push(index);
+        if let Some(number) = numbers[index] {
+            by_number
+                .entry((heading.level, parent, number))
+                .or_default()
+                .push(index);
         }
+        siblings
+            .entry((heading.level, parent))
+            .or_default()
+            .push(index);
+    }
+    // The highest section number among each group's earlier headings.
+    let mut highest = HashMap::<(usize, &str), Vec<u64>>::new();
+    for (index, heading) in headings.iter().enumerate() {
         let path = &paths[index];
         let parent = parent_of(path);
+        let group = (heading.level, parent);
+        let rank = numbers[index].and_then(number_rank);
+        let earlier_above =
+            |rank: &Vec<u64>| highest.get(&group).is_some_and(|earlier| earlier > rank);
+        if heading.start < from {
+            if let Some(rank) = rank
+                && highest.get(&group).is_none_or(|earlier| *earlier < rank)
+            {
+                highest.insert(group, rank);
+            }
+            continue;
+        }
         let fix = |existing: &str| {
             format!(
                 "To revise that section, use action=section with section {existing:?}; to add a subsection under it, use insert_last_child; to add a new section, give it a title and number its siblings do not have"
             )
         };
-        if let Some(present) = headings
+        if let Some(present) = by_path[path.as_str()]
             .iter()
-            .zip(&paths)
-            .find(|(other, other_path)| other.start != heading.start && *other_path == path)
-            .map(|(other, _)| other)
+            .find(|&&other| headings[other].start != heading.start)
+            .map(|&other| &headings[other])
         {
             bail!(
                 "invalid_argument_value: append adds {:?}, which the document already has under the same parent at line {}; appending would duplicate that section. {}",
@@ -3423,49 +3491,47 @@ fn check_appended_headings(candidate: &str, from: usize) -> Result<()> {
                 fix(path)
             );
         }
-        let Some(number) = section_number(documentation::bare_heading_title(&heading.heading))
-        else {
+        let Some(number) = numbers[index] else {
             continue;
         };
-        if let Some((present, present_path)) =
-            headings.iter().zip(&paths).find(|(other, other_path)| {
-                other.start != heading.start
-                    && other.level == heading.level
-                    && section_number(documentation::bare_heading_title(&other.heading))
-                        == Some(number)
-                    && parent_of(other_path) == parent
-            })
+        if let Some(&other) = by_number[&(heading.level, parent, number)]
+            .iter()
+            .find(|&&other| headings[other].start != heading.start)
         {
+            let present = &headings[other];
             bail!(
                 "invalid_argument_value: append adds {:?}, but the document already has section {number} as {:?} under the same parent at line {}, so two sections would share that number. {}",
                 heading.heading,
                 present.heading,
                 present.line,
-                fix(present_path)
+                fix(&paths[other])
             );
         }
         // An append lands after every sibling: a live document wrote
         // section 8, then appended 6 and 7 after it.
-        let Some(rank) = number_rank(number) else {
+        let Some(rank) = rank else {
             continue;
         };
-        if let Some((later, later_path)) =
-            headings.iter().zip(&paths).find(|(other, other_path)| {
-                other.start < heading.start
-                    && other.level == heading.level
-                    && parent_of(other_path) == parent
-                    && section_number(documentation::bare_heading_title(&other.heading))
-                        .and_then(number_rank)
-                        .is_some_and(|other_rank| other_rank > rank)
-            })
-        {
+        if earlier_above(&rank) {
+            let later = siblings[&group]
+                .iter()
+                .find(|&&other| {
+                    headings[other].start < heading.start
+                        && numbers[other]
+                            .and_then(number_rank)
+                            .is_some_and(|other_rank| other_rank > rank)
+                })
+                .expect("an earlier sibling holds the highest number");
             bail!(
                 "invalid_argument_value: append adds {:?} after its sibling {:?} at line {}, so numbered sections would be out of order. Place it before that sibling with action=insert_before and section {:?}, or renumber it",
                 heading.heading,
-                later.heading,
-                later.line,
-                later_path
+                headings[*later].heading,
+                headings[*later].line,
+                paths[*later]
             );
+        }
+        if highest.get(&group).is_none_or(|earlier| *earlier < rank) {
+            highest.insert(group, rank);
         }
     }
     Ok(())

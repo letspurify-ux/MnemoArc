@@ -36,11 +36,12 @@ fn squashed(text: &str) -> String {
 
 /// Optimal string alignment distance, bounded to short identifiers.
 fn distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    if a.len().abs_diff(b.len()) > 2 {
+    // Before collecting: a received name can be megabytes long.
+    if a.chars().count().abs_diff(b.chars().count()) > 2 {
         return 3;
     }
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
     let mut rows = vec![vec![0usize; b.len() + 1]; a.len() + 1];
     for (i, row) in rows.iter_mut().enumerate() {
         row[0] = i;

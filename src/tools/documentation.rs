@@ -318,35 +318,46 @@ pub(super) fn heading_path(doc: &str, start: usize) -> Result<String> {
     HeadingIndex::new(doc).path_at(start).map(str::to_owned)
 }
 
+/// Character bigrams of a title, ignoring case, spacing and punctuation,
+/// sorted so equal pairs are adjacent.
+fn title_bigrams(text: &str) -> Vec<(char, char)> {
+    let chars: Vec<char> = text
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    let mut pairs: Vec<_> = chars.windows(2).map(|pair| (pair[0], pair[1])).collect();
+    pairs.sort_unstable();
+    pairs
+}
+
+/// The requested title's bigrams with their counts, and how many there are.
+type TitleTarget = (HashMap<(char, char), usize>, usize);
+
+fn title_target(text: &str) -> TitleTarget {
+    let pairs = title_bigrams(text);
+    let mut counts = HashMap::new();
+    for pair in &pairs {
+        *counts.entry(*pair).or_insert(0) += 1;
+    }
+    (counts, pairs.len())
+}
+
 /// Dice similarity of the character bigrams of two titles, ignoring case,
-/// spacing and punctuation, so Korean and English wording rank alike.
-fn title_similarity(a: &str, b: &str) -> f64 {
-    let bigrams = |text: &str| {
-        let chars: Vec<char> = text
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect();
-        chars
-            .windows(2)
-            .map(|pair| (pair[0], pair[1]))
-            .collect::<Vec<_>>()
-    };
-    let (a, mut b) = (bigrams(a), bigrams(b));
-    if a.is_empty() || b.is_empty() {
+/// spacing and punctuation, so Korean and English wording rank alike. The
+/// requested title's bigrams are counted once (`target`): matched pair by
+/// pair against each heading, a 3000-character section name took 1.8 s
+/// against 40,000 headings.
+fn title_similarity(target: &TitleTarget, title: &str) -> f64 {
+    let title = title_bigrams(title);
+    if target.1 == 0 || title.is_empty() {
         return 0.0;
     }
-    let total = a.len() + b.len();
-    let shared = a
-        .iter()
-        .filter(|pair| {
-            b.iter()
-                .position(|other| other == *pair)
-                .map(|index| b.swap_remove(index))
-                .is_some()
-        })
-        .count();
-    (2 * shared) as f64 / total as f64
+    let shared: usize = title
+        .chunk_by(|a, b| a == b)
+        .map(|run| run.len().min(target.0.get(&run[0]).copied().unwrap_or(0)))
+        .sum();
+    (2 * shared) as f64 / (target.1 + title.len()) as f64
 }
 
 pub(super) fn bare_heading_title(heading: &str) -> &str {
@@ -480,12 +491,14 @@ impl HeadingIndex {
             let candidate_indices: Vec<_> = if matching.is_empty() {
                 // Only some headings fit: the closest titles help more than
                 // the first ones, which a live model then distrusted.
-                let target = bare_heading_title(requested_path.lines().last().unwrap_or(requested));
+                let target = title_target(bare_heading_title(
+                    requested_path.lines().last().unwrap_or(requested),
+                ));
                 let mut indices: Vec<_> = (0..headings.len()).collect();
                 if indices.len() > SHOWN {
                     let score: Vec<_> = headings
                         .iter()
-                        .map(|h| title_similarity(target, bare_heading_title(&h.heading)))
+                        .map(|h| title_similarity(&target, bare_heading_title(&h.heading)))
                         .collect();
                     indices.sort_by(|a, b| score[*b].total_cmp(&score[*a]).then(a.cmp(b)));
                     indices.truncate(SHOWN);
@@ -1864,15 +1877,21 @@ const CITATION_PATTERN: &str = r"((?:[\p{L}\p{N}_./@%-]|/\+|\[\[?[\p{L}\p{N}_.@-
 /// and the label only shows it. Label text may go on after the match, but
 /// not across another bracket; a URL or plain-path target keeps the label
 /// as the citation.
-fn link_label_of_citation(line: &str, from: usize, pattern: &regex::Regex) -> bool {
-    let rest = &line[from..];
-    let Some(close) = rest.find("](") else {
+fn link_label_of_citation(
+    line: &str,
+    marks: &LineMarks,
+    from: usize,
+    pattern: &regex::Regex,
+) -> bool {
+    // The label ends at the first bracket after the citation, which must
+    // open the link target.
+    let Some(close) = marks
+        .bracket_from(from)
+        .filter(|&at| line[at..].starts_with("]("))
+    else {
         return false;
     };
-    if rest[..close].contains(['[', ']']) {
-        return false;
-    }
-    let target = &rest[close + 2..];
+    let target = &line[close + 2..];
     let Some(end) = target.find(')') else {
         return false;
     };
@@ -1936,9 +1955,12 @@ fn network_address(path: &str, separator: &str) -> bool {
 /// Whether a line holds a citation, as the citation checks read one: not
 /// a URL and not a host with its port (`file_exists` tells a file apart).
 fn line_cites(pattern: &regex::Regex, line: &str, file_exists: &dyn Fn(&str) -> bool) -> bool {
+    let mut marks = None;
     pattern.captures_iter(line).any(|c| {
         let whole = c.get(0).unwrap();
-        !url_prefix(&line[..whole.start()], whole.as_str())
+        !marks
+            .get_or_insert_with(|| LineMarks::new(line))
+            .url_prefix(line, whole.start(), whole.as_str())
             && (!network_address(&c[1], &c[2]) || file_exists(&c[1]))
     })
 }
@@ -1974,7 +1996,10 @@ fn spaced_path(s: &Session, before: &str, cited: &str) -> Option<String> {
     if !before.ends_with(' ') {
         return None;
     }
-    let words: Vec<&str> = before.split(' ').collect();
+    // Only the last words are joined: splitting the whole text before each
+    // missing citation was quadratic on a long line.
+    let mut words: Vec<&str> = before.rsplitn(6, ' ').collect();
+    words.reverse();
     // words ends with the empty word after the final space.
     (2..=words.len().min(5)).find_map(|count| {
         let joined = words[words.len() - count..].join(" ");
@@ -1994,12 +2019,55 @@ fn encode_citation_path(path: &str) -> String {
     path.replace('%', "%25").replace(' ', "%20")
 }
 
-fn url_prefix(before: &str, matched: &str) -> bool {
-    let head = before
-        .rsplit(|ch: char| ch.is_whitespace() || ['`', '(', '"'].contains(&ch))
-        .next()
-        .unwrap_or("");
-    head.contains("://") || (head.ends_with(':') && matched.starts_with("//"))
+/// Where a line's word separators, link brackets and `://` are, found once
+/// per line. Each citation looked back to the previous separator and ahead
+/// to the next bracket: a 256 KB line with 20,000 citations took 2.8 s to
+/// audit, 16 s with no space between them.
+struct LineMarks {
+    /// Byte offset just past each word separator.
+    words: Vec<usize>,
+    /// Byte offset of each `://`.
+    schemes: Vec<usize>,
+    /// Byte offset of each `[` and `]`.
+    brackets: Vec<usize>,
+}
+
+impl LineMarks {
+    fn new(line: &str) -> Self {
+        let mut marks = Self {
+            words: Vec::new(),
+            schemes: line.match_indices("://").map(|(at, _)| at).collect(),
+            brackets: Vec::new(),
+        };
+        for (at, ch) in line.char_indices() {
+            if ch.is_whitespace() || ['`', '(', '"'].contains(&ch) {
+                marks.words.push(at + ch.len_utf8());
+            }
+            if matches!(ch, '[' | ']') {
+                marks.brackets.push(at);
+            }
+        }
+        marks
+    }
+
+    /// Whether the text of `line` before `start` makes the citation
+    /// matched there part of a URL: its word holds a `://`, or ends in `:`
+    /// right before a match starting with the `//` of a scheme.
+    fn url_prefix(&self, line: &str, start: usize, matched: &str) -> bool {
+        let separators = self.words.partition_point(|&end| end <= start);
+        let head = separators.checked_sub(1).map_or(0, |last| self.words[last]);
+        let schemes = self.schemes.partition_point(|&at| at < head);
+        self.schemes
+            .get(schemes)
+            .is_some_and(|&at| at + "://".len() <= start)
+            || (line[head..start].ends_with(':') && matched.starts_with("//"))
+    }
+
+    /// The first `[` or `]` at or after `from`.
+    fn bracket_from(&self, from: usize) -> Option<usize> {
+        let index = self.brackets.partition_point(|&at| at < from);
+        self.brackets.get(index).copied()
+    }
 }
 
 /// Per zero-based `str::lines` line, whether a CommonMark parse puts it in
@@ -2089,9 +2157,11 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
         };
         // The text the columns of this line's citations index, shared by them.
         let mut line_text: Option<Arc<str>> = None;
+        let mut marks = None;
         for c in pattern.captures_iter(&visible) {
             let whole = c.get(0).unwrap();
-            if url_prefix(&visible[..whole.start()], whole.as_str()) {
+            let marks = marks.get_or_insert_with(|| LineMarks::new(&visible));
+            if marks.url_prefix(&visible, whole.start(), whole.as_str()) {
                 continue;
             }
             // A Markdown link whose label and target are both citations,
@@ -2099,7 +2169,7 @@ fn scan_citations(doc: &str) -> Result<(Vec<Citation>, Vec<Value>)> {
             // text. Checked as a citation it reported a missing main.rs on
             // every such link, and a live run spent twelve requests rewriting
             // labels whose targets already resolved.
-            if link_label_of_citation(&visible, whole.end(), &pattern) {
+            if link_label_of_citation(&visible, marks, whole.end(), &pattern) {
                 continue;
             }
             let begin = c[3].parse().unwrap_or(0);
@@ -2571,13 +2641,17 @@ fn path_rewrites<'a>(
 ) -> (Vec<PathRewrite<'a>>, Option<(usize, usize)>) {
     let mut rewrites = Vec::new();
     let mut span: Option<(usize, usize)> = None;
+    let mut marks = None;
     for c in pattern.captures_iter(line) {
         let whole = c.get(0).unwrap();
         let path = c.get(1).unwrap();
         let Some(file) = paths.get(decode_citation_path(path.as_str()).as_str()) else {
             continue;
         };
-        if url_prefix(&line[..whole.start()], whole.as_str()) {
+        if marks
+            .get_or_insert_with(|| LineMarks::new(line))
+            .url_prefix(line, whole.start(), whole.as_str())
+        {
             continue;
         }
         // A match inside a longer path, agent.rs in src\agent.rs:1-2, does

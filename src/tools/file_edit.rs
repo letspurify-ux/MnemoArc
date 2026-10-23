@@ -276,20 +276,30 @@ fn exact_replace(old: &str, needle: &str, replacement: &str, all: bool) -> Resul
             "empty_old_text: old_text must not be empty; copy the exact text to replace from file_read"
         );
     }
-    let mut matches = 0;
-    let mut cursor = 0;
-    while let Some(offset) = old[cursor..].find(needle) {
-        matches += 1;
-        let start = cursor + offset;
-        cursor = start + old[start..].chars().next().unwrap().len_utf8();
-    }
-    if matches == 0 {
+    let Some(first) = old.find(needle) else {
         bail!(
             "text_not_found: old_text does not occur in the current file; copy it exactly (including indentation and line breaks) from a fresh file_read"
         );
+    };
+    // A second match may overlap the first (`aa` in `aaa`), so it is looked
+    // for one character after the first. Counting overlapping matches by
+    // searching again after each one took 28 s for a 2000-character
+    // old_text in a 4 MiB file of one repeated character.
+    let next_start = first + old[first..].chars().next().unwrap().len_utf8();
+    if !all && old[next_start..].contains(needle) {
+        bail!(
+            "ambiguous_text: {} matches; provide a longer old_text or replace_all=true",
+            old.matches(needle).count().max(2)
+        );
     }
-    if matches > 1 && !all {
-        bail!("ambiguous_text: {matches} matches; provide a longer old_text or replace_all=true");
+    // The size of the result is known before building it: replacing every
+    // `a` of a 4 MiB file with 200 characters allocated 800 MB only to be
+    // refused as too large.
+    let count = if all { old.matches(needle).count() } else { 1 };
+    let size =
+        (old.len() - count * needle.len()).saturating_add(count.saturating_mul(replacement.len()));
+    if size > MAX_FILE_BYTES {
+        bail!("unsupported_large_file: maximum 16MiB");
     }
     let result = if all {
         old.replace(needle, replacement)

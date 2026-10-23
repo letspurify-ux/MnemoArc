@@ -360,3 +360,213 @@ fn a_long_history_query_is_not_prepared_per_message() {
     let found = s.history.search("ITEM 7 3", 0, 10);
     assert_eq!(found["items"].as_array().unwrap().len(), 1, "{found}");
 }
+
+/// Counting matches searched again after each one: a 2000-character
+/// old_text in a 4 MiB file of one repeated character took 28 s to be
+/// refused as ambiguous, and replacing every character with 200 allocated
+/// 800 MB before the size check refused it.
+#[test]
+fn file_edit_checks_ambiguity_and_result_size_without_rescanning() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = "a".repeat(4 << 20);
+    write(&dir, "a.txt", &body);
+    write(&dir, "b.txt", "xaay");
+    let mut s = Session::new(
+        Project {
+            root: dir.path().into(),
+            output: dir.path().join("out.md"),
+            ..Default::default()
+        },
+        support::compact_config(),
+    );
+    let digest = tools::hash(body.as_bytes());
+    let started = Instant::now();
+    let error = tools::execute(
+        &mut s,
+        "file_edit",
+        json!({"path":"a.txt","old_text":"a".repeat(2000),"new_text":"b","expected_hash":digest}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("ambiguous_text: 2097 matches"), "{error}");
+    let error = tools::execute(
+        &mut s,
+        "file_edit",
+        json!({"path":"a.txt","old_text":"a","new_text":"b".repeat(200),"expected_hash":digest,"replace_all":true}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("unsupported_large_file"), "{error}");
+    assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        body
+    );
+    // Overlapping occurrences are still ambiguous; a single one is replaced.
+    let digest = tools::hash(b"xaay");
+    let error = tools::execute(
+        &mut s,
+        "file_edit",
+        json!({"path":"b.txt","old_text":"a","new_text":"b","expected_hash":digest}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("ambiguous_text: 2 matches"), "{error}");
+    write(&dir, "b.txt", "xaaay");
+    let digest = tools::hash(b"xaaay");
+    let error = tools::execute(
+        &mut s,
+        "file_edit",
+        json!({"path":"b.txt","old_text":"aa","new_text":"b","expected_hash":digest}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("ambiguous_text: 2 matches"), "{error}");
+    tools::execute(
+        &mut s,
+        "file_edit",
+        json!({"path":"b.txt","old_text":"aa","new_text":"b","expected_hash":digest,"replace_all":true}),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "xbay"
+    );
+}
+
+/// Each appended heading was compared with every heading of the document
+/// three times: 2000 headings appended to 40,000 took 6 s. The checks still
+/// refuse a duplicate, a reused number and an out-of-order number.
+#[test]
+fn append_checks_headings_against_indexes_of_the_document() {
+    let mut doc = String::from("# Title\n\n");
+    for i in 0..40_000 {
+        doc.push_str(&format!("## {i}. Section {i}\n\ntext\n\n"));
+    }
+    let (_dir, mut s) = document(&doc);
+    let text: String = (0..2000)
+        .map(|j| format!("## {}. New {j}\n\nx\n\n", 40_000 + j))
+        .collect();
+    let started = Instant::now();
+    let saved = tools::execute(
+        &mut s,
+        "document_edit",
+        json!({"action":"append","text":text,"expected_hash":tools::hash(doc.as_bytes())}),
+    )
+    .unwrap();
+    assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+    let digest = saved["hash"].as_str().unwrap().to_owned();
+    for (text, refusal) in [
+        ("## 7. Section 7\n\ny\n", "which the document already has"),
+        ("## 7. Other\n\ny\n", "would share that number"),
+        ("## 39. Late\n\ny\n", "would share that number"),
+        (
+            "## 50000. Last\n\n## 3.5 Early\n\ny\n",
+            "would be out of order",
+        ),
+    ] {
+        let error = tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"append","text":text,"expected_hash":digest}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(refusal), "{text:?}: {error}");
+    }
+}
+
+/// A missing section's closest headings were ranked by matching each
+/// bigram of the requested name against each heading's: a 3000-character
+/// name took 1.8 s against 40,000 headings.
+#[test]
+fn closest_headings_for_a_long_missing_section_are_ranked_in_linear_time() {
+    let mut doc = String::from("# Title\n\n");
+    for i in 0..40_000 {
+        doc.push_str(&format!("## {i}. Section about topic {i}\n\ntext\n\n"));
+    }
+    doc.push_str("## Overview of the parser\n\ntext\n");
+    let (_dir, mut s) = document(&doc);
+    let section = format!("Overview of the parsr {}", "q".repeat(30_000));
+    let started = Instant::now();
+    let error = tools::execute(&mut s, "document_inspect", json!({"section":section}))
+        .unwrap_err()
+        .to_string();
+    assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+    assert!(error.starts_with("section_not_found"), "{error}");
+    let error = tools::execute(
+        &mut s,
+        "document_inspect",
+        json!({"section":"Overview of the parsr"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("\"heading\":\"## Overview of the parser\""),
+        "{error}"
+    );
+}
+
+/// fix_word widens its anchor line by line until it is unique. Each width
+/// scanned the document (2.9 s for a word among 20,000 repeated lines), and
+/// uniqueness was judged without overlaps or the final line break, so the
+/// anchor it chose occurred twice and replace_text refused the fix.
+#[test]
+fn fix_word_anchors_a_word_among_repeated_lines() {
+    for lines in [20, 20_000] {
+        let doc: String = std::iter::once("# Title\n\n".to_owned())
+            .chain((0..lines).map(|_| "The 설정д here\n".to_owned()))
+            .collect();
+        let (_dir, mut s) = document(&doc);
+        let audit = tools::execute(&mut s, "document_audit", json!({"limit":1})).unwrap();
+        let first = audit["issues"][0]["fix_id"].as_str().unwrap().to_owned();
+        let middle = lines / 2;
+        let started = Instant::now();
+        let saved = tools::execute(
+            &mut s,
+            "document_edit",
+            json!({"action":"fix_word","fix_id":format!("{first}-{middle}"),"text":"설정","expected_hash":tools::hash(doc.as_bytes())}),
+        )
+        .unwrap();
+        assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+        let text = std::fs::read_to_string(s.project.output.clone()).unwrap();
+        let fixed: Vec<usize> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| *line == "The 설정 here")
+            .map(|(index, _)| index + 1)
+            .collect();
+        // Line 3 holds the first copy.
+        assert_eq!(fixed, [2 + middle], "{}", saved["hash"]);
+        assert_eq!(text.len(), doc.len() - "д".len());
+    }
+}
+
+/// Each citation on a line looked back to the previous word separator and
+/// ahead to the next bracket: a 256 KB line of 20,000 citations took 2.8 s
+/// to audit and 3.5 s to save, 16 s and 20 s with no space between them.
+#[test]
+fn citations_on_one_long_line_are_scanned_in_linear_time() {
+    for separator in [", ", ","] {
+        let cited: Vec<String> = (0..20_000)
+            .map(|i| format!("src/a.rs:{}", 1 + i % 50))
+            .collect();
+        let doc = format!(
+            "# Title\n\nClaims {}. See https://example.com/src/a.rs:3 and [a.rs:2](src/a.rs:2).\n",
+            cited.join(separator)
+        );
+        let (dir, mut s) = document(&doc);
+        write(
+            &dir,
+            "src/a.rs",
+            &(0..50)
+                .map(|i| format!("fn f{i}() {{}}\n"))
+                .collect::<String>(),
+        );
+        let started = Instant::now();
+        let audit = tools::execute(&mut s, "document_audit", json!({"limit":5})).unwrap();
+        assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+        // The URL and the link label are not citations; the link target is.
+        assert_eq!(audit["citations_checked"], 20_001, "{audit}");
+    }
+}
