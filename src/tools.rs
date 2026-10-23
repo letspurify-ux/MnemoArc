@@ -5179,6 +5179,7 @@ fn candidate_paths_bounded(
         );
     }
     let scope = directory.map(Path::to_path_buf);
+    let rules = file_edit::ProjectRules::new(p);
     let mut entries = vec![];
     let mut non_utf8 = 0usize;
     let mut path_bytes = 0usize;
@@ -5224,7 +5225,7 @@ fn candidate_paths_bounded(
         }
         let rel = entry.path().strip_prefix(&root)?;
         if directory.is_some_and(|scope| !entry.path().starts_with(scope))
-            || excluded(p, rel)?
+            || rules.excluded(rel)?
             || filter.as_ref().is_some_and(|f| !f.is_match(rel))
         {
             continue;
@@ -5266,12 +5267,44 @@ fn unsafe_ignore_file(dir: &Path) -> Option<PathBuf> {
         Ok(metadata) => metadata.is_file() && metadata.len() <= MAX_IGNORE_FILE_BYTES,
         Err(_) => true,
     };
+    // The first line of a file `safe` accepted, as the walker reads it.
+    let first_line = |path: &Path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.lines().next().map(str::to_owned))
+    };
     let git = dir.join(".git");
     let mut files = vec![dir.join(".ignore"), dir.join(".gitignore")];
     match git.metadata() {
         Ok(metadata) if metadata.is_dir() => files.push(git.join("info/exclude")),
-        // A `.git` file (worktree, submodule) is read for its gitdir line.
-        Ok(metadata) if metadata.is_file() => files.push(git),
+        // A `.git` file (worktree, submodule) is read for its gitdir line,
+        // and the walker reads the commondir file of that directory and
+        // then info/exclude under the directory it names: a gitdir line
+        // naming a folder whose commondir linked to /dev/zero grew a
+        // walk without end.
+        Ok(metadata) if metadata.is_file() => {
+            files.push(git.clone());
+            if let Some(gitdir) = safe(&git)
+                .then(|| first_line(&git))
+                .flatten()
+                .and_then(|line| line.strip_prefix("gitdir: ").map(PathBuf::from))
+            {
+                let commondir_file = gitdir.join("commondir");
+                if !safe(&commondir_file) {
+                    return Some(commondir_file);
+                }
+                if let Some(commondir) = first_line(&commondir_file) {
+                    files.push(
+                        if commondir.starts_with('.') {
+                            gitdir.join(commondir)
+                        } else {
+                            PathBuf::from(commondir)
+                        }
+                        .join("info/exclude"),
+                    );
+                }
+            }
+        }
         _ => {}
     }
     files.into_iter().find(|file| !safe(file))
@@ -7097,8 +7130,8 @@ pub(crate) fn parallel_read_history(
 /// The line a file cursor continues from, while its file is unchanged. The
 /// cursor offset counts characters of its range, as read_file does.
 fn cursor_next_line(s: &Session, cursor: &crate::session::FileCursor) -> Option<usize> {
-    let contents = read_text(&read_path(&s.project, &cursor.path).ok()?).ok()?;
-    if hash(contents.as_bytes()) != cursor.hash {
+    let (contents, digest) = read_text_hashed(&read_path(&s.project, &cursor.path).ok()?).ok()?;
+    if digest != cursor.hash {
         return None;
     }
     let newlines = contents
@@ -8265,6 +8298,40 @@ mod file_tests {
             walk(root.clone()).unwrap(),
             ["src/a.rs", "src/kept/.gitignore"]
         );
+
+        // A `.git` file's gitdir leads the walker to a commondir file and an
+        // info/exclude it names; neither may block or grow the walk.
+        let worktree = dir.path().join("worktree");
+        for (sub, commondir) in [
+            ("exclude", None),
+            ("endless", Some("/dev/zero")),
+            ("piped", Some("")),
+        ] {
+            let gitdir = dir.path().join("gitdirs").join(sub);
+            std::fs::create_dir_all(&gitdir).unwrap();
+            match commondir {
+                None => {
+                    std::fs::write(gitdir.join("commondir"), "../common\n").unwrap();
+                    std::fs::create_dir_all(gitdir.join("../common/info")).unwrap();
+                    std::os::unix::fs::symlink("/dev/zero", gitdir.join("../common/info/exclude"))
+                        .unwrap();
+                }
+                Some("") => fifo(&gitdir.join("commondir")),
+                Some(target) => {
+                    std::os::unix::fs::symlink(target, gitdir.join("commondir")).unwrap()
+                }
+            }
+            std::fs::create_dir_all(worktree.join(sub)).unwrap();
+            std::fs::write(worktree.join(sub).join("a.rs"), "fn a() {}\n").unwrap();
+            std::fs::write(
+                worktree.join(sub).join(".git"),
+                format!("gitdir: {}\n", gitdir.display()),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(worktree.join("plain")).unwrap();
+        std::fs::write(worktree.join("plain/a.rs"), "fn a() {}\n").unwrap();
+        assert_eq!(walk(worktree).unwrap(), ["plain/a.rs"]);
 
         let other = dir.path().join("other");
         std::fs::create_dir_all(&other).unwrap();

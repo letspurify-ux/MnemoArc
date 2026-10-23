@@ -13,6 +13,129 @@ fn displayed_line(line: usize, text: &str) -> Value {
     json!({"line":line,"text":text.chars().take(500).collect::<String>(),"truncated":text.chars().nth(500).is_some()})
 }
 
+/// A matcher of the search expression over a whole file that matches
+/// wherever one of its lines matches, `^` and `$` matching at line ends: a
+/// file it does not match has no matching line, and a file it matches is
+/// checked only at the lines its matches start on. A 20,000-file scope spent
+/// most of a search calling the line matcher once per line. An expression
+/// tied to the text's own start or end (`\A`, `\z`, or `^`/`$` with
+/// multi-line mode turned off) has no such matcher.
+struct WholeText {
+    regex: regex::Regex,
+    /// `$` meets lines whose `\r\n` the line matcher drops but the whole
+    /// text keeps, and CRLF mode would change what `.` matches, so a file
+    /// holding `\r` is checked line by line.
+    line_end: bool,
+    /// Over non-ASCII text a Unicode word boundary makes the fast engines
+    /// give up, and a whole file would be scanned by the slowest one.
+    word_boundary: bool,
+}
+
+impl WholeText {
+    fn applies(&self, contents: &str) -> bool {
+        (!self.line_end || !contents.contains('\r')) && (!self.word_boundary || contents.is_ascii())
+    }
+}
+
+fn whole_text_matcher(expression: &str, case_sensitive: bool) -> Option<WholeText> {
+    use regex_syntax::hir::Look;
+    let hir = regex_syntax::ParserBuilder::new()
+        .multi_line(true)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .parse(expression)
+        .ok()?;
+    let looks = hir.properties().look_set();
+    let any = |wanted: &[Look]| wanted.iter().any(|&look| looks.contains(look));
+    if any(&[Look::Start, Look::End, Look::StartCRLF, Look::EndCRLF]) {
+        return None;
+    }
+    let regex = regex::RegexBuilder::new(&within_lines(hir).to_string())
+        .size_limit(1024 * 1024)
+        .build()
+        .ok()?;
+    Some(WholeText {
+        regex,
+        line_end: any(&[Look::EndLF]),
+        word_boundary: any(&[
+            Look::WordUnicode,
+            Look::WordUnicodeNegate,
+            Look::WordStartUnicode,
+            Look::WordEndUnicode,
+            Look::WordStartHalfUnicode,
+            Look::WordEndHalfUnicode,
+        ]),
+    })
+}
+
+/// `hir` with no class matching '\n'. No line holds one, and a match that
+/// crossed lines (`\s+` running into the next) was a candidate the line
+/// matcher then rejected, making the search slower than line by line.
+fn within_lines(hir: regex_syntax::hir::Hir) -> regex_syntax::hir::Hir {
+    use regex_syntax::hir::{
+        Capture, Class, ClassBytes, ClassBytesRange, ClassUnicode, ClassUnicodeRange, Hir, HirKind,
+        Repetition,
+    };
+    match hir.into_kind() {
+        HirKind::Class(Class::Unicode(mut class)) => {
+            class.difference(&ClassUnicode::new([ClassUnicodeRange::new('\n', '\n')]));
+            Hir::class(Class::Unicode(class))
+        }
+        HirKind::Class(Class::Bytes(mut class)) => {
+            class.difference(&ClassBytes::new([ClassBytesRange::new(b'\n', b'\n')]));
+            Hir::class(Class::Bytes(class))
+        }
+        HirKind::Repetition(repetition) => Hir::repetition(Repetition {
+            sub: Box::new(within_lines(*repetition.sub)),
+            ..repetition
+        }),
+        HirKind::Capture(capture) => Hir::capture(Capture {
+            sub: Box::new(within_lines(*capture.sub)),
+            ..capture
+        }),
+        HirKind::Concat(parts) => Hir::concat(parts.into_iter().map(within_lines).collect()),
+        HirKind::Alternation(parts) => {
+            Hir::alternation(parts.into_iter().map(within_lines).collect())
+        }
+        HirKind::Empty => Hir::empty(),
+        HirKind::Literal(literal) => Hir::literal(literal.0),
+        HirKind::Look(look) => Hir::look(look),
+    }
+}
+
+/// The lines of `contents` a search checks, as (index, start, end) with
+/// `end` past the line's '\n': every line, or with a whole-text matcher only
+/// the lines its matches start on, in order.
+fn candidate_lines<'a>(
+    contents: &'a str,
+    whole: Option<&'a WholeText>,
+) -> impl Iterator<Item = (usize, usize, usize)> + 'a {
+    let whole = whole
+        .filter(|whole| whole.applies(contents))
+        .map(|whole| &whole.regex);
+    let (mut position, mut index) = (0, 0);
+    std::iter::from_fn(move || {
+        if position >= contents.len() {
+            return None;
+        }
+        let mut start = position;
+        if let Some(whole) = whole {
+            let found = whole.find_at(contents, position)?.start();
+            let skipped = &contents[position..found];
+            if let Some(last) = skipped.rfind('\n') {
+                index += skipped.bytes().filter(|&byte| byte == b'\n').count();
+                start = position + last + 1;
+            }
+        }
+        let end = contents[start..]
+            .find('\n')
+            .map_or(contents.len(), |newline| start + newline + 1);
+        let line = (index, start, end);
+        (position, index) = (end, index + 1);
+        Some(line)
+    })
+}
+
 /// Models often send the search text as `pattern`, which is the legacy
 /// file-glob alias of path_glob. Without this, a bare "missing query" error
 /// left a live run retrying the same call and then avoiding the tool.
@@ -199,6 +322,7 @@ pub(super) fn execute(
         .case_insensitive(!case_sensitive)
         .size_limit(1024 * 1024)
         .build().map_err(|e| anyhow::anyhow!("invalid_search_regex: {e}; no search executed. For literal code such as .on(, retry with regex:false; for literal alternatives use queries. Keep the same file scope."))?;
+    let whole = whole_text_matcher(&expression, case_sensitive);
     let mut fingerprint = Sha256::new();
     // Presentation options are part of the cursor identity too: an offset into
     // matching lines cannot be reused as an offset into matching files.
@@ -247,15 +371,15 @@ pub(super) fn execute(
         matched_files += 1;
         fingerprint.update(serde_json::to_vec(&(path.to_string_lossy(), &digest))?);
         let mut matching_lines = 0usize;
-        let mut byte_offset = 0;
-        for (i, chunk) in contents.split_inclusive('\n').enumerate() {
+        for (checked, (i, line_start, byte_offset)) in
+            candidate_lines(&contents, whole.as_ref()).enumerate()
+        {
+            let chunk = &contents[line_start..byte_offset];
             let line = chunk
                 .strip_suffix('\n')
                 .map(|line| line.strip_suffix('\r').unwrap_or(line))
                 .unwrap_or(chunk);
-            let line_start = byte_offset;
-            byte_offset += chunk.len();
-            if i % 256 == 0 && cancel.is_cancelled() {
+            if checked % 256 == 0 && cancel.is_cancelled() {
                 bail!("cancelled");
             }
             // A blank or whitespace-only line cannot provide the non-empty
@@ -381,4 +505,190 @@ pub(super) fn execute(
         output["counts"] = json!(&files);
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Matching line numbers as the line-by-line search finds them.
+    fn line_by_line(regex: &regex::Regex, contents: &str) -> Vec<usize> {
+        contents
+            .split_inclusive('\n')
+            .enumerate()
+            .filter(|(_, chunk)| {
+                let line = chunk
+                    .strip_suffix('\n')
+                    .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                    .unwrap_or(chunk);
+                !line.trim().is_empty() && regex.is_match(line)
+            })
+            .map(|(index, _)| index + 1)
+            .collect()
+    }
+
+    #[test]
+    fn whole_text_candidates_find_every_matching_line() {
+        let contents = [
+            "fn alpha() {}\nlet beta = 1;\r\nalpha\r\n\n  \nend alpha",
+            "한글 alpha 단어\nalpha한글\r\n한글alpha\nalpha\n",
+            "x\ny\nxy\n\nyx\r\n\r\nx",
+            "alpha\n",
+            "",
+            "\n\n\nalpha",
+            "load();\nload()\r\nunload()\nend$\n",
+            "a\rb\nalpha\r",
+        ];
+        let expressions = [
+            "alpha",
+            "^alpha$",
+            "^alpha",
+            "alpha$",
+            r"\balpha\b",
+            r"(?:^|\W)(?:alpha)(?:$|\W)",
+            "x*",
+            "^$",
+            r"\s",
+            "y\nx",
+            "[^a]",
+            "(?s).",
+            r"\Aalpha",
+            r"alpha\z",
+            "(?-m)^alpha",
+            "(?-R)alpha$",
+            "(?-R)^alpha",
+            r"\Bpha",
+            r"load\(\)",
+            r"\bload\(\)",
+            "end\\$$",
+            "b$",
+            r"\b{start}alpha",
+            "(?i)ALPHA",
+            "한글$",
+        ];
+        for expression in expressions {
+            for case_sensitive in [true, false] {
+                let regex = regex::RegexBuilder::new(expression)
+                    .case_insensitive(!case_sensitive)
+                    .build()
+                    .unwrap();
+                let whole = whole_text_matcher(expression, case_sensitive);
+                for text in contents {
+                    let found: Vec<usize> = candidate_lines(text, whole.as_ref())
+                        .filter(|&(_, start, end)| {
+                            let chunk = &text[start..end];
+                            let line = chunk
+                                .strip_suffix('\n')
+                                .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                                .unwrap_or(chunk);
+                            !line.trim().is_empty() && regex.is_match(line)
+                        })
+                        .map(|(index, _, _)| index + 1)
+                        .collect();
+                    assert_eq!(
+                        found,
+                        line_by_line(&regex, text),
+                        "{expression:?} case_sensitive={case_sensitive} in {text:?}"
+                    );
+                }
+            }
+        }
+        // Generated texts and expressions over line ends, boundaries and
+        // non-ASCII letters.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        let letters = ["a", "b", " ", "\n", "\r", "\r\n", "é", "한", "_", "("];
+        let pieces = [
+            "a",
+            "b",
+            "^",
+            "$",
+            r"\b",
+            r"\B",
+            " ",
+            r"\s",
+            ".",
+            "a*",
+            "[^b]",
+            "é",
+            "한",
+            r"\(",
+            "(?:a|b)",
+            r"\w",
+            r"\W",
+            r"\r",
+            r"\n",
+            "(?s)",
+            "(?R)",
+            "(?-m)",
+            "(?i)",
+            r"\A",
+            r"\z",
+            "(?-u:\\b)",
+            "[a-z]+",
+        ];
+        for _ in 0..3000 {
+            let text: String = (0..next(24))
+                .map(|_| letters[next(letters.len())])
+                .collect();
+            let expression: String = (0..1 + next(4))
+                .map(|_| pieces[next(pieces.len())])
+                .collect();
+            let case_sensitive = next(2) == 0;
+            let Ok(regex) = regex::RegexBuilder::new(&expression)
+                .case_insensitive(!case_sensitive)
+                .build()
+            else {
+                continue;
+            };
+            let whole = whole_text_matcher(&expression, case_sensitive);
+            let found: Vec<usize> = candidate_lines(&text, whole.as_ref())
+                .filter(|&(_, start, end)| {
+                    let chunk = &text[start..end];
+                    let line = chunk
+                        .strip_suffix('\n')
+                        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                        .unwrap_or(chunk);
+                    !line.trim().is_empty() && regex.is_match(line)
+                })
+                .map(|(index, _, _)| index + 1)
+                .collect();
+            assert_eq!(
+                found,
+                line_by_line(&regex, &text),
+                "{expression:?} in {text:?}"
+            );
+        }
+        // Ordinary expressions get a whole-text matcher.
+        for expression in [
+            "alpha",
+            r"\balpha\b",
+            "^alpha$",
+            r"(?:^|\W)(?:alpha)(?:$|\W)",
+            r"\s+\w+",
+            "(?s).",
+            "(?i)ALPHA",
+            "한글$",
+            r"load\(\)",
+        ] {
+            for case_sensitive in [true, false] {
+                assert!(
+                    whole_text_matcher(expression, case_sensitive).is_some(),
+                    "{expression}"
+                );
+            }
+        }
+        // Expressions tied to the text's own ends are searched line by line.
+        for expression in [r"\Aalpha", r"alpha\z", "(?-m)^alpha", "(?R)alpha$"] {
+            assert!(
+                whole_text_matcher(expression, true).is_none(),
+                "{expression}"
+            );
+        }
+    }
 }

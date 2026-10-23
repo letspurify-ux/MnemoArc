@@ -1372,6 +1372,7 @@ dependencies = [
  "mime_guess",
  "oracle",
  "regex",
+ "regex-syntax",
  "reqwest",
  "serde",
  "serde_json",
