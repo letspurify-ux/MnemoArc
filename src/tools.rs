@@ -8007,21 +8007,17 @@ pub fn document_issue_count(s: &Session, known: Option<&str>) -> Option<(String,
 pub fn run_call(s: &mut Session, call: &crate::llm::ToolCall) -> Value {
     run_call_cancellable(s, call, &tokio_util::sync::CancellationToken::new())
 }
-/// Budget the actual chat message, including JSON escaping and call ID.
+/// Budget the actual chat message, including JSON escaping and call ID: the
+/// model_result rendering every tool message is sent as (context.rs
+/// model_message). The stored result's source paths, hashes and observation
+/// times are not sent; counted, they took about 70 tokens per search match,
+/// so pages were cut short, and a read below about 400 tokens of budget went
+/// to the archive with no text at all.
 pub fn result_tokens(call: &crate::llm::ToolCall, result: &Value, model: &str) -> usize {
-    let raw = context::count(
-        &json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}),
+    context::count(
+        &json!({"role":"tool","tool_call_id":call.id,"content":model_result(result).to_string()}),
         model,
-    );
-    let rendered = model_result(result);
-    if rendered == *result {
-        return raw;
-    }
-    let shown = context::count(
-        &json!({"role":"tool","tool_call_id":call.id,"content":rendered.to_string()}),
-        model,
-    );
-    raw.max(shown)
+    )
 }
 
 /// Fields a tool still accepts from old callers but no longer advertises:
@@ -8102,6 +8098,34 @@ fn compact_sources(shown: &mut Value) {
         for row in rows {
             compact(row.get_mut("source"));
         }
+    }
+}
+
+/// Drop the observation a read registered for a view it then did not
+/// deliver whole, unless an earlier result delivered its lines. Left in
+/// place, a read cut from 120 lines to 7 attested all 120: a citation of
+/// line 100 passed the unread check, and the lines counted as progress.
+fn forget_undelivered_source(s: &mut Session, id: &str) {
+    let Some(source) = s.sources.get(id).cloned() else {
+        return;
+    };
+    let (Some(path), Some(start), Some(end)) =
+        (source.path.as_deref(), source.start_line, source.end_line)
+    else {
+        return;
+    };
+    let delivered = read_path(&s.project, path)
+        .ok()
+        .and_then(|resolved| {
+            let (text, digest) = read_text_hashed(&resolved).ok()?;
+            (source.hash.as_deref() == Some(digest.as_str())).then_some((resolved, text))
+        })
+        .is_some_and(|(resolved, text)| {
+            let (_, covered) = coverage::report(s, &resolved, &text, 0, 1);
+            start >= 1 && (start..=end).all(|line| covered.get(line - 1).copied().unwrap_or(false))
+        });
+    if !delivered {
+        s.sources.remove_counted(id);
     }
 }
 
@@ -8227,11 +8251,15 @@ pub fn limit_result(
                 .flatten()
         })
         .filter(|id| s.history.read(*id).is_ok());
+    // An archive made here is taken back when a native continuation
+    // reaches what the shortened result leaves out.
+    let mut made_archive = false;
     let archive = if call.name == "history" && args["action"] == "read" {
         args["id"].as_u64().unwrap_or_default()
     } else if let Some(id) = old_archive {
         id
     } else {
+        made_archive = true;
         let id = s.history.push(
             vec![json!({"role":"tool_archive","call_id":call.id,"result":result})],
             true,
@@ -8255,6 +8283,18 @@ pub fn limit_result(
             }
             let chars: Vec<_> = text.chars().collect();
             let mut template = output.clone();
+            // A view its own cursor continues needs no archive of the whole
+            // result, as for the collections below: the model never reads
+            // it, and the history kept every shortened read whole.
+            let native_text = matches!(
+                (call.name.as_str(), pointer),
+                ("file_read" | "document_inspect", "/data/content/text")
+                    | ("memory_read", "/data/body/text")
+            );
+            if native_text && let Some(fields) = template.as_object_mut() {
+                fields.remove("archive_id");
+            }
+            let original_source = template["data"]["source"]["id"].as_str().map(str::to_owned);
             // Each shortened view gets its own immutable source observation.
             // Archives and previously delivered results keep their original IDs.
             let narrowed_source = if call.name == "file_read" && pointer == "/data/content/text" {
@@ -8262,6 +8302,15 @@ pub fn limit_result(
                     .as_str()
                     .and_then(|id| s.sources.get(id))
                     .map(|source| Source::clone(source))
+                    // A result replayed from the call ledger can name a view
+                    // a later cut forgot; the result holds its observation.
+                    .or_else(|| {
+                        let mut source = template["data"]["source"].clone();
+                        if source.get("excerpt").is_none() && source.is_object() {
+                            source["excerpt"] = json!("");
+                        }
+                        serde_json::from_value::<Source>(source).ok()
+                    })
                     .map(|mut source| {
                         source.id = crate::memory::source_id();
                         template["data"]["source"]["id"] = json!(source.id);
@@ -8368,11 +8417,24 @@ pub fn limit_result(
                         s.sources
                             .insert_counted(source.id.clone(), std::sync::Arc::new(source));
                     }
+                    if let Some(original) = original_source
+                        .filter(|original| output["data"]["source"]["id"] != *original)
+                    {
+                        forget_undelivered_source(s, &original);
+                    }
+                }
+                if native_text
+                    && made_archive
+                    && s.history.bundles.back().is_some_and(|b| b.id == archive)
+                {
+                    s.history.bundles.pop_back();
+                    s.history.next_id -= 1;
                 }
                 return output;
             }
         }
     }
+    /// Whether the shortened collection continues with a cursor of its own.
     fn adjust_collection_continuation(
         output: &mut Value,
         call: &crate::llm::ToolCall,
@@ -8381,9 +8443,9 @@ pub fn limit_result(
         original_len: usize,
         retained_len: usize,
         archive: u64,
-    ) {
+    ) -> bool {
         if retained_len >= original_len {
-            return;
+            return false;
         }
         output["truncated"] = json!(true);
         let data = &mut output["data"];
@@ -8411,13 +8473,13 @@ pub fn limit_result(
                 }
             }
             output["next_cursor"] = cursor;
-            return;
+            return true;
         }
         if let Some(cursor) = data["next_cursor"].as_str()
             && let Some((prefix, _)) = cursor.rsplit_once(':')
         {
             data["next_cursor"] = json!(format!("{prefix}:{}", start + retained_len));
-            return;
+            return true;
         }
         if call.name == "history"
             && args["action"] == "search"
@@ -8427,11 +8489,11 @@ pub fn limit_result(
                 .and_then(|item| item["id"].as_u64())
         {
             data["next_cursor"] = json!(id);
-            return;
+            return true;
         }
         if data["next_offset"].is_u64() {
             data["next_offset"] = json!(start + retained_len);
-            return;
+            return true;
         }
         // A shortened last page has no cursor of its own; these tools' cursor
         // is the listing's fingerprint and an index, so one can be issued.
@@ -8439,12 +8501,13 @@ pub fn limit_result(
             && let Some(fingerprint) = data["hash"].as_str()
         {
             data["next_cursor"] = json!(format!("{fingerprint}:{}", start + retained_len));
-            return;
+            return true;
         }
         // There is no native continuation for this shortened page. Expose the
         // immutable archive instead of silently dropping the removed items.
         output["archive_id"] = json!(archive);
         output["next_cursor"] = json!({"tool":"history","action":"read","id":archive,"offset":0});
+        false
     }
 
     // Collections stay structured; a shortened native page resumes at the
@@ -8462,23 +8525,56 @@ pub fn limit_result(
         if items.is_empty() {
             continue;
         }
-        // Search for the longest prefix within the limit. Dropping one item
-        // per full re-count took about a second for a 400-heading outline.
-        let low = context::longest_within(0, items.len(), limit, None, |keep| {
-            output["data"][field] = Value::Array(items[..keep].to_vec());
-            result_tokens(call, &output, &s.config.model)
-        });
-        output["data"][field] = Value::Array(items[..low].to_vec());
-        if low > 0 {
-            adjust_collection_continuation(
-                &mut output,
+        // Each page is measured as it is returned: with the cursor that
+        // continues it, and with the archive pointer only where no cursor of
+        // its own reaches the items left out. The archive of the whole page
+        // held every shortened search page again (2.3 of 2.6 MB of history
+        // after 60 pages), and its pointer took room from the items.
+        let mut base = output.clone();
+        if let Some(fields) = base.as_object_mut() {
+            fields.remove("archive_id");
+            fields.remove("next_cursor");
+        }
+        let page = |keep: usize| -> (Value, bool) {
+            let mut page = base.clone();
+            page["data"][field] = Value::Array(items[..keep].to_vec());
+            let native = adjust_collection_continuation(
+                &mut page,
                 call,
                 &args,
                 field,
                 items.len(),
-                low,
+                keep,
                 archive,
             );
+            if !native && keep == items.len() {
+                // Nothing left out of the collection: what was cut is
+                // elsewhere in the result, kept in the archive.
+                page["archive_id"] = json!(archive);
+                page["next_cursor"] =
+                    json!({"tool":"history","action":"read","id":archive,"offset":0});
+            }
+            (page, native)
+        };
+        // Search for the longest prefix within the limit. Dropping one item
+        // per full re-count took about a second for a 400-heading outline.
+        let mut low = context::longest_within(0, items.len(), limit, None, |keep| {
+            result_tokens(call, &page(keep).0, &s.config.model)
+        });
+        let (mut shown, mut native) = page(low);
+        // A count can rise as a page shrinks: a last page gains a cursor.
+        while low > 0 && result_tokens(call, &shown, &s.config.model) > limit {
+            low -= 1;
+            (shown, native) = page(low);
+        }
+        if low == 0 {
+            output["data"][field] = Value::Array(Vec::new());
+        } else {
+            output = shown;
+            if native && made_archive && s.history.bundles.back().is_some_and(|b| b.id == archive) {
+                s.history.bundles.pop_back();
+                s.history.next_id -= 1;
+            }
             // A continuation sent without the listing's scope keeps it, as
             // for a cursor file_list issued itself.
             if call.name == "file_list"

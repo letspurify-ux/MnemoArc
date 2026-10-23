@@ -4007,16 +4007,24 @@ mod worker_wait_tests {
                 s.file_cursors[id].offset,
                 result["data"]["next_offset"].as_u64().unwrap() as usize
             );
-            let archived = &s
-                .history
-                .read(result["archive_id"].as_u64().unwrap())
-                .unwrap()
-                .messages[0]["result"];
-            let archived_id = archived["next_cursor"]["cursor"].as_str().unwrap();
-            assert_eq!(
-                s.file_cursors[archived_id].offset,
-                archived["data"]["next_offset"].as_u64().unwrap() as usize
-            );
+            // A read its cursor continues keeps no archive of the whole
+            // read; an archived one names a cursor of the owner's session.
+            if let Some(archive) = result["archive_id"].as_u64() {
+                let archived = &s.history.read(archive).unwrap().messages[0]["result"];
+                let archived_id = archived["next_cursor"]["cursor"].as_str().unwrap();
+                assert_eq!(
+                    s.file_cursors[archived_id].offset,
+                    archived["data"]["next_offset"].as_u64().unwrap() as usize
+                );
+            } else {
+                assert!(
+                    s.history
+                        .bundles
+                        .iter()
+                        .all(|bundle| bundle.messages.iter().all(|m| m["role"] != "tool_archive")),
+                    "{result}"
+                );
+            }
             let continuation = tools::execute(&mut s, "file_read", json!({"cursor":id})).unwrap();
             assert_eq!(continuation["read_offset"], result["data"]["next_offset"]);
         }

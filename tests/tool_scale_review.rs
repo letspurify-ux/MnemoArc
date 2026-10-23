@@ -859,3 +859,83 @@ fn waiting_plan_operations_are_tried_on_the_plan_alone() {
     assert_eq!(s.task.details.len(), 100_000);
     assert_eq!(s.task.details[7]["note"].as_str().unwrap().len(), 209);
 }
+
+/// Tool review 2026-10-23: a read the batch share cut from 120 lines to a
+/// few kept the observation of all 120 lines, so a citation of a line the
+/// model never received passed the unread check and counted as progress.
+/// A view delivered whole before stays evidence.
+#[test]
+fn a_read_cut_after_it_ran_attests_only_the_delivered_lines() {
+    let (dir, mut s) = document("# T\n");
+    let body: String = (0..120)
+        .map(|i| format!("    let value_{i} = compute_something(argument_{i}); // comment {i}\n"))
+        .collect();
+    write(&dir, "src/a.rs", &body);
+    let read = |s: &mut Session, id: &str| {
+        let call = mnemoarc::llm::ToolCall {
+            id: id.into(),
+            name: "file_read".into(),
+            arguments: json!({"path":"src/a.rs","max_lines":120,"force_read":true}).to_string(),
+        };
+        let full = tools::run_call(s, &call);
+        (call, full)
+    };
+    let (call, full) = read(&mut s, "r1");
+    assert_eq!(full["data"]["content"]["line_end"], 120, "{full}");
+    let cut = tools::limit_result(&mut s, &call, full, 400);
+    tools::record_delivered_read(&mut s, &call, &cut);
+    let delivered = cut["data"]["content"]["line_end"].as_u64().unwrap();
+    assert!(delivered < 100, "{cut}");
+    assert!(cut["archive_id"].is_null(), "{cut}");
+    assert_eq!(cut["next_cursor"]["tool"], "file_read");
+    assert!(
+        s.sources
+            .values()
+            .all(|source| source.end_line <= Some(delivered as usize))
+    );
+    std::fs::write(
+        dir.path().join("summary.md"),
+        "# T\n\n## A\n\nThe value is computed (src/a.rs:100-100).\n",
+    )
+    .unwrap();
+    assert_eq!(tools::unread_citations(&s).unwrap().len(), 1);
+    // Delivered whole once, the view stays evidence when a later identical
+    // read is cut.
+    let (call, full) = read(&mut s, "r2");
+    tools::record_delivered_read(&mut s, &call, &full);
+    let whole = full["data"]["source"]["id"].as_str().unwrap().to_owned();
+    assert!(tools::unread_citations(&s).unwrap().is_empty());
+    let (call, again) = read(&mut s, "r3");
+    assert_eq!(again["data"]["source"]["id"], whole.as_str());
+    tools::limit_result(&mut s, &call, again, 400);
+    assert!(s.sources.contains_key(&whole));
+    assert!(tools::unread_citations(&s).unwrap().is_empty());
+}
+
+/// Tool review 2026-10-23: a page shortened to fit kept an archive of the
+/// whole page and pointed to it although its own cursor continued it;
+/// shortened search pages filled the history with copies of themselves.
+#[test]
+fn a_shortened_page_with_its_own_cursor_keeps_no_archive() {
+    let (dir, mut s) = document("# T\n");
+    let body: String = (0..300)
+        .map(|i| format!("    let value_{i} = compute(argument_{i}); // needle {i}\n"))
+        .collect();
+    write(&dir, "src/a.rs", &body);
+    let bundles = s.history.bundles.len();
+    let call = mnemoarc::llm::ToolCall {
+        id: "s1".into(),
+        name: "source_search".into(),
+        arguments: json!({"query":"needle","limit":100}).to_string(),
+    };
+    let full = tools::run_call(&mut s, &call);
+    let page = tools::limit_result(&mut s, &call, full, 800);
+    let rows = page["data"]["matches"].as_array().unwrap().len();
+    assert!(rows > 0 && rows < 100, "{rows}");
+    assert!(page["data"]["next_cursor"].is_string(), "{page}");
+    assert!(
+        page["archive_id"].is_null() && page["next_cursor"].is_null(),
+        "{page}"
+    );
+    assert_eq!(s.history.bundles.len(), bundles);
+}

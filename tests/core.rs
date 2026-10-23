@@ -1048,9 +1048,22 @@ fn bounded_file_results_keep_sources_offsets_and_fit_serialized_message_budget()
     assert!(tools::result_tokens(&call, &reduced, &s.config.model) <= 600);
     assert!(reduced["data"]["preview"].is_null());
     let archive_count = s.history.bundles.len();
-    let twice = tools::limit_result(&mut s, &call, reduced.clone(), 400);
+    // Cut again (as a batch share does), on a copy: the second cut is what
+    // would be delivered, and it forgets the first cut's view.
+    let mut again = s.clone();
+    let twice = tools::limit_result(&mut again, &call, reduced.clone(), 400);
     assert!(tools::result_tokens(&call, &twice, &s.config.model) <= 400);
-    assert_eq!(s.history.bundles.len(), archive_count);
+    assert_eq!(again.history.bundles.len(), archive_count);
+    assert!(
+        again
+            .sources
+            .contains_key(twice["data"]["source"]["id"].as_str().unwrap())
+    );
+    assert!(
+        !again
+            .sources
+            .contains_key(reduced["data"]["source"]["id"].as_str().unwrap())
+    );
 
     assert!(reduced["data"]["source"]["id"].is_string(), "{reduced}");
     let shown = reduced["data"]["content"]["text"].as_str().unwrap();
@@ -1069,13 +1082,10 @@ fn bounded_file_results_keep_sources_offsets_and_fit_serialized_message_budget()
         .unwrap();
     assert_eq!(source.end_line, Some(end));
     assert_ne!(source.id, original_source.id);
-    assert_eq!(
-        s.sources[&original_source.id].end_line,
-        original_source.end_line
-    );
-    assert_eq!(
-        s.sources[&original_source.id].excerpt,
-        original_source.excerpt
+    // The longer view was never delivered: it attests nothing.
+    assert!(
+        !s.sources.contains_key(&original_source.id),
+        "an undelivered view must not remain evidence"
     );
     assert_eq!(reduced["data"]["content"]["line_end"], end);
     assert_eq!(reduced["data"]["content"]["first_line_complete"], true);
