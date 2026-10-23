@@ -3,7 +3,36 @@ use super::*;
 /// Called only after the final batch budget has been applied. Archives and search
 /// excerpts are deliberately not treated as delivered document text.
 pub fn record_delivered_read(s: &mut Session, call: &crate::llm::ToolCall, result: &Value) {
-    if !matches!(call.name.as_str(), "file_read" | "document_inspect") || result["status"] != "ok" {
+    if result["status"] != "ok" {
+        return;
+    }
+    // The observations this result delivers, a read's or each search
+    // match's, and those a source lookup showed.
+    let data = &result["data"];
+    let delivered: Vec<&str> = std::iter::once(&data["source"])
+        .chain(
+            data["matches"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|row| &row["source"]),
+        )
+        .filter_map(|source| source["id"].as_str())
+        .chain(
+            (call.name == "source_lookup")
+                .then(|| data["items"].as_array())
+                .flatten()
+                .into_iter()
+                .flatten()
+                .filter_map(|item| item["id"].as_str()),
+        )
+        .filter(|id| !s.delivered_sources.contains(*id))
+        .collect();
+    if !delivered.is_empty() {
+        s.delivered_sources
+            .extend(delivered.into_iter().map(str::to_owned));
+    }
+    if !matches!(call.name.as_str(), "file_read" | "document_inspect") {
         return;
     }
     let data = &result["data"];

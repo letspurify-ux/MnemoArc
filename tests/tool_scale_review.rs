@@ -939,3 +939,61 @@ fn a_shortened_page_with_its_own_cursor_keeps_no_archive() {
     );
     assert_eq!(s.history.bundles.len(), bundles);
 }
+
+/// Tool review 2026-10-23: the search matches a page left out to fit its
+/// budget kept their observations, so their lines passed the unread check
+/// though the model never received them. A match delivered by an earlier
+/// page stays evidence.
+#[test]
+fn search_matches_left_out_of_a_page_attest_nothing() {
+    let (dir, mut s) = document("# T\n");
+    let body: String = (0..300)
+        .map(|i| format!("    let value_{i} = compute(argument_{i}); // needle {i}\n"))
+        .collect();
+    write(&dir, "src/a.rs", &body);
+    let search = |s: &mut Session, id: &str, budget: usize| {
+        let call = mnemoarc::llm::ToolCall {
+            id: id.into(),
+            name: "source_search".into(),
+            arguments: json!({"query":"needle","limit":100}).to_string(),
+        };
+        let full = tools::run_call(s, &call);
+        let page = tools::limit_result(s, &call, full, budget);
+        tools::record_delivered_read(s, &call, &page);
+        page
+    };
+    let page = search(&mut s, "s1", 800);
+    let shown: Vec<u64> = page["data"]["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["line"].as_u64().unwrap())
+        .collect();
+    assert!(!shown.is_empty() && shown.len() < 100, "{shown:?}");
+    let attested: Vec<usize> = s
+        .sources
+        .values()
+        .filter_map(|source| source.start_line)
+        .collect();
+    assert!(
+        attested.iter().all(|line| shown.contains(&(*line as u64))),
+        "{attested:?}"
+    );
+    std::fs::write(
+        dir.path().join("summary.md"),
+        "# T\n\n## A\n\nThe value is computed (src/a.rs:90-90).\n",
+    )
+    .unwrap();
+    assert_eq!(tools::unread_citations(&s).unwrap().len(), 1);
+    // A wider page delivers line 90; cut again later, it stays.
+    s.config.result_tokens = Some(40_000);
+    let wide = search(&mut s, "s2", 40_000);
+    assert_eq!(
+        wide["data"]["matches"].as_array().unwrap().len(),
+        100,
+        "{wide}"
+    );
+    assert!(tools::unread_citations(&s).unwrap().is_empty());
+    search(&mut s, "s3", 800);
+    assert!(tools::unread_citations(&s).unwrap().is_empty());
+}

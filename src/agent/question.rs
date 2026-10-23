@@ -314,6 +314,7 @@ fn append(s: &mut Session, messages: Vec<Value>) -> Result<()> {
 fn collect(s: &mut Session, work: &Session) -> Result<()> {
     let mut next = s.clone();
     next.sources = work.sources.clone();
+    next.delivered_sources = work.delivered_sources.clone();
     next.file_cursors = work.file_cursors.clone();
     next.read_coverage = work.read_coverage.clone();
     next.coverage_cursors = work.coverage_cursors.clone();
@@ -477,6 +478,9 @@ async fn answer(
             let (updated, result) = execute_one(work, call.clone(), cancel, deadline).await;
             work = updated;
             let result = tools::limit_result(&mut work, &call, result, result_budget);
+            // What a follow-up answer reads is delivered evidence as in a
+            // run: its reads count as read, and its sources as delivered.
+            tools::record_delivered_read(&mut work, &call, &result);
             emit(
                 events,
                 AgentEvent::Tool {

@@ -8106,6 +8106,9 @@ fn compact_sources(shown: &mut Value) {
 /// place, a read cut from 120 lines to 7 attested all 120: a citation of
 /// line 100 passed the unread check, and the lines counted as progress.
 fn forget_undelivered_source(s: &mut Session, id: &str) {
+    if s.delivered_sources.contains(id) {
+        return;
+    }
     let Some(source) = s.sources.get(id).cloned() else {
         return;
     };
@@ -8574,6 +8577,22 @@ pub fn limit_result(
             if native && made_archive && s.history.bundles.back().is_some_and(|b| b.id == archive) {
                 s.history.bundles.pop_back();
                 s.history.next_id -= 1;
+            }
+            // Search matches left out of a page continued by its cursor are
+            // not delivered: a later page observes them again. Kept, they
+            // attested lines the model never received.
+            if native && field == "matches" {
+                let kept: BTreeSet<&str> = items[..low]
+                    .iter()
+                    .filter_map(|row| row["source"]["id"].as_str())
+                    .collect();
+                for id in items[low..]
+                    .iter()
+                    .filter_map(|row| row["source"]["id"].as_str())
+                    .filter(|id| !kept.contains(id) && !s.delivered_sources.contains(*id))
+                {
+                    s.sources.remove_counted(id);
+                }
             }
             // A continuation sent without the listing's scope keeps it, as
             // for a cursor file_list issued itself.

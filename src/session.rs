@@ -621,6 +621,11 @@ pub struct Session {
     pub memory: MemoryStore,
     pub history: SessionHistory,
     pub sources: Shared<BTreeMap<String, Arc<Source>>>,
+    /// IDs of the sources a delivered result carried (see
+    /// tools::record_delivered_read). A result cut to fit its budget forgets
+    /// the observations it registered and did not deliver, but never one an
+    /// earlier result delivered.
+    pub(crate) delivered_sources: Shared<BTreeSet<String>>,
     pub file_cursors: Shared<BTreeMap<String, Arc<FileCursor>>>,
     pub read_coverage: Shared<BTreeMap<String, Arc<ReadCoverage>>>,
     /// Coverage page revisions let legacy offset callers detect intervening
@@ -785,6 +790,7 @@ impl Session {
             memory: Default::default(),
             history: Default::default(),
             sources: Shared::default(),
+            delivered_sources: Shared::default(),
             file_cursors: Shared::default(),
             read_coverage: Shared::default(),
             coverage_cursors: Shared::default(),
