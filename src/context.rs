@@ -337,8 +337,69 @@ fn count_tokens(tokenizer: &tiktoken_rs::CoreBPE, text: &str) -> usize {
     total + tokenizer.encode_with_special_tokens(&text[part..]).len()
 }
 
+/// Texts shorter than this are counted again: hashing them saves little.
+const MEMO_MIN_BYTES: usize = 1024;
+/// Texts longer than this are counted again: they are rare, and a memo of
+/// them would mostly hold one-off counts.
+const MEMO_MAX_BYTES: usize = 4 * 1024 * 1024;
+const MEMO_ENTRIES: usize = 64;
+
+type CountKey = (usize, [u8; 32]);
+
+/// Counts of recently counted texts. A tool result is counted whole on each
+/// step to the model (its own result limit, the run's limit, the batch
+/// share and the batch's remaining budget), every count a full encoding of
+/// the same text: counting took most of a file_read page.
+fn count_memo() -> &'static std::sync::Mutex<std::collections::VecDeque<(CountKey, usize)>> {
+    static MEMO: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::VecDeque<(CountKey, usize)>>,
+    > = std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
 pub fn tokens(text: &str, model: &str) -> usize {
+    use sha2::Digest;
     let tokenizer = tokenizer(model);
+    let key = (MEMO_MIN_BYTES..=MEMO_MAX_BYTES)
+        .contains(&text.len())
+        .then(|| -> CountKey {
+            (
+                std::ptr::from_ref(tokenizer) as usize,
+                sha2::Sha256::digest(text.as_bytes()).into(),
+            )
+        });
+    let memo = || count_memo().lock().unwrap_or_else(|p| p.into_inner());
+    let remembered = key.and_then(|key| {
+        memo()
+            .iter()
+            .find(|(known, _)| *known == key)
+            .map(|(_, count)| *count)
+    });
+    let n = match remembered {
+        Some(count) => count,
+        None => {
+            let count = encode_count(tokenizer, text);
+            if let Some(key) = key {
+                let mut memo = memo();
+                if memo.len() >= MEMO_ENTRIES {
+                    memo.pop_front();
+                }
+                memo.push_back((key, count));
+            }
+            count
+        }
+    };
+    if is_estimated(model) {
+        // Provider tokenizers vary. Keep the multilingual fallback and its
+        // 25% headroom, explicitly labelled as an estimate in the UI.
+        n.saturating_mul(5).div_ceil(4)
+    } else {
+        n
+    }
+}
+
+/// count_tokens on an encoder thread.
+fn encode_count(tokenizer: &'static tiktoken_rs::CoreBPE, text: &str) -> usize {
     let (reply, result) = std::sync::mpsc::sync_channel(1);
     let sent = encoders().is_some_and(|encoders| {
         encoders
@@ -349,18 +410,11 @@ pub fn tokens(text: &str, model: &str) -> usize {
             })
             .is_ok()
     });
-    let n = match sent.then(|| result.recv().ok()).flatten() {
+    match sent.then(|| result.recv().ok()).flatten() {
         Some(Ok(count)) => count,
         Some(Err(panic)) => std::panic::resume_unwind(panic),
         // Without an encoder thread, count here as before.
         None => count_tokens(tokenizer, text),
-    };
-    if is_estimated(model) {
-        // Provider tokenizers vary. Keep the multilingual fallback and its
-        // 25% headroom, explicitly labelled as an estimate in the UI.
-        n.saturating_mul(5).div_ceil(4)
-    } else {
-        n
     }
 }
 pub fn is_estimated(model: &str) -> bool {
@@ -382,6 +436,7 @@ pub fn truncate(text: &str, limit: usize, model: &str) -> (String, bool) {
     };
     let length = text.chars().count();
     let (mut low, mut high) = (0, length);
+    let mut above = None;
     // Each count costs the length counted. Widen from a prefix of about the
     // limit's size, so a long text is not counted whole a dozen times when
     // only its start fits. The whole text is counted only when every probe
@@ -389,25 +444,89 @@ pub fn truncate(text: &str, limit: usize, model: &str) -> (String, bool) {
     // its range, up to 16MiB, to return a few kilobytes.
     let mut probe = limit.saturating_mul(4).max(1);
     while probe < high {
-        if tokens(prefix(probe), model) <= limit {
+        let count = tokens(prefix(probe), model);
+        if count <= limit {
             low = probe;
             probe = probe.saturating_mul(2);
         } else {
             high = probe - 1;
+            above = Some((probe, count));
         }
     }
-    if high == length && tokens(text, model) <= limit {
-        return (text.into(), false);
-    }
-    while low < high {
-        let mid = (low + high).div_ceil(2);
-        if tokens(prefix(mid), model) <= limit {
-            low = mid
-        } else {
-            high = mid - 1
+    if high == length {
+        let count = tokens(text, model);
+        if count <= limit {
+            return (text.into(), false);
         }
+        high = length.saturating_sub(1);
+        above = Some((length, count));
     }
+    let low = longest_within(low, high, limit, above, |length| {
+        tokens(prefix(length), model)
+    });
     (prefix(low).into(), true)
+}
+
+/// The longest length in `low..=high` whose count is within `limit`, for a
+/// count that grows with the length; `low` is taken to fit. `above` is a
+/// longer length known not to fit, with its count. A try goes where the
+/// counts measured so far put the limit, since token counts grow about in
+/// proportion to the length; a try that did not halve the range is followed
+/// by one that does, so the search takes at most about twice the counts of
+/// a bisection. Bisection alone counted once per bit of the length: fourteen
+/// counts of a whole result to shorten one file_read page.
+pub fn longest_within(
+    mut low: usize,
+    mut high: usize,
+    limit: usize,
+    mut above: Option<(usize, usize)>,
+    mut count: impl FnMut(usize) -> usize,
+) -> usize {
+    let mut low_count: Option<usize> = None;
+    // The length that failed before `above`, while `low` is unmeasured.
+    let mut farther: Option<(usize, usize)> = None;
+    let mut halve = false;
+    while low < high {
+        let width = high - low;
+        let interpolated = !halve && above.is_some();
+        let mid = match above {
+            // Aim halfway between the lengths counted `limit` and
+            // `limit + 1`, where the longest fitting length ends.
+            Some((over, over_count)) if interpolated => {
+                let target = 2 * limit as i128 + 1;
+                let (over, over_count) = (over as i128, 2 * over_count as i128);
+                let estimate = match (low_count, farther) {
+                    (Some(base), _) => {
+                        let base = 2 * base as i128;
+                        low as i128
+                            + (target - base) * (over - low as i128) / (over_count - base).max(1)
+                    }
+                    // Extend the line through the two failing counts.
+                    (None, Some((far, far_count))) if 2 * far_count as i128 > over_count => {
+                        over - (over_count - target) * (far as i128 - over)
+                            / (2 * far_count as i128 - over_count)
+                    }
+                    (None, _) => low as i128 + target * (over - low as i128) / over_count.max(1),
+                };
+                estimate.clamp(low as i128 + 1, high as i128) as usize
+            }
+            // Nothing measured beyond the range yet: its end is the first
+            // try, and often fits.
+            None => high,
+            Some(_) => (low + high).div_ceil(2),
+        };
+        let measured = count(mid);
+        if measured <= limit {
+            low = mid;
+            low_count = Some(measured);
+        } else {
+            high = mid - 1;
+            farther = above;
+            above = Some((mid, measured));
+        }
+        halve = interpolated && (high - low).saturating_mul(2) > width;
+    }
+    low
 }
 pub const CHECKPOINT_MAX_REQUESTS: usize = 8;
 pub const CHECKPOINT_MAX_FAILURES: usize = 8;

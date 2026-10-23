@@ -521,6 +521,109 @@ fn long_stretches_without_spaces_are_counted_quickly_and_closely() {
         started.elapsed()
     );
 }
+// Repeated counts of one text are remembered per tokenizer, and a
+// remembered count is the tokenizer's own.
+#[test]
+fn remembered_counts_stay_per_tokenizer() {
+    let text = "fn main() { println!(\"한국어🦀\"); }\n".repeat(80);
+    let o200k = tiktoken_rs::o200k_base_singleton()
+        .encode_with_special_tokens(&text)
+        .len();
+    let cl100k = tiktoken_rs::cl100k_base_singleton()
+        .encode_with_special_tokens(&text)
+        .len();
+    assert_ne!(o200k, cl100k);
+    for _ in 0..3 {
+        assert_eq!(context::tokens(&text, "gpt-4o"), o200k);
+        assert_eq!(context::tokens(&text, "gpt-4"), cl100k);
+    }
+    // An estimated model keeps its headroom on a remembered count.
+    let estimated = context::tokens(&text, "unknown-model");
+    assert_eq!(estimated, cl100k.saturating_mul(5).div_ceil(4));
+    assert_eq!(context::tokens(&text, "unknown-model"), estimated);
+}
+// A truncation or result limit searched by halving counted the whole
+// result once per bit of its length. The search that tries where the counts
+// put the limit must find what halving finds, in fewer counts.
+#[test]
+fn longest_within_matches_bisection_in_fewer_counts() {
+    let bisect = |high: usize, limit: usize, count: &dyn Fn(usize) -> usize| {
+        let (mut low, mut high) = (0, high);
+        while low < high {
+            let mid = (low + high).div_ceil(2);
+            if count(mid) <= limit {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        low
+    };
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = |bound: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % bound
+    };
+    let (mut tries, mut halvings) = (0, 0);
+    for _ in 0..3000 {
+        let high = next(20_000) as usize;
+        // A fixed overhead and a count rising in uneven steps, as token
+        // counts of prefixes do.
+        let overhead = next(500) as usize;
+        let steps: Vec<usize> = (0..=high)
+            .scan(overhead, |total, _| {
+                *total += usize::from(next(4) == 0) + usize::from(next(50) == 0) * 5;
+                Some(*total)
+            })
+            .collect();
+        let limit = next(steps[high] as u64 + 50) as usize;
+        let count = |length: usize| steps[length];
+        let expected = bisect(high, limit, &count);
+        let mut counted = 0;
+        let found = context::longest_within(0, high, limit, None, |length| {
+            counted += 1;
+            count(length)
+        });
+        assert_eq!(found, expected, "high {high} limit {limit}");
+        tries += counted;
+        halvings += usize::BITS as usize - high.leading_zeros() as usize;
+        // Never more than about twice a bisection's counts.
+        assert!(
+            counted <= 2 * (usize::BITS - high.leading_zeros()) as usize + 2,
+            "{counted} counts for {high}"
+        );
+    }
+    assert!(
+        tries * 5 < halvings * 4,
+        "{tries} counts against {halvings}"
+    );
+    // Counts in proportion to the length, as for repetitive text, take a few
+    // counts where halving took fourteen.
+    for limit in [0, 1, 299, 300, 1000, 3000, 4966, 5000] {
+        let count = |length: usize| 300 + length / 3;
+        let mut counted = 0;
+        let found = context::longest_within(0, 13_999, limit, Some((14_000, count(14_000))), |l| {
+            counted += 1;
+            count(l)
+        });
+        assert_eq!(found, bisect(13_999, limit, &count), "limit {limit}");
+        if (300..4966).contains(&limit) {
+            assert!(counted <= 5, "{counted} counts for limit {limit}");
+        }
+    }
+    // A count that is not monotone still yields a length that fits.
+    for _ in 0..1000 {
+        let high = next(2_000) as usize;
+        let counts: Vec<usize> = (0..=high).map(|_| next(100) as usize).collect();
+        let limit = next(100) as usize;
+        let found = context::longest_within(0, high, limit, Some((high + 1, 1000)), |length| {
+            counts[length]
+        });
+        assert!(found == 0 || counts[found] <= limit);
+    }
+}
 #[test]
 fn counts_from_short_lived_threads_match_the_tokenizer() {
     // Counting runs on shared encoder threads; a tool call's own thread

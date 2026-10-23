@@ -4829,12 +4829,27 @@ pub(crate) fn open_regular_file(path: &Path) -> Result<std::fs::File> {
 const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 
 fn read_bytes_bounded(path: &Path) -> Result<Vec<u8>> {
-    read_bytes_versioned(path).map(|(bytes, _)| bytes)
+    read_bytes_versioned(path, ReadAs::Bytes).map(|(bytes, _)| bytes)
+}
+
+/// Bytes a text read checks for a NUL before reading the rest.
+const BINARY_PROBE_BYTES: u64 = 8 * 1024;
+
+#[derive(Clone, Copy, PartialEq)]
+enum ReadAs {
+    Bytes,
+    /// Stop at a NUL in the first BINARY_PROBE_BYTES and return those:
+    /// read_text refuses the file for it, and searches and text listings
+    /// read every binary file in scope to its end, up to 16MiB, to refuse it.
+    Text,
+    /// Text of a file a walk found: also refused, unread, when the digest
+    /// cache knows this version is not text (see walked_text).
+    WalkedText,
 }
 
 /// The file's bytes, with its version when the file kept one version for the
 /// whole read (a write during the read changes its size, time or change time).
-fn read_bytes_versioned(path: &Path) -> Result<(Vec<u8>, Option<FileVersion>)> {
+fn read_bytes_versioned(path: &Path, read_as: ReadAs) -> Result<(Vec<u8>, Option<FileVersion>)> {
     use std::io::Read;
 
     let file = open_regular_file(path)?;
@@ -4844,14 +4859,29 @@ fn read_bytes_versioned(path: &Path) -> Result<(Vec<u8>, Option<FileVersion>)> {
         bail!("unsupported_large_file: maximum 16MiB");
     }
     let before = file_version(&meta).ok();
+    if read_as == ReadAs::WalkedText
+        && let Some(version) = before
+        && cached_digest(path, version, |entry| entry.text) == Some(false)
+    {
+        bail!(
+            "unsupported_non_text_file: {} is not a text file",
+            path.display()
+        );
+    }
     // Bound the actual read too: the file may grow after the metadata check.
     // Reserve the expected length and one EOF probe byte. Starting empty or
     // filling the capacity exactly makes read_to_end grow to the next power
     // of two even for an unchanged file.
     let mut bytes = Vec::with_capacity(length as usize + 1);
-    (&file)
-        .take((MAX_FILE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
+    let mut reader = (&file).take((MAX_FILE_BYTES + 1) as u64);
+    if read_as != ReadAs::Bytes {
+        (&mut reader)
+            .take(BINARY_PROBE_BYTES)
+            .read_to_end(&mut bytes)?;
+    }
+    if read_as == ReadAs::Bytes || !bytes.contains(&0) {
+        reader.read_to_end(&mut bytes)?;
+    }
     if bytes.len() > MAX_FILE_BYTES {
         bail!("unsupported_large_file: maximum 16MiB");
     }
@@ -5023,32 +5053,51 @@ pub(crate) fn read_text(path: &Path) -> Result<String> {
 /// read takes the digest from the digest cache: reads and searches hashed
 /// the whole file again on every page.
 pub(crate) fn read_text_hashed(path: &Path) -> Result<(String, String)> {
-    let (text, version) = read_text_versioned(path)?;
+    Ok(with_digest(path, read_text_versioned(path)?))
+}
+
+/// The text with its digest, taken from the digest cache for a version it
+/// holds.
+fn with_digest(path: &Path, (text, version): (String, Option<FileVersion>)) -> (String, String) {
     if let Some(version) = version
         && let Some(digest) = cached_digest(path, version, |entry| entry.hash.clone())
     {
-        return Ok((text, digest));
+        return (text, digest);
     }
     let digest = hash(text.as_bytes());
     if let Some(version) = version {
         remember_digest(path, version, |entry| entry.hash = Some(digest.clone()));
     }
-    Ok((text, digest))
+    (text, digest)
 }
 
 fn read_text_versioned(path: &Path) -> Result<(String, Option<FileVersion>)> {
-    let (bytes, version) = read_bytes_versioned(path)?;
+    read_text_as(path, ReadAs::Text)
+}
+
+fn read_text_as(path: &Path, read_as: ReadAs) -> Result<(String, Option<FileVersion>)> {
+    let (bytes, version) = read_bytes_versioned(path, read_as)?;
+    // A walked file found not to be text at one version is not read again
+    // at that version (walked_text).
+    let not_text = |error: anyhow::Error| {
+        if read_as == ReadAs::WalkedText
+            && let Some(version) = version
+        {
+            remember_digest(path, version, |entry| entry.text = Some(false));
+        }
+        error
+    };
     if bytes.contains(&0) {
-        bail!(
+        return Err(not_text(anyhow::anyhow!(
             "unsupported_binary_file: {} contains NUL bytes and is not a text file; choose a text file",
             path.display()
-        );
+        )));
     }
     let text = String::from_utf8(bytes).map_err(|_| {
-        anyhow::anyhow!(
+        not_text(anyhow::anyhow!(
             "unsupported_non_utf8_file: {} is not valid UTF-8 text; choose a UTF-8 text file",
             path.display()
-        )
+        ))
     })?;
     Ok((text, version))
 }
@@ -5266,10 +5315,17 @@ const MAX_IGNORE_FILE_BYTES: u64 = 1024 * 1024;
 fn unsafe_ignore_file(dir: &Path) -> Option<PathBuf> {
     let safe = safe_ignore_file;
     // The first line of a file `safe` accepted, as the walker reads it.
+    // Opened without blocking and read within the bound: the file can turn
+    // into a pipe or grow after the check.
     let first_line = |path: &Path| {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|text| text.lines().next().map(str::to_owned))
+        use std::io::Read;
+        let mut text = String::new();
+        open_regular_file(path)
+            .ok()?
+            .take(MAX_IGNORE_FILE_BYTES)
+            .read_to_string(&mut text)
+            .ok()?;
+        text.lines().next().map(str::to_owned)
     };
     let git = dir.join(".git");
     let mut files = vec![dir.join(".ignore"), dir.join(".gitignore")];
@@ -5376,29 +5432,34 @@ fn paths(
 /// in the digest cache. Text mode read every file in scope on every page; a
 /// cached answer costs a metadata read.
 fn listed_as_text(path: &Path) -> Result<bool> {
-    let version = || {
-        path.metadata()
-            .ok()
-            .and_then(|meta| file_version(&meta).ok())
-    };
-    let before = version();
-    if let Some(version) = before
+    if let Some(version) = path
+        .metadata()
+        .ok()
+        .and_then(|meta| file_version(&meta).ok())
         && let Some(text) = cached_digest(path, version, |entry| entry.text)
     {
         return Ok(text);
     }
-    let text = search_text(path)?.is_some();
-    if let Some(before) = before.filter(|before| Some(*before) == version()) {
-        remember_digest(path, before, |entry| entry.text = Some(text));
+    Ok(walked_text(path)?.is_some())
+}
+/// The text of a file a walk found, with its version (read_text_versioned),
+/// or None for a file the walk skips (search_text_with). Whether it is text
+/// is kept in the digest cache, as listed_as_text keeps it, and a file found
+/// not to be text (binary or not UTF-8) is not read again at that version:
+/// every search page read each such file in scope to its end, up to 16MiB,
+/// to skip it again.
+fn walked_text(path: &Path) -> Result<Option<(String, Option<FileVersion>)>> {
+    let text = search_text_with(path, |path| read_text_as(path, ReadAs::WalkedText))?;
+    if let Some((_, Some(version))) = &text
+        && cached_digest(path, *version, |entry| entry.text) != Some(true)
+    {
+        remember_digest(path, *version, |entry| entry.text = Some(true));
     }
     Ok(text)
 }
-fn search_text(path: &Path) -> Result<Option<String>> {
-    search_text_with(path, read_text)
-}
-/// search_text with the file's digest (read_text_hashed).
+/// walked_text with the file's digest (read_text_hashed).
 fn search_text_hashed(path: &Path) -> Result<Option<(String, String)>> {
-    search_text_with(path, read_text_hashed)
+    Ok(walked_text(path)?.map(|text| with_digest(path, text)))
 }
 fn search_text_with<T>(path: &Path, read: impl FnOnce(&Path) -> Result<T>) -> Result<Option<T>> {
     match read(path) {
@@ -7749,7 +7810,6 @@ pub fn limit_result(
             };
             let narrowed_cursor = (call.name == "file_read" && pointer == "/data/content/text")
                 .then(new_file_cursor_id);
-            let (mut low, mut high) = (0, chars.len());
             let candidate = |length: usize| {
                 let mut v = template.clone();
                 *v.pointer_mut(pointer).unwrap() =
@@ -7811,14 +7871,9 @@ pub fn limit_result(
                 }
                 v
             };
-            while low < high {
-                let mid = (low + high).div_ceil(2);
-                if result_tokens(call, &candidate(mid), &s.config.model) <= limit {
-                    low = mid;
-                } else {
-                    high = mid - 1;
-                }
-            }
+            let low = context::longest_within(0, chars.len(), limit, None, |length| {
+                result_tokens(call, &candidate(length), &s.config.model)
+            });
             output = candidate(low);
             if low > 0 && result_tokens(call, &output, &s.config.model) <= limit {
                 if narrowed_cursor.is_some() {
@@ -7939,21 +7994,12 @@ pub fn limit_result(
         if items.is_empty() {
             continue;
         }
-        // Bisect for the longest prefix within the limit. Dropping one item
+        // Search for the longest prefix within the limit. Dropping one item
         // per full re-count took about a second for a 400-heading outline.
-        let mut fits = |keep: usize| {
+        let low = context::longest_within(0, items.len(), limit, None, |keep| {
             output["data"][field] = Value::Array(items[..keep].to_vec());
-            result_tokens(call, &output, &s.config.model) <= limit
-        };
-        let (mut low, mut high) = (0, items.len());
-        while low < high {
-            let mid = (low + high).div_ceil(2);
-            if fits(mid) {
-                low = mid;
-            } else {
-                high = mid - 1;
-            }
-        }
+            result_tokens(call, &output, &s.config.model)
+        });
         output["data"][field] = Value::Array(items[..low].to_vec());
         if low > 0 {
             adjust_collection_continuation(
@@ -8073,6 +8119,11 @@ pub fn run_call_cancellable(
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Value {
     let mut result = guard_tool(s, |s| run_call_inner(s, call, cancel));
+    // run_call_inner limited a successful result already, and recovery
+    // leaves one unchanged.
+    if result["status"] == "ok" {
+        return result;
+    }
     recovery::attach(s, call, &mut result);
     if result["status"] != "ok"
         && failure_holds_checkpoint(s, &call.name, &result)
@@ -8511,6 +8562,48 @@ mod file_tests {
         assert_ne!(hash_file(&path).unwrap(), first);
         assert_eq!(text_line_count(&path).unwrap(), 2);
         assert!(!digest_cache().lock().unwrap().contains_key(&path));
+    }
+
+    #[test]
+    fn walked_files_found_not_to_be_text_are_not_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let settled = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(settled)
+                .unwrap();
+            path
+        };
+        let mut large = vec![b'a'; 4 * 1024 * 1024];
+        large[10] = 0;
+        let binary = write("a.bin", &large);
+        let latin = write("a.log", b"caf\xe9\n");
+        let text = write("a.rs", b"fn a() {}\n");
+        // A NUL near the start refuses the file with the usual error.
+        let error = read_text(&binary).unwrap_err().to_string();
+        assert!(error.starts_with("unsupported_binary_file"), "{error}");
+        assert!(search_text_hashed(&binary).unwrap().is_none());
+        assert!(search_text_hashed(&latin).unwrap().is_none());
+        assert!(search_text_hashed(&text).unwrap().is_some());
+        let text_flag = |path: &Path| digest_cache().lock().unwrap()[path].text;
+        assert_eq!(text_flag(&binary), Some(false));
+        assert_eq!(text_flag(&latin), Some(false));
+        assert_eq!(text_flag(&text), Some(true));
+        assert!(!listed_as_text(&binary).unwrap());
+        assert!(listed_as_text(&text).unwrap());
+        // A read outside a walk still names what is wrong with the file.
+        let error = read_text(&latin).unwrap_err().to_string();
+        assert!(error.starts_with("unsupported_non_utf8_file"), "{error}");
+        // A new version is read again.
+        let fixed = write("a.log", b"cafe\n");
+        assert_eq!(fixed, latin);
+        assert!(search_text_hashed(&latin).unwrap().is_some());
+        assert_eq!(text_flag(&latin), Some(true));
     }
 
     #[test]
