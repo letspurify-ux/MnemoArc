@@ -529,11 +529,16 @@ fn write_path(
         temp.as_file().set_permissions(permissions.clone())?;
     }
     temp.as_file().sync_all()?;
-    if existed {
-        temp.persist(path)?;
+    // A failed persist hands the temporary file back inside its error. Kept
+    // there, it outlived the rollback, whose removal of the directories this
+    // write created then failed as not empty: an uncertain-write report for
+    // a patch that had been undone.
+    let persisted = if existed {
+        temp.persist(path)
     } else {
-        temp.persist_noclobber(path)?;
-    }
+        temp.persist_noclobber(path)
+    };
+    persisted.map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -802,5 +807,30 @@ mod glob_tests {
         assert!(excluded_case_alias(&project, Path::new("docs/a.md")).unwrap());
         assert!(excluded_case_alias(&project, Path::new("SRC/Cargo.lock")).unwrap());
         assert!(excluded_case_alias(&project, Path::new("src/a.rs")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    // A failed persist kept the temporary file inside its error, so the
+    // rollback that ran while the error was held could not remove the
+    // directories the write had created.
+    #[test]
+    fn a_failed_write_leaves_no_temporary_file_behind_its_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Renaming a file over a non-empty directory fails.
+        let target = dir.path().join("taken");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("inner"), "x").unwrap();
+        let mut created = Vec::new();
+        let error = write_path(&target, "text", true, None, &mut created).unwrap_err();
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, ["taken"], "{error}");
+        assert!(created.is_empty());
     }
 }

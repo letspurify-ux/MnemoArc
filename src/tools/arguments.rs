@@ -21,6 +21,7 @@ pub(super) fn failure(
     received: &str,
     detail: &str,
 ) -> anyhow::Error {
+    let field = shown_name(field);
     recovery::DiagnosticError {
         message: format!(
             "{code}: {field} {detail} for {name}; correct this field and resend the intended call"
@@ -42,6 +43,20 @@ fn matches_type(value: &Value, kind: &str) -> bool {
         "array" => value.is_array(),
         "object" => value.is_object(),
         _ => unreachable!("unsupported tool schema type: {kind}"),
+    }
+}
+
+/// Longest argument name an error repeats, as input diagnostics list them.
+const SHOWN_NAME_CHARS: usize = 80;
+
+/// An argument name or path as an error repeats it, cut to its first 80
+/// characters. A leaked call can carry a whole file in one key: a 4 MiB key
+/// was repeated in the message and its data, and bounding that result took
+/// 3 s.
+pub(super) fn shown_name(name: &str) -> std::borrow::Cow<'_, str> {
+    match name.char_indices().nth(SHOWN_NAME_CHARS) {
+        Some((end, _)) => format!("{}…", &name[..end]).into(),
+        None => name.into(),
     }
 }
 
@@ -87,6 +102,7 @@ pub(super) fn unknown_field(
     } else {
         "fields"
     };
+    let path = shown_name(path);
     let mut data = json!({"execution":"not_started","input_error":{
         "tool":name,"field":path,"expected":{"allowed_fields":allowed},"received":value_type(value)
     }});
@@ -174,7 +190,7 @@ pub(super) fn validate_field(
     {
         let (message, target) = enum_value_error(name, path, value, allowed, parent);
         let mut data = json!({"execution":"not_started","input_error":{
-            "tool":name,"field":path,"expected":{"enum":allowed},"received":value_type(value)
+            "tool":name,"field":shown_name(path),"expected":{"enum":allowed},"received":value_type(value)
         }});
         if let Some(target) = target {
             data["input_error"]["did_you_mean"] = json!(target);
@@ -250,10 +266,11 @@ pub(super) fn validate_field(
                 let field = format!("{path}.{required}");
                 // A missing field next to an unaccepted one is usually a
                 // misnamed field (file_patch "op" for "action"); name both.
-                let unknown: Vec<_> = if schema["additionalProperties"] == false {
+                let unknown: Vec<&str> = if schema["additionalProperties"] == false {
                     object
                         .keys()
-                        .filter(|key| schema["properties"].get(key.as_str()).is_none())
+                        .map(String::as_str)
+                        .filter(|key| schema["properties"].get(key).is_none())
                         .take(8)
                         .collect()
                 } else {
@@ -283,18 +300,22 @@ pub(super) fn validate_field(
                         .is_some_and(|target| target == required)
                 });
                 let rename = match (meant, unknown.as_slice()) {
-                    (Some(only), _) | (None, [only]) => {
-                        format!("; if {only} carries this value, send it as {required}")
-                    }
+                    (Some(only), _) | (None, [only]) => format!(
+                        "; if {} carries this value, send it as {required}",
+                        shown_name(only)
+                    ),
                     _ => String::new(),
                 };
+                let unknown: Vec<_> = unknown.into_iter().map(shown_name).collect();
                 return Err(recovery::DiagnosticError {
                     message: format!(
-                        "missing_argument: {field} is required for {name}; {path} also has fields that are not accepted: {}{rename}; correct the field names and resend the intended call",
+                        "missing_argument: {} is required for {name}; {} also has fields that are not accepted: {}{rename}; correct the field names and resend the intended call",
+                        shown_name(&field),
+                        shown_name(path),
                         json!(unknown)
                     ),
                     data: json!({"execution":"not_started","input_error":{
-                        "tool":name,"field":field,"expected":schema["properties"][required],
+                        "tool":name,"field":shown_name(&field),"expected":schema["properties"][required],
                         "received":"missing","unknown_fields":unknown
                     }}),
                 }

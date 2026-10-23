@@ -174,3 +174,88 @@ fn history_search_pages_stay_complete() {
     assert_eq!(rest["items"].as_array().unwrap().len(), 20, "{rest}");
     assert!(rest["next_cursor"].is_null(), "{rest}");
 }
+
+/// A path given as a memory source ID is replaced by the sources delivered
+/// from that file; each was checked against every source found before it,
+/// so a file with 60,000 delivered sources took seconds per memory_write.
+#[test]
+fn path_source_ids_resolve_linearly_in_delivered_sources() {
+    let (dir, mut s) = document("# Doc\n");
+    let lines = 60_000;
+    let text: String = (0..lines).map(|i| format!("needle_{i}\n")).collect();
+    write(&dir, "src/big.rs", &text);
+    let digest = tools::hash(text.as_bytes());
+    let path = dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("src/big.rs")
+        .display()
+        .to_string();
+    for i in 0..lines {
+        let source = mnemoarc::memory::Source {
+            id: format!("SB{i:06}"),
+            observed_at: Default::default(),
+            origin: "file".into(),
+            path: Some(path.clone()),
+            start_line: Some(i + 1),
+            end_line: Some(i + 1),
+            line_start_complete: true,
+            line_end_complete: true,
+            evidence_truncated: false,
+            hash: Some(digest.clone()),
+            excerpt: format!("needle_{i}"),
+        };
+        s.sources
+            .insert(source.id.clone(), std::sync::Arc::new(source));
+    }
+    let started = Instant::now();
+    let saved = tools::execute(
+        &mut s,
+        "memory_write",
+        json!({"title":"Needles","summary":"s","body":"b","kind":"fact","source_ids":["src/big.rs"]}),
+    )
+    .unwrap();
+    assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+    // At most eight of the file's delivered sources, the most recent first;
+    // observed at the same time, they keep their order in the file.
+    assert_eq!(
+        saved["resolved_source_ids"]["src/big.rs"],
+        json!((0..8).map(|i| format!("SB{i:06}")).collect::<Vec<_>>()),
+        "{saved}"
+    );
+}
+
+/// An unaccepted argument name is repeated by its error. A leaked call can
+/// carry a whole file in one key: a 4 MiB key was repeated in the message
+/// and its data, and bounding that result took seconds.
+#[test]
+fn errors_repeat_only_the_start_of_a_long_argument_name() {
+    let (_dir, mut s) = document("# Doc\n");
+    let key = "k".repeat(4 << 20);
+    let call = mnemoarc::llm::ToolCall {
+        id: "c1".into(),
+        name: "source_search".into(),
+        arguments: json!({"query":"a", key: 1}).to_string(),
+    };
+    let started = Instant::now();
+    let result = tools::run_call(&mut s, &call);
+    assert!(started.elapsed() < LIMIT, "{:?}", started.elapsed());
+    let error = result["error"].as_str().unwrap();
+    assert!(error.starts_with("unknown_argument: kkk"), "{error}");
+    assert!(error.len() < 2000, "{}", error.len());
+    assert!(
+        result.to_string().len() < 8000,
+        "{}",
+        result.to_string().len()
+    );
+    // A nested key is cut the same way, with the field it lacks.
+    let batch = tools::execute(
+        &mut s,
+        "file_patch",
+        json!({"operations":[{"path":"a.rs", "x".repeat(1 << 20): "y"}]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(batch.len() < 2000, "{}", batch.len());
+}

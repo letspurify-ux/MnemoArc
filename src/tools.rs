@@ -5731,15 +5731,13 @@ fn delivered_sources_for(
         let current = hash_file(&resolved)?;
         wanted.push((resolved, current, start as usize, end as usize));
     }
+    // Looked up per source: scanning what was supplied and found so far made
+    // a path naming one file with 30,000 delivered sources take 0.85 s.
+    let mut known: std::collections::HashSet<&str> =
+        supplied.iter().map(|source| source.id.as_str()).collect();
     let mut found: Vec<crate::memory::Source> = Vec::new();
     for source in s.sources.values() {
-        if source.origin != "file"
-            || source.evidence_truncated
-            || supplied
-                .iter()
-                .chain(&found)
-                .any(|known| known.id == source.id)
-        {
+        if source.origin != "file" || source.evidence_truncated || !known.insert(&source.id) {
             continue;
         }
         let (Some(path), Some(start), Some(end)) =
@@ -5770,7 +5768,7 @@ fn delivered_sources_for(
             found.push(Source::clone(source));
         }
     }
-    found.sort_by_key(|source| (source.path.clone(), source.start_line));
+    found.sort_by(|a, b| (&a.path, a.start_line).cmp(&(&b.path, b.start_line)));
     Ok(found)
 }
 

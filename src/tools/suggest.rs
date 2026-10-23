@@ -355,7 +355,10 @@ pub(crate) fn field(
         .map(|(target, _)| *target)
         .or_else(|| closest(key, allowed).filter(|target| *target != key))?;
     let text = if siblings.get(target).is_some() {
-        format!("; {target} is already supplied, so drop {key}")
+        format!(
+            "; {target} is already supplied, so drop {}",
+            super::arguments::shown_name(key)
+        )
     } else {
         format!("; did you mean {target}? send this value as {target}")
     };
