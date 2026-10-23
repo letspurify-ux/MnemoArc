@@ -5610,13 +5610,27 @@ fn candidate_paths_bounded(
     let mut entries = vec![];
     let mut non_utf8 = 0usize;
     let mut path_bytes = 0usize;
+    // Compared in decomposed form, as the project's own patterns are: a
+    // model types "한글파일.md" composed, while files macOS created hold it
+    // decomposed, and such a path_glob matched none of them though the
+    // same name as a path opened the file.
     let filter = pattern
-        .map(|glob| root_relative_glob(p, &root, glob))
-        .map(globset::Glob::new)
+        .map(|glob| {
+            use unicode_normalization::UnicodeNormalization;
+            root_relative_glob(p, &root, glob).nfd().collect::<String>()
+        })
+        .map(|glob| globset::Glob::new(&glob))
         .transpose()?
         .map(|glob| glob_matcher(&glob))
         .transpose()
         .map_err(|error| anyhow::anyhow!("invalid_path_glob: {error}"))?;
+    let filtered_out = |filter: &globset::GlobSet, rel: &Path| {
+        use unicode_normalization::UnicodeNormalization;
+        match rel.to_str() {
+            Some(text) if !text.is_ascii() => !filter.is_match(text.nfd().collect::<String>()),
+            _ => !filter.is_match(rel),
+        }
+    };
     // The walker reads the root's and its parents' ignore files first.
     for dir in root.ancestors() {
         if let Some(file) = unsafe_ignore_file(dir) {
@@ -5654,7 +5668,7 @@ fn candidate_paths_bounded(
         let rel = entry.path().strip_prefix(&root)?;
         if directory.is_some_and(|scope| !entry.path().starts_with(scope))
             || rules.excluded(rel)?
-            || filter.as_ref().is_some_and(|f| !f.is_match(rel))
+            || filter.as_ref().is_some_and(|f| filtered_out(f, rel))
         {
             continue;
         }
@@ -6237,7 +6251,7 @@ fn delivered_ending_with<'a>(
             continue;
         };
         if let Ok(relative) = resolved.strip_prefix(&root)
-            && relative.ends_with(wanted)
+            && decomposed(relative).ends_with(decomposed(wanted))
         {
             files.insert(relative.to_string_lossy().into_owned());
         }
@@ -6258,9 +6272,27 @@ fn delivered_ending_with<'a>(
 #[derive(Default)]
 pub(super) struct FilesByName {
     /// Delivered source paths.
-    delivered: Option<HashMap<std::ffi::OsString, BTreeSet<String>>>,
+    delivered: Option<HashMap<String, BTreeSet<String>>>,
     /// Project files, project-relative; None when the root is unreadable.
-    project: Option<Option<HashMap<std::ffi::OsString, Vec<PathBuf>>>>,
+    project: Option<Option<HashMap<String, Vec<PathBuf>>>>,
+}
+
+/// `path` in decomposed form, as file names are compared: a model writes
+/// "한글파일.md" composed, while a file macOS created holds it decomposed,
+/// and a folder-less citation of it got no project path.
+fn decomposed(path: &Path) -> PathBuf {
+    use unicode_normalization::UnicodeNormalization;
+    let text = path.to_string_lossy();
+    if text.is_ascii() {
+        path.to_path_buf()
+    } else {
+        PathBuf::from(text.nfd().collect::<String>())
+    }
+}
+
+/// A file name as FilesByName keys it.
+fn name_key(name: &std::ffi::OsStr) -> String {
+    decomposed(Path::new(name)).to_string_lossy().into_owned()
 }
 
 /// The one file a cited path that is not a project path names: the one
@@ -6280,7 +6312,7 @@ fn file_ending_with(s: &Session, suffix: &str, files: &mut FilesByName) -> Optio
                 && let Some(name) = Path::new(path).file_name()
             {
                 by_name
-                    .entry(name.to_owned())
+                    .entry(name_key(name))
                     .or_default()
                     .insert(path.to_owned());
             }
@@ -6289,7 +6321,7 @@ fn file_ending_with(s: &Session, suffix: &str, files: &mut FilesByName) -> Optio
     });
     let named = wanted
         .file_name()
-        .and_then(|name| delivered.get(name))
+        .and_then(|name| delivered.get(&name_key(name)))
         .into_iter()
         .flatten()
         .map(String::as_str);
@@ -6314,7 +6346,7 @@ fn file_ending_with(s: &Session, suffix: &str, files: &mut FilesByName) -> Optio
                 && let Some(name) = relative.file_name()
             {
                 by_name
-                    .entry(name.to_owned())
+                    .entry(name_key(name))
                     .or_default()
                     .push(relative.to_owned());
             }
@@ -6322,9 +6354,10 @@ fn file_ending_with(s: &Session, suffix: &str, files: &mut FilesByName) -> Optio
         Some(by_name)
     });
     let mut found = None;
-    let candidates = project.as_ref()?.get(wanted.file_name()?)?;
+    let candidates = project.as_ref()?.get(&name_key(wanted.file_name()?))?;
+    let wanted = decomposed(wanted);
     for relative in candidates {
-        if relative.ends_with(suffix) {
+        if decomposed(relative).ends_with(&wanted) {
             if found.is_some() {
                 return None;
             }

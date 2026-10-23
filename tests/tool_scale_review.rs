@@ -1101,3 +1101,49 @@ fn shortened_last_pages_and_audits_continue_where_they_were_cut() {
     }
     assert_eq!(Some(listed), total);
 }
+
+/// Tool review 2026-10-23: files macOS creates hold Korean names
+/// decomposed (NFD) while models write them composed (NFC). A composed
+/// path_glob matched none of them, and a folder-less composed citation of
+/// one got no project path, though the same name as a path opened the file.
+#[test]
+fn composed_names_match_decomposed_file_names() {
+    use unicode_normalization::UnicodeNormalization;
+    let (dir, mut s) = document("# T\n");
+    let composed = "한글파일.md";
+    let decomposed: String = composed.nfd().collect();
+    write(
+        &dir,
+        &format!("문서/{decomposed}"),
+        "# 제목\n\n본문 needle 한 줄.\n",
+    );
+    let found = tools::execute(
+        &mut s,
+        "source_search",
+        json!({"query":"needle","path_glob":format!("**/{composed}")}),
+    )
+    .unwrap();
+    assert_eq!(found["matches"].as_array().unwrap().len(), 1, "{found}");
+    let listed = tools::execute(
+        &mut s,
+        "file_list",
+        json!({"mode":"paths","path_glob":format!("문서/{composed}")}),
+    )
+    .unwrap();
+    assert_eq!(listed["paths"].as_array().unwrap().len(), 1, "{listed}");
+    std::fs::write(
+        dir.path().join("summary.md"),
+        format!("# T\n\n## A\n\nSee {composed}:1-1 here.\n"),
+    )
+    .unwrap();
+    let audit = tools::execute(&mut s, "document_audit", json!({})).unwrap();
+    let issue = audit["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|issue| issue["kind"] == "citation_path")
+        .unwrap_or_else(|| panic!("{audit}"));
+    let suggested: String = issue["suggested"].as_str().unwrap().nfd().collect();
+    let expected: String = format!("문서/{decomposed}:1-1").nfd().collect();
+    assert_eq!(suggested, expected, "{issue}");
+}
