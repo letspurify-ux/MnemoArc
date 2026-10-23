@@ -2430,8 +2430,11 @@ fn anchored_passage(old: &str, target: &str) -> Option<String> {
 /// are often retyped with an en dash or a moved backtick; showing the exact
 /// text lets the caller copy it instead of guessing again.
 fn near_match(old: &str, target: &str) -> Option<String> {
-    fn normalize(text: &str) -> (Vec<char>, Vec<(usize, usize)>) {
-        let mut chars = Vec::new();
+    /// The normalized text, and for each of its characters its byte offset
+    /// there and the span of `text` it stands for.
+    fn normalize(text: &str) -> (String, Vec<usize>, Vec<(usize, usize)>) {
+        let mut normal = String::new();
+        let mut offsets = Vec::new();
         let mut spans: Vec<(usize, usize)> = Vec::new();
         for (at, c) in text.char_indices() {
             let end = at + c.len_utf8();
@@ -2443,30 +2446,34 @@ fn near_match(old: &str, target: &str) -> Option<String> {
                 c if c.is_whitespace() => ' ',
                 c => c,
             };
-            if c == ' ' && chars.last() == Some(&' ') {
+            if c == ' ' && normal.ends_with(' ') {
                 if let Some(span) = spans.last_mut() {
                     span.1 = end;
                 }
                 continue;
             }
-            chars.push(c);
+            offsets.push(normal.len());
+            normal.push(c);
             spans.push((at, end));
         }
-        (chars, spans)
+        (normal, offsets, spans)
     }
-    let (doc, spans) = normalize(old);
-    let (wanted, _) = normalize(target.trim());
-    if wanted.len() < 8 || wanted.len() > doc.len() {
+    let (doc, offsets, spans) = normalize(old);
+    let (wanted, wanted_offsets, _) = normalize(target.trim());
+    if wanted_offsets.len() < 8 {
         return None;
     }
-    let mut found =
-        (0..=doc.len() - wanted.len()).filter(|&i| doc[i..i + wanted.len()] == wanted[..]);
-    let start = found.next()?;
-    if found.next().is_some() {
+    // A substring search, not a comparison at every position: that took
+    // the length of the document times the length of old_text, while this
+    // edit holds the write gate.
+    let start = doc.find(&wanted)?;
+    let next = start + doc[start..].chars().next().map_or(1, char::len_utf8);
+    if doc[next..].contains(&wanted) {
         return None;
     }
-    let (from, _) = spans[start];
-    let (_, to) = spans[start + wanted.len() - 1];
+    let first = offsets.binary_search(&start).ok()?;
+    let (from, _) = spans[first];
+    let (_, to) = spans[first + wanted_offsets.len() - 1];
     Some(old[from..to].to_owned())
 }
 
@@ -2793,12 +2800,16 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
             // same heading already exists there (or twice in text).
             // Reporting it as an ambiguous section argument would point at
             // the wrong mistake.
+            // One index for every inserted heading: parsing the candidate
+            // per heading made a 200-section insert into a 4000-heading
+            // document take seconds.
+            let index = documentation::HeadingIndex::new(&candidate);
             for heading in new_headings
                 .iter()
                 .filter(|heading| heading.level == required_level)
             {
-                let path = documentation::heading_path(&candidate, inserted_start + heading.start)?;
-                if documentation::resolve_heading(&candidate, &path).is_err() {
+                let path = index.path_at(inserted_start + heading.start)?;
+                if index.resolve(path).is_err() {
                     let verb = if heading.start == 0 {
                         "starts with"
                     } else {
@@ -3525,14 +3536,16 @@ fn inserted_sibling_sections(old: &str, new: &str, section: &str) -> Vec<String>
         return Vec::new();
     };
     let existing = documentation::headings(old);
+    let existing: std::collections::HashSet<&str> = existing
+        .iter()
+        .map(|present| present.heading.trim())
+        .collect();
     documentation::headings(new)
         .iter()
         .filter(|heading| {
             heading.level == resolved.level
                 && heading.start > resolved.start
-                && !existing
-                    .iter()
-                    .any(|present| present.heading.trim() == heading.heading.trim())
+                && !existing.contains(heading.heading.trim())
         })
         .map(|heading| heading.heading.clone())
         .collect()
@@ -8858,5 +8871,63 @@ mod file_tests {
             Some(dir.path().join("docs/out.md").canonicalize().unwrap())
         );
         assert_eq!(paths.lookup("out.md"), read_path(&project, "out.md").ok());
+    }
+}
+
+#[cfg(test)]
+mod edit_diagnostic_tests {
+    use super::*;
+
+    /// near_match shows the passage that differs only in dashes, quotes,
+    /// backticks or spacing, and nothing when it occurs twice, overlapping
+    /// occurrences included.
+    #[test]
+    fn near_match_finds_one_normalized_passage() {
+        let old = "Intro.\nThe range is `a`–b and ‘quoted’  here.\nEnd.\n";
+        assert_eq!(
+            near_match(old, "The range is a-b and 'quoted' here."),
+            Some("The range is `a`–b and ‘quoted’  here.".to_owned())
+        );
+        assert_eq!(near_match("x aaaaaaaaaa y", "aaaaaaaaa"), None);
+        assert_eq!(
+            near_match("x aaaaaaaa y", "aaaaaaaa"),
+            Some("aaaaaaaa".to_owned())
+        );
+        assert_eq!(near_match("short", "sho"), None);
+    }
+
+    /// Tool review 2026-10-23: near_match compared old_text at every
+    /// position of the document, so repetitive text cost the document's
+    /// length times old_text's, with the write gate held.
+    #[test]
+    fn near_match_is_linear_on_repetitive_text() {
+        let old = "ab ".repeat(300_000);
+        let target = format!("{}c", "ab ".repeat(30_000));
+        let started = std::time::Instant::now();
+        assert_eq!(near_match(&old, &target), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// headings closes every open section at a heading of its level or
+    /// above, so each section still ends where the next peer starts.
+    #[test]
+    fn heading_sections_end_at_their_next_peer() {
+        let doc = "# A\n## B\n### C\n## D\n#### E\n# F\n";
+        let ends: Vec<_> = documentation::headings(doc)
+            .iter()
+            .map(|heading| (heading.heading.clone(), &doc[heading.start..heading.end]))
+            .map(|(heading, text)| (heading, text.lines().count()))
+            .collect();
+        assert_eq!(
+            ends,
+            [
+                ("# A".to_owned(), 5),
+                ("## B".to_owned(), 2),
+                ("### C".to_owned(), 1),
+                ("## D".to_owned(), 2),
+                ("#### E".to_owned(), 1),
+                ("# F".to_owned(), 1),
+            ]
+        );
     }
 }

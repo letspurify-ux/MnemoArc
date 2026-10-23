@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -89,6 +90,9 @@ fn visible_without_html_comments(line: &str, in_comment: &mut bool) -> String {
 /// section replace deleted the next section.
 pub(super) fn headings(doc: &str) -> Vec<Heading> {
     let mut result: Vec<Heading> = Vec::new();
+    // Indices of headings whose section still runs to the end, by rising
+    // level: a heading ends every open one at its level or deeper.
+    let mut open: Vec<usize> = Vec::new();
     let mut fence: Option<CodeFence> = None;
     let mut in_comment = false;
     let mut offset = 0;
@@ -130,11 +134,13 @@ pub(super) fn headings(doc: &str) -> Vec<Heading> {
                 .get(run)
                 .is_none_or(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
         {
-            for prior in result.iter_mut().rev() {
-                if prior.end == doc.len() && prior.level >= run {
-                    prior.end = start;
-                }
+            while let Some(&prior) = open.last()
+                && result[prior].level >= run
+            {
+                result[prior].end = start;
+                open.pop();
             }
+            open.push(result.len());
             result.push(Heading {
                 heading: line.trim().to_string(),
                 start,
@@ -309,13 +315,7 @@ fn around(headings: &[Heading], ranges: &[(usize, usize)], max: usize) -> Vec<us
 }
 
 pub(super) fn heading_path(doc: &str, start: usize) -> Result<String> {
-    let headings = headings(doc);
-    let paths = heading_paths(&headings);
-    headings
-        .iter()
-        .position(|heading| heading.start == start)
-        .map(|index| paths[index].clone())
-        .ok_or_else(|| anyhow::anyhow!("section_not_found: heading position changed"))
+    HeadingIndex::new(doc).path_at(start).map(str::to_owned)
 }
 
 /// Dice similarity of the character bigrams of two titles, ignoring case,
@@ -389,6 +389,15 @@ impl HeadingIndex {
         let headings = headings(doc);
         let paths = heading_paths(&headings);
         Self { headings, paths }
+    }
+
+    /// The section path of the heading starting at byte `start`.
+    pub(super) fn path_at(&self, start: usize) -> Result<&str> {
+        self.headings
+            .iter()
+            .position(|heading| heading.start == start)
+            .map(|index| self.paths[index].as_str())
+            .ok_or_else(|| anyhow::anyhow!("section_not_found: heading position changed"))
     }
 
     pub(super) fn resolve(&self, requested: &str) -> Result<&Heading> {
@@ -945,7 +954,7 @@ fn issue_kinds(issues: &[Value]) -> Value {
 /// in order and at most `limit`, for a read of the output to start near.
 pub(super) fn open_issue_lines(s: &Session, output: &Path, doc: &str, limit: usize) -> Vec<u64> {
     let mut lines = BTreeSet::new();
-    if let Ok((_, issues)) = citation_issues(s, output, doc) {
+    if let Ok((_, issues, _)) = citation_issues_and_paths(s, output, doc, false) {
         lines.extend(issues.iter().filter_map(|issue| issue["line"].as_u64()));
     }
     lines.extend(
@@ -1308,27 +1317,142 @@ fn code_names(span: &str) -> (Vec<String>, Vec<String>) {
 /// requests. The definition encloses the cited lines while every nonblank
 /// line from it through the last cited line is indented deeper, except a
 /// line that starts with `)` (a signature continued over several lines).
-fn defined_around(source: &[String], name: &str, begin: usize, end: usize) -> bool {
+struct CitedFile {
+    lines: Vec<String>,
+    text: String,
+    /// Byte offset in text of each line.
+    starts: Vec<usize>,
+    /// Lines defining each name checked so far, ascending.
+    definitions: HashMap<String, Vec<usize>>,
+}
+
+impl CitedFile {
+    fn new(text: String) -> Self {
+        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        let mut starts = Vec::with_capacity(lines.len());
+        let mut at = 0;
+        for piece in text.split_inclusive('\n').take(lines.len()) {
+            starts.push(at);
+            at += piece.len();
+        }
+        Self {
+            lines,
+            text,
+            starts,
+            definitions: HashMap::new(),
+        }
+    }
+
+    fn defined_around(&mut self, name: &str, begin: usize, end: usize) -> bool {
+        if !self.definitions.contains_key(name) {
+            // One search of the whole text finds the lines holding the
+            // name; testing each line above each citation cost a save 5
+            // seconds for 2000 claims citing a 20000-line file.
+            let mut holding: Vec<usize> = self
+                .text
+                .match_indices(name)
+                .map(|(at, _)| self.starts.partition_point(|start| *start <= at) - 1)
+                .collect();
+            holding.dedup();
+            let mut whole = None;
+            holding.retain(|&line| {
+                self.lines
+                    .get(line)
+                    .is_some_and(|text| defines(text, name, &mut whole))
+            });
+            self.definitions.insert(name.to_owned(), holding);
+        }
+        let source = &self.lines;
+        let indent = |text: &str| text.len() - text.trim_start().len();
+        let last = end.min(source.len());
+        let above = begin.saturating_sub(1).min(source.len());
+        self.definitions[name]
+            .iter()
+            .rev()
+            .filter(|&&at| at < above)
+            .any(|&at| {
+                let depth = indent(&source[at]);
+                source[at + 1..last].iter().all(|line| {
+                    let trimmed = line.trim_start();
+                    trimmed.is_empty() || indent(line) > depth || trimmed.starts_with(')')
+                })
+            })
+    }
+}
+
+/// The definition forms of `name` as one pattern.
+fn definition_pattern(name: &str) -> Option<regex::Regex> {
     let name = regex::escape(name);
-    let Ok(definition) = regex::Regex::new(&format!(
+    regex::Regex::new(&format!(
         r"\b(?:fn|function|def|struct|enum|trait|class|interface|mod|impl)\s+{name}\b|\b(?:const|let|var)\s+{name}\s*(?::[^=]*)?=[^=]|(?:^|[\s,{{]){name}\s*:\s*(?:async\s+)?(?:function\b|\(|[A-Za-z_$][\w$]*\s*=>)|^\s*(?:(?:async|static|get|set|public|private|protected)\s+)*{name}\s*\([^()]*\)\s*\{{\s*$"
-    )) else {
+    ))
+    .ok()
+}
+
+/// Occurrences of a name in one line checked form by form. Each check scans
+/// the line, so a line holding the name more often is matched by one
+/// pattern for the whole line instead.
+const DEFINITION_OCCURRENCES: usize = 8;
+
+/// Whether `text` holds a definition form of `name` (a code_names word):
+/// the text before an occurrence of the name and the text after it each
+/// match their half of one form. A pattern compiled per name cost a save
+/// 360ms for 2000 claims citing lines inside their functions, and each
+/// compiled pattern held about 180KB; `whole` is that pattern, compiled
+/// only for a line with more than DEFINITION_OCCURRENCES occurrences.
+fn defines(text: &str, name: &str, whole: &mut Option<Option<regex::Regex>>) -> bool {
+    static FORMS: std::sync::OnceLock<Option<Vec<(regex::Regex, regex::Regex)>>> =
+        std::sync::OnceLock::new();
+    let Some(forms) = FORMS.get_or_init(|| {
+        [
+            (
+                r"\b(?:fn|function|def|struct|enum|trait|class|interface|mod|impl)\s+$",
+                r"^(?:\W|$)",
+            ),
+            (r"\b(?:const|let|var)\s+$", r"^\s*(?::[^=]*)?=[^=]"),
+            (
+                r"(?:^|[\s,{])$",
+                r"^\s*:\s*(?:async\s+)?(?:function\b|\(|[A-Za-z_$][\w$]*\s*=>)",
+            ),
+            (
+                r"^\s*(?:(?:async|static|get|set|public|private|protected)\s+)*$",
+                r"^\s*\([^()]*\)\s*\{\s*$",
+            ),
+        ]
+        .into_iter()
+        .map(|(before, after)| {
+            Some((
+                regex::Regex::new(before).ok()?,
+                regex::Regex::new(after).ok()?,
+            ))
+        })
+        .collect()
+    }) else {
         return false;
     };
-    let indent = |text: &str| text.len() - text.trim_start().len();
-    let last = end.min(source.len());
-    source[..begin.saturating_sub(1).min(source.len())]
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, text)| definition.is_match(text))
-        .any(|(at, text)| {
-            let depth = indent(text);
-            source[at + 1..last].iter().all(|line| {
-                let trimmed = line.trim_start();
-                trimmed.is_empty() || indent(line) > depth || trimmed.starts_with(')')
-            })
-        })
+    if name.is_empty() {
+        return false;
+    }
+    if text.matches(name).nth(DEFINITION_OCCURRENCES).is_some() {
+        return whole
+            .get_or_insert_with(|| definition_pattern(name))
+            .as_ref()
+            .is_some_and(|pattern| pattern.is_match(text));
+    }
+    let mut from = 0;
+    while let Some(found) = text[from..].find(name) {
+        let at = from + found;
+        let (before, after) = (&text[..at], &text[at + name.len()..]);
+        if forms
+            .iter()
+            .any(|(head, tail)| head.is_match(before) && tail.is_match(after))
+        {
+            return true;
+        }
+        // Occurrences may overlap; the name starts with an ASCII character.
+        from = at + text[at..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
 }
 
 const CITATION_MISMATCH_LIMIT: usize = 8;
@@ -1346,7 +1470,7 @@ pub(super) fn citation_mismatch_check(s: &Session, output: &Path, doc: &str) -> 
     let citations = citation_spans(doc).ok()?;
     let unchanged = unchanged_sections(s, output, doc);
     let own = output.canonicalize().ok();
-    let mut files = BTreeMap::<PathBuf, Option<Vec<String>>>::new();
+    let mut files = BTreeMap::<PathBuf, Option<CitedFile>>::new();
     let mut paths = PathResolver::new(&s.project);
     let mut items = Vec::new();
     let mut total = 0usize;
@@ -1434,30 +1558,26 @@ pub(super) fn citation_mismatch_check(s: &Session, output: &Path, doc: &str) -> 
                 }
                 let Some(source) = files
                     .entry(resolved.clone())
-                    .or_insert_with(|| {
-                        read_text(&resolved)
-                            .ok()
-                            .map(|text| text.lines().map(str::to_owned).collect())
-                    })
-                    .as_ref()
+                    .or_insert_with(|| read_text(&resolved).ok().map(CitedFile::new))
+                    .as_mut()
                 else {
                     continue;
                 };
                 if citation.begin == 0
                     || citation.end < citation.begin
-                    || citation.end > source.len()
+                    || citation.end > source.lines.len()
                 {
                     continue;
                 }
                 checked = true;
-                let cited_text = &source[citation.begin - 1..citation.end];
+                let cited_text = &source.lines[citation.begin - 1..citation.end];
                 found |= names.iter().chain(&qualifiers).any(|name| {
                     cited_text
                         .iter()
                         .any(|cited_line| cited_line.contains(name.as_str()))
                 }) || names
                     .iter()
-                    .any(|name| defined_around(source, name, citation.begin, citation.end));
+                    .any(|name| source.defined_around(name, citation.begin, citation.end));
             }
             if checked && !found {
                 total += 1;
@@ -2169,7 +2289,7 @@ pub(super) fn rust_test_modules(text: &str) -> Vec<(usize, usize)> {
 }
 
 fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<Value>)> {
-    citation_issues_and_paths(s, output, doc).map(|(checked, issues, _)| (checked, issues))
+    citation_issues_and_paths(s, output, doc, true).map(|(checked, issues, _)| (checked, issues))
 }
 
 /// (document line, cited path, project file it names): the citation_path
@@ -2177,10 +2297,14 @@ fn citation_issues(s: &Session, output: &Path, doc: &str) -> Result<(usize, Vec<
 type FixablePaths = Vec<(usize, String, String)>;
 
 /// citation_issues, with the fixable citation paths behind their fixes.
+/// Without `with_fixes` no ready edit is built: callers that only count
+/// issues or complete the paths themselves skipped a cost that grows with
+/// the document times its fixable lines.
 fn citation_issues_and_paths(
     s: &Session,
     output: &Path,
     doc: &str,
+    with_fixes: bool,
 ) -> Result<(usize, Vec<Value>, FixablePaths)> {
     let (spans, mut issues) = scan_citations(doc)?;
     let mut versions = std::collections::BTreeMap::new();
@@ -2289,6 +2413,9 @@ fn citation_issues_and_paths(
             }
         }
     }
+    if !with_fixes {
+        return Ok((spans.len(), issues, fixable));
+    }
     // One fix per line: the first citation_path issue on that line carries
     // the edit that rewrites every fixable citation on it.
     let mut fixes = citation_fixes(doc, &fixable);
@@ -2314,6 +2441,12 @@ fn citation_issues_and_paths(
 /// Widening steps tried before a fix falls back to its whole line.
 const FIX_WIDEN_STEPS: usize = 40;
 
+/// Lines tried for a ready fix, as many as one document_edit_batch applies.
+/// Each try scans and rewrites the whole document: an audit of a 1.3MB
+/// document with 6000 folder-less citations took 40 seconds. Later issues
+/// keep their suggested path, and the next save completes every one.
+const FIX_LINES_LIMIT: usize = 32;
+
 /// Ready replace_text edits, one per document line, that rewrite the line's
 /// unresolved citation paths to their suggested project paths. old_text is
 /// the citation span widened one character on each side until it occurs
@@ -2336,7 +2469,7 @@ fn citation_fixes(doc: &str, fixable: &[(usize, String, String)]) -> BTreeMap<us
     let lines: Vec<&str> = doc.lines().collect();
     let mut current = doc.to_owned();
     let mut fixes = BTreeMap::new();
-    for (line_number, paths) in by_line {
+    for (line_number, paths) in by_line.into_iter().take(FIX_LINES_LIMIT) {
         let Some(line) = line_number
             .checked_sub(1)
             .and_then(|index| lines.get(index))
@@ -2348,7 +2481,7 @@ fn citation_fixes(doc: &str, fixable: &[(usize, String, String)]) -> BTreeMap<us
             continue;
         };
         let mut steps = 0;
-        while current.matches(&line[start..end]).count() != 1 {
+        while current.matches(&line[start..end]).take(2).count() != 1 {
             if steps == FIX_WIDEN_STEPS || (start == 0 && end == line.len()) {
                 (start, end) = (0, line.len());
                 break;
@@ -2381,7 +2514,7 @@ pub(super) fn complete_citation_paths(
     output: &Path,
     doc: &str,
 ) -> Option<(String, Vec<Value>)> {
-    let (_, issues, fixable) = citation_issues_and_paths(s, output, doc).ok()?;
+    let (_, issues, fixable) = citation_issues_and_paths(s, output, doc, false).ok()?;
     let pattern = regex::Regex::new(CITATION_PATTERN).ok()?;
     let mut by_line = BTreeMap::<usize, BTreeMap<&str, &str>>::new();
     for (line, cited, file) in &fixable {
@@ -2735,5 +2868,132 @@ mod outline_tests {
             assert!(near.contains(&title.to_owned()), "{title} in {near:?}");
         }
         assert_eq!(omitted, 21);
+    }
+}
+
+#[cfg(test)]
+mod definition_tests {
+    use super::{DEFINITION_OCCURRENCES, defines, definition_pattern};
+
+    /// The pattern defines checks form by form: one regex per name.
+    fn reference(name: &str) -> regex::Regex {
+        definition_pattern(name).unwrap()
+    }
+
+    /// Lines built from definition fragments around the name agree with
+    /// the per-name pattern, including overlapping and embedded names.
+    #[test]
+    fn split_forms_match_the_per_name_pattern() {
+        let heads = [
+            "",
+            " ",
+            "  ",
+            "\t",
+            "fn ",
+            "pub fn ",
+            "function ",
+            "def ",
+            "struct ",
+            "impl ",
+            "mod  ",
+            "xfn ",
+            "const ",
+            "let ",
+            "var ",
+            "export const ",
+            "{",
+            ",",
+            "a,",
+            "(",
+            "async ",
+            "static async ",
+            "public get ",
+            "  private ",
+            "load",
+            "_",
+            "é ",
+            "ü",
+            "const loadx",
+            "fn\u{a0}",
+            "class\u{3000}",
+        ];
+        let tails = [
+            "",
+            " ",
+            "()",
+            "() {",
+            "(a, b) {  ",
+            "(a) { x }",
+            "(a(b)) {",
+            " = 1",
+            "= 1",
+            "==",
+            " =",
+            ": T = v",
+            ": T == v",
+            ":x=y",
+            ": function",
+            ": functionx",
+            ": function(",
+            ": (",
+            ": async () =>",
+            ": async x =>",
+            ": x => 1",
+            ": $a  =>",
+            ": 1 =>",
+            "x",
+            "_",
+            "é",
+            "\u{301}",
+            "-",
+            "::run",
+            ".load",
+            ": async function",
+            "load: () =>",
+            "ad() {",
+            "\u{a0}= 2",
+        ];
+        let mut checked = 0;
+        for name in ["load", "loadload", "aaaa", "run_x"] {
+            let reference = reference(name);
+            for head in heads {
+                for middle in ["", "load", "x", " "] {
+                    for tail in tails {
+                        let text = format!("{head}{name}{middle}{tail}");
+                        assert_eq!(
+                            defines(&text, name, &mut None),
+                            reference.is_match(&text),
+                            "{text:?} defines {name:?}"
+                        );
+                        let doubled = format!("{head}{name}{tail}, {head}{name}{tail}");
+                        assert_eq!(
+                            defines(&doubled, name, &mut None),
+                            reference.is_match(&doubled),
+                            "{doubled:?} defines {name:?}"
+                        );
+                        checked += 2;
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000);
+    }
+
+    /// A line holding the name many times is matched in one pass: checking
+    /// each occurrence scanned the rest of the line again.
+    #[test]
+    fn many_occurrences_in_one_line_stay_linear() {
+        let mut whole = None;
+        let line = "const load: a, ".repeat(100_000);
+        let started = std::time::Instant::now();
+        assert!(!defines(&line, "load", &mut whole));
+        let defined = format!("{line}const load = 1");
+        assert!(defines(&defined, "load", &mut whole));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let few = "const load: a, ".repeat(DEFINITION_OCCURRENCES);
+        assert_eq!(
+            defines(&few, "load", &mut None),
+            reference("load").is_match(&few)
+        );
     }
 }

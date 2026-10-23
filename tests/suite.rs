@@ -60,6 +60,8 @@ mod tool_recovery;
 mod tool_review_followup;
 #[path = "tool_review_followup2.rs"]
 mod tool_review_followup2;
+#[path = "tool_scale_review.rs"]
+mod tool_scale_review;
 #[path = "web.rs"]
 mod web;
 #[path = "web_automation.rs"]

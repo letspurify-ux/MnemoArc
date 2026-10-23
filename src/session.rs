@@ -307,6 +307,9 @@ impl SessionHistory {
     }
     pub fn search(&self, query: &str, after: u64, limit: usize) -> Value {
         let q = query.to_lowercase();
+        let limit = limit.clamp(1, 50);
+        // One match past the page shows that there are more; the rest of
+        // the history is not serialized and searched.
         let rows: Vec<_> = self
             .bundles
             .iter()
@@ -318,8 +321,9 @@ impl SessionHistory {
                     .contains(&q)
                     || b.messages.iter().any(|m| text_contains(m, &q, 2))
             })
+            .take(limit + 1)
             .collect();
-        let items:Vec<_>=rows.iter().take(limit.clamp(1,50)).map(|b|json!({"id":b.id,"active":b.active,"excerpt":serde_json::to_string(&b.messages).unwrap().chars().take(240).collect::<String>()})).collect();
+        let items:Vec<_>=rows.iter().take(limit).map(|b|json!({"id":b.id,"active":b.active,"excerpt":serde_json::to_string(&b.messages).unwrap().chars().take(240).collect::<String>()})).collect();
         json!({"next_cursor":if rows.len()>items.len(){items.last().and_then(|x|x["id"].as_u64())}else{None},"items":items,"pruned_through":self.pruned_through})
     }
 }
