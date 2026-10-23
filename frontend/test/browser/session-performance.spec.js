@@ -182,11 +182,11 @@ test("cached tools stay read-only until verification and later edits preserve th
   await page.locator(".session-button").filter({ hasText: "다른 세션" }).click();
   await expect(verifying(page)).toHaveCount(0);
   const remote = await request.put(`/api/sessions/${session.id}/tools`, {
-    headers: { "X-MnemoArc-Client": "web" }, data: { names: ["code_outline"] },
+    headers: { "X-MnemoArc-Client": "web" }, data: { names: ["file_list"] },
   });
   expect(remote.ok()).toBe(true);
   session.revision++;
-  session.active_tools = ["code_outline"];
+  session.active_tools = ["file_list"];
   const pending = gate();
   await page.route(`**/api/sessions/${session.id}`, async (route) => {
     pending.seen();
@@ -213,11 +213,11 @@ test("cached tools stay read-only until verification and later edits preserve th
     expect(submitted).toBeUndefined();
   } finally { pending.release(); }
   await expect(toggle).toBeEnabled();
-  await expect(page.getByRole("checkbox", { name: "코드 구조 조회", exact: true })).toBeChecked();
+  await expect(page.getByRole("checkbox", { name: "파일 목록", exact: true })).toBeChecked();
   await toggle.check();
   await written.requested;
   const saved = await (await request.get(`/api/sessions/${session.id}`)).json();
-  expect(saved.active_tools).toEqual(["code_outline", "source_search"]);
+  expect(saved.active_tools).toEqual(["file_list", "source_search"]);
 });
 
 for (const notice of ["session", "global", "summary"]) {

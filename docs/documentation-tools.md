@@ -26,15 +26,11 @@
 | 커서 이어 읽기 관용 | `file_read`에 커서와 `max_lines`만 함께 오면 `max_lines`를 무시하고 원래 범위를 이어 읽는다(`ignored_arguments`로 알림). 커서와 `start_line`이 함께 오면 그 줄부터 새 범위를 읽고, 커서를 이어 읽지 않았다는 것과 커서가 이어 읽을 줄 번호(파일이 바뀌었으면 커서가 더는 맞지 않는다는 것)를 `ignored_arguments: ["cursor"]`와 `ignored_note`로 알린다. 새 범위가 바로 그 줄에서 시작하면 알리지 않는다. 다만 `start_line: 1`과 1줄 이하의 `max_lines`(또는 `limit`)는 모든 인자를 채워 보내는 모델의 자리표시 값으로 보고, 커서가 아직 유효하면 커서를 이어 읽는다(`ignored_arguments: ["start_line","max_lines"]`, 이어 읽은 줄 번호는 `ignored_note`). 이 모델은 이어 읽기마다 이 값을 붙였다. 아무 표시 없이 1행만 받았을 때는 같은 범위를 다른 요청으로 다시 읽었고(두 라이브 실행의 이어 읽기 4건 모두), 알림을 붙인 뒤에도 커서만 보낼 수 없어 같은 호출을 다시 보내거나 커서를 포기했다. 커서와 `offset`, 또는 다른 파일의 `path`를 섞으면 계속 거절한다. `next_cursor` 객체(`{"tool":"file_read","cursor":"R2"}`)를 통째로 `cursor`에 넣으면(JSON 문자열이든 객체든) 같은 도구의 이어 읽기 호출로 보고, 그 안의 `cursor`와 호출에 빠졌거나 빈 인자(`code_outline`의 경로·필터 등)를 쓴다. 다른 도구의 객체는 그대로 잘못된 커서다(라이브 실행에서 객체를 문자열로 보낸 읽기가 `invalid_file_cursor`로 실패했다). `file_list`는 커서를 발급한 `mode`·`path_glob`을 기억해, 이어 조회에서 이를 빠뜨려도 원래 범위를 유지한다. 커서가 다른 인자로 발급된 경우의 오류는 "목록이 바뀜"이 아니라 인자 불일치 가능성을 먼저 알린다. |
 | `source_search` 폴더 범위 | `path`에 폴더를 주면 그 아래 전체(`<폴더>/**`)를 검색한다. |
 | 인자 혼동 안내 | `source_search`에 `query`·`queries` 없이 `pattern`만 오면, `pattern`은 파일을 거르는 glob(`path_glob`의 옛 별칭)이고 찾을 텍스트는 `query`로 보내라고 안내한다(`path`가 있으면 `pattern`을 빼라고도 적는다). `document_edit`·`document_edit_batch`의 `insert_before`·`insert_after`·`insert_first_child`·`insert_last_child`에 `old_text`가 오면, 이 동작은 `section`의 제목을 기준으로 섹션을 넣는다는 점과 구절 기준 삽입은 `insert_before_text`·`insert_after_text`를 쓰라는 점을 오류에 함께 적는다. `action=section`에 `section`이 없거나 비어 있으면, 이 동작은 제목 하나가 가리키는 섹션만 바꾼다는 점과 문서 전체를 바꾸려면 `expected_hash`와 함께 `action=write`를 쓰라는 점을 덧붙인다(문서 전체를 `section: ""`으로 보낸 라이브 실행). 정해진 값 목록이 있는 인자에 다른 값이 오면 받은 값과 허용 값을 함께 적고(`action "show" is not one of: list, apply`), `task_plan`의 `action`에 `insert`·`complete` 같은 계획 연산 이름이 오면 `action "apply"`와 `operations[].op`로 보내라고 안내한다. `source_search`에 정규식이 아닌 `query`와 그 값이 없는 `queries`가 함께 오면, `query`를 `queries` 맨 앞에 합쳐 한 번의 OR 검색으로 실행하고 결과의 `notice`에 합친 `queries`를 적는다. 합쳐서 16개를 넘거나 `regex:true`이면 계속 충돌로 거절한다(`query` "chat"과 다른 검색어 4개를 보낸 라이브 실행이 거절돼 한 요청을 버렸다). `history`·`task_state`·`memory_manage`·`document_edit`에서 다른 액션이 쓰는 인자가 빈 값(`""`, `[]`, `{}`, `null`)으로 오면 보내지 않은 것으로 보고 뺀다(`task_state action=read`에 자리표시 값 `patch:{}`를 붙인 라이브 실행이 거절됐다). 값이 있으면 계속 그 인자를 받는 액션을 알리며 거절하고, 어떤 액션도 쓰지 않는 인자(이름 오타)는 빈 값이어도 거절한다. `document_edit`이 그 액션이 받지 않는 인자로 거절할 때, 그 액션에 빠진 필드도 같은 오류에 적는다(`text is also missing; action=insert_after needs text, section`). `task_plan`에 `action` 없이 `operations`가 오면 `operations`를 받는 액션은 `apply`뿐이므로 `apply`로 처리한다. `task_state`의 `patch`에 `action`이 든 호출 전체가 오면(JSON 문자열이든 객체든) 그 호출로 풀어 처리한다. `patch` 필드에는 `action`이 없어서 다른 뜻으로 읽힐 수 없고, 바깥 `action`과 다르면 풀지 않고 그대로 검사한다(`{"patch":"{\"action\": \"update\", \"patch\": {...}}"}`를 보낸 라이브 실행이 `action` 누락으로 거절됐다). |
-| 탐색 도구 유지 | 진척 없는 라운드가 쌓여 집중 복구에 들어가도, 저장된 문서가 없으면 `file_list`·`source_search`·`symbol_search`·`symbol_relations`·`code_outline`을 숨기지 않는다. 작성 안내는 그대로 나간다. 문서를 쓰기 전에 탐색 도구를 숨기면 아직 소스를 찾지 못한 모델이 경로를 추측하게 된다. |
+| 탐색 도구 유지 | 진척 없는 라운드가 쌓여 집중 복구에 들어가도, 저장된 문서가 없으면 `file_list`·`source_search`를 숨기지 않는다. 작성 안내는 그대로 나간다. 문서를 쓰기 전에 탐색 도구를 숨기면 아직 소스를 찾지 못한 모델이 경로를 추측하게 된다. |
 | `document_edit` `append` | 기존 문서가 줄바꿈 없이 끝나고 붙일 내용이 `#` 제목으로 시작하면 줄바꿈을 넣어 제목이 앞 문장에 붙지 않게 한다. 그 밖의 이어 쓰기는 그대로 붙인다. |
 | 문서 해시 누락 | 빈 `expected_hash`(`""`, 모든 인자를 채워 보내는 모델의 자리표시 값)는 빠뜨린 것으로 본다. 구절 기준 편집은 그대로 적용되고 나머지는 아래 처리를 따른다. 일괄 수정의 편집 항목에 든 빈 값도 무시해, 최상위로 올려 "비어 있으면 안 된다"로 거절하거나 실제 최상위 해시와 충돌로 보지 않는다(`replace_text`에 빈 해시를 보낸 라이브 실행이 거절됐다). `append`·`section`·섹션 삽입과 `document_edit_batch`가 `expected_hash`를 빠뜨려도, 문서가 모델이 마지막으로 저장한 내용 그대로면 그 저장 결과의 해시를 채운다. 그 밖의 경우에는 편집을 메모리에서 현재 문서에 적용해 보고, 해시 누락과 함께 다른 문제(제목 수준, 없는 섹션, 일괄 수정의 실패 항목 전부)를 한 번에 알린 뒤 아무것도 쓰지 않는다. 다른 인자 오류에도 해시 누락을 덧붙인다. 섹션 삽입의 제목 수준이 틀리면 그 수준에 맞는 동작(형제면 `insert_after`/`insert_before`, 자식이면 `insert_last_child`/`insert_first_child`)을 안내한다. |
-| `symbol_search` | Tree-sitter로 Rust·JS/TS·Python·Java·C# 선언을 검색한다. `path`/`path_glob`, 이름·종류·소속 필터와 페이지 조회를 지원하며, `symbol_read`와 공유하는 심볼 ID를 반환한다. 선언 발췌는 탐색용이다. |
-| `symbol_relations` | 검색 결과의 `path`·`symbol_id`로 호출 대상·호출자·참조 위치를 조회한다. 지역 선언·import·소속을 고려하고 후보·모호함·미해결 사유를 반환한다. 원문 읽기와 의미 검증은 별도로 수행한다. |
 
 일괄 검증은 관련 원문과 실제 문서를 비교한 뒤 호출해야 한다. 단순히 읽은 항목을 자동으로 검증 처리하지 않는다. 기존 ID를 지정한 `upsert`에서 생략한 제목·출처·기억 참조·섹션은 기존 값을 유지하며 같은 제목의 중복 항목 생성을 거부한다. 신규 항목은 제목이 필수이며, 존재하지 않는 ID에 제목 없이 수정 요청하면 오류를 반환한다. 기존 항목을 수정하면 이전 검증 상태는 무효화된다.
-
-구현 범위와 사용법은 [Tree-sitter 심볼 검색과 호출·참조 추적](syntax-navigation.md)에 정리했다.
 
 ## Markdown·Mermaid 형식 검사
 
@@ -100,12 +96,12 @@ Mermaid는 AST의 `mermaid` 코드 펜스 본문을 `merman-core`의 `Engine::pa
 | 점수가 오르지 않은 요청 | 동작 |
 |---|---|
 | 감지 횟수 × 1 (기본 8) | 집중 안내 |
-| 감지 횟수 × 2 (기본 16) | `file_list`·`source_search`·`symbol_search`·`code_outline` 숨김. `file_read`·`symbol_read`는 유지 |
+| 감지 횟수 × 2 (기본 16) | `file_list`·`source_search` 숨김. `file_read`는 유지 |
 | 감지 횟수 × 3 (기본 24) 또는 남은 예산 ≤ 마감 예산 비율(기본 10%), 또는 남은 시간 < 이 실행의 평균 요청 시간 × 3(검증 예산 비율만큼의 시간이 상한) | 마감 단계 |
 
 문서 작업에서 모델이 텍스트도 도구 호출도 없는 빈 응답을 내면, 다음 요청의 `run_guidance.recovery_reason`에 연속 빈 응답 횟수를 적고 도구 호출 강제(`tool_choice: required`)를 풀어 같은 요청이 반복되지 않게 한다(일부 공급자는 강제된 도구 선택에 추론만 내고 빈 응답을 돌려준다). 빈 응답이 3회 연속이면 진척 사다리를 기다리지 않고 마감 단계(`empty_response`)로 들어간다. 라이브 실행에서 같은 요청이 24회 반복돼 입력 1.4M 토큰을 쓴 뒤에야 정체 마감된 문제를 막는다.
 
-마감 단계에서는 탐색·기억 도구를 막고(저장된 문서가 아직 없으면 `file_read`·`symbol_read`·`source_lookup`까지 막고 수집한 근거로 문서를 바로 만들라고 지시한다), 모델에 수집한 근거로 문서를 마무리하라고 지시한다. 최대 12회 요청이 허용된다. 마감 단계에서는 요청이 고수위(`high_water`)를 넘는 것만으로 체크포인트를 시작하지 않고, 입력 예산을 넘을 때만 시작한다(입력 예산은 정리 요청 공간을 이미 예약한다). 체크포인트 요청은 12회에 세지 않으며, 마감 요청으로 센 회차가 체크포인트로 바뀌면 그 회차를 돌려준다. 라이브 실행에서 마지막 마감 요청이 체크포인트가 되고 이어진 정리 요청 4회(입력 약 36만 토큰)가 끝나자마자 `closing_round_limit`으로 마감된 문제를 막는다.
+마감 단계에서는 탐색·기억 도구를 막고(저장된 문서가 아직 없으면 `file_read`·`source_lookup`까지 막고 수집한 근거로 문서를 바로 만들라고 지시한다), 모델에 수집한 근거로 문서를 마무리하라고 지시한다. 최대 12회 요청이 허용된다. 마감 단계에서는 요청이 고수위(`high_water`)를 넘는 것만으로 체크포인트를 시작하지 않고, 입력 예산을 넘을 때만 시작한다(입력 예산은 정리 요청 공간을 이미 예약한다). 체크포인트 요청은 12회에 세지 않으며, 마감 요청으로 센 회차가 체크포인트로 바뀌면 그 회차를 돌려준다. 라이브 실행에서 마지막 마감 요청이 체크포인트가 되고 이어진 정리 요청 4회(입력 약 36만 토큰)가 끝나자마자 `closing_round_limit`으로 마감된 문제를 막는다.
 
 - 읽지 않은 인용 범위는 마감 단계에서도 `file_read`로 읽거나 인용을 읽은 줄로 좁혀 해소한다. 남은 범위는 마감 보고에 `근거 미확인`으로 표시하며 검증된 것으로 보고하지 않는다.
 - 마감 단계에서 첫 최종 답변의 거절은 한 번의 보완 기회로 쓰고, 두 번째 최종 답변은 남은 문제를 보고하며 수락한다.
@@ -181,7 +177,7 @@ Mermaid는 AST의 `mermaid` 코드 펜스 본문을 `merman-core`의 `Engine::pa
 
 읽기 기록은 에이전트가 개별·묶음 토큰 제한을 모두 적용한 **최종 본문**을 전달할 때 저장한다. `file_read`와 섹션 조회의 겹치는 범위를 합치며 한글·부분 줄·CRLF를 처리한다. 목차, 검색 발췌, 원문 보관소에만 남긴 결과, 반복 조회로 생략한 본문은 새 읽기로 계산하지 않는다. 원문 보관소를 통해 텍스트를 회수한 경우도 이 집계에는 포함하지 않으므로 필요하면 해당 파일/섹션 도구로 읽는다.
 
-`file_read`·`symbol_read`는 범위 내부의 LF·CRLF를 원문 그대로 보존하며, 범위 마지막 줄의 종결 개행만 생략한다. 커서와 `line_offsets`는 이 원문 기준 Unicode 문자 위치다. 읽은 본문을 `document_edit`의 `old_text`로 복사할 때는 줄 번호 접두사를 제거하고 공백과 줄바꿈을 유지한다. 단일·배치 patch 모두 공백·개행만 있는 비어 있지 않은 대상을 허용하되, 겹치는 출현까지 포함해 문서 전체에서 정확히 한 번 일치해야 한다.
+`file_read`는 범위 내부의 LF·CRLF를 원문 그대로 보존하며, 범위 마지막 줄의 종결 개행만 생략한다. 커서와 `line_offsets`는 이 원문 기준 Unicode 문자 위치다. 읽은 본문을 `document_edit`의 `old_text`로 복사할 때는 줄 번호 접두사를 제거하고 공백과 줄바꿈을 유지한다. 단일·배치 patch 모두 공백·개행만 있는 비어 있지 않은 대상을 허용하되, 겹치는 출현까지 포함해 문서 전체에서 정확히 한 번 일치해야 한다.
 
 이는 세션 내 전달 이력이며 이해·의미 검증 또는 현재 활성 컨텍스트 보존을 증명하지 않는다. 체크포인트 이후에도 유지되고 세션 종료 시 사라진다. 파일이 바뀌면 이전 해시 기록을 적용하지 않으며 새 본문 전달 시 해당 파일의 기록을 교체한다. 기록은 세션 메타데이터 용량 제한에 포함한다. 전체 읽기를 강제하는 완료 조건은 추가하지 않는다.
 
@@ -224,60 +220,14 @@ Mermaid는 AST의 `mermaid` 코드 펜스 본문을 `merman-core`의 `Engine::pa
 
 일치 줄과 문맥 줄은 각각 최대 500 Unicode 문자로 표시하고 생략이 있으면 `truncated=true`를 붙인다. 잘린 일치 줄의 출처 ID는 탐색용이며 인용 검증을 충족하지 않으므로 `file_read`로 전체 줄을 읽어야 한다. `context`에는 일치 줄을 제외한 앞뒤 줄과 줄 번호가 들어간다. 출처 ID는 일치 줄만 가리킨다. 문맥을 검증 근거로 사용할 때에도 `file_read`로 해당 범위를 읽는다.
 
-내용 검색과 심볼 검색은 파일 후보 목록을 만든 뒤 각 파일을 한 번 읽어 텍스트 검사와 탐색을 수행한다. 내용 검색은 반환할 페이지의 결과만 보관하므로 100,000줄이 넘는 일치도 전체 결과를 메모리에 쌓지 않고 페이지 조회할 수 있다. 파일 내용과 검색 조건의 해시를 재검사하므로 다음 페이지에서도 전체 대상 파일을 다시 읽는다. 지속 캐시나 의미 기반 심볼 인덱스는 사용하지 않는다.
+내용 검색은 파일 후보 목록을 만든 뒤 각 파일을 한 번 읽어 텍스트 검사와 탐색을 수행한다. 내용 검색은 반환할 페이지의 결과만 보관하므로 100,000줄이 넘는 일치도 전체 결과를 메모리에 쌓지 않고 페이지 조회할 수 있다. 파일 내용과 검색 조건의 해시를 재검사하므로 다음 페이지에서도 전체 대상 파일을 다시 읽는다. 지속 캐시나 의미 기반 심볼 인덱스는 사용하지 않는다.
 
 
-## 구조 탐색
+## 구조 탐색 도구 제거
 
-구현과 테스트는 Rust이며 JS/Python 보조 구현은 추가하지 않는다. 탐색 대상 언어용 소스 fixture는 Rust 테스트 문자열로 생성한다. 구조 탐색은 [Tree-sitter Rust 바인딩](https://docs.rs/tree-sitter/latest/tree_sitter/)과 언어별 네이티브 문법을 사용한다.
+Tree-sitter 기반 `code_outline`·`symbol_search`·`symbol_relations`·`symbol_read`는 제거했다. 선언·호출 위치는 `source_search`로 찾고 그 범위를 `file_read`로 읽는다. 아래 변경 기록의 이 도구들에 대한 내용은 이력이다.
 
-두 도구는 `source-docs` 그룹 또는 개별 이름으로 선택할 수 있다.
-
-| 도구 | 인자와 결과 |
-|---|---|
-| `code_outline` | `path` 필수. 선택 `query`, `match`, `case_sensitive`, `kind`, `container`, `max_depth`, `view`, `cursor`, `limit`(기본 50, 최대 100). 선언의 종류·소속·위치·`symbol_id`를 반환한다. |
-| `symbol_read` | `path`, `symbol_id` 필수. 선택 `start_line`(파일의 절대 줄 번호), `max_lines`(1~2,000), `force_read`. 심볼 범위 안에서 본문과 출처를 반환한다. 범위를 생략하면 기존처럼 전체 심볼 읽기를 요청한다. |
-
-```json
-{"path":"backend/src/agent.js","view":"compact","max_depth":0}
-{"path":"backend/src/agent.js","query":"handleQuestion","match":"exact","kind":"function"}
-{"path":"Store.java","container":"Store","kind":"method","max_depth":1,"view":"compact"}
-```
-
-위 인자를 `code_outline`에 전달한 후, 반환된 `symbol_id`를 그대로 `symbol_read`에 전달한다. `name_line`, `name_column`은 이름의 위치이며 줄·열 모두 1부터 시작하고 열은 Unicode 문자 수다.
-
-처음에는 `view=compact`, `max_depth=0`으로 파일의 최상위 구조를 확인한다. 함수 목록에는 `kind=function`, 클래스 메서드 목록에는 `kind=method`를 추가한다. 인자·기본값·선언된 반환 타입은 정확한 이름으로 상세 조회한 시그니처부터 확인한다. 잘리지 않은 시그니처로 답할 수 있으면 본문을 읽을 필요가 없다. 실행 동작을 확인할 때는 `symbol_read`에 `max_lines=30`처럼 필요한 양을 지정하고, 필요하면 심볼 안의 절대 `start_line`으로 이동한다.
-
-- `query`: 이름 검색. 기본 `match=contains`는 부분 일치, `match=exact`는 전체 이름 일치다. `case_sensitive` 기본값은 false다.
-- `kind`: 언어 간 공통 분류인 `symbol_kind`로 필터링한다. `function`, `method`, `constructor`, `class`, `struct`, `interface`, `trait`, `impl`, `enum`, `enum_member`, `record`, `annotation`, `field`, `variable`, `constant`, `type`, `module`, `macro`, `property`, `accessor`, `event`, `delegate`, `operator`, `destructor`를 지원한다. 기본값은 모든 종류다.
-- `container`: 출력에서 복사한 정확한 소속 경로로 필터링한다. `Store`, `Outer::Inner`처럼 쓰며 대소문자를 구분한다. 빈 문자열은 최상위만 선택한다.
-- `max_depth`: 심볼 중첩 깊이의 상한이다. 최상위는 0, 클래스의 직접 멤버는 1이다. AST 노드 깊이가 아니며 기본값은 제한 없음이다. 필터에서 부모가 제외돼도 자식의 소속·깊이는 유지된다.
-- `view=compact`: 이름·공통 종류·소속·깊이·위치·심볼 ID만 반환한다. 선언 발췌와 출처 ID를 발급하지 않으므로 본문 근거가 필요하면 `symbol_read`를 사용한다.
-- 기본 `view=detailed`: 기존 상세 필드를 유지하며 `symbol_kind`, `depth`를 추가한다. `kind`는 기존 Tree-sitter 노드 이름이고, 필터 인자 `kind`는 공통 분류를 사용한다.
-
-각 심볼의 `location`은 `프로젝트상대경로:시작줄-끝줄` 형식이다. 위치 목록에서는 이 값을 그대로 사용하며, 다른 심볼의 끝 줄과 섞어 범위를 만들지 않는다. 메서드는 클래스 내부에 있으므로 `kind=method`, 정확한 `container`를 사용하고 `max_depth=0`은 지정하지 않는다.
-
-자식 멤버 조회에는 부모의 `qualified_name`을 `container`에 그대로 복사한다. Java 중첩 클래스도 `Service::Inner` 형식을 사용하며 `Service.Inner`로 바꾸지 않는다. 오버로드는 같은 `qualified_name`을 가질 수 있으므로 본문 읽기에는 각각의 `symbol_id`를 사용한다. 빈 구조 조회에는 `empty_reason`, 필터 수정 안내, 최대 12개의 `available_containers`를 반환하며 후보가 더 있으면 `container_suggestions_truncated=true`로 알린다.
-
-JS/TS의 변수에 직접 할당한 화살표 함수·함수 표현식은 `function`으로 분류한다. Java 필드 시그니처에는 타입과 접근 제한자를 포함한다. 여러 변수가 같은 선언문에 있으면 심볼 ID는 각각 구분되지만 시그니처와 본문 읽기에는 공유 선언문이 포함될 수 있다. 분류는 구문 기반이며 모든 언어의 모든 선언 형식을 인식하는 것은 아니다.
-
-### 구조 탐색 범위
-
-Rust(`rs`), JavaScript(`js`, `jsx`, `mjs`, `cjs`), TypeScript(`ts`, `tsx`, `mts`, `cts`), Python(`py`, `pyi`), Java(`java`), C#(`cs`)을 지원한다. 함수·클래스·메서드·인터페이스·Rust impl/trait·Java 생성자/record/enum/annotation 등의 이름 있는 선언을 탐색한다. 모든 언어의 모든 구문이나 타입 관계를 모델링하는 기능은 아니다. `container`는 구문상 소속이며 실제 호출 관계가 아니다. 지원하지 않는 확장자는 `source_search`와 `file_read`로 안내한다.
-
-C#은 블록·파일 범위 namespace(`module`), class/struct/interface/record/enum, 생성자·메서드·지역 함수, 필드·상수, 프로퍼티·인덱서(`property`), get/set/init/add/remove(`accessor`), 이벤트·delegate·연산자·소멸자를 탐색한다. namespace도 심볼 깊이에 포함된다. `namespace Demo.Core;` 아래 `Store` 클래스의 멤버 조회에는 `container:"Demo.Core::Store"`를 사용하며, 반환된 `qualified_name`을 그대로 복사한다. 파일 범위 namespace 심볼 자체의 읽기는 namespace 선언만 포함한다. partial 타입 병합, record의 컴파일러 생성 멤버, 활성 전처리 분기 선택, 의미 기반 참조 해석은 하지 않는다. `.csproj`, `.razor`, `.cshtml`은 구조 탐색 대상이 아니다.
-
-구문 오류가 있으면 `has_parse_errors=true`로 표시하며 부분 구조를 반환할 수 있다. 상세 조회의 `source`는 이름 선언 줄을, `signature_source`는 표시된 시그니처의 줄 범위를 가리킨다. 구조 목록과 시그니처 발췌는 탐색용 출처이므로 인용 검증에는 사용할 수 없다. 시그니처와 선언 발췌는 최대 500문자다. `signature_truncated=true`이면 시그니처가 불완전하므로 필요한 원문을 읽는다. 여러 줄에 걸친 복수 선언에서 뒤쪽 선언의 공통 수식어·타입 접두부가 생략되면 이 플래그와 `signature_context_start_line`을 함께 반환한다. 필요한 공통 접두부는 해당 줄부터 `file_read`로 확인한다. 시그니처는 실행 동작의 근거를 대신하지 않는다. 본문은 `symbol_read`로 확인하며, 한 줄에 여러 선언이 있으면 같은 줄의 주변 코드도 포함된다. 다른 선언만 있는 줄은 해당 심볼의 읽기 범위에 포함하지 않는다.
-
-`symbol_read`의 시작 줄은 심볼 범위 밖이면 거부하고, 요청한 줄 수는 심볼 끝에서 제한한다. 일부 줄만 읽은 결과를 전체 구현을 확인한 것으로 취급하지 않는다. 출력 예산 때문에 잘린 경우 먼저 `file_read` 커서로 요청 범위를 마저 읽는다.
-
-LLM 요청에서는 `file_read`·`symbol_read`의 본문을 `content.numbered_text`의 `절대줄번호|원문`으로 전달한다. 원문을 중복 전송하지 않으며 `line_offsets`는 모델용 표현에서 제외한다. 원시 도구 결과·저장 이력·출처·읽기 기록은 기존 `content.text`와 Unicode 오프셋을 유지한다. 토큰 예산은 원시 표현과 모델용 표현 중 큰 값을 기준으로 제한한다. 줄 중간부터 이어 읽은 경우에도 같은 절대 줄 번호와 `first_line_complete`·`last_line_complete`를 유지하며, 번호 접두사는 원문이나 커서 오프셋에 포함되지 않는다. 빈 본문에는 가상의 줄을 추가하지 않는다.
-
-심볼 ID는 파일 해시와 구문 범위에 연결된다. 파일이 변경되면 `symbol_read`와 목차 커서는 만료된다. 본문 읽기는 기존 파일 읽기의 결과 예산·최종 전달 범위 기록을 사용하며, 잘린 결과는 반환된 **file_read 커서**로 이어 읽는다. 2,000줄을 넘는 심볼은 `next_line`에서 새 읽기를 시작하되 `symbol.end_line`까지만 읽는다. 구조 목록이 출력 예산을 넘으면 온전한 심볼 단위로 페이지를 줄이고 `code_outline`의 `next_cursor`로 이어 조회한다. 도구 응답의 `next_cursor`에는 경로와 필터를 포함한 후속 호출 인자를 제공한다. 모든 필터와 `view`를 유지해야 하며 `limit`만 변경할 수 있다. 변경된 조건이나 소스로 커서를 재사용하면 거부한다. 예산이 심볼 하나도 담을 수 없을 만큼 작은 경우에만 원문 보관소로 이어 조회한다.
-
-### 테스트
-
-`cargo test`는 지원 문법의 구조 추출, 오래된 심볼·커서 거부, 본문 결과 예산·이어 읽기를 검증한다. 구조 목록을 반복 축소하거나 여러 페이지로 읽어도 심볼이 누락·중복되지 않는지, 심볼 하나도 담지 못하는 예산에서는 원문을 보존하는지도 검사한다. 구조 탐색 테스트만 실행하려면 `cargo test --test suite structure::`를 사용한다.
+LLM 요청에서는 `file_read`의 본문을 `content.numbered_text`의 `절대줄번호|원문`으로 전달한다. 원문을 중복 전송하지 않으며 `line_offsets`는 모델용 표현에서 제외한다. 원시 도구 결과·저장 이력·출처·읽기 기록은 기존 `content.text`와 Unicode 오프셋을 유지한다. 토큰 예산은 원시 표현과 모델용 표현 중 큰 값을 기준으로 제한한다. 줄 중간부터 이어 읽은 경우에도 같은 절대 줄 번호와 `first_line_complete`·`last_line_complete`를 유지하며, 번호 접두사는 원문이나 커서 오프셋에 포함되지 않는다. 빈 본문에는 가상의 줄을 추가하지 않는다.
 
 문서 작업 초기화와 이전 문서 검토 설계 기록은 [소스 문서 작업·검토 설계](source-document-review.md)를 참고하세요. `document_edit`는 쓰기 직후 제한된 인용 오류 목록도 반환합니다.
 

@@ -10,7 +10,7 @@ struct Match {
 }
 
 fn displayed_line(line: usize, text: &str) -> Value {
-    json!({"line":line,"text":text.chars().take(500).collect::<String>(),"truncated":text.chars().count()>500})
+    json!({"line":line,"text":text.chars().take(500).collect::<String>(),"truncated":text.chars().nth(500).is_some()})
 }
 
 /// Models often send the search text as `pattern`, which is the legacy
@@ -138,7 +138,7 @@ pub(super) fn execute(
     }
     let mut exact_path = args["path"]
         .as_str()
-        .map(|p| read_path(&s.project, p))
+        .map(|p| read_path_suggesting(&s.project, p))
         .transpose()?;
     // `path` is literal even for directories such as Next.js `[slug]` routes.
     // Comparing path components avoids turning their names into glob syntax.
@@ -182,7 +182,12 @@ pub(super) fn execute(
         )
     } else if args["regex"].as_bool().unwrap_or(false) {
         if whole_word {
-            format!(r"\b(?:{query})\b")
+            // A whole-word match has no word character beside it, as grep -w
+            // reads it: `\b` around a pattern ending in punctuation needs a
+            // word character on its far side, so `load\(\)` never matched
+            // `load();`. Only whether a line matches is used, so the
+            // neighbours may be part of the match.
+            format!(r"(?:^|\W)(?:{query})(?:$|\W)")
         } else {
             query.to_owned()
         }
@@ -211,7 +216,13 @@ pub(super) fn execute(
     } else {
         0
     };
-    let requested_end = requested_offset.saturating_add(n(args, "limit", 20).clamp(1, 100));
+    let mut requested_end = requested_offset.saturating_add(n(args, "limit", 20).clamp(1, 100));
+    // A page holds about eight result budgets of text at most: a hundred
+    // matches with twenty context lines each made a 2MB page that the result
+    // limit then counted and cut for seconds, leaving no match in it. The
+    // cursor continues after the last match kept.
+    let page_bytes = s.config.result_budget().saturating_mul(32).max(16 * 1024);
+    let mut kept_bytes = 0usize;
     let mut rows = Vec::new();
     let mut files = Vec::new();
     let mut matched_files = 0;
@@ -230,11 +241,10 @@ pub(super) fn execute(
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
-        let Some(contents) = search_text(&path)? else {
+        let Some((contents, digest)) = search_text_hashed(&path)? else {
             continue;
         };
         matched_files += 1;
-        let digest = hash(contents.as_bytes());
         fingerprint.update(serde_json::to_vec(&(path.to_string_lossy(), &digest))?);
         let mut matching_lines = 0usize;
         let mut byte_offset = 0;
@@ -273,12 +283,25 @@ pub(super) fn execute(
             for (distance, text) in contents[byte_offset..].lines().take(after).enumerate() {
                 context.push(displayed_line(i + distance + 2, text));
             }
+            let text: String = line.chars().take(500).collect();
+            kept_bytes = kept_bytes
+                .saturating_add(text.len())
+                .saturating_add(
+                    context
+                        .iter()
+                        .map(|line| line["text"].as_str().map_or(0, str::len))
+                        .sum(),
+                )
+                .saturating_add(path.as_os_str().len() + 300);
+            if kept_bytes >= page_bytes {
+                requested_end = index + 1;
+            }
             rows.push(Match {
                 path: path.clone(),
                 hash: digest.clone(),
                 line: i + 1,
-                text: line.chars().take(500).collect(),
-                truncated: line.chars().count() > 500,
+                truncated: line.chars().nth(500).is_some(),
+                text,
                 context,
             });
         }
@@ -302,9 +325,7 @@ pub(super) fn execute(
     if offset > total {
         bail!(INVALID_CURSOR);
     }
-    let end = offset
-        .saturating_add(n(args, "limit", 20).clamp(1, 100))
-        .min(total);
+    let end = requested_end.min(total);
     let mut output = json!({
         "hash":fingerprint,"mode":mode,"matched_files":matched_files,
         "matching_files":matching_file_count,"total_matching_lines":total_matching_lines,

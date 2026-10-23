@@ -270,13 +270,6 @@ fn fast_paths_preserve_exclusions_and_text_modes_skip_unsupported_files() {
     let fast = tools::execute(&mut s, "file_list", json!({"mode":"paths"})).unwrap();
     assert_eq!(fast["paths"], json!(["a.rs", "binary", "invalid"]));
     assert_eq!(search(&mut s, json!({"query":"hit"}))["matched_files"], 1);
-    assert_eq!(
-        tools::execute(&mut s, "symbol_search", json!({"query":"hit"})).unwrap()["symbols"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
     s.project.exclude.push("*.rs".into());
     assert_eq!(
         search(&mut s, json!({"query":"hit"}))["total_matching_lines"],
@@ -649,4 +642,147 @@ fn a_literal_query_beside_queries_is_searched_with_them() {
     .unwrap_err()
     .to_string();
     assert!(error.starts_with("conflicting_arguments:"), "{error}");
+}
+
+/// Tool review 2026-10-23: a path_glob of 57,000 `?*` pairs passed
+/// Glob::new and then panicked in globset's compile_matcher. Long globs are
+/// refused, and one under the limit whose matcher cannot be built is an
+/// error, not a panic.
+#[test]
+fn oversized_path_globs_are_refused_without_panicking() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+    for (tool, args) in [
+        ("file_list", json!({"path_glob":"?*".repeat(57_000)})),
+        ("file_list", json!({"pattern":"?*".repeat(57_000)})),
+        (
+            "source_search",
+            json!({"query":"fn","path_glob":"?*".repeat(57_000)}),
+        ),
+    ] {
+        let error = tools::execute(&mut s, tool, args).unwrap_err().to_string();
+        assert!(error.starts_with("invalid_path_glob:"), "{tool}: {error}");
+    }
+    // A long glob under the limit still lists: a thousand alternatives.
+    let glob = format!("{{{}a}}.rs", "x,".repeat(1000));
+    let listed = tools::execute(&mut s, "file_list", json!({"path_glob":glob})).unwrap();
+    assert_eq!(listed["total_files"], 1, "{listed}");
+}
+
+/// Tool review 2026-10-23: `\b` around a regex ending in punctuation needs a
+/// word character after it, so whole_word `load\(\)` never matched `load();`.
+#[test]
+fn whole_word_regex_ending_in_punctuation_matches() {
+    let (dir, mut s) = setup();
+    std::fs::write(dir.path().join("a.js"), "load();\nreload();\nload(x)\n").unwrap();
+    // As grep -w reads it: `load(x)` has a word character after `load(`.
+    for (query, lines) in [(r"load\(\)", 1), (r"load\(", 1), ("load", 2)] {
+        let found = search(
+            &mut s,
+            json!({"query":query,"regex":true,"whole_word":true}),
+        );
+        assert_eq!(found["total_matching_lines"], lines, "{query}: {found}");
+    }
+}
+
+/// Tool review 2026-10-23: a page of a hundred matches with twenty context
+/// lines each was 2MB, which the result limit counted and cut for seconds.
+/// A page stops at a size bound, and its cursor goes on from the first match
+/// left out, so paging still delivers every match once.
+#[test]
+fn large_match_pages_stop_at_a_size_bound_and_continue_without_gaps() {
+    let (dir, mut s) = setup();
+    let line = format!("hit {}\n", "x".repeat(600));
+    std::fs::write(dir.path().join("a.txt"), line.repeat(300)).unwrap();
+    let args = json!({"query":"hit","before":20,"after":20,"limit":100});
+    let mut page = search(&mut s, args.clone());
+    let total = page["total_matching_lines"].as_u64().unwrap() as usize;
+    assert_eq!(total, 300);
+    let mut seen = Vec::new();
+    loop {
+        let rows = page["matches"].as_array().unwrap();
+        assert!(!rows.is_empty() && rows.len() < 100, "{}", rows.len());
+        seen.extend(rows.iter().map(|row| row["line"].as_u64().unwrap()));
+        let Some(cursor) = page["next_cursor"].as_str() else {
+            break;
+        };
+        let mut next = args.clone();
+        next["cursor"] = json!(cursor);
+        page = search(&mut s, next);
+    }
+    assert_eq!(seen, (1..=300).collect::<Vec<_>>());
+}
+
+/// Tool review 2026-10-23: a last page shortened to fit the result budget
+/// had no cursor of its own, so the items left out were reachable only
+/// through the history archive.
+#[test]
+fn a_shortened_last_file_list_page_continues_with_its_own_cursor() {
+    let (dir, mut s) = setup();
+    s.config.result_tokens = Some(1000);
+    let names: Vec<String> = (0..120)
+        .map(|i| format!("{}{i:03}.rs", "n".repeat(40)))
+        .collect();
+    for name in &names {
+        std::fs::write(dir.path().join(name), "fn a() {}\n").unwrap();
+    }
+    let mut listed = Vec::new();
+    let mut args = json!({"limit":500});
+    for call in 0.. {
+        let result = tools::run_call(
+            &mut s,
+            &mnemoarc::llm::ToolCall {
+                id: format!("l{call}"),
+                name: "file_list".into(),
+                arguments: args.to_string(),
+            },
+        );
+        assert_eq!(result["status"], "ok", "{result}");
+        listed.extend(
+            result["data"]["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|path| path.as_str().unwrap().to_owned()),
+        );
+        let Some(cursor) = result["data"]["next_cursor"].as_str() else {
+            assert!(result["archive_id"].is_null(), "{result}");
+            break;
+        };
+        // The continuation is sent without the listing's mode or limit.
+        args = json!({"cursor":cursor});
+        assert!(call < 20);
+    }
+    assert_eq!(listed, names);
+}
+
+/// Tool review 2026-10-23: text mode read every file in scope on every page;
+/// a file's text-ness is now kept per version. A changed file is checked
+/// again.
+#[test]
+fn file_list_text_mode_notices_a_file_that_stopped_being_text() {
+    let (dir, mut s) = setup();
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, "fn a() {}\n").unwrap();
+    // Cached only once settled (two seconds old).
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    for _ in 0..2 {
+        let listed = tools::execute(&mut s, "file_list", json!({})).unwrap();
+        assert_eq!(listed["total_files"], 1, "{listed}");
+    }
+    std::fs::write(&path, b"fn a() {}\0\n").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let listed = tools::execute(&mut s, "file_list", json!({})).unwrap();
+    assert_eq!(listed["total_files"], 0, "{listed}");
 }

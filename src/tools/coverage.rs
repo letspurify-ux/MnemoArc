@@ -1,13 +1,9 @@
 use super::*;
 
-/// Called only after the final batch budget has been applied. Archives, search
-/// excerpts and outlines are deliberately not treated as delivered document text.
+/// Called only after the final batch budget has been applied. Archives and search
+/// excerpts are deliberately not treated as delivered document text.
 pub fn record_delivered_read(s: &mut Session, call: &crate::llm::ToolCall, result: &Value) {
-    if !matches!(
-        call.name.as_str(),
-        "file_read" | "symbol_read" | "document_inspect"
-    ) || result["status"] != "ok"
-    {
+    if !matches!(call.name.as_str(), "file_read" | "document_inspect") || result["status"] != "ok" {
         return;
     }
     let data = &result["data"];
@@ -20,18 +16,16 @@ pub fn record_delivered_read(s: &mut Session, call: &crate::llm::ToolCall, resul
     let Ok(allowed) = read_path(&s.project, path) else {
         return;
     };
-    let Ok(doc) = read_text(&allowed) else {
+    let Ok((doc, digest)) = read_text_hashed(&allowed) else {
         return;
     };
-    let digest = hash(doc.as_bytes());
     if data["hash"] != digest {
         return;
     }
-    let normalized = doc.replace("\r\n", "\n");
     if shown.is_empty() && data["content"]["last_line_complete"] != true {
         return;
     }
-    let raw_start = if matches!(call.name.as_str(), "file_read" | "symbol_read") {
+    let raw_start = if call.name == "file_read" {
         let line = data["read_start"].as_u64().unwrap_or(1) as usize;
         doc.split_inclusive('\n')
             .take(line.saturating_sub(1))
@@ -60,14 +54,20 @@ pub fn record_delivered_read(s: &mut Session, call: &crate::llm::ToolCall, resul
             .filter(|&(i, _)| !doc[i..].starts_with("\r\n"))
             .count()
     };
+    let raw_end = raw_start + shown.chars().count();
     let start = normalized_offset(raw_start);
-    let mut end = normalized_offset(raw_start + shown.chars().count());
+    let mut end = normalized_offset(raw_end);
     // file_read omits the range's final line terminator. The boundary flag
     // certifies that the full line body was delivered, including empty lines.
-    if matches!(call.name.as_str(), "file_read" | "symbol_read")
+    if call.name == "file_read"
         && data["content"]["last_line_complete"] == true
         && (!shown.ends_with('\n') || data["content"]["truncated"] != true)
-        && normalized.chars().nth(end) == Some('\n')
+        // The LF-normalized character at `end` is a line break exactly
+        // where the original has LF or CRLF.
+        && doc
+            .char_indices()
+            .nth(raw_end)
+            .is_some_and(|(i, _)| doc[i..].starts_with('\n') || doc[i..].starts_with("\r\n"))
     {
         end += 1;
     }

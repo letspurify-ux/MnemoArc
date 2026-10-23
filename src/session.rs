@@ -789,10 +789,6 @@ impl Session {
                 "document_inspect",
                 "file_list",
                 "source_search",
-                "code_outline",
-                "symbol_search",
-                "symbol_relations",
-                "symbol_read",
             ]
             .into_iter()
             .map(str::to_owned)
@@ -874,7 +870,7 @@ impl Session {
                             self.sources.values().map(|source| &**source).collect();
                         candidates.sort_by_key(|s| std::cmp::Reverse(s.observed_at));
                         let choices: Vec<_> = candidates.into_iter().take(8).map(|s| json!({"id":s.id,"path":s.path,"start_line":s.start_line,"end_line":s.end_line})).collect();
-                        anyhow::anyhow!("unknown_source: {id}; Use source_lookup with the matching path to recover an observed ID, or history to inspect the original result. A compact code_outline is navigation only and supplies no evidence ID. If no matching evidence exists, {}; do not save an unsupported fact. Do not substitute unrelated IDs or remove source_ids to bypass this error. Recent sources (not automatic replacements): {}", if self.checkpoint.is_some() { "record the pending read in checkpoint_complete progress and read the source after the checkpoint" } else { "file_read the range first and use the source ID it returns" }, json!(choices))
+                        anyhow::anyhow!("unknown_source: {id}; Use source_lookup with the matching path to recover an observed ID, or history to inspect the original result. If no matching evidence exists, {}; do not save an unsupported fact. Do not substitute unrelated IDs or remove source_ids to bypass this error. Recent sources (not automatic replacements): {}", if self.checkpoint.is_some() { "record the pending read in checkpoint_complete progress and read the source after the checkpoint" } else { "file_read the range first and use the source ID it returns" }, json!(choices))
                     })
             })
             .collect()

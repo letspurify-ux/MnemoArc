@@ -169,8 +169,6 @@ pub fn describe(message: &str) -> Value {
         (Class::InvalidInput, "correct_arguments")
     } else if code == "unknown_source" {
         (Class::MissingEvidence, "lookup_observed_evidence")
-    } else if code == "unknown_symbol" || code == "invalid_symbol_id" {
-        (Class::InvalidInput, "copy_observed_symbol_id")
     } else if matches!(
         code,
         "database_disabled" | "database_password_missing" | "database_execution_disabled"
@@ -378,15 +376,10 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "restart_document_inspection" | "inspect_document_outline" => &["document_inspect"],
         "choose_exact_section" => &["document_inspect", "file_read"],
         "repair_document_citation" => &["document_inspect", "document_edit", "document_edit_batch"],
-        "copy_observed_symbol_id" => &["code_outline", "symbol_read"],
         "check_file_permissions" => &["file_list", "file_read", "document_inspect"],
-        "inspect_timeout_before_retry" => &[
-            "history",
-            "document_inspect",
-            "file_read",
-            "source_search",
-            "code_outline",
-        ],
+        "inspect_timeout_before_retry" => {
+            &["history", "document_inspect", "file_read", "source_search"]
+        }
         "inspect_outcome_before_retry" if call.name == "db_execute" => &["history", "db_query"],
         "use_available_tools" if result["recovery"]["code"] == "checkpoint_pending" => {
             &["checkpoint_complete", "memory_write", "task_state"]
@@ -394,9 +387,6 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "inspect_outcome_before_retry" => &["history", "document_inspect", "file_read"],
         "use_available_tools" if result["recovery"]["code"] == "workflow_write_scope" => {
             &["document_inspect", "document_edit", "document_edit_batch"]
-        }
-        "use_available_tools" if result["recovery"]["code"] == "unsupported_language" => {
-            &["source_search", "file_read", "tool_catalog", "tool_select"]
         }
         "correct_arguments" if call.name == "document_inspect" => {
             &["document_inspect", "file_read"]
@@ -428,12 +418,6 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         "correct_arguments" if call.name == "task_plan" => &["task_plan"],
         "correct_arguments" if call.name == "file_list" => &["file_list"],
         "correct_arguments" if call.name == "source_search" => &["source_search"],
-        "correct_arguments" if call.name == "symbol_search" => &["symbol_search"],
-        "correct_arguments" if call.name == "symbol_relations" => {
-            &["symbol_relations", "symbol_search", "code_outline"]
-        }
-        "correct_arguments" if call.name == "code_outline" => &["code_outline"],
-        "correct_arguments" if call.name == "symbol_read" => &["symbol_read", "code_outline"],
         // Memory-specific stale errors need the broader recovery set below:
         // the generic memory branch would otherwise match first and make the
         // code-specific branch unreachable.
@@ -476,11 +460,7 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
         {
             &["file_read", "file_list"]
         }
-        "refresh_matching_state" if call.name == "symbol_search" => &["symbol_search", "file_read"],
-        "refresh_matching_state" if call.name == "symbol_relations" => {
-            &["symbol_search", "code_outline", "symbol_relations"]
-        }
-        "refresh_matching_state" => &["code_outline", "file_read", "source_lookup", "history"],
+        "refresh_matching_state" => &["file_read", "source_lookup", "history"],
         "reduce_request_or_cleanup" if result["recovery"]["code"] == "memory_body_limit" => {
             &["memory_write", "memory_manage"]
         }
@@ -509,12 +489,6 @@ pub fn attach(s: &Session, call: &crate::llm::ToolCall, result: &mut Value) {
             &["file_list"]
         }
         "reduce_request_or_cleanup" if call.name == "file_patch" => &["file_patch", "file_read"],
-        "reduce_request_or_cleanup" if call.name == "code_outline" => &["code_outline"],
-        "reduce_request_or_cleanup"
-            if matches!(call.name.as_str(), "symbol_search" | "symbol_relations") =>
-        {
-            &["symbol_search", "symbol_relations", "file_list"]
-        }
         "reduce_request_or_cleanup" => &[
             "memory_manage",
             "task_state",
@@ -627,7 +601,6 @@ pub fn correctable_document_error(result: &Value) -> bool {
             Some(
                 "tool_not_active"
                     | "unsupported_tool"
-                    | "unsupported_language"
                     | "checkpoint_pending"
                     | "closing_mode"
                     | "progress_recovery"

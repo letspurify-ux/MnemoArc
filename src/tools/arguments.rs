@@ -221,11 +221,7 @@ pub(super) fn validate_field(
             return Err(failure(
                 name,
                 path,
-                if name == "symbol_read" && matches!(path, "start_line" | "max_lines") {
-                    "invalid_symbol_range"
-                } else {
-                    "invalid_argument_value"
-                },
+                "invalid_argument_value",
                 json!({key:bound}),
                 value_type(value),
                 &format!("violates {key}={bound}; received {actual}"),

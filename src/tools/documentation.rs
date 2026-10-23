@@ -632,7 +632,7 @@ pub(super) fn execute(
                 (Some(path), Ok(output)) if !output.exists() && names_output(s, path, output) => {
                     output.clone()
                 }
-                (Some(path), _) => read_path(&s.project, path)?,
+                (Some(path), _) => super::read_path_suggesting(&s.project, path)?,
                 (None, _) => output?,
             };
             if !path.exists() {
@@ -2186,6 +2186,7 @@ fn citation_issues_and_paths(
     let mut versions = std::collections::BTreeMap::new();
     let mut paths = PathResolver::new(&s.project);
     let mut suggestions = BTreeMap::<String, Option<String>>::new();
+    let mut project_files = None;
     // (document line, cited path, suggested project path)
     let mut fixable = Vec::new();
     for Citation {
@@ -2251,7 +2252,9 @@ fn citation_issues_and_paths(
                     .then(|| {
                         suggestions
                             .entry(cited.clone())
-                            .or_insert_with(|| super::file_ending_with(s, cited))
+                            .or_insert_with(|| {
+                                super::file_ending_with(s, cited, &mut project_files)
+                            })
                             .clone()
                     })
                     .flatten();

@@ -58,7 +58,7 @@ async fn run(s: Session, client: Arc<dyn LlmClient>) -> Session {
 enum Pattern {
     Final,
     InvalidPlan,
-    RepeatedOutline,
+    RepeatedListing,
     RepeatedLargeRead,
 }
 
@@ -95,11 +95,11 @@ impl LlmClient for Stubborn {
                 }],
                 ..Default::default()
             },
-            Pattern::RepeatedOutline => Completion {
+            Pattern::RepeatedListing => Completion {
                 calls: vec![ToolCall {
-                    id: format!("outline-{calls}"),
-                    name: "code_outline".into(),
-                    arguments: json!({"path":"source.rs","view":"compact"}).to_string(),
+                    id: format!("list-{calls}"),
+                    name: "file_list".into(),
+                    arguments: json!({"path_glob":"*.rs"}).to_string(),
                 }],
                 ..Default::default()
             },
@@ -157,7 +157,7 @@ async fn unchanged_navigation_result_is_bounded() {
     std::fs::write(dir.path().join("source.rs"), "fn one() {}\n").unwrap();
     let s = session(dir.path());
     let client = Arc::new(Stubborn {
-        pattern: Pattern::RepeatedOutline,
+        pattern: Pattern::RepeatedListing,
         calls: Mutex::new(0),
     });
     let result = run(s, client.clone()).await;
@@ -288,10 +288,9 @@ impl LlmClient for UniqueNavigation {
         if *calls <= 15 {
             return Ok(Completion {
                 calls: vec![ToolCall {
-                    id: format!("outline-{calls}"),
-                    name: "code_outline".into(),
-                    arguments: json!({"path":format!("file-{calls}.rs"),"view":"compact"})
-                        .to_string(),
+                    id: format!("list-{calls}"),
+                    name: "file_list".into(),
+                    arguments: json!({"path_glob":format!("file-{calls}.rs")}).to_string(),
                 }],
                 ..Default::default()
             });
@@ -330,7 +329,7 @@ async fn novel_navigation_without_source_evidence_eventually_stops() {
         .unwrap();
     }
     let s = session(dir.path());
-    // Keep finding different outlines without reading source evidence.
+    // Keep finding different listings without reading source evidence.
     struct EndlessNavigation(Mutex<usize>);
     #[async_trait]
     impl LlmClient for EndlessNavigation {
@@ -348,10 +347,9 @@ async fn novel_navigation_without_source_evidence_eventually_stops() {
             }
             Ok(Completion {
                 calls: vec![ToolCall {
-                    id: format!("outline-{calls}"),
-                    name: "code_outline".into(),
-                    arguments: json!({"path":format!("file-{calls}.rs"),"view":"compact"})
-                        .to_string(),
+                    id: format!("list-{calls}"),
+                    name: "file_list".into(),
+                    arguments: json!({"path_glob":format!("file-{calls}.rs")}).to_string(),
                 }],
                 ..Default::default()
             })
@@ -372,6 +370,8 @@ async fn novel_navigation_without_source_evidence_eventually_stops() {
         result.progress_recovery.rounds_without_substantive_progress,
         24
     );
+    // Every listing ran and was new navigation, not a withheld or repeated call.
+    assert_eq!(result.progress_recovery.seen_navigation_results.len(), 24);
     assert_eq!(*client.0.lock().unwrap(), 24);
 }
 

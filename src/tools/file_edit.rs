@@ -31,8 +31,8 @@ fn folded_alias_key(value: &str) -> String {
 /// resolves is checked against every pattern: one memory revalidation over
 /// 2000 source files compiled 24000 globs and took 0.9 s. The patterns come
 /// from the project settings, so few are seen; a full cache starts over.
-fn project_glob(pattern: String, folded: bool) -> Result<Option<Arc<globset::GlobMatcher>>> {
-    type Compiled = std::result::Result<Option<Arc<globset::GlobMatcher>>, String>;
+fn project_glob(pattern: String, folded: bool) -> Result<Option<Arc<globset::GlobSet>>> {
+    type Compiled = std::result::Result<Option<Arc<globset::GlobSet>>, String>;
     static CACHE: OnceLock<Mutex<HashMap<(String, bool), Compiled>>> = OnceLock::new();
     const ENTRIES: usize = 256;
     let cache = CACHE.get_or_init(Default::default);
@@ -47,12 +47,14 @@ fn project_glob(pattern: String, folded: bool) -> Result<Option<Arc<globset::Glo
     let compiled: Compiled = if folded {
         Ok(globset::Glob::new(&key.0)
             .ok()
-            .map(|glob| Arc::new(glob.compile_matcher())))
+            .and_then(|glob| super::glob_matcher(&glob).ok())
+            .map(Arc::new))
     } else {
         globset::GlobBuilder::new(&key.0)
             .case_insensitive(true)
             .build()
-            .map(|glob| Some(Arc::new(glob.compile_matcher())))
+            .and_then(|glob| super::glob_matcher(&glob))
+            .map(|glob| Some(Arc::new(glob)))
             .map_err(|error| error.to_string())
     };
     let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);

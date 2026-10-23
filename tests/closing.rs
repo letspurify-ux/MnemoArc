@@ -72,13 +72,7 @@ fn closing_mode_and_second_stall_stage_withhold_discovery_tools() {
 
     s.progress_recovery.closing = Some(Closing::default());
     let names = tool_names(&s);
-    for blocked in [
-        "file_list",
-        "source_search",
-        "symbol_search",
-        "code_outline",
-        "memory_write",
-    ] {
+    for blocked in ["file_list", "source_search", "memory_write"] {
         assert!(!names.iter().any(|name| name == blocked), "{blocked}");
     }
     for kept in ["file_read", "document_edit", "task_plan"] {
@@ -651,7 +645,7 @@ fn closing_without_a_document_withholds_reading_until_it_is_written() {
     s.active_tools = ToolRegistry::optional_names();
     s.progress_recovery.closing = Some(Closing::default());
     let names = tool_names(&s);
-    for withheld in ["file_read", "symbol_read", "source_search"] {
+    for withheld in ["file_read", "source_search"] {
         assert!(!names.iter().any(|name| name == withheld), "{withheld}");
     }
     assert!(names.iter().any(|name| name == "document_edit"));
@@ -844,7 +838,6 @@ fn missing_paths_suggest_similar_project_files_and_directories_list_entries() {
     for (tool, args) in [
         ("file_read", json!({"path":"backend/src"})),
         ("document_inspect", json!({"path":"backend/src"})),
-        ("code_outline", json!({"path":"backend/src"})),
     ] {
         let error = tools::execute(&mut s, tool, args).unwrap_err().to_string();
         assert!(error.starts_with("path_is_directory"), "{tool}: {error}");

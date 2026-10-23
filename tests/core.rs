@@ -1132,18 +1132,7 @@ fn catalog_finds_spaced_tool_names_and_new_sessions_can_read() {
     )
     .unwrap();
     assert_eq!(search["total_matching_lines"], 1);
-    let outline = tools::execute(
-        &mut s,
-        "code_outline",
-        json!({"path":"nav.rs","query":"target","match":"exact"}),
-    )
-    .unwrap();
-    let body = tools::execute(
-        &mut s,
-        "symbol_read",
-        json!({"path":"nav.rs","symbol_id":outline["symbols"][0]["symbol_id"],"max_lines":5}),
-    )
-    .unwrap();
+    let body = tools::execute(&mut s, "file_read", json!({"path":"nav.rs","max_lines":5})).unwrap();
     assert!(body["content"]["text"].as_str().unwrap().contains("found"));
     for (query, expected) in [
         ("file read", "file_read"),
@@ -1200,7 +1189,7 @@ fn directory_read_has_actionable_recovery_and_search_distinguishes_no_files() {
     assert!(error.contains("path_is_directory") && error.contains("file_list"));
     let bad = tools::execute(
         &mut s,
-        "symbol_search",
+        "source_search",
         json!({"pattern":"^export (async )?function","query":"agent.js"}),
     )
     .unwrap_err()
@@ -1208,31 +1197,36 @@ fn directory_read_has_actionable_recovery_and_search_distinguishes_no_files() {
     assert!(bad.contains("invalid_path_glob"));
     let found = tools::execute(
         &mut s,
-        "symbol_search",
+        "source_search",
         json!({"path_glob":"main.js","query":"handle"}),
     )
     .unwrap();
     assert_eq!(found["matched_files"], 1);
-    assert_eq!(found["scanned_files"], 1);
-    assert_eq!(found["symbols"].as_array().unwrap().len(), 1);
-    let no_symbol = tools::execute(
+    assert_eq!(found["matching_files"], 1);
+    assert_eq!(found["matches"].as_array().unwrap().len(), 1);
+    let no_match = tools::execute(
         &mut s,
-        "symbol_search",
+        "source_search",
         json!({"path_glob":"main.js","query":"missing"}),
     )
     .unwrap();
-    assert_eq!(no_symbol["matched_files"], 1);
-    assert!(no_symbol["symbols"].as_array().unwrap().is_empty());
-    let no_file =
-        tools::execute(&mut s, "symbol_search", json!({"path_glob":"missing.js"})).unwrap();
+    assert_eq!(no_match["matched_files"], 1);
+    assert_eq!(no_match["empty_reason"], "no_matching_lines");
+    let no_file = tools::execute(
+        &mut s,
+        "source_search",
+        json!({"path_glob":"missing.js","query":"handle"}),
+    )
+    .unwrap();
     assert_eq!(no_file["matched_files"], 0);
+    assert_eq!(no_file["empty_reason"], "no_searchable_files");
     let legacy = tools::execute(
         &mut s,
-        "symbol_search",
+        "source_search",
         json!({"pattern":"main.js","query":"handle"}),
     )
     .unwrap();
-    assert_eq!(legacy["symbols"][0]["name"], found["symbols"][0]["name"]);
+    assert_eq!(legacy["matches"], found["matches"]);
 }
 
 #[test]
@@ -2384,7 +2378,7 @@ fn a_whole_next_cursor_sent_as_the_cursor_continues_the_read() {
         assert_eq!(continued["content"], expected["content"]);
     }
     // Another tool's continuation is not this read's cursor.
-    let other = json!({"tool":"code_outline","path":"pages.md","cursor":cursor}).to_string();
+    let other = json!({"tool":"source_search","path":"pages.md","cursor":cursor}).to_string();
     assert!(
         tools::execute(&mut s, "file_read", json!({"cursor":other}))
             .unwrap_err()
@@ -2651,27 +2645,22 @@ fn leaked_native_tool_call_markup_is_split_into_arguments() {
     }
     // A repaired call that still fails names the fields that did arrive, so
     // the model resends the missing one instead of repeating the call.
-    s.active_tools = tools::ToolRegistry::optional_names();
     let error = tools::execute(
         &mut s,
-        "symbol_relations",
-        json!({"path</arg_key> a.rs</arg_value><arg_key>relation":"callers"}),
+        "source_search",
+        json!({"path</arg_key> a.rs</arg_value><arg_key>regex":true}),
     )
     .unwrap_err()
     .to_string();
-    assert!(error.starts_with("missing_argument: symbol_id"), "{error}");
+    assert!(error.starts_with("missing_argument: query"), "{error}");
     assert!(
-        error.contains("only these fields were received: path, relation"),
+        error.contains("only these fields were received: path, regex"),
         "{error}"
     );
     // An ordinary failure without leaked markup carries no such note.
-    let error = tools::execute(
-        &mut s,
-        "symbol_relations",
-        json!({"path":"a.rs","relation":"callers"}),
-    )
-    .unwrap_err()
-    .to_string();
+    let error = tools::execute(&mut s, "source_search", json!({"path":"a.rs","regex":true}))
+        .unwrap_err()
+        .to_string();
     assert!(!error.contains("<arg_key>"), "{error}");
     // A leaked value that disagrees with an explicit field is not dropped.
     let error = tools::execute(
@@ -3009,4 +2998,33 @@ fn checkpoint_complete_is_offered_only_while_a_checkpoint_is_pending() {
     .unwrap();
     ContextManager::commit(&mut s).unwrap();
     assert!(!offered(&s));
+}
+
+#[test]
+fn model_line_labels_preserve_blank_lines_pipes_and_partial_boundaries() {
+    let raw = json!({"status":"ok","data":{"read_start":10,"read_offset":3,
+        "content":{"text":"한글|x\n\n끝\n","line_start":12,"line_end":14,
+        "line_offsets":[0,5,6,8],"first_line_complete":false,"last_line_complete":true}},
+        "next_cursor":{"tool":"file_read","cursor":"R7"}});
+    let shown = tools::model_result(&raw);
+    assert_eq!(
+        shown["data"]["content"]["numbered_text"],
+        "12|한글|x\n13|\n14|끝\n"
+    );
+    assert!(shown["data"]["content"].get("line_offsets").is_none());
+    assert_eq!(shown["data"]["content"]["first_line_complete"], false);
+    assert_eq!(shown["next_cursor"], raw["next_cursor"]);
+    // Character offsets stay with the runtime; the model continues with
+    // next_cursor.
+    assert!(shown["data"].get("read_offset").is_none());
+    assert_eq!(raw["data"]["read_offset"], 3);
+    assert_eq!(raw["data"]["content"]["text"], "한글|x\n\n끝\n");
+    assert_eq!(tools::model_result(&shown), shown);
+    for raw in [
+        json!({"status":"ok","data":{"read_start":1,"content":{"text":"","line_start":1}}}),
+        json!({"status":"ok","data":{"content":{"text":"a\nb","line_start":1}}}),
+        json!({"status":"error","data":{"read_start":1,"content":{"text":"a","line_start":1}}}),
+    ] {
+        assert_eq!(tools::model_result(&raw), raw);
+    }
 }

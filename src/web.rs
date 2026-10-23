@@ -230,7 +230,7 @@ fn normalize_project(mut project: Project) -> Result<Project> {
     }
     tools::output_path(&project)?;
     for pattern in project.include.iter().chain(&project.exclude) {
-        globset::Glob::new(pattern)?;
+        tools::glob_matcher(&globset::Glob::new(pattern)?)?;
     }
     Ok(project)
 }

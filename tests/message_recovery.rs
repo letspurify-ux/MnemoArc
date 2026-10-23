@@ -490,14 +490,22 @@ impl LlmClient for ChangeSettings {
                 assert!(
                     definitions
                         .iter()
-                        .any(|tool| tool["function"]["name"] == "symbol_search")
+                        .any(|tool| tool["function"]["name"] == "source_search")
                 );
                 assert!(
                     !definitions
                         .iter()
-                        .any(|tool| tool["function"]["name"] == "symbol_read")
+                        .any(|tool| tool["function"]["name"] == "file_list")
                 );
             }
+        } else if let Some(definitions) = request["tools"].as_array() {
+            // Offered until the selection changes, so its absence above is
+            // the new selection's doing.
+            assert!(
+                definitions
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "file_list")
+            );
         }
         if round == changing {
             let mut next = config.clone();
@@ -509,7 +517,7 @@ impl LlmClient for ChangeSettings {
                 .await
                 .unwrap();
             self.commands
-                .send(RunCommand::Tools(["symbol_search".into()].into()))
+                .send(RunCommand::Tools(["source_search".into()].into()))
                 .await
                 .unwrap();
         }

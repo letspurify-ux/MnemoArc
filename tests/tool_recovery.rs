@@ -122,12 +122,7 @@ fn nul_document_input_can_be_corrected_with_the_same_tool_in_closing_mode() {
 fn file_scan_capacity_suggests_narrowing_the_available_scan_tool() {
     let dir = tempfile::tempdir().unwrap();
     let s = session(dir.path());
-    for name in [
-        "file_list",
-        "source_search",
-        "symbol_search",
-        "symbol_relations",
-    ] {
+    for name in ["file_list", "source_search"] {
         let call = ToolCall {
             id: "scan".into(),
             name: name.into(),

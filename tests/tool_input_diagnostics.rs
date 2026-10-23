@@ -93,7 +93,7 @@ fn every_registered_parameter_rejects_wrong_types_with_recovery_before_execution
             checked += 1;
         }
     }
-    assert!(checked > 130, "only {checked} parameters checked");
+    assert!(checked >= 106, "only {checked} parameters checked");
 }
 
 #[test]
@@ -352,29 +352,6 @@ fn archived_batches_keep_the_recovery_decision_after_reattachment() {
         assert!(
             tools::result_tokens(&invocation, &second, &s.config.model) <= 200,
             "{second}"
-        );
-    }
-}
-
-#[test]
-fn empty_symbol_query_is_preserved_as_an_exact_filter() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
-    let mut s = session();
-    s.project.root = dir.path().into();
-    for name in ["code_outline", "symbol_search"] {
-        let result = tools::run_call(
-            &mut s,
-            &ToolCall {
-                id: name.into(),
-                name: name.into(),
-                arguments: json!({"path":"a.rs","query":"","match":"exact"}).to_string(),
-            },
-        );
-        assert_eq!(result["status"], "ok", "{result}");
-        assert!(
-            !result.to_string().contains("main"),
-            "empty exact filter was lost: {result}"
         );
     }
 }
@@ -741,13 +718,13 @@ fn runtime_input_errors_name_the_field_and_claim_no_change_only_with_evidence() 
     // Read-only tool: a rejection cannot have changed anything.
     let result = tools::run_call(
         &mut s,
-        &call_id("symbol_read", json!({"path":"main.rs","symbol_id":"bogus"})),
+        &call_id(
+            "db_query",
+            json!({"action":"run","id":"sample","params":{"x":1}}),
+        ),
     );
-    assert_eq!(
-        result["data"]["input_error"]["field"], "symbol_id",
-        "{result}"
-    );
-    assert_eq!(result["data"]["input_error"]["received"], "string");
+    assert_eq!(result["data"]["input_error"]["field"], "params", "{result}");
+    assert_eq!(result["data"]["input_error"]["received"], "object");
     assert_eq!(result["data"]["execution"], "rejected_without_changes");
     // A write tool that states nothing was persisted.
     let result = tools::run_call(
@@ -1236,13 +1213,6 @@ fn unaccepted_fields_name_the_field_the_call_most_likely_meant() {
         "did you mean old_text?",
     );
     check(
-        "symbol_read",
-        json!({"path":"src/main.rs","name":"helper"}),
-        "name",
-        None,
-        r#"symbol_search {"query":"helper","match":"exact"}"#,
-    );
-    check(
         "document_edit_batch",
         json!({"expected_hash":"x","edits":[{"action":"replace_text","old_text":"Body.","new":"X"}]}),
         "edits[0].new",
@@ -1321,18 +1291,6 @@ fn rejected_values_name_the_value_the_call_most_likely_meant() {
         );
     };
     check(
-        "code_outline",
-        json!({"path":"src/main.rs","kind":"fn"}),
-        Some("function"),
-        r#"did you mean "function"?"#,
-    );
-    check(
-        "symbol_relations",
-        json!({"path":"src/main.rs","symbol_id":"x","relation":"callees"}),
-        Some("calls"),
-        r#"did you mean "calls"?"#,
-    );
-    check(
         "task_state",
         json!({"action":"update","patch":{"phase":"verification"}}),
         Some("verify"),
@@ -1368,12 +1326,6 @@ fn rejected_values_name_the_value_the_call_most_likely_meant() {
         json!({"expected_hash":"x","edits":[{"action":"create","text":"X"}]}),
         None,
         "create it first with document_edit action=create",
-    );
-    check(
-        "code_outline",
-        json!({"path":"src/main.rs","match":"regex","query":"h.*"}),
-        None,
-        "source_search with regex:true",
     );
     check(
         "history",
@@ -1606,11 +1558,6 @@ fn a_directory_path_with_a_glob_names_the_one_glob_that_means_both() {
             r#"send only path_glob:"src/backend/*.rs" instead of pattern (relative to project.root; ** includes subdirectories) (pattern is a file glob, the legacy alias of path_glob, not the text to find); the text to find goes in query"#,
         ),
         (
-            "symbol_search",
-            json!({"query":"api","path":"src","path_glob":"*.rs"}),
-            r#"send only path_glob:"src/**/*.rs" (relative to project.root; ** includes subdirectories)"#,
-        ),
-        (
             "source_search",
             json!({"query":"a","path":"src/main.rs","path_glob":"*.rs"}),
             r#"path already names one file, so drop path_glob "*.rs""#,
@@ -1665,23 +1612,18 @@ fn a_path_naming_the_project_root_beside_a_glob_is_no_conflict() {
             "{path}: {result}"
         );
     }
-    for (name, args) in [
-        (
+    let result = tools::run_call(
+        &mut s,
+        &call_id(
             "source_search",
             json!({"query":"fn api","path":root,"path_glob":"src/**/*.rs"}),
         ),
-        (
-            "symbol_search",
-            json!({"query":"api","path":root,"path_glob":"src/**/*.rs"}),
-        ),
-    ] {
-        let result = tools::run_call(&mut s, &call_id(name, args));
-        assert_eq!(result["status"], "ok", "{name}: {result}");
-        assert!(
-            result.to_string().contains("src/backend/api.rs"),
-            "{name}: {result}"
-        );
-    }
+    );
+    assert_eq!(result["status"], "ok", "{result}");
+    assert!(
+        result.to_string().contains("src/backend/api.rs"),
+        "{result}"
+    );
     // A subdirectory with a glob still names the one glob meaning both.
     let result = tools::run_call(
         &mut s,
@@ -1698,21 +1640,17 @@ fn a_path_naming_the_project_root_beside_a_glob_is_no_conflict() {
 
 #[test]
 fn a_directory_given_to_a_file_tool_names_that_tool_for_the_next_call() {
-    // A live model sent code_outline the project root twice and was told to
-    // use file_read.
     let (dir, mut s) = project_session();
     s.active_tools = ToolRegistry::optional_names();
     let root = dir.path().display().to_string();
-    for tool in ["code_outline", "file_read"] {
-        let error = tools::execute(&mut s, tool, json!({"path":root}))
-            .unwrap_err()
-            .to_string();
-        assert!(error.starts_with("path_is_directory"), "{tool}: {error}");
-        assert!(
-            error.contains(&format!("then call {tool} with that file path")),
-            "{tool}: {error}"
-        );
-    }
+    let error = tools::execute(&mut s, "file_read", json!({"path":root}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("path_is_directory"), "{error}");
+    assert!(
+        error.contains("then call file_read with that file path"),
+        "{error}"
+    );
 }
 
 // Live run 2026-10-13: the hint's fixed "backend/**" example sent the model
@@ -1723,7 +1661,7 @@ fn a_directory_error_suggests_a_glob_for_that_directory() {
     s.active_tools = ToolRegistry::optional_names();
     let error = tools::execute(
         &mut s,
-        "code_outline",
+        "file_read",
         json!({"path":dir.path().join("src").display().to_string()}),
     )
     .unwrap_err()
@@ -1731,7 +1669,7 @@ fn a_directory_error_suggests_a_glob_for_that_directory() {
     assert!(error.contains("path_glob (e.g. src/**)"), "{error}");
     let error = tools::execute(
         &mut s,
-        "code_outline",
+        "file_read",
         json!({"path":dir.path().display().to_string()}),
     )
     .unwrap_err()
@@ -1790,37 +1728,4 @@ fn an_unknown_tool_name_names_the_offered_tool_it_most_likely_meant() {
             assert_eq!(result["recovery"]["tools"][0], meant, "{result}");
         }
     }
-}
-
-#[test]
-fn blank_symbol_cursors_and_paths_start_from_the_beginning() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("a.rs"), "fn main() {}\nfn helper() {}\n").unwrap();
-    let mut s = session();
-    s.project.root = dir.path().into();
-    // The live shape: every optional string filled with "". The empty query
-    // stays an exact empty-name filter; the blank cursor is dropped.
-    let outline = tools::execute(
-        &mut s,
-        "code_outline",
-        json!({"path":"a.rs","query":"","match":"contains","case_sensitive":true,"kind":"function","container":"","max_depth":1,"view":"compact","cursor":"","limit":100}),
-    )
-    .unwrap();
-    assert!(outline.to_string().contains("helper"), "{outline}");
-    let found = tools::execute(
-        &mut s,
-        "symbol_search",
-        json!({"query":"helper","path":"","path_glob":"","cursor":""}),
-    )
-    .unwrap();
-    assert!(found.to_string().contains("helper"), "{found}");
-    // A live run scoped the search with path_glob and filled the legacy
-    // pattern alias with "": that is no second filter.
-    let scoped = tools::execute(
-        &mut s,
-        "symbol_search",
-        json!({"query":"helper","path_glob":"a.rs","pattern":"","cursor":"","limit":30,"path":"","match":"exact","case_sensitive":true,"kind":"function","container":"","max_depth":2}),
-    )
-    .unwrap();
-    assert!(scoped.to_string().contains("helper"), "{scoped}");
 }

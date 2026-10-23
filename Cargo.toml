@@ -36,13 +36,6 @@ axum = "0.8"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower-http = { version = "0.6", features = ["fs"] }
-tree-sitter = "0.27.0"
-tree-sitter-rust = "0.24.2"
-tree-sitter-javascript = "0.25.0"
-tree-sitter-typescript = "0.23.2"
-tree-sitter-python = "0.25.0"
-tree-sitter-java = "0.23.5"
-tree-sitter-c-sharp = "0.23.5"
 oracle = "0.6.3"
 
 [target.'cfg(unix)'.dependencies]
@@ -88,7 +81,7 @@ path = "tests/robustness.rs"
 name = "web_launcher"
 path = "tests/web_launcher.rs"
 
-# Dependencies (tiktoken, serde_json, tree-sitter, regex) do the per-round
+# Dependencies (tiktoken, serde_json, regex) do the per-round
 # work of agent scenario tests; unoptimized they made those tests 7-8x slower.
 # This crate stays unoptimized, so incremental rebuilds keep their speed.
 [profile.dev.package."*"]

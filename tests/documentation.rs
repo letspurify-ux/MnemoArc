@@ -934,27 +934,6 @@ fn exact_line_map_and_repeat_suppression_allow_forced_verification_and_changes()
     assert!(run(&mut s, "file_read", args)["content"].is_object());
 }
 #[test]
-fn symbols_page_and_expire_on_source_change() {
-    let (dir, mut s) = setup();
-    std::fs::write(
-        dir.path().join("main.ts"),
-        "export async function load() {}\nexport class Store {}\nconst value = 1;\n",
-    )
-    .unwrap();
-    let p = run(&mut s, "symbol_search", json!({"limit":1}));
-    assert_eq!(p["symbols"][0]["name"], "load");
-    assert_eq!(
-        run(
-            &mut s,
-            "symbol_search",
-            json!({"limit":1,"cursor":p["next_cursor"]})
-        )["symbols"][0]["name"],
-        "Store"
-    );
-    std::fs::write(dir.path().join("main.ts"), "export function other() {}\n").unwrap();
-    assert!(tools::execute(&mut s, "symbol_search", json!({"cursor":p["next_cursor"]})).is_err());
-}
-#[test]
 fn documentation_tools_respect_permissions_and_reserve() {
     let (dir, mut s) = setup();
     std::fs::write(

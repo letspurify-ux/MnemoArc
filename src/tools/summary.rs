@@ -17,9 +17,7 @@ pub fn call_summary(root: &Path, name: &str, arguments: &str) -> String {
     let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
     let path = |key: &str| relative(root, args[key].as_str().unwrap_or(""));
     let detail = match name {
-        // symbol_read also carries a symbol_id, an opaque hash of about 140
-        // characters; its path says where the symbol is.
-        "file_read" | "symbol_read" => {
+        "file_read" => {
             let target = path("path");
             // A continuation may carry only its cursor.
             if target.is_empty() {
@@ -29,15 +27,7 @@ pub fn call_summary(root: &Path, name: &str, arguments: &str) -> String {
                     String::new()
                 }
             } else {
-                // Without start_line, symbol_read starts at the symbol's first
-                // line, not line 1 of the file.
-                let from_symbol = name == "symbol_read" && args["start_line"].is_null();
-                let range = if from_symbol {
-                    String::new()
-                } else {
-                    range(&args)
-                };
-                format!("{target}{range}")
+                format!("{target}{}", range(&args))
             }
         }
         "file_list" => args["path_glob"]
@@ -45,8 +35,7 @@ pub fn call_summary(root: &Path, name: &str, arguments: &str) -> String {
             .or(args["pattern"].as_str())
             .map(str::to_owned)
             .unwrap_or_else(|| path("path")),
-        "code_outline" => join([path("path"), quoted(&args["query"])]),
-        "source_search" | "symbol_search" | "memory_find" => {
+        "source_search" | "memory_find" => {
             let query = match &args["queries"] {
                 Value::Array(queries) => queries
                     .iter()
@@ -66,10 +55,6 @@ pub fn call_summary(root: &Path, name: &str, arguments: &str) -> String {
                 .unwrap_or_else(|| path("path"));
             join([query, scope])
         }
-        "symbol_relations" => join([
-            args["relation"].as_str().unwrap_or("").to_owned(),
-            path("path"),
-        ]),
         "document_edit" => edit(&args),
         "document_edit_batch" => {
             let edits: Vec<Value> = match &args["edits"] {
@@ -160,10 +145,6 @@ fn label(name: &str) -> &str {
         "file_patch" => "파일 패치",
         "db_query" => "DB 조회",
         "db_execute" => "DB 실행",
-        "symbol_search" => "심볼 검색",
-        "symbol_relations" => "호출·참조 추적",
-        "code_outline" => "코드 구조 조회",
-        "symbol_read" => "심볼 본문 읽기",
         "file_list" => "파일 목록",
         "file_read" => "파일 읽기",
         "source_search" => "소스 검색",
@@ -489,32 +470,6 @@ mod tests {
         );
         assert_eq!(summary("file_read", json!("not an object")), "파일 읽기");
         assert_eq!(call_summary(Path::new("/"), "file_read", "{"), "파일 읽기");
-    }
-
-    #[test]
-    fn symbol_reads_show_the_file_not_the_symbol_hash() {
-        let id = format!("{}:{}:120:480", "a".repeat(64), "b".repeat(64));
-        assert_eq!(
-            summary(
-                "symbol_read",
-                json!({"path":"/work/app/src/agent.rs","symbol_id":id,"max_lines":30})
-            ),
-            "심볼 본문 읽기 src/agent.rs"
-        );
-        assert_eq!(
-            summary(
-                "symbol_read",
-                json!({"path":"src/agent.rs","symbol_id":id,"start_line":140,"max_lines":30})
-            ),
-            "심볼 본문 읽기 src/agent.rs:140-169"
-        );
-        assert_eq!(
-            summary(
-                "symbol_relations",
-                json!({"path":"src/agent.rs","symbol_id":id,"relation":"callers"})
-            ),
-            "호출·참조 추적 callers src/agent.rs"
-        );
     }
 
     #[test]

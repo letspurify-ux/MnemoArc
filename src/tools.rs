@@ -4,10 +4,8 @@ mod document_format;
 mod documentation;
 mod file_edit;
 mod memory_tools;
-mod navigation;
 pub mod recovery;
 mod search;
-mod structure;
 mod suggest;
 mod summary;
 mod writes;
@@ -134,10 +132,6 @@ impl ToolRegistry {
             "file_read"
                 | "file_list"
                 | "source_search"
-                | "code_outline"
-                | "symbol_search"
-                | "symbol_relations"
-                | "symbol_read"
                 | "document_inspect"
                 | "source_lookup"
                 | "memory_read"
@@ -149,7 +143,7 @@ impl ToolRegistry {
     }
 
     pub fn specs() -> Vec<ToolSpec> {
-        let mut specs = vec![
+        let specs = vec![
             ToolSpec {
                 name: "db_query",
                 description: "Read user-approved Oracle queries. First use action=list to discover enabled query IDs, purpose and bind parameters; then action=run with an ID and params. Results use a read-only transaction, bound rows and cells; truncated=true includes shortened cells. RAW/BLOB cells are hexadecimal strings.",
@@ -299,46 +293,6 @@ impl ToolRegistry {
                 ),
             },
             ToolSpec {
-                name: "symbol_search",
-                description: "Search Tree-sitter declarations across Rust, JS/JSX, TS/TSX, Python, Java and C# files. query matches symbol names (case-insensitive substring by default); use match=exact for an exact name. path scopes one file/directory; path_glob filters files; do not combine them. kind, container and max_depth follow code_outline. File changes expire cursors/IDs.",
-                optional: true,
-                read_only: true,
-                parameters: schema(
-                    json!({"query":string(),"path_glob":string(),"pattern":legacy_pattern("a symbol name (send that as query)"),"cursor":string(),"limit":number()}),
-                    &[],
-                ),
-            },
-            ToolSpec {
-                name: "symbol_relations",
-                description: "Trace syntax calls/references without external language servers. Copy path and symbol_id from symbol_search/code_outline. relation=calls lists outgoing call sites in the symbol (nested functions have their own calls); callers finds incoming calls; references includes call and non-call uses. Optional path_glob limits scanned files; the target file is always included. resolved means a unique local syntax binding, NOT guaranteed runtime execution. Explicit imports/module paths and member access return candidate/ambiguous targets; unknown receivers or shadowed bindings remain unresolved. Never infer links from matching names alone. Results carry no source evidence IDs. Inbound results omit unresolved targets: an empty page is not proof of no callers. Source changes expire cursors/IDs.",
-                optional: true,
-                read_only: true,
-                parameters: schema(
-                    json!({"path":string(),"symbol_id":string(),"relation":action(&["calls","callers","references"]),"path_glob":string(),"cursor":string(),"limit":number()}),
-                    &["path", "symbol_id"],
-                ),
-            },
-            ToolSpec {
-                name: "code_outline",
-                description: "Explore one Rust, JS/JSX, TS/TSX, Python, Java or C# file. For a function list use {path,view:\"compact\",max_depth:0,kind:\"function\"}; use kind:\"method\" with container and without max_depth:0 for class methods. Omit kind only for a mixed overview. Find a name with {path,query:\"handleQuestion\",match:\"exact\",kind:\"function\"}. query defaults to case-insensitive substring matching. kind filters normalized symbol_kind; for container copy the parent class qualified_name, e.g. Store or Outer::Inner, never converting :: to Java or C# member dots. qualified_name is navigation, not a unique ID for overloaded methods. Defaults: all kinds/depths, view=detailed. Compact returns names, kinds, containers, positions, a ready-to-copy location and symbol IDs, without source evidence. For parameters, defaults and declared return types use view=detailed with query and match=exact; an untruncated signature often answers without a body read. Detailed includes signature_source and signature_truncated; if truncated, read only the missing signature lines. When signature_context_start_line is present, shared declaration modifiers were omitted; use file_read there for the common prefix. Edits expire cursors/IDs.",
-                optional: true,
-                read_only: true,
-                parameters: schema(
-                    json!({"path":string(),"query":string(),"match":action(&["contains","exact"]),"case_sensitive":{"type":"boolean"},"kind":action(&["function","method","constructor","class","struct","interface","trait","impl","enum","enum_member","record","annotation","field","variable","constant","type","module","macro","property","accessor","event","delegate","operator","destructor"]),"container":{"type":"string","description":"Exact enclosing symbol path, case-sensitive. Empty string selects top-level symbols."},"max_depth":{"type":"integer","minimum":0,"description":"Maximum symbol nesting depth: 0 top level, 1 direct members (not AST depth)."},"view":action(&["compact","detailed"]),"cursor":string(),"limit":number()}),
-                    &["path"],
-                ),
-            },
-            ToolSpec {
-                name: "symbol_read",
-                description: "Read a symbol's lines, e.g. {path,symbol_id,max_lines:30} for the start of a function. A range is capped at the symbol end; omit start_line and max_lines to read the whole symbol subject to file_read limits. Copy exact symbol_id from code_outline or symbol_search; stale IDs are rejected. If text is truncated, finish that requested range with file_read cursor before starting another range at next_line, at most symbol.end_line. Shared declaration lines can include neighboring declarations.",
-                optional: true,
-                read_only: true,
-                parameters: schema(
-                    json!({"path":string(),"symbol_id":string(),"start_line":{"type":"integer","minimum":1,"description":"Absolute file line inside the symbol, NOT a relative offset. Omit to start at the symbol's first line."},"max_lines":{"type":"integer","minimum":1,"maximum":2000,"description":"Requested line count."},"force_read":{"type":"boolean"}}),
-                    &["path", "symbol_id"],
-                ),
-            },
-            ToolSpec {
                 name: "document_audit",
                 description: "Audits the configured output: citation format path:line[-line], unread_citation, Markdown tables/code fences and fenced Mermaid syntax. After this task's first save, run_guidance.document_readiness carries its first issues; offset pages the rest.",
                 optional: true,
@@ -409,29 +363,6 @@ impl ToolRegistry {
                 ),
             },
         ];
-        let outline_fields = specs
-            .iter()
-            .find(|spec| spec.name == "code_outline")
-            .unwrap()
-            .parameters["properties"]
-            .clone();
-        let search_fields = specs
-            .iter_mut()
-            .find(|spec| spec.name == "symbol_search")
-            .unwrap()
-            .parameters["properties"]
-            .as_object_mut()
-            .unwrap();
-        for field in [
-            "path",
-            "match",
-            "case_sensitive",
-            "kind",
-            "container",
-            "max_depth",
-        ] {
-            search_fields.insert(field.into(), outline_fields[field].clone());
-        }
         specs
     }
     /// Closing mode finishes from gathered evidence. Broad discovery and
@@ -440,9 +371,6 @@ impl ToolRegistry {
         [
             "file_list",
             "source_search",
-            "symbol_search",
-            "symbol_relations",
-            "code_outline",
             "memory_write",
             "memory_read",
             "memory_find",
@@ -460,8 +388,7 @@ impl ToolRegistry {
         s.checkpoint.is_none()
             && s.progress_recovery.closing.is_some()
             && (Self::closing_blocked(name)
-                || (!s.document_written
-                    && matches!(name, "file_read" | "symbol_read" | "source_lookup")))
+                || (!s.document_written && matches!(name, "file_read" | "source_lookup")))
     }
     /// Source documentation reads the project and writes only its configured
     /// output. A live run wrote a stray manual into the source repository with
@@ -626,13 +553,10 @@ impl ToolRegistry {
         if s.checkpoint.is_some() || !s.is_document_work() || !s.document_written {
             return false;
         }
-        let broad = matches!(
-            name,
-            "file_list" | "source_search" | "symbol_search" | "symbol_relations" | "code_outline"
-        );
+        let broad = matches!(name, "file_list" | "source_search");
         // Second stage of the document progress ladder: after twice the
         // stall limit without a better result, stop broad discovery even in
-        // the verify phase. Targeted file_read/symbol_read remain.
+        // the verify phase. Targeted file_read remains.
         let stalled =
             s.progress_recovery.rounds_since_best >= s.config.stall_round_limit.saturating_mul(2);
         // Recovery focus steers an existing draft toward writing. Before
@@ -1458,7 +1382,7 @@ fn normalize_argument_aliases(s: &Session, name: &str, args: &mut Value) -> Resu
     // A glob is relative to project.root already, so a path naming the root
     // narrows nothing: a live model sent the root's absolute path with
     // path_glob and was refused for conflicting filters.
-    if matches!(name, "file_list" | "source_search" | "symbol_search")
+    if matches!(name, "file_list" | "source_search")
         && let Some(fields) = args.as_object_mut()
         && (fields.contains_key("path_glob") || fields.contains_key("pattern"))
         && fields
@@ -4021,6 +3945,17 @@ fn list(args: &Value, key: &str) -> Vec<String> {
         })
         .unwrap_or_default()
 }
+/// A glob compiled for matching. globset's compile_matcher panics when the
+/// glob's regular expression outgrows its size limit (a path_glob of 57,000
+/// `?*` pairs did); building a one-glob set reports that as an error.
+pub(crate) fn glob_matcher(glob: &globset::Glob) -> Result<globset::GlobSet, globset::Error> {
+    globset::GlobSetBuilder::new().add(glob.clone()).build()
+}
+
+/// Longest path_glob accepted. No file path needs a longer pattern, and a
+/// long one costs a large matcher on every listing and search.
+const MAX_PATH_GLOB_CHARS: usize = 4096;
+
 fn path_glob(args: &Value) -> Result<Option<&str>> {
     if args["path_glob"].is_string()
         && args["pattern"].is_string()
@@ -4039,6 +3974,11 @@ fn path_glob(args: &Value) -> Result<Option<&str>> {
         );
     }
     if let Some(value) = value {
+        if value.chars().count() > MAX_PATH_GLOB_CHARS {
+            bail!(
+                "invalid_path_glob: longer than {MAX_PATH_GLOB_CHARS} characters; send a shorter file glob such as backend/**/*.js"
+            );
+        }
         globset::Glob::new(value).map_err(|error| anyhow::anyhow!("invalid_path_glob: {error}"))?;
     }
     Ok(value)
@@ -4190,12 +4130,10 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
             fields.retain(|key, value| {
                 let required =
                     required.is_some_and(|required| required.iter().any(|r| r == key.as_str()));
-                // An empty query is an exact empty-name filter for the
-                // symbol tools, so only their navigation tokens are dropped.
-                // A live run sent code_outline cursor:"" and document_inspect
-                // section:"" and repeated each rejected call; another sent
-                // symbol_search path_glob with pattern:"" (its legacy alias),
-                // which was rejected as two conflicting filters.
+                // A live run sent document_inspect section:"" and repeated
+                // the rejected call; another sent path_glob with pattern:""
+                // (its legacy alias), which was rejected as two conflicting
+                // filters.
                 let blank_navigation_option = value.as_str() == Some("")
                     && match name {
                         "file_list" | "source_search" | "file_read" => matches!(
@@ -4206,9 +4144,6 @@ fn normalize_integer_arguments(name: &str, args: &mut Value) {
                             key.as_str(),
                             "path" | "path_glob" | "pattern" | "cursor" | "query" | "section"
                         ),
-                        "code_outline" | "symbol_search" | "symbol_relations" | "symbol_read" => {
-                            matches!(key.as_str(), "path" | "path_glob" | "pattern" | "cursor")
-                        }
                         // A blank id matched no source, and the empty result
                         // told the model not to invent an ID.
                         "source_lookup" => matches!(key.as_str(), "path" | "id"),
@@ -4416,8 +4351,17 @@ fn output_name_at_root(p: &Project, candidate: &Path) -> Option<PathBuf> {
     PathResolver::new(p).output_name_at_root(candidate)
 }
 
+/// The canonical project path `path` names. A missing path's error does not
+/// list similar paths: finding them walks the project, and most callers only
+/// check whether a path resolves (citation checks did so for every missing
+/// cited path). A path a tool call names uses read_path_suggesting.
 pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
     PathResolver::new(p).resolve(path)
+}
+
+/// read_path whose not-found error lists similar project paths.
+pub fn read_path_suggesting(p: &Project, path: &str) -> Result<PathBuf> {
+    PathResolver::new(p).resolve_suggesting(path)
 }
 
 /// read_path for many paths of one project. Each read_path canonicalized the
@@ -4503,6 +4447,15 @@ impl<'a> PathResolver<'a> {
     }
 
     pub(crate) fn resolve(&mut self, path: &str) -> Result<PathBuf> {
+        self.resolve_with(path, false)
+    }
+
+    pub(crate) fn resolve_suggesting(&mut self, path: &str) -> Result<PathBuf> {
+        self.resolve_with(path, true)
+    }
+
+    /// resolve; `suggest` adds similar project paths to a not-found error.
+    fn resolve_with(&mut self, path: &str, suggest: bool) -> Result<PathBuf> {
         let p = self.project;
         let root = self.root()?;
         let mut candidate = if Path::new(path).is_absolute() {
@@ -4524,7 +4477,9 @@ impl<'a> PathResolver<'a> {
                 // Reading the output before its first write: say so, rather than
                 // suggesting a different project file (a live run asked three times).
                 let is_output = self.output().is_ok_and(|output| output == candidate);
-                let hint = if e.kind() == std::io::ErrorKind::NotFound && is_output {
+                let hint = if !suggest {
+                    String::new()
+                } else if e.kind() == std::io::ErrorKind::NotFound && is_output {
                     " The configured output does not exist yet: nothing has been written to it."
                         .to_owned()
                 } else if e.kind() == std::io::ErrorKind::NotFound {
@@ -4637,7 +4592,7 @@ fn path_shape_hint(root: &Path, path: &str) -> Option<String> {
         ));
     }
     path.contains(['*', '?', '[', '{']).then(|| format!(
-        " path takes one exact file or directory and does not expand globs; to match files by pattern send path_glob:{path:?} instead (file_list, source_search and symbol_search accept path_glob)."
+        " path takes one exact file or directory and does not expand globs; to match files by pattern send path_glob:{path:?} instead (file_list and source_search accept path_glob)."
     ))
 }
 
@@ -4645,6 +4600,10 @@ fn path_shape_hint(root: &Path, path: &str) -> Option<String> {
 /// first, then the same stem with another extension (agent.py -> agent.js),
 /// then directories of that name. Ignore and exclude rules apply, so hidden
 /// files are never suggested.
+/// Longest walk for a path suggestion: similar paths of a missing one, or
+/// the project file a cited path without its folders names.
+const SIMILAR_PATHS_WALK: std::time::Duration = std::time::Duration::from_secs(2);
+
 fn similar_paths(p: &Project, missing: &Path) -> Vec<String> {
     const MAX_SUGGESTIONS: usize = 5;
     const MAX_SCANNED: usize = 20_000;
@@ -4661,7 +4620,16 @@ fn similar_paths(p: &Project, missing: &Path) -> Vec<String> {
     let Ok(root) = p.root.canonicalize() else {
         return vec![];
     };
-    let Ok(paths) = candidate_paths(p, None, &tokio_util::sync::CancellationToken::new()) else {
+    // A suggestion is worth a short walk at most: the error it decorates
+    // has no cancellation token, so an unbounded walk of a large project
+    // could not be stopped by the tool time limit.
+    let Ok(paths) = candidate_paths_scoped(
+        p,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+        None,
+        std::time::Instant::now().checked_add(SIMILAR_PATHS_WALK),
+    ) else {
         return vec![];
     };
     let mut exact = vec![];
@@ -4741,7 +4709,7 @@ fn directory_entries(p: &Project, directory: &Path) -> (Vec<String>, usize) {
         None,
         &tokio_util::sync::CancellationToken::new(),
         Some(directory),
-        None,
+        std::time::Instant::now().checked_add(SIMILAR_PATHS_WALK),
         FileScanLimits {
             max_paths: 20_000,
             max_path_bytes: 4 * 1024 * 1024,
@@ -4796,8 +4764,6 @@ fn directory_error(p: &Project, directory: &DirectoryPath, tool: &str) -> anyhow
                 }
             },
         );
-    // The next call is the same tool on one file: a live model sent
-    // code_outline the project root twice and was told to use file_read.
     let next = match tool {
         // The output needs no path: a live model sent document_inspect the
         // project root and was told to find a file with file_list.
@@ -4805,7 +4771,7 @@ fn directory_error(p: &Project, directory: &DirectoryPath, tool: &str) -> anyhow
             "document_inspect without path inspects the configured output {}; pass path only for another Markdown file",
             p.output.display()
         ),
-        "code_outline" | "symbol_read" | "symbol_relations" | "file_read" => {
+        "file_read" => {
             format!(
                 "{tool} reads one file: find it with file_list and path_glob (e.g. {glob}), then call {tool} with that file path"
             )
@@ -4863,24 +4829,37 @@ pub(crate) fn open_regular_file(path: &Path) -> Result<std::fs::File> {
 const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 
 fn read_bytes_bounded(path: &Path) -> Result<Vec<u8>> {
+    read_bytes_versioned(path).map(|(bytes, _)| bytes)
+}
+
+/// The file's bytes, with its version when the file kept one version for the
+/// whole read (a write during the read changes its size, time or change time).
+fn read_bytes_versioned(path: &Path) -> Result<(Vec<u8>, Option<FileVersion>)> {
     use std::io::Read;
 
     let file = open_regular_file(path)?;
-    let length = file.metadata()?.len();
+    let meta = file.metadata()?;
+    let length = meta.len();
     if length > MAX_FILE_BYTES as u64 {
         bail!("unsupported_large_file: maximum 16MiB");
     }
+    let before = file_version(&meta).ok();
     // Bound the actual read too: the file may grow after the metadata check.
     // Reserve the expected length and one EOF probe byte. Starting empty or
     // filling the capacity exactly makes read_to_end grow to the next power
     // of two even for an unchanged file.
     let mut bytes = Vec::with_capacity(length as usize + 1);
-    file.take((MAX_FILE_BYTES + 1) as u64)
+    (&file)
+        .take((MAX_FILE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_FILE_BYTES {
         bail!("unsupported_large_file: maximum 16MiB");
     }
-    Ok(bytes)
+    let after = file
+        .metadata()
+        .ok()
+        .and_then(|meta| file_version(&meta).ok());
+    Ok((bytes, before.filter(|before| Some(*before) == after)))
 }
 
 pub(crate) fn hash_file(path: &Path) -> Result<String> {
@@ -4935,13 +4914,17 @@ struct FileDigest {
     version: FileVersion,
     hash: Option<String>,
     lines: Option<usize>,
+    /// Whether file_list's text mode lists it (see listed_as_text).
+    text: Option<bool>,
 }
 /// Size, modification time and, on Unix, the inode and status-change time:
 /// a write that kept the size and reset the modification time (touch -r,
 /// rsync -t) left the old digest in use; the change time cannot be reset.
 type FileVersion = (u64, std::time::SystemTime, (u64, i64, i64));
 type DigestCache = std::collections::HashMap<std::path::PathBuf, FileDigest>;
-const DIGEST_CACHE_ENTRIES: usize = 8192;
+/// Room for every file one scan can list (FileScanLimits::max_paths), so a
+/// text listing of a large project is not cleared while it is paged.
+const DIGEST_CACHE_ENTRIES: usize = 100_000;
 const DIGEST_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn digest_cache() -> &'static std::sync::Mutex<DigestCache> {
@@ -4994,6 +4977,7 @@ fn remember_digest(path: &Path, version: FileVersion, update: impl FnOnce(&mut F
         version,
         hash: None,
         lines: None,
+        text: None,
     });
     update(entry);
 }
@@ -5032,19 +5016,41 @@ fn hash_reader_cancelled(
 }
 
 pub(crate) fn read_text(path: &Path) -> Result<String> {
-    let bytes = read_bytes_bounded(path)?;
+    read_text_versioned(path).map(|(text, _)| text)
+}
+
+/// read_text with the file's digest. A file that kept one version across the
+/// read takes the digest from the digest cache: reads and searches hashed
+/// the whole file again on every page.
+pub(crate) fn read_text_hashed(path: &Path) -> Result<(String, String)> {
+    let (text, version) = read_text_versioned(path)?;
+    if let Some(version) = version
+        && let Some(digest) = cached_digest(path, version, |entry| entry.hash.clone())
+    {
+        return Ok((text, digest));
+    }
+    let digest = hash(text.as_bytes());
+    if let Some(version) = version {
+        remember_digest(path, version, |entry| entry.hash = Some(digest.clone()));
+    }
+    Ok((text, digest))
+}
+
+fn read_text_versioned(path: &Path) -> Result<(String, Option<FileVersion>)> {
+    let (bytes, version) = read_bytes_versioned(path)?;
     if bytes.contains(&0) {
         bail!(
             "unsupported_binary_file: {} contains NUL bytes and is not a text file; choose a text file",
             path.display()
         );
     }
-    String::from_utf8(bytes).map_err(|_| {
+    let text = String::from_utf8(bytes).map_err(|_| {
         anyhow::anyhow!(
             "unsupported_non_utf8_file: {} is not valid UTF-8 text; choose a UTF-8 text file",
             path.display()
         )
-    })
+    })?;
+    Ok((text, version))
 }
 pub(crate) fn read_text_preview(path: &Path, max_bytes: usize) -> Result<(String, bool)> {
     use std::io::Read;
@@ -5155,13 +5161,13 @@ fn candidate_paths_bounded(
     limits: FileScanLimits,
 ) -> Result<(Vec<PathBuf>, usize)> {
     let check = || -> Result<()> {
-        if let Some(deadline) = deadline {
-            structure::check_budget(cancel, deadline)
-        } else if cancel.is_cancelled() {
-            bail!("cancelled")
-        } else {
-            Ok(())
+        if cancel.is_cancelled() {
+            bail!("cancelled");
         }
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            bail!("cancelled_or_timeout: file scan timed out; narrow path_glob");
+        }
+        Ok(())
     };
     check()?;
     let root = p.root.canonicalize()?;
@@ -5180,7 +5186,19 @@ fn candidate_paths_bounded(
         .map(|glob| root_relative_glob(p, &root, glob))
         .map(globset::Glob::new)
         .transpose()?
-        .map(|g| g.compile_matcher());
+        .map(|glob| glob_matcher(&glob))
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid_path_glob: {error}"))?;
+    // The walker reads the root's and its parents' ignore files first.
+    for dir in root.ancestors() {
+        if let Some(file) = unsafe_ignore_file(dir) {
+            bail!(
+                "unsafe_ignore_file: {} is not a regular file of at most {} bytes, so the project cannot be walked; replace it or remove it",
+                file.display(),
+                MAX_IGNORE_FILE_BYTES
+            );
+        }
+    }
     for entry in ignore::WalkBuilder::new(&root)
         .hidden(false)
         .follow_links(false)
@@ -5189,7 +5207,8 @@ fn candidate_paths_bounded(
                 || (!SKIPPED_DIRECTORIES.contains(&entry.file_name().to_string_lossy().as_ref())
                     && scope.as_ref().is_none_or(|scope| {
                         entry.path().starts_with(scope) || scope.starts_with(entry.path())
-                    }))
+                    })
+                    && unsafe_ignore_file(entry.path()).is_none())
         })
         .build()
     {
@@ -5232,6 +5251,32 @@ fn candidate_paths_bounded(
     check()?;
     Ok((entries, non_utf8))
 }
+/// Largest ignore file a walk lets the walker read.
+const MAX_IGNORE_FILE_BYTES: u64 = 1024 * 1024;
+
+/// An ignore file in `dir` the walker would open but must not: anything but
+/// a regular file of at most MAX_IGNORE_FILE_BYTES (links followed, as the
+/// walker does). The walker opens these itself, before any check of ours,
+/// and reads them to the end: a pipe blocked it for good, holding a tool
+/// worker each call until none were left, and a link to /dev/zero grew the
+/// server until the system killed it. A directory holding one is not
+/// entered.
+fn unsafe_ignore_file(dir: &Path) -> Option<PathBuf> {
+    let safe = |path: &Path| match path.metadata() {
+        Ok(metadata) => metadata.is_file() && metadata.len() <= MAX_IGNORE_FILE_BYTES,
+        Err(_) => true,
+    };
+    let git = dir.join(".git");
+    let mut files = vec![dir.join(".ignore"), dir.join(".gitignore")];
+    match git.metadata() {
+        Ok(metadata) if metadata.is_dir() => files.push(git.join("info/exclude")),
+        // A `.git` file (worktree, submodule) is read for its gitdir line.
+        Ok(metadata) if metadata.is_file() => files.push(git),
+        _ => {}
+    }
+    files.into_iter().find(|file| !safe(file))
+}
+
 // Keep the existing text-only listing contract. Searches use candidates directly
 // so text validation and matching share one read instead of opening every file twice.
 fn paths(
@@ -5244,14 +5289,42 @@ fn paths(
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
-        if search_text(&path)?.is_some() {
+        if listed_as_text(&path)? {
             result.push(path);
         }
     }
     Ok(result)
 }
+/// Whether file_list's text mode lists the file: search_text's answer, kept
+/// in the digest cache. Text mode read every file in scope on every page; a
+/// cached answer costs a metadata read.
+fn listed_as_text(path: &Path) -> Result<bool> {
+    let version = || {
+        path.metadata()
+            .ok()
+            .and_then(|meta| file_version(&meta).ok())
+    };
+    let before = version();
+    if let Some(version) = before
+        && let Some(text) = cached_digest(path, version, |entry| entry.text)
+    {
+        return Ok(text);
+    }
+    let text = search_text(path)?.is_some();
+    if let Some(before) = before.filter(|before| Some(*before) == version()) {
+        remember_digest(path, before, |entry| entry.text = Some(text));
+    }
+    Ok(text)
+}
 fn search_text(path: &Path) -> Result<Option<String>> {
-    match read_text(path) {
+    search_text_with(path, read_text)
+}
+/// search_text with the file's digest (read_text_hashed).
+fn search_text_hashed(path: &Path) -> Result<Option<(String, String)>> {
+    search_text_with(path, read_text_hashed)
+}
+fn search_text_with<T>(path: &Path, read: impl FnOnce(&Path) -> Result<T>) -> Result<Option<T>> {
+    match read(path) {
         Ok(text) => Ok(Some(text)),
         // A file the walk found but cannot read (permissions, or removed
         // since) is skipped like a binary one: one such file failed every
@@ -5462,7 +5535,7 @@ fn delivered_sources_for(
         ) else {
             continue;
         };
-        let resolved = paths.resolve(path)?;
+        let resolved = paths.resolve_suggesting(path)?;
         let current = hash_file(&resolved)?;
         wanted.push((resolved, current, start as usize, end as usize));
     }
@@ -5632,7 +5705,13 @@ fn delivered_file_ending_with(s: &Session, suffix: &str) -> Result<Option<String
 /// The one file a cited path that is not a project path names: the one
 /// delivered file ending with it, else the one project file ending with it.
 /// None when no file or several do, since a guess could point elsewhere.
-fn file_ending_with(s: &Session, suffix: &str) -> Option<String> {
+/// `project_files` holds the project's files for the calls of one check:
+/// each missing citation walked the whole project again.
+fn file_ending_with(
+    s: &Session,
+    suffix: &str,
+    project_files: &mut Option<Vec<PathBuf>>,
+) -> Option<String> {
     match delivered_file_ending_with(s, suffix) {
         Ok(Some(file)) => return Some(file),
         Ok(None) => {}
@@ -5642,14 +5721,18 @@ fn file_ending_with(s: &Session, suffix: &str) -> Option<String> {
         return None;
     }
     let root = s.project.root.canonicalize().ok()?;
-    let paths = candidate_paths(
-        &s.project,
-        None,
-        &tokio_util::sync::CancellationToken::new(),
-    )
-    .ok()?;
+    let paths = project_files.get_or_insert_with(|| {
+        candidate_paths_scoped(
+            &s.project,
+            None,
+            &tokio_util::sync::CancellationToken::new(),
+            None,
+            std::time::Instant::now().checked_add(SIMILAR_PATHS_WALK),
+        )
+        .unwrap_or_default()
+    });
     let mut found = None;
-    for path in &paths {
+    for path in paths.iter() {
         let Ok(relative) = path.strip_prefix(&root) else {
             continue;
         };
@@ -5881,8 +5964,8 @@ fn normalize_call_arguments(s: &Session, name: &str, args: &mut Value) -> Result
 
 /// A call's arguments as it executed them. Continuations are built from
 /// these: rebuilt from the raw arguments, a next_cursor object sent back
-/// whole as the cursor lost its offset and filters, so code_outline and
-/// source_search returned the same page again and history read restarted.
+/// whole as the cursor lost its offset and filters, so source_search
+/// returned the same page again and history read restarted.
 fn executed_arguments(s: &Session, call: &crate::llm::ToolCall) -> Value {
     let raw = if call.arguments.trim().is_empty() {
         "{}"
@@ -5954,23 +6037,16 @@ fn execute_repaired(
     check_whole_write(s, name, &args)?;
     if s.run_guidance["phase"] == "verify"
         && s.document_written
-        && ((name == "file_list"
-            && args["cursor"].as_str().is_none()
-            && !["path", "path_glob", "pattern"].iter().any(|key| {
-                args[*key].as_str().is_some_and(|pattern| {
-                    !matches!(pattern.trim(), "" | "." | "./" | "*" | "**" | "**/*")
-                })
-            }))
-            || (name == "symbol_search"
-                && args["query"].as_str().unwrap_or("").is_empty()
-                && !["path", "path_glob", "pattern"].iter().any(|key| {
-                    args[*key].as_str().is_some_and(|path| {
-                        !matches!(path.trim(), "" | "." | "./" | "*" | "**" | "**/*")
-                    })
-                })))
+        && name == "file_list"
+        && args["cursor"].as_str().is_none()
+        && !["path", "path_glob", "pattern"].iter().any(|key| {
+            args[*key].as_str().is_some_and(|pattern| {
+                !matches!(pattern.trim(), "" | "." | "./" | "*" | "**" | "**/*")
+            })
+        })
     {
         bail!(
-            "verification_reserve: use a targeted path_glob or nonempty symbol query for missing evidence; broad discovery is paused"
+            "verification_reserve: use a targeted path_glob for missing evidence; broad discovery is paused"
         );
     }
     let result = match name {
@@ -5986,9 +6062,6 @@ fn execute_repaired(
             cancel,
             s.config.tool_timeout_secs,
         ),
-        "code_outline" | "symbol_read" => structure::execute(s, name, &args, cancel),
-        "symbol_search" => navigation::search(s, &args, cancel),
-        "symbol_relations" => navigation::relations(s, &args, cancel),
         "document_inspect" | "document_audit" => documentation::execute(s, name, &args, cancel),
         "tool_catalog" => {
             let q = args["query"].as_str().unwrap_or("").to_lowercase();
@@ -6363,7 +6436,7 @@ fn execute_repaired(
             // file has no content; name where evidence IDs come from.
             let notice = if matches.is_empty() && (id.is_some() || !path.is_empty()) {
                 Some(format!(
-                    "No observed source matches this id/path. Source IDs are created only by delivered file_read, symbol_read, source_search or detailed code_outline results in this session; copy one exactly, or {}. Do not invent an ID.",
+                    "No observed source matches this id/path. Source IDs are created only by delivered file_read or source_search results in this session; copy one exactly, or {}. Do not invent an ID.",
                     if s.checkpoint.is_some() {
                         "record the pending read in checkpoint_complete progress"
                     } else {
@@ -6494,7 +6567,7 @@ fn execute_repaired(
                         path_glob_conflict_hint(s, &args)
                     );
                 }
-                let dir = read_path(&s.project, path)?;
+                let dir = read_path_suggesting(&s.project, path)?;
                 if !dir.is_dir() {
                     bail!(
                         "invalid_argument_value: path must be a directory for file_list; read a file with file_read"
@@ -6518,7 +6591,7 @@ fn execute_repaired(
                     if cancel.is_cancelled() {
                         bail!("cancelled");
                     }
-                    if search_text(&path)?.is_some() {
+                    if listed_as_text(&path)? {
                         searchable.push(path);
                     }
                 }
@@ -7039,16 +7112,16 @@ fn cursor_next_line(s: &Session, cursor: &crate::session::FileCursor) -> Option<
     Some(cursor.start_line + newlines)
 }
 
-/// Shared line reader for explicit file reads and Tree-sitter symbol bodies.
+/// The line reader of file_read.
 fn read_file(
     s: &mut Session,
     args: &mut Value,
-    _cancel: &tokio_util::sync::CancellationToken,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value> {
     let cursor = if let Some(id) = args["cursor"].as_str() {
         let cursor = s.file_cursors.get(id).cloned().ok_or_else(|| anyhow::anyhow!("invalid_file_cursor: copy next_cursor.cursor exactly from this session, or start a new read with path/start_line/max_lines"))?;
         if let Some(path) = args.get("path").and_then(Value::as_str)
-            && read_path(&s.project, path)? != read_path(&s.project, &cursor.path)?
+            && read_path_suggesting(&s.project, path)? != read_path(&s.project, &cursor.path)?
         {
             bail!(
                 "cursor_arguments_conflict: cursor belongs to {}; for another file omit cursor and use path/start_line/max_lines",
@@ -7091,9 +7164,11 @@ fn read_file(
             output.display()
         );
     };
-    let path = read_path(&s.project, path)?;
-    let contents = read_text(&path)?;
-    let digest = hash(contents.as_bytes());
+    let path = read_path_suggesting(&s.project, path)?;
+    let (contents, digest) = read_text_hashed(&path)?;
+    if cancel.is_cancelled() {
+        bail!("cancelled");
+    }
     if cursor.as_ref().is_some_and(|c| c.hash != digest) {
         bail!(
             "file_cursor_expired: file changed; start a new read with path/start_line/max_lines and no cursor"
@@ -7175,7 +7250,7 @@ fn read_file(
     .then(|| documentation::open_issue_lines(s, &path, &contents, OPEN_ISSUE_LINES))
     .filter(|lines| !lines.is_empty());
     if prior >= s.config.repeated_read_limit && !args["force_read"].as_bool().unwrap_or(false) {
-        let mut result = json!({"path":path,"hash":digest,"total_lines":contents.lines().count(),"repeated_read":true,"suppressed":true,"guidance":"Unchanged range already present repeatedly in active context. Reuse it, continue it with its next_cursor, read another range, use document_inspect for output metadata, or force_read=true for deliberate verification."});
+        let mut result = json!({"path":path,"hash":digest,"total_lines":total_lines,"repeated_read":true,"suppressed":true,"guidance":"Unchanged range already present repeatedly in active context. Reuse it, continue it with its next_cursor, read another range, use document_inspect for output metadata, or force_read=true for deliberate verification."});
         if let Some(issue_lines) = &issue_lines {
             result["open_issue_lines"] = json!(issue_lines);
             result["guidance"] = json!(
@@ -7183,6 +7258,9 @@ fn read_file(
             );
         }
         return Ok(result);
+    }
+    if cancel.is_cancelled() {
+        bail!("cancelled");
     }
     let mut content = bounded_text(s, selected, offset);
     let shown = content["text"].as_str().unwrap();
@@ -7229,9 +7307,9 @@ fn read_file(
     let next_line = if truncated {
         Some(start)
     } else {
-        (start - 1 + lines < contents.lines().count()).then_some(start + lines)
+        (start - 1 + lines < total_lines).then_some(start + lines)
     };
-    let mut result = json!({"path":path,"total_lines":contents.lines().count(),"hash":digest,"read_start":start,"read_offset":offset,"read_max_lines":lines,"content":content,"source":source,"next_line":next_line,"next_offset":if truncated{content["next_offset"].clone()}else{json!(0)}});
+    let mut result = json!({"path":path,"total_lines":total_lines,"hash":digest,"read_start":start,"read_offset":offset,"read_max_lines":lines,"content":content,"source":source,"next_line":next_line,"next_offset":if truncated{content["next_offset"].clone()}else{json!(0)}});
     if let Some(issue_lines) = issue_lines {
         result["open_issue_lines"] = json!(issue_lines);
     }
@@ -7395,8 +7473,8 @@ pub fn model_result(result: &Value) -> Value {
     shown
 }
 
-/// The model view of the source observations a read, search match or
-/// outline symbol carries (memory and source_lookup results keep theirs:
+/// The model view of the source observations a read or search match
+/// carries (memory and source_lookup results keep theirs:
 /// there the excerpt is the content).
 fn compact_sources(shown: &mut Value) {
     fn compact(source: Option<&mut Value>) {
@@ -7415,16 +7493,9 @@ fn compact_sources(shown: &mut Value) {
     if data.get("read_start").is_some_and(Value::is_u64) {
         compact(data.get_mut("source"));
     }
-    for (rows, keys) in [
-        ("matches", &["source"][..]),
-        ("symbols", &["source", "signature_source"][..]),
-    ] {
-        if let Some(rows) = data.get_mut(rows).and_then(Value::as_array_mut) {
-            for row in rows {
-                for key in keys {
-                    compact(row.get_mut(*key));
-                }
-            }
+    if let Some(rows) = data.get_mut("matches").and_then(Value::as_array_mut) {
+        for row in rows {
+            compact(row.get_mut("source"));
         }
     }
 }
@@ -7477,22 +7548,7 @@ pub fn limit_result(
     limit: usize,
 ) -> Value {
     let args = executed_arguments(s, call);
-    if call.name == "code_outline"
-        && result["status"] == "ok"
-        && let (Some(path), Some(cursor)) = (
-            result["data"]["path"].as_str(),
-            result["data"]["next_cursor"].as_str(),
-        )
-    {
-        result["next_cursor"] = structure::continuation(&args, path, cursor);
-    }
-    if matches!(call.name.as_str(), "symbol_search" | "symbol_relations")
-        && result["status"] == "ok"
-        && let Some(cursor) = result["data"]["next_cursor"].as_str()
-    {
-        result["next_cursor"] = navigation::continuation(&call.name, &args, cursor);
-    }
-    if matches!(call.name.as_str(), "file_read" | "symbol_read")
+    if call.name == "file_read"
         && result["status"] == "ok"
         && result["data"]["content"]["truncated"] == true
         && !result["next_cursor"]["cursor"].is_string()
@@ -7558,17 +7614,6 @@ pub fn limit_result(
     if result_tokens(call, &output, &s.config.model) <= limit {
         return output;
     }
-    if call.name == "code_outline"
-        && let Some(page) = structure::limit_outline(call, &args, &output, limit, &s.config.model)
-    {
-        return page;
-    }
-    if matches!(call.name.as_str(), "symbol_search" | "symbol_relations")
-        && result["status"] == "ok"
-        && let Some(page) = navigation::limit_page(call, &args, &output, limit, &s.config.model)
-    {
-        return page;
-    }
     let old_archive = result["archive_id"]
         .as_u64()
         .or_else(|| {
@@ -7607,9 +7652,7 @@ pub fn limit_result(
             let mut template = output.clone();
             // Each shortened view gets its own immutable source observation.
             // Archives and previously delivered results keep their original IDs.
-            let narrowed_source = if matches!(call.name.as_str(), "file_read" | "symbol_read")
-                && pointer == "/data/content/text"
-            {
+            let narrowed_source = if call.name == "file_read" && pointer == "/data/content/text" {
                 template["data"]["source"]["id"]
                     .as_str()
                     .and_then(|id| s.sources.get(id))
@@ -7622,8 +7665,7 @@ pub fn limit_result(
             } else {
                 None
             };
-            let narrowed_cursor = (matches!(call.name.as_str(), "file_read" | "symbol_read")
-                && pointer == "/data/content/text")
+            let narrowed_cursor = (call.name == "file_read" && pointer == "/data/content/text")
                 .then(new_file_cursor_id);
             let (mut low, mut high) = (0, chars.len());
             let candidate = |length: usize| {
@@ -7631,9 +7673,7 @@ pub fn limit_result(
                 *v.pointer_mut(pointer).unwrap() =
                     json!(chars[..length].iter().collect::<String>());
                 let offset = args["offset"].as_u64().unwrap_or(0) + length as u64;
-                if pointer == "/data/content/text"
-                    && matches!(call.name.as_str(), "file_read" | "symbol_read")
-                {
+                if pointer == "/data/content/text" && call.name == "file_read" {
                     let line = template["data"]["read_start"].as_u64().unwrap();
                     let offset = template["data"]["read_offset"].as_u64().unwrap() + length as u64;
                     let shown = v["data"]["content"]["text"].as_str().unwrap();
@@ -7727,7 +7767,7 @@ pub fn limit_result(
                         output["data"]["source"]["id"] = json!(existing.id);
                     } else {
                         s.sources
-                            .insert(source.id.clone(), std::sync::Arc::new(source));
+                            .insert_counted(source.id.clone(), std::sync::Arc::new(source));
                     }
                 }
                 return output;
@@ -7794,6 +7834,14 @@ pub fn limit_result(
             data["next_offset"] = json!(start + retained_len);
             return;
         }
+        // A shortened last page has no cursor of its own; these tools' cursor
+        // is the listing's fingerprint and an index, so one can be issued.
+        if matches!(call.name.as_str(), "file_list" | "source_search")
+            && let Some(fingerprint) = data["hash"].as_str()
+        {
+            data["next_cursor"] = json!(format!("{fingerprint}:{}", start + retained_len));
+            return;
+        }
         // There is no native continuation for this shortened page. Expose the
         // immutable archive instead of silently dropping the removed items.
         output["archive_id"] = json!(archive);
@@ -7835,6 +7883,18 @@ pub fn limit_result(
                 low,
                 archive,
             );
+            // A continuation sent without the listing's scope keeps it, as
+            // for a cursor file_list issued itself.
+            if call.name == "file_list"
+                && let Some(cursor) = output["data"]["next_cursor"].as_str()
+                && let Some((fingerprint, _)) = cursor.split_once(':')
+            {
+                let glob = args.get("path_glob").or_else(|| args.get("pattern"));
+                s.remember_list_scope(
+                    fingerprint.to_owned(),
+                    json!({"mode":args.get("mode"),"path_glob":glob,"path":args.get("path")}),
+                );
+            }
             return output;
         }
     }
@@ -8144,6 +8204,75 @@ mod panic_tests {
 #[cfg(test)]
 mod file_tests {
     use super::*;
+
+    /// Tool review 2026-10-23: the walker opens and reads every ignore file
+    /// itself. A pipe named .ignore blocked each walk for good, leaking a
+    /// tool worker per call until none were left; a link to /dev/zero grew
+    /// the server until the system killed it.
+    #[cfg(unix)]
+    #[test]
+    fn walks_skip_ignore_files_that_are_not_small_regular_files() {
+        use std::os::unix::ffi::OsStrExt;
+        let fifo = |path: &Path| {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+        };
+        let walk = |root: PathBuf| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let project = Project {
+                    root: root.clone(),
+                    output: root.join("out.md"),
+                    ..Default::default()
+                };
+                let found =
+                    candidate_paths(&project, None, &tokio_util::sync::CancellationToken::new())
+                        .map(|paths| {
+                            paths
+                                .iter()
+                                .map(|p| {
+                                    p.strip_prefix(root.canonicalize().unwrap())
+                                        .unwrap()
+                                        .display()
+                                        .to_string()
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                let _ = tx.send(found);
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the walk blocked on an ignore file")
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("app");
+        for sub in ["src", "piped", "piped_link", "endless", "huge", "src/kept"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+            std::fs::write(root.join(sub).join("a.rs"), "fn a() {}\n").unwrap();
+        }
+        fifo(&root.join("piped/.gitignore"));
+        fifo(&dir.path().join("outside_pipe"));
+        std::os::unix::fs::symlink(
+            dir.path().join("outside_pipe"),
+            root.join("piped_link/.ignore"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("/dev/zero", root.join("endless/.gitignore")).unwrap();
+        std::fs::write(root.join("huge/.gitignore"), "x\n".repeat(600_000)).unwrap();
+        // Ordinary ignore files still apply.
+        std::fs::write(root.join("src/kept/.gitignore"), "a.rs\n").unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        assert_eq!(
+            walk(root.clone()).unwrap(),
+            ["src/a.rs", "src/kept/.gitignore"]
+        );
+
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("a.rs"), "fn a() {}\n").unwrap();
+        fifo(&other.join(".gitignore"));
+        let error = walk(other).unwrap_err().to_string();
+        assert!(error.starts_with("unsafe_ignore_file"), "{error}");
+    }
 
     // Every tool call keeps a copy of the session as its backup. A read then
     // copied each file's coverage ranges and every cursor already held, so a

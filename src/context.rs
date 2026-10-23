@@ -84,7 +84,7 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     both(
         "Citations",
-        "Cite only lines delivered to you as complete lines of the current file version: file_read and symbol_read label each delivered line as N|source text, where N is the absolute file line and not part of the source; copy these labels, and never count lines, infer positions from a symbol span or treat cursor offsets as line numbers. For an execution-order claim cite both operations; for exception behavior cite the branch that selects the error.",
+        "Cite only lines delivered to you as complete lines of the current file version: file_read labels each delivered line as N|source text, where N is the absolute file line and not part of the source; copy these labels, and never count lines, infer positions or treat cursor offsets as line numbers. For an execution-order claim cite both operations; for exception behavior cite the branch that selects the error.",
     ),
     source(
         "Citations",
@@ -128,7 +128,7 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     both(
         "Reading the project",
-        "Locate before you read: find the identifier, route or dispatch branch with a scoped source_search, code_outline or symbol_search, then read that range with explicit start_line and max_lines, or read a whole file when the work covers it; once a search has located the branch, read it instead of searching again. Batch independent searches and reads in one response instead of paying a model request per file. When a full file path is supplied, scope navigation to it. Search a user-supplied route string or identifier before guessing its implementation syntax. Search context and symbol excerpts are navigation, not evidence: read the code with file_read or symbol_read before explaining it.",
+        "Locate before you read: find the identifier, route or dispatch branch with a scoped source_search, then read that range with explicit start_line and max_lines, or read a whole file when the work covers it; once a search has located the branch, read it instead of searching again. Batch independent searches and reads in one response instead of paying a model request per file. When a full file path is supplied, scope navigation to it. Search a user-supplied route string or identifier before guessing its implementation syntax. Search context is navigation, not evidence: read the code with file_read before explaining it.",
     ),
     both(
         "Reading the project",
@@ -371,9 +371,6 @@ pub fn count(value: &Value, model: &str) -> usize {
     tokens(&value.to_string(), model)
 }
 pub fn truncate(text: &str, limit: usize, model: &str) -> (String, bool) {
-    if tokens(text, model) <= limit {
-        return (text.into(), false);
-    }
     // Search borrowed prefixes. A Vec<char> and copied trial strings can cost
     // several times the input size even when only a small preview is returned.
     let prefix = |length: usize| {
@@ -383,10 +380,13 @@ pub fn truncate(text: &str, limit: usize, model: &str) -> (String, bool) {
             .map_or(text.len(), |(byte, _)| byte);
         &text[..end]
     };
-    let (mut low, mut high) = (0, text.chars().count());
+    let length = text.chars().count();
+    let (mut low, mut high) = (0, length);
     // Each count costs the length counted. Widen from a prefix of about the
     // limit's size, so a long text is not counted whole a dozen times when
-    // only its start fits.
+    // only its start fits. The whole text is counted only when every probe
+    // fit: counted first, each page of a long file read counted the rest of
+    // its range, up to 16MiB, to return a few kilobytes.
     let mut probe = limit.saturating_mul(4).max(1);
     while probe < high {
         if tokens(prefix(probe), model) <= limit {
@@ -395,6 +395,9 @@ pub fn truncate(text: &str, limit: usize, model: &str) -> (String, bool) {
         } else {
             high = probe - 1;
         }
+    }
+    if high == length && tokens(text, model) <= limit {
+        return (text.into(), false);
     }
     while low < high {
         let mid = (low + high).div_ceil(2);

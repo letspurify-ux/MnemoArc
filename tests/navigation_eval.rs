@@ -358,18 +358,20 @@ fn correct_facts_and_valid_citations_still_require_delivered_implementation() {
     assert!(check_citations(&project, &answer).is_empty());
     assert_eq!(check_evidence("java", &project, &answer, &[]).len(), 4);
     let mut s = Session::new(project.clone(), support::compact_config());
-    s.active_tools = ["code_outline", "file_read"]
+    s.active_tools = ["source_search", "file_read"]
         .into_iter()
         .map(str::to_owned)
         .collect();
-    let outline = tools::execute(
+    // A search that only locates the file delivers no implementation.
+    let search = tools::execute(
         &mut s,
-        "code_outline",
-        json!({"path":"src/sample/Service.java","view":"compact"}),
+        "source_search",
+        json!({"path":"src/sample/Service.java","query":"Parser.parse","mode":"files"}),
     )
     .unwrap();
+    assert_eq!(search["matching_files"], 1);
     assert_eq!(
-        check_evidence("java", &project, &answer, &[outline]).len(),
+        check_evidence("java", &project, &answer, &[search]).len(),
         4
     );
     let reads: Vec<_> = ["src/sample/Service.java", "src/sample/Parser.java"]
@@ -542,9 +544,6 @@ async fn live_navigation_regressions() {
             }
             if case == "recovery" && !successful_search {
                 failures.push("search_not_recovered".into());
-            }
-            if case == "java" && !calls.iter().any(|c| c["name"] == "code_outline") {
-                failures.push("structure_not_used".into());
             }
             assert_eq!(source_files(&project, case), before, "source changed");
             if project.output.exists() {

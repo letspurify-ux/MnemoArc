@@ -172,9 +172,7 @@ cargo run -- run --project /path/to/project --output docs/source-summary.md \
 
 부분 완료·복구 가능한 중단은 종료 코드 2로 표시합니다. 취소하거나 프로그램을 종료해도 이미 작성한 결과 파일은 남습니다.
 
-기존 문서의 요약·설명·Mermaid 요청은 관련 구간을 읽고 채팅으로 답하도록 안내합니다. 새 세션은 `file_list`, `file_read`, `document_inspect`, `source_search`, `code_outline`, `symbol_search`, `symbol_relations`, `symbol_read`를 바로 제공하며, 프로젝트의 출력 경로를 자동으로 작성해야 할 산출물로 지정하지 않습니다. 소스 조사·문서 수정·검증은 해당 작업을 요청했을 때 수행하도록 지시합니다. 여러 읽기 결과는 남은 결과 예산을 균등하게 나누고, 잘린 본문은 파일/섹션 커서로 이어 읽습니다.
-
-호출·참조 탐색은 내장 Tree-sitter로 동작하며 별도 언어 서버가 필요하지 않습니다. 명시적 import와 지역 선언을 따라 관련 위치를 찾고, 확정할 수 없는 관계는 후보·미해결 상태로 표시합니다. [사용법과 분석 범위](docs/syntax-navigation.md)를 참고하세요.
+기존 문서의 요약·설명·Mermaid 요청은 관련 구간을 읽고 채팅으로 답하도록 안내합니다. 새 세션은 `file_list`, `file_read`, `document_inspect`, `source_search`를 바로 제공하며, 프로젝트의 출력 경로를 자동으로 작성해야 할 산출물로 지정하지 않습니다. 소스 조사·문서 수정·검증은 해당 작업을 요청했을 때 수행하도록 지시합니다. 여러 읽기 결과는 남은 결과 예산을 균등하게 나누고, 잘린 본문은 파일/섹션 커서로 이어 읽습니다.
 
 ## 기억과 컨텍스트
 
@@ -282,8 +280,7 @@ OpenCode 비교는 동일 소스 지문, 같은 모델·요청, 비슷한 시간
 ### 문서 조사·검증 도구
 
 `source-docs`에 문서 목차·섹션 조회(`document_inspect`), 섹션 단위 수정,
-출처 일괄 점검(`document_audit`),
-선언 검색(`symbol_search`), 호출·참조 추적(`symbol_relations`)이 포함된다. 파일 읽기는 실제 줄 수와 줄 위치를 제공한다.
+출처 일괄 점검(`document_audit`)이 포함된다. 파일 읽기는 실제 줄 수와 줄 위치를 제공한다.
 일반 작업 방식에서는 프로젝트 텍스트 파일에 `file_edit`(정확한 문자열 교체), `file_write`(생성·전체 교체),
 `file_patch`(여러 파일의 추가·수정·교체·이동·삭제)를 사용할 수 있다. 소스 기반 문서 작성에서는 이 도구들을 숨긴다.
 기존 파일의 수정에는 현재 파일 해시가 필요하며 설정된 Markdown 출력은 `document_edit`로 편집한다.
@@ -347,21 +344,13 @@ OpenAI 호환 클라이언트를 직접 호출할 때도 설정과 요청 JSON�
 파일명 탐색에는 `file_list mode=paths`를 사용해 본문 읽기를 생략할 수 있습니다. 기존 텍스트 전용 목록은 기본 `mode=text`로 유지됩니다. `source_search`는 대소문자·단어 경계 옵션, 앞뒤 문맥, 일치 파일 목록과 파일별 일치 줄 수를 지원합니다. 내용·심볼 검색의 중복 파일 읽기를 제거하고, 내용 검색은 반환할 페이지의 결과만 보관합니다. 파일 변경 감지를 위해 다음 페이지에서도 내용을 재검사합니다. 사용 예와 출처 범위는 [코드 탐색 옵션](docs/documentation-tools.md#코드-탐색-옵션)을 참고하세요.
 
 
-새 세션의 탐색 도구 기본 제공, 구문 트리 캐시와 호출·입력 토큰 회귀 기준은 [탐색 효율 개선 기록](docs/navigation-efficiency-improvement.md)을 참고하세요. 실제 모델 평가의 남은 실패도 기록했습니다.
+새 세션의 탐색 도구 기본 제공과 호출·입력 토큰 회귀 기준은 [탐색 효율 개선 기록](docs/navigation-efficiency-improvement.md)을 참고하세요. 실제 모델 평가의 남은 실패도 기록했습니다.
 
 소스 채팅 답변의 1회 검토(`source_answer_review`)는 제거했습니다. 질문 답변은 검토 없이 바로 표시하며, 기존 설정 파일의 `source_answer_review` 항목은 읽을 때 무시합니다. 이전 설계 기록은 [소스 답변 검토 설계](docs/source-answer-review.md)에 남아 있습니다. 여러 문자열 검색은 `source_search queries:["abort", "signal"]`처럼 정규식 없이 수행할 수 있습니다.
 
-### Tree-sitter 구조 탐색
+### 구조 탐색 도구 제거
 
-`source-docs` 그룹의 `code_outline`, `symbol_read`로 코드 구조와 심볼 본문을 탐색합니다. 구현과 자동 테스트는 Rust로 작성했습니다. Tree-sitter는 네이티브 파서의 Rust 바인딩을 사용하며 Rust, JavaScript/JSX, TypeScript/TSX, Python, Java, C#을 분석합니다.
-
-구조 조회는 별도 서버 설치 없이 사용할 수 있습니다. 같은 내용·언어의 구문 트리는 최대 8개, 원문 크기 합계 4MiB까지 캐시해 반복 파싱을 줄입니다(트리 자체의 메모리 크기 한도를 뜻하지 않습니다). 매 호출에서 파일 권한·현재 내용 해시를 다시 확인하며 출처와 필터 결과는 재사용하지 않습니다. 사용 예와 검증 범위는 [구조 탐색](docs/documentation-tools.md#구조-탐색)을 참고하세요.
-
-LLM은 `code_outline`의 `view=compact`, `max_depth=0`으로 최상위 구조를 확인하고, `query`·`match=exact`·공통 `kind`·정확한 `container`로 범위를 좁힌 뒤 `symbol_read`로 본문을 읽을 수 있습니다. 기본 상세 응답은 유지하며 간결한 목록은 출처 근거로 취급하지 않습니다. 다음 페이지 호출에는 모든 필터가 전달되고 조건 변경 시 커서를 거부합니다.
-
-함수 목록에는 `kind=function`을 사용하고, 인자·기본값·선언된 반환 타입은 상세 시그니처와 `signature_source`로 먼저 확인합니다. `signature_truncated`가 잘림 여부를 알립니다. 본문이 필요하면 `symbol_read`의 `max_lines`와 파일 절대 줄 번호인 `start_line`으로 심볼 안의 필요한 부분만 읽을 수 있습니다.
-
-LLM에는 읽은 본문을 절대 줄 번호와 함께 전달하고, 구조 목록에는 복사 가능한 `location`을 제공합니다. 원문과 커서 오프셋은 유지하며 모델용 줄 번호도 응답 토큰 예산에 반영합니다.
+Tree-sitter 기반 `code_outline`, `symbol_search`, `symbol_relations`, `symbol_read`는 제거했습니다. 소스 위치는 `source_search`로 찾고 `file_read`로 읽습니다.
 
 작업 방식은 **새 세션** 창에서 **일반 작업**·**소스 기반 문서 작성** 중 선택합니다(기본 일반 작업). 일반 작업은 최초 요청과 후속 질문·요청 모두에서 파일·문서 수집과 편집을 지원합니다. 근거 검증과 문서 작업용 진행 정체 처리·마감 단계를 실행하지 않으며 `document_audit` 도구를 숨깁니다. 소스 기반 문서 작성은 문서 작성·감사 도구를 활성화합니다. 생성 문서를 별도 모델 요청으로 실제 소스·현재 요구사항과 대조하던 소스 문서 검토(`source_document_review`)와 그 집중 복구 기준(`review_limit`)은 제거했으며, 기존 설정 파일의 두 항목은 읽을 때 무시합니다. 별도의 완료 조건 검토도 제거했으며, 기존 설정 파일의 `completion_review_enabled` 항목은 읽을 때 무시합니다. 정적 문서 감사와 출처 검사는 그대로 동작합니다. 작업 방식과 이전 검토 설계 기록은 [소스 문서 작업·검토 설계](docs/source-document-review.md)를 참고하세요.
 

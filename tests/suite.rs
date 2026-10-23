@@ -36,8 +36,6 @@ mod memory_recovery;
 mod memory_retrieval;
 #[path = "message_recovery.rs"]
 mod message_recovery;
-#[path = "navigation.rs"]
-mod navigation;
 #[path = "navigation_eval.rs"]
 mod navigation_eval;
 #[path = "progress_recovery.rs"]
@@ -50,14 +48,6 @@ mod search;
 mod session_messages;
 #[path = "streaming.rs"]
 mod streaming;
-#[path = "structure.rs"]
-mod structure;
-#[path = "symbol_precision.rs"]
-mod symbol_precision;
-#[path = "symbol_regressions.rs"]
-mod symbol_regressions;
-#[path = "symbol_review_followup.rs"]
-mod symbol_review_followup;
 #[path = "task_plan.rs"]
 mod task_plan;
 #[path = "tool_argument_robustness.rs"]

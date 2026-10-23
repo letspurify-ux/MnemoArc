@@ -1152,12 +1152,7 @@ async fn execute_one(
 /// it names the scope as the cause: a bare tool_timeout read as transient
 /// and invited the identical call.
 fn stop_message(reason: &str, tool: &str, secs: u64) -> String {
-    if reason == "tool_timeout"
-        && matches!(
-            tool,
-            "file_list" | "source_search" | "symbol_search" | "symbol_relations" | "code_outline"
-        )
-    {
+    if reason == "tool_timeout" && matches!(tool, "file_list" | "source_search") {
         format!(
             "scope_timeout: {tool} did not finish within the {secs}s tool time limit, and the same call would stop again; narrow its scope (path, path_glob, or a more specific query or pattern) or split it into smaller calls"
         )
@@ -3000,8 +2995,6 @@ pub async fn run_session_controlled(
                     "file_read",
                     "file_list",
                     "source_search",
-                    "symbol_search",
-                    "symbol_relations",
                     "document_inspect",
                 ]
                 .contains(&call.name.as_str())
@@ -3050,16 +3043,8 @@ pub async fn run_session_controlled(
                 let result = suppress_unchanged_repeat(&s, &messages, call, result);
                 tools::record_delivered_read(&mut s, call, &result);
                 if result["status"] == "ok"
-                    && [
-                        "file_list",
-                        "source_search",
-                        "symbol_search",
-                        "symbol_relations",
-                        "code_outline",
-                        "document_inspect",
-                        "db_query",
-                    ]
-                    .contains(&call.name.as_str())
+                    && ["file_list", "source_search", "document_inspect", "db_query"]
+                        .contains(&call.name.as_str())
                     && result["data"]["suppressed"] != true
                 {
                     novel_navigation_evidence |= s

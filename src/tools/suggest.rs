@@ -146,12 +146,7 @@ const FIELD_ALIASES: &[(&str, &[&str])] = &[
     ("case_sensitive", &["case", "match_case", "case_sensitivity", "casesensitive"]),
     ("before", &["before_context", "lines_before", "context_before"]),
     ("after", &["after_context", "lines_after", "context_after"]),
-    ("symbol_id", &["id", "symbol", "sid", "symbolid"]),
-    ("relation", &["relation_type", "relationship", "direction", "type", "kind"]),
     ("kind", &["symbol_kind", "kinds", "type", "symbol_type", "category", "memory_type"]),
-    ("container", &["parent", "class", "class_name", "scope", "within", "owner", "parent_name"]),
-    ("max_depth", &["depth", "level", "nesting", "max_level"]),
-    ("view", &["format", "detail", "verbosity", "output", "style"]),
     ("old_text", &[
         "old", "old_string", "old_str", "old_content", "find", "search", "search_text",
         "target", "target_text", "anchor", "anchor_text", "original", "original_text", "match",
@@ -253,7 +248,7 @@ fn special_field(
     };
     match (tool, scope, key) {
         (
-            "file_read" | "symbol_read",
+            "file_read",
             "",
             "end_line" | "end" | "line_end" | "to_line" | "stop_line" | "last_line" | "until_line"
             | "end_row",
@@ -299,7 +294,7 @@ fn special_field(
             "; source_search has no context argument: send before and after (0 to 20 lines each)".into(),
         ),
         (
-            "source_search" | "code_outline" | "symbol_search",
+            "source_search",
             "",
             "ignore_case" | "case_insensitive" | "insensitive" | "icase" | "nocase",
         ) => renamed(
@@ -316,14 +311,6 @@ fn special_field(
         ) => note(
             "; document_inspect pages by outline heading index (offset) or by section; to read document lines by number use file_read with the output path and start_line".into(),
         ),
-        (
-            "symbol_read" | "symbol_relations",
-            "",
-            "name" | "symbol" | "symbol_name" | "function" | "fn" | "method" | "query",
-        ) => note(format!(
-            "; {tool} needs symbol_id copied from code_outline or symbol_search, not a name: find it with symbol_search {{\"query\":{},\"match\":\"exact\"}}",
-            siblings[original]
-        )),
         ("file_patch", "", "patch" | "diff" | "unified_diff" | "input") => note(
             "; file_patch takes operations, an array of {action,path,...} objects, not diff text: e.g. {\"operations\":[{\"action\":\"update\",\"path\":\"src/a.rs\",\"expected_hash\":\"<hash from file_read>\",\"old_text\":\"...\",\"new_text\":\"...\"}]}".into(),
         ),
@@ -381,36 +368,15 @@ pub(crate) fn field(
 /// Values models send for an accepted enum value of the same field.
 #[rustfmt::skip]
 const VALUE_ALIASES: &[(&str, &str, &[&str])] = &[
-    ("kind", "function", &["fn", "func", "def", "functions", "fun", "proc"]),
-    ("kind", "method", &["methods", "member_function", "fn_method"]),
-    ("kind", "variable", &["var", "let", "vars", "variables"]),
-    ("kind", "constant", &["const", "consts", "constants"]),
-    ("kind", "class", &["cls", "classes"]),
-    ("kind", "interface", &["iface", "interfaces"]),
-    ("kind", "property", &["prop", "props", "properties"]),
-    ("kind", "constructor", &["ctor", "init", "constructors"]),
-    ("kind", "struct", &["structs", "record_struct"]),
-    ("kind", "module", &["mod", "modules", "namespace", "package"]),
-    ("kind", "type", &["type_alias", "typedef", "types"]),
-    ("kind", "enum_member", &["variant", "enum_variant", "enum_value"]),
     ("kind", "fact", &["note", "finding", "observation", "info", "information"]),
     ("kind", "failure", &["lesson", "error", "bug", "problem", "issue", "mistake"]),
     ("kind", "procedure", &["howto", "how_to", "steps", "process", "recipe", "instructions"]),
     ("kind", "decision", &["choice", "rationale", "design"]),
     ("kind", "question", &["open_question", "unknown"]),
-    ("relation", "calls", &["callees", "outgoing", "calls_to", "call", "outbound", "callee"]),
-    ("relation", "callers", &["incoming", "called_by", "caller", "inbound", "callers_of"]),
-    ("relation", "references", &["refs", "usages", "uses", "reference", "usage", "ref"]),
-    ("match", "contains", &[
-        "substring", "partial", "fuzzy", "includes", "prefix", "starts_with", "like",
-    ]),
-    ("match", "exact", &["equals", "exact_match", "full", "strict", "eq", "equal", "whole"]),
     ("mode", "matches", &["lines", "line", "content", "match", "grep", "text"]),
     ("mode", "files", &["files_with_matches", "file", "names", "filenames", "list"]),
     ("mode", "count", &["counts", "total", "number"]),
     ("mode", "paths", &["tree", "list", "all", "files", "names", "path"]),
-    ("view", "compact", &["summary", "brief", "short", "names", "list", "simple"]),
-    ("view", "detailed", &["full", "verbose", "detail", "details", "signatures", "long"]),
     ("action", "read", &["get", "show", "view", "fetch", "load", "open", "display"]),
     ("action", "update", &["set", "patch", "edit", "modify", "change", "save"]),
     ("action", "search", &["find", "query", "grep", "lookup", "list"]),
@@ -571,14 +537,6 @@ pub(crate) fn value(
     {
         return Some(found);
     }
-    if field == "match" && matches!(normalized.as_str(), "regex" | "regexp" | "pattern" | "glob") {
-        return Some(Suggestion {
-            target: None,
-            text: format!(
-                "; {tool} matches symbol names only as contains (substring) or exact; for a regular expression over source text use source_search with regex:true"
-            ),
-        });
-    }
     let target = VALUE_ALIASES
         .iter()
         .find(|(name, target, aliases)| {
@@ -627,10 +585,6 @@ const TOOL_ALIASES: &[(&str, &[&str])] = &[
         "grep", "search", "search_code", "rg", "ripgrep", "find", "code_search", "search_files",
         "find_in_files", "search_source",
     ]),
-    ("code_outline", &["outline", "symbols", "list_symbols", "file_outline", "document_symbols"]),
-    ("symbol_search", &["find_symbol", "search_symbols", "symbol_find", "workspace_symbols"]),
-    ("symbol_read", &["read_symbol", "show_symbol", "get_symbol"]),
-    ("symbol_relations", &["callers", "references", "find_references", "call_graph", "calls"]),
     ("file_edit", &["edit", "edit_file", "str_replace", "replace", "replace_in_file", "apply_edit"]),
     ("file_write", &["write", "write_file", "create_file", "save_file"]),
     ("file_patch", &["patch", "apply_patch", "multi_edit"]),
@@ -754,13 +708,13 @@ mod tests {
 
     #[test]
     fn values_follow_aliases_case_and_unique_prefixes() {
-        let kinds = [json!("function"), json!("method"), json!("class")];
+        let modes = [json!("matches"), json!("files"), json!("count")];
         let target = |sent: &str| {
-            value("code_outline", "kind", &json!(sent), &kinds, &json!({})).and_then(|s| s.target)
+            value("source_search", "mode", &json!(sent), &modes, &json!({})).and_then(|s| s.target)
         };
-        assert_eq!(target("fn").as_deref(), Some("function"));
-        assert_eq!(target("Functions").as_deref(), Some("function"));
-        assert_eq!(target("meth").as_deref(), Some("method"));
-        assert_eq!(target("struct"), None);
+        assert_eq!(target("lines").as_deref(), Some("matches"));
+        assert_eq!(target("Files").as_deref(), Some("files"));
+        assert_eq!(target("coun").as_deref(), Some("count"));
+        assert_eq!(target("histogram"), None);
     }
 }
