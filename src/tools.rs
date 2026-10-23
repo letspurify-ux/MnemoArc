@@ -2767,6 +2767,29 @@ fn apply_document_edit_operation(old: &str, args: &Value) -> Result<String> {
 /// apply_document_edit_operation on a document whose hash `digest` the
 /// caller already has.
 fn apply_document_edit_at(old: &str, digest: Option<&str>, args: &Value) -> Result<String> {
+    let result = apply_document_edit_text(old, digest, args)?;
+    // A document whose every line ends in CRLF (saved by a Windows editor)
+    // keeps doing so: models send LF breaks, and an inserted passage left
+    // "second\n\r\n## B" behind, which no later old_text matched with
+    // either break. The rest of the result is the document's own text, so
+    // only the edit's lines change. A whole-document write keeps its own.
+    if matches!(args["action"].as_str(), Some("create" | "write"))
+        || !crlf_lines(old)
+        || crlf_lines(&result)
+    {
+        return Ok(result);
+    }
+    Ok(crlf_line_breaks(&result))
+}
+
+/// Whether `text` has line breaks and every one is CRLF.
+/// A document with LF breaks is told by its first line, without a scan.
+fn crlf_lines(text: &str) -> bool {
+    let mut breaks = text.match_indices('\n').peekable();
+    breaks.peek().is_some() && breaks.all(|(at, _)| at > 0 && text.as_bytes()[at - 1] == b'\r')
+}
+
+fn apply_document_edit_text(old: &str, digest: Option<&str>, args: &Value) -> Result<String> {
     let action = text(args, "action")?;
     let new = if action == "delete_text" {
         ""

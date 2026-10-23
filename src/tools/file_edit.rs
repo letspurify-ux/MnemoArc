@@ -318,11 +318,24 @@ fn exact_replace(old: &str, needle: &str, replacement: &str, all: bool) -> Resul
     if size > MAX_FILE_BYTES {
         bail!("unsupported_large_file: maximum 16MiB");
     }
-    let result = if all {
+    let mut result = if all {
         old.replace(needle, replacement)
     } else {
         old.replacen(needle, replacement, 1)
     };
+    // A file whose lines all end in CRLF keeps doing so (see
+    // apply_document_edit_at): the new text's LF breaks follow the file's.
+    // An edit that names CRs itself changes exactly the bytes it names.
+    if !needle.contains('\r')
+        && !replacement.contains('\r')
+        && super::crlf_lines(old)
+        && !super::crlf_lines(&result)
+    {
+        result = super::crlf_line_breaks(&result);
+        if result.len() > MAX_FILE_BYTES {
+            bail!("unsupported_large_file: maximum 16MiB");
+        }
+    }
     content(&result)?;
     Ok(result)
 }

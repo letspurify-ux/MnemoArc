@@ -620,3 +620,20 @@ fn update_with_lf_breaks_matches_a_crlf_file() {
         "one\r\ntwo\r\nthird\r\n"
     );
 }
+
+#[test]
+fn update_keeps_a_crlf_file_crlf() {
+    let (dir, mut session) = setup();
+    let path = dir.path().join("win.txt");
+    std::fs::write(&path, "first\r\nsecond\r\n").unwrap();
+    let digest = run(&mut session, "file_read", json!({"path":"win.txt"}))["hash"].clone();
+    run(
+        &mut session,
+        "file_edit",
+        json!({"path":"win.txt","old_text":"first","new_text":"one\nadded","expected_hash":digest}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "one\r\nadded\r\nsecond\r\n"
+    );
+}

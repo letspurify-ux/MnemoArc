@@ -649,3 +649,43 @@ fn old_text_with_lf_breaks_matches_a_crlf_document() {
     assert!(error.contains("occurs 2 times"), "{error}");
     assert_eq!(std::fs::read_to_string(&output).unwrap(), doc);
 }
+
+// Text inserted into a document whose lines all end in CRLF was saved with
+// the LF breaks the model sent: "second\n\r\n## B" was left behind, and an
+// old_text across it matched with neither break. The document keeps CRLF
+// breaks; a whole-document write keeps the breaks it was sent with.
+#[test]
+fn edits_keep_a_crlf_document_crlf() {
+    let (dir, mut s) = setup();
+    let output = dir.path().join("guide.md");
+    let doc = "# T\r\n\r\n## A\r\n\r\na text\r\n\r\n## B\r\n\r\nb text\r\n";
+    std::fs::write(&output, doc).unwrap();
+    let inserted = run(
+        &mut s,
+        "document_edit",
+        json!({"action":"insert_last_child","section":"## A","text":"### A1\n\nchild text\nsecond\n","expected_hash":tools::hash(doc.as_bytes())}),
+    );
+    let saved = std::fs::read_to_string(&output).unwrap();
+    assert_eq!(
+        saved,
+        "# T\r\n\r\n## A\r\n\r\na text\r\n\r\n### A1\r\n\r\nchild text\r\nsecond\r\n\r\n## B\r\n\r\nb text\r\n"
+    );
+    assert_eq!(inserted["hash"], tools::hash(saved.as_bytes()));
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"replace_text","old_text":"second\n\n## B","text":"second line\n\n## B"}),
+    );
+    assert!(
+        std::fs::read_to_string(&output)
+            .unwrap()
+            .contains("second line\r\n\r\n## B\r\n")
+    );
+    let current = std::fs::read_to_string(&output).unwrap();
+    run(
+        &mut s,
+        "document_edit",
+        json!({"action":"write","text":"# T\n\nnew\n","expected_hash":tools::hash(current.as_bytes())}),
+    );
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "# T\n\nnew\n");
+}

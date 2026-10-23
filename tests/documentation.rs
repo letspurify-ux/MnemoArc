@@ -4383,9 +4383,10 @@ fn appended_heading_follows_the_document_heading_spacing() {
             "# Guide\n\n## One\nText.\n\n",
             "# Guide\n\n## One\nText.\n\n## Two\nMore.\n",
         ),
+        // A CRLF document keeps CRLF breaks in the appended text too.
         (
             "# Guide\r\n\r\n## One\r\nText.\r\n",
-            "# Guide\r\n\r\n## One\r\nText.\r\n\r\n## Two\nMore.\n",
+            "# Guide\r\n\r\n## One\r\nText.\r\n\r\n## Two\r\nMore.\r\n",
         ),
         // With only a title so far, the line after it shows the spacing: a
         // live manual began "# Title\n\nIntro" and its first "## ..." was
@@ -4439,7 +4440,7 @@ fn appended_heading_follows_the_document_heading_spacing() {
         assert_eq!(
             written,
             format!(
-                "{}{delimiter}{delimiter}## Two\nMore.\n",
+                "{}{delimiter}{delimiter}## Two{delimiter}More.{delimiter}",
                 original.trim_end()
             ),
             "{original:?} + {text:?}"
