@@ -42,6 +42,22 @@ test("tables with many definitions parse cells together (was 72 s)", () => {
   within(5000, () => render(`${table}\n${definitions}`));
 });
 
+test("serialized visualizations with many definitions are protected in one parse (was 3 s at 400)", () => {
+  const definitions = Array.from(
+    { length: 1000 },
+    (_, i) => `[d${i}]: /u${i}`,
+  ).join("\n");
+  const cells =
+    "| h | i |\n| - | - |\n" +
+    Array.from({ length: 1000 }, (_, i) => `| \`chart\\nx,y\\na,${i}\` | b |`).join("\n");
+  const paragraphs = Array.from(
+    { length: 1000 },
+    (_, i) => `\`mermaid\\nflowchart LR\\nA-->B${i}\``,
+  ).join("\n\n");
+  within(5000, () => render(`${cells}\n\n${definitions}`));
+  within(5000, () => render(`${paragraphs}\n\n${definitions}`));
+});
+
 test("Mermaid comment masking is linear in blank lines", () => {
   const source = "%% note\n" + "\n".repeat(80000) + "flowchart LR";
   const masked = within(2000, () => executableMermaidSource(source));

@@ -31,40 +31,90 @@ export function remarkProtectTableVisualizations() {
       for (const child of node.children ?? []) collectDefinitions(child);
     };
     collectDefinitions(tree);
-    const visit = node => {
+    const rows = [];
+    const collectRows = node => {
       if (node.type === 'tableCell' || node.type === 'paragraph') {
         const start = node.position.start.offset;
         const row = source.slice(start, node.position.end.offset);
-        if (!/`[ \t]*(?:chart|mermaid)(?=(?:\\r)?\\n|\\?<br\s*\/?>)/i.test(row)) return;
-        // 표 구분자를 제외한 한 행을 분석하면 | 때문에 잘렸던 주소·HTML도 온전히
-        // 인식된다. 주소/속성에 적힌 백틱은 실행할 코드가 아니다.
-        const inlinePrefix = node.type === 'tableCell' ? 'x ' : '';
-        const rowSource = inlinePrefix + row + (definitions.length ? '\n\n' + definitions.join('\n') : '');
-        const protectedRanges = markdownLiteralRanges(processor.parse(rowSource), rowSource)
-          .map(([start, end]) => [start - inlinePrefix.length, end - inlinePrefix.length]);
-        for (const span of inlineCodeSpans(row, protectedRanges)) {
-          if (!/^(chart|mermaid)(?=(?:\\r)?\\n|\\?<br\s*\/?>)/i.test(span.value.trim())) continue;
-          if (codeSpanInLiteral(span, protectedRanges)) continue;
-          if (node.type === 'paragraph' && (row.slice(0, span.start).trim() || row.slice(span.end).trim())) continue;
-          // 바깥 GFM 표의 이스케이프 한 겹을 벗긴다. 내부 표 값의 \|는
-          // 바깥 셀에서 \\\|로 써야 하며, 코드 노드로 재파싱하며 잃지 않도록 보관한다.
-          const body = node.type === 'tableCell' ? span.value.replace(/(\\+)\|/g,
-            (_whole, slashes) => '\\'.repeat(Math.floor(slashes.length / 2)) + '|') : span.value;
-          const token = prefix + values.size;
-          values.set(token, body);
-          originals.set('`' + token + '`', row.slice(span.start, span.end));
-          edits.push({ start: start + span.start, end: start + span.end, value: '`' + token + '`' });
-        }
+        if (/`[ \t]*(?:chart|mermaid)(?=(?:\\r)?\\n|\\?<br\s*\/?>)/i.test(row)) rows.push({ node, start, row });
         return;
       }
       if (node.type === 'code') return;
-      for (const child of node.children ?? []) visit(child);
+      for (const child of node.children ?? []) collectRows(child);
     };
     const { structure } = analyzeRichStructure(source, tree, value => processor.parse(value), value => fromMarkdown(value, {
       extensions: [...processor.data('micromarkExtensions'), { disable: { null: ['table'] } }],
       mdastExtensions: processor.data('fromMarkdownExtensions'),
     }));
-    visit(structure);
+    collectRows(structure);
+    // 표 구분자를 제외한 한 행을 분석하면 | 때문에 잘렸던 주소·HTML도 온전히
+    // 인식된다. 주소/속성에 적힌 백틱은 실행할 코드가 아니다.
+    // 행마다 정의 전체를 붙여 파싱하면 '행 수 × 정의 수'였다(실측: 400개씩 3초).
+    // 인라인 문법은 빈 줄을 넘지 않으므로 행을 빈 줄로 나눠 정의와 함께 한 번에
+    // 파싱한다. 어느 행이 제 구역을 넘거나 정의가 되면 행마다 따로 파싱한다.
+    const declarations = definitions.length ? '\n\n' + definitions.join('\n') : '';
+    const prefixOf = node => (node.type === 'tableCell' ? 'x ' : '');
+    let combined = '';
+    for (const item of rows) {
+      item.base = combined.length + prefixOf(item.node).length;
+      combined += prefixOf(item.node) + item.row + '\n\n';
+      item.limit = item.base + item.row.length;
+      item.ranges = [];
+    }
+    let separate = rows.length < 2;
+    if (!separate) {
+      const parsedSource = combined + declarations;
+      const parsed = processor.parse(parsedSource);
+      const owner = offset => {
+        let low = 0, high = rows.length;
+        while (low < high) {
+          const mid = (low + high) >>> 1;
+          if (rows[mid].limit < offset) low = mid + 1;
+          else high = mid;
+        }
+        return rows[low];
+      };
+      // 행의 노드는 자기 구역 안에 있어야 하고, 행 안의 정의는 그 행에서만 보여야 한다.
+      const pending = [...parsed.children];
+      while (pending.length && !separate) {
+        const node = pending.pop();
+        const { start, end } = node.position ?? {};
+        if (!start || start.offset >= combined.length) continue;
+        const item = owner(start.offset);
+        if (!item || end.offset > item.limit || node.type === 'definition' || node.type === 'footnoteDefinition')
+          separate = true;
+        else pending.push(...(node.children ?? []));
+      }
+      if (!separate) {
+        for (const [start, end] of markdownLiteralRanges(parsed, parsedSource)) {
+          if (start >= combined.length) break;
+          const item = owner(start);
+          item.ranges.push([start - item.base, end - item.base]);
+        }
+      }
+    }
+    for (const { node, start, row, ranges } of rows) {
+      let protectedRanges = ranges;
+      if (separate) {
+        const inlinePrefix = prefixOf(node);
+        const rowSource = inlinePrefix + row + declarations;
+        protectedRanges = markdownLiteralRanges(processor.parse(rowSource), rowSource)
+          .map(([start, end]) => [start - inlinePrefix.length, end - inlinePrefix.length]);
+      }
+      for (const span of inlineCodeSpans(row, protectedRanges)) {
+        if (!/^(chart|mermaid)(?=(?:\\r)?\\n|\\?<br\s*\/?>)/i.test(span.value.trim())) continue;
+        if (codeSpanInLiteral(span, protectedRanges)) continue;
+        if (node.type === 'paragraph' && (row.slice(0, span.start).trim() || row.slice(span.end).trim())) continue;
+        // 바깥 GFM 표의 이스케이프 한 겹을 벗긴다. 내부 표 값의 \|는
+        // 바깥 셀에서 \\\|로 써야 하며, 코드 노드로 재파싱하며 잃지 않도록 보관한다.
+        const body = node.type === 'tableCell' ? span.value.replace(/(\\+)\|/g,
+          (_whole, slashes) => '\\'.repeat(Math.floor(slashes.length / 2)) + '|') : span.value;
+        const token = prefix + values.size;
+        values.set(token, body);
+        originals.set('`' + token + '`', row.slice(span.start, span.end));
+        edits.push({ start: start + span.start, end: start + span.end, value: '`' + token + '`' });
+      }
+    }
     if (!edits.length) return tree;
     let result = '', at = 0;
     for (const edit of edits) { result += source.slice(at, edit.start) + edit.value; at = edit.end; }
