@@ -433,7 +433,26 @@ const Message = memo(function Message({ role, text, trace, stopped }) {
 
 // Extracted from llm_agent/frontend/src/App.jsx; session ownership belongs to MnemoArc.
 export { Message };
+// 미리보기는 갱신마다 받은 글 전체를 다시 파싱한다 — 비용이 답변 길이에 비례해, 갱신이 잦은 긴 답변에서는
+// 파싱이 주 스레드를 다 차지했다(실측: 2만 5천 자에서 갱신마다 120~180ms, 초당 다섯 번 이상).
+// 그래서 다음 갱신은 직전 미리보기를 그린 시간의 몇 배가 지난 뒤에 그린다 — 짧은 답은 지금처럼
+// PREVIEW_FLUSH_MS마다, 긴 답은 그리는 데 쓰는 시간이 전체의 일부로 묶인다. 마지막 글은 늦게라도 그려진다.
+const PREVIEW_DUTY = 4;
 export function StreamingMessage({text}) {
   const plugins = useMarkdownPlugins(REHYPE_PLUGINS);
-  return <Boundary key={text ? 'text' : 'empty'} what="stream" fallback={<BrokenMessage role="assistant" text={text} />}><div className="row assistant"><div className="bubble assistant"><PreviewBody text={text} rehypePlugins={plugins} /></div></div></Boundary>;
+  const [shown, setShown] = useState(text);
+  const started = useRef(0), cost = useRef(0), drawn = useRef(0);
+  started.current = performance.now();
+  useLayoutEffect(() => {
+    drawn.current = performance.now();
+    cost.current = drawn.current - started.current;
+  }, [shown]);
+  useEffect(() => {
+    if (text === shown) return;
+    const wait = drawn.current + Math.max(PREVIEW_FLUSH_MS, cost.current * PREVIEW_DUTY) - performance.now();
+    if (wait <= 0) { setShown(text); return; }
+    const timer = setTimeout(() => setShown(text), wait);
+    return () => clearTimeout(timer);
+  }, [text, shown]);
+  return <Boundary key={shown ? 'text' : 'empty'} what="stream" fallback={<BrokenMessage role="assistant" text={shown} />}><div className="row assistant"><div className="bubble assistant"><PreviewBody text={shown} rehypePlugins={plugins} /></div></div></Boundary>;
 }
