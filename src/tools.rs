@@ -8032,8 +8032,7 @@ pub fn audit_document(s: &mut Session) -> Result<Value> {
 /// `known`, so an unchanged document is not checked again.
 pub fn document_issue_count(s: &Session, known: Option<&str>) -> Option<(String, usize)> {
     let path = output_path(&s.project).ok()?;
-    let doc = read_text(&path).ok()?;
-    let digest = hash(doc.as_bytes());
+    let (doc, digest) = read_text_hashed(&path).ok()?;
     if known == Some(digest.as_str()) {
         return None;
     }
@@ -8164,11 +8163,10 @@ fn forget_undelivered_source(s: &mut Session, id: &str) {
         .ok()
         .and_then(|resolved| {
             let (text, digest) = read_text_hashed(&resolved).ok()?;
-            (source.hash.as_deref() == Some(digest.as_str())).then_some((resolved, text))
+            (source.hash.as_deref() == Some(digest.as_str())).then_some((resolved, text, digest))
         })
-        .is_some_and(|(resolved, text)| {
-            let (_, covered) = coverage::report(s, &resolved, &text, 0, 1);
-            start >= 1 && (start..=end).all(|line| covered.get(line - 1).copied().unwrap_or(false))
+        .is_some_and(|(resolved, text, digest)| {
+            coverage::lines_delivered(s, &resolved, &text, &digest, start, end)
         });
     if !delivered {
         s.sources.remove_counted(id);

@@ -42,6 +42,12 @@ oracle = "0.6.3"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# On ARM, sha2 uses the CPU's SHA-256 instructions only with "asm" (x86 uses
+# them by default): file digests ran at 430 MB/s on Apple silicon. Its
+# assembly helper does not build with MSVC, so Windows keeps the default.
+[target.'cfg(all(target_arch = "aarch64", not(windows)))'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 

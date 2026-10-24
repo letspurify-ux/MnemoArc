@@ -327,9 +327,9 @@ fn plan_check(s: &mut Session) -> Option<String> {
     let stall_limit = s.config.stall_round_limit;
     let current = s.task.current_todo().map(|item| item.id.clone());
     let document = tools::output_path(&s.project)
-        .and_then(|path| tools::read_text(&path))
+        .and_then(|path| tools::read_text_hashed(&path))
         .ok()
-        .map(|doc| tools::hash(doc.as_bytes()));
+        .map(|(_, digest)| digest);
     let watch = &mut s.progress_recovery.todo_watch;
     match (current, watch.as_ref()) {
         (Some(id), Some(watched)) if watched.id == id => {}
@@ -1931,8 +1931,8 @@ pub async fn run_session_controlled(
             "instruction":if focused_repair || repeated_outcome_focus || substantive_focus || artifact_focus { focused_instruction } else if progress_recovery { if document_work { "Progress recovery: the last requests produced no new evidence, document change or resolved citation. Change approach instead of repeating them: read sources the document still needs and has not read, write or correct a section, or file_read a cited range reported as unread." } else if planned_work { "Progress recovery: plan edits or repeated reads have not produced an outcome. Execute the first unfinished item using available evidence and tools. Do not recreate the plan or save another summary. Insert only a concrete missing prerequisite; complete an item only with the actual result. If evidence is missing, read only the necessary range." } else { "Progress recovery: repeated preparation has not produced an outcome. Correct any necessary task_plan call using its returned example, then carry out the first concrete action; otherwise answer from existing evidence. Do not repeat an unchanged call or save another summary." } } else { phase_instruction(&phase, budget_phase, answer_workflow, planned_work) } });
         if s.checkpoint.is_none() && !s.progress_recovery.checkpoint_document_edits.is_empty() {
             let hash = tools::output_path(&s.project)
-                .and_then(|path| tools::read_text(&path))
-                .map(|doc| tools::hash(doc.as_bytes()))
+                .and_then(|path| tools::read_text_hashed(&path))
+                .map(|(_, digest)| digest)
                 .ok();
             s.run_guidance["checkpoint_document_edits"] = json!({
                 "edits":s.progress_recovery.checkpoint_document_edits,

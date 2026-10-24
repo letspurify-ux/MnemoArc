@@ -141,43 +141,96 @@ pub fn record_delivered_read(s: &mut Session, call: &crate::llm::ToolCall, resul
     s.read_coverage.insert_counted(key, entry.into());
 }
 
-pub(super) fn report(
-    s: &Session,
-    path: &Path,
-    doc: &str,
-    offset: usize,
-    limit: usize,
-) -> (Value, Vec<bool>) {
+/// Each line of `doc` as read coverage measures it: where it starts and
+/// where its text ends, in characters of the text with CRLF line breaks
+/// written as LF (an empty line spans one character, its break). The text
+/// is walked in place; a converted copy of a 16 MiB file was made for every
+/// check.
+fn line_spans(doc: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut cursor = 0;
+    doc.split_inclusive('\n').map(move |line| {
+        let (body, break_chars) = match line.strip_suffix('\n') {
+            Some(body) => (body.strip_suffix('\r').unwrap_or(body), 1),
+            None => (line, 0),
+        };
+        let body = body.chars().count();
+        let start = cursor;
+        cursor += body + break_chars;
+        (start, start + body.max(1))
+    })
+}
+
+/// Whether the merged `ranges` cover a line spanning `start..end`.
+fn span_covered(ranges: &[(usize, usize)], (start, end): (usize, usize)) -> bool {
+    let index = ranges.partition_point(|&(_, b)| b <= start);
+    ranges
+        .get(index)
+        .is_some_and(|&(a, b)| a <= start && b >= end)
+}
+
+/// The delivered ranges of `path` at the version hashed `digest`.
+fn delivered_ranges<'a>(s: &'a Session, path: &Path, digest: &str) -> Option<&'a [(usize, usize)]> {
     let key = path
         .canonicalize()
         .unwrap_or_else(|_| path.to_owned())
         .to_string_lossy()
         .into_owned();
-    let digest = hash(doc.as_bytes());
+    s.read_coverage
+        .get(&key)
+        .filter(|r| r.hash == digest)
+        .map(|r| r.ranges.as_slice())
+}
+
+/// Whether every line `start..=end` (from 1) of `doc`, hashed `digest`, was
+/// delivered whole. Only the lines up to `end` are walked: a cut page of a
+/// long file checked its few lines with a report of the whole file.
+pub(super) fn lines_delivered(
+    s: &Session,
+    path: &Path,
+    doc: &str,
+    digest: &str,
+    start: usize,
+    end: usize,
+) -> bool {
+    if start == 0 {
+        return false;
+    }
+    if end < start {
+        return true;
+    }
+    let Some(ranges) = delivered_ranges(s, path, digest) else {
+        return false;
+    };
+    let mut spans = line_spans(doc).skip(start - 1);
+    (start..=end).all(|_| spans.next().is_some_and(|span| span_covered(ranges, span)))
+}
+
+/// The read coverage of `doc`, whose hash the caller already holds as
+/// `digest`: hashing it again took half of each page of a 16 MiB file read
+/// in pages, whose cut pages check their coverage.
+pub(super) fn report(
+    s: &Session,
+    path: &Path,
+    doc: &str,
+    digest: &str,
+    offset: usize,
+    limit: usize,
+) -> (Value, Vec<bool>) {
+    debug_assert_eq!(digest, hash(doc.as_bytes()));
+    let key = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_owned())
+        .to_string_lossy()
+        .into_owned();
     let prior = s.read_coverage.get(&key);
     let ranges = prior
         .filter(|r| r.hash == digest)
         .map(|r| r.ranges.as_slice())
         .unwrap_or(&[]);
-    let normalized = doc.replace("\r\n", "\n");
-    let mut cursor = 0;
-    let mut covered = Vec::new();
-    let mut index = 0;
-    for line in normalized.split_inclusive('\n') {
-        let len = line.chars().count();
-        let body = line.strip_suffix('\n').unwrap_or(line).chars().count();
-        let end = cursor + body.max(1);
-        while index < ranges.len() && ranges[index].1 <= cursor {
-            index += 1;
-        }
-        covered.push(
-            ranges
-                .get(index)
-                .is_some_and(|&(a, b)| a <= cursor && b >= end),
-        );
-        cursor += len;
-    }
-    let mut missing: Vec<Value> = Vec::new();
+    let covered: Vec<bool> = line_spans(doc)
+        .map(|span| span_covered(ranges, span))
+        .collect();
+    let mut missing: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i < covered.len() {
         if covered[i] {
@@ -188,18 +241,19 @@ pub(super) fn report(
         while i < covered.len() && !covered[i] {
             i += 1;
         }
-        missing.push(json!({"start_line":start,"end_line":i}));
+        missing.push((start, i));
     }
     let end = offset
         .saturating_add(limit.clamp(1, 100))
         .min(missing.len());
-    let page = if offset < missing.len() {
-        &missing[offset..end]
-    } else {
-        &[]
-    };
+    let page: Vec<Value> = missing
+        .get(offset..end)
+        .unwrap_or(&[])
+        .iter()
+        .map(|&(start, end)| json!({"start_line":start,"end_line":end}))
+        .collect();
     (
-        json!({"revision":hash(&serde_json::to_vec(&(digest.as_str(), ranges)).expect("coverage revision input is serializable")),"previous_revision_ignored":prior.is_some_and(|r| r.hash != digest),"fully_read_lines":covered.iter().filter(|&&v|v).count(),"complete":covered.iter().all(|&v|v),"missing_ranges":page,"missing_range_count":missing.len(),"next_offset":(end < missing.len()).then_some(end)}),
+        json!({"revision":hash(&serde_json::to_vec(&(digest, ranges)).expect("coverage revision input is serializable")),"previous_revision_ignored":prior.is_some_and(|r| r.hash != digest),"fully_read_lines":covered.iter().filter(|&&v|v).count(),"complete":covered.iter().all(|&v|v),"missing_ranges":page,"missing_range_count":missing.len(),"next_offset":(end < missing.len()).then_some(end)}),
         covered,
     )
 }
@@ -301,6 +355,102 @@ mod tests {
                 ranges, expected,
                 "{doc:?} line {line} offset {offset} shown {shown:?} complete {complete}"
             );
+        }
+    }
+
+    /// The per-line coverage as computed before the walk in place: over a
+    /// copy with CRLF written as LF.
+    fn copied_coverage(doc: &str, ranges: &[(usize, usize)]) -> Vec<bool> {
+        let normalized = doc.replace("\r\n", "\n");
+        let (mut cursor, mut index, mut covered) = (0, 0, Vec::new());
+        for line in normalized.split_inclusive('\n') {
+            let len = line.chars().count();
+            let body = line.strip_suffix('\n').unwrap_or(line).chars().count();
+            let end = cursor + body.max(1);
+            while index < ranges.len() && ranges[index].1 <= cursor {
+                index += 1;
+            }
+            covered.push(
+                ranges
+                    .get(index)
+                    .is_some_and(|&(a, b)| a <= cursor && b >= end),
+            );
+            cursor += len;
+        }
+        covered
+    }
+
+    // The report and the range check walk the text in place; both agree with
+    // the coverage computed over a converted copy, for any line breaks.
+    #[test]
+    fn coverage_walked_in_place_matches_the_converted_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::new(
+            crate::config::Project {
+                root: dir.path().into(),
+                output: dir.path().join("out.md"),
+                ..Default::default()
+            },
+            crate::config::Config::compact_test(),
+        );
+        let path = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        let pieces = ["a", "한", "\n", "\r\n", "\r", "\r\r\n", "é ", "xyz", "\n\n"];
+        for round in 0..300 {
+            let doc: String = (0..1 + next(40))
+                .map(|_| pieces[next(pieces.len())])
+                .collect();
+            let digest = hash(doc.as_bytes());
+            let lines = doc.split_inclusive('\n').count();
+            s.read_coverage = Default::default();
+            for read in 0..next(4) {
+                let line = 1 + next(lines);
+                let shown: String = doc
+                    .split_inclusive('\n')
+                    .skip(line - 1)
+                    .take(1 + next(3))
+                    .collect::<String>()
+                    .chars()
+                    .take(next(20))
+                    .collect();
+                let call = crate::llm::ToolCall {
+                    id: format!("c{round}-{read}"),
+                    name: "file_read".into(),
+                    arguments: "{}".into(),
+                };
+                std::fs::write(&path, &doc).unwrap();
+                let result = json!({"status":"ok","data":{
+                    "path":path,"hash":digest,"read_start":line,"read_offset":0,
+                    "content":{"text":shown,"last_line_complete":next(2) == 0,"truncated":false}
+                }});
+                record_delivered_read(&mut s, &call, &result);
+            }
+            let ranges = s
+                .read_coverage
+                .get(path.to_string_lossy().as_ref())
+                .map(|c| c.ranges.clone())
+                .unwrap_or_default();
+            let expected = copied_coverage(&doc, &ranges);
+            let (report, covered) = report(&s, &path, &doc, &digest, 0, 100);
+            assert_eq!(covered, expected, "{doc:?} {ranges:?}");
+            assert_eq!(report["complete"], expected.iter().all(|&v| v));
+            for _ in 0..8 {
+                let start = next(lines + 2);
+                let end = next(lines + 2);
+                let old = start >= 1
+                    && (start..=end).all(|line| expected.get(line - 1).copied().unwrap_or(false));
+                assert_eq!(
+                    lines_delivered(&s, &path, &doc, &digest, start, end),
+                    old,
+                    "{doc:?} {ranges:?} {start}..={end}"
+                );
+            }
         }
     }
 }

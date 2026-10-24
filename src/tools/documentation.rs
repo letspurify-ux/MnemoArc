@@ -669,8 +669,7 @@ pub(super) fn execute(
                 };
                 return Ok(json!({"exists":false,"path":path,"total_lines":0,"guidance":guidance}));
             }
-            let doc = read_text(&path)?;
-            let digest = hash(doc.as_bytes());
+            let (doc, digest) = super::read_text_hashed(&path)?;
             let document_offset = n(args, "offset", 0);
             let coverage_offset = n(args, "coverage_offset", 0);
             // Models page with offset alone (14 times in 12 live runs, 5 in
@@ -761,6 +760,7 @@ pub(super) fn execute(
                     s,
                     &path,
                     &doc,
+                    &digest,
                     n(args, "coverage_offset", 0),
                     n(args, "limit", 50),
                 );
@@ -838,8 +838,7 @@ pub(super) fn execute(
                     "document_missing: the configured output has not been written yet; create it with document_edit action=create before auditing it"
                 );
             }
-            let doc = read_text(&path)?;
-            let document_hash = hash(doc.as_bytes());
+            let (doc, document_hash) = super::read_text_hashed(&path)?;
             let (checked, issues, format_check) = audit_issues(s, &path, &doc, &document_hash)?;
             // The issue list includes delivered-evidence state as well as
             // document citations. Bind every continuation page to the
@@ -1182,10 +1181,10 @@ pub(super) fn unread_citations(s: &Session, doc: &str) -> Result<Vec<Value>> {
         {
             continue;
         }
-        let Ok(text) = read_text(path) else {
+        let Ok((text, digest)) = super::read_text_hashed(path) else {
             continue;
         };
-        let (_, covered) = super::coverage::report(s, path, &text, 0, 1);
+        let (_, covered) = super::coverage::report(s, path, &text, &digest, 0, 1);
         if !covered.contains(&true) {
             continue;
         }
