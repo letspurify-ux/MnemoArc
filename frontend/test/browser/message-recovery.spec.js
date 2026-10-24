@@ -117,3 +117,18 @@ test("a failed change is identified separately from a question and can be resubm
     0,
   );
 });
+
+test("a tool result that is JSON null or not JSON is shown without breaking the chat", async ({ page, request }) => {
+  await workspace({ page, request }, {
+    bundles: [{ id: 1, messages: [
+      { role: "user", content: "요청" },
+      { role: "assistant", content: "", tool_calls: [{ id: "a", function: { name: "file_read", arguments: "{}" } }] },
+      { role: "tool", content: "null", summary: "빈 결과" },
+      { role: "tool", content: "plain text", summary: "글자 결과" },
+      { role: "assistant", content: "답변" },
+    ] }],
+  });
+  await expect(page.locator(".tool-result")).toHaveCount(2);
+  await expect(page.locator(".tool-result-summary")).toHaveText(["빈 결과", "글자 결과"]);
+  await expect(page.getByText("답변", { exact: true })).toBeVisible();
+});

@@ -729,7 +729,7 @@ export default function App() {
               <SessionButton
                 key={s.id}
                 session={s}
-                active={s.id === selected}
+                active={s.id === selected && page === "chat"}
                 onClick={() => choose(s.id)}
                 onClose={safe(() => closeSession(s.id))}
                 closing={runningById.get(s.id)?.closing}

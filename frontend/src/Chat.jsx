@@ -339,8 +339,10 @@ const ToolResult = memo(function ToolResult({ content, summary }) {
     try {
       result = JSON.parse(content);
     } catch {
-      result = { status: "unknown", data: content };
+      // Not JSON; shown as text below.
     }
+    // A JSON null has no status to read; reading it would unmount the app.
+    result ??= { status: "unknown", data: content };
     const displayed = displayToolResult(result);
     return { result, displayed, text: JSON.stringify(displayed, null, 2) };
   }, [content]);
