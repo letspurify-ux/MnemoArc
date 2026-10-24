@@ -17,27 +17,54 @@ export function tableOwnership(source, tree, structure, parse) {
   visit(tree, 'definition', definitions);
   visit(tree, 'footnoteDefinition', definitions);
   const declarations = definitions.map(node => source.slice(node.position.start.offset, node.position.end.offset)).join('\n\n');
+  // 행은 문서 순서이고 겹치지 않는다. 노드마다 모든 행을 훑으면 큰 표에서 제곱 비용이다.
   const ranges = rows.map(row => [row.position.start.offset, row.position.end.offset]);
+  const crossesRow = (start, end) => {
+    let low = 0, high = ranges.length;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (ranges[mid][1] <= start) low = mid + 1;
+      else high = mid;
+    }
+    return low < ranges.length && ranges[low][0] < end;
+  };
   const outside = node => {
     const start = node.position?.start.offset, end = node.position?.end.offset;
     // 링크 등 원자 노드가 새 블록 경계를 가로지르면 그 짝 자체가 무효다.
-    if ((!node.children || ['link', 'linkReference'].includes(node.type)) &&
-      ranges.some(([a, b]) => start < b && end > a)) return null;
+    if ((!node.children || ['link', 'linkReference'].includes(node.type)) && crossesRow(start, end)) return null;
     return node.children ? { ...node, children: node.children.map(outside).filter(Boolean) } : node;
   };
   const ownership = outside(tree);
-  for (const cell of cells) {
+  // 인라인 컨테이너이므로 #, >, 들여쓰기, 백틱을 새 블록의 시작으로
+  // 읽지 않게 한다. 접두사는 분석에만 쓰며 표시·치환 원문에 들어가지 않는다.
+  // 셀은 한 줄이고 접두사 때문에 각자 한 문단이 된다. 인라인 문법은 문단을 넘지 않으므로
+  // 빈 줄로 나눠 한 번에 파싱한다 — 셀마다 정의 전체를 붙여 파싱하면 정의가 많은 문서에서
+  // '셀 수 × 정의 수'였다(실측: 표와 정의 1,000개씩 72초).
+  let combined = '';
+  const segments = cells.map(cell => {
     const start = cell.position.start.offset, end = cell.position.end.offset;
-    // 인라인 컨테이너이므로 #, >, 들여쓰기, 백틱을 새 블록의 시작으로
-    // 읽지 않게 한다. 접두사는 분석에만 쓰며 표시·치환 원문에 들어가지 않는다.
     const row = 'x ' + source.slice(start, end);
-    const parsed = parse(row + (declarations ? '\n\n' + declarations : ''));
+    const base = combined.length;
+    combined += row + '\n\n';
+    return { start, base, limit: base + row.length };
+  });
+  const parsed = parse(combined + declarations);
+  let index = 0;
+  for (const node of parsed.children) {
+    while (index < segments.length && node.position.start.offset >= segments[index].limit) index++;
+    const segment = segments[index];
+    if (!segment || node.position.start.offset < segment.base || node.position.end.offset > segment.limit) continue;
+    // 줄 번호는 셀 하나만 파싱했을 때와 같게 둔다 (셀마다 두 줄씩 앞선다).
+    const shift = segment.start - 2 - segment.base, lines = 2 * index;
     const relocate = node => {
-      if (node.position) for (const point of [node.position.start, node.position.end]) point.offset += start - 2;
+      if (node.position) for (const point of [node.position.start, node.position.end]) {
+        point.offset += shift;
+        point.line -= lines;
+      }
       for (const child of node.children ?? []) relocate(child);
       return node;
     };
-    ownership.children.push(...parsed.children.filter(node => node.position.end.offset <= row.length).map(relocate));
+    ownership.children.push(relocate(node));
   }
   return ownership;
 }

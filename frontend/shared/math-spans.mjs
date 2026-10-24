@@ -11,11 +11,14 @@ export const normalizeMath = tex => tex.replace(/[₩￦＼]{2}|[₩￦＼](?=[A
   match => '\\'.repeat(match.length));
 const isLetter = c => /[A-Za-z0-9]/.test(c ?? '');
 const cjk = /[ᄀ-ᇿ぀-ヿ㄰-㆏一-鿿가-힣]/;
-const escapedAt = (s, i) => {
-  let n = 0;
-  while (i > 0 && SLASH.test(s[--i])) n++;
-  return n % 2 === 1;
+// 위치마다 앞의 역슬래시를 거꾸로 세면 역슬래시가 길게 이어진 원문에서 제곱 비용이다
+// (실측: 8만 자 35초). 각 위치에서 끝나는 연속 길이를 한 번만 센다.
+const slashRuns = s => {
+  const runs = new Uint32Array(s.length);
+  for (let i = 0; i < s.length; i++) runs[i] = SLASH.test(s[i]) ? (i ? runs[i - 1] : 0) + 1 : 0;
+  return runs;
 };
+const escapedAt = (runs, i) => i > 0 && runs[i - 1] % 2 === 1;
 
 // Markdown 수식 구분자와 TeX 문법 검증은 별개다. 중괄호 오류가 있어도 수식 범위는 보호해야
 // 내부 |가 표를 쪼개지 않는다. 명령의 인자 끝(})을 찾을 때만 중괄호 깊이를 검사한다.
@@ -66,12 +69,55 @@ export function unwrapMath(tex) {
 const offsets = node => [node.position?.start?.offset, node.position?.end?.offset];
 export function collectMathSpans(tree, source, parse, structure = tree, atomicRanges = []) {
   const normalized = normalizeMath(source); // 길이가 같으므로 원문 좌표가 유지된다.
+  // 정규화는 역슬래시 계열 글자끼리만 바꾸므로 두 원문의 연속 길이가 같다.
+  const runs = slashRuns(source);
   const protectedRanges = [], noBare = [], candidates = [], contexts = [], tableRows = [], textScopes = [], tagScopes = [], referenceEdits = [];
   const tableSeparators = [], blockCodes = [], knownLinks = new Set(), definitions = new Map();
   let hasDefinitions = false;
+  // 위치를 포함하는 문맥 중 가장 나중에 넣은 것. 위치마다 목록 전체를 거꾸로 훑으면
+  // 문단이 많은 문서(미리보기는 2MB까지)에서 제곱 비용이다. 조회는 단계마다 위치가
+  // 늘어나는 순서이므로, 시작한 문맥을 번호가 큰 것부터 꺼내는 힙에 넣고 끝난 것은
+  // 꼭대기에 올 때 버린다. 위치가 거꾸로 가면 처음부터 다시 쌓되, 그런 일이 잦으면
+  // 목록을 훑는다.
+  let order = null, entered = 0, lastQuery = -Infinity, restarts = 0;
+  const active = [];
+  const above = (a, b) => active[a] > active[b];
+  const swap = (a, b) => { [active[a], active[b]] = [active[b], active[a]]; };
+  const enter = index => {
+    let i = active.push(index) - 1;
+    while (i > 0 && above(i, (i - 1) >> 1)) { swap(i, (i - 1) >> 1); i = (i - 1) >> 1; }
+  };
+  const leave = () => {
+    const last = active.pop();
+    if (!active.length) return;
+    active[0] = last;
+    for (let i = 0; ;) {
+      const left = 2 * i + 1, right = left + 1;
+      let top = i;
+      if (left < active.length && above(left, top)) top = left;
+      if (right < active.length && above(right, top)) top = right;
+      if (top === i) return;
+      swap(i, top);
+      i = top;
+    }
+  };
   const contextAt = start => {
-    for (let i = contexts.length - 1; i >= 0; i--)
-      if (contexts[i].start <= start && contexts[i].end > start) return contexts[i];
+    if (start < lastQuery && restarts < 8) {
+      restarts++;
+      entered = 0;
+      active.length = 0;
+      lastQuery = -Infinity;
+    }
+    if (start >= lastQuery) {
+      lastQuery = start;
+      order ??= contexts.map((_, i) => i).sort((a, b) => contexts[a].start - contexts[b].start);
+      while (entered < order.length && contexts[order[entered]].start <= start) enter(order[entered++]);
+      while (active.length && !(contexts[active[0]].end > start)) leave();
+      if (active.length) return contexts[active[0]];
+    } else {
+      for (let i = contexts.length - 1; i >= 0; i--)
+        if (contexts[i].start <= start && contexts[i].end > start) return contexts[i];
+    }
     return { quotes: 0, boundaryEnd: source.length };
   };
   const protect = (start, end) => { if (start !== undefined && end !== undefined) protectedRanges.push({ start, end }); };
@@ -234,7 +280,7 @@ export function collectMathSpans(tree, source, parse, structure = tree, atomicRa
     if (!['$', '\\'].includes(normalized[i])) continue;
     const protectedRange = firstRange(i);
     if (owns(protectedRange, i)) { i = protectedRange.end - 1; continue; }
-    if (escapedAt(source, i)) continue;
+    if (escapedAt(runs, i)) continue;
     while (rowIndex < tableRows.length && tableRows[rowIndex].end <= i) rowIndex++;
     const row = tableRows[rowIndex];
     const inRow = row && row.start <= i;
@@ -315,7 +361,7 @@ export function collectMathSpans(tree, source, parse, structure = tree, atomicRa
     const start = scope.start + line.index + line[0].length - text.length, end = start + text.length;
     const expression = text.slice(0, match.index).replace(/\\[A-Za-z]+/g, '').replace(/\d+(?:\.\d*)?|\.\d+/g, '0');
     if (!cjk.test(expression) && !/[A-Za-z]{3,}|[.!?:]/.test(expression) &&
-      !escapedAt(normalized, start + text.lastIndexOf('\\tag')) && !intersects(start, end) &&
+      !escapedAt(runs, start + text.lastIndexOf('\\tag')) && !intersects(start, end) &&
       !candidates.some(span => span.start < end && span.end > start))
       candidates.push({ start, end, value: text.trim(), display: true });
   }

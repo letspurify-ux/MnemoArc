@@ -47,8 +47,11 @@ mermaid.initialize(MERMAID_CONFIG);
 // 설정은 전역이므로 설정 변경과 실제 렌더를 같은 직렬 작업으로 묶는다. 수식 라벨은
 // 본문과 같은 제한의 KaTeX가 만든 MathML을 주입하고 라벨 HTML은 잠긴 설정으로 정화한다.
 let renderQueue = Promise.resolve();
-function renderDiagram(id, text) {
+// 차례를 기다리는 동안 사라진 그림(세션 전환·답변 갱신)은 그리지 않는다 — 그대로 두면 지나간
+// 그림들을 모두 그린 뒤에야 지금 화면의 그림 차례가 온다.
+function renderDiagram(id, text, wanted) {
   const task = renderQueue.then(async () => {
+    if (!wanted()) return null;
     // 직전 그림의 본문 설정과 무관한 기본 설정에서 종류를 판정한다.
     mermaid.initialize(MERMAID_CONFIG);
     const candidate = mermaidMathLabels(text, mermaid.detectType(text.replace(/\r\n?/g, '\n')));
@@ -85,7 +88,7 @@ export default function Mermaid({ text }) {
       return;
     }
     // 그리지 못하면(문법 오류 등) svg를 null로 둔 채 끝낸다 — 아래에서 원문을 코드로 보여준다.
-    renderDiagram(id, text).then(r => { if (alive) setRendered(r); }, e => console.warn('[mermaid] render failed:', e?.message ?? e));
+    renderDiagram(id, text, () => alive).then(r => { if (alive && r) setRendered(r); }, e => console.warn('[mermaid] render failed:', e?.message ?? e));
     return () => { alive = false; };
   }, [text, id]);
   // 그림 안의 링크(`click A "주소"`)는 답변의 링크와 같은 규칙으로 연다 — 새 탭, 페이지 안 앵커만

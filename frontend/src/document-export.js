@@ -7,13 +7,22 @@ const citationPattern =
 const sourceLabel = "(?:근거|출처|소스|참고|sources?|evidence)";
 
 function replaceCitations(text, replacement, mermaid = false) {
+  // Matches arrive in order; scanning back from each one to the token start
+  // was quadratic on a long line of citations without spaces.
+  let scanned = 0,
+    tokenStart = 0,
+    scheme = -1;
   return text.replace(citationPattern, (citation, offset) => {
-    let tokenStart = offset;
-    while (tokenStart > 0 && !/[\s`(\["']/.test(text[tokenStart - 1]))
-      tokenStart--;
-    const prefix = text.slice(tokenStart, offset);
+    for (; scanned < offset; scanned++) {
+      if (/[\s`(\["']/.test(text[scanned])) tokenStart = scanned + 1;
+      else if (text.startsWith("://", scanned)) scheme = scanned;
+    }
     // URLs can contain file suffixes and line-like fragments too.
-    if (citation.startsWith("//") || prefix.includes("://")) return citation;
+    if (
+      citation.startsWith("//") ||
+      (scheme >= tokenStart && scheme + 3 <= offset)
+    )
+      return citation;
     // Serialized Mermaid breaks can otherwise be read as part of the path.
     if (mermaid && text[offset - 1] === "\\" && /^[nr]/.test(citation))
       return citation[0] + replacement;
@@ -25,8 +34,10 @@ function citationOnly(text) {
   const remainder = replaceCitations(text, "");
   return (
     remainder !== text &&
+    // Each run of separators has one owner, so long whitespace cannot
+    // backtrack quadratically.
     new RegExp(
-      `^[\\s,;·()\\[\\]{}]*(?:${sourceLabel}[ \\t]*[:：]?)?[\\s,;·()\\[\\]{}]*$`,
+      `^[\\s,;·()\\[\\]{}]*(?:${sourceLabel}(?:[ \\t]*[:：])?[\\s,;·()\\[\\]{}]*)?$`,
       "i",
     ).test(remainder)
   );
@@ -88,8 +99,10 @@ export function cleanDocument(markdown) {
 
   let result = transform(tree);
   if (!result.includes(marker)) return result;
-  const markers = `${marker}(?:[ \\t]*[,;·]?[ \\t]*${marker})*`;
-  const label = `(?:${sourceLabel}[ \\t]*[:：]?[ \\t]*)?`;
+  // Whitespace around an optional separator belongs to one quantifier only;
+  // overlapping ones backtracked quadratically on long runs of spaces.
+  const markers = `${marker}(?:[ \\t]*(?:[,;·][ \\t]*)?${marker})*`;
+  const label = `(?:${sourceLabel}[ \\t]*(?:[:：][ \\t]*)?)?`;
   // Remove wrappers only when their entire contents were citation annotations.
   // Fullwidth brackets too: a live document wrapped every citation in 【】.
   let previous;
@@ -114,20 +127,39 @@ export function cleanDocument(markdown) {
       new RegExp(`${sourceLabel}[ \\t]*[:：][ \\t]*${markers}`, "gi"),
       marker,
     )
-    .replace(new RegExp(markers, "g"), marker)
-    .replace(
-      new RegExp(`[ \\t]*${marker}[ \\t]*`, "g"),
-      (match, offset, text) => {
-        const before = text[offset - 1];
-        const after = text[offset + match.length];
-        return match.length > marker.length &&
-          before &&
-          after &&
-          !/[\s([{【（［]/.test(before) &&
-          !/[\s)\]},.;:!?"'】）］]/.test(after)
-          ? " "
-          : "";
-      },
-    );
+    .replace(new RegExp(markers, "g"), marker);
+  return joinAroundMarkers(result, marker);
+}
+
+// Drop each marker with the spaces and tabs around it, keeping one space only
+// between words the removed citation separated. Matching the surrounding
+// blanks with a regular expression retried every position of a long run.
+function joinAroundMarkers(text, marker) {
+  const parts = text.split(marker);
+  const blank = (c) => c === " " || c === "\t";
+  const bounds = parts.map((part, i) => {
+    let start = 0,
+      end = part.length;
+    if (i > 0) while (start < end && blank(part[start])) start++;
+    if (i < parts.length - 1) while (end > start && blank(part[end - 1])) end--;
+    return [start, end];
+  });
+  let result = parts[0].slice(0, bounds[0][1]);
+  for (let i = 1; i < parts.length; i++) {
+    const [leftStart, leftEnd] = bounds[i - 1];
+    const [start, end] = bounds[i];
+    const before = leftEnd > leftStart ? parts[i - 1][leftEnd - 1] : undefined;
+    const after = parts[i][start];
+    const spaced = leftEnd < parts[i - 1].length || start > 0;
+    if (
+      spaced &&
+      before &&
+      after &&
+      !/[\s([{【（［]/.test(before) &&
+      !/[\s)\]},.;:!?"'】）］]/.test(after)
+    )
+      result += " ";
+    result += parts[i].slice(start, end);
+  }
   return result;
 }

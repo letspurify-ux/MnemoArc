@@ -108,7 +108,7 @@ test("configure entirely in UI, stream rich chat, switch/cancel sessions and ret
     page.getByRole("checkbox", { name: "문서 근거 점검", exact: true }),
   ).toHaveCount(0);
   await expect(
-    page.getByRole("checkbox", { name: "심볼 검색", exact: true }),
+    page.getByRole("checkbox", { name: "소스 검색", exact: true }),
   ).toBeVisible();
   expect(errors).toEqual([]);
 });

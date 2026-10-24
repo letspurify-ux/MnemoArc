@@ -1,7 +1,9 @@
 import RobotIcon from "./RobotIcon.jsx";
 import {
+  memo,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -185,7 +187,11 @@ export default function Chat({
           )}
           {messages.map((m) =>
             m.role === "tool" ? (
-              <ToolResult key={m.key} message={m} />
+              <ToolResult
+                key={m.key}
+                content={m.content}
+                summary={m.summary}
+              />
             ) : m.role === "assistant" && m.tool_calls?.length ? (
               <div className="tool-group" key={m.key}>
                 {m.content && <Message role="assistant" text={m.content} />}
@@ -323,15 +329,21 @@ export default function Chat({
     </section>
   );
 }
-function ToolResult({ message }) {
+// The chat rerenders every second while a task runs and on every streamed
+// update, and a page holds up to 100 rounds of tool results. Parse and format
+// each result once instead of on every render.
+const ToolResult = memo(function ToolResult({ content, summary }) {
   const [showRaw, setShowRaw] = useState(false);
-  let result;
-  try {
-    result = JSON.parse(message.content);
-  } catch {
-    result = { status: "unknown", data: message.content };
-  }
-  const displayed = displayToolResult(result);
+  const { result, displayed, text } = useMemo(() => {
+    let result;
+    try {
+      result = JSON.parse(content);
+    } catch {
+      result = { status: "unknown", data: content };
+    }
+    const displayed = displayToolResult(result);
+    return { result, displayed, text: JSON.stringify(displayed, null, 2) };
+  }, [content]);
   return (
     <details
       className={`tool-result ${result.status === "ok" ? "" : "failed"}`}
@@ -339,12 +351,10 @@ function ToolResult({ message }) {
       <summary>
         <span>{result.status === "ok" ? "✓" : "!"}</span>{" "}
         {/* What the call did (tools::call_summary); older servers send none. */}
-        <span className="tool-result-summary">
-          {message.summary || "도구 결과"}
-        </span>{" "}
+        <span className="tool-result-summary">{summary || "도구 결과"}</span>{" "}
         <small>{result.status}</small>
       </summary>
-      <pre>{JSON.stringify(displayed, null, 2)}</pre>
+      <pre>{text}</pre>
       {displayed !== result && (
         <details
           className="tool-result-raw"
@@ -356,4 +366,4 @@ function ToolResult({ message }) {
       )}
     </details>
   );
-}
+});

@@ -12,7 +12,29 @@ export function executableMermaidSource(source) {
     masked += text.slice(at, start) + mask(text.slice(start, end));
     at = end;
   }
-  return (masked + text.slice(at)).replace(/^\s*%%(?!{)[^\r\n]+(?:\r\n?|\n)?/gm, mask);
+  return maskComments(masked + text.slice(at));
+}
+
+// /^\s*%%(?!{)[^\r\n]+(?:\r\n?|\n)?/gm를 그대로 따른다. 정규식의 \s*는 빈 줄을 넘어가므로
+// 줄 시작마다 공백 끝까지 다시 훑어, 빈 줄이 많은 원문에서 제곱 비용이었다(실측: 4만 줄 0.9초).
+// 한 공백 구간의 줄 시작은 모두 같은 첫 글자를 보므로 그 구간은 한 번만 판정한다.
+const LINE_END = /[\n\r\u2028\u2029]/;
+function maskComments(text) {
+  let out = '', at = 0;
+  for (let i = 0; i <= text.length;) {
+    if (i > 0 && !LINE_END.test(text[i - 1])) { i++; continue; }
+    let q = i;
+    while (q < text.length && /\s/.test(text[q])) q++;
+    if (text.startsWith('%%', q) && q + 2 < text.length && !/[{\r\n]/.test(text[q + 2])) {
+      let end = q + 3;
+      while (end < text.length && !/[\r\n]/.test(text[end])) end++;
+      if (text[end] === '\r') end += text[end + 1] === '\n' ? 2 : 1;
+      else if (text[end] === '\n') end++;
+      out += text.slice(at, i) + mask(text.slice(i, end));
+      at = i = end;
+    } else i = q + 1;
+  }
+  return out + text.slice(at);
 }
 
 export function mermaidMathExpressions(source, owns) {
