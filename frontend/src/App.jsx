@@ -1000,7 +1000,9 @@ export default function App() {
           </div>
         )}
       </main>
-      {newSession && (
+      {/* A server version change clears the workspace while the dialog is
+          open; its project list returns with the next accepted state. */}
+      {newSession && state && (
         <NewSession
           project={newSession.project}
           projects={state.config.projects}

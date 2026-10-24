@@ -40,6 +40,23 @@ test("a server version change disables a cached session and keeps its unsent dra
   await expect(input).toHaveValue("중지 후 수정할 요청 초안");
 });
 
+test("a server version change while the new session dialog is open keeps the app mounted", async ({
+  page,
+  request,
+}) => {
+  const { state } = await workspace({ page, request });
+  await page.getByRole("button", { name: "새 세션", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "새 세션 설정" })).toBeVisible();
+  delete state.api_version;
+  await expect(
+    page.getByText(/실행 중인 서버와 화면 버전이 맞지 않습니다/),
+  ).toBeVisible();
+  state.api_version = 3;
+  await expect(
+    page.getByRole("textbox", { name: "메시지", exact: true }),
+  ).toBeVisible();
+});
+
 test("a failed change is identified separately from a question and can be resubmitted", async ({
   page,
   request,
