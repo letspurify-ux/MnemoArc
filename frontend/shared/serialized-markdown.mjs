@@ -57,7 +57,8 @@ export function normalizeSerializedMarkdown(source, tree, parse, parseWithoutTab
   const ranges = [];
   const scanLiterals = [];
   // 후보 발견만 한다. 구분 행의 대시 개수·열 수는 아래의 GFM 파서가 판정한다.
-  const serializedTable = /\\n[ \t>]*\|?[ \t]*:?-+[ \t]*:?[ \t]*\|/.test(source);
+  // 공백은 한 수량자만 받는다 — 겹치면 직렬화 개행 뒤의 긴 공백에서 제곱으로 되짚는다.
+  const serializedTable = /\\n[ \t>]*(?:\|[ \t]*)?:?-+[ \t]*(?::[ \t]*)?\|/.test(source);
   const framedRows = [], visualizations = [];
   let structure = tree;
   let frame = '';

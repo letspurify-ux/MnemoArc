@@ -68,10 +68,20 @@ const TYPE_ALIASES = new Map(Object.entries({
 // 설정 줄. 콜론 뒤는 값이며 따옴표가 있어도 벗기지 않는다(모델이 따옴표를 쓰면 그것까지 제목이다 —
 // 벗기기 시작하면 어디까지 벗길지가 또 하나의 규칙이 된다). `data:` 는 서버가 채우고 지우는 줄이라
 // 여기까지 살아오면 서버가 처리하지 못한 것이다 — 값은 무시하되 줄은 설정으로 먹는다.
-const CONFIG_RE = /^\s*(type|title|x|y|y2|xtype|data)\s*:\s*(.*?)\s*$/i;
+// 값은 콜론 뒤를 다듬은 것이고 줄바꿈 글자가 있으면 설정이 아니다(/\s*:\s*(.*?)\s*$/와 같은 규칙).
+// 그 정규식의 게으른 값 뒤 \s*$는 값 가운데의 긴 공백을 글자마다 다시 훑어 제곱 비용이었다
+// (실측: 공백 4만 칸 1.1초). 그래서 값은 통째로 받아 다듬는다.
+const CONFIG_RE = /^\s*(type|title|x|y|y2|xtype|data)\s*:([^]*)$/i;
+const configLine = raw => {
+  const m = CONFIG_RE.exec(raw);
+  if (!m) return null;
+  const value = m[2].trim();
+  return /[\n\r\u2028\u2029]/.test(value) ? null : [m[1], value];
+};
 // GFM 표의 구분 줄(|---|:--:|). 있으면 건너뛰고, 없어도 표로 받는다 — 모델이 빼먹는 일이 있고,
 // 우리에게 필요한 것은 머리글과 값뿐이다.
-const SEP_ROW_RE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
+// 칸 사이·끝의 공백은 한 수량자만 받는다 — 겹치면 끝의 긴 공백에서 제곱으로 되짚는다.
+const SEP_ROW_RE = /^\s*\|?\s*:?-+:?(?:\s*\|\s*:?-+:?)*(?:\s*\|)?\s*$/;
 
 // 표 한 줄을 칸으로 쪼갠다. GFM처럼 `\|` 는 칸 안의 파이프, `\\` 는 역슬래시 하나다 — 되돌려야
 // '표로 보기'(GFM이 그린다)와 차트의 라벨이 같은 글자가 된다(서버 escapeCell이 이렇게 적는다).
@@ -109,11 +119,14 @@ const CURRENCY_RE = /^([-+]?)\s*[₩$€¥]\s*/;
 // 되참조(\1)로 첫 구분자와 같은 것만 받는다 — 잡아만 두고 쓰지 않으면 '1 234,567'처럼 섞인 표기가
 // 통과해 1234567이 된다(실측). 그러면 글자 열이 숫자 열로 둔갑해 없는 값이 그려진다.
 const GROUPED_RE = /^[-+]?\d{1,3}(?:([, ])\d{3})(?:\1\d{3})*(?:\.\d*)?$/;
-const PLAIN_RE = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?$/i;
+// 소수점이 없을 때 두 숫자 수량자가 같은 자리를 나눠 갖지 않게 한다(긴 숫자 뒤 글자에서 제곱 비용).
+const PLAIN_RE = /^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?$/i;
 export function toNumber(cell) {
   let s = String(cell ?? '').trim();
   if (isMissing(s)) return null;
-  s = s.replace(CURRENCY_RE, '$1').replace(/\s*%$/, '');
+  s = s.replace(CURRENCY_RE, '$1');
+  // /\s*%$/를 정규식으로 지우면 값 가운데의 긴 공백에서 위치마다 다시 훑는다.
+  if (s.endsWith('%')) s = s.slice(0, -1).trimEnd();
   if (GROUPED_RE.test(s)) s = s.replace(/[, ]/g, '');
   if (!PLAIN_RE.test(s)) return null;
   const n = Number(s);
@@ -213,8 +226,8 @@ export function splitBlock(text) {
   for (const raw of String(text ?? '').split(/\r\n?|\n/)) {
     if (!raw.trim()) continue;
     if (!inTable) {
-      const m = CONFIG_RE.exec(raw);
-      if (m) { config[m[1].toLowerCase()] = m[2]; continue; }
+      const m = configLine(raw);
+      if (m) { config[m[0].toLowerCase()] = m[1]; continue; }
     }
     if (raw.includes('|')) { inTable = true; table.push(raw); }
     // 파이프도 설정도 아닌 줄(설명 문장 등)은 버린다 — 표를 깨뜨리지 않는 것이 우선이다.
@@ -501,7 +514,7 @@ export function chartNotes(spec) {
 // 좁은 쪽이 요구하는 둘: ① 공백은 스페이스·탭뿐이다(micromark와 같은 규칙 — 같은 파일 OPEN_LINE_RE·
 // maskLiteralFences가 `[ \t]`만 보는 것과 같은 이유다. `\s`는 NBSP·전각공백·얇은공백·VT·FF까지 공백으로
 // 세는데 micromark는 아니다) ② 줄이 파이프로 시작한다.
-const GFM_SEP_RE = /^[ \t]*\|[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*\r?$/;
+const GFM_SEP_RE = /^[ \t]*\|[ \t]*:?-+:?(?:[ \t]*\|[ \t]*:?-+:?)*(?:[ \t]*\|)?[ \t]*\r?$/;
 // 줄 앞에 파이프가 없으면 넣는다(들여쓰기는 그대로). 넣는 이유는 그 첫 글자다: 파이프 없이 시작하는
 // 줄은 markdown이 표보다 먼저 다른 블록으로 읽는다 — `- | -` 구분 줄은 목록 항목이 되고(실측: '표로
 // 보기'가 표 대신 글머리표 하나와 파이프 글자 묶음이 됐다), 머리글의 첫 칸이 `#`이면 제목이, `*`·`+`이면

@@ -3,8 +3,46 @@ import { closingMathDelimiter } from './math-spans.mjs';
 import { verbEnd, texGroupEnds } from './tex-environments.mjs';
 export const MATH_ADAPTER_KEY = 'llm-agent.mermaid.math.v1';
 const mask = value => value.replace(/[^\r\n]/g, ' ');
+
+// 머리말 정규식을 그대로 따른다. 정규식의 여는 `---` 뒤 \s*는 빈 줄까지 삼키므로, 그 공백 안의
+// 줄바꿈마다 본문을 끝까지 다시 찾아 빈 줄이 많은 원문에서 제곱 비용이었다(실측: 4만 줄 2초).
+// 정규식이 고르는 짝은 '닫는 줄이 뒤에 있는 가장 늦은 본문 시작'과 '그 뒤 첫 닫는 줄'이다.
+//   newline: 줄바꿈으로 보는 글자 — 들여쓰기는 그 밖의 공백이다.
+//   closeEnd(text, at): 닫는 `---` 뒤 꼬리가 맞으면 일치의 끝, 아니면 -1.
+export function frontMatterSpan(text, newline, closeEnd) {
+  let at = 0;
+  while (at < text.length && /\s/.test(text[at]) && !newline(text[at])) at++;
+  const indent = text.slice(0, at);
+  if (!text.startsWith('---', at)) return null;
+  const starts = [];
+  for (let i = at + 3; i < text.length && /\s/.test(text[i]); i++) if (newline(text[i])) starts.push(i + 1);
+  if (!starts.length) return null;
+  const closings = [];
+  const fence = indent + '---';
+  for (let i = starts[0]; i < text.length; i++) {
+    if (!newline(text[i]) || !text.startsWith(fence, i + 1)) continue;
+    const end = closeEnd(text, i + 1 + fence.length);
+    if (end >= 0) closings.push({ at: i, end });
+  }
+  if (!closings.length) return null;
+  const last = closings[closings.length - 1].at;
+  let bodyStart = -1;
+  for (const start of starts) if (start <= last) bodyStart = start;
+  if (bodyStart < 0) return null;
+  const close = closings.find(item => item.at >= bodyStart);
+  return { bodyStart, bodyEnd: close.at, end: close.end };
+}
+
+// /^([^\S\n\r]*)-{3}\s*[\n\r](.*?)[\n\r]\1-{3}\s*[\n\r]+/s — 닫는 줄 뒤 공백 중 마지막 줄바꿈까지.
+const lineBreak = c => c === '\n' || c === '\r';
+const mermaidCloseEnd = (text, at) => {
+  let end = -1;
+  for (let i = at; i < text.length && /\s/.test(text[i]); i++) if (lineBreak(text[i])) end = i + 1;
+  return end;
+};
 export function executableMermaidSource(source) {
-  let text = source.replace(/^([^\S\n\r]*)-{3}\s*[\n\r](.*?)[\n\r]\1-{3}\s*[\n\r]+/s, mask);
+  const front = frontMatterSpan(source, lineBreak, mermaidCloseEnd);
+  let text = front ? mask(source.slice(0, front.end)) + source.slice(front.end) : source;
   let at = 0, masked = '';
   for (let start = text.indexOf('%%{'); start >= 0; start = text.indexOf('%%{', at)) {
     const close = text.indexOf('}%%', start + 3);

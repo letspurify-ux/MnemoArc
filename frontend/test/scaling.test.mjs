@@ -8,6 +8,8 @@ import { REMARK_PLUGINS } from "../src/chat/math.js";
 import { cleanDocument } from "../src/document-export.js";
 import { collectMathSpans } from "../shared/math-spans.mjs";
 import { executableMermaidSource } from "../shared/mermaid-math-spans.mjs";
+import { cleanUrl, mermaidFetchesViaStyle } from "../src/chat/markdown.js";
+import { parseChartBlock, splitBlock, toNumber } from "../src/chat/chart.js";
 
 const processor = unified().use(remarkParse).use(REMARK_PLUGINS);
 const render = (markdown) =>
@@ -62,5 +64,36 @@ test("clean export stays linear on long citation lines and blank runs", () => {
   assert.equal(
     within(3000, () => cleanDocument("`a.rs:1" + " ".repeat(40000) + "`")),
     "",
+  );
+});
+
+test("Mermaid front matter is found without rescanning blank lines (was 2 s)", () => {
+  const blank = "---" + "\n".repeat(40000) + "x";
+  assert.equal(within(2000, () => mermaidFetchesViaStyle(blank)), false);
+  assert.equal(within(2000, () => executableMermaidSource(blank)), blank);
+  const front = "---\nconfig:\n  fontFamily: url(x)\n---\nflowchart LR";
+  assert.equal(mermaidFetchesViaStyle(front), true);
+  assert.equal(
+    executableMermaidSource(front),
+    front.slice(0, front.indexOf("flowchart")).replace(/[^\r\n]/g, " ") +
+      "flowchart LR",
+  );
+});
+
+test("chart lines with long blank or digit runs parse in linear time (was 1 s)", () => {
+  const spaces = " ".repeat(80000);
+  const block = `title: a${spaces}b\ntype: bar\n| a | b |\n|-|-|${spaces}x\n| x | 1${spaces}x |`;
+  const { config } = within(1500, () => splitBlock(block));
+  assert.equal(config.title, `a${spaces}b`);
+  within(1500, () => parseChartBlock(block));
+  assert.equal(within(1500, () => toNumber("1".repeat(80000) + "x")), null);
+  assert.equal(toNumber("12.5 %"), 12.5);
+});
+
+test("serialized table detection and URL cleanup stay linear", () => {
+  within(1500, () => render("a\\n" + " ".repeat(80000) + "x"));
+  assert.equal(
+    within(1500, () => cleanUrl(" http://a" + " ".repeat(80000) + "b \u0001")),
+    "http://a" + " ".repeat(80000) + "b",
   );
 });

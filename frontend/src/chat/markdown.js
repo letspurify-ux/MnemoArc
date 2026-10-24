@@ -6,6 +6,7 @@
 // 바깥으로 나가는 요청이 된다.
 import { defaultUrlTransform } from 'react-markdown';
 import { mermaidMathExpressions } from './mermaid-math.js';
+import { frontMatterSpan } from '../../shared/mermaid-math-spans.mjs';
 
 // 각 markdown 렌더의 ID 공간을 분리한다. 같은 번호의 각주가 여러 답변에 있어도
 // 본문·각주·되돌아가기·접근성 설명이 그 답변 안에서 연결되어야 한다.
@@ -82,9 +83,14 @@ export function mdProps(components) {
 // 없다. 그래도 걷어내는 이유: 그림의 src는 mdUrlTransform이 원문 그대로 넘기고 아래 imageKind가
 // 유일한 관문이라, 인코딩을 거치지 않은 값이 한 번이라도 들어오면 '\x01javascript:…'가 브라우저에서
 // 앞이 잘려 살아난다(확인: new URL('\x01javascript:alert(1)', base) → javascript:alert(1)).
-export const cleanUrl = s => (typeof s === 'string'
-  ? s.replace(/[\t\n\r]/g, '').replace(/^[\u0000-\u0020]+/, '').replace(/[\u0000-\u0020]+$/, '')
-  : '');
+// 끝의 글자는 정규식(/[\u0000-\u0020]+$/)으로 지우지 않는다 — 가운데의 긴 공백에서 위치마다 끝까지 훑는다.
+export const cleanUrl = s => {
+  if (typeof s !== 'string') return '';
+  const t = s.replace(/[\t\n\r]/g, '').replace(/^[\u0000-\u0020]+/, '');
+  let end = t.length;
+  while (end > 0 && t.charCodeAt(end - 1) <= 0x20) end--;
+  return t.slice(0, end);
+};
 
 // 페이지 안 앵커인가. 이것만 제자리에서 연다 — 나머지는 새 탭이다(같은 탭에서 열리면 이력이
 // 메모리에만 있는 이 화면에서는 대화가 사라진다).
@@ -218,8 +224,17 @@ const directives = s => {
 // 먼저 \n으로 바꾼다)을 mermaid는 받는데, `---\r?\n`만 보던 앞선 정규식은 넷 다 놓쳐 그 머리말의 url(이 검사 밖에서
 // 요청을 냈다(실측). 닫는 줄의 들여쓰기가 다른 `---`는 mermaid에게 닫는 줄이 아니므로 여기서도 아니다 — 그것을 닫는 줄로
 // 읽으면 그 뒤의 진짜 설정이 검사 밖으로 나간다. 닫는 줄 뒤의 줄바꿈은 mermaid가 요구하지만 여기서는 요구하지 않는다(넓게).
-const FRONTMATTER_RE = /^([^\S\n]*)---\s*\n([\s\S]*?)\n\1---[^\S\n]*(?:\n|$)/;
-const frontmatter = s => FRONTMATTER_RE.exec(s.replace(/\r\n?/g, '\n'))?.[2] ?? '';
+// /^([^\S\n]*)---\s*\n([\s\S]*?)\n\1---[^\S\n]*(?:\n|$)/와 같은 짝을 정규식의 되짚기 없이 찾는다
+// (frontMatterSpan 참고 — 빈 줄이 많은 원문에서 그 정규식은 제곱 비용이었다).
+const frontmatterCloseEnd = (text, at) => {
+  while (at < text.length && text[at] !== '\n' && /\s/.test(text[at])) at++;
+  return at === text.length || text[at] === '\n' ? at : -1;
+};
+const frontmatter = s => {
+  const text = s.replace(/\r\n?/g, '\n');
+  const front = frontMatterSpan(text, c => c === '\n', frontmatterCloseEnd);
+  return front ? text.slice(front.bodyStart, front.bodyEnd) : '';
+};
 export const mermaidFetchesViaStyle = text => {
   const s = String(text ?? '');
   const config = `${directives(s).join('\n')}\n${frontmatter(s)}`;
