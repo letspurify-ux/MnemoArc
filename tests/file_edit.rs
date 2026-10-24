@@ -637,3 +637,39 @@ fn update_keeps_a_crlf_file_crlf() {
         "one\r\nadded\r\nsecond\r\n"
     );
 }
+
+// Outside Windows a backslash is part of a file name: "src\\new.rs" made a
+// file of that name at the project root, which reads of src/ never found.
+#[cfg(not(windows))]
+#[test]
+fn backslash_paths_are_not_created_as_file_names() {
+    let (dir, mut session) = setup();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+    let error = tools::execute(
+        &mut session,
+        "file_write",
+        json!({"path":"src\\new.rs","content":"x\n"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("invalid_file_path"), "{error}");
+    assert!(error.contains("\"src/new.rs\""), "{error}");
+    assert!(!dir.path().join("src\\new.rs").exists());
+    let read = tools::execute(&mut session, "file_read", json!({"path":"src\\a.rs"}))
+        .unwrap_err()
+        .to_string();
+    assert!(read.contains("\"src/a.rs\" exists"), "{read}");
+    // A file that already has such a name is still written.
+    std::fs::write(dir.path().join("odd\\name.txt"), "old\n").unwrap();
+    let digest = run(&mut session, "file_read", json!({"path":"odd\\name.txt"}))["hash"].clone();
+    run(
+        &mut session,
+        "file_write",
+        json!({"path":"odd\\name.txt","content":"new\n","expected_hash":digest}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("odd\\name.txt")).unwrap(),
+        "new\n"
+    );
+}

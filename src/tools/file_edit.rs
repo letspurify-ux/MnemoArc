@@ -194,6 +194,16 @@ fn project_path(s: &Session, raw: &str) -> Result<PathBuf> {
     {
         bail!("invalid_file_path: use a project-relative path without . or .. components");
     }
+    // Outside Windows a backslash is part of a file name, not a separator:
+    // "src\\new.rs" made a file of that name at the project root instead of
+    // src/new.rs, where reads of the same path then found nothing. A file
+    // that already has such a name is still written.
+    if cfg!(not(windows)) && raw.contains('\\') && !s.project.root.join(relative).exists() {
+        bail!(
+            "invalid_file_path: {raw:?} separates folders with \\, which is part of a file name here; use / as in {:?}",
+            raw.replace('\\', "/")
+        );
+    }
     let root = s.project.root.canonicalize()?;
     if excluded(&s.project, relative)? {
         bail!("path_excluded: {raw}");

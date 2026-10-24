@@ -4964,6 +4964,16 @@ fn path_shape_hint(root: &Path, path: &str) -> Option<String> {
             end - start + 1
         ));
     }
+    // Outside Windows a backslash is part of a file name: "src\\a.rs" names
+    // no file of src/.
+    if cfg!(not(windows)) && path.contains('\\') {
+        let separated = path.replace('\\', "/");
+        if exists(&separated) {
+            return Some(format!(
+                " \\ is part of a file name here, not a folder separator; {separated:?} exists: use / between folders."
+            ));
+        }
+    }
     path.contains(['*', '?', '[', '{']).then(|| format!(
         " path takes one exact file or directory and does not expand globs; to match files by pattern send path_glob:{path:?} instead (file_list and source_search accept path_glob)."
     ))
