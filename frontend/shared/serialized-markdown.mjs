@@ -113,7 +113,7 @@ export function normalizeSerializedMarkdown(source, tree, parse, parseWithoutTab
     // 종속된다. 문서의 리터럴 컨테이너를 복구 과정에서 표로 승격하지 않는다.
     const envelopes = [];
     const envelope = node => {
-      if (['code', 'inlineCode', 'html', 'definition', 'link', 'image', 'inlineMath', 'math'].includes(node.type))
+      if (node.position && ['code', 'inlineCode', 'html', 'definition', 'link', 'image', 'inlineMath', 'math'].includes(node.type))
         envelopes.push([node.position.start.offset, node.position.end.offset]);
       for (const child of node.children ?? []) envelope(child);
     };
@@ -135,10 +135,15 @@ export function normalizeSerializedMarkdown(source, tree, parse, parseWithoutTab
     for (const span of visualizations) if (framedRows.some(([start, end]) => span.start >= start && span.end <= end))
       ranges.push([span.start, span.end]);
   }
+  // GFM은 '['에 막힌 주소·메일을 원문 위치 없이 글자에서 다시 링크로 만든다.
+  // 그 링크는 부모 글자의 일부이므로 다른 글자처럼 복구 대상에 남긴다.
   const visit = node => {
-    if (['code', 'inlineCode', 'table', 'html', 'definition', 'link', 'image', 'inlineMath', 'math'].includes(node.type)) {
+    if (node.position && ['code', 'inlineCode', 'table', 'html', 'definition', 'link', 'image', 'inlineMath', 'math'].includes(node.type)) {
       const start = node.position.start.offset, end = node.position.end.offset;
-      ranges.push([start, end]);
+      // 글자에서 찾은 주소·www·메일 링크는 공백까지를 주소로 읽어 직렬화 개행과 다음 줄까지
+      // 삼킨다(https://a.b\n다음 → 주소 a.b\n다음). 개행을 복구한 뒤 다시 판정하게 둔다.
+      // 코드 경계 검사에서는 여전히 원문이다.
+      if (node.type !== 'link' || ['[', '<'].includes(source[start])) ranges.push([start, end]);
       if (!['inlineCode', 'inlineMath', 'math'].includes(node.type)) scanLiterals.push([start, end]);
       return;
     }
